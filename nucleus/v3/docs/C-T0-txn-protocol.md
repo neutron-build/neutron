@@ -118,7 +118,7 @@ Every clause marked "kept with §0.2" reads with these substitutions. A kept cla
 | snapshot registry | The one mutex that holds every registered ts and publishes `W` (§3.6). |
 | live-txn registry | The in-memory map `TxnId → owner handle` of every large txn of the current boot whose provisional entries may still exist. A txn registers when it becomes large, before it writes its first provisional entry, and deregisters after its finalize or cleanup has deleted the last one (§2.4). It is a leaf lock (§2.6). Distinct from the snapshot registry. |
 | boot checkpoint | The checkpoint every read-write open runs after recovery; its meta is durable before the first txn starts (§2.5, §3.7). |
-| boot id | The low 32 bits of the boot checkpoint's `ckpt_id` (§2.5). Not S-STORE's checkpoint epoch `e`, which is one higher after the boot checkpoint's flip. |
+| boot id | The id of a read-write boot: the newest of its boot checkpoint's `ckpt_id` low 32 bits, one above the opened meta's `boot_id`, and one above every boot id its recovery walk accepted (§2.5, S-STORE §14 step 8). Not S-STORE's checkpoint epoch `e`, which is one higher after the boot checkpoint's flip. |
 | key column | As v7.8: a column of any non-partial, non-expression unique index of the relation. |
 
 ---
@@ -242,10 +242,10 @@ There is **no resolver job**, nothing is persisted about `T` beyond its WAL reco
 
 ### 2.5 Txn identity, boot id, no system keys
 - **TxnId** is S-STORE §12.2's `txn` field. `n` is a counter dense per boot, kept in memory, starting at 1 (S-STORE §12.2: `n = 0` is `SegmentEnd`'s).
-- **The boot id** is the low 32 bits of the `ckpt_id` of the **boot checkpoint**: the checkpoint every read-write open runs after recovery (§3.7, S-STORE §14 step 8), or one above the newest boot id the recovery walk accepted, if newer (S-STORE §14 step 8). It is not S-STORE's checkpoint epoch `e`: after the boot checkpoint's flip, `e` is one higher (S-STORE §1). v8 draft 8.0 called it the "boot epoch".
+- **The boot id** is the newest, in serial-number order (S-STORE §12.5), of three values (S-STORE §14 step 8): the low 32 bits of the `ckpt_id` of the **boot checkpoint**, the checkpoint every read-write open runs after recovery (§3.7); one above the opened meta's `boot_id`; and one above the newest boot id the recovery walk accepted. It is not S-STORE's checkpoint epoch `e`: after the boot checkpoint's flip, `e` is one higher (S-STORE §1). v8 draft 8.0 called it the "boot epoch".
   - **The boot checkpoint is durable before the first txn.** No txn starts (and so no `TxnId` is issued and no `Chunk` is appended) until the boot checkpoint's meta is synced (S-STORE §13 step 5). Mutant **BOOT-CKPT-NOT-DURABLE**: txns start after step 0; a crash before step 5 leaves the previous meta durable, and the next boot's checkpoint gets the same `ckpt_id`.
   - **It always writes a new meta**, with `ckpt_id` one above the recovered meta's, even when no page is dirty. Mutant **BOOT-CKPT-SKIP-CLEAN**: a clean open skips the checkpoint and reuses the recovered meta's `ckpt_id`, which the previous boot already used.
-  - **Why boot ids never repeat.** With both rules, each boot's id comes from a `ckpt_id` above every `ckpt_id` durable before it, so no two boots that issued a `TxnId` share an id (this file compares them for equality only; S-STORE §12.5 also orders them in serial-number order, sound while fewer than `2^31` checkpoints separate two compared boots; a repeat would need `2^32` checkpoints). The creating session's id is 0 (S-STORE §2.2). A meta lost after its sync can still repeat the id of a boot none of whose records any walk reached; those records lie past the valid end.
+  - **Why boot ids do not repeat where it matters.** With both rules and S-STORE §14 step 8, each boot's id is newer than the opened meta's and than every record its recovery accepted, so no two boots whose records one walk can reach share an id (this file compares them for equality only; S-STORE §12.5 also orders them in serial-number order, sound while fewer than `2^31` checkpoints separate two compared boots; a repeat would need `2^32` checkpoints). The creating session's id is 0 (S-STORE §2.2). A meta lost after its sync can still repeat the id of a boot none of whose records any walk reached; those records lie past the valid end.
   - **Why the boot checkpoint is needed.** Without it, a boot that crashes before its first checkpoint is followed by a boot with the same id. Its counter restarts, and its `TxnId`s collide with the dead chunks of the crashed boot that still lie in the replay span. Recovery would then attach those chunks to the new txn's marker (mutant **BOOT-ID-REUSE**, draft 8.0's EPOCH-REUSE).
   - The boot checkpoint also places `wal_start_lsn` past the crashed boot's unmarked chunks (S-STORE §12.6: a transaction aborted before the flip does not count).
   - **Read-only opens (N11)** run no boot checkpoint and have no boot id. They start no write txn and write no provisional entry, so every provisional entry is dead to them (§2.4). Every txn in a read-only open is READ ONLY, and any data write, DDL or sequence advance gets 25006. S-STORE §14.1 specifies what such an open replays and what it refuses.
@@ -741,7 +741,7 @@ Each invariant needs a test and a named mutant that the test catches. The "Pinne
 | I-UNIQUE | §5.3: committed state `≤ S` never has two live rows with one unique key; checked after the lock | B-2d | UNIQUE-BEFORE-LOCK |
 | I-FK | v7.8 §11, unchanged | B-2d | (v7.8 seed 58) |
 | I-VIS | §2.2: `Committed(c)` before `visible_ts ≥ c` | B-1c, B-1d | VISIBLE-BEFORE-STATE |
-| I-ACK | §3.4: COMMIT returns only once `visible_ts ≥ c` (and after the sync for `on`) | B-1c | ACK-BEFORE-VISIBLE |
+| I-ACK | §3.4: COMMIT returns only once `visible_ts ≥ c` (and, for `on`, once S-STORE I-ACK-PREFIX holds for its record) | B-1c | ACK-BEFORE-VISIBLE |
 | I-SNAP-ORDER | §3.6: `S` is read and registered in one step | B-1c | SNAP-TWO-STEP |
 | I-ATOMIC | after any crash, all or none of a txn's writes are visible at `visible_ts` | B-1d, A-7d | CKPT-T-VISIBLE |
 | I-DURABLE | an acked `on` commit survives any crash | B-1c, A-7d | (S-STORE I-REDO-COMPLETE mutants) |
@@ -771,7 +771,7 @@ Each invariant needs a test and a named mutant that the test catches. The "Pinne
 | I-LOCK-ORDER | §2.6: locks are taken in the stated order; the stripe is never taken under a page latch; the live-txn registry is a leaf | B-1d | STRIPE-UNDER-LATCH |
 | I-PROV-WAL | §3.2/§5.5: each provisional entry equals the last chunk op for its key | B-1d, A-7d | ROLLBACK-NO-SUPERSEDE, ROLLBACK-KEEPS-PROV |
 | I-M | §3.5: checkpoint `T = M`; `W ≤ M` | B-1d, A-7c | CKPT-T-VISIBLE, W-ABOVE-M |
-| I-BOOT-ID | §2.5: boot ids never repeat; the boot checkpoint always writes a new meta, which is durable before the first txn | B-1d, A-7d | BOOT-ID-REUSE, BOOT-CKPT-NOT-DURABLE, BOOT-CKPT-SKIP-CLEAN |
+| I-BOOT-ID | §2.5: boot ids increase across the boots whose records one walk can reach (S-STORE §14 step 8; residual in S-STORE §12.5); the boot checkpoint always writes a new meta, which is durable before the first txn | B-1d, A-7d | BOOT-ID-REUSE, BOOT-CKPT-NOT-DURABLE, BOOT-CKPT-SKIP-CLEAN, BOOT-ID-CKPT-ONLY, BOOT-ID-NO-META-FLOOR |
 | I-HOL | §3.1–§3.2: an unrelated commit waits for at most one bounded small apply and one chunk batch per active large txn, where a batch is at most `chunk_batch` bytes or one `Chunk` record | B-1d | CHUNK-QUEUE-UNBOUNDED, BATCH-PLUS-ONE |
 | I-W-FLOOR | §3.7: after open, `W ≥` the recovered meta's `gc_w` | B-3 | W-FLOOR-ZERO |
 | I-W-MONO | §9.1: `W` never decreases | B-3 | W-DECREASE |
@@ -858,7 +858,7 @@ This file wins over the plan. PL-1 should bring the plan in line:
 
 ## Changelog
 - **Draft 8.3** (2026-11-03, card S-1-F3, with S-STORE draft 5; pointer clauses only):
-  - **TxnId and boot ids (§2.5).** `n` starts at 1 (`n = 0` is S-STORE `SegmentEnd`'s). A boot's id is one above the newest boot id its recovery walk accepted when that is newer than its `ckpt_id`'s low bits (S-STORE §14 step 8), so a meta rollback cannot make a boot repeat an id whose records a walk can reach. S-STORE §12.5 orders boot ids in serial-number order; the creating session's id is 0.
+  - **TxnId and boot ids (§2.5).** `n` starts at 1 (`n = 0` is S-STORE `SegmentEnd`'s). A boot's id is the newest, in serial-number order, of its `ckpt_id`'s low bits, one above the opened meta's `boot_id`, and one above the newest boot id its recovery walk accepted (S-STORE §14 step 8), so a meta rollback cannot make a boot repeat an id whose records a walk can reach. §1's `boot id` row and §11.1's I-BOOT-ID row (statement; mutants BOOT-ID-CKPT-ONLY, BOOT-ID-NO-META-FLOOR) say the same, and §11.1's I-ACK row cites I-ACK-PREFIX. S-STORE §12.5 orders boot ids in serial-number order; the creating session's id is 0.
   - **"Synced" → I-ACK-PREFIX.** §3.1 steps 3 and 5, §3.2's head-of-line bullet and step 2, §3.4's I-ACK and §3.5's `visible_ts` say "durable" in terms of S-STORE I-ACK-PREFIX (§12.4), so an `on` commit never becomes visible or acked over an unwritten earlier batch (X-5c-F3, seed 21).
   - **Reused ts (§3.7 step 4).** A store whose image holds an entry above the recovered frontier never opens read-write (S-STORE I-WAL-COVER).
   - **Poison (§6.3).** Every wait has the poison mark in its predicate; the poisoner wakes every queue after releasing what it holds (S-STORE §9.2).
