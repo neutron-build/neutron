@@ -3153,3 +3153,113 @@ fn d18_ts_order() {
         m.pass
     );
 }
+
+/// **X-5c-F3-F1 step 4 pin (nv3-X-5c-F3-F2 §1; a literal config).** The
+/// twin supply never dropped a **failed** recovery's reads: the
+/// recovery loop's final `Err` arm set `recovery_reads` but never
+/// extended the caller's collector, so a pre-supplied twin whose
+/// recovery failed handed its round no reads at all (3509 r0, 4699 r0,
+/// 8399 r1 — the real round's O-3 (c) then judged an empty set against
+/// its own faults). The config: a published tree and a checkpoint (both
+/// metas durable), then directed LOST faults on **both** meta slots —
+/// open reads both meta slots, finds no valid meta, and recovery
+/// returns `Err` at `Open`. The collector passed as the round's twin
+/// must then hold exactly those reads (the page file at 4096 and 8192).
+/// Reverting the fix (mutant M-TWa: the extend removed) fails this pin
+/// — the collector stays empty.
+#[test]
+fn twin_supply_carries_a_failed_recovery_reads() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 9)),
+        nested: Vec::new(),
+    };
+    // A faultless crash round supplies the crashed disk the faults are
+    // built from (the same schedule prefix, so the same bytes).
+    let base = run(2026, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("the page file");
+    let mut metas: Vec<e4_recovery::sim::MediaFault> = Vec::new();
+    for slot_off in [4096u64, 8192] {
+        if let Some(w) = base
+            .crashed_disk
+            .dwrites_of(pf)
+            .iter()
+            .rev()
+            .find(|w| w.off == slot_off && w.bytes.len() == 4096)
+            .cloned()
+        {
+            metas.push(e4_recovery::sim::MediaFault {
+                inode: pf,
+                off: w.off,
+                len: 4096,
+                bytes: w.bytes.clone(),
+                pre: w.pre.clone(),
+                kind: e4_recovery::sim::MediaKind::Lost,
+            });
+        }
+    }
+    assert!(
+        metas.len() == 2,
+        "both meta slots' durable writes must be faulted (found {})",
+        metas.len()
+    );
+    let (disk, st) = harness::create_store(cfg(None), 2026, 7).expect("create");
+    let mut twin: Vec<(usize, u64, u64)> = Vec::new();
+    let out = harness::run_round(
+        2026,
+        0,
+        &script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: metas,
+            no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
+    );
+    // Sanity: this is a failed-recovery round (the recovery-Err branch
+    // of the oracle judged it).
+    assert!(
+        out.o1.is_err(),
+        "the round must be a failed-recovery round (o1={:?})",
+        out.o1
+    );
+    // The collector carries the failed recovery's own reads — both
+    // meta slots above all.
+    assert!(
+        twin.iter().any(|&(f, off, _)| f == pf && off == 4096)
+            && twin.iter().any(|&(f, off, _)| f == pf && off == 8192),
+        "the twin collector must carry the failed recovery's reads of both meta slots (got {twin:?})"
+    );
+    assert!(
+        !twin.is_empty(),
+        "the twin collector must not be empty after a failed recovery (M-TWa)"
+    );
+}

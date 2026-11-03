@@ -2357,6 +2357,18 @@ pub fn run_round(
                     .skip(reads_before)
                     .map(|r| (r.inode, r.off, r.len))
                     .collect();
+                // **X-5c-F3-F1 step 4 (nv3-X-5c-F3-F2 §1): the final
+                // `Err` arm extends the caller's twin collector exactly
+                // as the `Ok` arm does.** The draft set `recovery_reads`
+                // but never extended the collector, so a pre-supplied
+                // twin whose recovery failed handed its round no reads
+                // at all (3509 r0, 4699 r0, 8399 r1: the real round's
+                // O-3 (c) then judged an empty set against its own
+                // faults). The reads are the real round's own — this
+                // life's — never a store memory or a §3.3 verdict.
+                if let Some(t) = twin.as_mut() {
+                    t.extend(recovery_reads.iter().copied());
+                }
                 recovery_served.extend(g.disk.served.clone());
                 recovery_events = g.disk.events.clone();
                 break Err(e);
