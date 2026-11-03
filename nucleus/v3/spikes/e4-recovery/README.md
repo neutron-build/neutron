@@ -1,6 +1,13 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3, **all steps 0–8 done** — step 0 committed
+Status: **stage X-5c-F3-F1, step 0 done — committed
+F3's Acceptance 10k as the triage file of record (7b709ccb:
+`E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0
+PANIC=0 O1F_FAIL=2665 MONITOR=0` / `E4 FOLD FAILING_SEEDS=955
+FAILING_ROUNDS=914 TWIN_FAILING_ROUNDS=71 DEFECT_SEEDS=0`, sha256
+`efb7835e…73906c5`) and re-derived the class table (served rounds split
+out first). The stage before it (X-5c-F3) is complete and merged (all
+its steps 0–8 done): step 0 committed
 F2's Acceptance 10k as the triage file of record (b9dd5a9a:
 `E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41
 PANIC=0 O1F_FAIL=2723 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1070
@@ -1794,6 +1801,62 @@ nothing here is fixed separately.
   family; G8 clears the 41 MP-LIVELOCK rounds as `poison`-crash
   detection rounds; C-DIV, MW-ORPHAN, MP-A, shape C and the twins'
   remainders stand as escalated).
+
+## Stage X-5c-F3-F1's record (this card)
+
+**Step 0 — F3's Acceptance 10k committed as the triage file of record
+(7b709ccb), and this card's class table re-derived from it.** The three
+provenance checks passed before the copy (the prov file's
+`commit=fe798c0a… status_lines=0 exit=0 verify_exit=0`; the JSON's
+sha256 equal to its `json_sha256` `efb7835e…73906c5`; `git diff --quiet
+fe798c0a HEAD` over `src/`, `tests/`, `examples/`, `Cargo.toml` and
+`v3/Cargo.lock` exiting 0 — the merged tip 038bb9cc is F3's verdict
+commit on top of fe798c0a, which touches only `nucleus/v3/verdicts/`).
+
+Final lines, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0 PANIC=0 O1F_FAIL=2665 MONITOR=0
+E4 FOLD FAILING_SEEDS=955 FAILING_ROUNDS=914 TWIN_FAILING_ROUNDS=71 DEFECT_SEEDS=0
+```
+
+G8's effect shows in `DEADLOCK=0` (F2's file: 41; MP-LIVELOCK is gone).
+Rounds: C 11,822 / MP 2,183 (+ 2,183 twins) / MW 1,416 (+ 1,416 twins).
+
+**The class table, re-derived from the committed file (the reporting
+rule: `served=true` rounds are split out first — the oracle's `o3` text
+is last-writer-wins, so 6149 r1's serve reads as O-3(d), and an
+O-3(a) text can hide an O-3(e) failure).** Field definitions: a
+**failing** primary round has `pass=false`; a **failing twin** round has
+`pass=false` in the twin record. All counts are over primary rounds
+unless "twin" is in the name.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **Served (split out first)** | 7 MP + 1 MW | MP/MW failing round with `served=true`: 1897/2437/2927/4378/4718/7528/8728 (all r0, all `mrb=true`, all `O-3(a): served corruption` — MP-A, judged under X5-R30 (c) from step 6's fields) and 6149 r1 (MW, `O-3(d)` text — the serve is step 2's target: the SegmentEnd valid-end fix) | 1897, 2437; 6149 r1 |
+| **C-XX** (class C) | 64 | class C failing round with `o2 != null` ("class C amcheck(i) not clean") or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 21, `AmcheckIi` 43 (no `o2`-only round in this file) | 943 (r0, `Open`), 906 (r0, `AmcheckIi`) |
+| **C-DIV** | 388 | class C failing round carrying an `o1` text, **excluding** rounds whose `o1` is an O-1(a) inside a C-XX round (the recovery-`Err` default). **93 carry `frontier < lo`** (88 (b) + 5 (a)) — the WAL hole, this card's step 1; the other 295: (b) 144, (c) 93, (d) 58. By round index: r0 58, r1 64, **r2 266 of 1,373** (19.4%) | 21 (r0, b, `frontier < lo`), 46 (r1, b), 36 (r2, d), 10 (r2, c) |
+| **MP O-3(c)** (X5-R32's) | 17 | MP failing round with `o3` = `O-3(c): XX001 with every media fault on unread, unreferenced targets`: 7, 1167, 1628, 2047, 2307, 3307, 3887, 4348, 4707, 6047, 6767 (r2), 7367, 7748, 8837, 9168, 9508, 9928 — exactly X5-R32 (d) 1's named list (all r1 except 6767 r2) | 7 r1, 1167 r1 |
+| **MW O-3(c)** (the same family, X5-R32 (d) 2) | 5 | MW failing round with the O-3(c) text: 1889 r2, 3509 r0, 4699 r0, 5229 r1, 8399 r1 — step 7 takes them with C-XX | 3509 r0, 8399 r1 |
+| **MP-E shape C** | 5 | MP failing round with `o3` starting `O-3(e): (ii)`: 688, 3718, 4858, 5238, 5638 (all r0). **9717 passes in this file** (round and twin) — moved by F3's step-1 fix; the card's Goal expected it here | 688, 4858 |
+| **MW-ORPHAN** | 451 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing`: 450 non-served + 6149 r1 (served, split out above) — P's count. S-1-F3's; never fixed here | 39 (r0), 59 (r0) |
+| **Other MW** | 13 | the MW failing rounds outside the classes above: 10 O-3(d) with O-1(a) (2769, 3099, 3159, 4239, 5299, 6179, 7219, 8389, 9309, 9699), 1 O-1(a) only (3399 r0), 2 O-1f only (2019 r2, 4049 r1) — the MW-ORPHAN published-set family | 3399, 2019 |
+| **Other MP** | 1 | 6028 r0: `O-1(b) at c=13, tree 2: scan mismatch`, recovery `Ok`, no O-3 text — C-DIV's shape inside class MP | 6028 |
+| **The twins** | 71 | failing twin rounds: 26 MP + 45 MW; `o1` texts: MP (b) 22, (a) 3, (c) 1; MW (a) 17, (b) 16, (c) 6, (d) 6 — the classes echo there (the twin is judged as class C) | 339/849 family |
+
+Partition check: C 415 = 64 C-XX ∪ 388 C-DIV (overlap 37 rounds); MP 30
+= 7 served + 17 O-3(c) + 5 shape C + 1 other; MW 469 = 450 ORPHAN
+(non-served) + 5 O-3(c) + 13 other + 1 served (6149 r1). Total failing
+rounds 914 = `FAILING_ROUNDS`; failing seeds 955 = `FAILING_SEEDS`;
+`TWIN_FAILING_ROUNDS=71`; 0 livelock/deadlock rounds, 0 defect seeds.
+
+Deviations from the card's Goal table, measured: the C-DIV r2
+denominator is **1,373** class C r2 rounds in this file (the Goal says
+"266 of 1,357" — 1,357 was F2's file's denominator; the numerator 266
+matches exactly), and **9717 passes** here (the Goal's MP-E shape C
+list expected it; its findings were "separators out of order" and
+"lpid 36 reachable more than once", the family F3's step-1 `next_lpid`
+fix plausibly cleared — recorded, not re-derived deeper).
 
 
 
