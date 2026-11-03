@@ -1388,7 +1388,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ao\":[{}],\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1419,6 +1419,11 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.pass_na
                     .map(|b| b.to_string())
                     .unwrap_or_else(|| "null".into()),
+                x.ack_over
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 x.client_xx001,
                 x.pass,
                 x.deadlock,
@@ -1842,6 +1847,20 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "skx" => x.skx = j.boolv()?,
             "smx" => x.smx = j.boolv()?,
             "pass_na" => x.pass_na = j.opt_bool()?,
+            "ao" => {
+                j.eat(b'[')?;
+                if !j.try_eat(b']') {
+                    loop {
+                        let t = j.int()?;
+                        x.ack_over.push(t);
+                        if j.try_eat(b',') {
+                            continue;
+                        }
+                        j.eat(b']')?;
+                        break;
+                    }
+                }
+            }
             "cxx" => x.client_xx001 = j.int()? as u32,
             "pass" => x.pass = j.boolv()?,
             "dl" => x.deadlock = j.boolv()?,

@@ -1583,6 +1583,14 @@ pub struct RoundOutcome {
     /// X5-R28 (a): the kept set `K_ii` at the amcheck (ii) point
     /// (empty unless (ii) ran).
     pub kept_slots_ii: BTreeSet<u64>,
+    /// **X5-R34 (f):** the round's `ack_over` — the SyncOn commit ts's
+    /// whose own §12.4 ack wait returned before the crash while their
+    /// record ends above the derived durable end `D` (and outside `Rc`).
+    /// Empty when there are none; a non-empty list is an
+    /// ACK-OVER-HOLE store failure (escalated, never relaxed). A
+    /// diagnostic in the record (`run` writes it, `verify` parses it);
+    /// the pass fold reads it only through the round's task error.
+    pub ack_over: Vec<u64>,
 }
 
 impl Default for RoundOutcome {
@@ -1637,6 +1645,7 @@ impl Default for RoundOutcome {
             served_k: false,
             kept_slots: BTreeSet::new(),
             kept_slots_ii: BTreeSet::new(),
+            ack_over: Vec::new(),
         }
     }
 }
@@ -1982,9 +1991,56 @@ pub fn run_round(
         return outcome;
     }
     // Work 2.1: written/acked from the disk events — the write carrying
-    // the commit record's last byte returned, and (SyncOn) a WAL sync
-    // covering it returned / (SyncOff) the write returned.
-    let (written_ts, acked_ts, unparsed_written) = derive_written_acked(&events, &wal_commits);
+    // the commit record's last byte returned, and the ack per §12.4.
+    // **X5-R34 (binding):** the SyncOn acked half is I-ACK-PREFIX's
+    // `durable_end` `D` from SimDisk history — `p0` is the WAL append
+    // position this round's workload started from (the valid end of the
+    // recovery that produced the round's base), and the `/wal/` durable
+    // bindings are read at the end of the workload pass through the one
+    // observer accessor this card adds. Never store memory (X5-R34 (i)).
+    let p0 = start_store.wal.append;
+    let wal_bindings = disk.durable_dir_bindings(crate::sim::WAL_DIR);
+    // *Guard* (X5-R34 (b) 2): every record in `wal_commits` has
+    // `lsn ≥ p0`. A violation is a harness defect and fails the round
+    // loudly.
+    let p0_guard = wal_commits
+        .iter()
+        .filter(|(_, (_, lsn, _))| *lsn < p0)
+        .map(|(ts, (_, lsn, _))| (*ts, *lsn))
+        .collect::<Vec<_>>();
+    let (written_ts, acked_ts, unparsed_written) =
+        derive_written_acked(&events, &wal_commits, p0, &wal_bindings);
+    // X5-R34 (d) diagnostic (`E4_D_DIAG`, default off, stderr only,
+    // never a digest input): `D`, the reason its walk stopped, `Rc`, and
+    // each SyncOn commit's verdict — the (h) 1 table's inputs. `D` and
+    // `Rc` are computed regardless: the (f) cross-check below reads
+    // them.
+    let (d_val, d_stop, d_rc) = x5r34_durable_prefix(&events, &wal_bindings, p0);
+    if std::env::var("E4_D_DIAG").is_ok() {
+        eprintln!(
+            "D diag: seed={seed} round={round} class={:?} p0={p0} D={d_val} stop={d_stop} rc={:?}",
+            faults.class, d_rc
+        );
+        for (ts, (sync_on, lsn, len)) in wal_commits.iter() {
+            let name = x5r34_seg_name(*lsn - (*lsn % crate::store::WAL_SEG));
+            eprintln!(
+                "D diag: ts={ts} sync_on={sync_on} lsn={lsn} len={len} end={} D={d_val} in_rc={} acked={}",
+                lsn + len,
+                d_rc.contains(&name),
+                (!sync_on && written_ts.contains(ts))
+                    || (*sync_on && (lsn + len <= d_val || d_rc.contains(&name)))
+            );
+        }
+    }
+    // **X5-R34 (f): the judged cross-check (ACK-OVER-HOLE).** Every
+    // SyncOn commit whose own §12.4 ack wait returned before the crash
+    // (`client_acked`) must have its record at or below `D` (or live in
+    // a recycled segment): a client-observed ack above the derived
+    // durable end is a store failure of the round, through the same
+    // path as X5-R10's guard. A commit acked by (e) but **absent** from
+    // `client_acked` is not a failure (its committer crashed in its
+    // wait; the record is durable and recovery must replay it).
+    let ack_over = x5r34_ack_over(&client_acked, &wal_commits, d_val, &d_rc);
     // X-5c-F3-F1 step 1 (e), the cross-check (`E4_ACK_DIAG`, stderr
     // only, never a digest input): every commit's derived `acked` flag
     // against the client-observed ack (did this commit's own
@@ -2077,6 +2133,23 @@ pub fn run_round(
         task_error = Some(format!(
             "wal_commits written but unparsable (record len past segment): {unparsed_written:?}"
         ));
+    }
+    // X5-R34 (b) 2's guard: a record below `p0` is a harness defect.
+    if !p0_guard.is_empty() && task_error.is_none() {
+        task_error = Some(format!(
+            "X5-R34 p0 guard: wal_commits record below p0={p0}: {p0_guard:?}"
+        ));
+    }
+    // X5-R34 (f): the judged cross-check — a client-observed SyncOn ack
+    // above `D` is a store failure of the round (the pass fold fails it
+    // through the task error, exactly as X5-R10's guard does).
+    if !ack_over.is_empty() && task_error.is_none() {
+        let ts = ack_over[0];
+        let (lsn, len) = match wal_commits.get(&ts) {
+            Some((_, l, n)) => (*l, *n),
+            None => (0, 0),
+        };
+        task_error = Some(x5r34_ack_over_text(ts, lsn, len, d_val));
     }
 
     // ---- the crash and the faults ----
@@ -3071,6 +3144,9 @@ pub fn run_round(
     outcome.nested_points = nested_points;
     outcome.media_faults = round_media;
     outcome.renames_dropped = renames_dropped;
+    // X5-R34 (f): the cross-check's record field (the task error above
+    // already fails any non-empty list through the pass fold).
+    outcome.ack_over = ack_over;
     // ---- the monitors (3.10), from disk events and parsed WAL bytes ----
     {
         let g = sched.lock();
@@ -3161,15 +3237,29 @@ fn ack_record_present(events: &[DiskEvent], lsn: u64) -> bool {
 /// could, and the cap now refuses it). The harness fails the round on
 /// any; dropping the entry silently let an acked commit vanish from the
 /// model while recovery lost it too (the F1 demonstration).
+///
+/// **X5-R34 (a), binding:** the **SyncOn acked half is I-ACK-PREFIX's
+/// `durable_end` derived from SimDisk history** (`x5r34_durable_prefix`,
+/// carrying `p0` — the round's starting append position — and the
+/// durable `/wal/` directory bindings read through
+/// [`SimDisk::durable_dir_bindings`]). A SyncOn commit is acked iff
+/// `lsn + len ≤ D`, or its segment name is in `Rc` (the recycled
+/// exemption). Unchanged: `written` (the `hi` input), SyncOff's acked
+/// (= written) and the `unparsed_written` report. The acked half never
+/// reads store memory (`wal.durable`/`wal.written`) — only `E`, `p0`
+/// and the durable bindings (X5-R34 (b), (i)).
 pub fn derive_written_acked(
     events: &[DiskEvent],
     wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    p0: u64,
+    wal_bindings: &BTreeMap<String, usize>,
 ) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
-    // inode → (off → latest issued bytes) and the return/sync extents.
+    // inode → (off → latest issued bytes) and the returned extents (the
+    // `written` half's inputs). X5-R34 removed the per-inode sync-extent
+    // ratchet this acked half used; `D` comes from
+    // [`x5r34_durable_prefix`] below.
     let mut files: BTreeMap<usize, FileWrites> = BTreeMap::new();
     let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
-    let mut durable_end: BTreeMap<usize, u64> = BTreeMap::new();
-    let mut sync_after: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
     for e in events {
         match e {
             DiskEvent::WriteIssued { inode, off, bytes } => {
@@ -3179,22 +3269,7 @@ pub fn derive_written_acked(
                 let w = returned_end.entry(*inode).or_default();
                 *w = (*w).max(off + len);
             }
-            DiskEvent::SyncReturned { inode, .. } => {
-                // A sync makes durable everything the file had **through
-                // the then-returned extent**; record the event order by
-                // pairing it with the returned extent at this point.
-                let w = returned_end.get(inode).copied().unwrap_or(0);
-                sync_after.entry(*inode).or_default().push(w);
-            }
             _ => {}
-        }
-    }
-    // Per sync event (in order), the durable extent ratchets: durable =
-    // max over syncs of the returned extent at sync time.
-    for (inode, exts) in sync_after.iter() {
-        let d = durable_end.entry(*inode).or_default();
-        for w in exts {
-            *d = (*d).max(*w);
         }
     }
     // Walk each stitched file's records; ts → (inode, record end in-file).
@@ -3270,30 +3345,50 @@ pub fn derive_written_acked(
     let mut written = Vec::new();
     let mut acked = Vec::new();
     let mut unparsed_written = Vec::new();
+    // X5-R34 (d)/(e): the durable prefix `D` and the recycled set.
+    let (d, _d_stop, rc) = x5r34_durable_prefix(events, wal_bindings, p0);
     for (ts, (sync_on, lsn, _len)) in wal_commits.iter() {
-        let Some((inode, end)) = ts_pos.get(ts).copied() else {
-            // The walk never yielded this commit's record. If its header
-            // sits issued at the segment-relative position with its own
-            // lsn and a length past the segment end, the bytes were
-            // written but can never parse — report it (F1); the harness
-            // fails the round. A record simply never written (or torn
-            // mid-body, a normal crash outcome) has no full header or a
-            // length that fits, and stays silent.
-            if let Some(rec_len) = issued_header_len(&files, *lsn, seg)
-                && (*lsn % seg) + rec_len > seg
-            {
-                unparsed_written.push(*ts);
+        // The `written` half — unchanged (the walk + the returned
+        // extents; the `hi` input).
+        let w_ok = match ts_pos.get(ts).copied() {
+            Some((inode, end)) => {
+                let w = returned_end.get(&inode).copied().unwrap_or(0);
+                if w >= end {
+                    written.push(*ts);
+                    true
+                } else {
+                    false
+                }
             }
-            continue;
+            None => {
+                // The walk never yielded this commit's record. If its
+                // header sits issued at the segment-relative position
+                // with its own lsn and a length past the segment end,
+                // the bytes were written but can never parse — report
+                // it (F1); the harness fails the round. A record simply
+                // never written (or torn mid-body, a normal crash
+                // outcome) has no full header or a length that fits,
+                // and stays silent.
+                if let Some(rec_len) = issued_header_len(&files, *lsn, seg)
+                    && (*lsn % seg) + rec_len > seg
+                {
+                    unparsed_written.push(*ts);
+                }
+                false
+            }
         };
-        let w = returned_end.get(&inode).copied().unwrap_or(0);
-        let d = durable_end.get(&inode).copied().unwrap_or(0);
-        if w >= end {
-            written.push(*ts);
-            let acked_now = if *sync_on { d >= end } else { true };
-            if acked_now {
-                acked.push(*ts);
-            }
+        // The acked half — X5-R34 (e), independent of the walk: a
+        // SyncOn commit is acked iff its record ends at or below `D`,
+        // or its segment was recycled away this round (`Rc`); a SyncOff
+        // commit is acked iff written (unchanged).
+        let acked_now = if *sync_on {
+            let name = x5r34_seg_name(*lsn - (*lsn % seg));
+            lsn + _len <= d || rc.contains(&name)
+        } else {
+            w_ok
+        };
+        if acked_now {
+            acked.push(*ts);
         }
     }
     (written, acked, unparsed_written)
@@ -3336,6 +3431,475 @@ fn magic_ok(hdr: &[u8]) -> bool {
         b.copy_from_slice(s);
     }
     u32::from_le_bytes(b) == 0x4C41_574E
+}
+
+// ---- X5-R34: I-ACK-PREFIX's `durable_end` from SimDisk history ----
+
+/// The segment file name holding LSN `x` (§12.2's `<16 hex>.log` inside
+/// `"/wal/"`; X5-R34 (b) defines `name(x)`).
+pub fn x5r34_seg_name(seg: u64) -> String {
+    format!("{seg:016x}.log")
+}
+
+/// **X5-R34 (b): the per-round view of the workload pass's event
+/// stream** `E`, built in one pass. Everything the durable-prefix
+/// derivation needs and nothing else:
+/// - per-inode issued writes, in event order (`writes`), their distinct
+///   start offsets (`write_starts`, the SegmentEnd candidates of (c)'s
+///   slack rule), and the per-inode **last-issued byte map**
+///   (`last_issued`, maintained with the same split-neighbours
+///   discipline as `Inode::record_issued`, but from `E` alone);
+/// - the per-inode last `SyncReturned` index (`last_sync`);
+/// - `β(n)` per segment name (the last `create`/rename-into-`n` dir op
+///   preceding the last `sync_dir("/wal/")` return) and the recycled
+///   set `Rc` (every rename **source**).
+///
+/// Determinism: `BTreeMap`/`BTreeSet` only; no wall clock, no store
+/// memory, no taint map (X5-R34 (i)).
+struct X5r34View {
+    /// inode → `(event index, off, end)` of each issued write, in event
+    /// order.
+    writes: BTreeMap<usize, Vec<(usize, u64, u64)>>,
+    /// inode → its distinct write start offsets (record candidates).
+    write_starts: BTreeMap<usize, BTreeSet<u64>>,
+    /// inode → its last `SyncReturned` event index (`sync_data` and
+    /// `sync_all` alike — (W) does not distinguish).
+    last_sync: BTreeMap<usize, usize>,
+    /// inode → the last-issued bytes as an interval map (start → bytes).
+    last_issued: BTreeMap<usize, BTreeMap<u64, Vec<u8>>>,
+    /// `β(n)`: segment name → the last binding dir op's event index
+    /// before the last `sync_dir("/wal/")` return (absent = the binding
+    /// predates the round, or none ever became durable).
+    beta: BTreeMap<String, usize>,
+    /// `Rc`: segment names renamed away this round (the (R) exemption).
+    rc: BTreeSet<String>,
+}
+
+impl X5r34View {
+    /// One pass over `E` (X5-R34 (b) 1: index order is time order, and
+    /// the media faults applied after `E` was captured never appear).
+    fn build(events: &[DiskEvent]) -> Self {
+        let mut v = X5r34View {
+            writes: BTreeMap::new(),
+            write_starts: BTreeMap::new(),
+            last_sync: BTreeMap::new(),
+            last_issued: BTreeMap::new(),
+            beta: BTreeMap::new(),
+            rc: BTreeSet::new(),
+        };
+        let mut binding_ops: Vec<(usize, String)> = Vec::new();
+        let mut last_dirsync: Option<usize> = None;
+        for (i, e) in events.iter().enumerate() {
+            match e {
+                DiskEvent::WriteIssued { inode, off, bytes } => {
+                    v.writes
+                        .entry(*inode)
+                        .or_default()
+                        .push((i, *off, *off + bytes.len() as u64));
+                    v.write_starts.entry(*inode).or_default().insert(*off);
+                    let m = v.last_issued.entry(*inode).or_default();
+                    issued_insert(m, *off, bytes);
+                }
+                DiskEvent::SyncReturned { inode, .. } => {
+                    v.last_sync.insert(*inode, i);
+                }
+                DiskEvent::SyncDirReturned { dir } if dir == crate::sim::WAL_DIR => {
+                    last_dirsync = Some(i);
+                }
+                DiskEvent::DirOpIssued { dir, what } if dir == crate::sim::WAL_DIR => {
+                    if let Some(n) = what
+                        .strip_prefix("create ")
+                        .and_then(|n| n.strip_prefix("/wal/"))
+                    {
+                        // `create /wal/<name>`
+                        binding_ops.push((i, n.to_owned()));
+                    } else if let Some(rest) = what.strip_prefix("rename ") {
+                        // `rename /wal/<from> -> /wal/<to>`: the source is
+                        // recycled away (Rc), the target newly bound.
+                        if let Some((from, to)) = rest.split_once(" -> ") {
+                            // Names are bare (`<16 hex>.log`), as the
+                            // durable bindings key them.
+                            let from = from.strip_prefix("/wal/").unwrap_or(from);
+                            let to = to.strip_prefix("/wal/").unwrap_or(to);
+                            v.rc.insert(from.to_owned());
+                            binding_ops.push((i, to.to_owned()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // β(n): only ops the last `sync_dir("/wal/")` return covers can
+        // have made a binding durable (X5-R34 (b) 4).
+        if let Some(ds) = last_dirsync {
+            for (idx, n) in binding_ops {
+                if idx < ds {
+                    let b = v.beta.entry(n).or_insert(idx);
+                    if idx > *b {
+                        *b = idx;
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// The durable byte ranges of one segment, as **file offsets**
+    /// `[a, b)` within it (X5-R34 (c)): (R) the whole segment when its
+    /// name was renamed away; (W) the ranges whose last issued write
+    /// postdates the durable binding and a sync of the inode followed;
+    /// (S) the slack after a `SegmentEnd` whose own bytes are (W)-
+    /// durable and whose last-issued bytes decode as the filler at its
+    /// own position.
+    fn durable_ranges(
+        &self,
+        name: &str,
+        bindings: &BTreeMap<String, usize>,
+        seg: u64,
+    ) -> Vec<(u64, u64)> {
+        let wseg = crate::store::WAL_SEG;
+        if self.rc.contains(name) {
+            // (R) Recycled: an exemption, whole-segment.
+            return vec![(0, wseg)];
+        }
+        let Some(&inode) = bindings.get(name) else {
+            return Vec::new();
+        };
+        // (W): paint the writes in **reverse event order**, filling only
+        // the not-yet-painted gaps — so the **last** write covering a
+        // byte always decides it (an earlier write can never override a
+        // later one).
+        let mut cov: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
+        if let Some(ws) = self.writes.get(&inode) {
+            let last_sync = self.last_sync.get(&inode).copied();
+            for &(idx, off, end) in ws.iter().rev() {
+                let after_binding = match self.beta.get(name) {
+                    Some(&b) => idx > b,
+                    None => true, // the binding predates the round
+                };
+                let dur = after_binding && matches!(last_sync, Some(s) if s > idx);
+                for (a, b) in interval_gaps(&cov, off, end) {
+                    interval_add(&mut cov, a, b, dur);
+                }
+            }
+        }
+        // (S): the slack after a SegmentEnd filler. Its own bytes must
+        // be (W)-durable, and its **last-issued** bytes at its position
+        // must decode as `K_SEGEND` carrying its own lsn — so a later
+        // overwrite of the filler kills the slack.
+        if let Some(starts) = self.write_starts.get(&inode)
+            && let Some(issued) = self.last_issued.get(&inode)
+        {
+            for &off in starts.iter() {
+                if off >= wseg {
+                    continue;
+                }
+                let hdr = stitch_issued(issued, off, 24);
+                if hdr.len() < 24 || !magic_ok(&hdr) {
+                    continue;
+                }
+                let len = {
+                    let mut b = [0u8; 4];
+                    if let Some(s) = hdr.get(4..8) {
+                        b.copy_from_slice(s);
+                    }
+                    u32::from_le_bytes(b) as u64
+                };
+                if len < 16 || off + len > wseg {
+                    continue;
+                }
+                let q = seg + off;
+                let whole = stitch_issued(issued, off, len as usize);
+                if whole.len() < len as usize {
+                    continue;
+                }
+                match crate::store::wal::dec_record(&whole, q, wseg) {
+                    Ok(Some(r)) if r.kind == crate::store::wal::K_SEGEND && r.lsn == q => {
+                        // The filler's own bytes must be (W)-durable.
+                        if covered_by(&cov, off, off + len) {
+                            interval_add(&mut cov, off + len, wseg, true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Normalise to the durable ranges only.
+        cov.into_iter()
+            .filter(|(_, (_, d))| *d)
+            .map(|(a, (b, _))| (a, b))
+            .collect()
+    }
+
+    /// Why the byte at file offset `off` of segment `name` is not
+    /// durable — the diagnostic's stop reason (never a digest or
+    /// sim-visible input).
+    fn stop_reason(&self, name: &str, bindings: &BTreeMap<String, usize>, off: u64) -> String {
+        if !bindings.contains_key(name) {
+            return format!(
+                "no durable directory binding for segment {name} \
+                 (G1: created or renamed without a surviving sync_dir)"
+            );
+        }
+        let inode = bindings[name];
+        let last_covering = self.writes.get(&inode).and_then(|ws| {
+            ws.iter()
+                .rev()
+                .find(|&&(_, a, b)| a <= off && off < b)
+                .copied()
+        });
+        match last_covering {
+            None => format!(
+                "no issued write covers offset {off} on inode {inode}, and no SegmentEnd slack does"
+            ),
+            Some((idx, a, b)) => match self.beta.get(name) {
+                Some(&bi) if idx <= bi => format!(
+                    "the last covering write (ev {idx}, [{a},{b})) precedes the durable \
+                     binding (ev {bi}) — stale bytes of an earlier segment name"
+                ),
+                _ => match self.last_sync.get(&inode) {
+                    Some(&s) if s > idx => format!(
+                        "the covering write (ev {idx}) is synced, but a later write \
+                         re-dirtied part of its range"
+                    ),
+                    _ => {
+                        format!("no sync of inode {inode} after the last covering write (ev {idx})")
+                    }
+                },
+            },
+        }
+    }
+}
+
+/// The first LSN a segment file name encodes (`{seg:016x}.log`), or
+/// `None` when the name is not a segment name.
+fn seg_first_lsn_of(name: &str) -> Option<u64> {
+    let hex = name.strip_suffix(".log")?;
+    if hex.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Split-neighbour insert into a last-issued interval map (the same
+/// discipline as `Inode::record_issued`, over `E` alone).
+fn issued_insert(map: &mut BTreeMap<u64, Vec<u8>>, off: u64, bytes: &[u8]) {
+    let end = off + bytes.len() as u64;
+    let mut to_remove: Vec<u64> = Vec::new();
+    let mut to_add: Vec<(u64, Vec<u8>)> = Vec::new();
+    for (&fstart, fbytes) in map.range(..end) {
+        let fend = fstart + fbytes.len() as u64;
+        if fend <= off {
+            continue;
+        }
+        if fstart < off
+            && let Some(pre) = fbytes.get(..(off - fstart) as usize)
+        {
+            to_add.push((fstart, pre.to_vec()));
+        }
+        if fend > end
+            && let Some(post) = fbytes.get((end - fstart) as usize..)
+        {
+            to_add.push((end, post.to_vec()));
+        }
+        to_remove.push(fstart);
+    }
+    for k in to_remove {
+        map.remove(&k);
+    }
+    for (k, v) in to_add {
+        map.insert(k, v);
+    }
+    map.insert(off, bytes.to_vec());
+}
+
+/// Stitch `len` bytes at `off` from a last-issued interval map.
+fn stitch_issued(map: &BTreeMap<u64, Vec<u8>>, off: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut cur = off;
+    while out.len() < len {
+        let Some((&start, bytes)) = map.range(..=cur).next_back() else {
+            break;
+        };
+        if start + bytes.len() as u64 <= cur {
+            break;
+        }
+        let skip = (cur - start) as usize;
+        let Some(take) = bytes.get(skip..) else {
+            break;
+        };
+        let need = len - out.len();
+        let take = &take[..take.len().min(need)];
+        out.extend_from_slice(take);
+        cur += take.len() as u64;
+        if take.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// The sub-ranges of `[a, b)` not covered by any interval in `cov`.
+fn interval_gaps(cov: &BTreeMap<u64, (u64, bool)>, a: u64, b: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cur = a;
+    while cur < b {
+        match cov.range(..=cur).next_back() {
+            Some((&start, &(end, _))) if start <= cur && end > cur => {
+                cur = end;
+            }
+            _ => {
+                // Uncovered at `cur`: the gap runs to the next interval's
+                // start, or to `b`.
+                let next = cov
+                    .range(cur..)
+                    .next()
+                    .map(|(&s, _)| s)
+                    .filter(|s| *s > cur)
+                    .unwrap_or(b)
+                    .min(b);
+                let stop = next.max(cur + 1);
+                out.push((cur, stop));
+                cur = stop;
+            }
+        }
+    }
+    out
+}
+
+/// Insert `[a, b)` with value `d` into an interval map (merging
+/// adjacent equal values).
+fn interval_add(cov: &mut BTreeMap<u64, (u64, bool)>, a: u64, b: u64, d: bool) {
+    if a >= b {
+        return;
+    }
+    // Merge with a same-value predecessor that touches `a`.
+    let mut a = a;
+    if let Some((&ps, &(pe, pd))) = cov.range(..a).next_back()
+        && pd == d
+        && pe >= a
+    {
+        a = ps;
+        cov.remove(&ps);
+    }
+    let mut b = b;
+    if let Some((&ns, &(ne, nd))) = cov.range(b..).next()
+        && ns == b
+        && nd == d
+    {
+        b = ne;
+        cov.remove(&ns);
+    }
+    cov.insert(a, (b, d));
+}
+
+/// Is `[a, b)` wholly covered by `true` intervals?
+fn covered_by(cov: &BTreeMap<u64, (u64, bool)>, a: u64, b: u64) -> bool {
+    let mut cur = a;
+    while cur < b {
+        let Some((&start, &(end, d))) = cov.range(..=cur).next_back() else {
+            return false;
+        };
+        if !d || start > cur || end <= cur {
+            return false;
+        }
+        cur = end;
+    }
+    true
+}
+
+/// **X5-R34 (f): the judged cross-check's set.** Every SyncOn ts in
+/// `client_acked` (the commits whose own §12.4 ack wait returned before
+/// the crash) whose record ends above the derived durable end `D` and
+/// whose segment is not in the recycled set `Rc` — the ACK-OVER-HOLE
+/// store failures. A commit acked by (e) but absent from
+/// `client_acked` is not here and is not a failure.
+pub fn x5r34_ack_over(
+    client_acked: &BTreeSet<u64>,
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    d: u64,
+    rc: &BTreeSet<String>,
+) -> Vec<u64> {
+    let wseg = crate::store::WAL_SEG;
+    client_acked
+        .iter()
+        .filter(|ts| match wal_commits.get(*ts) {
+            Some((true, lsn, len)) => {
+                let name = x5r34_seg_name(*lsn - (*lsn % wseg));
+                lsn + len > d && !rc.contains(&name)
+            }
+            _ => false,
+        })
+        .copied()
+        .collect()
+}
+
+/// The ACK-OVER-HOLE failure text (X5-R34 (f), verbatim).
+pub fn x5r34_ack_over_text(ts: u64, lsn: u64, len: u64, d: u64) -> String {
+    format!(
+        "ACK-OVER-HOLE: client-acked SyncOn ts={ts} ends at {} above durable_end {d} (I-ACK-PREFIX, X5-R34)",
+        lsn + len
+    )
+}
+
+/// **X5-R34 (d): the durable prefix `D`.** The largest `L ≥ p0` such
+/// that every byte in `[p0, L)` is durable (X5-R34 (c)), scanning in
+/// LSN order: a segment boundary is crossed like any other position,
+/// and an exact segment end or `SegmentEnd` slack continues at the next
+/// segment's first LSN. Returns `(D, the stop reason, Rc)`; the reason
+/// names the first non-durable byte's cause (a diagnostic, never a
+/// digest or sim-visible input). Computed over per-inode interval maps
+/// in one pass over `E` — never a per-byte loop over the WAL span.
+pub fn x5r34_durable_prefix(
+    events: &[DiskEvent],
+    wal_bindings: &BTreeMap<String, usize>,
+    p0: u64,
+) -> (u64, String, BTreeSet<String>) {
+    let v = X5r34View::build(events);
+    let wseg = crate::store::WAL_SEG;
+    // The scan can never pass the highest segment a name binds or a
+    // recycle reached: above it no rule can hold.
+    let max_seg = wal_bindings
+        .keys()
+        .filter_map(|n| seg_first_lsn_of(n))
+        .chain(v.rc.iter().filter_map(|n| seg_first_lsn_of(n)))
+        .max()
+        .unwrap_or(0);
+    let mut lsn = p0;
+    loop {
+        let seg = lsn - (lsn % wseg);
+        if seg > max_seg {
+            return (
+                lsn,
+                format!("beyond the last bound or recycled segment ({max_seg:#x})"),
+                v.rc,
+            );
+        }
+        let name = x5r34_seg_name(seg);
+        let off0 = lsn - seg;
+        let ranges = v.durable_ranges(&name, wal_bindings, seg);
+        let mut off = off0;
+        for &(a, b) in ranges.iter() {
+            if a > off {
+                break;
+            }
+            if b > off {
+                off = b;
+            }
+            if off >= wseg {
+                break;
+            }
+        }
+        if off < wseg {
+            let why = v.stop_reason(&name, wal_bindings, off);
+            return (
+                seg + off,
+                format!("byte at lsn {} ({name}@{off}): {why}", seg + off),
+                v.rc,
+            );
+        }
+        lsn = seg + wseg;
+    }
 }
 
 /// The `len` bytes at `off` of the stitched file, if fully present.

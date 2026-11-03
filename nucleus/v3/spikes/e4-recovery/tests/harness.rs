@@ -628,7 +628,13 @@ fn derivation_reports_written_unparsable_commits() {
     let rec_len = wal::REC_FIXED + over_payload.len() as u64;
     let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
     commits.insert(5u64, (true, 0u64, rec_len));
-    let (written, _acked, unparsed) = harness::derive_written_acked(&events, &commits);
+    // X5-R34: the derivation takes `p0` and the durable `/wal/`
+    // bindings (here: segment 0 durably bound to the inode, no dir ops
+    // this round — the binding predates it, so `β` does not exist).
+    let mut bindings: BTreeMap<String, usize> = BTreeMap::new();
+    bindings.insert(harness::x5r34_seg_name(0), inode);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&events, &commits, 0, &bindings);
     assert!(
         written.is_empty(),
         "an unparsable record never marks the commit written"
@@ -659,7 +665,7 @@ fn derivation_reports_written_unparsable_commits() {
     let ok_len = wal::REC_FIXED + ok_payload.len() as u64;
     let mut ok_commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
     ok_commits.insert(5u64, (true, 0u64, ok_len));
-    let (w2, a2, u2) = harness::derive_written_acked(&ok_events, &ok_commits);
+    let (w2, a2, u2) = harness::derive_written_acked(&ok_events, &ok_commits, 0, &bindings);
     assert_eq!(
         u2,
         Vec::<u64>::new(),
@@ -670,7 +676,7 @@ fn derivation_reports_written_unparsable_commits() {
     // A commit whose record was never written stays silent too.
     let mut none_commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
     none_commits.insert(6u64, (true, 65536u64, 128u64));
-    let (_, _, u3) = harness::derive_written_acked(&ok_events, &none_commits);
+    let (_, _, u3) = harness::derive_written_acked(&ok_events, &none_commits, 0, &bindings);
     assert_eq!(
         u3,
         Vec::<u64>::new(),
@@ -1179,4 +1185,322 @@ fn r30_predicate_conditions_are_load_bearing() {
     // (f) class MW: both predicates false.
     let (a, b) = yes(&disk, true, false, e4_recovery::sim::FaultClass::Mw);
     assert!(!a && !b, "class MW turns both predicates off");
+}
+
+// ---- X5-R34 (g): the derivation's self-tests (literal event lists) ----
+
+/// A tiny event-list builder for the X5-R34 self-tests: write, sync,
+/// dir-op and dirsync events in index order (every env op is one atomic
+/// sim step, so `WriteIssued`+`WriteReturned` — and
+/// `SyncIssued`+`SyncReturned` — sit at adjacent indices).
+mod x5r34 {
+    use e4_recovery::sim::DiskEvent;
+    use std::collections::BTreeMap;
+
+    pub struct Ev {
+        pub events: Vec<DiskEvent>,
+    }
+
+    impl Ev {
+        pub fn new() -> Self {
+            Ev { events: Vec::new() }
+        }
+        pub fn write(&mut self, inode: usize, off: u64, bytes: &[u8]) -> &mut Self {
+            self.events.push(DiskEvent::WriteIssued {
+                inode,
+                off,
+                bytes: bytes.to_vec(),
+            });
+            self.events.push(DiskEvent::WriteReturned {
+                inode,
+                off,
+                len: bytes.len() as u64,
+            });
+            self
+        }
+        pub fn sync(&mut self, inode: usize) -> &mut Self {
+            self.events
+                .push(DiskEvent::SyncIssued { inode, all: false });
+            self.events
+                .push(DiskEvent::SyncReturned { inode, all: false });
+            self
+        }
+        pub fn dirop(&mut self, what: &str) -> &mut Self {
+            self.events.push(DiskEvent::DirOpIssued {
+                dir: "/wal/".to_owned(),
+                what: what.to_owned(),
+            });
+            self
+        }
+        pub fn dirsync(&mut self) -> &mut Self {
+            self.events.push(DiskEvent::SyncDirReturned {
+                dir: "/wal/".to_owned(),
+            });
+            self
+        }
+        pub fn bindings(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+            pairs.iter().map(|(n, i)| ((*n).to_owned(), *i)).collect()
+        }
+    }
+
+    impl Default for Ev {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// A real `K_COMMIT` record of exactly `len` bytes at `lsn` (the
+    /// tests encode genuine records so both derivations' walks yield
+    /// them; dummy bytes would hide the frozen form's verdicts).
+    pub fn rec(ts: u64, lsn: u64, len: u64) -> Vec<u8> {
+        let payload = vec![0u8; (len as usize).saturating_sub(45)];
+        e4_recovery::store::wal::enc_record(
+            e4_recovery::store::wal::K_COMMIT,
+            (1, 1),
+            ts,
+            &payload,
+            lsn,
+        )
+    }
+}
+
+/// **X5-R34 (g) 1 — 20 r2's shape:** an inode is written and synced in
+/// its life as segment A, renamed to B and dir-synced; then a SyncOn
+/// record is written at B's offset with no later sync. It must **not**
+/// be acked: the bytes below the record are segment A's stale life
+/// (only writes made after a name was bound to its inode belong to the
+/// stream at that name), and the record itself was never synced.
+#[test]
+fn x5r34_stale_bytes_of_a_renamed_segment_never_ack() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let seg_a = 0x60000u64;
+    let seg_b = 0xa0000u64;
+    let name_a = harness::x5r34_seg_name(seg_a);
+    let name_b = harness::x5r34_seg_name(seg_b);
+    let inode = 7usize;
+    // The old life as segment A: bytes [0, 12000) written and synced.
+    let mut ev = x5r34::Ev::new();
+    ev.write(inode, 0, &vec![1u8; 12000]).sync(inode);
+    // The recycle: A renamed to B, dir-synced (B durably bound, A gone).
+    ev.dirop(&format!("rename /wal/{name_a} -> /wal/{name_b}"))
+        .dirsync();
+    // The new record at B@5952, written, never synced.
+    let lsn = seg_b + 5952;
+    let len = 3573u64;
+    ev.write(inode, 5952, &x5r34::rec(64, lsn, len));
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(64u64, (true, lsn, len));
+    let bindings = x5r34::Ev::bindings(&[(&name_b, inode)]);
+    let (_w, acked, _u) = harness::derive_written_acked(&ev.events, &commits, seg_b, &bindings);
+    assert!(
+        !acked.contains(&64),
+        "a SyncOn record over a renamed segment's stale life, never synced, must not be acked"
+    );
+    // D stops at B's first byte: even the stale prefix is not durable.
+    let (d, _stop, rc) = harness::x5r34_durable_prefix(&ev.events, &bindings, seg_b);
+    assert_eq!(d, seg_b, "D stops at segment B's first LSN (stale bytes)");
+    assert!(
+        !rc.contains(&name_b),
+        "B is the rename target, not a source: no exemption"
+    );
+}
+
+/// **X5-R34 (g) 2 — contiguity:** batch 2 is written and synced while
+/// batch 1 below it is unwritten. Batch 2's SyncOn commit must not be
+/// acked — with batch 2 on the same inode, and as a variant on the next
+/// segment's inode. I-ACK-PREFIX: the frontiers advance only over the
+/// contiguous prefix.
+#[test]
+fn x5r34_contiguous_prefix_required_two_batches() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let name0 = harness::x5r34_seg_name(0);
+    // Same inode: batch 1 at [0, 2000) never written; batch 2 at
+    // [2000, 2500) written and synced.
+    let inode = 9usize;
+    let mut ev = x5r34::Ev::new();
+    ev.dirop(&format!("create /wal/{name0}"))
+        .dirsync()
+        .write(inode, 2000, &x5r34::rec(7, 2000, 500))
+        .sync(inode);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(7u64, (true, 2000, 500));
+    let bindings = x5r34::Ev::bindings(&[(&name0, inode)]);
+    let (_w, acked, _u) = harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert!(
+        !acked.contains(&7),
+        "a synced batch above an unwritten earlier batch must not be acked (same inode)"
+    );
+    // The next segment's inode: batch 2 in segment 1, same hole below.
+    let name1 = harness::x5r34_seg_name(65536);
+    let inode1 = 11usize;
+    let mut ev2 = x5r34::Ev::new();
+    ev2.dirop(&format!("create /wal/{name0}"))
+        .dirsync()
+        .dirop(&format!("create /wal/{name1}"))
+        .dirsync()
+        .write(inode1, 0, &x5r34::rec(8, 65536, 500))
+        .sync(inode1);
+    let mut commits2: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits2.insert(8u64, (true, 65536, 500));
+    let bindings2 = x5r34::Ev::bindings(&[(&name0, inode), (&name1, inode1)]);
+    let (_w2, acked2, _u2) = harness::derive_written_acked(&ev2.events, &commits2, 0, &bindings2);
+    assert!(
+        !acked2.contains(&8),
+        "a synced batch above an unwritten earlier batch must not be acked (next segment)"
+    );
+}
+
+/// **X5-R34 (g) 3 — the directory:** a segment is created with no later
+/// `sync_dir("/wal/")`. Its records must not be acked, even though they
+/// are synced (G1: no record in a created or renamed segment counts
+/// durable before the directory entry survives).
+#[test]
+fn x5r34_unsynced_directory_binding_blocks_acked() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let name0 = harness::x5r34_seg_name(0);
+    let inode = 5usize;
+    let mut ev = x5r34::Ev::new();
+    ev.dirop(&format!("create /wal/{name0}"))
+        .write(inode, 0, &x5r34::rec(3, 0, 500))
+        .sync(inode);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(3u64, (true, 0, 500));
+    // The durable bindings are empty: the create never survived a
+    // sync_dir, exactly as a crash would leave it.
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (_w, acked, _u) = harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert!(
+        !acked.contains(&3),
+        "a synced record in a segment whose directory binding never became durable must not be acked"
+    );
+}
+
+/// **X5-R34 (g) 4 — a forged early ack:** `client_acked` holds a ts
+/// whose record ends above `D`. The cross-check must name it, with the
+/// ACK-OVER-HOLE text verbatim.
+#[test]
+fn x5r34_forged_ack_over_hole_fails_loudly() {
+    use e4_recovery::harness;
+    use std::collections::{BTreeMap, BTreeSet};
+    let name0 = harness::x5r34_seg_name(0);
+    let inode = 5usize;
+    // ts 5: written and synced in a durably bound segment — a genuine
+    // ack. ts 9: forged (its record sits in segment 1, never written).
+    let mut ev = x5r34::Ev::new();
+    ev.dirop(&format!("create /wal/{name0}"))
+        .dirsync()
+        .write(inode, 0, &x5r34::rec(5, 0, 500))
+        .sync(inode);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(5u64, (true, 0, 500));
+    commits.insert(9u64, (true, 65536, 500));
+    let bindings = x5r34::Ev::bindings(&[(&name0, inode)]);
+    let (d, _stop, rc) = harness::x5r34_durable_prefix(&ev.events, &bindings, 0);
+    assert_eq!(d, 500, "D covers exactly the synced record");
+    let mut client: BTreeSet<u64> = BTreeSet::new();
+    client.insert(5);
+    client.insert(9);
+    let over = harness::x5r34_ack_over(&client, &commits, d, &rc);
+    assert_eq!(over, vec![9u64], "only the forged ts is named");
+    assert_eq!(
+        harness::x5r34_ack_over_text(9, 65536, 500, d),
+        "ACK-OVER-HOLE: client-acked SyncOn ts=9 ends at 66036 above durable_end 500 (I-ACK-PREFIX, X5-R34)",
+        "the failure text is X5-R34 (f)'s, verbatim"
+    );
+    // The genuine ack is never named.
+    let mut honest: BTreeSet<u64> = BTreeSet::new();
+    honest.insert(5);
+    assert!(
+        harness::x5r34_ack_over(&honest, &commits, d, &rc).is_empty(),
+        "a client ack at or below D is not a failure"
+    );
+}
+
+/// **X5-R34 (g) 5 — must pass:** (a) a record written after its
+/// segment's durable binding and then synced, contiguous from `p0`, is
+/// acked; (b) a record in an `Rc` segment is acked, and exempt from
+/// (f); (c) a SyncOn record placed after an exact segment end, in a
+/// durably bound and synced next segment, is acked.
+#[test]
+fn x5r34_genuine_durability_acks() {
+    use e4_recovery::harness;
+    use std::collections::{BTreeMap, BTreeSet};
+    // (a) written after the binding, synced, contiguous from p0.
+    let name0 = harness::x5r34_seg_name(0);
+    let inode = 5usize;
+    let mut ev = x5r34::Ev::new();
+    ev.dirop(&format!("create /wal/{name0}"))
+        .dirsync()
+        .write(inode, 0, &x5r34::rec(5, 0, 500))
+        .sync(inode);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(5u64, (true, 0, 500));
+    let bindings = x5r34::Ev::bindings(&[(&name0, inode)]);
+    let (_w, acked, _u) = harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert!(
+        acked.contains(&5),
+        "(a) written after the durable binding, then synced: acked"
+    );
+    // (b) the segment was renamed away after the commit: Rc exempts it,
+    // and (f) never names it.
+    let name_dst = harness::x5r34_seg_name(65536);
+    ev.dirop(&format!("rename /wal/{name0} -> /wal/{name_dst}"))
+        .dirsync();
+    let (d2, _s2, rc2) = harness::x5r34_durable_prefix(&ev.events, &bindings, 0);
+    assert!(rc2.contains(&name0), "(b) the rename source is in Rc");
+    let (_w2, acked2, _u2) = harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert!(
+        acked2.contains(&5),
+        "(b) a record in a recycled segment is acked (the exemption)"
+    );
+    let mut client: BTreeSet<u64> = BTreeSet::new();
+    client.insert(5);
+    assert!(
+        harness::x5r34_ack_over(&client, &commits, d2, &rc2).is_empty(),
+        "(b) an Rc commit is exempt from the cross-check"
+    );
+    // (c) a record ending exactly at segment 0's end, then a SyncOn
+    // record in a durably bound and synced segment 1: both acked, and D
+    // crosses the boundary.
+    let inode1 = 6usize;
+    let mut ev3 = x5r34::Ev::new();
+    ev3.dirop(&format!("create /wal/{name0}")).dirsync();
+    // Four cap-size records fill segment 0 exactly (4 x 16384 = 65536;
+    // REC_MAX = WAL_SEG/4), so the last ends exactly at the boundary.
+    let cap = 16384u64;
+    for r in 0..4u64 {
+        let lsn = r * cap;
+        ev3.write(inode, lsn, &x5r34::rec(11 + r, lsn, cap));
+    }
+    ev3.sync(inode);
+    let name1 = name1_of();
+    ev3.dirop(&format!("create /wal/{name1}"))
+        .dirsync()
+        .write(inode1, 0, &x5r34::rec(12, 65536, 700))
+        .sync(inode1);
+    let mut commits3: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    for r in 0..4u64 {
+        commits3.insert(11 + r, (true, r * cap, cap));
+    }
+    commits3.insert(12u64, (true, 65536, 700));
+    let bindings3 = x5r34::Ev::bindings(&[(&name0, inode), (&name1, inode1)]);
+    let (d3, _s3, _rc3) = harness::x5r34_durable_prefix(&ev3.events, &bindings3, 0);
+    assert_eq!(
+        d3,
+        65536 + 700,
+        "(c) D crosses the exact segment end into the next segment"
+    );
+    let (_w3, acked3, _u3) = harness::derive_written_acked(&ev3.events, &commits3, 0, &bindings3);
+    assert!(
+        acked3.contains(&11) && acked3.contains(&12),
+        "(c) both the boundary record and the next segment's SyncOn record are acked"
+    );
+}
+
+/// Segment 1's name (a small readability helper for the test above).
+fn name1_of() -> String {
+    e4_recovery::harness::x5r34_seg_name(65536)
 }

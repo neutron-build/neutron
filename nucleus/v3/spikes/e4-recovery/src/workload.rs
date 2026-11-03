@@ -714,6 +714,13 @@ pub struct RoundRec {
     /// `served ∧ (skx ∨ smx)`, else null. A diagnostic, never an oracle
     /// input.
     pub pass_na: Option<bool>,
+    /// **X5-R34 (f):** the round's `ack_over` — the SyncOn commit ts's
+    /// whose own §12.4 ack wait returned before the crash while their
+    /// record ends above the derived durable end `D` (and outside the
+    /// recycled set `Rc`). Empty when there are none; non-empty is an
+    /// ACK-OVER-HOLE store failure (the round's task error carries the
+    /// text). A diagnostic the pass fold never reads.
+    pub ack_over: Vec<u64>,
     /// X-5c: script ops that unwound on a client-visible XX001.
     pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
@@ -1608,6 +1615,7 @@ fn round_rec(
     rr.skx = out.skx;
     rr.smx = out.smx;
     rr.pass_na = out.pass_na;
+    rr.ack_over = out.ack_over.clone();
     rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();
