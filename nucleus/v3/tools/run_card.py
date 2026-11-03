@@ -295,6 +295,23 @@ def gate_passed(rc, out):
     return rc == 0 and bool(lines) and lines[-1].strip() == GATE_PASS
 
 
+def failure_text(cmd, out):
+    """The retry text for a failing Acceptance command: `$ cmd`, then every
+    non-zero `STEP <name> EXIT=<n>` line of the whole output (column 0 only, so
+    a nested script's indented echo is not listed), then the last 60 lines.
+
+    gate.sh runs every step after a failing one, so in X-5c-F1 the later steps'
+    output pushed `STEP fmt EXIT=1` out of the tail and three attempts never
+    learned that rustfmt was what failed. With no failing STEP line the text is
+    exactly the old `$ cmd` plus tail."""
+    lines = out.splitlines()
+    steps = [l.rstrip("\r") for l in lines if re.fullmatch(r"STEP \S+ EXIT=[1-9][0-9]*", l.rstrip("\r"))]
+    head = f"$ {cmd}\n"
+    if steps:
+        head += "Failing steps (from the full output):\n" + "\n".join(steps) + "\n"
+    return head + "\n".join(lines[-60:])
+
+
 def in_scope(path, touch):
     return any(fnmatch.fnmatch(path, pat) or path.startswith(pat.rstrip("*")) for pat in touch)
 
@@ -913,7 +930,7 @@ def main():
                     rc, out = 1, out + "\nno tests ran: a cargo test acceptance command must run at least one test"
                 print(f"[{card_id}] {'PASS' if rc == 0 else 'FAIL'}: {c}", flush=True)
                 if rc:
-                    failures.append(f"$ {c}\n" + "\n".join(out.splitlines()[-60:]))
+                    failures.append(failure_text(c, out))
             try:
                 dirty = "\n".join(f"{xy} {f}" for xy, f in worktree_changes(wt) if f != "opencode.json")
             except subprocess.CalledProcessError as e:
