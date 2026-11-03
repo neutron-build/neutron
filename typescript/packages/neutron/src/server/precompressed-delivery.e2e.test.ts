@@ -107,7 +107,7 @@ describe("precompressed prerendered pages", () => {
     expect(gzip.headers.etag).toMatch(/^"[^"]+-gzip"$/);
     expect(decode(gzip)).toBe(PAGE);
 
-    for (const accept of [undefined, "identity", "br;q=0, gzip;q=0"]) {
+    for (const accept of [undefined, "identity", "br;q=0, gzip;q=0", "gzip;q=0.5, identity"]) {
       const identity = await request(port, "/about", accept ? { "accept-encoding": accept } : {});
       expect(identity.headers["content-encoding"], accept).toBeUndefined();
       expect(identity.body.toString("utf-8"), accept).toBe(PAGE);

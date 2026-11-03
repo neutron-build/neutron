@@ -22,7 +22,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { createStaticFileHandler } from "./static-files.js";
 import { negotiateContentEncoding, type ContentCoding } from "./content-encoding.js";
 import type { WebSocketServer } from "ws";
-import { compress } from "hono/compress";
+import { compression } from "./compression.js";
 import { Hono, type Context } from "hono";
 import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
@@ -880,8 +880,8 @@ export async function createServer(
   }
 
   if (enableCompress) {
-    // `Vary: Accept-Encoding` is ours to add — hono's compress middleware sets
-    // Content-Encoding and weakens the ETag, and never touches Vary.
+    // `Vary: Accept-Encoding` is added here, not by the compression
+    // middleware, which only sets Content-Encoding and weakens the ETag.
     //
     // Without it a shared cache can store the gzipped body and hand it to a
     // client that did not ask for gzip and cannot decode it. RFC 9110 §12.5.5
@@ -901,7 +901,7 @@ export async function createServer(
         c.res.headers.set("Vary", `${existing}, Accept-Encoding`);
       }
     });
-    app.use("*", compress());
+    app.use("*", compression());
   }
 
   // Innermost of the framework's response post-processors (request id,
