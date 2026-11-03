@@ -2373,6 +2373,67 @@ expect_ok "runner e2e: XMD: a non-string start trusts nothing, without raising" 
 xm XME '{"run":"r","start":"TIP","t":0}'$'\n''{"run":"r","end":"TIP","t":0}'
 expect_ok "runner e2e: XME: control: a well-formed closed range trusts the verdict between runs" \
   res XME "rc == 0 and r['pass'] and r['scope'] == 'ok' and '(protected)' not in out"
+# --- runner: a branch rewritten since its ledger's runs (X-6-F1-F1-F3) ------
+# Ledger ranges are keyed on commit ids, so a rebase or amend between runs gives
+# an earlier run's forged verdict a new id in no range, and a --keep run trusted
+# it as the gate's (X-6-F1-F1 Finding 5). Now --keep refuses while a closed
+# range's end is no longer an ancestor of HEAD; --trust-existing moves that
+# ledger aside and trusts HEAD as is; an intact ledger is never overridden. B, E
+# and F above are the controls: a gate verdict, or an orchestrator commit, on
+# top of end is not a rewrite. Every rewrite pins the committer date, so the
+# rewritten commit gets a new id even within the same second. The card's XAM
+# and XGN are XWA and XWG here, because XA and XG are e2e ids and stray_commits
+# matches `card_id in` a subject. (XRW, XWA, XWG, XTI: none is a substring of
+# another e2e id, nor another id of one of them.)
+rwdate='@1700000000 +0000'
+# ledger_at ID N KEY: field KEY of record N of ID's ledger.
+ledger_at() { python3 -c 'import json, sys; print(json.loads(open(sys.argv[1]).read().splitlines()[int(sys.argv[2])])[sys.argv[3]])' "$e/cards/logs/$1.ledger.jsonl" "$2" "$3"; }
+# anc ID REV WANT: `merge-base --is-ancestor REV card/v3-ID` exits WANT (0 or
+# 1), or with WANT "fail" exits anything else.
+anc() { local rc=0; git -C "$r" merge-base --is-ancestor "$2" "card/v3-$1" 2>/dev/null || rc=$?
+  if [ "$3" = fail ]; then [ "$rc" -gt 1 ]; else [ "$rc" = "$3" ]; fi; }
+# rw_refused NAME ENDS: the run refused before attempt 1 with the exact line,
+# ENDS (a Python expression) naming the ends, and left the ledger as it was
+# (two records, none moved aside).
+rw_refused() { res "$1" "rc == 1 and \"[${1%%-*}] the branch was rewritten since its ledger's runs (ends no longer in HEAD's history: \" + $2 + \"); rerun without --keep, or pass --trust-existing after inspecting the branch\" in out.splitlines() and 'attempt 1:' not in out and len(L) == 2 and A == []"; }
+# XRW: a forged verdict, then a rebase of the branch onto its base (REBASE-LAUNDERS).
+e2e XRW-1 forge --attempts 1
+expect_ok "runner e2e: XRW: premise: run 1's forge fails scope and closes its range at the forged tip" res XRW-1 "r['scope'] == 'FAIL' and $closed"
+xrw_end=$(ledger_at XRW 1 end)
+(cd "$ewt/XRW" && GIT_COMMITTER_DATE=$rwdate git rebase -q --force-rebase e2e/base)
+expect_ok "runner e2e: XRW: premise: the rebase leaves the old end out of the tip's history" anc XRW "$xrw_end" 1
+e2e XRW-2 work --attempts 1 --keep
+expect_ok "runner e2e: XRW: --keep refuses a branch rebased since its ledger's runs" rw_refused XRW-2 "L[-1]['end']"
+e2e XRW-3 work --attempts 1 --keep --trust-existing
+expect_ok "runner e2e: XRW: --trust-existing moves the ledger aside, trusts HEAD and starts" \
+  res XRW-3 "rc == 0 and r['pass'] and len(A) == 1 and len(A[0]) == 2 and A[0][1]['end'] == '$xrw_end' and len(L) == 4 and L[0].get('trust-existing') is True and L[1]['end'] == L[0]['start'] == L[2]['start'] and $closed and '[XRW] --trust-existing: card/v3-XRW rewritten since its ledger; trusted as is at ' + L[0]['start'] + ' (old ledger moved to ' in out"
+# XWA: run 1 passes, then its tip is amended. start is still an ancestor, so only
+# a check of end sees it (REWRITE-CHECK-START).
+e2e XWA-1 work --attempts 1
+expect_ok "runner e2e: XWA: premise: run 1 passes" res XWA-1 "rc == 0 and r['pass'] and $closed"
+xwa_start=$(ledger_at XWA 0 start) xwa_end=$(ledger_at XWA 1 end)
+(cd "$ewt/XWA" && GIT_COMMITTER_DATE=$rwdate git commit -q --amend --no-edit)
+expect_ok "runner e2e: XWA: premise: the amend leaves the old end out of the tip's history" anc XWA "$xwa_end" 1
+expect_ok "runner e2e: XWA: premise: start is still in the tip's history" anc XWA "$xwa_start" 0
+e2e XWA-2 work --attempts 1 --keep
+expect_ok "runner e2e: XWA: --keep refuses a branch amended since its ledger's runs" rw_refused XWA-2 "L[-1]['end']"
+# XWG: a hand-written ledger (as D) whose closed range ends at a well-formed id
+# that is no object, so merge-base fails (REWRITE-FAIL-OPEN).
+git -C "$r" worktree add -q -B card/v3-XWG "$ewt/XWG" e2e/base
+printf '{"run": "r", "start": "%s", "t": 0}\n{"run": "r", "end": "%s", "t": 0}\n' "$(git -C "$ewt/XWG" rev-parse HEAD)" "$wcx" >"$e/cards/logs/XWG.ledger.jsonl"
+expect_ok "runner e2e: XWG: premise: merge-base fails on the end" anc XWG "$wcx" fail
+xwg_rc=0; git -C "$ewt/XWG" merge-base --is-ancestor "$wcx" HEAD 2>/dev/null || xwg_rc=$?
+e2e XWG work --attempts 1 --keep
+expect_ok "runner e2e: XWG: an end git cannot judge refuses, naming the failed merge-base" \
+  rw_refused XWG "'$wcx (git merge-base failed, exit $xwg_rc)'"
+# XTI: a forged verdict and an intact ledger: --trust-existing must not reset it
+# (TRUST-OVERRIDES-INTACT).
+e2e XTI-1 forge --attempts 1
+expect_ok "runner e2e: XTI: premise: run 1's range ends at the tip (the ledger is intact)" anc XTI "$(ledger_at XTI 1 end)" 0
+e2e XTI-2 work --attempts 1 --keep --trust-existing
+expect_ok "runner e2e: XTI: --trust-existing on an intact ledger leaves the forge protected" flagged XTI-2
+expect_ok "runner e2e: XTI: --trust-existing on an intact ledger says it was ignored and changes nothing" \
+  res XTI-2 "'[XTI] --trust-existing ignored: the ledger is intact' in out.splitlines() and A == [] and len(L) == 4 and not any(x.get('trust-existing') for x in L)"
 # R: refs outside the card branch, moved from inside a run (X-6-F1-F3-F1).
 # refmove is `git fetch . +HEAD:main` (the fake binary is not under the deny list).
 main_at='subprocess.run(["git", "-C", repo, "rev-parse", "main"], capture_output=True, text=True).stdout.strip()'
