@@ -2555,6 +2555,18 @@ pub fn run_round(
                 w: &world,
                 defects: Vec::new(),
             };
+            // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr only,
+            // never a digest input): the store's own amcheck right
+            // after recovery (before any post-recovery write), so a
+            // violation already present in the recovered tree is
+            // separated from one the harness checkpoint produces.
+            if std::env::var("E4_CXX_DIAG").is_ok() {
+                let f = amcheck::amcheck(&cx, &cfg);
+                eprintln!(
+                    "CXX diag: seed={seed} round={round} post-recovery findings={:?}",
+                    f
+                );
+            }
             let mut ex = Extracted {
                 ok: true,
                 frontier,
@@ -2699,6 +2711,18 @@ pub fn run_round(
             // fails without a crash is a loud round failure, never a
             // silent skip.
             let ck = ckpt::checkpoint(&cx, &mut |_| Ok(()));
+            // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr only,
+            // never a digest input): the store's own amcheck right
+            // after the harness checkpoint (the (ii) point), so the
+            // first image that violates a tree-structure invariant can
+            // be named per round.
+            if std::env::var("E4_CXX_DIAG").is_ok() {
+                let f = amcheck::amcheck(&cx, &cfg);
+                eprintln!(
+                    "CXX diag: seed={seed} round={round} post-harness-ckpt findings={:?}",
+                    f
+                );
+            }
             if let Err(e) = &ck {
                 cx.with("h:ck2fail", |c| {
                     let h = c.h();

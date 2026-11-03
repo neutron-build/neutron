@@ -1717,3 +1717,57 @@ fn replay_walk_probe_never_swallows_a_recovery_crash() {
         }
     }
 }
+
+/// **X-5c-F3-F1 step 7 pin, C-XX sub-shape 1: the directory's identical
+/// re-put never appends a duplicate (§6.8; the B5 `pos` vs `pos − 1`
+/// deviation on the unversioned dir path).** `dir_put_locked` located
+/// the equal entry at `pos` — the first strictly-greater position —
+/// but an existing copy sits at `pos − 1`, so a directory put for an
+/// id the durable leaf already held (with the in-memory directory
+/// missing it — an interrupted drop's entry-removal step never landed)
+/// appended a **duplicate**: seed 151 r1's directory keys were
+/// `[1, 2, 3, 4, 4]`, and amcheck (ii) reported "dir: leaf keys out of
+/// order" plus the two-roots cascade ("child lpid N unmapped",
+/// "separators out of order", "lpid 38 reachable more than once"). The
+/// literal config: a store with tree 2; the in-memory directory entry
+/// removed (the interrupted drop's state); `dir_create_tree(2)` again —
+/// the durable directory leaf must hold exactly one entry for 2 and
+/// amcheck must stay clean. Reverting the fix (mutant M-CXXc: the
+/// `pos − 1` check removed) appends the duplicate and fails the pin.
+#[test]
+fn cxx_dir_reput_never_appends_a_duplicate() {
+    let seed = 7070u64;
+    let cfg = tcfg(8, 8, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, Some(2));
+    let sched = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // The interrupted drop's state: the durable leaf holds tree 2, the
+    // in-memory directory does not.
+    cx.with("pin7:forget", |c| {
+        c.store().dir.remove(&2);
+        Ok(())
+    })
+    .expect("forget");
+    tree::dir_create_tree(&cx, 2).expect("re-create tree 2");
+    let root = {
+        let g = sched.lock();
+        g.st.meta.dir_root
+    };
+    let keys = tree::raw_cells(&cx, root, false).expect("dir cells");
+    let twos = keys
+        .iter()
+        .filter(|(k, _)| k.as_slice() == 2u64.to_be_bytes().as_slice())
+        .count();
+    assert_eq!(
+        twos, 1,
+        "the directory leaf must hold exactly one entry for tree 2"
+    );
+    let findings = amcheck::amcheck(&cx, &cfg);
+    assert!(
+        findings.is_empty(),
+        "a directory re-put must never disorder the leaf (6.8): {findings:?}"
+    );
+}

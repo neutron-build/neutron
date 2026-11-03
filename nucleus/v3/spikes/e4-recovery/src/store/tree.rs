@@ -1090,9 +1090,29 @@ fn dir_put_locked<H: StoreHost>(
         .iter()
         .position(|(k, _)| k.as_slice() > ekey.as_slice())
         .unwrap_or(cells.len());
-    let hit = pos < cells.len() && cells.get(pos).map(|c| c.0.as_slice()) == Some(ekey.as_slice());
-    if hit {
-        if let Some(c) = cells.get_mut(pos) {
+    // The equal entry, if any, sits just **below** `pos`: `pos` is the
+    // first strictly-greater position, so an existing copy of the key
+    // is at `pos − 1` — the same prototype deviation insert_locked
+    // documents (B5: "checking `pos` instead let every identical
+    // replay insert a duplicate"). The draft's dir path checked only
+    // `pos`, so a directory put whose id the durable leaf already held
+    // — with the in-memory directory missing it (an interrupted drop's
+    // entry-removal step never landed; its resume walks after replay) —
+    // inserted a **duplicate** id (X-5c-F3-F1 step 7, seed 151 r1: dir
+    // keys `[1, 2, 3, 4, 4]`; amcheck (ii) then reported "dir: leaf
+    // keys out of order", "tree: child lpid N unmapped", "separators
+    // out of order" and "lpid 38 reachable more than once" — the two
+    // entries for id 4 named different roots). §6.8's directory entry
+    // is a replace, never an append.
+    let hit = if pos > 0 && cells.get(pos - 1).map(|c| c.0.as_slice()) == Some(ekey.as_slice()) {
+        pos - 1
+    } else if pos < cells.len() && cells.get(pos).map(|c| c.0.as_slice()) == Some(ekey.as_slice()) {
+        pos
+    } else {
+        usize::MAX
+    };
+    if hit != usize::MAX {
+        if let Some(c) = cells.get_mut(hit) {
             c.1 = val;
         }
     } else {

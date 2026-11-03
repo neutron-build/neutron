@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::amcheck;
 use super::page::{self, Ref};
 use super::prims;
 use super::tree;
@@ -1398,6 +1399,25 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     Ok(())
                 })?;
                 frontier = frontier.max(rec.ts);
+                // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr
+                // only, never a digest input): the store's own amcheck
+                // after each replayed commit, naming the record whose
+                // apply first violates a tree invariant.
+                if std::env::var("E4_CXX_DIAG").is_ok() {
+                    let f = amcheck::amcheck(
+                        cx,
+                        &cx.with("recover:amchk", |c| Ok(c.store().cfg.clone()))?,
+                    );
+                    if !f.is_empty() {
+                        eprintln!(
+                            "CXX diag: replay K_COMMIT ts={} lsn={} ops={} first findings={:?}",
+                            rec.ts,
+                            rec.lsn,
+                            wal::rec_ops(rec).len(),
+                            f.get(..3).unwrap_or(&f)
+                        );
+                    }
+                }
             }
             K_CHUNK => {
                 if let Some(ts) = markers.get(&rec.txn).copied()
@@ -1411,6 +1431,58 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                         Ok(())
                     })?;
                     frontier = frontier.max(ts);
+                    // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`):
+                    // the chunked superseding replay is the prime
+                    // suspect for separator disorder (a replace below
+                    // newer versions).
+                    if std::env::var("E4_CXX_DIAG").is_ok() {
+                        let f = amcheck::amcheck(
+                            cx,
+                            &cx.with("recover:amchk2", |c| Ok(c.store().cfg.clone()))?,
+                        );
+                        if !f.is_empty() {
+                            eprintln!(
+                                "CXX diag: replay K_CHUNK txn={:?} ts={} lsn={} first findings={:?}",
+                                rec.txn,
+                                ts,
+                                rec.lsn,
+                                f.get(..3).unwrap_or(&f)
+                            );
+                            // The chunk's own ops, and the directory's
+                            // keys at the finding.
+                            eprintln!(
+                                "CXX diag:   ops of this chunk: {}",
+                                wal::rec_ops(rec)
+                                    .iter()
+                                    .map(|o| match o {
+                                        wal::WOp::CreateTree { tree } => format!("C{tree}"),
+                                        wal::WOp::DropTree { tree } => format!("D{tree}"),
+                                        wal::WOp::Put { tree, key, .. } => {
+                                            format!("P{tree}/{}", key.len())
+                                        }
+                                        wal::WOp::Delete { tree, key } => {
+                                            format!("X{tree}/{}", key.len())
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            let dir_root =
+                                cx.with("recover:dr", |c| Ok(c.store().meta.dir_root))?;
+                            let cells = tree::raw_cells(cx, dir_root, false)
+                                .map(|cs| {
+                                    cs.iter()
+                                        .map(|(k, _)| {
+                                            u64::from_be_bytes(
+                                                k.as_slice().try_into().unwrap_or([0; 8]),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            eprintln!("CXX diag:   dir keys now: {cells:?}");
+                        }
+                    }
                 }
             }
             _ => {}

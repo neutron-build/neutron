@@ -1,12 +1,27 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F1, step 0 done — committed
+Status: **stage X-5c-F3-F1, steps 0–9 done — step 0 committed
 F3's Acceptance 10k as the triage file of record (7b709ccb:
 `E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0
 PANIC=0 O1F_FAIL=2665 MONITOR=0` / `E4 FOLD FAILING_SEEDS=955
 FAILING_ROUNDS=914 TWIN_FAILING_ROUNDS=71 DEFECT_SEEDS=0`, sha256
 `efb7835e…73906c5`) and re-derived the class table (served rounds split
-out first). The stage before it (X-5c-F3) is complete and merged (all
+out first); step 1 the WAL's serialized writer (§12.4 contiguous ack,
+e6ebbdda) with its two-task pin and the ESCALATED ack cross-check
+(55 disagreeing commits over 4,656); step 2 SegmentEnd's valid end
+(001d3b7f) — 6149 r1's serve is gone, now MW-ORPHAN's shape; step 3
+G-2 pinned, G-1/G-1b demonstrated equivalent (G-1 and a §12.2/§12.5
+silence ESCALATED), 26640ebf; step 4 the twin supply carries a failed
+recovery's reads (e81ad13d); step 5 X5-R32 transcribed literally
+(e34b75ef — the one oracle commit; the 17 named rounds: 4 ruled, 13
+moved, no ESCALATE); step 6 X5-R30 (c)'s skx/smx/pass_na fields
+(86b716b4; skx 1897/4718, smx 2927/7528/8728, all pass_na=true); steps
+7–8 within X5-R19's budget: C-XX sub-shape 1 root-caused (the
+directory's duplicate re-put, §6.8) and fixed with its pin, sub-shape 2
+(a replay-made stale parent) and C-DIV's remainder ESCALATED with
+evidence; step 9 this README (the duplicate table removed, the
+MW-ORPHAN column corrected, the rulings copied verbatim). The stage
+before it (X-5c-F3) is complete and merged (all
 its steps 0–8 done): step 0 committed
 F2's Acceptance 10k as the triage file of record (b9dd5a9a:
 `E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41
@@ -646,6 +661,133 @@ and esc-2.
   - **X-5c-F3**: the classes, with `verify --no-quotas`;
   - **X-5c-F4**: X5-R17's retune and the final file, with plain `verify`. The worker tunes on contiguous ranges of at most 200 seeds. These are development probes only, never quota evidence. A quota miss fails the Acceptance, which feeds the table back to the next attempt. This amends the old F2 Goal's "each try is a whole 10k run", which was a process rule, not X5-R17's text.
   - **Then X-5c `--keep`**: it commits F4's file, runs plain `verify` on it, runs `mutants`, and writes the RESULT.
+
+## P rulings X5-R30 (c) and X5-R32, verbatim (nv3-X-5c-F3-gate-1 and
+## nv3-X-5c-F3-F2, 2026-11-01; binding)
+
+Copied word for word from card X-5c-F3-F1 (its "Carried" sections, verbatim
+copies of the rulings) before this card's Work began, beside X5-R28–R31.
+
+**X5-R30 (c), RULED:** 1. **(K serves) O-3(a) moves.** A served range does
+not count as served corruption if all of the following hold: it lies wholly
+inside slots of K (X5-R28 (a)); it was accepted after open selected the
+rolled-back meta (in a recovery life or in extraction, never in the
+workload pass); the round has no R-taint and no uncovered accept. **Why.**
+K's condition 2 proves from the DWrite history that the bytes are V_k(s),
+byte for byte: the opened image's own content, accepted through that
+image's own reference. The sim calls the range tainted only because a
+post-anchor reuse write never landed. That is the proxy flaw X5-R28
+corrected for completeness, and the same correction applies to the same
+slots here. 2. **(Meta serves) O-3(a) moves, on the same principle, as
+follows.** A served range does not count as served corruption if: it is
+exactly the opened meta's slot (1 or 2); the round meets X5-R5's
+conditions 1 and 2 (class MP, a meta-slot fault, and `meta_rollback`);
+the accepted bytes equal a DWrite the store issued to that slot and a
+completed `sync_all` covered. **Why.** X5-R5 pre-registered that open
+selecting an older durable meta under a meta-slot fault is a legitimate
+outcome. The meta it selects is genuine. Taint fires only because a newer
+write to that slot was dropped by F-CRASH or reverted by the fault. The
+rollback's consequences remain judged, unchanged, by R, K, O-1 and O-3(e).
+3. **Nothing else moves.** R-taint, any serve outside K or the opened meta
+slot, any serve in the workload pass, any uncovered accept, and every MW
+serve (6149 included) stay served corruption. 4. **Applying it from
+recorded fields.** The current record cannot apply the ruling exactly: `sk`
+is vacuously true on an R-taint-only round and is computed over
+workload-pass serves too; the record carries no meta-serve field; an
+`O-3(a)` text can hide an O-3(e) failure. So **X-5c-F3-F1 adds three
+diagnostic record fields**. They are never oracle inputs, and the oracle
+stays frozen: `skx`: rule 1's predicate, exact; `smx`: rule 2's predicate,
+exact; `pass_na`: the round's verdict re-evaluated with the existing
+`OracleCfg::no_taint` knob, recorded only when `served ∧ (skx ∨ smx)`. The
+final file is judged with no re-run: a served round passes iff
+`(skx ∨ smx) ∧ pass_na`. RESULT item 6 must list this as a post-data
+amendment (X5-R30 (c)), with the rounds it moved. 5. **In F2's and F3's
+files,** the seven rounds stay recorded as failures, since the fields are
+absent. The gate's evidence says that 1897, 2437 and 4718 satisfy rule 1
+and 2927, 4378, 7528 and 8728 satisfy rule 2's location conditions; the
+byte check remains `smx`'s to establish. Whether each then passes depends
+on `pass_na`.
+
+**X5-R32 (O-3(c) in class MP: the damaged-referenced arm; post-data;
+governs every campaign from X-5c-F3-F1's Acceptance on).** It corrects the
+twin rule where the twin's sets are a failed stand-in for the real round's.
+It is P's, and it is recorded under RESULT item 6 as a **post-data oracle
+amendment**: the 22 rounds were seen before it was made, while F3-F1's
+Acceptance and F4's final campaign were not. (a) The harness supply comes
+from SimDisk history only: never from store memory, never from §3.3 or
+amcheck output, and never from a store error text. 1. `FaultTargets` gains
+`prior_page_slots: BTreeSet<u64>` — the page-file slots of every media
+fault applied to this round's disk before this round's own draw:
+`disk.media[..media_base]` in `harness::run_round`; each fault maps by
+`page_slots`' rule (`off / 4096`, plus `to_off / 4096` for a MISDIRECTED,
+and only for faults whose inode is the page file); it is empty in round 0,
+in classes C and MW (which have no page faults), and in every twin round
+(which applies no media faults). 2. `Extracted` gains `recovery_reads:
+Vec<(usize, u64, u64)>` and `page_file: usize` — exactly the harness's
+`recovery_reads` (the reads of the recovery life whose result the round
+judges, on the `Ok` arm and the final `Err` arm alike; the real round's,
+never the twin's); both arms set both fields before the verdict's
+`check_round`. (b) The oracle amendment (the frozen `src/oracle.rs` and
+`tests/oracle.rs` change only by this text, in one commit whose subject
+names X5-R32): the definitions, computed inside `check_round` —
+`H = faults.page_slots ∪ faults.prior_page_slots`;
+`D = { s ∈ ex.tainted_image_slots : s ∉ {0, 1, 2}, s ∈ H, s ∉ ex.kept_slots }`;
+`D_ii` the same against the (ii) sets (empty unless `ex.amcheck_ii_ran`);
+`D_read` iff some `s ∈ D` has a read in `ex.recovery_reads` on
+`ex.page_file` overlapping `[s·4096, (s+1)·4096)`; `sites = ex.xx001`, plus
+`Read23` if `lost_at_match > 0`. A site is explained when: `Open` and
+`Replay`: iff `D_read`; `AmcheckI` and `Read23`: iff `D ≠ ∅`; `AmcheckIi`:
+iff `D_ii ≠ ∅`. In the twin rule's `Some(t)` branch, `any_fault &&
+all_uncovered` keeps its failure text, except when all of these hold:
+`class == FaultClass::Mp`; `!cfg.no_r32`; `sites` is non-empty; every site
+is explained. Then O-3(c) does not fail, and the verdict's new field `r32`
+is `true` (false in every other case). Unchanged: the `None` branch (no
+twin), which still fails closed; the twin's sets and the per-fault
+referenced/read test; the WAL ranges; class MW; X5-R6's `explained` rule;
+every other clause. The record: `RoundVerdict` gains `pub r32: bool`; the
+campaign record gains the round field `r32`, written by `run` and parsed by
+`verify` — a diagnostic the pass fold does not read. The knob:
+`OracleCfg` gains `no_r32: bool`, which removes the arm; it exists only for
+the load-bearing demonstration. `tests/oracle.rs` gains one must-pass (mp8)
+and five must-fail cases (mf24–mf28) on one literal world, class MP round
+1: the round's only fault is on slot 50, which the twin neither read nor
+references; `prior_page_slots = {6}`, slot 6 is in `image_slots` and
+`tainted_image_slots = {6}`; amcheck (i) reports slot 6 (so O-3(e) holds);
+`xx001 = [Open, AmcheckI]`, and `recovery_reads` contains
+`(page_file, 6·4096, 4096)`. (c) Why it is neither circular nor a
+loosening: `D`'s members are media-fault targets, from the disk's
+applied-fault list; they are tainted (durable bytes ≠ the last bytes
+issued, from SimDisk's history) and referenced by the image recovery
+opened (the harness walk of the durable bytes); none of these inputs is
+§3.3, amcheck, or store memory. A detection on such a slot is the plan's
+clause 3. O-3(e)'s completeness half already *requires* amcheck (i) to
+report it, so the frozen rule was unsatisfiable on every round where the
+twin rule fired and `D ≠ ∅`. What still fails: a recovery that fails
+without having read damage (`Open`/`Replay` need `D_read`); a detection
+whose only "damage" is F-CRASH or store-made taint (`H`); a K slot (its
+bytes are the image's own content); any MW round; any round with no twin.
+The same granularity as before: one explained site per kind is enough,
+just as one covered fault was enough before; the exactness of amcheck's
+findings stays O-3(e)'s. (d) The decision rule, pre-registered: 1. at
+X-5c-F3-F1's tip, single-seed runs of the 17 named seeds; each named round
+must have `r32 = true` and no O-3(c) text, or be recorded "moved by
+<commit>" with its new outcome (not a failure of this rule); a round that
+keeps the twin-rule shape with `r32 = false` is an ESCALATE — never widen
+`D`. 2. Not covered: 1889 r2, 3509 r0, 4699 r0, 5229 r1 and 8399 r1 stay
+O-3(c) failures under X5-R32 (C-XX family). 3. From F3-F1's Acceptance
+file on: every `r32 = true` round must be class MP, and any other is a
+harness defect that fails the gate; the gate lists the `r32 = true` rounds
+in RESULT item 6 as moved by this post-data amendment; an O-3(c) round
+with `r32 = false` stays a failure, classified under C-XX unless P rules
+otherwise. 4. The WAL side is not ruled: no worker extends `D` to the WAL.
+(e) X5-R32 does not move O-3(a), (b), (d) or (e), O-1, O-2, R, K or
+X5-R30. It is empty in classes C and MW. Never satisfy O-3(c) by making a
+harness walk report ground truth as a store finding (X5-R23).
+
+**The reporting rule (this card's step 0, standing):** every class table
+splits out `served=true` rounds first (the oracle's `o3` text is
+last-writer-wins, so a serve can read as O-3(d), and an `O-3(a)` text can
+hide an O-3(e) failure).
 
 ## Stage X-5c-F1's record (X-5c-F1)
 
@@ -1699,13 +1841,13 @@ classification stands; P opens S-1-F3 on confirmation).** Five rounds'
 evidence at the fixed tip (record fields + the MPE diag's fault list;
 artifacts at `$HOME/.cache/nv3-review/runlogs/X-5c-F3.orph.<seed>.*`):
 
-| Seed/round | opened `T` (`lo`) | `hi` | frontier | orphan max ts (the O-1(c) text) | the damaged WAL record | later round reissues its ts? |
+| Seed/round | opened `T` (the opened meta's `T`, equal to the frontier in every row) | `hi` | frontier | orphan max ts (the O-1(c) text) | the damaged WAL record | later round reissues its ts? |
 |---|---|---|---|---|---|---|
-| 39 r0 | 8 | 8 | 5 | 7 | MISDIRECTED `/wal` inode 3 off 25724 len 22446 → 26112 | no later round (r0-only seed) |
-| 59 r0 | 7 | 8 | 4 | 6 | MISDIRECTED inode 4 off 58211 len 49 → 53760; TORN same inode | no later round |
-| 109 r0 | 11 | 14 | 4 | 5 | MISDIRECTED inode 4 off 25933 len 848 → 11776 | no later round |
-| 149 r0 | 6 | 6 | 4 | 5 | MISDIRECTED inode 3 off 55140 len 10396 → 8704 | no later round |
-| 209 r0 | 22 | 22 | 8 | 11 | MISDIRECTED inode 2 off 26151 len 1211 → 0; 47190 len 6463 → 37376 | no later round |
+| 39 r0 | 5 | 8 | 5 | 7 | MISDIRECTED `/wal` inode 3 off 25724 len 22446 → 26112 | no later round (r0-only seed) |
+| 59 r0 | 4 | 8 | 4 | 6 | MISDIRECTED inode 4 off 58211 len 49 → 53760; TORN same inode | no later round |
+| 109 r0 | 4 | 14 | 4 | 5 | MISDIRECTED inode 4 off 25933 len 848 → 11776 | no later round |
+| 149 r0 | 4 | 6 | 4 | 5 | MISDIRECTED inode 3 off 55140 len 10396 → 8704 | no later round |
+| 209 r0 | 8 | 22 | 8 | 11 | MISDIRECTED inode 2 off 26151 len 1211 → 0; 47190 len 6463 → 37376 | no later round |
 
 In every round: the orphan's max ts is above the recovered frontier and
 ≤ `hi` (P's own finding, on all 422 of the 437 in F2's file); the
@@ -2181,40 +2323,97 @@ never oracle inputs**; the oracle is frozen apart from X5-R32.
   — every served round above would pass under the ruling. **Never
   adjusted a predicate to fit a round.**
 
+**Steps 7–8 — the C-XX and C-DIV remainders (the budget: started
+2026-11-02T18:34:03-07:00, root-causing stopped at 18:50 per X5-R19's
+50-minute valve).** The 0..200 re-derivation at the tip (after steps
+1–6): **17 failing rounds** (F3's file had 22 in 0..200), **C-XX 2**
+(150 r1 `Open`, 151 r1 `AmcheckIi` + O-2), **C-DIV 10** ((b) 6, (c) 4,
+**(d) 0** — was 58 in F3's file), 0 livelock, 0 defect seeds; seed 21 no
+longer fails. **Every MP-E shape C seed passes at the tip** (4858, 688,
+3718, 5238, 5638, 9717 — the orphan-map-entry family cleared with this
+card's store fixes), and all 5 MW O-3(c) rounds moved or pass (step 4's
+record).
 
+- **Step 7, C-XX sub-shape 1 — root-caused as a prototype deviation
+  from §6.8 (§9.1's identical-entry rule on the unversioned dir path)
+  and fixed.** The method (P's): the store's own amcheck after each
+  replayed record, each harness checkpoint and each recovery
+  (`E4_CXX_DIAG`, stderr only, never a digest input) names the first
+  violating operation: seed 151 r1's first violating record is the
+  chunked apply of **K_CHUNK txn (1,4) ts=13 at lsn 221562**, and the
+  directory keys at that instant are **`[1, 2, 3, 4, 4]`** — a
+  duplicate directory entry. The cause is `tree::dir_put_locked`
+  (src/store/tree.rs, the `hit` computation): it looked for the equal
+  entry at `pos` — the first strictly-greater position — but an
+  existing copy sits at `pos − 1`, exactly the B5 prototype deviation
+  `insert_locked`'s own comment documents for the versioned path, left
+  unfixed on the directory path. A directory put for an id the durable
+  leaf already held — with the in-memory directory missing it (an
+  interrupted drop's entry-removal step never landed; `resume_drops`
+  walks after replay) — appended a duplicate whose two entries named
+  **different roots**, and amcheck (ii) then reported "dir: leaf keys
+  out of order", "tree: child lpid N unmapped", "separators out of
+  order" and "lpid 38 reachable more than once" (the two subtrees). The
+  fix: the equality check covers `pos − 1` (a replace there, §6.8's
+  "a directory entry is a replace, never an append"). The pin
+  `cxx_dir_reput_never_appends_a_duplicate` (a literal config: tree 2
+  created, the in-memory entry removed — the interrupted drop's state —
+  `dir_create_tree(2)` again; the leaf must hold exactly one entry and
+  amcheck stays clean). **Mutant M-CXXc** (the `pos − 1` check
+  removed): the pin fails with two entries — applied, shown, reverted
+  clean. Post-fix, 151 r1's directory keys are `[1, 2, 3, 4]` and the
+  duplicate-driven findings are gone.
+- **Step 7, C-XX sub-shape 2 — ESCALATED to P with the evidence.** A
+  second, distinct defect remains in 151 r1: the recovered tree holds a
+  mapped inner page whose child reference names an **unmapped** lpid
+  ("tree: child lpid 38 unmapped", a single finding, present
+  post-recovery **after** `resume_drops`, and the opened image's (i)
+  walk was clean — so the stale parent is **produced during the
+  chunked replay itself**, not inherited), which the harness checkpoint
+  then amplifies into the full structure cascade (separators, subtree
+  bounds, reachable-more-than-once) in the graduated image. The
+  alloc-reuse-while-mapped reading was tested and excluded (the
+  diagnostic logs free-set reuses still mapped in `map.cur`: none
+  occur). P's lead (i) first half (a `free_lpid` whose map removal
+  reaches image k while a page of k still references the LPID) is the
+  open candidate; the root cause sits in the replay/flip interaction
+  and is **not** fixed within the budget. Evidence: the `E4_CXX_DIAG`
+  artifacts at
+  `$HOME/.cache/nv3-review/runlogs/cxxd151*.err` and
+  `cxxfix151*.err` (the per-record replay findings, the directory keys,
+  the post-recovery and post-checkpoint findings, before and after the
+  dir fix). **150 r1 (XX001 at
+  Open, two nested crashes) was not reached within the budget** —
+  recorded, reproducible twice.
+- **Step 8, C-DIV — the cut recorded, the class ESCALATED (the
+  r2 skew stands).** The 10 tip repros (each confirmed in the 0..200
+  run): (b) 20 r2, 112 r2, 115 r1, 120 r2, 151 r1, 152 r2; (c) 63 r2,
+  104 r2, 125 r2, 186 r2; **(d) none at the tip** (was 58 in F3's
+  file). Field-level cut: the four (b) rounds with `frontier == lo ==
+  hi` (112, 120, 151, 152 — the scan mismatches at the only candidate
+  cut, three with nested crashes, one without); the two `frontier < lo`
+  rounds (**20 r2: lo=64, frontier=63; 115 r1: lo=25, frontier=24**) —
+  both are **derived-only cross-check rounds** (step 1 (e)'s shape A:
+  the derivation says a SyncOn commit's write and covering sync
+  returned — it is durable by events — while the committer's own wait
+  never returned; the round then fails O-1(b) at every candidate with
+  the frontier one below `lo`), i.e. an acked-by-derivation commit
+  sitting beyond a §12.5 replay stop — the same question class as
+  MW-ORPHAN, and P's to rule on; and the four (c) rounds
+  (`raw entry above the cut` with `frontier == hi` in all four — the
+  orphan-above-the-cut shape, MW-ORPHAN's mechanism inside class C,
+  three with nested crashes: entries above every legal cut after a
+  §12.5 stop, 3 of 4 with `nested > 0`). **The per-key diff the card's
+  cut prescribes was not built within the budget** (it needs a per-key
+  model-vs-recovered-state diagnostic); the class is ESCALATED with
+  this evidence under X5-R16/X5-R19, the leads standing (cross-round
+  carry, the §12.5 stop, G2 truncation — the step-1 fix removed the
+  WAL-hole explanation for every round that had it, and the two
+  `frontier < lo` remainders are the derivation-vs-durability question
+  the cross-check escalated). **If step 1 (e)'s escalation is ruled a
+  derivation defect, it would explain the two `frontier < lo` rounds
+  (20 r2, 115 r1) directly.**
 
-Final lines, verbatim:
-
-```
-E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41 PANIC=0 O1F_FAIL=2723 MONITOR=0
-E4 FOLD FAILING_SEEDS=1070 FAILING_ROUNDS=1015 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0
-```
-
-**The class table, re-derived from the committed file (every count
-reproduces P's Goal re-derivation exactly).** Field definitions: a
-**failing** primary round has `pass=false` in the pass fold; a **failing
-twin** round has `pass=false` in the twin record (which carries only
-`pass` and the `o1` text). All counts are over primary rounds unless
-"twin" is in the name.
-
-| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
-|---|---|---|---|
-| **C-XX** (class C) | 130 | class C failing round with `o2 != null` ("class C amcheck(i) not clean") or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 45, `AmcheckIi` 82, and 3 rounds with `o2` only (no O-3(b)); 98 carry both `o2` and O-3(b), 29 O-3(b) only, 8 have no `o1` at all | 221 (r0, `Open`), 66 (r0, `AmcheckIi`) |
-| **C-XX** (the same shape in MP/MW: O-3(c) with no damaged referenced slot) | 15 MP + 13 MW | MP/MW failing round with `o3` = `O-3(c): XX001 with every media fault on unread, unreferenced targets`; in MP 7 stand alone (907/1167/4167/7367/7748/8837/9508 r0–r1) and 8 sit inside MP-LIVELOCK rounds | MP 907 (r0; 528 now passes), MW 1769 (r0) |
-| **C-DIV** | 424 | class C failing round carrying an `o1` text, **excluding** rounds whose `o1` is an O-1(a) inside a C-XX round (46 of the 50 (a) rounds: 45 are the recovery-`Err` default `published {} != model {…}`, plus seed 8764 r1 whose genuine (a) sits beside its O-3(b)). Kinds: (b) 267 (266 "scan mismatch" + 1382 r0's "scan read failed", itself an O-2 round), (c) 95, (d) 58, (a) 4 (4004 r0, 7531 r1, 8480 r2, 8804 r1). By round index: r0 88/7,000 (1.3%), r1 70/3,424 (2.0%), r2 266/1,357 (19.6%) | 21 (r0, b), 46 (r1, b), 36 (r2, d), 10 (r2, c) |
-| **MP-LIVELOCK** | 41 | MP failing round with `ll` or `dl` set; livelock site `lls`: `h:writer` 19, `h:evictor` 15, `h:ckpt` 7; 38 at round 1, 3 at round 2; every one's previous round has `r6=true, pass=true, o1dl>0`; 8 also carry the C-XX O-3(c) text | 987 (r1, `h:ckpt`), 1108 (r1, `h:writer`), 1247 (r1, `h:evictor`) |
-| **MP-A** | 7 | MP failing round with `served=true`: 1897/2437/2927/4378/4718/7528/8728, all round 0, all `mrb=true`, all recovery-`Err` (Q14 meta-fault rounds) | 1897, 2437 |
-| **MW-ORPHAN** | 446 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` | 39 (r0), 59 (r0) |
-| **Other MW** | 26 | the MW failing rounds outside MW-ORPHAN: 13 O-3(c) (the C-XX shape above), 10 O-3(d) with O-1(a), 1 O-1(a) only (3399 r0), 2 O-1f only (2019 r2, 4049 r1) | 3399, 2019 |
-| **Other MP** | 4 | MP failing rounds outside every class above: 6028 r0, 7388 r1, 9548 r1 (O-1(b) scan mismatch) and 8788 r1 (O-1(c)); all recovery-`Ok`, no O-3 text | 6028 |
-| **MP-E shape C** (handed on by X5-R29 (c)) | 6 | MP failing round with `o3` starting `O-3(e): (ii)`; all `mrb=false, rlen=0`: 688/3718/4858/5238/5638/9717 (all r0) | 688, 4858, 9717 |
-| **The twins** | 103 | failing twin rounds: 44 MP over 43 seeds + 59 MW over 48 seeds; their `o1` texts: MP (b) 28, (a) 10, (c) 2, (d) 1, none 3; MW (b) 23, (a) 21, (c) 8, (d) 6, none 1 — the classes echo there (the twin is judged as class C) | 339 (MW r0, (c)), 849 (MW r1, (a)), 907 (MP r0, (b)) |
-
-Partition check: C 478 = 130 C-XX ∪ 424 C-DIV (overlap 76 rounds); MP 65
-= 41 LIVELOCK + 7 MP-A + 7 C-XX-alone + 6 shape C + 4 other (the 8
-C-XX-inside-LIVELOCK counted once, in LIVELOCK); MW 472 = 446 ORPHAN +
-26 other. Total failing rounds 1,015; failing seeds 1,070 (1,015 failing
-primary rounds + twin-only failures and seed-level flags).
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
@@ -3187,7 +3386,7 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (153 tests)
+cargo test -q --release -p e4-recovery      # the whole crate (172 tests)
 cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (20)
 cargo run -q --release -p e4-recovery --example pin   # the pinned CRC32C /
                                                       # splitmix64 values (Work 0)
@@ -3202,6 +3401,17 @@ cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
 # `--no-quotas` (X5-R15 (b)) waives only the quota exit: X-5c-F1's
 # Acceptance form.
 ```
+
+**X-5c-F3-F1's Acceptance** (the runner's, X5-R31 — this card runs no
+campaign-class command in its attempts; single-seed and ≤ 200-seed runs
+only, under the backstop, output outside the worktree):
+`$HOME/.cache/nv3-review/runlogs/X-5c-F3-F1.acc.campaign.json` (the 10k
+`run --seeds 0..10000 --threads 16`, `ulimit -v 25165824`), its prov in
+`X-5c-F3-F1.acc.prov`, then `verify --no-quotas` of that file
+(`X-5c-F3-F1.acc.verify.out`), then the record check and
+`bash scripts/gate.sh`. Its 10k becomes **F4's step-0 triage file**. The
+class-table repros of this card's steps re-derive from a ≤ 200-seed run
+at the tip (the recorded commands live in the stage record above).
 
 **The X-5c-F2 Acceptance 10k is the runner's, never a worker's
 (X5-R31).** Inside an attempt no worker runs `e4-campaign run` over
