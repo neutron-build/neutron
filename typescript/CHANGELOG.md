@@ -4,6 +4,72 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [core 0.5.2, cli 0.5.2] - 2026-11-03
+
+Patch release; no migration. Found by profiling a large production app
+(Fylun) against its Next.js 16 build on the same hardware. `create` 0.1.11
+and the dependent packages already admit core 0.5.2 (`^0.5.0`) and are not
+republished. cli 0.5.2 requires core 0.5.2 (it writes the precompressed
+files and route table that core 0.5.2 serves).
+
+### Changed
+
+- **Build-time precompression.** `neutron-ts build` writes `.br` (brotli
+  quality 11) and `.gz` (level 9) next to every compressible output of 1 KB
+  or more (html, js, css, json, svg, xml, txt, wasm) when the Node server
+  serves the build (no adapter, node, docker). The server negotiates
+  `Accept-Encoding` (br, then gzip, then identity; `q=0` honoured) and sends
+  the stored bytes with a strong per-representation ETag and 304s, instead of
+  gzipping every prerendered page and asset on every request. Static page
+  throughput roughly doubles. Builds without the siblings fall back to
+  dynamic compression. Vercel, Netlify and Cloudflare builds are unchanged
+  (their edge compresses). On Fylun, prerendered pages went from ~2x to
+  ~4x Next.js 16's throughput on the same hardware.
+- **Dynamic compression uses `node:zlib`**, brotli first: complete bodies are
+  compressed in one call (brotli 4 / gzip 6), streams chunk by chunk with a
+  flush per chunk, bodies under 1 KB are sent as is, and SSE,
+  `Cache-Control: no-transform` and non-text types are left alone. Replaces
+  `hono/compress`; the `compress` option is unchanged.
+- **The production server no longer loads build-time code.** The Vite
+  plugins, the route-file parser (`@babel/parser`), MDX (`@mdx-js/mdx`,
+  micromark, acorn) and front matter (`gray-matter`, js-yaml, esprima) load
+  only on the dev / Vite path or on first use. The build writes
+  `dist/.neutron-routes.json` and a prebuilt server boots from it. Importing
+  `@neutron-build/core` takes about half the time and memory it did; a test
+  boots a prebuilt app and fails if any of these modules load.
+- **Image widths.** The default `images.widths` ladder is now
+  16, 32, 48, 64, 96, 128, 256, 384, 640, 750, 828, 1080, 1200, 1920, 2048,
+  3840 (was 320, 640, 960, 1200, 1600), and `server.images.widths`, documented
+  before but never read, is now honoured. `<Image>` / `<Picture>` with a
+  known layout width (`sizes` of one absolute length, or `width` without
+  `sizes`) emit only the 1x and 2x candidates, and `src` is the 1x one, not
+  the largest. `width` without `sizes` now implies `sizes="<width>px"`
+  rather than `100vw`. New `intrinsicWidth` prop drops candidates wider than
+  the source. `/_neutron/image` serves a width that is not on the ladder at
+  the next ladder width up, so only ladder widths are ever generated or
+  cached; widths above the ladder's largest are still refused.
+- **Image encoding.** AVIF is encoded at `q - 20` with effort 3 (it was the
+  raw `q` at the default effort: ~2.5x the bytes of WebP at the same `q` on
+  real photos, and ~6x slower to encode), EXIF orientation is applied, and a
+  source narrower than the requested width is no longer upscaled. The cache
+  key carries an encoder version, so entries written by 0.5.1 are re-encoded.
+  With the new ladder, Fylun's home page sends 121 KB of optimized images
+  (was 454 KB; Next sends 106 KB).
+
+### Fixed
+
+- **An unmatched path answers 404 for every method.** A POST (or any
+  non-GET) to a URL with no route returned `405 Allow: GET, HEAD`, and ran the
+  not-found page's own action if it had one. A matched route without the
+  method still answers 405 with `Allow`.
+- **`/assets/*` is sent `Cache-Control: public, max-age=31536000,
+  immutable`.** The middleware meant to set it never ran behind the static
+  file handler, so hashed assets went out with no Cache-Control.
+- Prerendered pages keep `public, max-age=0, must-revalidate` (a route's
+  `headers()` export still overrides it) and now carry a strong ETag and
+  answer `If-None-Match` with 304. Long edge caching of HTML stays opt-in:
+  without a CDN purge on every deploy it serves stale pages.
+
 ## [core 0.5.1, cli 0.5.1] - 2026-10-31
 
 Patch release; no migration. `create` 0.1.11 and the dependent packages
