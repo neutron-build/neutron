@@ -1816,6 +1816,91 @@ e2e XOW side --attempts 2
 expect_ok "runner e2e: L: control: a commit naming the card on another branch is named a stray commit" \
   res XOW "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and '[XOW] worker committed outside its worktree; stopping:' in out.splitlines() and 'cannot list commits' not in out and any(l.endswith(' nucleus v3: XOW side') for l in out.splitlines())"
 git -C "$r" branch -q -D side-XOW
+# --- runner: a malformed trust ledger trusts nothing (X-6-F1-F1-F1) ---------
+# worker_commits reads only well-formed records; anything else is None ("trust
+# nothing"), never a crash, a skip or an empty set. "--all" as a start once
+# reached rev-list as an option and emptied the worker set; a nonexistent id
+# fails the rev-list (G-REVLIST-FAIL-TRUSTS); "not json" is G-MALFORMED-TRUSTS.
+# wc WANT LEDGER...: worker_commits over $r with base e2e/base, one ledger file
+# per LEDGER (its whole text). WANT "none" requires None for every one, "empty"
+# requires set(). A raised exception is a mismatch, printed as such.
+wc() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$t/wc" "$@" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+repo, d, want, cases = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5:]
+d.mkdir(exist_ok=True)
+ok = bool(cases)
+for i, text in enumerate(cases):
+    path = d / f"{i}.ledger.jsonl"
+    path.write_text(text + "\n")
+    try:
+        got = rc.worker_commits(repo, "e2e/base", path)
+    except Exception as x:
+        got = f"raised {type(x).__name__}: {x}"
+    good = got is None if want == "none" else got == set()
+    ok = ok and good
+    print("ok  " if good else "BAD ", repr(text), "->", repr(got))
+sys.exit(0 if ok else 1)
+P
+}
+wo=$(git -C "$r" rev-parse e2e/base)
+wcu=$(tr a-f A-F <<<"$wo")
+wcx=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+expect_ok "runner ledger: premise: the uppercase id differs and the made-up id is no object here" \
+  bash -c '[ "$1" != "$2" ] && ! git -C "$3" cat-file -e "$4^{commit}"' _ "$wcu" "$wo" "$r" "$wcx"
+expect_ok "runner ledger: malformed records trust nothing" wc none \
+  'not json' \
+  '[]' \
+  "{\"run\": 1, \"start\": \"$wo\"}" \
+  '{"run": "a", "start": 123}' \
+  '{"run": "a", "start": {}}' \
+  '{"run": "a", "start": "--all"}' \
+  '{"run": "a", "start": "HEAD"}' \
+  "{\"run\": \"a\", \"start\": \"${wo:0:39}\"}" \
+  "{\"run\": \"a\", \"start\": \"$wcu\"}" \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n''{"run": "a", "end": 123}' \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n''{"run": "a", "end": "--all"}' \
+  "{\"run\": \"a\", \"start\": \"$wcx\"}"
+expect_ok "runner ledger: control: a well-formed closed range lists an empty set, not None" wc empty \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n'"{\"run\": \"a\", \"end\": \"$wo\"}"
+# The same ledgers end to end (as D: a hand-written ledger, a hand-made verdict
+# commit, then a --keep run doing clean work): the verdict must be flagged. On
+# the code before this card, XMB passed (the forged verdict was exempt) and XMD
+# raised TypeError out of scope_violations. XME is the control: a well-formed
+# closed range, so the verdict lies between runs and is trusted, as in E. (XMA
+# to XME: none is a substring of another e2e id, nor another id of one of them.)
+# xm ID LEDGER: a fresh XM* worktree at e2e/base, LEDGER (with TIP replaced by
+# its HEAD) as its trust ledger, the hand-made verdict, and the --keep run.
+xm() { git -C "$r" worktree add -q -B "card/v3-$1" "$ewt/$1" e2e/base
+  printf '%s\n' "${2//TIP/$(git -C "$ewt/$1" rev-parse HEAD)}" >"$e/cards/logs/$1.ledger.jsonl"
+  by_hand "$1" "nucleus v3: $1 verdict MERGE"
+  e2e "$1" work --attempts 1 --keep; }
+# flagged_raw ID: flagged's test, for a ledger res cannot parse (res reads every
+# line as JSON). It also requires the bad line still first, then this run's
+# start and end: the runner trusts nothing and repairs nothing.
+flagged_raw() { PYTHONDONTWRITEBYTECODE=1 python3 - "$e/$1" "$e/cards/logs/$1.ledger.jsonl" "$1" <<'P'
+import json, pathlib, sys
+b, lp, cid = sys.argv[1:4]
+read = lambda suffix: pathlib.Path(b + suffix).read_text() if pathlib.Path(b + suffix).exists() else ""
+r, out, lines = json.loads(read(".json") or "{}"), read(".out"), pathlib.Path(lp).read_text().splitlines()
+print(out)
+print("result:", r, "ledger:", lines)
+tail = [json.loads(l) for l in lines[1:]]
+sys.exit(0 if r.get("scope") == "FAIL" and r.get("pass") is False and f"nucleus/v3/verdicts/{cid}.md (protected)" in out
+         and lines[0] == "not json" and len(tail) == 2 and "start" in tail[0] and tail[1].get("end") and tail[0]["run"] == tail[1]["run"] else 1)
+P
+}
+xm XMA 'not json'
+expect_ok "runner e2e: XMA: an unparsable ledger line trusts nothing (G-MALFORMED-TRUSTS)" flagged_raw XMA
+xm XMB '{"run":"r","start":"--all","t":0}'$'\n''{"run":"r","end":"TIP","t":0}'
+expect_ok "runner e2e: XMB: an option-shaped start (--all) trusts nothing" flagged XMB
+xm XMC "{\"run\":\"r\",\"start\":\"$wcx\",\"t\":0}"
+expect_ok "runner e2e: XMC: a start git does not know trusts nothing (G-REVLIST-FAIL-TRUSTS)" flagged XMC
+xm XMD '{"run":"r","start":123,"t":0}'
+expect_ok "runner e2e: XMD: a non-string start trusts nothing, without raising" flagged XMD
+xm XME '{"run":"r","start":"TIP","t":0}'$'\n''{"run":"r","end":"TIP","t":0}'
+expect_ok "runner e2e: XME: control: a well-formed closed range trusts the verdict between runs" \
+  res XME "rc == 0 and r['pass'] and r['scope'] == 'ok' and '(protected)' not in out"
 # R: refs outside the card branch, moved from inside a run (X-6-F1-F3-F1).
 # refmove is `git fetch . +HEAD:main` (the fake binary is not under the deny list).
 main_at='subprocess.run(["git", "-C", repo, "rev-parse", "main"], capture_output=True, text=True).stdout.strip()'
