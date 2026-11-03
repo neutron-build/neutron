@@ -2779,6 +2779,96 @@ pub fn run_round(
                 &mut sample_rng,
                 &OracleCfg::default(),
             );
+            // X-5c-F3-F3a step 6 (d) lead 3 (`E4_O1_DIAG`, stderr only,
+            // default off, never a digest input): at the failing O-1
+            // candidate, the per-key diff — the first divergent key per
+            // published tree, its owning model commit, and whether that
+            // commit's record was durable (record end ≤ D, or a
+            // recycled segment), replayed (ts ≤ the frontier), or
+            // skipped as ≤ T (ts ≤ the opened meta's T).
+            if std::env::var("E4_O1_DIAG").is_ok()
+                && let Err(text) = &first.o1
+            {
+                if let Some(c) = text
+                    .split("c=")
+                    .nth(1)
+                    .and_then(|rest| rest.split([',', ' ']).next())
+                    .and_then(|n| n.parse::<u64>().ok())
+                {
+                    for t in model
+                        .published_at(c)
+                        .iter()
+                        .filter(|t| **t != CATALOG)
+                        .copied()
+                        .collect::<Vec<_>>()
+                    {
+                        let (Ok(got), want) = (reader.scan(t, c), model.scan(t, c)) else {
+                            continue;
+                        };
+                        let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
+                        keys.extend(want.keys().cloned());
+                        for k in keys.iter() {
+                            let g = crate::oracle::live(&got)
+                                .iter()
+                                .find(|(gk, _)| *gk == k)
+                                .map(|(_, v)| (*v).clone());
+                            let w = crate::oracle::live(&want)
+                                .iter()
+                                .find(|(wk, _)| *wk == k)
+                                .map(|(_, v)| (*v).clone());
+                            if g == w {
+                                continue;
+                            }
+                            let owner = model
+                                .commits
+                                .iter()
+                                .rev()
+                                .find(|(ts, rec)| {
+                                    **ts <= c
+                                        && rec.ops.iter().any(|op| matches!(op, Op::Put { tree, key, .. } | Op::Delete { tree, key } if *tree == t && key == k))
+                                })
+                                .map(|(ts, _)| *ts);
+                            let flags = owner.map(|ts| {
+                                let rec = wal_commits.get(&ts);
+                                let mrec = model.commits.get(&ts);
+                                let durable = rec
+                                    .map(|&(sync_on, lsn, len)| {
+                                        lsn + len <= d_val
+                                            || d_rc.contains(&x5r34_seg_name(
+                                                lsn - (lsn % crate::store::WAL_SEG),
+                                            ))
+                                            || (!sync_on
+                                                && mrec.map(|m| m.written).unwrap_or(false))
+                                    })
+                                    .unwrap_or(false);
+                                format!(
+                                    "owner_ts={ts} durable={durable} replayed={} le_T={}",
+                                    ts <= ex.frontier,
+                                    ts <= ex.opened_t
+                                )
+                            });
+                            eprintln!(
+                                "O1 diag: seed={seed} round={round} c={c} tree={t} key={k:?} store={g:?} model={w:?} {flags:?}"
+                            );
+                            break;
+                        }
+                        // The (c) shape: which raw entries sit above the
+                        // failing cut, and their owning model commit.
+                        if let Ok(raw) = reader.raw(t) {
+                            for e in raw.iter().filter(|e| e.ts > c) {
+                                let owner = model.commits.get(&e.ts);
+                                eprintln!(
+                                    "O1 diag: seed={seed} round={round} c={c} tree={t} raw-above: key={:?} ts={} owner_in_model={} owner_mode={:?}",
+                                    e.key,
+                                    e.ts,
+                                    owner.is_some(),
+                                    owner.map(|o| o.mode),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let _ = first;
             // The harness checkpoint (G4: after the oracle check; it
             // supplies O-2 (ii) and the next round's base), then

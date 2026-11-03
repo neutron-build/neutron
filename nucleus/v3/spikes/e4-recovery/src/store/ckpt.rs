@@ -1437,6 +1437,39 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         }
         break 'outer;
     }
+    // X-5c-F3-F3a step 6 (c) (`E4_TXN_DIAG`, stderr only, default off,
+    // never a digest input): per recovery, each marker's recorded chunk
+    // count against the chunks this walk attached to its txn. A mismatch
+    // would mean step 4 is incomplete — per-boot txn ids still colliding
+    // across lives — and is escalated by the card, never hidden.
+    if std::env::var("E4_TXN_DIAG").is_ok() {
+        let mut attached: BTreeMap<(u32, u64), u64> = BTreeMap::new();
+        for rec in replay.iter() {
+            if rec.kind == K_CHUNK {
+                *attached.entry(rec.txn).or_insert(0) += 1;
+            }
+        }
+        for (txn, ts) in markers.iter() {
+            let marker = replay.iter().find(|r| r.kind == K_MARKER && r.txn == *txn);
+            let want = marker.and_then(|r| {
+                r.payload
+                    .get(..4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_le_bytes)
+                    .map(|n| n as u64)
+            });
+            let got = attached.get(txn).copied().unwrap_or(0);
+            eprintln!(
+                "TXN diag: marker txn={txn:?} ts={ts} chunk_count={want:?} attached={got}{}",
+                if Some(got) != want { " MISMATCH" } else { "" }
+            );
+        }
+        for (txn, got) in attached.iter() {
+            if !markers.contains_key(txn) {
+                eprintln!("TXN diag: unmarked chunks txn={txn:?} attached={got}");
+            }
+        }
+    }
     // Pass 2: install the opened store, then apply in LSN order through
     // the gated insert path (§9.1's identical-entry no-op makes it
     // idempotent).

@@ -1,21 +1,24 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F3a — steps 0–4 done — step 0 committed
-F3-F1's Acceptance 10k as the triage file of record (929ade38), the
-X5-R33/X5-R34 rulings verbatim before any run (31effe00), F3-F1-F5's
-record fixes (97e85cab) and the class table re-derived (b68d948c);
-step 1 X5-R34 — I-ACK-PREFIX's `durable_end` from SimDisk history, the
-judged `ack_over` cross-check, the 37-round table holding P's
-prediction exactly (13da010b, b9d6824c); step 2 the exact-segment-end
-hop clearing all four boundary store losses (ce8f8bbc, 51947e16); step
-3 I-ACK-PREFIX with two or more batches in flight, interval-set
-frontiers, the `writer:prewrite` pin (cbf0754c); step 4 per-boot ids —
-the three-way boot-id rule, W4 (i)'s ordered stop, the five pins and
-their five mutants, 186's shape gone and 405 moved (8b71e560 + this
-commit's pins). Remaining: step 5 (the F3-F1-F3 pins + mf29), step 6
-(the C-XX/C-DIV remainder pass), step 7 (the README) and the runner's
-Acceptance. The stage before it (X-5c-F3-F1) is complete: steps 0–9
-done — step 0 committed
+Status: **stage X-5c-F3-F3a complete (steps 0–7 done) — step 0
+committed F3-F1's Acceptance 10k as the triage file of record
+(929ade38), the X5-R33/X5-R34 rulings verbatim before any run
+(31effe00), F3-F1-F5's record fixes (97e85cab) and the class table
+re-derived (b68d948c); step 1 X5-R34 — I-ACK-PREFIX's `durable_end`
+from SimDisk history, the judged `ack_over` cross-check, the 37-round
+table holding P's prediction exactly (13da010b, b9d6824c); step 2 the
+exact-segment-end hop clearing all four boundary store losses
+(ce8f8bbc, 51947e16); step 3 I-ACK-PREFIX with two or more batches in
+flight, interval-set frontiers, the `writer:prewrite` pin (cbf0754c);
+step 4 per-boot ids — the three-way boot-id rule, W4 (i)'s ordered
+stop, the five pins and their five mutants, 186's shape gone and 405
+moved (8b71e560, 8e62b04b); step 5 the F3-F1-F3 pins — the r30 guard
+cases (5482edac) and mf29 (94254d12); step 6 the time-boxed C-XX/C-DIV
+remainder — both C-XX leads cleared, `E4_TXN_DIAG` clean on every
+repro, the per-key cut recorded, the remainder ESCALATED with evidence;
+step 7 this README. The Acceptance 10k (`X-5c-F3-F3a.acc.*`) is the
+runner's and becomes F3-F3b's triage file. The stage before it
+(X-5c-F3-F1) is complete: steps 0–9 done — step 0 committed
 F3's Acceptance 10k as the triage file of record (7b709ccb:
 `E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0
 PANIC=0 O1F_FAIL=2665 MONITOR=0` / `E4 FOLD FAILING_SEEDS=955
@@ -3048,6 +3051,79 @@ gate edit 1; the (f′) three-way amendment).** The fix: **8b71e560**
   18, C-XX 0, C-DIV 7; step 4: FAILING_ROUNDS 18, MW-ORPHAN 9, MP
   O-3(e)(ii) 2, DEADLOCK 0, DEFECT_SEEDS 0).
 
+**Step 6 — the C-XX / C-DIV remainder pass (X5-R16's treatment,
+X5-R19's valve; time-boxed).** Start **2026-11-03T14:12:43−07:00**,
+stop **2026-11-03T14:19:31−07:00** (the evidence below was gathered
+inside the box; root-causing was not going to fit, and the Acceptance
+commands need the rest of the attempt).
+
+- **(b) Repros** (from the s4 0..200 run at the tip): **C-XX none**
+  (0 in the window); **C-DIV 7, all r2** — (b) 112, 120, 152; (c) 63,
+  104, 125, 186; (d) none in 0..200 (the class table's 62 (d) rounds
+  lie outside the window). Each confirmed twice with identical
+  digests (`X-5c-F3-F3a.s6.seed*.r{1,2}.json`).
+- **(c) `E4_TXN_DIAG`** (new, stderr, default off, `ckpt.rs`'s
+  recovery — per recovery, each marker's chunk count against the chunks
+  the walk attached to its txn): **no mismatch on any repro, no
+  unmarked-chunk line** — every marker's attached count equals its
+  chunk count (186 r2: `txn=(4, 3) ts=16 chunk_count=23 attached=23`
+  — P's finding measured 46 attached of 23 written; step 4 closed it).
+  **Step 4 is complete; no (c) escalation.**
+- **(d) P's leads:**
+  1. **C-XX 151 r1 (sub-shape 2)** — passes at the tip (frontier 16 ≥
+     lo 15): moved by step 4, exactly P's suspicion ("the chunked
+     superseding replay of a foreign txn's chunks is the same
+     mechanism") — with per-boot ids the foreign chunks never attach.
+     The `E4_CXX_DIAG` perturbation question is moot: no repro remains
+     in the window to re-confirm.
+  2. **C-XX 150 r1 (Open XX001, two nested crashes)** — passes at the
+     tip (`nested=2`, no XX001, no O-1/O-2/O-3 text).
+  3. **The per-key cut** (new `E4_O1_DIAG`, stderr, default off,
+     `harness.rs` after the oracle check — at the failing candidate,
+     the first divergent live key per published tree with its owning
+     model commit, and every raw entry above the cut):
+     - **(b) 112 r2** @ c=15, tree 3, key 17: **store=None,
+       model=Some**, owner ts=5 — `durable=false` (round-local: D
+       measures only this round's span from p0), `replayed=true`
+       (ts ≤ frontier 15), `le_T=true` (ts ≤ the opened meta's T);
+     - **(c) 63 r2** @ c=23, tree 5, key 3: the same live shape; every
+       raw-above entry is a **SyncOff** commit above lo (63: ts=24 ×15;
+       125: ts=34–40 ×73; 186: ts=16 ×451 — 186's ts-16 commit is the
+       23-chunk chunked txn);
+     - the pattern holds on every repro examined (112, 63, 125, 186,
+       104): **the recovered live scan misses an entry whose owning
+       commit sits at ts ≤ T and ≤ the recovery frontier at every
+       legal candidate** — one shared shape behind (b) and (c), with
+       (c)'s rounds additionally holding SyncOff entries above the cut
+       (the reported clause is whichever trips first per candidate).
+- **(e) Outcome:** **not root-caused within the budget — ESCALATE with
+  the evidence above** (X5-R16, X5-R19). Nothing points at the sim's
+  crash or fault model; nothing needed S-1-F3's coverage check (no
+  F3-F3b deferral). No fix, no pin, no test change in this step — the
+  two diagnostics above are the only code, committed disabled. The
+  `durable=false` flag is round-local and does not by itself prove the
+  owner's record was never durable on disk (a prior round's durability
+  is outside D's span) — the `le_T=true ∧ replayed=true ∧ missing`
+  triple is the reproducible core P's triage should start from.
+
+**Step 7 — the README (this section, the class table beside the
+0..200 counts, "How to reproduce" and the Status line) is this
+commit.** The 0..200 counts at each step's tip (all from
+`X-5c-F3-F3a.s*` artifacts; the s0 baseline judges by the old
+derivation and is timing-only, never cited):
+
+| Step tip | FAILING_ROUNDS | C-XX | C-DIV | MW-ORPHAN | ack_over | C `0<frontier<lo` |
+|---|---|---|---|---|---|---|
+| step 0 (F3-F1's store; s0baseline is timing-only — it judges by the old derivation, never cited) | 17 | 2 | 9 | 6 | 0 | 2 (20 r2, 115 r1) |
+| step 1 (X5-R34, 13da010b) | 15 | 2 | 7 | 6 | 0 | 0 |
+| step 2 (the hop, ce8f8bbc; four single seeds) | — | — | — | — | 0 (per-seed) | 0 (the four boundary rounds cleared) |
+| step 3 (two in flight, cbf0754c) | 18 | 0 | 7 | 9 | 0 | 0 |
+| step 4 (per-boot ids, 8b71e560) | 18 | 0 | 7 (b 3, c 4) | 9 | 0 | 0 |
+
+(C-DIV here is the class-table definition — a failing class-C round
+outside C-XX carrying an `o1` — counted from each run's JSON. No
+retune, no seed exclusion anywhere.)
+
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
@@ -4047,6 +4123,22 @@ only, under the backstop, output outside the worktree):
 class-table repros of this card's steps re-derive from a ≤ 200-seed run
 at the tip (the recorded commands live in the stage record above).
 
+**X-5c-F3-F3a's Acceptance** (this card's; the same X5-R31 discipline
+held — every in-attempt command was a single seed or a ≤ 200-seed run
+under the backstop with output outside the worktree):
+`$HOME/.cache/nv3-review/runlogs/X-5c-F3-F3a.acc.campaign.json` (the
+10k `run --seeds 0..10000 --threads 16`, `ulimit -v 25165824`), its prov
+in `X-5c-F3-F3a.acc.prov`, then `verify --no-quotas` of that file
+(`X-5c-F3-F3a.acc.verify.out`), then the record check (the `ack_over` /
+`C_FRONTIER_BELOW_LO` / `MISSING_FIELDS` python one-liner of the card's
+Acceptance) and `bash scripts/gate.sh`. **Its 10k becomes F3-F3b's
+step-0 triage file**, and from it on, X5-R34 (h) 5 makes every failing
+class-C `0 < frontier < lo` round a store loss for P's triage (405 r1,
+moved by 8b71e560, will be in it). This card's step-0 file
+(`results/campaign.json`, commit 929ade38) is F3-F1's Acceptance 10k —
+this card's own Acceptance 10k is **not committed** (F3-F3b's step 0
+commits it after its own provenance checks).
+
 **The X-5c-F2 Acceptance 10k is the runner's, never a worker's
 (X5-R31).** Inside an attempt no worker runs `e4-campaign run` over
 more than 200 contiguous seeds, `e4-campaign verify`, a stress loop,
@@ -4057,7 +4149,7 @@ Acceptance, at the card's final tip, is:
 
 ```bash
 cd nucleus/v3
-O=$HOME/.cache/nv3-review/runlogs/X-5c-F2.acc
+O=$HOME/.cache/nv3-review/runlogs/X-5c-F3-F3a.acc
 { echo commit=$(git rev-parse HEAD); echo status_lines=$(git status --porcelain -- spikes/e4-recovery Cargo.lock | wc -l); echo start=$(date -Iseconds); echo load_at_start=$(cut -d' ' -f1-3 /proc/loadavg); } > $O.prov
 (ulimit -v 25165824; cargo run -q --release -p e4-recovery --bin e4-campaign -- run --seeds 0..10000 --threads 16 --out $O.campaign.json > $O.campaign.out 2> $O.campaign.err)
 { echo exit=$?; echo end=$(date -Iseconds); echo load_at_end=$(cut -d' ' -f1-3 /proc/loadavg); echo json_sha256=$(sha256sum $O.campaign.json | cut -d' ' -f1); } >> $O.prov
