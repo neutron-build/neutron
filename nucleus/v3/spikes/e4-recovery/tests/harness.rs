@@ -1188,6 +1188,56 @@ fn r30_predicate_conditions_are_load_bearing() {
     // (f) class MW: both predicates false.
     let (a, b) = yes(&disk, true, false, e4_recovery::sim::FaultClass::Mw);
     assert!(!a && !b, "class MW turns both predicates off");
+    // **X-5c-F3-F3a step 5 (the F3-F1 gate's three uncaught mutants):
+    // the guard conditions, each broken alone, must turn BOTH
+    // predicates off — must-false cases for `skx` and for `smx`, each
+    // from a world in which every other condition holds.** The skx base
+    // world: one serve wholly inside `K = {5}` (the opened meta slot 2
+    // is not the served slot, so smx's own check is false there) — skx
+    // holds. The three drops: `meta_slot_fault` false, `meta_rollback`
+    // false (OWN-1), one uncovered accept recorded (OWN-2).
+    let yes3 = |disk: &SimDisk,
+                served: &[(usize, u64, u64)],
+                kept: &std::collections::BTreeSet<u64>,
+                meta_slot_fault: bool,
+                meta_rollback: bool,
+                uncovered: bool|
+     -> (bool, bool) {
+        harness::r30_predicates(
+            e4_recovery::sim::FaultClass::Mp,
+            served,
+            true,
+            false,
+            uncovered,
+            meta_slot_fault,
+            meta_rollback,
+            kept,
+            Some(slot),
+            disk,
+            pf,
+        )
+    };
+    let kept5: std::collections::BTreeSet<u64> = [5u64].into();
+    let served_k = vec![(pf, 5 * 4096, 4096u64)];
+    let (k, m) = yes3(&disk, &served_k, &kept5, true, true, false);
+    assert!(k && !m, "the skx base world: skx holds, smx does not");
+    for (name, msf, mrb, unc) in [
+        ("meta_slot_fault false", false, true, false),
+        ("meta_rollback false (OWN-1)", true, false, false),
+        ("one uncovered accept recorded (OWN-2)", true, true, true),
+    ] {
+        let (k, m) = yes3(&disk, &served_k, &kept5, msf, mrb, unc);
+        assert!(!k && !m, "{name}: skx must be false in the skx world");
+        let (a, b) = yes3(
+            &disk,
+            &served,
+            &std::collections::BTreeSet::new(),
+            msf,
+            mrb,
+            unc,
+        );
+        assert!(!a && !b, "{name}: smx must be false in the smx world");
+    }
 }
 
 // ---- X5-R34 (g): the derivation's self-tests (literal event lists) ----
