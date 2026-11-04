@@ -4156,10 +4156,23 @@ fn decode_pg_param(
     type_hint: &Type,
 ) -> Option<DecodedParam> {
     let raw = portal.parameters.get(idx)?;
-    let Some(bytes) = raw.as_ref() else {
+    decode_param_bytes(
+        raw.as_deref(),
+        portal.parameter_format.is_binary(idx),
+        type_hint,
+    )
+}
+
+/// The portal-free body of [`decode_pg_param`]: one bound value as the client
+/// sent it (`None` = SQL NULL), its format code, and the resolved type.
+fn decode_param_bytes(
+    raw: Option<&[u8]>,
+    is_binary: bool,
+    type_hint: &Type,
+) -> Option<DecodedParam> {
+    let Some(bytes) = raw else {
         return Some(DecodedParam::Null);
     };
-    let is_binary = portal.parameter_format.is_binary(idx);
 
     // A malformed or unrepresentable declared binary array must never fall
     // through to the unknown-OID integer/UTF-8 guesses. Its array cast refuses
@@ -6211,6 +6224,95 @@ where
         }
     }
     Ok(())
+}
+
+/// Entry points for the cargo-fuzz crate (`fuzz/`): Nucleus's own handling of
+/// client-supplied pgwire content, reachable without a socket or executor.
+/// Not a stable API.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub mod fuzz_api {
+    use super::*;
+
+    /// A Bind parameter as `substitute_parameters` renders it into SQL text,
+    /// or `None` when the decoder yields nothing. `oid` is the Parse-declared
+    /// (or inferred) parameter type; an unknown OID is treated as UNKNOWN.
+    pub fn bind_param_sql(raw: Option<&[u8]>, is_binary: bool, oid: u32) -> Option<String> {
+        let ty = Type::from_oid(oid).unwrap_or(Type::UNKNOWN);
+        Some(match decode_param_bytes(raw, is_binary, &ty)? {
+            DecodedParam::Null => "NULL".to_owned(),
+            DecodedParam::Numeric(s) | DecodedParam::Bool(s) => s,
+            DecodedParam::Text(s) => format!("'{}'", sanitize_sql_text_literal(&s)),
+        })
+    }
+
+    /// A Bind parameter as the cached-AST path turns it into a `Value`.
+    pub fn bind_param_value(raw: Option<&[u8]>, is_binary: bool, oid: u32) -> Value {
+        let ty = Type::from_oid(oid).unwrap_or(Type::UNKNOWN);
+        match decode_param_bytes(raw, is_binary, &ty) {
+            Some(DecodedParam::Null) | None => Value::Null,
+            Some(DecodedParam::Numeric(s))
+            | Some(DecodedParam::Bool(s))
+            | Some(DecodedParam::Text(s)) => NucleusHandler::pg_string_to_value(&s, &ty),
+        }
+    }
+
+    pub fn sanitize_text_literal(value: &str) -> String {
+        sanitize_sql_text_literal(value)
+    }
+
+    pub fn substitute_placeholders(sql: &str, replacements: &[String]) -> String {
+        substitute_positional_placeholders(sql, replacements)
+    }
+
+    pub fn count_placeholders(sql: &str) -> usize {
+        super::count_placeholders(sql)
+    }
+
+    pub fn replace_placeholders_with_null(sql: &str) -> String {
+        super::replace_placeholders_with_null(sql)
+    }
+
+    /// Parameter-type inference for a Parse message (no catalog).
+    pub fn infer_parameter_oids(sql: &str, declared: &[u32]) -> Vec<u32> {
+        let declared: Vec<Option<Type>> = declared.iter().map(|o| Type::from_oid(*o)).collect();
+        NucleusHandler::infer_parameter_types_with_ast(sql, &declared, None, None)
+            .iter()
+            .map(Type::oid)
+            .collect()
+    }
+
+    pub fn parse_timeout_ms(v: &str) -> Option<u64> {
+        super::parse_timeout_ms(v)
+    }
+
+    /// `Some((delimiter, is_csv, is_binary, has_header))` for COPY ... FROM STDIN.
+    pub fn detect_copy_from_stdin(sql: &str) -> Option<(u8, bool, bool, bool)> {
+        super::detect_copy_from_stdin(sql)
+            .map(|c| (c.delimiter, c.is_csv, c.is_binary, c.has_header))
+    }
+
+    pub fn parse_copy_rows(
+        data: &[u8],
+        delimiter: u8,
+        is_csv: bool,
+        has_header: bool,
+    ) -> Result<Vec<Vec<Option<String>>>, String> {
+        super::parse_copy_rows(data, delimiter, is_csv, has_header)
+    }
+
+    pub fn parse_copy_binary_rows(
+        data: &[u8],
+        types: &[DataType],
+    ) -> Result<Vec<Vec<Option<String>>>, String> {
+        super::parse_copy_binary_rows(data, types)
+    }
+
+    /// The cancel-key comparison `on_cancel_request` runs on a decoded
+    /// CancelRequest.
+    pub fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+        super::constant_time_eq(lhs, rhs)
+    }
 }
 
 // ============================================================================

@@ -140,6 +140,18 @@ mod dml;
 pub(crate) mod enlistment;
 mod expr;
 mod helpers;
+
+/// Entry points for the cargo-fuzz crate (`fuzz/`); not a stable API.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub mod fuzz_api {
+    use crate::types::Value;
+
+    /// `INTERVAL '<raw>'` as the executor evaluates it, with no leading field.
+    pub fn parse_interval(raw: &str) -> Result<Value, String> {
+        super::helpers::parse_interval_literal(raw, None).map_err(|e| e.to_string())
+    }
+}
 mod join;
 mod logical_dump;
 mod masking_ddl;

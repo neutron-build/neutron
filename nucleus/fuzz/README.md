@@ -21,10 +21,34 @@ cargo +nightly fuzz run fuzz_sql_parser -- -max_len=4096
 
 ### Wire Protocol
 
-Feeds arbitrary bytes into the PostgreSQL wire protocol decoder. Malformed messages should be handled gracefully.
+Decodes arbitrary bytes with the `pgwire` frontend decoder and drives Nucleus's own handling of the content: Bind parameter decoding (text and binary, per OID), placeholder substitution and the SQL-literal round trip, Parse parameter-type inference, `statement_timeout` parsing, and COPY text/CSV/binary row parsing. Byte 0 selects the mode (see the target's header).
 
 ```bash
-cargo +nightly fuzz run fuzz_wire_protocol -- -max_len=1024
+cargo +nightly fuzz run fuzz_wire_protocol -- -max_len=4096
+```
+
+### RESP
+
+Feeds arbitrary bytes, in fuzzer-chosen chunk sizes, to the RESP reader and command extractor (pre-auth surface).
+
+```bash
+cargo +nightly fuzz run fuzz_resp -- -max_len=4096
+```
+
+### Value Text
+
+Casts arbitrary text to every scalar type Nucleus parses itself, plus array, INTERVAL and NUMERIC typmod/arithmetic paths, and checks that rendered values parse back.
+
+```bash
+cargo +nightly fuzz run fuzz_value_text -- -max_len=4096
+```
+
+The targets use the `fuzz-api` feature of `nucleusdb`, which exposes `wire::fuzz_api` and `executor::fuzz_api`. It is never enabled by the server build.
+
+On a disk-constrained machine, build without sanitizers and with an explicit target dir:
+
+```bash
+CARGO_TARGET_DIR=/tmp/nucleus-fuzz-target cargo +nightly fuzz build -s none
 ```
 
 ## Running

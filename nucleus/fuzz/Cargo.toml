@@ -2,23 +2,54 @@
 name = "nucleus-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+bytes = "1"
+futures = "0.3"
+# Same major/minor as nucleus so the decoder below is the one the server runs.
+pgwire = { version = "0.36", default-features = false }
+sqlparser = "0.61"
+tokio = { version = "1", features = ["io-util"] }
 
 [dependencies.nucleus]
+package = "nucleusdb"
 path = ".."
+default-features = false
+features = ["fuzz-api"]
+
+# Not part of any parent workspace.
+[workspace]
+members = ["."]
 
 [[bin]]
 name = "fuzz_sql_parser"
 path = "fuzz_targets/sql_parser.rs"
+test = false
 doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_wire_protocol"
 path = "fuzz_targets/wire_protocol.rs"
+test = false
 doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_resp"
+path = "fuzz_targets/resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_value_text"
+path = "fuzz_targets/value_text.rs"
+test = false
+doc = false
+bench = false
