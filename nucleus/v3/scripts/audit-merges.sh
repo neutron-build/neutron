@@ -52,7 +52,8 @@ while read -r sha; do
     printf 'audit: %s (%s): %s\n' "$id" "$(git rev-parse --short "$sha")" "$errs"
     bad=1
   fi
-  if ! errs=$(check_merge "$id" "$sha^1" "$sha^2" audit); then
+  # "$sha": short-id verdicts pass only for merges listed by this exact id (enforce-lib.sh).
+  if ! errs=$(check_merge "$id" "$sha^1" "$sha^2" audit "$sha"); then
     printf 'audit: %s (%s):\n%s\n' "$id" "$(git rev-parse --short "$sha")" "$errs"
     bad=1
   fi

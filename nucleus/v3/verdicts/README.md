@@ -17,7 +17,7 @@ Gate-model: <model id, e.g. claude-opus-5-5>
 Gate-session: <T3 task id / agent id of the gating session>
 Date: <YYYY-MM-DD>
 Gate-exit: GATE EXIT=0           (the literal last line of scripts/gate.sh on the branch tip)
-Commit: <hex id of the card commit the verdict covers, i.e. tip^: full 40-hex preferred; 7-39 accepted>
+Commit: <full 40-hex id of the card commit the verdict covers, i.e. tip^ (required)>
 Mutants: <name -> catching test | UNCAUGHT>, ...   (or "n/a")
 Followups: <card ids, comma-separated> | none
 ```
@@ -32,14 +32,24 @@ only by review (the `Gate-session` id must match a real T3 task or agent run).
 In audit mode `Card-gate` is taken from the verdict, because cards are
 local-only. Periodic Opus reviews spot-check `Gate-session` ids against T3.
 
-**Short Commit ids are judged against the local object store.** A short
-`Commit` must name exactly one commit among those present where the check runs.
-At merge time that is the shared store, which still holds the reviewed commit,
-so a commit ground to share its prefix is refused as ambiguous (test-enforcement
-G7C). A fresh CI clone holds only what the scaffold reaches. If the card branch
-was rewritten after review, the reviewed commit is absent there, and
-`audit-merges.sh` would accept a ground commit under a genuine verdict. This is
-accepted (PLAN-v3 §8.1, C4 decision 3). Such a merge must first bypass
-`merge-card.sh`, and whoever can do that can equally commit a verdict that
-names the ground commit's full id, which is the authorship limit above. Gates
-write the full 40-hex id, which cannot collide.
+**Commit is the full 40-hex id (X-6-F1-F2-F3-F1-F1).** `merge-card.sh`
+refuses any other form; gates write it in every verdict, REWORK and ESCALATE
+included. A short id had to
+name exactly one commit among the objects present where the check ran, so a
+commit ground to share the reviewed prefix was refused as ambiguous only while
+the reviewed commit was still there. Deleting that unreachable object (any
+same-uid worker can) left the ground commit alone with the prefix, and a fresh
+CI clone never holds it; no hash check helps when the object is gone. A full id
+cannot collide.
+
+The merges made before this rule keep their short ids: `SHORT_COMMIT_MERGES` in
+`scripts/enforce-lib.sh` lists them (44, from S-0's `ac4ff9a0` to X-5's
+`266b8f4c`), and `audit-merges.sh` judges only those under the old 7-40 hex
+rule, ambiguity count included. The list is keyed by the merge commit's own
+full id, not a date (text a writer chooses) or an ancestry cutoff: that id pins
+the merge's parents and so the verdict blob at its second parent, all of which
+the audit hash-verifies, and no new merge can carry a listed id. The list is
+frozen; its comment gives the command that re-derives it. A short-id merge made
+after it fails the audit, and merge mode never consults it. What remains is
+verdict authorship: whoever can bypass `merge-card.sh` can also commit a
+verdict naming an unreviewed commit's full id, which is the trust limit above.

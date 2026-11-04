@@ -41,14 +41,94 @@ vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed '
 _changed_names() { local b=$1 h=$2; shift 2; git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$b...$h" -- "$@"; }
 changed() { local b=$1 h=$2; shift 2; verify_objects "$b" "$h" || { printf '%s\n' "$VERIFY_PROBLEMS" >&2; return 1; }; _changed_names "$b" "$h" "$@"; }
 
-# check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
+# SHORT_COMMIT_MERGES: the card merges whose verdict names its commit by a
+# short id, from before merge-card required the full 40-hex one
+# (X-6-F1-F2-F3-F1-F1). audit-merges.sh judges only these under the old 7-40 hex
+# rule (check_merge says why it is keyed by merge commit id). Frozen: nothing
+# appends to it and no script writes it, so a short-id merge made after that
+# card fails the audit. Oldest first. Generated at that card's base
+# (nucleus/v3-scaffold = 043739fb: 44 of its 89 audited merges; every merge
+# after 266b8f4c, X-5, names the full id) with the audit's own listing, run
+# from nucleus/v3:
+#   . scripts/git-env.sh; . scripts/core-paths-lib.sh; . scripts/enforce-lib.sh
+#   git rev-list --first-parent nucleus/v3-scaffold -- "${AUDIT_PATHS[@]}" | tac |
+#     while read -r m; do
+#       id=$(git log -1 --format=%s "$m" | sed -n 's/^nucleus v3: merge card\/v3-\([A-Za-z0-9._-]*\) (.*/\1/p')
+#       f=$(mktemp); verify_blob "$(git rev-parse "$m^2:$V3/verdicts/$id.md")" "$f" || echo "UNVERIFIED $m"
+#       [[ $(vfield "$(cat "$f")" Commit) =~ ^[0123456789abcdef]{40}$ ]] || echo "  $m # $id"
+#       rm -f "$f"
+#     done
+# BEGIN SHORT_COMMIT_MERGES (frozen)
+SHORT_COMMIT_MERGES=(
+  ac4ff9a04406de0afae5122d38fb97264381854b # S-0
+  738efa93a77ab37e45dc01c84e9d9be0cfac3e58 # X-0
+  a0788eeef2917762e6e8ae6b117f15c4ead6b340 # X-6
+  75afaba1cfc79f704a70267b9ce89b306d115865 # X-0-F1
+  831ea23f04798b82f33919e0ee9310ed17c25ffb # X-1a
+  c5ee3ce6c93f4aa8708e49fba52e1b70b96b1da7 # X-6-F1
+  09d6d94ded2658a1c454d5fda8a610899ec0621c # S-0-F1
+  16fde176f8aaa587505c9d84a8e7748c44351f2c # S-0-F2
+  592ba2a1c306001e624be11b1d7490f167eb6fe8 # X-0-F3
+  98b4702d2ca402cf87de64807329e0e199c4ff09 # S-0-F2-F1
+  ceae821e14b12d4743b566bdafbfb2a5f9047e6d # X-0-F3-F1
+  544a205c5ef0ad7cea7f3f167e4e7964fbf544de # S-0-F2-F2
+  cb3caec080c8d7f9f7b9ead20ce177dcb047cd12 # X-1a-F1
+  67b4cb1d6f4ac83c0f3801e0b3816ad4d3cf40c5 # X-1a-F2
+  8522c8c46ea38d690f5496c444fd0c571ad7a8bd # X-0-F1-F1
+  1a7106f41868082286c22de5c95bd633fd16d6b2 # S-0-F2-F1-F1
+  7729abfdca179af54da34316ebc3c958160a421e # X-0-F1-F1-F1
+  072dea5d6c0b8eb66bb4cbb5a78c729b570781d3 # X-1a-F3
+  5e4880664e40be69dc05309926451ea38b5cf791 # S-0-F2-F2-F1
+  fa84ef119beb8c377d56fb03a6373350bf734db2 # X-6-F1-F3
+  0a9261adc51ff24d6da135f93d8f3471da9d50ba # X-6-F1-F1
+  693a155f227e5ecf79cf60ac4db028a03b87b9c3 # S-0-F2-F2-F1-F1
+  9ed8c29cb29d38d3fd312e91ed940ee2caf4cc27 # S-0-F2-F1-F1-F1
+  9e45fc61685a5bfe0a1ae2aa352f30ec18bf8577 # X-6-F1-F3-F1
+  12c225cb36cd84a0be51e1922ee71228e3f96f56 # X-6-F1-F2
+  de9578f756793f4d63ce60800f07411be4fc96ac # X-1a-F3-F1
+  b6560ff32eb9e74d3dce73cfe55de32a2b0edf33 # X-1a-F2-F1
+  ef070bbb24566fcb3d150d6dd189f5b69b13963b # X-1a-F1-F3
+  e4f2a268e5f281016402003f45fc8bcc9064f78c # X-6-F2-F1
+  a974206f67e212c2601d914f6d5c44f490e2d746 # X-0-F2
+  7782a3bbf9a71c8c812719b69c6ba41b77247e97 # X-1a-F1-F1
+  3ca0350f6958920bd3ae7d3250ef84f8e0fca19a # X-1a-F1-F2
+  1ef49f4e3410e5edafccf3780b55c5acb551b898 # X-2
+  7425b94fae299f476130301a519c55271fd6574c # X-3
+  7ccd1cff8ef926f95a240b15d4b9c6a346251efe # X-1b
+  391e816c7d5d3dd661cba47053616e30baa7c727 # S-1
+  45f7c17a3312e7c3a15d2bd1f2e8dba3e9a8ace0 # X-1b-F2
+  a59bf36e26dfc7578539d09c5cde359c4ad6e4b5 # S-1-F1
+  b69b45894f5f413d58fe9887d2d3d7c8eb20d40e # X-1b-F3
+  97f421b8cf0c3967a82d742d177b5afbb1539fab # X-1b-F4
+  2b3924def8316c87a661dea31b4935d686250261 # S-2
+  5ff1bd06d10d62b23c4dfa352b5728b1cee662ae # S-2-F1
+  6fad35e5539d08fcacf3e2db64cef103e55ef57b # S-3
+  266b8f4c6f08d07a6d3d222786b325bd3894a3a5 # X-5
+)
+# END SHORT_COMMIT_MERGES
+
+# short_commit_grandfathered MODE MERGE_SHA: MODE is the literal "audit" and
+# MERGE_SHA, a full 40-hex merge commit id, is string-equal to an entry of
+# SHORT_COMMIT_MERGES. Keyed on the two arguments only, never on an environment
+# variable, a file or a marker: those are trusted state a worker could write.
+short_commit_grandfathered() {
+  local e
+  [ "$1" = audit ] && [[ $2 =~ ^[0123456789abcdef]{40}$ ]] || return 1
+  for e in "${SHORT_COMMIT_MERGES[@]}"; do [ "$e" = "$2" ] && return 0; done
+  return 1
+}
+
+# check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE | MERGE_SHA]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
+# Merge mode takes CARD_GATE CARD_CLASS QUEUE_FILE; audit mode takes MERGE_SHA,
+# the audited merge's full commit id (only the Commit rule reads it).
 # Prints one line per violation; returns 1 if there were any.
 # Audit mode verifies no objects itself (the commit+tree closure of the
 # audited ref is verified once by audit-merges.sh; the skips below say why);
 # every other mode verifies the ranges it reads.
 check_merge() {
-  local id=$1 base=$2 head=$3 mode=$4 card_gate=${5:-} card_class=${6:-} queue=${7:-}
+  local id=$1 base=$2 head=$3 mode=$4 card_gate='' card_class='' queue='' merge_sha=''
+  if [ "$mode" = audit ]; then merge_sha=${5:-}; else card_gate=${5:-} card_class=${6:-} queue=${7:-}; fi
   local own="$V3/verdicts/$id.md" errs=() v vid vtmp
   # The verdict's content decides every check below, so its blob is hashed
   # (git-env.sh's verify_blob) in both modes, and its fields are read from the
@@ -82,10 +162,23 @@ check_merge() {
   # or not. The class is spelled out so no locale reads a-f as a collation range.
   # Even a bare hex value never goes through a lookup: git resolves refs before
   # short object ids, so a branch or tag named like the prefix would redirect the
-  # field to any commit. The value is compared as text with tip^'s full id, and
-  # must name no other commit: rev-parse refused an ambiguous prefix, and without
-  # that a late commit ground to share the reviewed prefix would reuse the verdict.
-  # Only commits count, as the ^{commit} peel ignored blobs and trees.
+  # field to any commit. The value is compared as text with tip^'s full id.
+  # It must be all 40 digits (X-6-F1-F2-F3-F1-F1): a short id must also name no
+  # other commit, or a late commit ground to share the reviewed prefix reuses
+  # the verdict, but that count reads only the objects present where it runs.
+  # Deleting the unreachable reviewed commit's object (any same-uid worker can)
+  # leaves the ground commit alone with the prefix, and no hash check helps:
+  # there is nothing left to verify. A fresh CI clone is already in that state.
+  # A 40-hex id cannot collide. The merges made before this rule
+  # (SHORT_COMMIT_MERGES) keep the old rule, ambiguity count included and never
+  # weaker, in audit mode only, keyed by the audited merge's own commit id: that
+  # id pins the merge's parents and so the verdict blob at its second parent, a
+  # chain audit-merges.sh hash-verifies (verify_reachable, then verify_blob
+  # above), and no new merge can carry a listed id. A date is text a writer
+  # chooses, and an ancestry cutoff adds a read for no gain. The list is frozen,
+  # so a short-id merge made after it fails the audit. The legacy path keys on
+  # the MODE and MERGE_SHA arguments only (short_commit_grandfathered).
+  # In it only commits count, as the ^{commit} peel ignored blobs and trees.
   # The tip check reads HEAD^1's trees, the reviewed commit's, which the range
   # check below does not verify: HEAD^1 is neither the merge base nor the tip.
   # Audit mode skips this call and the one in changed (verdict
@@ -103,7 +196,20 @@ check_merge() {
   fi
   mapfile -d '' -t tipfiles < <(git diff-tree -z --ignore-submodules=none --no-commit-id --name-only -r "$head" -- ':/')
   { [ ${#tipfiles[@]} -eq 1 ] && [ "${tipfiles[0]}" = "$own" ]; } || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: ${tipfiles[*]}")
-  if [[ $vcommit =~ ^[0123456789abcdef]{7,40}$ ]]; then
+  if [[ $vcommit =~ ^[0123456789abcdef]{40}$ ]]; then
+    local full
+    if ! full=$(git rev-parse -q --verify "$head^1^{commit}"); then
+      errs+=("cannot resolve the commit under the verdict ($head^1)")
+    elif [ "$vcommit" != "$full" ]; then
+      errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
+    fi
+  elif ! short_commit_grandfathered "$mode" "$merge_sha"; then
+    if [[ $vcommit =~ ^[0123456789abcdef]+$ ]]; then
+      errs+=("verdict Commit '$vcommit' is not a full 40-hex commit id (short ids are accepted only for the merges frozen in SHORT_COMMIT_MERGES)")
+    else
+      errs+=("verdict Commit '$vcommit' is not a hex commit id (40 lowercase hex digits; revision expressions are refused)")
+    fi
+  elif [[ $vcommit =~ ^[0123456789abcdef]{7,40}$ ]]; then
     local parent objs kinds ty name ncommit=0 mine=0 bad=0
     # Through $(...) with the status checked: a failed listing prints nothing,
     # which must not read as "no other commit".
