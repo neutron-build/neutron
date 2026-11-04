@@ -3371,6 +3371,38 @@ pub fn run_round(
                     &cfg,
                 );
             }
+            // X-5c-F3-F3b-F1 Work 1 (folded; `E4_O1_AT_FRONTIER`, stderr
+            // only, default off, never a digest input): the per-key
+            // diff at `c = clamp(frontier, lo, hi)` — the candidate
+            // that rules out every other (the ESCALATE ruling's
+            // diagnostic). The capture side runs only when a test
+            // armed it, so no env var is mutated process-wide.
+            let o1f_wanted = std::env::var("E4_O1_AT_FRONTIER").is_ok()
+                || O1F_CAPTURE.with_borrow(|c| c.is_some());
+            if o1f_wanted && first.o1.is_err() {
+                let lines = o1_at_frontier_lines(
+                    seed,
+                    round,
+                    faults.class,
+                    c_prev,
+                    &model,
+                    &ex,
+                    &mut reader,
+                    &wal_commits,
+                    d_val,
+                    &d_rc,
+                );
+                if std::env::var("E4_O1_AT_FRONTIER").is_ok() {
+                    for l in lines.iter() {
+                        eprintln!("{l}");
+                    }
+                }
+                O1F_CAPTURE.with_borrow_mut(|c| {
+                    if let Some(v) = c {
+                        v.extend(lines);
+                    }
+                });
+            }
             let _ = first;
             // The harness checkpoint (G4: after the oracle check; it
             // supplies O-2 (ii) and the next round's base), then
@@ -4540,7 +4572,6 @@ pub fn key_history_trace(
                 | Op::DropTree { tree: t }
                 | Op::Put { tree: t, .. }
                 | Op::Delete { tree: t, .. } => *t == tree,
-                _ => false,
             })
             .collect();
         let ddl = mine
@@ -5016,6 +5047,129 @@ pub fn key_history_trace(
         }
         None => eprintln!("KEY diag: no durable meta lost the owner entry (image-side)"),
     }
+}
+
+// ---- X-5c-F3-F3b-F1 Work 1 (folded into X-5c-F3-F3a-F2): the
+// frontier-candidate diagnostic (`E4_O1_AT_FRONTIER`, stderr only,
+// default off, never a digest input) ----
+//
+// The round record's `o1` text is the error of the **first** failing
+// candidate (`check_round` keeps the first `Err`, at `c = lo`), so
+// whenever `lo` < frontier it reads O-1(c) "raw entry above the cut"
+// even when the failure that rules out every candidate sits at the
+// recovery-frontier candidate (verdict X-5c-F3-F3b's ESCALATE ruling:
+// the five MW rounds it re-classified as C-DIV's missing-≤T family).
+// This diagnostic runs `E4_O1_DIAG`'s per-key diff at
+// `c = clamp(frontier, lo, hi)` instead.
+
+thread_local! {
+    /// The diagnostic's capture buffer: `Some` while a test armed it
+    /// ([`o1f_capture_arm`]). Never read by the round, the record or
+    /// the digest — the pin's seam, so no test mutates a process-global
+    /// env var.
+    static O1F_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the frontier diagnostic's capture on this thread (the pin's
+/// seam: no env-var mutation, no stderr output, nothing
+/// digest-visible; the stderr side stays behind `E4_O1_AT_FRONTIER`).
+pub fn o1f_capture_arm() {
+    O1F_CAPTURE.with_borrow_mut(|c| *c = Some(Vec::new()));
+}
+
+/// Take the captured frontier-diagnostic lines (empty when never armed
+/// or already taken).
+pub fn o1f_capture_take() -> Vec<String> {
+    O1F_CAPTURE.with_borrow_mut(|c| c.take().unwrap_or_default())
+}
+
+/// **X-5c-F3-F3b-F1 Work 1: the per-key diff at the frontier
+/// candidate.** The same diff `E4_O1_DIAG` prints, at
+/// `c = clamp(frontier, lo, hi)` with `lo`/`hi` derived exactly as
+/// `check_round` derives them (X5-R33's MW lower bound included).
+/// Returns the lines (the caller prints them under
+/// `E4_O1_AT_FRONTIER` and, when armed, into the capture).
+#[allow(clippy::too_many_arguments)]
+pub fn o1_at_frontier_lines(
+    seed: u64,
+    round: u32,
+    class: FaultClass,
+    c_prev: u64,
+    model: &Model,
+    ex: &Extracted,
+    reader: &mut StoreReader<'_>,
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    d_val: u64,
+    d_rc: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut lo = model.lower_bound(c_prev);
+    let hi = model.upper_bound(lo);
+    if class == FaultClass::Mw {
+        // X5-R33 (c): `lo := max(c_prev, T, h, a)` (X5-R1's `lo := T`
+        // under `no_r33` never reaches this diagnostic — the campaign
+        // runs with the ruling on).
+        lo = c_prev.max(ex.opened_t).max(ex.mw_h).max(ex.mw_a);
+    }
+    let c = ex.frontier.clamp(lo, hi);
+    let mut out = Vec::new();
+    for t in model
+        .published_at(c)
+        .iter()
+        .filter(|t| **t != CATALOG)
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        let (Ok(got), want) = (reader.scan(t, c), model.scan(t, c)) else {
+            continue;
+        };
+        let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
+        keys.extend(want.keys().cloned());
+        for k in keys.iter() {
+            let g = crate::oracle::live(&got)
+                .iter()
+                .find(|(gk, _)| *gk == k)
+                .map(|(_, v)| (*v).clone());
+            let w = crate::oracle::live(&want)
+                .iter()
+                .find(|(wk, _)| *wk == k)
+                .map(|(_, v)| (*v).clone());
+            if g == w {
+                continue;
+            }
+            let owner = model
+                .commits
+                .iter()
+                .rev()
+                .find(|(ts, rec)| {
+                    **ts <= c
+                        && rec.ops.iter().any(|op| matches!(op, Op::Put { tree, key, .. } | Op::Delete { tree, key } if *tree == t && key == k))
+                })
+                .map(|(ts, _)| *ts);
+            let flags = owner.map(|ts| {
+                let rec = wal_commits.get(&ts);
+                let mrec = model.commits.get(&ts);
+                let durable = rec
+                    .map(|&(sync_on, lsn, len)| {
+                        lsn + len <= d_val
+                            || d_rc.contains(&x5r34_seg_name(lsn - (lsn % crate::store::WAL_SEG)))
+                            || (!sync_on && mrec.map(|m| m.written).unwrap_or(false))
+                    })
+                    .unwrap_or(false);
+                format!(
+                    "owner_ts={ts} durable={durable} replayed={} le_T={}",
+                    ts <= ex.frontier,
+                    ts <= ex.opened_t
+                )
+            });
+            out.push(format!(
+                "O1F diag: seed={seed} round={round} lo={lo} hi={hi} frontier={} c={c} tree={t} key={k:?} store={g:?} model={w:?} {flags:?}",
+                ex.frontier
+            ));
+            break;
+        }
+    }
+    out
 }
 
 /// **X5-R34 (b): the per-round view of the workload pass's event
