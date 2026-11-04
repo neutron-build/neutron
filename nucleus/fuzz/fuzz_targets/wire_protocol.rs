@@ -136,6 +136,37 @@ fn on_bind(stmt: Option<&Stmt>, formats: &[i16], params: &[Option<bytes::Bytes>]
     }
 }
 
+thread_local! {
+    static IN_PGWIRE_DECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// pgwire's own body decoders panic on short frames (unchecked `get_*` /
+/// `split_to`). Nucleus's connection loop contains that panic and closes the
+/// connection (`process_socket_closing_on_terminate`), so here it ends the
+/// stream instead of counting as a crash. libFuzzer's panic hook aborts, so
+/// it is bypassed only while pgwire is decoding; a panic anywhere in Nucleus
+/// still crashes.
+fn decode_frontend(buf: &mut BytesMut, ctx: &DecodeContext) -> Option<PgWireFrontendMessage> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let fuzzer_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !IN_PGWIRE_DECODE.with(|f| f.get()) {
+                fuzzer_hook(info);
+            }
+        }));
+    });
+    IN_PGWIRE_DECODE.with(|f| f.set(true));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PgWireFrontendMessage::decode(buf, ctx)
+    }));
+    IN_PGWIRE_DECODE.with(|f| f.set(false));
+    match res {
+        Ok(Ok(Some(m))) => Some(m),
+        _ => None,
+    }
+}
+
 fn wire_stream(data: &[u8], past_startup: bool) {
     let mut buf = BytesMut::from(data);
     let mut ctx = DecodeContext::new(ProtocolVersion::PROTOCOL3_0);
@@ -145,10 +176,7 @@ fn wire_stream(data: &[u8], past_startup: bool) {
     let mut copy: Option<((u8, bool, bool, bool), Vec<u8>)> = None;
 
     for _ in 0..64 {
-        let msg = match PgWireFrontendMessage::decode(&mut buf, &ctx) {
-            Ok(Some(m)) => m,
-            _ => return,
-        };
+        let Some(msg) = decode_frontend(&mut buf, &ctx) else { return };
         match msg {
             PgWireFrontendMessage::SslNegotiation(m) => {
                 ctx.awaiting_ssl = false;
