@@ -95,7 +95,10 @@ fn smoke_16_seeds() {
 /// generator, bit for bit — copied from X-5c-F4's Acceptance file
 /// (`$HOME/.cache/nv3-review/runlogs/X-5c-F4.acc.campaign.json`, sha256
 /// `bec7056c4463b5b812f8d27a162046cd42be1f1242970b1da4da458305ab3ac6`,
-/// prov `commit=1b0ce54e63d044b239cae497d22104ccced41cba`). The seed
+/// prov `commit=1b0ce54e63d044b239cae497d22104ccced41cba`), except
+/// seed 4's literal, which moved with step 2's Q11 wiring (its r0 Q11
+/// flag flipped 0→1 — the only digest input the wiring touches;
+/// X5-R37's moved-digest rule). The seed
 /// list is every seed any test passes to a seed runner (found by grep
 /// over `tests/`, cross-checked against P's 43-seed list; the smoke and
 /// round-trip seeds 0–9 are the grep's additions from the file, and P's
@@ -108,7 +111,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (1, 1198539130),
         (2, 927823387),
         (3, 923362676),
-        (4, 3047956786),
+        (4, 1441374082),
         (5, 980071820),
         (6, 2097771150),
         (7, 2267580514),
@@ -192,6 +195,24 @@ fn x5_r37_final_equals_base_at_this_tip() {
         workload::Tuning::FINAL,
         workload::Tuning::BASE,
         "this card builds the machinery only: FINAL == BASE (the card's Goal)"
+    );
+}
+
+/// **Q11's seed pin (card X-5c-F4-F1 step 2): P's probe hit.** Seed 4
+/// round 0, under `Tuning::BASE`: the round's WAL crossed into a
+/// recycled segment whose start still held its previous life's
+/// records, the recovery walk read them, and the wired counter fires
+/// the Q11 flag (P's probe of 2026-11-04: wired, 1 hit in 891 rounds
+/// over 0..600, seed 4 r0 — ≈ 15 per 10k rounds; "probe, not
+/// evidence"; the wiring alone cannot meet Q11's 100, which is what
+/// X5-R38's W11 targets).
+#[test]
+fn q11_seed4_round0_reads_a_stale_record_at_a_recycled_segment_start() {
+    let rec = workload::run_seed_with(4, None, &workload::Tuning::BASE);
+    let r0 = &rec.rounds[0];
+    assert!(
+        r0.q11_stale_seg,
+        "seed 4 r0: the stale record read at the recycled segment's start must set the Q11 flag"
     );
 }
 

@@ -257,6 +257,19 @@ pub fn dec_record_with_lsn_check(
     )
 }
 
+/// **Q11 (card X-5c-F4-F1 step 2; P ruling nv3-X-5c-F4-esc-1's
+/// ESCALATE 3):** do the bytes at `lsn` decode as a **stale** record —
+/// magic, `len` and CRC all valid, but the embedded lsn ≠ the expected
+/// position (a recycled segment's previous-life content at its start)?
+/// Implemented through [`dec_record_inner`] (the skip-lsn-check decode
+/// succeeds where the checked decode fails — never a second copy of
+/// the check). The counter it feeds (`stale_seg_reads`) is an
+/// observable only: the walk's stop never changes.
+pub fn is_stale_record(b: &[u8], lsn: u64, seg_end: u64) -> bool {
+    dec_record_inner(b, lsn, seg_end, true).is_ok_and(|r| r.is_some())
+        && dec_record_inner(b, lsn, seg_end, false).is_err()
+}
+
 fn dec_record_inner(
     b: &[u8],
     lsn: u64,

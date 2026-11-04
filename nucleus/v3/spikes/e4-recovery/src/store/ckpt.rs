@@ -1567,7 +1567,23 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                         continue 'outer;
                     }
                 }
-                Ok(None) | Err(()) => break 'outer,
+                Ok(None) | Err(()) => {
+                    // **Q11 (card X-5c-F4-F1 step 2; P ruling
+                    // nv3-X-5c-F4-esc-1's ESCALATE 3):** the decode
+                    // failed at the segment's first LSN (`off == 0`)
+                    // and the bytes are a *stale record* — magic, `len`
+                    // and CRC valid, the embedded lsn ≠ the position —
+                    // so this is a recycled segment's previous-life
+                    // content (a fresh segment starts zeroed: stale
+                    // content at a segment's start can only be a
+                    // recycled segment's). Count it, then stop exactly
+                    // as before — the walk's valid end never moves with
+                    // the counter (an observable only).
+                    if off == 0 && wal::is_stale_record(&bytes, lsn, seg + WAL_SEG) {
+                        st.stale_seg_reads += 1;
+                    }
+                    break 'outer;
+                }
             }
         }
         break 'outer;
