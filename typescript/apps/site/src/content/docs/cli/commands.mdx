@@ -333,12 +333,16 @@ Nucleus specialty functions and their wrappers remains best-effort. Use a
 trusted principal and do not infer complete specialty protection from the
 tested `NEXTVAL` paths. Values
 under secret-looking names are redacted, and results carry each touched
-model's actual transaction and durability limits. The HTTP transport answers
-only requests addressed to localhost, an IP address or the `--host` name.
+model's actual transaction and durability limits. A non-loopback `--host`
+requires `NEUTRON_MCP_TOKEN`, which is then checked on every HTTP request. The
+HTTP transport answers only requests addressed to localhost, a loopback
+address or the `--host` name, and refuses browser origins not listed with
+`--allow-origin`.
 
 **Flags:**
 - `--transport` — `stdio` (default) or `http`
-- `--host` — HTTP bind address (default: 127.0.0.1)
+- `--host` — HTTP bind address (default: 127.0.0.1; non-loopback requires `NEUTRON_MCP_TOKEN`)
+- `--allow-origin` — Browser origin allowed to call the HTTP transport (repeatable, exact match; default: none)
 - `--port` — HTTP port (default: 7700)
 - `--db` — Database URL
 - `--dump-schema` — Print schema and exit (`openai`, `mcp`, or `markdown`)
