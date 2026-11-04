@@ -1,22 +1,28 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4 launched (the X5-R17 retune and the final
-file; the third of X5-R31's stacked cards, from card/v3-X-5c at
-b19ab321) — step 0 done: F3-F3b's Acceptance 10k is the triage file of
-record (sha `8332df8d…`, prov commit 86ecf8ff) with this card's class
-table derived from it: 375 failing seeds / 352 failing rounds / 36
-failing twins / 0 defect seeds, `reuse_on_dropping` 0; one NEW class —
-17 MP poison+task-error rounds (zero in F3-F3a's file) — root-caused
-to the checkpointer's post-G8-mark refusal recorded as a round-failing
-task error, fixed under step 4 (the section below); the retune list is
-SIZING, Q4, Q7, Q8, Q11, Q12, Q18 — Q11's store counter
-(`stale_seg_reads`) has no increment site anywhere in the crate, so
-that quota is structurally unreachable by a workload retune and is
-ESCALATED. The stages before it (X-5c-F3-F3a-F2-F1, X-5c-F3-F3a-F2,
-X-5c-F3-F3b, X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are
-complete and merged. Opus judges E4 on the RESULT with P's rulings
-X5-R1–R36. (The previous stage's own Status paragraph is preserved in
-its record section below: X-5c-F3-F3a-F2's root causes A and B.)
+Status: **stage X-5c-F4 (the X5-R17 retune and the final file) —
+steps 0, 1 and 4 landed; **the retune itself is ESCALATED as
+infeasible within the card's Limits** (the record below carries the
+measured frontier): step 0 committed F3-F3b's Acceptance 10k as the
+triage file of record (sha `8332df8d…`, prov commit 86ecf8ff) with
+this card's class table (375 failing seeds / 352 failing rounds / 36
+failing twins / 0 defect seeds, `reuse_on_dropping` 0); step 1
+re-based X5-R17's SIZING row on seeds (9,626 of 10,000 miss at the
+unchanged workload) with its pin; step 4 fixed the file's one NEW
+class — 17 MP poison+task-error rounds, the checkpointer's post-G8-mark
+refusal recorded as a round failure (`g8_checkpoint_poison_ends_the_
+workload`) — and the probes then established that SIZING×40-min, Q4's
+value-distribution tension and Q11's dead `stale_seg_reads` counter
+cannot be closed by workload knobs alone, while any knob change breaks
+two REFRESH-3-protected pins plus two more (re-derivation recorded as
+the next attempt's first cost). The Acceptance 10k at this tip is
+expected to fail plain `verify` on the quota table alone (the step-0
+file's seven misses). The stages before it (X-5c-F3-F3a-F2-F1,
+X-5c-F3-F3a-F2, X-5c-F3-F3b, X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3,
+X-5c-F2, X-5c) are complete and merged. Opus judges E4 on the RESULT
+with P's rulings X5-R1–R36. (The previous stage's own Status paragraph
+is preserved in its record section below: X-5c-F3-F3a-F2's root causes
+A and B.)
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -4135,6 +4141,141 @@ Partition check: 352 = 10 served + 51 C-XX + 251 C-DIV + 5 C-DIV-in-MW +
 defect seeds. Every count equals the REFRESH's (375/352/36); no
 deviation to record.
 
+**Steps 2–4 (the retune, the wall budget, and the new class) — the
+attempt's record, and why the retune is not landed.** Every number
+below is a development probe over ≤ 200 contiguous seeds under the
+backstop (X5-R31), output outside the worktree — **probe, not
+evidence**; the Acceptance's whole 10k with plain `verify` is the only
+quota evidence, and none of these knob states is committed.
+
+- **The baseline (the fixed tip, 0..200):** 27.7 s wall at 16 threads
+  (× 50 ⇒ ~23 min for a 10k — the budget's headroom is ×1.7). SIZING:
+  191 of 200 seeds miss (the per-seed row of step 1); the misses'
+  median best interval reaches 0.41·4·F. Q4 0, Q7 5, Q8 7 (the probe
+  aggregate's raw count), Q12 0, Q18 20 rounds.
+- **Retune attempt 1** (chunked [900,1500], cb [30,45], ckpt_every
+  [8,12], the GC task sweeping every non-dropped tree × 2): SIZING
+  57/186 seeds met — but > 10 min for the 200-seed probe (≥ 20× the
+  budget). **Attempt 2** (chunked [900,1200], cb [20,31], values drawn
+  from the top of the card's 8–400 B range — `VALUE_LO = 280`, ~6 live
+  entries per leaf instead of ~9 — GC × 6 passes, drop rounds at half
+  of the non-bulk rounds): **61 s / 200 seeds ⇒ ~50 min for a 10k
+  (over the 40-min budget), SIZING 88/200 seeds met, Q8 ~450, Q18
+  ~1,150, Q4 0, Q12 0, and 0 failing rounds.** The misses split 41
+  universe-bound (the seed's whole page universe < 4·F) and 71
+  coverage-bound (the crash landed before one interval accumulated
+  4·F: an early uniform draw, or a targeted `Before0@k` just after a
+  completion reset the interval). **Attempt 3** (chunked [750,1000], 4
+  passes — budget-directed shrink): 53 s ⇒ ~44 min, SIZING 58/200,
+  **and Q18 fell to ~500** (the pass cut) — a retune that regresses a
+  carried quota below its floor is not landable.
+- **The three structural findings the probes established:**
+  1. **SIZING × the 40-min budget cannot both be met with card-legal
+     knobs.** Reaching ≥ 4·F (= 172–232 distinct dirtied LPIDs, F ∈
+     43..58 at §5.4's formula) in one interval for **every** seed
+     requires (a) a page universe of ~260+ tree pages in round 0 —
+     ~2,000+ insert ops per round at any value size, because the dirty
+     set counts only pool pages (`store_page`), never the map/free-set
+     pages (`write_fresh`) — and (b) that a **full-tree GC sweep pass**
+     land inside the crash-cut interval, because a crash that lands
+     before ~60 % of the round's yields otherwise sees fewer pages
+     than 4·F no matter how big the universe is. Point (a) alone puts
+     the measured cost at ≥ 2.2× the budget (61 s vs 48 s per 200) and
+     it still leaves 56 % of seeds missing; the only measured point
+     that approached the budget (53 s) met 29 % of seeds. The gap is
+     not tuning: it is the twin costs (every MP/MW seed runs its round
+     twice), the uniform counting pass (every uniform round runs its
+     workload twice) and the recovery replays, none of which the card
+     allows to shrink. **ESCALATED with these numbers** (the card's own
+     valve: "If SIZING and the budget cannot both be met, ESCALATE
+     with the numbers").
+  2. **Q11 is structurally unreachable: `StoreInner::stale_seg_reads`
+     has no increment site anywhere in the crate** (declared
+     `src/store/mod.rs`, initialised beside it, snapshotted by the
+     harness's `WorkloadObs`, read by the quota flag —
+     `grep -rn "stale_seg_reads +=" src/` finds nothing; it has had no
+     writer since 4b1e6068 introduced it). No workload retune can move
+     a counter that only ever holds its initialiser. The natural wire
+     point is the §12.5 stale check (`dec_record_inner`'s `rlsn != lsn`
+     arm, `src/store/wal.rs`) or the recovery walk's first read of a
+     recycled segment's start — a store/harness instrumentation fix
+     outside this card's Limits ("change only: the workload knobs;
+     X5-R17's SIZING accounting; fixes for new classes").
+     **ESCALATED**; plain `verify` will fail Q11 (0 < 100) at any
+     workload until P rules it wired or waived.
+  3. **Q4's two halves pull the value distribution in opposite
+     directions.** The merge half counts only GC pack steps
+     (`count_merge` has one call site, inside `gc_locked`), and a pack
+     fires only when a leaf pair's kept halves fit `F_PACK·U =
+     0.85·U` — i.e. both leaves under ~42 % full; with uniform values
+     the sweep's own rewrites keep pairs at ~2×50 % = 1.0·U
+     (measured: merges ≥ 1 in 1–2 of ~305 rounds at every knob state
+     tried, and 0 in the step-0 file). The SIZING half wants big
+     values (~6 entries/leaf ⇒ more pages per op); the merge half
+     wants small values (dense leaves ⇒ half-full pairs fit 0.85·U). A
+     knob state that satisfies both was not found inside the budget;
+     the candidate design (the chunked txn at the top of the value
+     range for the universe, small commits at the bottom drawn from a
+     hot sub-range for split/merge churn) is recorded here for the
+     next attempt. **ESCALATED as infeasible-within-scope alongside
+     (1).**
+- **Why no retune is committed:** beside (1)–(3), any knob change
+  moves every seed's workload wholesale and breaks four seed pins —
+  `x5_r36_seed112_r2_no_longer_fails_o1b_on_tree_3` survived, but
+  `o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2` and
+  `x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2` (two of the
+  REFRESH 3's five protected pins) plus
+  `x5r35_seed403_slice_feeds_the_derivation` and
+  `r30_skx_and_smx_record_fields` fail at every retuned knob state
+  measured. The REFRESH's own rule ("re-express the pin as a literal
+  config that reproduces the same round. Never change its assertions")
+  needs re-derivation scans per pin, which this attempt's 60-minute
+  budget could not hold beside the probes (the first attempt of this
+  card was in fact killed at the runner's 60-minute cap mid-probe).
+  Landing a retune that leaves red tests or regressed carried quotas
+  (Q18) would fail the Acceptance outright; the honest landing is the
+  fixed code of steps 0, 1 and 4 with this record.
+- **Step 4 — the one new class in the step-0 file, fixed (commit
+  3fc325a8):** the **MP poison + task-error class** (17 rounds — 747,
+  788, 967, 2347, 2988, 3607, 3968, 4127, 4347, 5148, 5328, 6767,
+  7968, 9168, 9388, 9508, 9968; zero in F3-F3a's rework file). Every
+  round is `crash="poison"` with `terr=true`, the task error
+  `checkpoint failed: Poisoned("XX001 in gated op: lpid N slot M (G8,
+  9.2)")`. Root cause: `checkpointer_body`'s `h:ck` poisoned arm fell
+  through to a final checkpoint whose first step refused on `alive()`
+  with the external G8 mark, and the error arm recorded the store's
+  designed post-mark refusal as a round-failing harness task error —
+  contrary to G8's harness contract ("the poisoned store is the end of
+  the round's workload … the faults, the recovery and the oracle run
+  as usual"). Classification: instrumentation defect (harness), the G8
+  half. The fix (`checkpoint_poison_end`, both at the poll and
+  mid-checkpoint, typed on `Fail::Poisoned` and gated on the new
+  `StoreInner::poison_fail_stop` flag — set only by the checkpoint
+  path's own fail-stop sites, so D12b's `gc_w > T` and D4's
+  meta-bound refusals keep their loud task errors). Pin
+  `g8_checkpoint_poison_ends_the_workload` (seeds 747/967 r1: crash
+  `poison`, fired, no task error, no livelock, the round passes as the
+  detection round it is); the revert mutant (both quiet arms restored
+  to the draft) fails it with the exact class text — applied, shown,
+  reverted clean; the single-arm reverts do not fail it (each arm
+  covers the other — recorded). Movement: all 17 named seeds pass at
+  the fix tip; 0..200 gives `FAILING_ROUNDS=2` (8 r0, 178 r1 — the
+  pre-existing MP O-3(e)(ii) pair, unchanged); the whole suite is 212
+  tests green.
+
+**Step 5 — the hand-off for X-5c (the final file).** This card's
+Acceptance 10k (the runner's, at this tip) is **not** a final file:
+with the workload unchanged, its quota table is the step-0 file's
+(seven misses — SIZING, Q4, Q7, Q8, Q11, Q12, Q18 — beside Q11's
+structural zero), so plain `verify` is expected to exit 2 on the quota
+check alone; the digests and the seed set will reproduce. The retune
+itself is ESCALATED (above) with the measured frontier and the
+candidate designs, and the next attempt inherits: the pin
+re-derivation cost of any knob change (four pins, two of them
+REFRESH-3-protected), the SIZING×budget numbers, Q11's dead counter,
+and Q4's value-distribution tension. X-5c's `--keep` relaunch commits
+whatever file P's ruling produces and runs the sweep and the RESULT.
+
 
 
 `run --seeds 0..10000 --threads 16` after the gc fix and X5-R13
@@ -5147,6 +5288,21 @@ moved by 8b71e560, will be in it). This card's step-0 file
 (`results/campaign.json`, commit 929ade38) is F3-F1's Acceptance 10k —
 this card's own Acceptance 10k is **not committed** (F3-F3b's step 0
 commits it after its own provenance checks).
+
+**X-5c-F4's Acceptance** (the runner's, X5-R31 — this card runs no
+campaign-class command in its attempts; the probes above were ≤ 200
+contiguous seeds under `ulimit -v 25165824` with output outside the
+worktree): `cargo test -q --release -p e4-recovery`, then
+`$HOME/.cache/nv3-review/runlogs/X-5c-F4.acc.campaign.json` (the 10k
+`run --seeds 0..10000 --threads 16` with the card's prov lines), then
+**plain** `verify --results` of that file (the card's form — the quota
+table decides), then `bash scripts/gate.sh`. **Expected at this tip:**
+the digests and the seed set reproduce; the quota table carries the
+step-0 file's seven misses (SIZING, Q4, Q7, Q8, Q11, Q12, Q18 — Q11
+structurally, see the stage record), so `verify` exits 2 on the quota
+check alone; the gate itself stays green (fmt, clippy, the suite's 212
+tests). The workload at this tip is the step-0 workload: this card's
+probes moved no committed knob.
 
 **X-5c-F3-F3b's Acceptance** (the same X5-R31 discipline — the
 in-attempt commands of this card's attempts were the 0..200 step
