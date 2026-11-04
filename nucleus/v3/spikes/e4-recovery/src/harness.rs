@@ -1408,51 +1408,31 @@ fn checkpointer_body(
 ) -> Result<(), SimFail> {
     let mut idx = 0u64;
     loop {
-        let (trigger, final_ckpt, poison_end) = cx
+        let (trigger, final_ckpt) = cx
             .with("h:ck", |c| {
-                if c.store().poisoned.is_some()
-                    && !c.store().poison_fail_stop
-                    && !c.sched_mut().crashed
-                {
-                    // **X-5c-F4 step 4 (the MP poison+task-error class):
-                    // G8 (9.2, W8 (e)) — the checkpointer issues no step
-                    // after the mark, and a poisoned store is the end of
-                    // the round's workload.** The draft fell through to
-                    // a "final" checkpoint whose first step refused on
-                    // `alive()` with `Fail::Poisoned`, and the error arm
-                    // below recorded that designed refusal as a
-                    // round-failing harness task error ("checkpoint
-                    // failed: Poisoned(…)") beside the poison crash —
-                    // 17 MP rounds in X-5c-F4's step-0 file (747/788/
-                    // 967…, all `crash="poison"` with `terr=true`),
-                    // deterministically, whenever the checkpointer's
-                    // poll landed between the mark and the poisoner's
-                    // own crash delivery. The poison end is the script
-                    // task's arm, not an error. A **fail-stop** mark
-                    // (`poison_fail_stop`: the checkpoint path's own
-                    // invariant violations) keeps the loud task-error
-                    // path — D12b's `gc_w > T` and D4's meta-bound
-                    // refusals fail the round as they always did.
-                    return Ok((false, false, true));
-                }
                 if c.sched_mut().crashed || c.store().poisoned.is_some() {
                     // G8 (9.2, W8 (e)): the checkpointer issues no step
-                    // after the mark.
-                    return Ok((true, true, false));
+                    // after the mark. **X-5c-F4-F1 step 5:** the quiet
+                    // poll arm that stood here is deleted — with the
+                    // mid-checkpoint `Fail::Poisoned` arm in place,
+                    // every schedule it covered (a mark observed at the
+                    // poll) produces an identical record through the
+                    // final checkpoint below, whose `ckpt:begin`
+                    // refuses on `alive()` with the same external-mark
+                    // `Fail::Poisoned` and ends the workload at the
+                    // same poison crash. A fail-stop mark
+                    // (`poison_fail_stop`) keeps its loud task error
+                    // through the generic arm below, exactly as before.
+                    return Ok((true, true));
                 }
                 let h = c.h();
                 let by_commits = h.commits_done >= (idx + 1) * every || h.force_ckpt;
                 Ok((
                     by_commits || h.workload_done,
                     h.workload_done && !by_commits,
-                    false,
                 ))
             })
             .map_err(fail_of)?;
-        if poison_end {
-            checkpoint_poison_end(cx);
-            return Ok(());
-        }
         if trigger {
             cx.with("h:ck2", |c| {
                 let (f, n) = {
@@ -1528,6 +1508,19 @@ fn checkpointer_body(
                     // the store's checkpoint invariant violations fail
                     // the round with the same text the generic error
                     // arm records.
+                    //
+                    // **X-5c-F4-F1 step 5 (P ruling (c)): this is the
+                    // one quiet checkpointer arm.** The draft's `h:ck`
+                    // poll arm (X-5c-F4 step 4's first half) was
+                    // deleted: with this arm present, every schedule
+                    // the poll arm covered produces an identical record
+                    // through it — the draft poll path ran a "final"
+                    // checkpoint whose `ckpt:begin` refused on
+                    // `alive()` with the same `Fail::Poisoned`, which
+                    // this arm ends the same way (the demonstration is
+                    // the step-5 record in the README) — so the poll
+                    // arm was unreachable alone and no single-arm pin
+                    // could exist for it.
                     let fail_stop = cx
                         .with("h:ckpoisontype", |c| Ok(c.store().poison_fail_stop))
                         .map_err(fail_of)?;
