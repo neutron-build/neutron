@@ -53,8 +53,20 @@ impl DevAccess {
     fn authorize(&self, headers: &HashMap<String, String>, preflight: bool) -> bool {
         headers.get("host") == Some(&self.host)
             && headers.get("origin") == Some(&self.origin)
-            && (preflight || headers.get("x-neutron-dev-token") == Some(&self.token))
+            && (preflight
+                || headers
+                    .get("x-neutron-dev-token")
+                    .is_some_and(|t| constant_time_eq(t.as_bytes(), self.token.as_bytes())))
     }
+}
+
+/// Compare two byte strings without short-circuiting on the first mismatch.
+/// Only the length (fixed for the dev token) is observable through timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 struct Dispatch {
@@ -361,6 +373,19 @@ mod tests {
         h.insert("origin".into(), a.origin.clone());
         h.insert("host".into(), "evil.example".into());
         assert!(!a.authorize(&h, true));
+        h.insert("host".into(), a.host.clone());
+        for wrong in ["secreT", "secre", "secrets", ""] {
+            h.insert("x-neutron-dev-token".into(), wrong.into());
+            assert!(!a.authorize(&h, false), "token {wrong:?}");
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
 
