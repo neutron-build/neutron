@@ -11,39 +11,38 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-test("LocalExecutor strips well-known operator secrets from the inherited env by default", async () => {
+test("LocalExecutor does not inherit operator secrets, including unlisted names", async () => {
   const root = await mkdtemp(join(tmpdir(), "neutron-exec-default-"));
+  const names = ["ANTHROPIC_API_KEY", "MY_APP_DB_PASSWORD"];
+  const saved = names.map((name) => process.env[name]);
+  for (const name of names) process.env[name] = "operator-secret-value";
   try {
-    const saved = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = "operator-secret-value";
-    try {
-      const executor = new LocalExecutor({ root });
-      const result = await executor.exec("printenv ANTHROPIC_API_KEY");
-      assert.equal(result.stdout.trim(), "");
-      assert.notEqual(result.exitCode, 0);
-    } finally {
-      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = saved;
-    }
+    const executor = new LocalExecutor({ root });
+    const result = await executor.exec("env");
+    assert.equal(result.stdout.includes("operator-secret-value"), false);
+    const path = await executor.exec('printf %s "$PATH"');
+    assert.equal(path.stdout, process.env.PATH ?? "", "PATH stays inherited");
   } finally {
+    names.forEach((name, i) => {
+      const value = saved[i];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    });
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("LocalExecutor envDenylist: [] restores full inheritance (explicit opt-out)", async () => {
-  const root = await mkdtemp(join(tmpdir(), "neutron-exec-optout-"));
+test("LocalExecutor inheritEnv adds caller-listed names to the allowlist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "neutron-exec-inherit-"));
+  const saved = process.env.TEST_EXEC_EXTRA;
+  process.env.TEST_EXEC_EXTRA = "passed-through";
   try {
-    const saved = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = "operator-secret-value";
-    try {
-      const executor = new LocalExecutor({ root, envDenylist: [] });
-      const result = await executor.exec("printenv ANTHROPIC_API_KEY");
-      assert.equal(result.stdout.trim(), "operator-secret-value");
-    } finally {
-      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = saved;
-    }
+    const executor = new LocalExecutor({ root, inheritEnv: ["TEST_EXEC_EXTRA"] });
+    const result = await executor.exec("printenv TEST_EXEC_EXTRA");
+    assert.equal(result.stdout.trim(), "passed-through");
   } finally {
+    if (saved === undefined) delete process.env.TEST_EXEC_EXTRA;
+    else process.env.TEST_EXEC_EXTRA = saved;
     await rm(root, { recursive: true, force: true });
   }
 });

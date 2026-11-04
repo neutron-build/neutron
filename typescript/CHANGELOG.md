@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Security (breaking)
+
+- **`@neutron-build/agents` `LocalExecutor` builds the child env from an
+  allowlist** (`PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`) instead of
+  stripping a denylist of known secret names. `envDenylist` is removed; list
+  extra names to inherit in `inheritEnv`. Explicit `env` values are always
+  passed.
+- **`@neutron-build/agents` exec tool requires approval against a
+  `LocalExecutor` by default** (it runs as the host user; it is not a
+  sandbox). Opt out with `execNeedsApproval: false` on `runTurn`,
+  `agentWorkflow` or `createAgentHandler`, or `execTool(executor, {
+  needsApproval: false })`.
+- **`@neutron-build/agents` `createAgentHandler` requires `auth` whenever the
+  turn has any tools** (agent tools, skills or an executor), not only an
+  executor. Client `messages` may contain only user and assistant text;
+  `toolApprovals` in the body is refused (400). Resume approval-suspended
+  turns server-side (`agentWorkflow` or `runTurn`).
+
 ## [core 0.5.2, cli 0.5.2] - 2026-11-03
 
 Patch release; no migration. Found by profiling a large production app

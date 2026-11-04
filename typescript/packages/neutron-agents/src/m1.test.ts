@@ -10,7 +10,7 @@ import { jsonSchema } from "@neutron-build/ai";
 import type { LoadedAgent } from "./agent.js";
 import { AgentError, LocalExecutor } from "./executor.js";
 import { loadAgent } from "./loader.js";
-import { runTurn } from "./runtime.js";
+import { execTool, runTurn } from "./runtime.js";
 
 // ---------------------------------------------------------------------------
 // LocalExecutor
@@ -145,6 +145,7 @@ test("runTurn wires instructions, the exec tool, and a real command end-to-end",
   const result = await runTurn(inlineAgent(model), {
     input: "run echo",
     executor: await makeExecutor(),
+    execNeedsApproval: false,
   });
 
   assert.equal(result.text, "The command printed from-agent.");
@@ -157,6 +158,26 @@ test("runTurn wires instructions, the exec tool, and a real command end-to-end",
     | undefined;
   assert.equal(toolMessage?.content[0]?.output.exitCode, 0);
   assert.match(toolMessage?.content[0]?.output.stdout ?? "", /from-agent/);
+});
+
+test("exec against a LocalExecutor requires approval by default", async () => {
+  const executor = await makeExecutor();
+  const marker = "agent-ran-marker";
+  const { model } = scriptedModel([
+    {
+      content: [{ type: "tool-call", toolCallId: "c1", toolName: "exec", input: { command: `touch ${marker}` } }],
+      finishReason: "tool-calls",
+      usage,
+      raw: null,
+    },
+    { content: [{ type: "text", text: "done" }], finishReason: "stop", usage, raw: null },
+  ]);
+  const suspended = await runTurn(inlineAgent(model), { input: "run it", executor });
+  assert.equal(suspended.finishReason, "tool-approval");
+  assert.equal(suspended.approvalRequests[0]?.toolName, "exec");
+  await assert.rejects(executor.getFile(marker), AgentError, "the command must not run before approval");
+  assert.equal(execTool(executor).needsApproval, true);
+  assert.equal(execTool(executor, { needsApproval: false }).needsApproval, false);
 });
 
 test("approval suspension passes through with resume-ready messages", async () => {
@@ -194,23 +215,19 @@ test("approval suspension passes through with resume-ready messages", async () =
   assert.equal(resumed.text, "done");
 });
 
-test("LocalExecutor envDenylist strips secrets from exec env; explicit env still wins", async () => {
+test("LocalExecutor inherits only allowlisted env; explicit env still wins", async () => {
   process.env.TEST_SBX_SECRET = "leaky";
   try {
-    const scrubbed = new LocalExecutor({
-      root: await mkdtemp(join(tmpdir(), "exec-deny-")),
-      envDenylist: ["TEST_SBX_SECRET"],
-    });
+    const scrubbed = new LocalExecutor({ root: await mkdtemp(join(tmpdir(), "exec-deny-")) });
     const result = await scrubbed.exec('echo "got:${TEST_SBX_SECRET:-none}"');
-    assert.equal(result.stdout.trim(), "got:none", "denylisted var must not reach the child");
+    assert.equal(result.stdout.trim(), "got:none", "a non-allowlisted var must not reach the child");
 
     const withOverride = new LocalExecutor({
       root: await mkdtemp(join(tmpdir(), "exec-deny2-")),
-      envDenylist: ["TEST_SBX_SECRET"],
       env: { TEST_SBX_SECRET: "scoped-replacement" },
     });
     const overridden = await withOverride.exec('echo "got:${TEST_SBX_SECRET:-none}"');
-    assert.equal(overridden.stdout.trim(), "got:scoped-replacement", "explicit env outranks the strip");
+    assert.equal(overridden.stdout.trim(), "got:scoped-replacement", "explicit env is always passed");
   } finally {
     delete process.env.TEST_SBX_SECRET;
   }
