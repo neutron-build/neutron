@@ -246,6 +246,7 @@ where
                 if byte == b'\n' { take_line!(); } else { line_bytes.push(byte); }
             }
         }
+        #[allow(unused_assignments)]
         if !line_bytes.is_empty() { take_line!(); }
         flush_event!();
     }
