@@ -2975,10 +2975,15 @@ git -C "$r" branch -q -D side-XOW
 # nothing"), never a crash, a skip or an empty set. "--all" as a start once
 # reached rev-list as an option and emptied the worker set; a nonexistent id
 # fails the rev-list (G-REVLIST-FAIL-TRUSTS); "not json" is G-MALFORMED-TRUSTS.
-# wc WANT LEDGER...: worker_commits over $r with base e2e/base, one ledger file
-# per LEDGER (its whole text). WANT "none" requires None for every one, "empty"
-# requires set(). A raised exception is a mismatch, printed as such.
-wc() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$t/wc" "$@" <<'P'
+# ledger_wc WANT LEDGER...: worker_commits over $r with base e2e/base, one
+# ledger file per LEDGER (its whole text). WANT "none" requires None for every
+# one, "empty" requires set(). A raised exception is a mismatch, printed as such.
+# The LEDGER token @deep stands for one line of 100000 "[" then 100000 "]": too
+# deep for json.loads (RecursionError at Python's default limit), and too long
+# to pass comfortably as an argument. Not named wc: a function of that name
+# shadowed coreutils wc for the rest of the suite, and in the subshells (cm,
+# cpm, dr_cm) whose core-paths-lib.sh runs wc -c (verdict X-6-F1-F1-F1).
+ledger_wc() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$t/ledger_wc" "$@" <<'P'
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
 repo, d, want, cases = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5:]
@@ -2986,6 +2991,7 @@ d.mkdir(exist_ok=True)
 ok = bool(cases)
 for i, text in enumerate(cases):
     path = d / f"{i}.ledger.jsonl"
+    text = "[" * 100000 + "]" * 100000 if text == "@deep" else text
     path.write_text(text + "\n")
     try:
         got = rc.worker_commits(repo, "e2e/base", path)
@@ -2993,7 +2999,7 @@ for i, text in enumerate(cases):
         got = f"raised {type(x).__name__}: {x}"
     good = got is None if want == "none" else got == set()
     ok = ok and good
-    print("ok  " if good else "BAD ", repr(text), "->", repr(got))
+    print("ok  " if good else "BAD ", repr(text if len(text) < 200 else text[:20] + f"... ({len(text)} chars)"), "->", repr(got))
 sys.exit(0 if ok else 1)
 P
 }
@@ -3002,7 +3008,11 @@ wcu=$(tr a-f A-F <<<"$wo")
 wcx=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 expect_ok "runner ledger: premise: the uppercase id differs and the made-up id is no object here" \
   bash -c '[ "$1" != "$2" ] && ! git -C "$3" cat-file -e "$4^{commit}"' _ "$wcu" "$wo" "$r" "$wcx"
-expect_ok "runner ledger: malformed records trust nothing" wc none \
+# The end cases and "$wo^0" below are ones git accepts, so a check weaker than
+# OID_RE.fullmatch (a str test for ends, .match for starts) would trust them.
+ledger_revs_resolve() { plain rev-parse --verify "$wo^0" && plain rev-parse --verify e2e/base; }
+expect_ok "runner ledger: premise: \$wo^0 and e2e/base resolve, so those cases discriminate" ledger_revs_resolve
+expect_ok "runner ledger: malformed records trust nothing" ledger_wc none \
   'not json' \
   '[]' \
   "{\"run\": 1, \"start\": \"$wo\"}" \
@@ -3014,8 +3024,14 @@ expect_ok "runner ledger: malformed records trust nothing" wc none \
   "{\"run\": \"a\", \"start\": \"$wcu\"}" \
   "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n''{"run": "a", "end": 123}' \
   "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n''{"run": "a", "end": "--all"}' \
-  "{\"run\": \"a\", \"start\": \"$wcx\"}"
-expect_ok "runner ledger: control: a well-formed closed range lists an empty set, not None" wc empty \
+  "{\"run\": \"a\", \"start\": \"$wcx\"}" \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n''{"run": "a", "end": "HEAD"}' \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n''{"run": "a", "end": "e2e/base"}' \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n'"{\"run\": \"a\", \"end\": \"${wo:0:39}\"}" \
+  "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n'"{\"run\": \"a\", \"end\": \"$wcu\"}" \
+  "{\"run\": \"a\", \"start\": \"$wo^0\"}" \
+  '@deep'
+expect_ok "runner ledger: control: a well-formed closed range lists an empty set, not None" ledger_wc empty \
   "{\"run\": \"a\", \"start\": \"$wo\"}"$'\n'"{\"run\": \"a\", \"end\": \"$wo\"}"
 # The same ledgers end to end (as D: a hand-written ledger, a hand-made verdict
 # commit, then a --keep run doing clean work): the verdict must be flagged. On
@@ -3031,10 +3047,17 @@ xm() { git -C "$r" worktree add -q -B "card/v3-$1" "$ewt/$1" e2e/base
   e2e "$1" work --attempts 1 --keep; }
 # flagged_raw ID: flagged's test, for a ledger res cannot parse (res reads every
 # line as JSON). It also requires the bad line still first, then this run's
-# start and end: the runner trusts nothing and repairs nothing.
+# start and end: the runner trusts nothing and repairs nothing. Like res, it
+# first kills a leftover opencode child (its .n.pid), so the two behave alike.
 flagged_raw() { PYTHONDONTWRITEBYTECODE=1 python3 - "$e/$1" "$e/cards/logs/$1.ledger.jsonl" "$1" <<'P'
-import json, pathlib, sys
+import json, os, pathlib, signal, sys
 b, lp, cid = sys.argv[1:4]
+pidf = pathlib.Path(b + ".n.pid")
+for kill in (os.killpg, os.kill) if pidf.exists() else ():  # os.kill: a child left in the runner's own group
+    try:
+        kill(int(pidf.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 read = lambda suffix: pathlib.Path(b + suffix).read_text() if pathlib.Path(b + suffix).exists() else ""
 r, out, lines = json.loads(read(".json") or "{}"), read(".out"), pathlib.Path(lp).read_text().splitlines()
 print(out)
@@ -3055,6 +3078,17 @@ expect_ok "runner e2e: XMD: a non-string start trusts nothing, without raising" 
 xm XME '{"run":"r","start":"TIP","t":0}'$'\n''{"run":"r","end":"TIP","t":0}'
 expect_ok "runner e2e: XME: control: a well-formed closed range trusts the verdict between runs" \
   res XME "rc == 0 and r['pass'] and r['scope'] == 'ok' and '(protected)' not in out"
+# The ledger helper is ledger_wc, not wc: a function named wc would shadow
+# coreutils wc here and in every subshell after it (cm, cpm, dr_cm), where
+# core-paths-lib.sh's base_core_entries counts with wc -c. expect_ok runs the
+# first row in this shell, so it sees any such function; the second makes the
+# call that a shadowed wc -c breaks. git-env.sh is sourced too: it defines the
+# verify_blob that base_core_entries needs (enforce-lib.sh sources it for cm).
+wc_is_file() { [ "$(type -t wc)" = file ]; }
+expect_ok "ledger block: coreutils wc is not shadowed" wc_is_file
+core_entries_sub() { (cd "$v3" && . scripts/git-env.sh && . scripts/core-paths-lib.sh && base_core_entries nucleus/v3-scaffold nucleus/v3) >"$t/bce.out" || return 1
+  cat "$t/bce.out"; grep -q '^tools/' "$t/bce.out"; }
+expect_ok "ledger block: base_core_entries in a subshell reads CORE_PATHS (its wc -c is coreutils')" core_entries_sub
 # --- runner: a branch rewritten since its ledger's runs (X-6-F1-F1-F3) ------
 # Ledger ranges are keyed on commit ids, so a rebase or amend between runs gives
 # an earlier run's forged verdict a new id in no range, and a --keep run trusted
