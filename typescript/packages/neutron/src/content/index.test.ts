@@ -599,6 +599,14 @@ async function makeTypeScriptConfigFixtureProject(): Promise<string> {
   tempRoots.push(root);
 
   await fs.mkdir(path.join(root, "src", "content", "blog"), { recursive: true });
+  // Install the package into the fixture the way an app has it, so the config's
+  // bare import resolves from the fixture rather than from the test runner.
+  await fs.mkdir(path.join(root, "node_modules", "@neutron-build"), { recursive: true });
+  await fs.symlink(
+    path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", ".."),
+    path.join(root, "node_modules", "@neutron-build", "core"),
+    "dir"
+  );
   await fs.writeFile(
     path.join(root, "src", "content", "config.ts"),
     `

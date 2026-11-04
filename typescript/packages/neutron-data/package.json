@@ -46,7 +46,7 @@
     "@libsql/client": "^0.17.0",
     "@neutron-build/nucleus": "workspace:^",
     "bullmq": "^5.58.0",
-    "drizzle-orm": "^0.44.5",
+    "drizzle-orm": "^0.45.2",
     "ioredis": "^5.8.1",
     "postgres": "^3.4.7"
   },
@@ -75,7 +75,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "drizzle-orm": "^0.45.2"
   },
   "publishConfig": {
     "access": "public"

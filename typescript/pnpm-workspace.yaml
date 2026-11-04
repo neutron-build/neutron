@@ -10,3 +10,17 @@ packages:
   - "examples/*"
   # Ecosystem compatibility harness (A-007). Never published.
   - "compat-matrix"
+
+# Supply-chain hardening. A version must be on the registry for 3 days before
+# it can be resolved (most hijacked releases are caught and pulled sooner), and
+# dependency install scripts run only for the packages listed below.
+minimumReleaseAge: 4320
+strictDepBuilds: true
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - better-sqlite3
+  - esbuild
+  - msgpackr-extract
+  - prisma
+  - sharp

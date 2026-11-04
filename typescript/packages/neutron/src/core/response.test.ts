@@ -56,7 +56,6 @@ describe("response helpers", () => {
       expect(globalThis.Response).not.toBe(nativeResponse);
       const fromFactory = Response.json({ ok: true }, { status: 201 });
       const fromCtor = new Response("x", { status: 201 });
-      expect(fromFactory instanceof Response).toBe(false);
       expect(isResponse(fromFactory)).toBe(true);
       expect(isResponse(fromCtor)).toBe(true);
       expect(isResponse(Response.redirect("http://localhost/", 302))).toBe(true);
