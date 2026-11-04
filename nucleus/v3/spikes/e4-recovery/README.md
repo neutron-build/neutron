@@ -908,6 +908,29 @@ splits out `served=true` rounds first (the oracle's `o3` text is
 last-writer-wins, so a serve can read as O-3(d), and an `O-3(a)` text can
 hide an O-3(e) failure).
 
+### Carried: X5-R36, verbatim (binding; pre-data; `verdicts/X-5c-F3-F3a-F2.md`; landed by X-5c-F3-F3a-F2-F1, committed as text by that card's step 0)
+
+**X5-R36 (the drop incarnation: what the model reads after `DropTree`).**
+- **Source.**
+  - S-STORE §6.8: DropTree frees the tree's pages and removes its directory entry, and CreateTree allocates a fresh root leaf.
+  - This verdict's ESCALATE ruling.
+  - The workload re-uses a dropped tree's id in the next round's setup commit. That is a prototype deviation from §6.8's "never reused", and it stands, because changing the workload would move every seed with a drop round.
+- **(a) The rule.**
+  - For a user tree `t` and a cut `c`, let `d(t, c)` be the largest ts `≤ c` of a model commit holding `DropTree{t}`, or 0 if there is none.
+  - `Model::scan_at(t, S, c)` is `Model::scan(t, S)` computed only over ops on `t` from commits with `d(t, c) < ts ≤ S`, and over loads of `t` with `d(t, c) < S_L ≤ S`. For `S ≤ d(t, c)` it is empty.
+  - `Model::scan(t, S)` becomes `scan_at(t, S, S)`.
+  - The catalog (tree 1) is never dropped. `published_at` is unchanged.
+- **(b) The wiring.**
+  - O-1(b) at candidate `c` compares against `scan_at(t, c, c)`.
+  - O-1(d) at sample `S` compares against `scan_at(t, S, c)`.
+  - Every harness call site that compares a store scan with the model at a read point `x` (`harness.rs` near 3286, 4516, 5123, and `o1_at_frontier_lines`) uses the cut that the compared store state recovered or read at.
+- **(c) What it does not touch.** `lo`, `hi`, the candidate set, `sample_points`, O-1(a)/(c), O-1f, O-2, O-3, K, R, X5-R1/R33/R34/R35, `trees_at`, the sim, the fault and crash models, and the workload stream.
+- **(d) It loosens nothing a correct store can satisfy.** It removes only the expectation of pre-drop content in a re-created tree, which §6.8 makes unservable. A store that serves pre-drop content in a re-created tree now fails O-1(b)/(d), where before it was required to.
+- **(e) The id-reuse hazard is surfaced, never excluded.** The round record gains `reuse_on_dropping`, computed from SimDisk/opened-image data and never from store memory. It is true when the opened image's directory holds `t` as `dropping` and the model holds `CreateTree{t}` at a ts in `(T, frontier]`.
+  - Such a round still runs the full oracle and counts by its outcome.
+  - Any `reuse_on_dropping = true` in F1's windows or in F4's 10k is an ESCALATE to P with the round.
+- **(f) Pre-data.** No run that judges by X5-R36 has been read. The gate's and the worker's 0..200 and single-seed runs are diagnosis, never judgement evidence.
+
 ## P ruling X5-R35, verbatim (the X-5c-F3-F3a rework gate, 2026-11-03;
 ## binding from the rework's first run; `verdicts/X-5c-F3-F3a.md` at
 ## 98313ae3 — committed before any run of the rework)
