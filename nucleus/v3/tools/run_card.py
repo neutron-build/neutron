@@ -625,16 +625,79 @@ def ledger_rewritten(wt, path):
     return gone
 
 
+def _verify_history(wt, base, tip):
+    """The problem lines of a hash check of every commit and tree that a
+    path-limited `git log base..tip -- <path>` reads ([] when there are none):
+    verify_objects' set, plus the commits of base..tip with their boundary (the
+    parents the oldest range commits are compared against), plus every tree
+    under each of those commits. A path-limited log compares each commit's
+    tree with its parent's, so an interior tree that is never hashed can make
+    a worker's commit look TREESAME and hide it (X-6-F1-F2-F3-F1 Finding 1).
+    A failed git step is a problem line, never "nothing found". Caches
+    nothing. Blobs are not read by such a log, so they are not verified."""
+    env = git_env()
+
+    def failed(step, p):
+        return [f"verify_objects: git {step} failed (exit {p.returncode}; cannot verify objects)"]
+
+    try:
+        d = pathlib.Path(tempfile.mkdtemp())
+    except OSError:
+        return ["verify_objects: cannot create a temporary directory (cannot verify objects)"]
+    try:
+        # verify_objects' three listings, repeated (its set is the floor).
+        p = subprocess.run(["git", "rev-list", "--boundary", f"{base}...{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode:
+            return failed("rev-list", p)
+        commits = [c.lstrip("-") for c in p.stdout.split()]
+        # Exit 1 is no merge base (unrelated histories); anything else fails.
+        p = subprocess.run(["git", "merge-base", "--all", base, tip], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode > 1:
+            return failed("merge-base", p)
+        mbs = p.stdout.split()
+        p = subprocess.run(["git", "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", base, tip, *mbs, "--"], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode:
+            return failed("rev-list", p)
+        roots = p.stdout.split()
+        # The log's own range, boundary included, marker stripped.
+        p = subprocess.run(["git", "rev-list", "--boundary", f"{base}..{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode:
+            return failed("rev-list", p)
+        hist = list(dict.fromkeys(c.lstrip("-") for c in p.stdout.split()))
+        # Every tree under each listed commit. --no-walk over the commits, not
+        # `rev-list --objects base..tip`: with a negative revision, --objects
+        # leaves out every tree reachable from the excluded side, so a subtree
+        # shared with an edge commit would never be listed though the log reads
+        # it. The walk lists a tree shared between commits once, so the cost is
+        # the distinct trees of the range, not commits x trees. --stdin: a long
+        # range stays off argv.
+        trees = []
+        if hist:
+            cmd = ["git", "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", "--stdin"]
+            p = subprocess.run(cmd, cwd=wt, env=env, input="".join(c + "\n" for c in hist), capture_output=True, text=True)
+            if p.returncode:
+                return failed("rev-list", p)
+            trees = p.stdout.split()
+        if not roots:
+            return ["verify_objects: the object listing is empty (cannot verify objects)"]
+        return _verify_ids(wt, "verify_objects", list(dict.fromkeys(commits + mbs + roots + hist + trees)), d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def gate_committed(wt, base, f, card_id, pre_head, ledger=None):
     """True if the last commit before this run (pre_head) to touch f is the
     gate's verdict commit for this card. A subject alone proves nothing (a
     worker can write one), so the commit must also be no worker commit in the
     trust ledger, and the caller requires f untouched since pre_head. ledger
     None checks the subject only: the unit scenarios, which have no runs.
-    main() always passes one. Objects that fail verify_objects(base, pre_head)
-    are False before anything is read, ledger or not: a forged commit can carry
-    any subject, and a forged tree can hide a worker's change to f."""
-    if verify_objects(wt, base, pre_head):
+    main() always passes one. Objects that fail _verify_history(base, pre_head),
+    which covers every commit and tree the path-limited log reads, are False
+    before anything is read, ledger or not: a forged commit can carry any
+    subject, and the log compares every interior commit's tree with its
+    parent's, so one forged tree there can hide a worker's change to f
+    (X-6-F1-F2-F3-F1 Finding 1)."""
+    if _verify_history(wt, base, pre_head):
         return False
     _, out = run(["git", "log", "-1", "--format=%H %s", f"{base}..{pre_head}", "--", f], wt)
     sha, _, subject = out.strip().partition(" ")
