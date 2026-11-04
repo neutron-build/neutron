@@ -3605,9 +3605,48 @@ expect_ok "fresh-gate: FG14: a swapped symlink blob is refused, naming the path 
 expect_ok "fresh-gate: FG14: no checkout is left" fg_clean
 restore_forged
 expect_ok "forged objects: FG14 restored" no_state4
-# FG11e goes here (GLM, verdict X-6-F1-F2-F2-F1-F1 R6): a lone-CR forgery
-# under text eol=crlf (blob x=1\r\n, source x=1\r\r\n), in the FG11d
-# pattern; mutant FG-LONE-CR-OK must fail it. Not written yet.
+# FG11e, a lone-CR forgery under text eol=crlf (verdict R6, pins the no-lone-CR
+# half of the CRLF-pair condition, which FG11d's lone LF cannot reach): clean
+# collapses only CRLF pairs, so the forged \r\r\n cleans back to the honest
+# \r\n blob — hash-object --path still names the tree id — while smudge gives
+# an LF that already has a CR before it no second one, so the lone CR survives
+# the checkout and the gate would run bytes the honest checkout (x=1\r\n)
+# never holds. The blob is committed raw (hash-object -w --no-filters plus
+# update-index --cacheinfo) because git add would clean it to x=1\n. The byte
+# premise below pins only the no-lone-LF half — exactly what FG-LONE-CR-OK
+# keeps — so the lone CR is left for the refusal row to pin.
+git -C "$r" checkout -q -b card/v3-FG11e nucleus/v3-scaffold
+fgstub "$r" FG11e
+printf 'nucleus/v3/spikes/fg11e.ps1 text eol=crlf\n' >"$r/.gitattributes"
+git -C "$r" add .gitattributes
+fg11e_raw=$(printf 'x=1\r\n' | git -C "$r" hash-object -w --no-filters --stdin)
+git -C "$r" update-index --add --cacheinfo 100644,"$fg11e_raw",nucleus/v3/spikes/fg11e.ps1
+git -C "$r" commit -qm "nucleus v3: FG11e lone-cr blob"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fg11e_id=$(git -C "$r" rev-parse card/v3-FG11e:nucleus/v3/spikes/fg11e.ps1)
+fg11e_src=$(printf 'x=1\r\r\n' | git -C "$r" hash-object -w --no-filters --stdin)
+expect_ok "premise: FG11e: the committed blob is the raw x=1\r\n one (git add would have cleaned it), and both blobs are loose objects" bash -c "[ '$fg11e_id' = '$fg11e_raw' ] && [ -f '$(objlo "$r" "$fg11e_id")' ] && [ -f '$(objlo "$r" "$fg11e_src")' ]"
+save_obj "$r" "$fg11e_id"
+forge_from "$r" "$fg11e_id" "$fg11e_src"
+git -C "$r" worktree add -q --detach "$t/fg11ep" card/v3-FG11e
+fg11e_hidden() {
+  local s a
+  a=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11ep" check-attr -a -- nucleus/v3/spikes/fg11e.ps1)
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11ep" ls-files -s -- nucleus/v3/spikes/fg11e.ps1)
+  echo "attrs: $a"; echo "index: $s"
+  [ "$a" = "$(printf 'nucleus/v3/spikes/fg11e.ps1: text: set\nnucleus/v3/spikes/fg11e.ps1: eol: crlf')" ] \
+    && [ "$(git -C "$r" hash-object --no-filters "$t/fg11ep/nucleus/v3/spikes/fg11e.ps1")" = "$fg11e_src" ] \
+    && [ "$s" = "$(printf '100644 %s 0\tnucleus/v3/spikes/fg11e.ps1' "$fg11e_id")" ] \
+    && [ "$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11ep" hash-object --path=nucleus/v3/spikes/fg11e.ps1 -- nucleus/v3/spikes/fg11e.ps1)" = "$fg11e_id" ] \
+    && od -An -v -tx1 -- "$t/fg11ep/nucleus/v3/spikes/fg11e.ps1" | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) { if ($i == "0a" && p != "0d") bad = 1; p = $i } } END { exit bad ? 3 : 0 }'
+}
+expect_ok "premise: FG11e: attrs text set, eol crlf; the checkout holds the source bytes (a lone CR, no lone LF); the index names the tree id; hash-object --path equals the tree id" fg11e_hidden
+git -C "$r" worktree remove --force "$t/fg11ep"
+fgrun card/v3-FG11e
+expect_ok "fresh-gate: FG11e: a lone-CR forgery under text eol=crlf is refused, naming the path and both ids, before the gate runs" fg_refused "nucleus/v3/spikes/fg11e.ps1: content hashes to $fg11e_src, tree says $fg11e_id"
+expect_ok "fresh-gate: FG11e: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG11e restored" no_state4
 expect_ok "fresh-gate: no attribute file is left in the scratch worktree after the GLM rows" bash -c "[ ! -e '$r/.gitattributes' ]"
 expect_ok "git state: none after the GLM forged-object rows" no_state
 # --- end of GLM rows --------------------------------------------------------
