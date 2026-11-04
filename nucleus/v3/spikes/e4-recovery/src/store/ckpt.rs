@@ -610,6 +610,11 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
                 let st = c.store();
                 if st.poisoned.is_none() {
                     st.poisoned = Some(format!("checkpoint step failed: {e} (9.2, G8)"));
+                    // X-5c-F4 step 4: a checkpoint step's own failure is
+                    // the checkpoint path's fail-stop — loud (the
+                    // checkpointer consults the flag). An external G8
+                    // mark (already set) keeps its quiet detection end.
+                    st.poison_fail_stop = true;
                 }
                 Ok(())
             })
@@ -682,6 +687,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let skip_bound = matches!(st.cfg.mutant, Some(Mutant::GcwBoundSkip));
         if over && !skip_bound {
             st.poisoned = Some("gc_w > T at meta write".into());
+            // X-5c-F4 step 4: the checkpoint path's own fail-stop stays
+            // loud (the checkpointer consults the flag).
+            st.poison_fail_stop = true;
             return Ok(FlipOut::Abort(Fail::Poisoned("gc_w > T".into())));
         }
         if matches!(st.cfg.mutant, Some(Mutant::GcwNotRecorded)) {
@@ -888,6 +896,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
                 let st = c.store();
                 if st.poisoned.is_none() {
                     st.poisoned = Some(why.clone());
+                    // X-5c-F4 step 4: the checkpoint path's own fail-stop
+                    // stays loud (the checkpointer consults the flag).
+                    st.poison_fail_stop = true;
                 }
                 Ok(())
             })

@@ -1100,3 +1100,57 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
         assert!(rec.defect.is_none(), "seed {seed}: no harness defect");
     }
 }
+
+/// **X-5c-F4 step 4 pin (the new MP poison+task-error class; literal
+/// configs = the class's repro seeds 747 and 967, round 1 each).** The
+/// class: G8's harness contract ends a poisoned workload at the poison
+/// crash ("the faults, the recovery and the oracle run as usual"), but
+/// `checkpointer_body` fell through to a final checkpoint whose first
+/// step refused on `alive()` with `Fail::Poisoned`, and its error arm
+/// recorded that designed refusal as a round-failing task error
+/// ("checkpoint failed: Poisoned("XX001 in gated op: …")") beside the
+/// poison crash — 17 MP rounds in X-5c-F4's step-0 file (zero in
+/// F3-F3a's), deterministically, whenever the checkpointer's poll
+/// landed between the mark and the poisoner's own crash delivery. The
+/// fix (`checkpoint_poison_end`) gives the checkpointer the script
+/// task's arm: no step after the mark, the crash delivered at once,
+/// the round judged as the detection round it is. Reverting the fix
+/// (mutant M-CKPOISONa: the `h:ck` poison arm falls through to the
+/// checkpoint again) fails this pin — seed 747 round 1 records
+/// `terr=true` and the round fails. A second revert arm (M-CKPOISONb:
+/// the mid-checkpoint `Fail::Poisoned` case removed) fails the same
+/// assertions whenever the mark lands mid-checkpoint.
+#[test]
+fn g8_checkpoint_poison_ends_the_workload() {
+    for seed in [747u64, 967] {
+        let rec = workload::run_seed(seed, None);
+        let r1 = &rec.rounds[1];
+        assert!(
+            r1.crash == "poison",
+            "seed {seed} round 1: the crash desc must record the poison point: {:?}",
+            r1.crash
+        );
+        assert!(
+            r1.fired,
+            "seed {seed} round 1: the poison delivery is the round's crash (never a NEVER-FIRED)"
+        );
+        assert!(
+            r1.task_error.is_none(),
+            "seed {seed} round 1: the store's designed post-mark refusal is never a harness \
+             task error: {:?}",
+            r1.task_error
+        );
+        assert!(
+            !r1.deadlock && !r1.livelock,
+            "seed {seed} round 1: the workload ends at the poison, no livelock (site {:?})",
+            r1.livelock_site.as_str()
+        );
+        assert!(
+            r1.pass,
+            "seed {seed} round 1: the round must pass as the detection round it is: \
+             o1={:?} o2={:?} o3={:?}",
+            r1.o1_fail, r1.o2_fail, r1.o3_fail
+        );
+        assert!(rec.defect.is_none(), "seed {seed}: no harness defect");
+    }
+}

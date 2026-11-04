@@ -1372,6 +1372,35 @@ fn evictor_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
     }
 }
 
+/// **X-5c-F4 step 4 (the MP poison+task-error class): the checkpointer's
+/// G8 poison end** — the poisoned store is the end of the round's
+/// workload exactly as the script task's `Fail::Poisoned` arm ends it:
+/// the crash desc of record becomes `poison` (the `poison_crash` flag),
+/// `workload_done` is set, the wait keys are woken and the crash is
+/// delivered at once — so the round continues to its faults, recovery
+/// and the ruled oracle "as usual" (G8's harness contract), never
+/// failing through a harness task error for the store's own designed
+/// post-mark refusal.
+fn checkpoint_poison_end(cx: &Cx<'_, RoundWorld>) {
+    let world_crashed = cx
+        .with("h:ckpoison", |c| {
+            let crashed = c.sched_mut().crashed;
+            if !crashed {
+                let h = c.h();
+                h.poison_crash = true;
+                h.workload_done = true;
+            }
+            Ok(crashed)
+        })
+        .unwrap_or(true);
+    if !world_crashed {
+        cx.w.wake(WaitKey::WalAcks);
+        cx.w.wake(WaitKey::MetaDurable);
+        cx.w.wake(WaitKey::Applied);
+        cx.w.deliver_crash();
+    }
+}
+
 fn checkpointer_body(
     cx: &Cx<'_, RoundWorld>,
     every: u64,
@@ -1379,21 +1408,51 @@ fn checkpointer_body(
 ) -> Result<(), SimFail> {
     let mut idx = 0u64;
     loop {
-        let (trigger, final_ckpt) = cx
+        let (trigger, final_ckpt, poison_end) = cx
             .with("h:ck", |c| {
+                if c.store().poisoned.is_some()
+                    && !c.store().poison_fail_stop
+                    && !c.sched_mut().crashed
+                {
+                    // **X-5c-F4 step 4 (the MP poison+task-error class):
+                    // G8 (9.2, W8 (e)) — the checkpointer issues no step
+                    // after the mark, and a poisoned store is the end of
+                    // the round's workload.** The draft fell through to
+                    // a "final" checkpoint whose first step refused on
+                    // `alive()` with `Fail::Poisoned`, and the error arm
+                    // below recorded that designed refusal as a
+                    // round-failing harness task error ("checkpoint
+                    // failed: Poisoned(…)") beside the poison crash —
+                    // 17 MP rounds in X-5c-F4's step-0 file (747/788/
+                    // 967…, all `crash="poison"` with `terr=true`),
+                    // deterministically, whenever the checkpointer's
+                    // poll landed between the mark and the poisoner's
+                    // own crash delivery. The poison end is the script
+                    // task's arm, not an error. A **fail-stop** mark
+                    // (`poison_fail_stop`: the checkpoint path's own
+                    // invariant violations) keeps the loud task-error
+                    // path — D12b's `gc_w > T` and D4's meta-bound
+                    // refusals fail the round as they always did.
+                    return Ok((false, false, true));
+                }
                 if c.sched_mut().crashed || c.store().poisoned.is_some() {
                     // G8 (9.2, W8 (e)): the checkpointer issues no step
                     // after the mark.
-                    return Ok((true, true));
+                    return Ok((true, true, false));
                 }
                 let h = c.h();
                 let by_commits = h.commits_done >= (idx + 1) * every || h.force_ckpt;
                 Ok((
                     by_commits || h.workload_done,
                     h.workload_done && !by_commits,
+                    false,
                 ))
             })
             .map_err(fail_of)?;
+        if poison_end {
+            checkpoint_poison_end(cx);
+            return Ok(());
+        }
         if trigger {
             cx.with("h:ck2", |c| {
                 let (f, n) = {
@@ -1457,6 +1516,37 @@ fn checkpointer_body(
             match r {
                 Err(Fail::Sim(SimFail::Crashed)) => return Ok(()),
                 Err(Fail::Sim(s)) => return Err(s),
+                Err(Fail::Poisoned(why)) => {
+                    // **X-5c-F4 step 4:** the mark landed mid-checkpoint
+                    // and this step's `alive()` refused. For an external
+                    // G8 detection mark that is the designed refusal
+                    // ("every later mutation refuses with
+                    // `Fail::Poisoned`"), never a round-failing task
+                    // error: the workload ends at the poison crash, as
+                    // the script task's arm ends it. A **fail-stop**
+                    // mark (`poison_fail_stop`) keeps the loud path —
+                    // the store's checkpoint invariant violations fail
+                    // the round with the same text the generic error
+                    // arm records.
+                    let fail_stop = cx
+                        .with("h:ckpoisontype", |c| Ok(c.store().poison_fail_stop))
+                        .map_err(fail_of)?;
+                    if !fail_stop {
+                        checkpoint_poison_end(cx);
+                    } else {
+                        let e = Fail::Poisoned(why);
+                        cx.with("h:ckfail", |c| {
+                            let h = c.h();
+                            if h.task_error.is_none() {
+                                h.task_error = Some(format!("checkpoint failed: {e:?}"));
+                            }
+                            h.workload_done = true;
+                            Ok(())
+                        })
+                        .ok();
+                    }
+                    return Ok(());
+                }
                 Err(e) => {
                     // A checkpoint that fails without a crash (the
                     // I-GCW fail-stop, a poisoned store) is a round

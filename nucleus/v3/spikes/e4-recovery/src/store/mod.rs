@@ -489,6 +489,18 @@ pub struct StoreInner {
     pub dirty_max: u64,
     /// Poison reason (I-FAIL-STOP).
     pub poisoned: Option<String>,
+    /// **X-5c-F4 step 4 (the MP poison+task-error class):** the poison
+    /// was created by the **checkpoint path's own fail-stop** — the
+    /// I-GCW bound (`gc_w > T` at the flip), §13 step 4's meta bound,
+    /// or a checkpoint step's non-Sim failure (the wrapper's mark) —
+    /// as opposed to an external G8 detection mark (a gated op's XX001
+    /// read, a background job's detection). The store's checkpoint
+    /// invariant violations must stay **loud** round failures (D12b's
+    /// fail-stop, D4's step-1/step-4 refusals), while G8's detected
+    /// damage ends the workload at the poison crash and the round is
+    /// judged by the oracle (its harness contract). The checkpointer
+    /// consults this flag; nothing else reads it.
+    pub poison_fail_stop: bool,
     /// A world-acquisition failure observed on a release path (S-BATON
     /// rule 4: loud, never swallowed). Release helpers (`gate_release`,
     /// `tree_unlock`, `unpin`, the eviction ungate, the checkpoint's
@@ -558,6 +570,7 @@ impl StoreInner {
             dirty_now: BTreeSet::new(),
             dirty_max: 0,
             poisoned: None,
+            poison_fail_stop: false,
             baton_fail: None,
             wal: wal::WalState::default(),
         }
