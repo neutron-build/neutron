@@ -982,6 +982,21 @@ splits out `served=true` rounds first (the oracle's `o3` text is
 last-writer-wins, so a serve can read as O-3(d), and an `O-3(a)` text can
 hide an O-3(e) failure).
 
+## P ruling X5-R35, verbatim (the X-5c-F3-F3a rework gate, 2026-11-03;
+## binding from the rework's first run; `verdicts/X-5c-F3-F3a.md` at
+## 98313ae3 — committed before any run of the rework)
+
+- **(a)** X5-R34's `E` is the slice of `disk.events` from the workload pass's first event to its end. The recovery and the harness boot checkpoint that precede the workload in `run_round`'s capture are not in `E`. (b) 1–5, (c)–(f) and (i) are otherwise unchanged. `Rc` and β are read over this `E`.
+- **(b)** A new self-test (g) 6 must fail: a recovery truncation zero-write plus its sync covers an enqueued, never-written SyncOn record, which must not be acked. Show that it fails on 13da010b's derivation, then revert.
+- **(c)** The rule. At the rework's tip, each of the 17 named rounds must leave `frontier < lo` or be recorded as moved (X5-R34 (h) 6). Any that keeps it is an (h) 3 store loss.
+- **(d)** This raises no `lo` and tightens nothing else. It removes an unsatisfiable lower bound: a commit whose bytes never reached disk.
+
+*(README annotation, not part of the verbatim text: the ruling's post-data
+note — "the 17 rounds above were seen" — names the verdict's Finding 2
+rounds: 205 r2, 381 r1, 403 r1, 774 r2, 1174 r2, 1203 r1, 3805 r2,
+3883 r2, 4193 r1, 4601 r1, 4612 r2, 5030 r1, 7203 r2, 7803 r1, 8200 r2,
+8404 r1 and 8825 r2.)*
+
 ## Stage X-5c-F1's record (X-5c-F1)
 
 ### X5-R14: the non-reproducing digests — root-caused, fixed, pinned
