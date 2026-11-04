@@ -1222,10 +1222,10 @@ async fn cmd_start(cfg: StartConfig) {
     let pool_config = SyncPoolConfig {
         max_connections: config.server.max_connections as u32,
         min_idle: config.pool.min_idle as u32,
-        max_idle_time_ms: config.pool.max_idle_time_secs * 1000,
-        max_lifetime_ms: config.pool.max_lifetime_secs * 1000,
-        acquire_timeout_ms: config.pool.acquire_timeout_secs * 1000,
-        validation_interval_ms: config.pool.validation_interval_secs * 1000,
+        max_idle_time_ms: config.pool.max_idle_time_secs.saturating_mul(1000),
+        max_lifetime_ms: config.pool.max_lifetime_secs.saturating_mul(1000),
+        acquire_timeout_ms: config.pool.acquire_timeout_secs.saturating_mul(1000),
+        validation_interval_ms: config.pool.validation_interval_secs.saturating_mul(1000),
     };
     let conn_pool = Arc::new(AsyncConnectionPool::new(pool_config));
     tracing::info!(

@@ -425,6 +425,46 @@ pub(super) fn validate_binary_collation(collation: &ast::ObjectName) -> Result<(
     }
 }
 
+/// Largest `statement_timeout` PostgreSQL accepts, in milliseconds (the
+/// setting is an `int`).
+pub(crate) const MAX_STATEMENT_TIMEOUT_MS: u64 = i32::MAX as u64;
+
+/// Parse a `statement_timeout` value into milliseconds, following
+/// PostgreSQL's unit conventions: a bare number is milliseconds, and an
+/// `ms`/`s`/`min`/`h` suffix is accepted. `0` disables the timeout. Values
+/// past `MAX_STATEMENT_TIMEOUT_MS` are refused, as PostgreSQL refuses them,
+/// instead of overflowing the unit multiplication.
+pub(crate) fn parse_statement_timeout(value: &str) -> Result<u64, ExecError> {
+    let v = value.trim().trim_matches('\'').trim();
+    let invalid = || {
+        ExecError::Runtime(format!(
+            "invalid value for parameter \"statement_timeout\": \"{v}\""
+        ))
+    };
+    let (num, unit) = v.split_at(v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len()));
+    let num = num.trim();
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let factor: u64 = match unit.trim() {
+        "" | "ms" => 1,
+        "s" => 1_000,
+        "min" => 60_000,
+        "h" => 3_600_000,
+        _ => return Err(invalid()),
+    };
+    num.parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(factor))
+        .filter(|ms| *ms <= MAX_STATEMENT_TIMEOUT_MS)
+        .ok_or_else(|| {
+            ExecError::Runtime(format!(
+                "\"{v}\" is outside the valid range for parameter \"statement_timeout\" \
+                 (0 .. {MAX_STATEMENT_TIMEOUT_MS} ms)"
+            ))
+        })
+}
+
 /// Parse a `lock_timeout` value into milliseconds.
 ///
 /// Accepts a bare number (milliseconds, as PostgreSQL does) or a number with a

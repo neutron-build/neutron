@@ -271,6 +271,12 @@ impl Executor {
             if var_name == "lock_timeout" {
                 parse_lock_timeout(&val)?;
             }
+            // PostgreSQL validates statement_timeout at SET time; storing an
+            // out-of-range or garbage value used to succeed and then be
+            // ignored (or overflow) when the next statement read it.
+            if var_name == "statement_timeout" && !val.trim().eq_ignore_ascii_case("default") {
+                super::parse_statement_timeout(&val)?;
+            }
 
             // SET LOCAL is transaction-scoped: it is undone at COMMIT and
             // ROLLBACK (`Session::guc_commit` / `guc_rollback`). Outside a

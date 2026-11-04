@@ -1338,7 +1338,7 @@ impl NucleusHandler {
             .executor
             .get_session_setting(session_id, "statement_timeout")
             .and_then(|v| parse_timeout_ms(&v))
-            .unwrap_or(self.statement_timeout_secs * 1000);
+            .unwrap_or(self.statement_timeout_secs.saturating_mul(1000));
 
         if timeout_ms > 0 {
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
@@ -3682,21 +3682,10 @@ impl CancelHandler for NucleusHandler {
 
 /// Parse a statement_timeout setting into milliseconds, following
 /// PostgreSQL's convention: bare integers are milliseconds; "s"/"ms"/"min"
-/// suffixes are honoured. Returns None for unparseable values.
+/// suffixes are honoured. Returns None for unparseable or out-of-range
+/// values (see `executor::parse_statement_timeout`).
 fn parse_timeout_ms(v: &str) -> Option<u64> {
-    let v = v.trim().trim_matches('\'');
-    if let Ok(n) = v.parse::<u64>() {
-        return Some(n);
-    }
-    let (num, unit) = v.split_at(v.find(|c: char| c.is_ascii_alphabetic())?);
-    let n = num.trim().parse::<u64>().ok()?;
-    match unit.trim() {
-        "ms" => Some(n),
-        "s" => Some(n * 1000),
-        "min" => Some(n * 60_000),
-        "h" => Some(n * 3_600_000),
-        _ => None,
-    }
+    crate::executor::parse_statement_timeout(v).ok()
 }
 
 // ============================================================================
@@ -6372,6 +6361,26 @@ mod tests {
     fn statement_timeout_parsing_refuses_garbage_rather_than_guessing() {
         for bad in ["soon", "10parsecs", "-5", "1.5s", ""] {
             assert_eq!(parse_timeout_ms(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn statement_timeout_parsing_refuses_overflow_and_out_of_range() {
+        // The unit multiplication used to be unchecked: a huge value panicked
+        // a debug build and wrapped to a short timeout in release.
+        assert_eq!(parse_timeout_ms("2147483647"), Some(2_147_483_647));
+        assert_eq!(parse_timeout_ms("2147483s"), Some(2_147_483_000));
+        for bad in [
+            "2147483648",
+            "2147484s",
+            "35792min",
+            "597h",
+            "18446744073709551615",
+            "18446744073709552s",
+            "18446744073709551616",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(parse_timeout_ms(bad), None, "{bad:?} must be out of range");
         }
     }
 

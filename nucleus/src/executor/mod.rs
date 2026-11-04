@@ -171,6 +171,7 @@ mod unique_gate;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
 use helpers::*;
+pub(crate) use helpers::parse_statement_timeout;
 #[cfg(feature = "server")]
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
