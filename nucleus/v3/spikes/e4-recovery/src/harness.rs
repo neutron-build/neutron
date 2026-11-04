@@ -3350,6 +3350,27 @@ pub fn run_round(
                     }
                 }
             }
+            // X-5c-F3-F3a-F2 Work 3 (`E4_KEY_DIAG`, stderr only, default
+            // off, never a digest input): the key-history trace of the
+            // first divergent key — every page write that carried its
+            // leaf, every durable meta's image view of it, and the
+            // opened image beside the recovered store's served bytes.
+            if std::env::var("E4_KEY_DIAG").is_ok()
+                && let Err(text) = &first.o1
+            {
+                key_history_trace(
+                    seed,
+                    round,
+                    faults.class,
+                    text,
+                    &model,
+                    &mut reader,
+                    &wal_commits,
+                    &end_disk,
+                    pf,
+                    &cfg,
+                );
+            }
             let _ = first;
             // The harness checkpoint (G4: after the oracle check; it
             // supplies O-2 (ii) and the next round's base), then
@@ -4122,6 +4143,879 @@ pub fn x5r34_workload_events(captured: &[DiskEvent], pre_workload: usize) -> &[D
 /// `"/wal/"`; X5-R34 (b) defines `name(x)`).
 pub fn x5r34_seg_name(seg: u64) -> String {
     format!("{seg:016x}.log")
+}
+
+// ---- X-5c-F3-F3a-F2 Work 3: the key-history trace (`E4_KEY_DIAG`,
+// stderr only, default off, never a digest input) ----
+//
+// For the O-1 failing round's first divergent key, the trace names every
+// step of the key's durable life: the owner commit's WAL record, every
+// page write that ever carried the key's leaf (LPID, slot, content
+// epoch, the key's ts values in those bytes), every durable meta (the
+// flips), each durable image's view of the key (which LPID held it, at
+// which slot, with which ts values), and the opened image's own mapping
+// beside the recovered store's served bytes. The first durable meta
+// whose image fails to hold the key while its `T` covers the owner ts
+// is reported as the **first step at which the key leaves the durable
+// image** (S-STORE §13 (c): a committed transaction with ts ≤ T must be
+// in image k as ordinary entries).
+
+/// One row of the leaf-write history: a durable page write that carried
+/// the key's leaf.
+#[derive(Debug, Clone)]
+struct KeyLeafWrite {
+    /// The write's index in the page file's durable-write list.
+    idx: usize,
+    /// The slot the write landed at.
+    slot: u64,
+    /// The leaf's LPID (the page header's id field).
+    lpid: u64,
+    /// The page header's content epoch.
+    epoch: u32,
+    /// The key's ts values present in the written bytes (empty = the
+    /// leaf was written without the key's group).
+    ts: Vec<u64>,
+}
+
+/// The key's ts values inside one page image (empty when the page is
+/// not a leaf or holds no entry of the key). A diagnostic reader of
+/// `E4_KEY_DIAG` only: never a verdict input.
+fn key_ts_in_page(p: &[u8], k: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    if crate::store::page::header_kind(p) != crate::store::page::KIND_LEAF {
+        return out;
+    }
+    let Ok(s) = crate::store::page::slotted(p) else {
+        return out;
+    };
+    for i in 0..s.n {
+        if let Ok((ek, _)) = crate::store::page::leaf_cell(p, i)
+            && let Some((uk, ts)) = tree::dec_ekey(ek)
+            && uk == k
+        {
+            out.push(ts);
+        }
+    }
+    out
+}
+
+/// One image's view of the key: every leaf that holds the key's group,
+/// plus the neighbour evidence when none does.
+#[derive(Debug, Clone, Default)]
+struct KeyImageView {
+    /// Every mapped leaf holding an entry of the key:
+    /// `(LPID, slot, the map ref's epoch, the page header's epoch, the
+    /// key's ts values in the bytes at the slot)`.
+    held: Vec<(u64, u64, u32, u32, Vec<u64>)>,
+    /// The closest mapped leaf evidence around the key when no leaf
+    /// holds it: `(pred user key, its leaf LPID, slot, header epoch)`
+    /// and/or the successor, in that order.
+    neighbours: Vec<(Vec<u8>, u64, u64, u32)>,
+    /// Map pages the walk could not read from the view.
+    missing: Vec<u64>,
+    /// The image's mapping of every LPID that ever carried the key in
+    /// the durable history (`(LPID, ref slot, ref epoch)`, or `None`
+    /// when this image leaves the LPID unmapped).
+    mapped_lpids: Vec<(u64, Option<(u64, u32)>)>,
+}
+
+/// Read the map radix of one image over a byte view (`slot → bytes`),
+/// mirroring `ckpt::walk_radix`'s span math exactly. §3.3 checks are
+/// skipped (a trace, never a verdict); an unreadable page contributes
+/// no entries and is recorded in `missing`.
+#[allow(clippy::too_many_arguments)]
+fn walk_map_view(
+    view: &dyn Fn(u64) -> Option<Vec<u8>>,
+    root: crate::store::page::Ref,
+    base: u64,
+    span: u64,
+    cap: u64,
+    depth: u8,
+    flat: &mut BTreeMap<u64, crate::store::page::Ref>,
+    missing: &mut Vec<u64>,
+) {
+    if depth > 8 || root.slot == 0 {
+        return;
+    }
+    let Some(b) = view(root.slot) else {
+        missing.push(root.slot);
+        return;
+    };
+    let rd64 = |off: usize| -> u64 {
+        b.get(off..off + 8)
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+            .map_or(0, u64::from_le_bytes)
+    };
+    let rd32 = |off: usize| -> u32 {
+        b.get(off..off + 4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map_or(0, u32::from_le_bytes)
+    };
+    let kind = crate::store::page::header_kind(&b);
+    let n = ((crate::store::page::PAGE - crate::store::page::HDR) / crate::store::page::MAP_ENTRY)
+        as u64;
+    if kind == crate::store::page::KIND_MAP_LEAF {
+        for i in 0..cap as usize {
+            let at = crate::store::page::HDR + i * crate::store::page::MAP_ENTRY;
+            let slot = rd64(at);
+            if slot != 0 {
+                flat.insert(
+                    base + i as u64,
+                    crate::store::page::Ref {
+                        slot,
+                        epoch: rd32(at + 8),
+                        crc: rd32(at + 12),
+                    },
+                );
+            }
+        }
+    } else {
+        for i in 0..n as usize {
+            let at = crate::store::page::HDR + i * crate::store::page::MAP_ENTRY;
+            let slot = rd64(at);
+            if slot != 0 {
+                let child_span = (span / n).max(1);
+                let child_base = base + i as u64 * span;
+                walk_map_view(
+                    view,
+                    crate::store::page::Ref {
+                        slot,
+                        epoch: rd32(at + 8),
+                        crc: rd32(at + 12),
+                    },
+                    child_base,
+                    child_span,
+                    cap,
+                    depth + 1,
+                    flat,
+                    missing,
+                );
+            }
+        }
+    }
+}
+
+/// One durable image's view of the key: which mapped leaves hold it,
+/// at which slots, with which ts values, the neighbour leaves when none
+/// does, and the image's mapping of every LPID `watch` names. `view`
+/// maps a slot to the bytes the analysis should see for that image.
+fn key_image_view(
+    view: &dyn Fn(u64) -> Option<Vec<u8>>,
+    meta: &crate::store::page::Meta,
+    cap: u64,
+    k: &[u8],
+    watch: &BTreeSet<u64>,
+) -> KeyImageView {
+    let mut out = KeyImageView::default();
+    if meta.map_root.slot == 0 {
+        return out;
+    }
+    let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+    let n = ((crate::store::page::PAGE - crate::store::page::HDR) / crate::store::page::MAP_ENTRY)
+        as u64;
+    let span = ckpt::radix_child_span(cap, n, meta.next_lpid);
+    walk_map_view(
+        view,
+        meta.map_root,
+        0,
+        span,
+        cap,
+        0,
+        &mut flat,
+        &mut out.missing,
+    );
+    for lpid in watch {
+        out.mapped_lpids
+            .push((*lpid, flat.get(lpid).map(|r| (r.slot, r.epoch))));
+    }
+    let mut pred: Option<(Vec<u8>, u64, u64, u32)> = None;
+    let mut succ: Option<(Vec<u8>, u64, u64, u32)> = None;
+    for (lpid, r) in flat.iter() {
+        let Some(b) = view(r.slot) else {
+            continue;
+        };
+        if crate::store::page::header_kind(&b) != crate::store::page::KIND_LEAF {
+            continue;
+        }
+        let Ok(s) = crate::store::page::slotted(&b) else {
+            continue;
+        };
+        let he = crate::store::page::header_epoch(&b);
+        for i in 0..s.n {
+            let Ok((ek, _)) = crate::store::page::leaf_cell(&b, i) else {
+                continue;
+            };
+            let Some((uk, ts)) = tree::dec_ekey(ek) else {
+                continue;
+            };
+            if uk == *k {
+                match out.held.iter_mut().find(|(l, _, _, _, _)| l == lpid) {
+                    Some((_, _, _, _, v)) => v.push(ts),
+                    None => out.held.push((*lpid, r.slot, r.epoch, he, vec![ts])),
+                }
+            } else if uk.as_slice() < k {
+                let better = pred
+                    .as_ref()
+                    .is_none_or(|(pk, _, _, _)| uk.as_slice() > pk.as_slice());
+                if better {
+                    pred = Some((uk.clone(), *lpid, r.slot, he));
+                }
+            } else if succ
+                .as_ref()
+                .is_none_or(|(sk, _, _, _)| uk.as_slice() < sk.as_slice())
+            {
+                succ = Some((uk.clone(), *lpid, r.slot, he));
+            }
+        }
+    }
+    if let Some(p) = pred {
+        out.neighbours.push(p);
+    }
+    if let Some(s) = succ {
+        out.neighbours.push(s);
+    }
+    out
+}
+
+/// One durable image's directory entry for tree `id`: `(root LPID,
+/// dropping)`, read from the same byte view the image walk uses.
+fn dir_entry_of_view(
+    view: &dyn Fn(u64) -> Option<Vec<u8>>,
+    meta: &crate::store::page::Meta,
+    cap: u64,
+    id: u64,
+) -> Option<(u64, bool)> {
+    if meta.dir_root == 0 {
+        return None;
+    }
+    let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+    let mut missing: Vec<u64> = Vec::new();
+    let n = ((crate::store::page::PAGE - crate::store::page::HDR) / crate::store::page::MAP_ENTRY)
+        as u64;
+    let span = ckpt::radix_child_span(cap, n, meta.next_lpid);
+    walk_map_view(
+        view,
+        meta.map_root,
+        0,
+        span,
+        cap,
+        0,
+        &mut flat,
+        &mut missing,
+    );
+    let idk = to_be64(id);
+    let mut cur = meta.dir_root;
+    for _ in 0..24 {
+        let r = flat.get(&cur)?;
+        let b = view(r.slot)?;
+        if crate::store::page::header_kind(&b) == crate::store::page::KIND_LEAF {
+            if let Ok(s) = crate::store::page::slotted(&b) {
+                for i in 0..s.n {
+                    if let Ok((dk, dv)) = crate::store::page::leaf_cell(&b, i)
+                        && dk == idk
+                        && dv.len() >= 9
+                    {
+                        let mut rb = [0u8; 8];
+                        if let Some(sb) = dv.get(0..8) {
+                            rb.copy_from_slice(sb);
+                        }
+                        return Some((u64::from_le_bytes(rb), dv.get(8) == Some(&1)));
+                    }
+                }
+            }
+            return None;
+        }
+        let Ok((seps, right)) = tree::inner_seps(&b) else {
+            return None;
+        };
+        let mut next = right;
+        for (child, sep) in seps.iter() {
+            if sep.as_slice() > idk.as_slice() {
+                next = *child;
+                break;
+            }
+        }
+        cur = next;
+    }
+    None
+}
+
+/// **X-5c-F3-F3a-F2 Work 3: the key-history trace** (`E4_KEY_DIAG`,
+/// stderr only, default off, never a digest input). Called from the
+/// O-1 failure point of a recovered round; `o1` is the failing round's
+/// O-1 text (its `c=` and, for O-1(d), its `S=` pick the read the trace
+/// diffs at), `disk` the recovery's end disk, `pf` the page-file inode.
+/// Every input is SimDisk bytes or the model — never store memory.
+#[allow(clippy::too_many_arguments)]
+pub fn key_history_trace(
+    seed: u64,
+    round: u32,
+    class: FaultClass,
+    o1: &str,
+    model: &Model,
+    reader: &mut StoreReader<'_>,
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    disk: &SimDisk,
+    pf: usize,
+    cfg: &StoreCfg,
+) {
+    // The read the O-1 text failed at: `c`, and the historical `S` of
+    // an O-1(d) row.
+    let num = |tag: &str| -> Option<u64> {
+        o1.split(&format!("{tag}="))
+            .nth(1)
+            .and_then(|rest| rest.split([',', ' ', ':']).next())
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    let (Some(c), s_hist) = (num("c"), num("S")) else {
+        return;
+    };
+    let read_ts = s_hist.unwrap_or(c);
+    // The first divergent key at that read (the same per-tree diff
+    // `E4_O1_DIAG` prints, at this read's ts).
+    let mut found: Option<(u64, Vec<u8>)> = None;
+    for t in model
+        .published_at(read_ts)
+        .iter()
+        .filter(|t| **t != CATALOG)
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        let (Ok(got), want) = (reader.scan(t, read_ts), model.scan(t, read_ts)) else {
+            continue;
+        };
+        let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
+        keys.extend(want.keys().cloned());
+        for k in keys.iter() {
+            let g = crate::oracle::live(&got)
+                .iter()
+                .find(|(gk, _)| *gk == k)
+                .map(|(_, v)| (*v).clone());
+            let w = crate::oracle::live(&want)
+                .iter()
+                .find(|(wk, _)| *wk == k)
+                .map(|(_, v)| (*v).clone());
+            if g != w {
+                found = Some((t, k.clone()));
+                break;
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let Some((tree, key)) = found else {
+        eprintln!(
+            "KEY diag: seed={seed} round={round} class={class:?} read_ts={read_ts}: no divergent key at this read"
+        );
+        return;
+    };
+    let owner = model
+        .commits
+        .iter()
+        .rev()
+        .find(|(ts, rec)| {
+            **ts <= read_ts
+                && rec
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, Op::Put { tree: t, key: k, .. } | Op::Delete { tree: t, key: k } if *t == tree && k == &key))
+        })
+        .map(|(ts, _)| *ts);
+    eprintln!(
+        "KEY diag: seed={seed} round={round} class={class:?} o1=\"{o1}\" read_ts={read_ts} tree={tree} key={key:?} owner_ts={owner:?} owner_rec={:?} owner_this_round_wal={:?}",
+        owner.and_then(|ts| model.commits.get(&ts).map(|r| (r.mode, r.written, r.acked))),
+        owner.and_then(|ts| wal_commits.get(&ts).copied()),
+    );
+    // The failing tree's lifecycle in the model: every CreateTree /
+    // DropTree / catalog publish op on it, and the ops-per-commit
+    // around them (the drop+recreate shape).
+    let mut tree_life: Vec<String> = Vec::new();
+    for (ts, rec) in model.commits.iter() {
+        let mine: Vec<&Op> = rec
+            .ops
+            .iter()
+            .filter(|op| match op {
+                Op::CreateTree { tree: t }
+                | Op::DropTree { tree: t }
+                | Op::Put { tree: t, .. }
+                | Op::Delete { tree: t, .. } => *t == tree,
+                _ => false,
+            })
+            .collect();
+        let ddl = mine
+            .iter()
+            .any(|op| matches!(op, Op::CreateTree { .. } | Op::DropTree { .. }));
+        let cat = rec.ops.iter().any(|op| match op {
+            Op::Put { tree: t, key, .. } | Op::Delete { tree: t, key } if *t == CATALOG => {
+                key.as_slice() == to_be64(tree).as_slice()
+            }
+            _ => false,
+        });
+        if ddl || cat {
+            tree_life.push(format!(
+                "ts={ts} mode={:?} written={} acked={} ops_on_tree={} catalog_op={}",
+                rec.mode,
+                rec.written,
+                rec.acked,
+                mine.len(),
+                cat,
+            ));
+        }
+    }
+    eprintln!("KEY diag: tree {tree} lifecycle in the model: {tree_life:?}");
+    // Every DDL op in the model (any tree), with durability flags —
+    // the drop+recreate shape across the whole seed.
+    let ddl_all: Vec<String> = model
+        .commits
+        .iter()
+        .filter(|(_, rec)| {
+            rec.ops
+                .iter()
+                .any(|op| matches!(op, Op::CreateTree { .. } | Op::DropTree { .. }))
+        })
+        .map(|(ts, rec)| {
+            format!(
+                "ts={ts} {:?} written={} acked={}",
+                rec.ops
+                    .iter()
+                    .filter(|op| matches!(op, Op::CreateTree { .. } | Op::DropTree { .. }))
+                    .collect::<Vec<_>>(),
+                rec.written,
+                rec.acked,
+            )
+        })
+        .collect();
+    eprintln!("KEY diag: all model DDL ops: {ddl_all:?}");
+    // The key's own model timeline: every op on this exact key, with
+    // its commit's mode and durability flags.
+    let key_tl: Vec<String> = model
+        .commits
+        .iter()
+        .filter(|(_, rec)| {
+            rec.ops.iter().any(|op| match op {
+                Op::Put {
+                    tree: t, key: k, ..
+                }
+                | Op::Delete { tree: t, key: k } => *t == tree && k == &key,
+                _ => false,
+            })
+        })
+        .map(|(ts, rec)| {
+            format!(
+                "ts={ts} {:?} mode={:?} written={} acked={}",
+                rec.ops
+                    .iter()
+                    .find(|op| match op {
+                        Op::Put {
+                            tree: t, key: k, ..
+                        }
+                        | Op::Delete { tree: t, key: k } => {
+                            *t == tree && k == &key
+                        }
+                        _ => false,
+                    })
+                    .map(|op| matches!(op, Op::Put { .. })),
+                rec.mode,
+                rec.written,
+                rec.acked,
+            )
+        })
+        .collect();
+    eprintln!("KEY diag: key timeline in the model: {key_tl:?}");
+    // The durable-write history of the page file: metas, leaf writes
+    // carrying the key, and the replayed snapshot each meta saw.
+    let dw = disk.dwrites_of(pf);
+    let mut metas: Vec<(usize, crate::store::page::Meta)> = Vec::new();
+    let mut leaf_writes: Vec<KeyLeafWrite> = Vec::new();
+    let mut lpids_of_key: BTreeSet<u64> = BTreeSet::new();
+    for (i, w) in dw.iter().enumerate() {
+        if w.off % crate::store::page::PAGE as u64 != 0 || w.bytes.len() != crate::store::page::PAGE
+        {
+            continue;
+        }
+        let slot = w.off / crate::store::page::PAGE as u64;
+        if slot == 1 || slot == 2 {
+            if let Ok(m) = crate::store::page::parse_meta(&w.bytes) {
+                metas.push((i, m));
+            }
+        } else if slot >= 3 {
+            let ts = key_ts_in_page(&w.bytes, &key);
+            if !ts.is_empty() {
+                lpids_of_key.insert(crate::store::page::header_id(&w.bytes));
+            }
+        }
+    }
+    for (i, w) in dw.iter().enumerate() {
+        if w.off % crate::store::page::PAGE as u64 != 0 || w.bytes.len() != crate::store::page::PAGE
+        {
+            continue;
+        }
+        let slot = w.off / crate::store::page::PAGE as u64;
+        if slot < 3 {
+            continue;
+        }
+        if crate::store::page::header_kind(&w.bytes) == crate::store::page::KIND_LEAF
+            && lpids_of_key.contains(&crate::store::page::header_id(&w.bytes))
+        {
+            leaf_writes.push(KeyLeafWrite {
+                idx: i,
+                slot,
+                lpid: crate::store::page::header_id(&w.bytes),
+                epoch: crate::store::page::header_epoch(&w.bytes),
+                ts: key_ts_in_page(&w.bytes, &key),
+            });
+        }
+    }
+    for w in leaf_writes.iter() {
+        eprintln!(
+            "KEY diag: leaf-write idx={} slot={} lpid={} epoch={} key_ts={:?}",
+            w.idx, w.slot, w.lpid, w.epoch, w.ts
+        );
+    }
+    // The directory-root LPID's write history: which tree ids each
+    // durable version of the dir leaf held (a stale version of this
+    // page is what loses a tree's entry — the trace's dir dimension).
+    let dir_lpid = metas.first().map(|(_, m)| m.dir_root).unwrap_or(1);
+    let mut dir_writes: Vec<(usize, u64, u32, Vec<u64>)> = Vec::new();
+    for (i, w) in dw.iter().enumerate() {
+        if w.off % crate::store::page::PAGE as u64 != 0
+            || w.bytes.len() != crate::store::page::PAGE
+            || crate::store::page::header_id(&w.bytes) != dir_lpid
+            || crate::store::page::header_kind(&w.bytes) != crate::store::page::KIND_LEAF
+        {
+            continue;
+        }
+        let mut ids: Vec<u64> = Vec::new();
+        if let Ok(s) = crate::store::page::slotted(&w.bytes) {
+            for j in 0..s.n {
+                if let Ok((dk, _)) = crate::store::page::leaf_cell(&w.bytes, j)
+                    && let Some(b) = dk.get(0..8)
+                    && let Ok(arr) = <[u8; 8]>::try_from(b)
+                {
+                    ids.push(u64::from_be_bytes(arr));
+                }
+            }
+        }
+        dir_writes.push((
+            i,
+            w.off / crate::store::page::PAGE as u64,
+            crate::store::page::header_epoch(&w.bytes),
+            ids,
+        ));
+    }
+    for (i, slot, ep, ids) in dir_writes.iter() {
+        eprintln!("KEY diag: dir-write idx={i} slot={slot} epoch={ep} ids={ids:?}");
+    }
+    // Each durable meta's image view of the key, in graduation order.
+    // The snapshot at meta k replays every page write that graduated
+    // before the meta's own write (step 3 syncs the pages before the
+    // meta write issues, so the image's pages are all in the snapshot).
+    let mut first_lost: Option<(usize, u64, String)> = None;
+    let mut snap: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let meta_at: BTreeMap<usize, crate::store::page::Meta> = metas.iter().copied().collect();
+    for (i, w) in dw.iter().enumerate() {
+        if w.off % crate::store::page::PAGE as u64 != 0 || w.bytes.len() != crate::store::page::PAGE
+        {
+            continue;
+        }
+        let slot = w.off / crate::store::page::PAGE as u64;
+        if let Some(m) = meta_at.get(&i) {
+            let snap_at = |s: u64| -> Option<Vec<u8>> { snap.get(&s).cloned() };
+            let v = key_image_view(&snap_at, m, cfg.map_leaf_cap, &key, &lpids_of_key);
+            let dir_e = dir_entry_of_view(&snap_at, m, cfg.map_leaf_cap, tree);
+            let held = if v.held.is_empty() {
+                format!(
+                    "not-held neighbours={:?} missing={:?}",
+                    v.neighbours, v.missing
+                )
+            } else {
+                format!(
+                    "held {:?}",
+                    v.held
+                        .iter()
+                        .map(|(l, s, re, he, ts)| (l, s, re, he, ts.clone()))
+                        .collect::<Vec<_>>()
+                )
+            };
+            let expected = owner.is_some_and(|ts| ts <= m.t);
+            let owner_in = v
+                .held
+                .iter()
+                .any(|(_, _, _, _, ts)| owner.is_some_and(|o| ts.contains(&o)));
+            if expected && !owner_in && first_lost.is_none() {
+                first_lost = Some((i, m.ckpt_id, format!("T={} {}", m.t, held)));
+            }
+            eprintln!(
+                "KEY diag: meta idx={i} ckpt_id={} slot={} T={} gc_w={} epoch={} boot={} map_root=(slot {} epoch {}) next_lpid={} slot_count={} wal_start={} wal_end={} ts_hi={} {held} watch={:?} expected_owner={expected} owner_in={owner_in}",
+                m.ckpt_id,
+                1 + (m.ckpt_id % 2),
+                m.t,
+                m.gc_w,
+                m.epoch,
+                m.boot_id,
+                m.map_root.slot,
+                m.map_root.epoch,
+                m.next_lpid,
+                m.slot_count,
+                m.wal_start_lsn,
+                m.wal_ckpt_end,
+                m.ts_ckpt_hi,
+                v.mapped_lpids,
+            );
+            eprintln!("KEY diag: meta idx={i} dir-entry of tree {tree}: {dir_e:?}");
+            // The dir leaf this image actually adopts: walk the dir tree
+            // over the snapshot and dump the leaf's slot and ids.
+            {
+                let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+                let mut miss: Vec<u64> = Vec::new();
+                let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+                    / crate::store::page::MAP_ENTRY) as u64;
+                let span = ckpt::radix_child_span(cfg.map_leaf_cap, n, m.next_lpid);
+                walk_map_view(
+                    &snap_at,
+                    m.map_root,
+                    0,
+                    span,
+                    cfg.map_leaf_cap,
+                    0,
+                    &mut flat,
+                    &mut miss,
+                );
+                let mut cur = m.dir_root;
+                for _ in 0..24 {
+                    let Some(r) = flat.get(&cur) else {
+                        eprintln!("KEY diag: meta idx={i} dir walk: lpid {cur} unmapped");
+                        break;
+                    };
+                    let Some(b) = snap_at(r.slot) else {
+                        eprintln!(
+                            "KEY diag: meta idx={i} dir walk: slot {} not durable",
+                            r.slot
+                        );
+                        break;
+                    };
+                    if crate::store::page::header_kind(&b) == crate::store::page::KIND_LEAF {
+                        let mut ids: Vec<u64> = Vec::new();
+                        if let Ok(s) = crate::store::page::slotted(&b) {
+                            for j in 0..s.n {
+                                if let Ok((dk, _)) = crate::store::page::leaf_cell(&b, j)
+                                    && let Some(sb) = dk.get(0..8)
+                                    && let Ok(arr) = <[u8; 8]>::try_from(sb)
+                                {
+                                    ids.push(u64::from_be_bytes(arr));
+                                }
+                            }
+                        }
+                        eprintln!(
+                            "KEY diag: meta idx={i} dir leaf lpid={cur} slot={} epoch={} ids={ids:?}",
+                            r.slot,
+                            crate::store::page::header_epoch(&b),
+                        );
+                        break;
+                    }
+                    let Ok((seps, right)) = tree::inner_seps(&b) else {
+                        break;
+                    };
+                    let idk = to_be64(tree);
+                    let mut next = right;
+                    for (child, sep) in seps.iter() {
+                        if sep.as_slice() > idk.as_slice() {
+                            next = *child;
+                            break;
+                        }
+                    }
+                    cur = next;
+                }
+            }
+        }
+        snap.insert(slot, w.bytes.clone());
+    }
+    // The opened image (the end disk's durable bytes) beside the
+    // recovered store's own served bytes.
+    let (om, _) = read_opened_meta(disk);
+    if let Some(m) = &om {
+        let view = |s: u64| -> Option<Vec<u8>> {
+            Some(disk.durable_read(
+                pf,
+                s * crate::store::page::PAGE as u64,
+                crate::store::page::PAGE as u64,
+            ))
+        };
+        let v = key_image_view(&view, m, cfg.map_leaf_cap, &key, &lpids_of_key);
+        eprintln!(
+            "KEY diag: opened-meta ckpt_id={} T={} epoch={} boot={} view={:?}",
+            m.ckpt_id, m.t, m.epoch, m.boot_id, v,
+        );
+        match reader.raw(tree) {
+            Ok(raw) => {
+                let served: Vec<(Vec<u8>, u64)> = raw
+                    .iter()
+                    .filter_map(|e| {
+                        tree::dec_ekey(&e.key)
+                            .filter(|(uk, _)| *uk == key)
+                            .map(|(_, ts)| (e.key.clone(), ts))
+                    })
+                    .collect();
+                eprintln!(
+                    "KEY diag: recovered-store raw entries of the key: {served:?} (of {} raw entries in tree {tree})",
+                    raw.len()
+                );
+            }
+            Err(e) => eprintln!("KEY diag: recovered-store raw read of tree {tree} failed: {e:?}"),
+        }
+        // The store's own served scan around the key (which neighbours
+        // it serves at the same read), and the opened image's tree
+        // structure: the directory entry of `tree` and the inner-page
+        // descent for both bounds of the key's group.
+        if let Ok(got) = reader.scan(tree, read_ts) {
+            let near: Vec<&Vec<u8>> = got
+                .keys()
+                .filter(|k2| {
+                    key.get(..key.len().saturating_sub(2))
+                        .zip(k2.get(..k2.len().saturating_sub(2)))
+                        .is_some_and(|(a, b)| a == b)
+                })
+                .collect();
+            eprintln!("KEY diag: recovered-store scan near the key: {near:?}");
+        }
+        let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+        let mut used: BTreeSet<u64> = BTreeSet::new();
+        let mut sink: Vec<Finding> = Vec::new();
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        let span = ckpt::radix_child_span(cfg.map_leaf_cap, n, m.next_lpid);
+        walk_map_disk(
+            disk,
+            pf,
+            m.map_root,
+            0,
+            span,
+            cfg.map_leaf_cap,
+            0,
+            &mut flat,
+            &mut used,
+            &mut sink,
+            false,
+        );
+        let page_of = |lpid: u64| -> Option<(u64, Vec<u8>)> {
+            flat.get(&lpid).map(|r| {
+                (
+                    r.slot,
+                    disk.durable_read(pf, r.slot * 4096, crate::store::page::PAGE as u64),
+                )
+            })
+        };
+        // The directory entry of `tree` (an 8-byte big-endian id key).
+        let idk = to_be64(tree);
+        let mut cur = m.dir_root;
+        let mut root_of_tree: Option<u64> = None;
+        for _ in 0..24 {
+            let Some((slot, b)) = page_of(cur) else {
+                eprintln!("KEY diag: dir walk: lpid {cur} unmapped in the opened image");
+                break;
+            };
+            if crate::store::page::header_kind(&b) == crate::store::page::KIND_LEAF {
+                if let Ok(s) = crate::store::page::slotted(&b) {
+                    for i in 0..s.n {
+                        if let Ok((dk, dv)) = crate::store::page::leaf_cell(&b, i) {
+                            let id = dk.first().map(|_| {
+                                u64::from_be_bytes(
+                                    dk.get(0..8)
+                                        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                                        .unwrap_or([0; 8]),
+                                )
+                            });
+                            eprintln!(
+                                "KEY diag: dir leaf lpid={cur} slot={slot} entry key={dk:?} id={id:?} root={} dropping={}",
+                                u64::from_le_bytes(
+                                    dv.get(0..8)
+                                        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                                        .unwrap_or([0; 8])
+                                ),
+                                dv.get(8) == Some(&1),
+                            );
+                            if dk == idk && dv.len() >= 8 {
+                                if let Some(s) = dv.get(0..8) {
+                                    let mut rb = [0u8; 8];
+                                    rb.copy_from_slice(s);
+                                    root_of_tree = Some(u64::from_le_bytes(rb));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            let Ok((seps, right)) = tree::inner_seps(&b) else {
+                break;
+            };
+            let mut next = right;
+            for (child, sep) in seps.iter() {
+                if sep.as_slice() > idk.as_slice() {
+                    next = *child;
+                    break;
+                }
+            }
+            eprintln!(
+                "KEY diag: dir walk: inner lpid={cur} slot={slot} epoch={} -> child {next}",
+                crate::store::page::header_epoch(&b)
+            );
+            cur = next;
+        }
+        eprintln!("KEY diag: opened-image dir entry of tree {tree}: root={root_of_tree:?}");
+        if let Some(root) = root_of_tree {
+            for (name, bound) in [
+                ("low", tree::enc_ekey(&key, u64::MAX)),
+                ("high", tree::enc_ekey(&key, 1)),
+            ] {
+                let mut cur = root;
+                for _ in 0..24 {
+                    let Some((slot, b)) = page_of(cur) else {
+                        eprintln!(
+                            "KEY diag: tree walk ({name}): lpid {cur} unmapped in the opened image"
+                        );
+                        break;
+                    };
+                    let kind = crate::store::page::header_kind(&b);
+                    if kind == crate::store::page::KIND_LEAF {
+                        eprintln!(
+                            "KEY diag: tree walk ({name}): leaf lpid={cur} slot={slot} epoch={} key_ts={:?} of {} cells",
+                            crate::store::page::header_epoch(&b),
+                            key_ts_in_page(&b, &key),
+                            crate::store::page::slotted(&b).map(|s| s.n).unwrap_or(0),
+                        );
+                        break;
+                    }
+                    let Ok((seps, right)) = tree::inner_seps(&b) else {
+                        eprintln!(
+                            "KEY diag: tree walk ({name}): inner lpid={cur} slot={slot} unparsable"
+                        );
+                        break;
+                    };
+                    let mut next = right;
+                    for (child, sep) in seps.iter() {
+                        if sep.as_slice() > bound.as_slice() {
+                            next = *child;
+                            break;
+                        }
+                    }
+                    eprintln!(
+                        "KEY diag: tree walk ({name}): inner lpid={cur} slot={slot} epoch={} seps={} -> child {next}",
+                        crate::store::page::header_epoch(&b),
+                        seps.len()
+                    );
+                    cur = next;
+                }
+            }
+        }
+    }
+    match first_lost {
+        Some((i, k, why)) => {
+            eprintln!("KEY diag: FIRST-LOST at durable meta ckpt_id={k} (dwrite idx {i}): {why}")
+        }
+        None => eprintln!("KEY diag: no durable meta lost the owner entry (image-side)"),
+    }
 }
 
 /// **X5-R34 (b): the per-round view of the workload pass's event
