@@ -2202,6 +2202,196 @@ expect_ok "runner refs: RF11 an existing card branch moved onto this run's commi
 # run's commit carries it too (G-R1-TIP-ONLY: every other R1 row sits on W itself).
 expect_ok "runner refs: RF18 a new branch on a descendant of this run's commit is a violation" rf refs/heads/card/v3-DESC 'git branch card/v3-DESC "$(git commit-tree "card/v3-RF^{tree}" -p card/v3-RF -m "nucleus v3: DESC on top")"'
 
+# RV1-RV5 (X-6-F1-F2-F3-F1-F3): ref_violations hash-verifies the commits its
+# ancestry rules read, so a forged commit cannot bend R1 or R2. A template like
+# rf0's: the scaffold tip S ("rv base 1"; pre_head card/v3-RV~1 = S) with main,
+# tag t0, nucleus/zz, nucleus/c1..c4, card/v3-ZZ and an origin ref at it, and
+# card/v3-RV one worker commit W past S. Every row copies the template (as rf's
+# rows copy rf0), so each forgery stays inside its own throwaway copy of the
+# scratch repository and no row reads another's moves; save_obj, restore_forged
+# and no_state4 guard the bytes as (a)-(l) do. #12 (X-6-F1-F3-F1-F2) is not
+# merged at base, so there is no second-parent tree probe and no (r4) row.
+rv0=$t/rv0
+git init -q -b nucleus/v3-scaffold "$rv0"
+git -C "$rv0" commit -q --allow-empty -m "rv base 0"
+git -C "$rv0" commit -q --allow-empty -m "rv base 1"
+git -C "$rv0" branch main && git -C "$rv0" tag t0 && git -C "$rv0" branch nucleus/zz && git -C "$rv0" branch card/v3-ZZ
+for i in 1 2 3 4; do git -C "$rv0" branch "nucleus/c$i" nucleus/v3-scaffold; done
+git -C "$rv0" update-ref refs/remotes/origin/nucleus/v3-scaffold nucleus/v3-scaffold
+git -C "$rv0" checkout -q -b card/v3-RV
+git -C "$rv0" commit -q --allow-empty -m "nucleus v3: RV work"
+rvS=$(git -C "$rv0" rev-parse nucleus/v3-scaffold)
+rvW=$(git -C "$rv0" rev-parse card/v3-RV)
+# rvc: a fresh copy of the template (this row's own scratch repository).
+rvc() { local d; d=$(mktemp -d "$t/rv.XXXX"); cp -a "$rv0/." "$d"; printf '%s\n' "$d"; }
+# rvo RUNNER REPO: ref_violations through RUNNER (the real runner, or a
+# reverted copy for a premise) on REPO as it stands, before = the template's
+# pristine snapshot; prints one line per entry, "(no violations)" when none.
+# pre_head comes from the template, never from the copy: git's read path
+# hash-checks a forged commit asked for by name (probed: rev-parse, rev-list
+# and merge-base all exit 128 on a forged tip), so the harness itself must
+# never resolve one.
+rvo() { PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "$2" "$rv0" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, b = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+pre = subprocess.run(["git", "rev-parse", "nucleus/v3-scaffold"], cwd=b, capture_output=True, text=True, check=True).stdout.strip()
+print("\n".join(rc.ref_violations(wt, rc.ref_snapshot(b), "card/v3-RV", pre)) or "(no violations)")
+P
+}
+# Step A reverted at both call sites (the F3-NO-VERIFY behaviour), as (e')
+# reverts its call by sed: the premise rows prove each hide really hides.
+sed -e 's/^        probs = verify_objects(wt, pre_head, own)$/        probs = []/' \
+    -e 's/^            probs = verify_objects(wt, old or pre_head, new) if new else \[\]$/            probs = []/' \
+    "$v3/tools/run_card.py" >"$t/run_card-rv-nover.py"
+# RV1: the R2 rewind dressed as a fast-forward (the gate's reproduction). P
+# sits on the scaffold's first commit and X on P, so nucleus/zz S -> X is a
+# rewind; P's loose file then becomes the same body naming S as its parent,
+# and the walk from X reaches S: the rewind reads as a fast-forward.
+rv1d=$(rvc)
+rv1p=$(git -C "$rv1d" commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold~1 -m "rv1 P")
+rv1x=$(git -C "$rv1d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv1p" -m "rv1 X")
+git -C "$rv1d" update-ref refs/heads/nucleus/zz "$rv1x"
+rv1_rewind() { local rc=0; git -C "$rv1d" merge-base --is-ancestor "$rvS" "$rv1x" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 1 ]; }
+expect_ok "premise: RV1 X does not descend from S (the move is a rewind)" rv1_rewind
+expect_ok "premise: RV1 P is a loose object" bash -c "[ -f '$(objlo "$rv1d" "$rv1p")' ]"
+printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nrv1 P forged\n' "$(git -C "$rv1d" rev-parse "nucleus/v3-scaffold^{tree}")" "$rvS" >"$t/rv1p.body"
+save_obj "$rv1d" "$rv1p"
+forge_commit "$rv1d" "$rv1p" "$t/rv1p.body"
+rv1_dressed() { local rc=0; git -C "$rv1d" merge-base --is-ancestor "$rvS" "$rv1x" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 0 ]; }
+expect_ok "premise: RV1 under the forgery the rewind reads as a fast-forward" rv1_dressed
+rv1_old() { local o; o=$(rvo "$t/run_card-rv-nover.py" "$rv1d"); echo "$o"; ! grep -qF "refs/heads/nucleus/zz" <<<"$o"; }
+expect_ok "premise: RV1 without the verifies the rewind is silent" rv1_old
+rv1_row() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv1d"); echo "$o"; grep -qF "refs/heads/nucleus/zz" <<<"$o" && grep -qF "object $rv1p fails its hash" <<<"$o"; }
+expect_ok "runner refs: RV1 the rewind dressed as a fast-forward is refused, naming P" rv1_row
+restore_forged
+expect_ok "forged objects: RV1 restored" no_state4
+# RV1's pin for F3-VERIFY-THEN-JUDGE (problems appended but R1/R2 still judged
+# on the lie): the card's own RV1 assertion cannot catch it, because under
+# RV1's forgery the fast-forward test passes, mutant or not. So nucleus/zz
+# honestly fast-forwards S -> Y through M (Y -> M -> S), and M's loose file
+# becomes the same body naming the scaffold's first commit: under the lie S
+# is no longer an ancestor of Y, so judging after the failed verify would
+# also name the honest move a rewind. M, not Y, is forged because git
+# hash-checks a forged commit read as a range tip (it answers exit 128, a
+# failed step, and never reaches the hash mismatch) — only a commit reached
+# through honest links can fail its hash inside verify_objects.
+rv1q=$(rvc)
+rv1m=$(git -C "$rv1q" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv1 pin M")
+rv1y=$(git -C "$rv1q" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv1m" -m "rv1 pin Y")
+git -C "$rv1q" update-ref refs/heads/nucleus/zz "$rv1y"
+rv1_ff() { local rc=0; git -C "$rv1q" merge-base --is-ancestor "$rvS" "$rv1y" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 0 ]; }
+expect_ok "premise: RV1 pin nucleus/zz S -> Y is an honest fast-forward" rv1_ff
+printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nrv1 pin M forged\n' "$(git -C "$rv1q" rev-parse "nucleus/v3-scaffold^{tree}")" "$(git -C "$rv1q" rev-parse nucleus/v3-scaffold~1)" >"$t/rv1m.body"
+save_obj "$rv1q" "$rv1m"
+forge_commit "$rv1q" "$rv1m" "$t/rv1m.body"
+rv1_lie() { local rc=0; git -C "$rv1q" merge-base --is-ancestor "$rvS" "$rv1y" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 1 ]; }
+expect_ok "premise: RV1 pin under the forgery the honest fast-forward reads as a rewind" rv1_lie
+rv1_pin() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv1q"); echo "$o"; grep -qF "refs/heads/nucleus/zz" <<<"$o" && grep -qF "object $rv1m fails its hash" <<<"$o" && ! grep -qF "may move only as a fast-forward" <<<"$o"; }
+expect_ok "runner refs: RV1 pin a forged fast-forward interior yields only the verification entry, never a fast-forward one" rv1_pin
+restore_forged
+expect_ok "forged objects: RV1 pin restored" no_state4
+# RV2: the R1 taint hidden. side-rv2 (absent from the template) is created at
+# C, whose history runs C -> M -> W through the worker commit W; M's loose
+# file then becomes the same body naming pre_head as its parent, so W drops
+# out of C's ancestry and the taint disappears from every ancestry read. M,
+# not C, is forged for the same reason as RV1 pin's: the ref's tip C must
+# stay readable (git hash-checks a forged tip), and the lie only needs the
+# walk from C to miss W.
+rv2d=$(rvc)
+rv2m=$(git -C "$rv2d" commit-tree "card/v3-RV^{tree}" -p "$rvW" -m "rv2 M")
+rv2c=$(git -C "$rv2d" commit-tree "card/v3-RV^{tree}" -p "$rv2m" -m "rv2 C")
+git -C "$rv2d" update-ref refs/heads/side-rv2 "$rv2c"
+rv2_taint() { local rc=0; git -C "$rv2d" merge-base --is-ancestor "$rvW" "$rv2c" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 0 ]; }
+expect_ok "premise: RV2 C descends from the worker commit W" rv2_taint
+printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nrv2 M forged\n' "$(git -C "$rv2d" rev-parse "card/v3-RV^{tree}")" "$rvS" >"$t/rv2m.body"
+save_obj "$rv2d" "$rv2m"
+forge_commit "$rv2d" "$rv2m" "$t/rv2m.body"
+rv2_hidden() { local rc=0; git -C "$rv2d" merge-base --is-ancestor "$rvW" "$rv2c" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 1 ]; }
+expect_ok "premise: RV2 under the forgery W is no longer an ancestor of C" rv2_hidden
+rv2_old() { local o; o=$(rvo "$t/run_card-rv-nover.py" "$rv2d"); echo "$o"; ! grep -qF "refs/heads/side-rv2" <<<"$o"; }
+expect_ok "premise: RV2 without the verifies the taint is silent" rv2_old
+rv2_row() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv2d"); echo "$o"; grep -qF "refs/heads/side-rv2" <<<"$o" && grep -qF "object $rv2m fails its hash" <<<"$o"; }
+expect_ok "runner refs: RV2 the hidden taint is refused, naming the forged M" rv2_row
+restore_forged
+expect_ok "forged objects: RV2 restored" no_state4
+# RV3: the worker list forged. The card branch gets a second worker commit
+# (W2, the honest tip; the run's pre_head stays the scaffold tip), and W1's
+# loose file becomes its body with a changed message line, so the id no
+# longer matches its bytes; the honest side-rv3 is created so the per-ref
+# loop would have work. W1, not the tip, is forged as in RV1 pin: a forged
+# tip would make the worker listing itself fail closed as a git step, never
+# reaching the hash mismatch. Without a trusted worker list R1 cannot be
+# judged: the answer is the worker-commits-unverifiable entry alone (early
+# return, fail closed).
+rv3d=$(rvc)
+rv3w1=$(git -C "$rv3d" rev-parse card/v3-RV)
+git -C "$rv3d" commit -q --allow-empty -m "nucleus v3: RV more work"
+rv3w2=$(git -C "$rv3d" rev-parse card/v3-RV)
+rv3s=$(git -C "$rv3d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv3 side")
+git -C "$rv3d" update-ref refs/heads/side-rv3 "$rv3s"
+printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nnucleus v3: RV work (message forged)\n' "$(git -C "$rv3d" rev-parse "card/v3-RV^{tree}")" "$rvS" >"$t/rv3w1.body"
+save_obj "$rv3d" "$rv3w1"
+forge_commit "$rv3d" "$rv3w1" "$t/rv3w1.body"
+rv3_row() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv3d"); echo "$o"; grep -qF "refs/heads/card/v3-RV: worker commits unverifiable: object $rv3w1 fails its hash" <<<"$o" && ! grep -qF "side-rv3" <<<"$o" && [ "$(grep -vcF "worker commits unverifiable" <<<"$o")" -eq 0 ]; }
+expect_ok "runner refs: RV3 a forged worker commit fails the check closed (only unverifiable entries)" rv3_row
+restore_forged
+expect_ok "forged objects: RV3 restored" no_state4
+# RV4: honest controls. A real fast-forward of nucleus/zz is no violation; a
+# real rewind still gets only the fast-forward entry (no verification entry);
+# deleting nucleus/zz still gets the deletion entry; and main moved under
+# RV1's forgery gets its protected entry and the verification entry (the rules
+# that need no ancestry fire on a lie too).
+rv4a=$(rvc)
+git -C "$rv4a" update-ref refs/heads/nucleus/zz "$(git -C "$rv4a" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv4 ff")"
+rv4_ff() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv4a"); echo "$o"; [ "$o" = "(no violations)" ]; }
+expect_ok "runner refs: RV4 an honest fast-forward of nucleus/zz is no violation" rv4_ff
+rv4b=$(rvc)
+rv4p=$(git -C "$rv4b" commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold~1 -m "rv4 P")
+rv4x=$(git -C "$rv4b" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv4p" -m "rv4 X")
+git -C "$rv4b" update-ref refs/heads/nucleus/zz "$rv4x"
+rv4_rewind() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv4b"); echo "$o"; grep -qF "refs/heads/nucleus/zz" <<<"$o" && grep -qF "may move only as a fast-forward" <<<"$o" && ! grep -qF "objects fail verification" <<<"$o"; }
+expect_ok "runner refs: RV4 an honest rewind is refused once, as a fast-forward violation only" rv4_rewind
+rv4c=$(rvc)
+git -C "$rv4c" update-ref -d refs/heads/nucleus/zz
+rv4_del() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv4c"); echo "$o"; grep -qF "refs/heads/nucleus/zz" <<<"$o" && grep -qF "(protected: nucleus/* may not be deleted)" <<<"$o"; }
+expect_ok "runner refs: RV4 deleting nucleus/zz is still refused" rv4_del
+rv4d=$(rvc)
+rv4mp=$(git -C "$rv4d" commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold~1 -m "rv4 main P")
+rv4mx=$(git -C "$rv4d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv4mp" -m "rv4 main X")
+git -C "$rv4d" update-ref refs/heads/main "$rv4mx"
+printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nrv4 main P forged\n' "$(git -C "$rv4d" rev-parse "nucleus/v3-scaffold^{tree}")" "$rvS" >"$t/rv4mp.body"
+save_obj "$rv4d" "$rv4mp"
+forge_commit "$rv4d" "$rv4mp" "$t/rv4mp.body"
+rv4_main() { local o; o=$(rvo "$v3/tools/run_card.py" "$rv4d"); echo "$o"; grep -qF "refs/heads/main" <<<"$o" && grep -qF "(protected: may not change)" <<<"$o" && grep -qF "object $rv4mp fails its hash" <<<"$o"; }
+expect_ok "runner refs: RV4 main moved under the forgery is refused twice: protected and unverifiable" rv4_main
+restore_forged
+expect_ok "forged objects: RV4 restored" no_state4
+# RV5: a git failure inside the verifies is an entry, never []. gshim's
+# pack-objects stops the worker verify first, so its entry is the
+# worker-commits-unverifiable one naming the step; GSHIM_FAIL "<S>...<Y>"
+# (full ids) matches no other git call ref_violations makes, so it fails
+# exactly the per-ref verify's boundary rev-list, with the move standing
+# honest otherwise.
+rv5a=$(rvc)
+git -C "$rv5a" update-ref refs/heads/nucleus/zz "$(git -C "$rv5a" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv5 ff")"
+rv5_pack() { local o; o=$(gshim pack-objects rvo "$v3/tools/run_card.py" "$rv5a"); echo "$o"; grep -qF "refs/heads/card/v3-RV: worker commits unverifiable: verify_objects: git pack-objects failed (exit 128; cannot verify objects)" <<<"$o"; }
+expect_ok "runner refs: RV5 a failed pack-objects in the worker verify is an entry, never []" rv5_pack
+rv5b=$(rvc)
+rv5z=$(git -C "$rv5b" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv5 per-ref ff")
+git -C "$rv5b" update-ref refs/heads/nucleus/zz "$rv5z"
+rv5_perref() { local o; o=$(gshim "$rvS...$rv5z" rvo "$v3/tools/run_card.py" "$rv5b"); echo "$o"; grep -qF "refs/heads/nucleus/zz" <<<"$o" && grep -qF "objects fail verification: verify_objects: git rev-list failed (exit 128; cannot verify objects)" <<<"$o"; }
+expect_ok "runner refs: RV5 a failed rev-list in the per-ref verify is an entry, never []" rv5_perref
+# Cost: ten honest moved refs (nucleus/zz and nucleus/c1..c4 fast-forward,
+# side-rvc1..c5 are created), one ref_violations call under 2 s; the measured
+# time prints in the row's output.
+rvcost=$(rvc)
+for i in 1 2 3 4 5; do git -C "$rvcost" update-ref "refs/heads/nucleus/c$i" "$(git -C "$rvcost" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv cost ff $i")"; done
+git -C "$rvcost" update-ref refs/heads/nucleus/zz "$(git -C "$rvcost" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv cost ff zz")"
+for i in 1 2 3 4 5; do git -C "$rvcost" update-ref "refs/heads/side-rvc$i" "$(git -C "$rvcost" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv cost side $i")"; done
+rv_cost() { local t0 t1 ms o; t0=$(date +%s%N); o=$(rvo "$v3/tools/run_card.py" "$rvcost"); t1=$(date +%s%N); ms=$(((t1 - t0) / 1000000)); echo "$o"; echo "     (RV cost) ref_violations over 10 moved refs: ${ms} ms"; [ "$ms" -lt 2000 ] && [ "$o" = "(no violations)" ]; }
+expect_ok "runner refs: RV cost ten honest moved refs verify in under 2 s" rv_cost
+
 # --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
 # The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
 # attempt accounting (nv3-B-0-esc-1) live in main()'s attempt loop, so these run
