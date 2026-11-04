@@ -93,7 +93,6 @@ test("translates stream-json events and builds the result", async () => {
   assert.equal(call.cwd, "/tmp/project");
   assert.deepEqual(call.args, [
     "-p",
-    "read the file",
     "--output-format",
     "stream-json",
     "--verbose",
@@ -103,15 +102,35 @@ test("translates stream-json events and builds the result", async () => {
     "acceptEdits",
     "--allowed-tools",
     "Read,Bash",
+    "--",
+    "read the file",
   ]);
 });
 
 test("sessionId maps to --resume", async () => {
   const { spawn, calls } = fakeSpawn(STREAM_JSON_SESSION);
   const harness = claudeCode({ spawn });
-  await harness.run({ prompt: "continue", sessionId: "sess-1" }).result;
-  assert.ok(calls[0]?.args.includes("--resume"));
-  assert.ok(calls[0]?.args.includes("sess-1"));
+  const sessionId = "5f0c2b9e-1d3a-4c8e-9b7f-2a6d4e8c0b1a";
+  await harness.run({ prompt: "continue", sessionId }).result;
+  const args = calls[0]!.args;
+  assert.equal(args[args.indexOf("--resume") + 1], sessionId);
+});
+
+test("a non-UUID sessionId is refused before spawning", async () => {
+  const { spawn, calls } = fakeSpawn(STREAM_JSON_SESSION);
+  const harness = claudeCode({ spawn });
+  const result = await harness.run({ prompt: "continue", sessionId: "--dangerously-skip-permissions" }).result;
+  assert.equal(result.status, "error");
+  assert.equal(result.error?.status, 400);
+  assert.equal(calls.length, 0);
+});
+
+test("an option-like prompt stays positional after --", async () => {
+  const { spawn, calls } = fakeSpawn(STREAM_JSON_SESSION);
+  const harness = claudeCode({ spawn });
+  await harness.run({ prompt: "--permission-mode=bypassPermissions" }).result;
+  const args = calls[0]!.args;
+  assert.deepEqual(args.slice(-2), ["--", "--permission-mode=bypassPermissions"]);
 });
 
 test("a nonzero exit without a result event becomes an error with stderr detail", async () => {
