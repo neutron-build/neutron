@@ -1,28 +1,31 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
 Status: **stage X-5c-F4 (the X5-R17 retune and the final file) —
-steps 0, 1 and 4 landed; **the retune itself is ESCALATED as
-infeasible within the card's Limits** (the record below carries the
-measured frontier): step 0 committed F3-F3b's Acceptance 10k as the
-triage file of record (sha `8332df8d…`, prov commit 86ecf8ff) with
-this card's class table (375 failing seeds / 352 failing rounds / 36
-failing twins / 0 defect seeds, `reuse_on_dropping` 0); step 1
-re-based X5-R17's SIZING row on seeds (9,626 of 10,000 miss at the
-unchanged workload) with its pin; step 4 fixed the file's one NEW
-class — 17 MP poison+task-error rounds, the checkpointer's post-G8-mark
-refusal recorded as a round failure (`g8_checkpoint_poison_ends_the_
-workload`) — and the probes then established that SIZING×40-min, Q4's
-value-distribution tension and Q11's dead `stale_seg_reads` counter
-cannot be closed by workload knobs alone, while any knob change breaks
-two REFRESH-3-protected pins plus two more (re-derivation recorded as
-the next attempt's first cost). The Acceptance 10k at this tip is
-expected to fail plain `verify` on the quota table alone (the step-0
-file's seven misses). The stages before it (X-5c-F3-F3a-F2-F1,
-X-5c-F3-F3a-F2, X-5c-F3-F3b, X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3,
-X-5c-F2, X-5c) are complete and merged. Opus judges E4 on the RESULT
-with P's rulings X5-R1–R36. (The previous stage's own Status paragraph
-is preserved in its record section below: X-5c-F3-F3a-F2's root causes
-A and B.)
+steps 0, 1 and 4 landed; **the retune is ESCALATED, pin-blocked above
+all** (the record below carries the measured frontier and the
+runner's own Acceptance feedback): step 0 committed F3-F3b's
+Acceptance 10k as the triage file of record (sha `8332df8d…`, prov
+commit 86ecf8ff) with this card's class table (375 failing seeds /
+352 failing rounds / 36 failing twins / 0 defect seeds,
+`reuse_on_dropping` 0); step 1 re-based X5-R17's SIZING row on seeds
+(9,628 of 10,000 miss in the Acceptance file) with its pin; step 4
+fixed the file's one NEW class — 17 MP poison+task-error rounds, the
+checkpointer's post-G8-mark refusal recorded as a round failure
+(`g8_checkpoint_poison_ends_the_workload`). The Acceptance's plain
+`verify` (the runner's, 17.3 min) exits 2 on the seven carried quota
+misses with the digests and the seed set reproducing. The probes
+established: the reachable retune (attempt 2's knobs ≈ 38 min/10k —
+the 17.1-min Acceptance datum corrects the budget reading; SIZING →
+~5,600 misses, Q8 ~450, Q18 ~1,150) is blocked **solely** by the r30
+seed pin's five served MP-A rounds (~1/1,000 seeds; 0 in every window
+measured) — no retune can land until P amends that pin; SIZING, Q4
+and Q12 are structurally short at any budget; Q11's
+`stale_seg_reads` counter has no increment site anywhere in the crate.
+The stages before it (X-5c-F3-F3a-F2-F1, X-5c-F3-F3a-F2,
+X-5c-F3-F3b, X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are
+complete and merged. Opus judges E4 on the RESULT with P's rulings
+X5-R1–R36. (The previous stage's own Status paragraph is preserved in
+its record section below: X-5c-F3-F3a-F2's root causes A and B.)
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -4263,18 +4266,56 @@ quota evidence, and none of these knob states is committed.
   pre-existing MP O-3(e)(ii) pair, unchanged); the whole suite is 212
   tests green.
 
-**Step 5 — the hand-off for X-5c (the final file).** This card's
-Acceptance 10k (the runner's, at this tip) is **not** a final file:
-with the workload unchanged, its quota table is the step-0 file's
-(seven misses — SIZING, Q4, Q7, Q8, Q11, Q12, Q18 — beside Q11's
-structural zero), so plain `verify` is expected to exit 2 on the quota
-check alone; the digests and the seed set will reproduce. The retune
-itself is ESCALATED (above) with the measured frontier and the
-candidate designs, and the next attempt inherits: the pin
-re-derivation cost of any knob change (four pins, two of them
-REFRESH-3-protected), the SIZING×budget numbers, Q11's dead counter,
-and Q4's value-distribution tension. X-5c's `--keep` relaunch commits
-whatever file P's ruling produces and runs the sweep and the RESULT.
+**The Acceptance's own run (the runner's, at this card's tip
+a812035f, 2026-11-04) — the quota feedback consumed, and the record's
+one correction.** The runner's 10k (`X-5c-F4.acc.*`, prov
+`commit=a812035f`, `exit=0`, json `bec7056c…`, 06:27:30→06:44:33 =
+**17.1 min at 16 threads**) and its plain `verify` (17.3 min,
+`verify_exit=2`) behaved exactly as predicted: the digests and the
+seed set reproduce; the quota table fails on the same seven — Q4
+0/1000, Q7 168/200, Q8 82/100, Q11 0/100, Q12 1/100, Q18 979/1000,
+SIZING 9,628 seed misses (the step-1 accounting live in `verify`).
+Two things this run teaches, recorded as the card's feedback loop
+demands:
+
+1. **The 40-min budget was NOT the binding constraint — the record
+   above over-weighted it, and this corrects it.** With the runner's
+   17.1-min datum, retune attempt 2's measured 61 s / 200 seeds
+   extrapolates to **~38 min for the 10k** (61/27.7 × 17.1), inside
+   X5-R17's ≤ 40 min, and its verify (~38 min) fits the runner's
+   60-min command limit with the same margin the unchanged workload
+   has. The budget alone would have allowed landing attempt 2
+   (SIZING 9,626 → ~5,600 misses, Q8 ~450, Q18 ~1,150 — Q7 beside
+   them, SIZING/Q4/Q11/Q12 still short).
+2. **The binding constraint is the pin re-derivation, and it is
+   structural, not temporal.** Every knob state measured breaks four
+   seed pins (two REFRESH-3-protected); the r30 pin
+   (`r30_skx_and_smx_record_fields`) needs **five served MP-A rounds**
+   (two skx + three smx, beside 6149's not-served shape), and served
+   rounds occur at ~10 per 10,000 seeds (the step-0 file: 537, 1887,
+   2927, 4098, 7238, 7528, 8107, 8578, 8728, 9358 — none under 500;
+   the retuned-knob probes: 0 in 0..200 at both attempt-2 and
+   attempt-3 states). Re-deriving five by ≤ 200-seed windows needs
+   ~25 windows ≈ 25+ minutes of probes **per attempt, at luck**, with
+   no guarantee any window holds one — and the REFRESH's own rule
+   forbids changing the assertions or shrinking the groups. F3-F3a
+   step 3 re-pointed its two by luck of the then-workload (537/1887
+   landed in its first window); this card's states have none in the
+   two windows measured. **No retune of this card can land until P
+   amends the pin** (a fixture form, a reduced group, a wider
+   re-derivation allowance, or a blessed knob state whose windows
+   carry served rounds) — this is now the primary ESCALATE item,
+   ahead of the SIZING×budget numbers.
+
+**The hand-off for the next attempt (and for P):** the quota table
+above is the live frontier; the reachable-in-scope retune (attempt 2's
+knobs, numbers above) is blocked by the r30 pin alone once the budget
+correction is applied; SIZING, Q4 and Q12 are blocked by the
+structural findings (the dirty set counts only `store_page` pool
+pages; pack merges need ≤ 42 %-full pairs vs SIZING's ~6-entry
+leaves; Q12's renames never land near crashes at any state measured);
+Q11 is blocked by its dead counter. Everything except the r30-pin
+amendment is P's to rule on.
 
 
 
@@ -5296,11 +5337,12 @@ worktree): `cargo test -q --release -p e4-recovery`, then
 `$HOME/.cache/nv3-review/runlogs/X-5c-F4.acc.campaign.json` (the 10k
 `run --seeds 0..10000 --threads 16` with the card's prov lines), then
 **plain** `verify --results` of that file (the card's form — the quota
-table decides), then `bash scripts/gate.sh`. **Expected at this tip:**
-the digests and the seed set reproduce; the quota table carries the
-step-0 file's seven misses (SIZING, Q4, Q7, Q8, Q11, Q12, Q18 — Q11
-structurally, see the stage record), so `verify` exits 2 on the quota
-check alone; the gate itself stays green (fmt, clippy, the suite's 212
+table decides), then `bash scripts/gate.sh`. **Measured at this tip
+(the runner's own run, 2026-11-04):** the 10k is 17.1 min at 16
+threads, `verify` 17.3 min and **exit 2 on the quota table alone**
+(Q4 0/1000, Q7 168/200, Q8 82/100, Q11 0/100, Q12 1/100, Q18 979/
+1000, SIZING 9,628 seed misses) — the digests and the seed set
+reproduce; the gate itself stays green (fmt, clippy, the suite's 212
 tests). The workload at this tip is the step-0 workload: this card's
 probes moved no committed knob.
 
