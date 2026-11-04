@@ -721,6 +721,11 @@ pub struct RoundRec {
     /// ACK-OVER-HOLE store failure (the round's task error carries the
     /// text). A diagnostic the pass fold never reads.
     pub ack_over: Vec<u64>,
+    /// **S-1-F3 §14 step 3a (W6 (ii); X-5c-F3-F3b step 2):** the round's
+    /// recovery `Err` is I-WAL-COVER's refusal (`Fail::WalLoss`, a typed
+    /// match). A diagnostic in the record; the pass fold does not read
+    /// it. X5-R33 (h) counts such rounds per class through it.
+    pub cover_err: bool,
     /// X-5c: script ops that unwound on a client-visible XX001.
     pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
@@ -1616,6 +1621,7 @@ fn round_rec(
     rr.smx = out.smx;
     rr.pass_na = out.pass_na;
     rr.ack_over = out.ack_over.clone();
+    rr.cover_err = out.cover_err;
     rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();

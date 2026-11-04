@@ -1910,6 +1910,40 @@ fn wal_exact_segment_end_hops() {
     let now6 = world.lock().disk.durable_read(fid, n5, bytes6.len() as u64);
     assert_eq!(now5, bytes5, "ts=5's bytes are not zeroed");
     assert_eq!(now6, bytes6, "ts=6's bytes are not zeroed");
+    // ---- **X-5c-F3-F3b step 2 (d), the new flip variant (gate edit
+    // 2):** a flip after the next segment's records opens `Ok`.** The
+    // recovered store checkpoints again — the flip's `wal_ckpt_end`
+    // covers both segment-1 records, step 1 waits for their contiguous
+    // durability, meta 2 is durable — then a crash, then recovery: the
+    // walk hops into segment 1 past the exact boundary, the coverage
+    // check passes, and the open is `Ok`. Under SEG-EXACT-NO-HOP
+    // (F3-F3a's hop disabled) the walk stops at the boundary, the
+    // valid end sits below the durable meta's `wal_ckpt_end`, and this
+    // recovery returns a **false `Fail::WalLoss`** — the flip variant's
+    // catcher.
+    {
+        let disk2 = world.lock().disk.clone();
+        let world2 = pass_world(1, seed + 20, disk2, rec_st);
+        let cx2 = Cx {
+            w: &world2,
+            t: HARNESS,
+        };
+        let mut hooks = |_hook: CkptHook| Ok(());
+        ckpt::checkpoint(&cx2, &mut hooks).expect("the flip over segment 1's records");
+        let mut d2 = world2.lock().disk.clone();
+        crash_clean(&mut d2, seed + 21);
+        let world3 = pass_world(1, seed + 22, d2, StoreInner::empty(cfg.clone(), 0));
+        let cx3 = Cx {
+            w: &world3,
+            t: HARNESS,
+        };
+        let r = ckpt::recover(&cx3, cfg.clone());
+        assert!(
+            matches!(r, Ok((_, 6))),
+            "a flip after the next segment's records opens Ok (the hop carries\
+             \nthe walk past the exact boundary; I-WAL-COVER passes), got {r:?}"
+        );
+    }
 }
 
 /// A small helper: the world's disk, cloned (the pin above).
@@ -3928,4 +3962,519 @@ fn cover_ts_cross_check_forged_meta() {
              \nwith XX001 and no fallback, got {opened:?}"
         );
     }
+}
+
+/// **X-5c-F3-F3b step 2 helper: apply a post-sync media fault on the
+/// durable WAL write covering `[lsn, lsn+len)`** (through SimDisk's
+/// fault API, the same effect a directed F-MEDIA-WAL fault has: the
+/// synced write reverts — LOST — or its stray bytes land elsewhere —
+/// MISDIRECTED — or a subset of its sectors reverts — TORN).
+fn fault_wal_write(
+    disk: &mut SimDisk,
+    seg_first: u64,
+    off: u64,
+    len: u64,
+    kind: e4_recovery::sim::MediaKind,
+) {
+    let name = format!("/wal/{seg_first:016x}.log");
+    let fid = disk.stat(&name).unwrap_or_else(|| panic!("segment {name}"));
+    let w = disk
+        .dwrites_of(fid)
+        .iter()
+        .rev()
+        .find(|w| w.off < off + len && w.off + w.bytes.len() as u64 > off)
+        .cloned()
+        .unwrap_or_else(|| panic!("no durable WAL write covers [{off}, {})", off + len));
+    disk.apply_one_media_fault(&e4_recovery::sim::MediaFault {
+        inode: fid,
+        off: w.off,
+        len: w.bytes.len() as u64,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind,
+    });
+}
+
+/// **X-5c-F3-F3b step 2 pin (S-1-F3 §14 step 3a, W6 (ii);
+/// `t_wal_loss_below_ckpt_end`; a literal config, one arm per
+/// variant).** I-WAL-COVER fails closed: when the walk's valid end
+/// cannot cover the opened meta's `wal_ckpt_end` — a post-sync fault
+/// damaged a record below the bound — the open returns `Fail::WalLoss`,
+/// **writes nothing** (no write, sync or directory event during the
+/// open; every inode's current and durable bytes and the directory
+/// bindings identical before and after), and **a second open, after a
+/// nested crash during the first, fails the same way**.
+///
+/// Every variant's target record sits below a durable meta's
+/// `wal_ckpt_end` (the flip's step 1 synced it):
+/// - **c-partly-applied** (the main shape, under LOST, TORN and
+///   MISDIRECTED faults): a commit `c > T` whose op is applied into the
+///   tree before the flip, so image k holds part of it;
+/// - **c-unapplied**: the fault on a record appended but unapplied at
+///   the flip;
+/// - **segend**: the fault on a `SegmentEnd` below the bound;
+/// - **marked-chunk**: the fault on a chunk of a marked transaction;
+/// - **unmarked-chunk**: the fault on a chunk of a transaction that
+///   never committed (no committed data lost, still XX001);
+/// - **bulk-fence**: the fault on a bulk load's fence commit `f > T`,
+///   with loaded entries in image k;
+/// - **short-segment**: a segment cut short so its end-of-file lies
+///   past the start of a record that runs past it, below the bound.
+#[test]
+fn wal_loss_below_ckpt_end_fails_closed() {
+    let seed = 9292u64;
+    let cfg = tcfg(8, 8, 1);
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    /// The variant's built disk: the target record's absolute LSN span
+    /// and its fault.
+    struct V {
+        kind: e4_recovery::sim::MediaKind,
+        short_len: Option<u64>,
+    }
+    let variants: &[(&str, V)] = &[
+        (
+            "c-partly-applied LOST",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: None,
+            },
+        ),
+        (
+            "c-partly-applied TORN",
+            V {
+                kind: e4_recovery::sim::MediaKind::Torn { sectors: vec![0] },
+                short_len: None,
+            },
+        ),
+        (
+            "c-partly-applied MISDIRECTED",
+            V {
+                kind: e4_recovery::sim::MediaKind::Misdirected { to_off: 512 },
+                short_len: None,
+            },
+        ),
+        (
+            "c-unapplied",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: None,
+            },
+        ),
+        (
+            "segend",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: None,
+            },
+        ),
+        (
+            "marked-chunk",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: None,
+            },
+        ),
+        (
+            "unmarked-chunk",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: None,
+            },
+        ),
+        (
+            "bulk-fence",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: None,
+            },
+        ),
+        (
+            "short-segment",
+            V {
+                kind: e4_recovery::sim::MediaKind::Lost,
+                short_len: Some(0),
+            },
+        ),
+    ];
+    for (vi, (vname0, v)) in variants.iter().enumerate() {
+        let vname: &str = vname0;
+        // ---- build: records above T, all synced below a durable meta's
+        // wal_ckpt_end ----
+        let disk = {
+            let host = TestWorld {
+                sched: SchedCore::new(1, seed + vi as u64),
+                disk: SimDisk::new(),
+                st: StoreInner::empty(cfg.clone(), 0),
+                flags: BTreeMap::new(),
+                nums: BTreeMap::new(),
+            };
+            let sched = Sched::new(host);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+            cx.with("pin:install", |c| {
+                *c.store() = st;
+                Ok(())
+            })
+            .expect("install");
+            tree::dir_create_tree(&cx, 2).expect("tree 2");
+            let target;
+            match vname {
+                "c-partly-applied LOST"
+                | "c-partly-applied TORN"
+                | "c-partly-applied MISDIRECTED" => {
+                    let (l, n) =
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 2, &[3u8; 40]).expect("c");
+                    // Partly applied before the flip: the op is in the
+                    // tree (image k holds part of c).
+                    ckpt::apply_op(
+                        &cx,
+                        &wal::WOp::Put {
+                            tree: 2,
+                            key: b"c".to_vec(),
+                            value: vec![2u8; 8],
+                        },
+                        2,
+                        false,
+                    )
+                    .expect("apply c");
+                    target = (l, l + n);
+                }
+                "c-unapplied" => {
+                    let (l, n) =
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 2, &[4u8; 40]).expect("c");
+                    target = (l, l + n);
+                }
+                "segend" => {
+                    // Fill segment 0 to leave a 20-byte tail (too short
+                    // for any record): the next enqueue writes a
+                    // SegmentEnd and hops; the fault hits the filler.
+                    let maxp = (e4_recovery::store::wal::REC_MAX - fixed) as usize;
+                    for ts in 1..=4u64 {
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp])
+                            .expect("fill");
+                    }
+                    let tail = seg - 4 * (maxp as u64 + fixed);
+                    assert!(tail < fixed, "the tail must be too short for a record");
+                    let (l, n) =
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 9), 9, &[9u8; 10]).expect("hop");
+                    assert_eq!(l, seg, "the record hops to segment 1");
+                    // The SegmentEnd sits at the dead tail; its span is
+                    // the target (its end rounds to the boundary on the
+                    // walk, but the damage stops the walk at its start).
+                    target = (seg - tail, seg - tail + fixed);
+                    let _ = n;
+                }
+                "marked-chunk" | "unmarked-chunk" => {
+                    let txn = (0u32, if vname == "marked-chunk" { 1 } else { 2 });
+                    enqueue_chunk(&cx, txn, &[op_put_key(b"K1", 1)]);
+                    // `commit_txn` registers the chunk in `open_chunks`
+                    // (h:openchunk) — the flip's `wal_start_lsn` reads
+                    // it (the None arm / the marked case), so the raw
+                    // fixture registers it too.
+                    cx.with("pin:openchunk", |c| {
+                        let st = c.store();
+                        let l = *st.wal.buf_tags.keys().next_back().expect("the chunk's lsn");
+                        st.wal.open_chunks.entry(txn).or_insert(l);
+                        Ok(())
+                    })
+                    .expect("open chunk");
+                    let tl = last_enqueued(&cx);
+                    if vname == "marked-chunk" {
+                        enqueue_marker(&cx, txn, 3, 1);
+                    }
+                    target = (tl, tl + fixed);
+                }
+                "bulk-fence" => {
+                    // A bulk load's shape: an unlogged tree with loaded
+                    // entries (image k holds them after the checkpoint),
+                    // and its fence commit f > T.
+                    tree::dir_create_tree(&cx, 3).expect("tree 3");
+                    let r3 = tree::dir_root_of(&cx, 3).expect("root 3");
+                    for i in 0..8u64 {
+                        ins(&cx, 3, r3, &i.to_be_bytes(), 3, &val(i, 3));
+                    }
+                    let (l, n) =
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 7), 3, &[7u8; 30]).expect("f");
+                    target = (l, l + n);
+                }
+                "short-segment" => {
+                    let maxp = (e4_recovery::store::wal::REC_MAX - fixed) as usize;
+                    for ts in 1..=4u64 {
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp])
+                            .expect("fill seg0");
+                    }
+                    // One max record in segment 1, then a small one that
+                    // runs past the short length we cut to.
+                    let (l1, n1) =
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 6), 6, &vec![0u8; maxp])
+                            .expect("seg1 max");
+                    assert_eq!(l1, seg, "the max record opens segment 1");
+                    let (l2, n2) =
+                        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 7), 7, &[7u8; 10]).expect("r7");
+                    wal::wal_wait_durable(&cx, l2 + n2).expect("durable");
+                    // The checkpoint below covers both; the short cut is
+                    // applied after it (a failed preallocation).
+                    target = (l2, l2 + n2);
+                    let _ = n1;
+                }
+                other => panic!("unknown variant {other}"),
+            }
+            if vname != "c-partly-applied LOST"
+                && vname != "c-partly-applied TORN"
+                && vname != "c-partly-applied MISDIRECTED"
+                && vname != "short-segment"
+                && vname != "segend"
+            {
+                // The other variants' records are acked here (the main
+                // three already enqueued; segend/short-segment ack their
+                // own inside the arm).
+            }
+            if vname != "short-segment" && vname != "segend" {
+                let end = cx
+                    .with("pin:end", |c| Ok(c.store().wal.append))
+                    .expect("append");
+                wal::wal_wait_durable(&cx, end).expect("variant records durable");
+            }
+            // The flip: T stays at 0 (nothing applied), wal_ckpt_end
+            // covers every enqueued record, and meta 1 is durable.
+            let mut hooks = |_hook: CkptHook| Ok(());
+            ckpt::checkpoint(&cx, &mut hooks).expect("the covering checkpoint");
+            let mut d = {
+                let g = sched.lock();
+                g.disk.clone()
+            };
+            crash_clean(&mut d, seed + vi as u64 + 50);
+            // The post-sync fault (or the short cut) on the target.
+            match v.short_len {
+                Some(cut) => {
+                    // The short segment: the file's length ends past the
+                    // target record's start but before its end — the
+                    // bytes past EOF read as zeros and the record's
+                    // header never decodes.
+                    let name = format!("/wal/{seg:016x}.log");
+                    let fid = d.stat(&name).expect("segment 1");
+                    let off_in_file = target.0 - seg;
+                    let cut = cut.max(off_in_file + 8);
+                    d.set_len(fid, cut).expect("cut the segment short");
+                    // The failed preallocation is durable: the length a
+                    // completed sync covered (a volatile set_len would
+                    // revert at the nested crash below).
+                    d.sync_all(fid).expect("the short length is durable");
+                }
+                None => {
+                    fault_wal_write(
+                        &mut d,
+                        seg_of(target.0),
+                        target.0 - seg_of(target.0),
+                        target.1 - target.0,
+                        v.kind.clone(),
+                    );
+                }
+            }
+            d
+        };
+        // ---- the assertion block ----
+        // Snapshot: events, every inode's current and durable bytes, the
+        // directory bindings (current and durable).
+        let snap_events = disk.events.len();
+        let snap_files = snapshot_files(&disk);
+        let snap_dirs = (
+            disk.list_dir("/"),
+            disk.list_dir("/wal/"),
+            disk.durable_dir_bindings("/"),
+        );
+        // First open: the typed refusal.
+        let world = pass_world(
+            1,
+            seed + 200 + vi as u64,
+            disk.clone(),
+            StoreInner::empty(cfg.clone(), 0),
+        );
+        let cx = Cx {
+            w: &world,
+            t: HARNESS,
+        };
+        let r1 = ckpt::recover(&cx, cfg.clone());
+        assert!(
+            matches!(r1, Err(Fail::WalLoss { .. })),
+            "{vname}: the open must return Fail::WalLoss (I-WAL-COVER), got {r1:?}"
+        );
+        let after = world.lock().disk.clone();
+        // Nothing was written during the open.
+        let wrote = after.events.iter().skip(snap_events).any(|e| {
+            matches!(
+                e,
+                e4_recovery::sim::DiskEvent::WriteIssued { .. }
+                    | e4_recovery::sim::DiskEvent::WriteReturned { .. }
+                    | e4_recovery::sim::DiskEvent::SyncIssued { .. }
+                    | e4_recovery::sim::DiskEvent::SyncReturned { .. }
+                    | e4_recovery::sim::DiskEvent::DirOpIssued { .. }
+                    | e4_recovery::sim::DiskEvent::SyncDirReturned { .. }
+            )
+        });
+        assert!(
+            !wrote,
+            "{vname}: a write/sync/directory event fired during the open"
+        );
+        // Every inode's bytes and the bindings are identical.
+        assert_eq!(
+            snapshot_files(&after),
+            snap_files,
+            "{vname}: some inode's current or durable bytes changed during the open"
+        );
+        assert_eq!(
+            (
+                after.list_dir("/"),
+                after.list_dir("/wal/"),
+                after.durable_dir_bindings("/")
+            ),
+            snap_dirs,
+            "{vname}: the directory bindings changed during the open"
+        );
+        // A second open, after a nested crash during the first: arm a
+        // crash inside a fresh first attempt, resolve F-CRASH, retry —
+        // the same refusal.
+        {
+            let world2 = pass_world(
+                1,
+                seed + 300 + vi as u64,
+                disk.clone(),
+                StoreInner::empty(cfg.clone(), 0),
+            );
+            let cx2 = Cx {
+                w: &world2,
+                t: HARNESS,
+            };
+            cx2.with("pin:arm", |c| {
+                c.sched_mut().crash_at_yield = Some(2);
+                Ok(())
+            })
+            .expect("arm");
+            let nested = ckpt::recover(&cx2, cfg.clone());
+            assert!(
+                matches!(nested, Err(Fail::Sim(SimFail::Crashed))),
+                "{vname}: the armed nested crash must propagate as Sim(Crashed), got {nested:?}"
+            );
+            let mut d2 = world2.lock().disk.clone();
+            crash_clean(&mut d2, seed + 400 + vi as u64);
+            let world3 = pass_world(
+                1,
+                seed + 500 + vi as u64,
+                d2,
+                StoreInner::empty(cfg.clone(), 0),
+            );
+            let cx3 = Cx {
+                w: &world3,
+                t: HARNESS,
+            };
+            let r2 = ckpt::recover(&cx3, cfg.clone());
+            assert!(
+                matches!(r2, Err(Fail::WalLoss { .. })),
+                "{vname}: the second open (after a nested crash) must fail the same way, got {r2:?}"
+            );
+        }
+    }
+}
+
+/// **X-5c-F3-F3b step 2 helpers.** `seg_of` and `last_enqueued` (the
+/// append position before the last-record helper runs), plus the file
+/// snapshot the fail-closed pin compares.
+fn seg_of(lsn: u64) -> u64 {
+    lsn - (lsn % e4_recovery::store::WAL_SEG)
+}
+
+fn last_enqueued(cx: &Cx<'_, TestWorld>) -> u64 {
+    cx.with("pin:last", |c| {
+        let st = c.store();
+        Ok(st.wal.buf_tags.keys().next_back().copied().unwrap_or(0))
+    })
+    .expect("last enqueued")
+}
+
+/// A comparable snapshot of every bound file's current and durable
+/// bytes (a fixed 1-MiB window: the fixtures' files are far smaller;
+/// reads past the end return zeros, deterministically).
+fn snapshot_files(disk: &SimDisk) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+    for dir in ["/", "/wal/"] {
+        for (name, fid) in disk.list_dir(dir) {
+            let mut d = disk.clone();
+            let cur = d.read_at(fid, 0, 1 << 20).expect("read current bytes");
+            let dur = disk.durable_read(fid, 0, 1 << 20);
+            let full = if dir == "/" {
+                name
+            } else {
+                format!("{dir}{name}")
+            };
+            out.push((full, cur, dur));
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// **X-5c-F3-F3b step 2 pin (S-1-F3 §14 step 3a, W6 (ii); a literal
+/// config).** A meta forged through `Env` whose `ts_ckpt_hi` exceeds
+/// every replayable commit: the walk's `max(T, hi_read)` can never
+/// reach it, and the open fails with `Fail::WalLoss` — the coverage
+/// check's second condition is its own catcher (mutant
+/// TS-HI-CHECK-SKIP, which removes it, opens this fixture).
+#[test]
+fn cover_ts_cross_check_unreachable_hi() {
+    let seed = 9393u64;
+    let cfg = tcfg(8, 8, 1);
+    let (mut disk, m1) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        // One acked commit (ts 2), then a checkpoint: meta 1 with
+        // wal_ckpt_end over the record and ts_ckpt_hi = 2.
+        enqueue_commit(&cx, (0, 1), 2, &[op_put_key(b"A", 1)]);
+        let mut hooks = |_hook: CkptHook| Ok(());
+        ckpt::checkpoint(&cx, &mut hooks).expect("checkpoint");
+        let m1 = cx.with("pin:m1", |c| Ok(c.store().meta)).expect("meta 1");
+        let g = sched.lock();
+        (g.disk.clone(), m1)
+    };
+    crash_clean(&mut disk, seed + 1);
+    // The forgery: meta 2 in the other slot, identical except
+    // ts_ckpt_hi = 50 — beyond every replayable commit (hi_read tops at
+    // 2, T is 0). Forged through Env: written and synced.
+    let pf = disk.stat("/pages").expect("page file");
+    let mut m2 = m1;
+    m2.ckpt_id = m1.ckpt_id + 1;
+    m2.ts_ckpt_hi = 50;
+    let bytes = e4_recovery::store::page::build_meta(&m2);
+    let slot = (1 + (m2.ckpt_id % 2)) * 4096;
+    disk.write_at(pf, slot, &bytes).expect("forge write");
+    disk.sync_all(pf).expect("forge sync");
+    let world = pass_world(1, seed + 2, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let r = ckpt::recover(&cx, cfg.clone());
+    assert!(
+        matches!(r, Err(Fail::WalLoss { ts_ckpt_hi: 50, .. })),
+        "the unreachable ts_ckpt_hi must fail the open with Fail::WalLoss, got {r:?}"
+    );
 }

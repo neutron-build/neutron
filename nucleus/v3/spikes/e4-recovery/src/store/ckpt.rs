@@ -1530,6 +1530,35 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         }
         break 'outer;
     }
+    // **S-1-F3 §14 step 3a (W6 (ii); X-5c-F3-F3b step 2): I-WAL-COVER,
+    // fail-closed.** Pass 1 also records the largest `commit_ts` of the
+    // `Commit` and `CommitMarker` records it reads (`hi_read`). The WAL
+    // **covers** image k iff the valid end (§12.5: the LSN at which the
+    // walk stopped, never an end-of-file) is at or above meta k's
+    // `wal_ckpt_end`, and `max(T, hi_read) ≥ ts_ckpt_hi`. If it does
+    // not, there is WAL loss: the open fails with XX001 (this typed
+    // error) **before `recover:install`, pass 2, any eviction write and
+    // `truncate_wal` — nothing is written**: no install, no replay
+    // mutation, no eviction write and no truncation. The files stay
+    // exactly as found, including any intact records behind the damage
+    // (the read-only salvage open that would follow is X5-R33 (i)'s, not
+    // this prototype's: Q1 = A's read-write refusal half only).
+    {
+        let hi_read = replay
+            .iter()
+            .filter(|r| r.kind == K_COMMIT || r.kind == K_MARKER)
+            .map(|r| r.ts)
+            .max()
+            .unwrap_or(0);
+        if valid_end < meta.wal_ckpt_end || meta.t.max(hi_read) < meta.ts_ckpt_hi {
+            return Err(Fail::WalLoss {
+                valid_end,
+                wal_ckpt_end: meta.wal_ckpt_end,
+                t: meta.t,
+                ts_ckpt_hi: meta.ts_ckpt_hi,
+            });
+        }
+    }
     // X-5c-F3-F3a step 6 (c) (`E4_TXN_DIAG`, stderr only, default off,
     // never a digest input): per recovery, each marker's recorded chunk
     // count against the chunks this walk attached to its txn. A mismatch
@@ -1702,6 +1731,14 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         ))
     })?;
     if !logical_only {
+        // **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3 (b)):**
+        // recovery's step-5 truncation is a WAL-path operation — a
+        // failure here fails the open, and the store is never installed
+        // in the host that would serve traffic. In the prototype that
+        // is exactly the equivalent of a poisoned, stopped store (the
+        // world unwinds, the round's recovery returns `Err`), so no
+        // in-memory mark is needed: nothing can observe a half-truncated
+        // store as usable.
         truncate_wal(cx, valid_end)?;
     }
     // The WAL writer state restarts at the valid end. The replayed
@@ -1709,6 +1746,22 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
     // (§12.6): a post-recovery flip must still cover the chunks of a
     // transaction whose marker is above its `T`, or the next recycle
     // could eat them before a later crash's replay (I-REPLAY-IDEM).
+    {
+        let hi_read = replay
+            .iter()
+            .filter(|r| r.kind == K_COMMIT || r.kind == K_MARKER)
+            .map(|r| r.ts)
+            .max()
+            .unwrap_or(0);
+        if valid_end < meta.wal_ckpt_end || meta.t.max(hi_read) < meta.ts_ckpt_hi {
+            return Err(Fail::WalLoss {
+                valid_end,
+                wal_ckpt_end: meta.wal_ckpt_end,
+                t: meta.t,
+                ts_ckpt_hi: meta.ts_ckpt_hi,
+            });
+        }
+    }
     cx.with("recover:walreset", |c| {
         let st = c.store();
         st.wal.append = valid_end;

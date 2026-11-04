@@ -1087,15 +1087,22 @@ fn r30_skx_and_smx_record_fields() {
             "seed {seed} r0: the no-taint re-verdict"
         );
     }
-    // 6149 r1: not served after the SegmentEnd fix — both predicates
-    // false and `pass_na` null (recorded only when served).
+    // 6149: not served after the SegmentEnd fix — both predicates false
+    // and `pass_na` null (recorded only when served). **Seed-shape
+    // maintenance (F3-F1's accepted rule; X-5c-F3-F3b steps 1–2):** the
+    //Assertions are unchanged; the round index moved from 1 to 0 —
+    // step 1's meta-format change moved the workload, the round-0
+    // recovery now ends at I-WAL-COVER's refusal (`cover_err`, a
+    // passing detection), and the chain stops there, so the old r1
+    // index fails only at its shape precondition (an index out of
+    // bounds), exactly as the rule describes.
     let rec = e4_recovery::workload::run_seed(6149, None);
-    let r = &rec.rounds[1];
-    assert!(!r.served, "seed 6149 r1: the serve is gone after step 2");
-    assert!(!r.skx && !r.smx, "seed 6149 r1: skx = smx = false");
+    let r = &rec.rounds[0];
+    assert!(!r.served, "seed 6149 r0: the serve is gone after step 2");
+    assert!(!r.skx && !r.smx, "seed 6149 r0: skx = smx = false");
     assert!(
         r.pass_na.is_none(),
-        "seed 6149 r1: pass_na is null (not served)"
+        "seed 6149 r0: pass_na is null (not served)"
     );
 }
 

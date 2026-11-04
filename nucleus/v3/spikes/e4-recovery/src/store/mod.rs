@@ -152,6 +152,24 @@ pub enum Fail {
     /// XX001: an integrity check failed.
     #[error("corrupt: {0}")]
     Corrupt(String),
+    /// **S-1-F3 §14 step 3a (W6 (ii); X-5c-F3-F3b step 2):** XX001 —
+    /// WAL loss. The walk's valid end does not cover the opened meta's
+    /// `wal_ckpt_end`, or the walk's largest accepted commit ts (with
+    /// `T`) does not reach `ts_ckpt_hi`: the WAL cannot cover image k,
+    /// and the open fails before pass 2, writing nothing.
+    #[error(
+        "WAL loss: valid_end={valid_end} wal_ckpt_end={wal_ckpt_end} t={t} ts_ckpt_hi={ts_ckpt_hi}"
+    )]
+    WalLoss {
+        /// The walk's stop position (§12.5 as amended).
+        valid_end: u64,
+        /// The opened meta's WAL bound.
+        wal_ckpt_end: u64,
+        /// The opened meta's `T`.
+        t: u64,
+        /// The opened meta's commit-ts bound.
+        ts_ckpt_hi: u64,
+    },
     /// The simulated environment crashed / deadlocked / violated S-BATON.
     #[error("sim: {0:?}")]
     Sim(SimFail),

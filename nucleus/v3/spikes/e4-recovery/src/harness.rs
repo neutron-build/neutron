@@ -1596,6 +1596,13 @@ pub struct RoundOutcome {
     /// diagnostic in the record (`run` writes it, `verify` parses it);
     /// the pass fold reads it only through the round's task error.
     pub ack_over: Vec<u64>,
+    /// **S-1-F3 §14 step 3a (W6 (ii); X-5c-F3-F3b step 2):** the
+    /// round's recovery `Err` is I-WAL-COVER's refusal — a typed match
+    /// on `Fail::WalLoss`, never a text match. The XX001 site stays
+    /// `Open` (X5-R11) and the seed ends at that round, as for any
+    /// recovery `Err`. A diagnostic in the record; the pass fold does
+    /// not read it.
+    pub cover_err: bool,
 }
 
 impl Default for RoundOutcome {
@@ -1651,6 +1658,7 @@ impl Default for RoundOutcome {
             kept_slots: BTreeSet::new(),
             kept_slots_ii: BTreeSet::new(),
             ack_over: Vec::new(),
+            cover_err: false,
         }
     }
 }
@@ -2371,6 +2379,10 @@ pub fn run_round(
     // compare, and an "XX001 at Open" would claim a detection that never
     // happened. The round fails through the deadlock fold.
     let mut recovery_livelock: Option<&'static str> = None;
+    // X-5c-F3-F3b step 2 (c): set by the recovery loop's final Err arm
+    // (a typed match); read into the outcome below.
+    #[allow(unused_assignments)]
+    let mut cover_err_outcome = false;
     // Every exit of the loop below assigns this before it is read (the
     // Ok arm and the final Err arm both collect the attempt's reads);
     // the initializer only satisfies the borrow checker.
@@ -2466,6 +2478,9 @@ pub fn run_round(
                 continue;
             }
             Err(e) => {
+                // **X-5c-F3-F3b step 2 (c):** the round field is a typed
+                // match on I-WAL-COVER's refusal, never a text match.
+                cover_err_outcome = matches!(e, Fail::WalLoss { .. });
                 let g = world.lock();
                 if g.sched.livelock {
                     recovery_livelock = Some(g.sched.livelock_site);
@@ -3257,6 +3272,9 @@ pub fn run_round(
     // X5-R34 (f): the cross-check's record field (the task error above
     // already fails any non-empty list through the pass fold).
     outcome.ack_over = ack_over;
+    // X-5c-F3-F3b step 2 (c): I-WAL-COVER's refusal on the recovery Err
+    // arm (a typed match; the livelock arm leaves it false).
+    outcome.cover_err = cover_err_outcome;
     // ---- the monitors (3.10), from disk events and parsed WAL bytes ----
     {
         let g = sched.lock();
