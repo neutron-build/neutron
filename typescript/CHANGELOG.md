@@ -21,6 +21,12 @@ All notable changes to this project are documented in this file.
   executor. Client `messages` may contain only user and assistant text;
   `toolApprovals` in the body is refused (400). Resume approval-suspended
   turns server-side (`agentWorkflow` or `runTurn`).
+- **`@neutron-build/ai` `claudeCode` harness** passes the prompt after `--`
+  so it is never parsed as a CLI option, and refuses a `sessionId` that is
+  not a UUID.
+- **`@neutron-build/mcp` `createMcpServer` gains `allowedOrigins`**: when
+  set, a request whose `Origin` is not listed is refused with 403 before
+  `authorize` runs. Unset keeps the bearer-only behaviour.
 
 ## [core 0.5.2, cli 0.5.2] - 2026-11-03
 
