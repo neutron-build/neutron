@@ -1013,12 +1013,31 @@ def parse_tokens(log_path):
 
 
 def kill_child(proc):
-    """Kill opencode and everything it started (its bash tool's git and cargo),
-    then reap it: a process that outlives the kill can still commit."""
+    """Kill opencode's process group (opencode, its bash tool's git and cargo,
+    and anything they backgrounded), then reap opencode: a process that
+    outlives the kill can still commit.
+
+    Called after every attempt, including one where opencode exited by itself:
+    a backgrounded grandchild (a bash tool call that ran `(sleep 30; git commit)
+    &`) keeps the group alive after opencode exits, and would otherwise commit
+    during the acceptance commands, after the end record, or into a span no
+    ledger range covers (X-6-F1-F1-F2). Safe on a child that already exited:
+    the group outlives its reaped leader while any member is alive, ESRCH
+    means it is already empty, and `wait()` on a reaped child returns at once.
+
+    Residuals: a grandchild that calls setsid/setpgid leaves the group and is
+    not reached (the post-hoc scope, ref and stray checks are the enforcement
+    there); and once the leader is reaped and the group has emptied, its pid
+    could in principle be reused as a new pgid before this killpg. Linux
+    allocates pids sequentially, so that needs a full pid wrap within
+    milliseconds."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
-        pass
+        pass  # ESRCH: the group is already empty
+    # PermissionError is deliberately not caught: a pgid reused by another
+    # user's process is not ours to ignore. Raising fails closed (the run
+    # crashes, and main()'s finally still writes the end record).
     proc.wait()
 
 
@@ -1206,6 +1225,10 @@ def main():
                             failure = f"opencode run killed: timed out after {ATTEMPT_S // 60} minutes or disk nearly full"
                             break
                     else:
+                        # opencode exited by itself, but a grandchild it
+                        # backgrounded may still be running in its group: kill
+                        # the group before anything reads the branch.
+                        kill_child(child)
                         finished = True
                 if finished or killed:
                     break
@@ -1287,7 +1310,8 @@ def main():
         # outlives the runner keeps committing after the end record.
         old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        if child is not None and child.poll() is None:
+        # Whether or not opencode itself is alive: its group may not be empty.
+        if child is not None:
             kill_child(child)
         _, head = run(["git", "rev-parse", "HEAD"], wt)
         head = head.strip()
