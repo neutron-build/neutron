@@ -2004,6 +2004,11 @@ pub struct WorkloadObs {
     /// **X5-R38:** the same for the W12 windows — a `wal_recycle`
     /// rename returned, its `sync_dir` not yet complete.
     pub w12_yields: Vec<u64>,
+    /// **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2):** the `n` the
+    /// open checkpoint's begin step folded (0 when no checkpoint is
+    /// open at the crash). A diagnostic pending OQ-1, never an exit
+    /// input.
+    pub ckpt_closed_dirty: u64,
     /// Flips whose image held part of a commit above `T` (Q9).
     pub q9_partial_flips: u64,
     /// LPIDs dirtied in the still-open interval (Work 5.3's crash-time
@@ -2354,6 +2359,7 @@ pub fn run_round(
             stale_seg_reads: st.stale_seg_reads,
             w11_yields: st.w11_yields.clone(),
             w12_yields: st.w12_yields.clone(),
+            ckpt_closed_dirty: st.ckpt_closed_dirty,
             q9_partial_flips: st.q9_partial_flips,
             dirty_now_len: st.dirty_now.len() as u64,
             dirty_max: st.dirty_max,

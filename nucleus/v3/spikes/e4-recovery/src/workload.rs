@@ -1111,6 +1111,14 @@ pub struct RoundRec {
     /// Work 5.3's sizing assertion for this round's intervals (a miss is
     /// a harness defect, never a pass).
     pub sizing_ok: bool,
+    /// **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2):** the crash cut
+    /// a ≥ 4·F interval — the crash fired and either the open interval
+    /// at the crash had already reached 4·F, or a checkpoint was open at
+    /// the crash whose begin step had folded a ≥ 4·F interval. A
+    /// diagnostic pending OQ-1 (whether SIZING's per-seed definition
+    /// changes to count crash-cut intervals is the owner's question);
+    /// never a digest input, never an exit input.
+    pub szc: bool,
 }
 
 /// The twin's per-round outcome (judged as class C; Work 2.5).
@@ -2099,8 +2107,28 @@ fn round_rec(
     // Work 5.3: ≥ 4·F distinct dirtied LPIDs in at least one checkpoint
     // interval (completed intervals' max, or the crash-cut open one).
     let four_f = 4 * cfg.pool_frames as u64;
-    rr.sizing_ok = obs.dirty_max >= four_f || obs.dirty_now_len >= four_f;
+    rr.sizing_ok = sizing_ok_of(obs, four_f);
+    // SIZING-C (step 4): the crash cut a ≥ 4·F interval.
+    rr.szc = szc_of(obs, four_f);
     rr
+}
+
+/// Work 5.3's sizing flag, pure in the observables (pub for the step-4
+/// directed pins): some interval of the round — a completed one
+/// (`dirty_max`) or the open one at the crash (`dirty_now_len`) —
+/// reached `four_f` distinct dirtied pool LPIDs.
+pub fn sizing_ok_of(obs: &harness::WorkloadObs, four_f: u64) -> bool {
+    obs.dirty_max >= four_f || obs.dirty_now_len >= four_f
+}
+
+/// **SIZING-C (step 4; ESCALATE 2 — a diagnostic pending OQ-1):** the
+/// crash fired and either the open interval at the crash had already
+/// reached `four_f`, or a checkpoint was open at the crash whose begin
+/// step folded a `≥ four_f` interval (`ckpt_closed_dirty`, which is 0
+/// whenever no checkpoint is open — so the second disjunct carries its
+/// own openness condition).
+pub fn szc_of(obs: &harness::WorkloadObs, four_f: u64) -> bool {
+    obs.crash_fired && (obs.dirty_now_len >= four_f || obs.ckpt_closed_dirty >= four_f)
 }
 
 /// The class's short name.

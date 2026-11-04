@@ -625,6 +625,8 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
             st.ckpt_open = false;
             st.flip_window = false;
             st.image_frozen = None;
+            // SIZING-C: no checkpoint is open (the abort path).
+            st.ckpt_closed_dirty = 0;
             Ok(())
         })
         .ok();
@@ -651,6 +653,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let n = st.dirty_now.len() as u64;
         st.dirty_max = st.dirty_max.max(n);
         st.dirty_now.clear();
+        // SIZING-C (X-5c-F4-F1 step 4): the open checkpoint's folded n,
+        // an observable only (0 when no checkpoint is open).
+        st.ckpt_closed_dirty = n;
         Ok(())
     })?;
     hooks(CkptHook::Before0)?;
@@ -990,6 +995,8 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let st = c.store();
         st.ckpt_done += 1;
         st.ckpt_open = false;
+        // SIZING-C: no checkpoint is open.
+        st.ckpt_closed_dirty = 0;
         Ok(())
     })?;
     // `wait_ckpt` (Work 13) polls `force_ckpt || ckpt_open`; the step-5

@@ -748,6 +748,23 @@ fn cmd_verify(args: &[String]) -> i32 {
             missed += 1;
         }
     }
+    // **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2): one INFO line,
+    // a diagnostic pending OQ-1 — never an exit input.** Crash rounds
+    // that cut a ≥ 4·F interval (the crash fired with the open interval
+    // already at 4·F, or an open checkpoint whose folded interval was
+    // ≥ 4·F), by class.
+    {
+        let mut by_class = [("C", 0u64), ("MP", 0u64), ("MW", 0u64)];
+        for rec in recs.iter() {
+            if let Some((_, n)) = by_class.iter_mut().find(|(c, _)| *c == rec.class) {
+                *n += rec.rounds.iter().filter(|r| r.szc).count() as u64;
+            }
+        }
+        println!(
+            "INFO SIZING-C crash rounds cutting a >= 4*F interval: C {} MP {} MW {}",
+            by_class[0].1, by_class[1].1, by_class[2].1
+        );
+    }
     if missed > 0 && !no_quotas {
         eprintln!("e4-campaign verify: {missed} quotas missed");
     }
@@ -1393,7 +1410,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1443,6 +1460,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.baton,
                 x.task_error.is_some(),
                 esc(x.cwin.unwrap_or("u")),
+                u8::from(x.szc),
                 u8::from(x.q4_split_merge),
                 u8::from(x.q5_open),
                 u8::from(x.q5_marked),
@@ -1887,6 +1905,10 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "terr" => {
                 let b = j.boolv()?;
                 x.task_error = b.then(|| "task error (see digest)".to_owned());
+            }
+            "szc" => {
+                // SIZING-C (step 4): the crash-cut diagnostic.
+                x.szc = j.int()? != 0;
             }
             "cwin" => {
                 // X5-R38: the window pick of record ("u" = the plain

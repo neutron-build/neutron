@@ -21,6 +21,20 @@ fn cfg(mutant: Option<Mutant>) -> StoreCfg {
     }
 }
 
+/// The SIZING-C pins' literal config: the smallest pool that holds a
+/// 3-level tree path, so 4·F = 24 distinct dirtied LPIDs is reachable
+/// inside one chunked transaction.
+fn scfg() -> StoreCfg {
+    StoreCfg {
+        map_leaf_cap: 8,
+        freeset_leaf_bits: 128,
+        pool_frames: 6,
+        r_epoch: 2,
+        mutant: None,
+        wal_io_fail: None,
+    }
+}
+
 fn drop_all() -> FaultKnobs {
     FaultKnobs {
         keep_latest_pm: 0,
@@ -2056,4 +2070,138 @@ fn x5_r36_reuse_on_dropping_predicate() {
         5,
         10
     ));
+}
+
+/// **SIZING-C pin 1 (card X-5c-F4-F1 step 4; a literal config): the
+/// crash cuts an open interval that had already reached 4·F — `szc`
+/// and `sizing_ok` both true.** A pool of 6 frames makes 4·F = 24
+/// distinct dirtied LPIDs; one chunked transaction of 3,000 puts over
+/// a 3,000-key space (no checkpoint: `checkpointer_every: None`) fills
+/// the interval, and the crash at the next op's yield cuts it.
+#[test]
+fn szc_crash_cuts_an_open_4f_interval() {
+    let four_f = 4 * 6u64;
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![Op::CreateTree { tree: 2 }],
+                },
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..3000u64).map(|i| op_put(i, i & 0xFF)).collect(),
+                },
+                ScriptOp::Yields(1),
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: None,
+        crash: Some(CrashSpec::TaskYield(1, 3)),
+        nested: Vec::new(),
+    };
+    let (disk, st) = harness::create_store(scfg(), 5111, 77).expect("create");
+    let out = harness::run_round(
+        5111,
+        0,
+        &script,
+        &round_faults(),
+        scfg(),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(
+        out.obs.dirty_now_len >= four_f,
+        "the chunked txn dirtied {} LPIDs; the pin needs ≥ 4·F = {four_f} (shrink the pool or grow the txn)",
+        out.obs.dirty_now_len
+    );
+    assert!(out.obs.crash_fired, "the crash fired");
+    assert!(
+        e4_recovery::workload::szc_of(&out.obs, four_f),
+        "szc: the crash cut an open interval that had reached 4·F"
+    );
+    assert!(
+        e4_recovery::workload::sizing_ok_of(&out.obs, four_f),
+        "sizing_ok: the open interval reached 4·F at the crash"
+    );
+}
+
+/// **SIZING-C pin 2: the small cut — an earlier interval reached 4·F
+/// and completed (a checkpoint folded it into `dirty_max`), and the
+/// crash then cuts a small open interval: `sizing_ok` true, `szc`
+/// false.** M-SZC-ANY (`szc := sizing_ok`) fails this pin.
+#[test]
+fn szc_a_completed_4f_interval_and_a_small_cut() {
+    let four_f = 4 * 6u64;
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![Op::CreateTree { tree: 2 }],
+                },
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..3000u64).map(|i| op_put(i, i & 0xFF)).collect(),
+                },
+                // The forced checkpoint completes: its begin step folds
+                // the ≥ 4·F interval into `dirty_max` and clears
+                // `dirty_now` (and `ckpt_closed_dirty` resets at
+                // `ckpt:end`).
+                ScriptOp::Checkpoint,
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![op_put(5000, 1)],
+                },
+                ScriptOp::Yields(1),
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1_000_000),
+        crash: Some(CrashSpec::TaskYield(1, 5)),
+        nested: Vec::new(),
+    };
+    let (disk, st) = harness::create_store(scfg(), 5222, 77).expect("create");
+    let out = harness::run_round(
+        5222,
+        0,
+        &script,
+        &round_faults(),
+        scfg(),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(out.obs.crash_fired, "the crash fired");
+    assert!(
+        out.obs.dirty_max >= four_f,
+        "the completed interval reached 4·F (dirty_max = {})",
+        out.obs.dirty_max
+    );
+    assert!(
+        out.obs.dirty_now_len < four_f,
+        "the crash cut a small open interval ({})",
+        out.obs.dirty_now_len
+    );
+    assert_eq!(
+        out.obs.ckpt_closed_dirty, 0,
+        "no checkpoint is open at the crash"
+    );
+    assert!(
+        e4_recovery::workload::sizing_ok_of(&out.obs, four_f),
+        "sizing_ok: the completed interval reached 4·F"
+    );
+    assert!(
+        !e4_recovery::workload::szc_of(&out.obs, four_f),
+        "szc: the crash cut only a small interval — the ≥ 4·F one completed earlier"
+    );
 }
