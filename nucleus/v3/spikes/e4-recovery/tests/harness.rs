@@ -1833,18 +1833,23 @@ fn x33_damage_maps_through_the_bound_name() {
     );
 }
 
-/// **X-5c-F3-F3b-F1 Work 1 pin (folded into X-5c-F3-F3a-F2; the
-/// frontier-candidate diagnostic, a literal-config seed pin).** The
-/// round record's `o1` keeps the **first** failing candidate's error,
-/// so a round whose ruling failure sits at the recovery-frontier
-/// candidate reads O-1(c) "raw entry above the cut" instead. Seed
-/// 1749 round 2 is the verdict's own repro: `lo` 40, `hi` 41,
-/// frontier 41 — the diagnostic must name tree 4's first divergent key
-/// with its owner ts 4 and `le_T` at `c = 41` (the clamp of the
-/// frontier), never the first candidate's `c = 40` view. The capture
-/// seam (`o1f_capture_arm`) runs the diagnostic without touching a
+/// **X-5c-F3-F3b-F1 Work 1 pin (folded into X-5c-F3-F3a-F2;
+/// X-5c-F3-F3a-F2-F1 Work 5 reworked it).** The frontier-candidate
+/// diagnostic at `c = clamp(frontier, lo, hi)`, with `lo`/`hi` derived
+/// exactly as `check_round` derives them (X5-R33's MW bound included).
+/// At F2's tip 1749 r2 failed O-1 at the frontier candidate (tree 4's
+/// pre-drop key, owner ts 4, `le_T=true`, at `c = 41`); X5-R36 removed
+/// that failure (the round passes, matched at `c = 41`), so the pin now
+/// asserts the always-line's load-bearing core on the same round:
+/// `lo` 40, `hi` 41, `frontier` 41, `T` 38, the clamp `c = 41`, and —
+/// on every line the round prints — `le_T` agreeing with
+/// `owner_ts ≤ T` parsed from the line itself. That catches the clamp
+/// mutants (`c = lo`, `c = hi`) and the `le_T`-from-frontier mutant
+/// (both UNCAUGHT at F2's tip, verdict finding 3). The capture seam
+/// (`o1f_capture_arm`) runs the diagnostic without touching a
 /// process-global env var; the stderr side stays behind
-/// `E4_O1_AT_FRONTIER`, default off.
+/// `E4_O1_AT_FRONTIER`, default off, and never moves the digest (the
+/// diff runs on a throwaway clone of the recovered world).
 #[test]
 fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
     e4_recovery::harness::o1f_capture_arm();
@@ -1852,7 +1857,7 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
     let lines = e4_recovery::harness::o1f_capture_take();
     assert!(
         !lines.is_empty(),
-        "the diagnostic must fire on 1749's failing rounds (defect: {:?})",
+        "the diagnostic must fire on 1749's rounds (defect: {:?})",
         rec.defect
     );
     let hit = lines
@@ -1860,20 +1865,99 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
         .find(|l| {
             l.contains("round=2")
                 && l.contains("tree=4")
+                && l.contains("lo=40")
+                && l.contains("hi=41")
+                && l.contains("frontier=41")
+                && l.contains("T=38")
                 && l.contains("c=41")
-                && l.contains("owner_ts=4")
-                && l.contains("le_T=true")
         })
         .cloned();
     let Some(line) = hit else {
         panic!(
-            "1749 r2: the frontier candidate's diff must name tree 4's\
-             \nowner ts 4 with le_T at c=41 — got {lines:?}"
+            "1749 r2: the frontier candidate's line must name lo 40 / hi 41\
+             \n/ frontier 41 / T 38 at c=41 — got {lines:?}"
         );
     };
+    check_le_t_agrees_with_owner_and_t(&line);
+}
+
+/// **X-5c-F3-F3a-F2-F1 Work 5 pin (verdict finding 3): the 5549 r2
+/// literal.** 5549 round 2 is the round where the clamp is not the
+/// identity on the hi side: the frontier 32 sits strictly below `hi`
+/// 33 (1749's frontier equals its `hi`, which is why `c = hi` survived
+/// at F2's tip). The pin asserts the real MW round's line at
+/// `c = 32` with `lo = 30`, `hi = 33`, `frontier = 32`, `T = 29`, and
+/// that `le_T` agrees with `owner_ts ≤ T` on the printed line — where
+/// the newest owner (ts 32) lies **above** `T` 29 and at the frontier,
+/// so `le_T` is false and a `le_T`-from-frontier computation (32 ≤ 32)
+/// breaks the agreement. The twin round's line (frontier 34, `T` 31)
+/// must not satisfy the literal.
+#[test]
+fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
+    e4_recovery::harness::o1f_capture_arm();
+    let rec = e4_recovery::workload::run_seed(5549, None);
+    let lines = e4_recovery::harness::o1f_capture_take();
     assert!(
-        line.contains("lo=40") && line.contains("hi=41") && line.contains("frontier=41"),
-        "the bounds and the frontier travel with the line: {line}"
+        !lines.is_empty(),
+        "the diagnostic must fire on 5549's rounds (defect: {:?})",
+        rec.defect
+    );
+    let hits: Vec<String> = lines
+        .iter()
+        .filter(|l| {
+            l.contains("round=2")
+                && l.contains("lo=30")
+                && l.contains("hi=33")
+                && l.contains("frontier=32")
+                && l.contains("T=29")
+                && l.contains("c=32")
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !hits.is_empty(),
+        "5549 r2: the real MW round's line must sit at c=32 with frontier 32\
+         \n< hi 33 and T=29 — got {lines:?}"
+    );
+    // The frontier is strictly inside the candidate window here: the
+    // clamp did real work (FRONTIER-AS-HI prints c=33).
+    assert!(
+        hits.iter().all(|l| l.contains("c=32 ")),
+        "every matched line names the clamped candidate: {hits:?}"
+    );
+    // The newest owner (32) is above T (29): le_T is false, and the
+    // agreement check below is what a frontier-computed le_T breaks.
+    assert!(
+        hits.iter()
+            .any(|l| l.contains("owner_ts=32") && l.contains("le_T=false")),
+        "5549 r2's newest owner (ts 32, above T 29, at the frontier) must\
+         \nprint le_T=false — got {hits:?}"
+    );
+    for line in hits.iter() {
+        check_le_t_agrees_with_owner_and_t(line);
+    }
+}
+
+/// Work 5's agreement check: on one O1F line, `le_T` must equal
+/// `owner_ts ≤ T` with both parsed from the line itself.
+fn check_le_t_agrees_with_owner_and_t(line: &str) {
+    let num = |tag: &str| -> Option<u64> {
+        line.split(&format!(" {tag}="))
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '"']).next().and_then(|n| n.parse().ok()))
+    };
+    let (Some(owner), Some(t)) = (num("owner_ts"), num("T")) else {
+        // A line with no owner (an ownerless key) carries no flags and
+        // no agreement to check.
+        return;
+    };
+    let Some(le_t) = line.split("le_T=").nth(1).map(|r| r.starts_with("true")) else {
+        return;
+    };
+    let want = owner <= t;
+    assert_eq!(
+        le_t, want,
+        "le_T must agree with owner_ts {owner} <= T {t} on: {line}"
     );
 }
 

@@ -3405,9 +3405,29 @@ pub fn run_round(
             // that rules out every other (the ESCALATE ruling's
             // diagnostic). The capture side runs only when a test
             // armed it, so no env var is mutated process-wide.
+            // X-5c-F3-F3a-F2-F1 Work 5: it runs whenever wanted, also
+            // on a round whose O-1 passed — X5-R36 removed the failures
+            // it was built to explain (1749/5549 r2 pass now), and the
+            // pin reads the frontier candidate's line either way (the
+            // first divergent key when one exists, else the tree's
+            // first key).
             let o1f_wanted = std::env::var("E4_O1_AT_FRONTIER").is_ok()
                 || O1F_CAPTURE.with_borrow(|c| c.is_some());
-            if o1f_wanted && first.o1.is_err() {
+            if o1f_wanted {
+                // Work 5: the diff runs on a **throwaway clone** of the
+                // recovered world. Its reads go through the store's own
+                // read path, which touches the pool — and the pool feeds
+                // the harness checkpoint below and the end store the
+                // next round starts from, so reading the judged world
+                // here would let the diagnostic move the seed (measured:
+                // seed 1749's digest 1584051239 → 2353463647 with the
+                // env var set, before the clone). On the clone it is
+                // byte-invisible, firing or not, on any round.
+                let diag_world = round_world(seed, end_disk.clone(), st.clone());
+                let mut diag_reader = StoreReader {
+                    w: &diag_world,
+                    defects: Vec::new(),
+                };
                 let lines = o1_at_frontier_lines(
                     seed,
                     round,
@@ -3415,7 +3435,7 @@ pub fn run_round(
                     c_prev,
                     &model,
                     &ex,
-                    &mut reader,
+                    &mut diag_reader,
                     &wal_commits,
                     d_val,
                     &d_rc,
@@ -5124,6 +5144,13 @@ pub fn o1f_capture_take() -> Vec<String> {
 /// `check_round` derives them (X5-R33's MW lower bound included).
 /// Returns the lines (the caller prints them under
 /// `E4_O1_AT_FRONTIER` and, when armed, into the capture).
+/// X-5c-F3-F3a-F2-F1 Work 5: it runs whether or not O-1 failed, so a
+/// round X5-R36 fixed still names its frontier candidate — per
+/// published tree, the **first divergent key** when one exists, else
+/// the tree's first key (a tree with no key on either side names
+/// nothing) — and every line carries `T=` (the opened meta's `T`)
+/// beside the `le_T` flag, so the two can be checked against each
+/// other.
 #[allow(clippy::too_many_arguments)]
 pub fn o1_at_frontier_lines(
     seed: u64,
@@ -5162,6 +5189,29 @@ pub fn o1_at_frontier_lines(
         };
         let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
         keys.extend(want.keys().cloned());
+        // Work 5's pick: the first **divergent** key when one exists,
+        // else the key whose owning commit is the newest at `c` (ties
+        // keep the first key in key order; an ownerless key ranks 0) —
+        // the newest owner is the load-bearing case for the `T=`/`le_T`
+        // pair (finding 3: only an owner above T can show `le_T` and
+        // `owner_ts ≤ frontier` apart), and a passing round still names
+        // its frontier candidate.
+        let owner_of = |k: &Vec<u8>| -> Option<u64> {
+            model
+                .commits
+                .iter()
+                .rev()
+                .find(|(ts, rec)| {
+                    **ts <= c
+                        && rec.ops.iter().any(|op| matches!(op, Op::Put { tree, key, .. } | Op::Delete { tree, key } if *tree == t && key == k))
+                })
+                .map(|(ts, _)| *ts)
+        };
+        // One candidate line entry: (key, store value, model value).
+        type Pick<'a> = (&'a Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+        let mut div: Option<Pick> = None;
+        let mut fall: Option<Pick> = None;
+        let mut fall_rank: u64 = 0;
         for k in keys.iter() {
             let g = crate::oracle::live(&got)
                 .iter()
@@ -5171,9 +5221,19 @@ pub fn o1_at_frontier_lines(
                 .iter()
                 .find(|(wk, _)| *wk == k)
                 .map(|(_, v)| (*v).clone());
-            if g == w {
-                continue;
+            if g != w && div.is_none() {
+                div = Some((k, g.clone(), w.clone()));
             }
+            let rank = owner_of(k).unwrap_or(0);
+            if rank > fall_rank {
+                fall_rank = rank;
+                fall = Some((k, g, w));
+            }
+        }
+        let Some((k, g, w)) = div.or(fall) else {
+            continue;
+        };
+        {
             let owner = model
                 .commits
                 .iter()
@@ -5199,11 +5259,12 @@ pub fn o1_at_frontier_lines(
                     ts <= ex.opened_t
                 )
             });
+            // Work 5: `T=` travels with the line, beside `le_T`.
             out.push(format!(
-                "O1F diag: seed={seed} round={round} lo={lo} hi={hi} frontier={} c={c} tree={t} key={k:?} store={g:?} model={w:?} {flags:?}",
-                ex.frontier
+                "O1F diag: seed={seed} round={round} lo={lo} hi={hi} frontier={} T={} c={c} tree={t} key={k:?} store={g:?} model={w:?} {flags:?}",
+                ex.frontier,
+                ex.opened_t
             ));
-            break;
         }
     }
     out
