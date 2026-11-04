@@ -3434,8 +3434,159 @@ expect_ok "fresh-gate: FG15: a -c hook.fg15.command is refused, at command-line 
 expect_ok "fresh-gate: FG15: no hook config is left" bash -c "[ -z \"\$(git -C '$r' config --get-regexp '^hook\\.')\" ] && [ ! -e '$t/fg15.marker' ]"
 
 # --- GLM rows go here (rework B, owner exception 2026-11-03) ---------------
-# FG11c, FG11d, FG13 and FG14: forged-object rows for the tightened eol
-# exception, an ident path and a symlink. See the card's REWORK section.
+# Rework B (verdict 3fdb25e0, R1 and R3): the rows that pin the tightened eol
+# exception (eol=crlf and no lone LF or CR), the refusal of every other
+# conversion attribute (ident), and the symlink hash. Each premise was probed
+# on git 2.47.3 before the row was written; every forgery is a loose object
+# unique to its own FG branch, every id is captured before its object is
+# forged, and each window restores before the next move (no_state4), as
+# FG11-FG12 do.
+
+# FG11c, the verdict R1 forgery: the repository's own rule (`text=auto eol=lf`)
+# written for one path. The forged blob holds the honest bytes with a CR before
+# the LF; smudge is the identity under eol=lf, so the CR survives the checkout
+# and the gate would run it, while clean strips the CR again, so hash-object
+# --path still names the tree id — exactly what the old, attribute-only
+# exception accepted. The eol=crlf requirement (and the no-lone-LF one) is what
+# refuses it (mutants FG-EXCEPTION-LF, FG-EOL-ANY).
+git -C "$r" checkout -q -b card/v3-FG11c nucleus/v3-scaffold
+fgstub "$r" FG11c
+printf 'nucleus/v3/spikes/fg11c.sh text=auto eol=lf\n' >"$r/.gitattributes"
+printf 'STRICT=1\n' >"$v3/spikes/fg11c.sh"
+git -C "$r" add .gitattributes nucleus/v3/spikes/fg11c.sh && git -C "$r" commit -qm "nucleus v3: FG11c cr-before-lf blob"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fg11c_id=$(git -C "$r" rev-parse card/v3-FG11c:nucleus/v3/spikes/fg11c.sh)
+fg11c_src=$(printf 'STRICT=1\r\n' | git -C "$r" hash-object -w --no-filters --stdin)
+expect_ok "premise: FG11c: both blobs are loose objects" bash -c "[ -f '$(objlo "$r" "$fg11c_id")' ] && [ -f '$(objlo "$r" "$fg11c_src")' ]"
+save_obj "$r" "$fg11c_id"
+forge_from "$r" "$fg11c_id" "$fg11c_src"
+git -C "$r" worktree add -q --detach "$t/fg11cp" card/v3-FG11c
+fg11c_hidden() {
+  local s a
+  a=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11cp" check-attr -a -- nucleus/v3/spikes/fg11c.sh)
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11cp" ls-files -s -- nucleus/v3/spikes/fg11c.sh)
+  echo "attrs: $a"; echo "index: $s"
+  [ "$a" = "$(printf 'nucleus/v3/spikes/fg11c.sh: text: auto\nnucleus/v3/spikes/fg11c.sh: eol: lf')" ] \
+    && [ "$(git -C "$r" hash-object --no-filters "$t/fg11cp/nucleus/v3/spikes/fg11c.sh")" = "$fg11c_src" ] \
+    && [ "$s" = "$(printf '100644 %s 0\tnucleus/v3/spikes/fg11c.sh' "$fg11c_id")" ] \
+    && [ "$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11cp" hash-object --path=nucleus/v3/spikes/fg11c.sh -- nucleus/v3/spikes/fg11c.sh)" = "$fg11c_id" ]
+}
+expect_ok "premise: FG11c: attrs text=auto eol=lf; the checkout holds the CR bytes; the index names the tree id; hash-object --path equals the tree id (the old rule's hole)" fg11c_hidden
+git -C "$r" worktree remove --force "$t/fg11cp"
+fgrun card/v3-FG11c
+expect_ok "fresh-gate: FG11c: a CR-before-LF forgery under text=auto eol=lf is refused, naming the path and both ids, before the gate runs" fg_refused "nucleus/v3/spikes/fg11c.sh: content hashes to $fg11c_src, tree says $fg11c_id"
+expect_ok "fresh-gate: FG11c: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG11c restored" no_state4
+
+# FG11d, a lone-LF forgery under eol=crlf (pins the CRLF-pair condition rework
+# A added): text=auto leaves a blob that already holds a CRLF as it is on
+# checkout, so the forged lone LF survives, and clean strips only CRLFs, so
+# hash-object --path names the tree id again. The no-lone-LF check is what
+# refuses it (mutant FG-NO-LONE-LF).
+git -C "$r" checkout -q -b card/v3-FG11d nucleus/v3-scaffold
+fgstub "$r" FG11d
+printf 'nucleus/v3/spikes/fg11d.ps1 text=auto eol=crlf\n' >"$r/.gitattributes"
+printf 'a\nb\n' >"$v3/spikes/fg11d.ps1"
+git -C "$r" add .gitattributes nucleus/v3/spikes/fg11d.ps1 2>/dev/null && git -C "$r" commit -qm "nucleus v3: FG11d lone-lf blob"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fg11d_id=$(git -C "$r" rev-parse card/v3-FG11d:nucleus/v3/spikes/fg11d.ps1)
+fg11d_src=$(printf 'a\r\nb\n' | git -C "$r" hash-object -w --no-filters --stdin)
+expect_ok "premise: FG11d: both blobs are loose objects" bash -c "[ -f '$(objlo "$r" "$fg11d_id")' ] && [ -f '$(objlo "$r" "$fg11d_src")' ]"
+save_obj "$r" "$fg11d_id"
+forge_from "$r" "$fg11d_id" "$fg11d_src"
+git -C "$r" worktree add -q --detach "$t/fg11dp" card/v3-FG11d
+fg11d_hidden() {
+  local s a
+  a=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11dp" check-attr -a -- nucleus/v3/spikes/fg11d.ps1)
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11dp" ls-files -s -- nucleus/v3/spikes/fg11d.ps1)
+  echo "attrs: $a"; echo "index: $s"
+  [ "$a" = "$(printf 'nucleus/v3/spikes/fg11d.ps1: text: auto\nnucleus/v3/spikes/fg11d.ps1: eol: crlf')" ] \
+    && [ "$(git -C "$r" hash-object --no-filters "$t/fg11dp/nucleus/v3/spikes/fg11d.ps1")" = "$fg11d_src" ] \
+    && [ "$s" = "$(printf '100644 %s 0\tnucleus/v3/spikes/fg11d.ps1' "$fg11d_id")" ] \
+    && [ "$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11dp" hash-object --path=nucleus/v3/spikes/fg11d.ps1 -- nucleus/v3/spikes/fg11d.ps1)" = "$fg11d_id" ]
+}
+expect_ok "premise: FG11d: attrs text=auto eol=crlf; the checkout holds the forged bytes unconverted (a lone LF); the index names the tree id; hash-object --path equals the tree id" fg11d_hidden
+git -C "$r" worktree remove --force "$t/fg11dp"
+fgrun card/v3-FG11d
+expect_ok "fresh-gate: FG11d: a lone-LF forgery under text=auto eol=crlf is refused, naming the path and both ids, before the gate runs" fg_refused "nucleus/v3/spikes/fg11d.ps1: content hashes to $fg11d_src, tree says $fg11d_id"
+expect_ok "fresh-gate: FG11d: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG11d restored" no_state4
+
+# FG13, an ident path (verdict R3, pins "other attributes are refused"):
+# ident's clean collapses any $Id: ... $ to $Id$, the same many-to-one hole as
+# R1, so the exception must refuse the path outright. The forged keyword is
+# *foreign* — `$Id: x y z $`, with spaces inside — which git's smudge leaves
+# as it is on 2.47.3 (an expanded `$Id: <40 hex> $` would be re-smudged to the
+# honest bytes and the forgery would do nothing). The path is eol=crlf because
+# that is the only way to reach the attribute check now (under eol=lf, R1's
+# rule alone refuses, and FG-ATTR-ANY would not be caught).
+git -C "$r" checkout -q -b card/v3-FG13 nucleus/v3-scaffold
+fgstub "$r" FG13
+printf 'nucleus/v3/spikes/fg13.ps1 text eol=crlf ident\n' >"$r/.gitattributes"
+printf 'a $Id$\n' >"$v3/spikes/fg13.ps1"
+git -C "$r" add .gitattributes nucleus/v3/spikes/fg13.ps1 2>/dev/null && git -C "$r" commit -qm "nucleus v3: FG13 ident blob"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fg13_id=$(git -C "$r" rev-parse card/v3-FG13:nucleus/v3/spikes/fg13.ps1)
+fg13_src=$(printf 'a $Id: x y z $\n' | git -C "$r" hash-object -w --no-filters --stdin)
+fg13_got=$(printf 'a $Id: x y z $\r\n' | git -C "$r" hash-object --no-filters --stdin)
+expect_ok "premise: FG13: both blobs are loose objects" bash -c "[ -f '$(objlo "$r" "$fg13_id")' ] && [ -f '$(objlo "$r" "$fg13_src")' ]"
+save_obj "$r" "$fg13_id"
+forge_from "$r" "$fg13_id" "$fg13_src"
+git -C "$r" worktree add -q --detach "$t/fg13p" card/v3-FG13
+fg13_hidden() {
+  local s a
+  a=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg13p" check-attr -a -- nucleus/v3/spikes/fg13.ps1)
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg13p" ls-files -s -- nucleus/v3/spikes/fg13.ps1)
+  echo "attrs: $a"; echo "index: $s"
+  [ "$a" = "$(printf 'nucleus/v3/spikes/fg13.ps1: text: set\nnucleus/v3/spikes/fg13.ps1: eol: crlf\nnucleus/v3/spikes/fg13.ps1: ident: set')" ] \
+    && [ "$(git -C "$r" hash-object --no-filters "$t/fg13p/nucleus/v3/spikes/fg13.ps1")" = "$fg13_got" ] \
+    && [ "$s" = "$(printf '100644 %s 0\tnucleus/v3/spikes/fg13.ps1' "$fg13_id")" ] \
+    && [ "$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg13p" hash-object --path=nucleus/v3/spikes/fg13.ps1 -- nucleus/v3/spikes/fg13.ps1)" = "$fg13_id" ] \
+    && od -An -v -tx1 -- "$t/fg13p/nucleus/v3/spikes/fg13.ps1" | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) { if (($i == "0a") != (p == "0d")) bad = 1; p = $i } } END { if (p == "0d") bad = 1; exit bad ? 3 : 0 }'
+}
+expect_ok "premise: FG13: attrs text set, eol crlf, ident set; the checkout holds the foreign ident unexpanded (pure CRLF, not the honest checkout's bytes); the index names the tree id; hash-object --path equals the tree id" fg13_hidden
+git -C "$r" worktree remove --force "$t/fg13p"
+fgrun card/v3-FG13
+expect_ok "fresh-gate: FG13: a forged blob on an ident path is refused, naming the path, the forged bytes' hash and the tree id, before the gate runs" fg_refused "nucleus/v3/spikes/fg13.ps1: content hashes to $fg13_got, tree says $fg13_id"
+expect_ok "fresh-gate: FG13: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG13 restored" no_state4
+
+# FG14, a swapped symlink blob (verdict R3, pins the symlink hash): the
+# checkout materialises whatever target the forged blob names, the fresh index
+# and the tree agree on fg14.lnk's own id, and only hashing the readlink bytes
+# against the tree id refuses (mutant FG-LINK-SKIP).
+git -C "$r" checkout -q -b card/v3-FG14 nucleus/v3-scaffold
+fgstub "$r" FG14
+ln -s fg.txt "$v3/spikes/fg14.lnk"
+ln -s ../scripts/gate.sh "$v3/spikes/fg14b.lnk"
+git -C "$r" add nucleus/v3/spikes/fg14.lnk nucleus/v3/spikes/fg14b.lnk && git -C "$r" commit -qm "nucleus v3: FG14 symlinks"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fg14_id=$(git -C "$r" rev-parse card/v3-FG14:nucleus/v3/spikes/fg14.lnk)
+fg14b_id=$(git -C "$r" rev-parse card/v3-FG14:nucleus/v3/spikes/fg14b.lnk)
+expect_ok "premise: FG14: both symlink blobs are loose objects" bash -c "[ -f '$(objlo "$r" "$fg14_id")' ] && [ -f '$(objlo "$r" "$fg14b_id")' ]"
+save_obj "$r" "$fg14_id"
+forge_from "$r" "$fg14_id" "$fg14b_id"
+git -C "$r" worktree add -q --detach "$t/fg14p" card/v3-FG14
+fg14_hidden() {
+  local s
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg14p" ls-files -s -- nucleus/v3/spikes/fg14.lnk)
+  echo "index: $s"; echo "readlink: $(readlink "$t/fg14p/nucleus/v3/spikes/fg14.lnk")"
+  [ -L "$t/fg14p/nucleus/v3/spikes/fg14.lnk" ] \
+    && [ "$(readlink "$t/fg14p/nucleus/v3/spikes/fg14.lnk")" = ../scripts/gate.sh ] \
+    && [ "$s" = "$(printf '120000 %s 0\tnucleus/v3/spikes/fg14.lnk' "$fg14_id")" ]
+}
+expect_ok "premise: FG14: a plain worktree add makes fg14.lnk a symlink to ../scripts/gate.sh (the other blob's target) while the index names its own tree id" fg14_hidden
+git -C "$r" worktree remove --force "$t/fg14p"
+fgrun card/v3-FG14
+expect_ok "fresh-gate: FG14: a swapped symlink blob is refused, naming the path and both ids, before the gate runs" fg_refused "nucleus/v3/spikes/fg14.lnk: content hashes to $fg14b_id, tree says $fg14_id"
+expect_ok "fresh-gate: FG14: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG14 restored" no_state4
+expect_ok "fresh-gate: no attribute file is left in the scratch worktree after the GLM rows" bash -c "[ ! -e '$r/.gitattributes' ]"
+expect_ok "git state: none after the GLM forged-object rows" no_state
 # --- end of GLM rows --------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
