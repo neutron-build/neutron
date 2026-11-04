@@ -909,7 +909,14 @@ def ref_violations(wt, before, branch, pre_head):
     This closes the accidental and rationalised ref writes and the plain verbs.
     A worker with a shell can still write a ref that is neither attributable nor
     protected (a non-fast-forward of another card branch, made at a commit it did
-    not make). Any git failure is one entry naming the command, never a pass."""
+    not make). Any git failure is one entry naming the command, never a pass.
+
+    The rules read ancestry through commit objects, and a forged one can bend
+    it (X-6-F1-F2-F3-F1 Finding 2), so verify_objects hash-checks what they
+    walk before they read it (pre_head...own for the worker list, old...new
+    for a moved ref, pre_head...new for a created one): a forged commit fails
+    its hash instead of bending R1 or R2. The residual is the same-uid race
+    between verify and read, as for every verify_objects consumer."""
     def git(*args):
         cmd = ["git", *args]
         p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -926,19 +933,32 @@ def ref_violations(wt, before, branch, pre_head):
         after = ref_snapshot(wt)
         # W is listed even when no ref moved, so a bad pre_head always fails here.
         worker = git("rev-list", own, f"^{pre_head}", "--").stdout.split()
+        # The listing is trusted only once its objects verify; it runs first
+        # only so that a bad pre_head is still named as rev-list's failure (as
+        # in changed_files). Without a trusted W, R1 cannot be judged: fail closed.
+        probs = verify_objects(wt, pre_head, own)
+        if probs:
+            return [f"{own}: worker commits unverifiable: {l}" for l in probs]
         for ref in sorted(set(before) | set(after)):
             old, new = before.get(ref), after.get(ref)
             if old == new or ref == own:
                 continue
             move = f"{ref}: {old or '(none)'} -> {new or '(deleted)'}"
-            hit = next((w for w in worker if reaches(w, new)), None) if new else None
-            if hit:
-                bad.append(f"{move} carries this run's commit {hit[:10]}")
+            # The rules that need no ancestry fire whatever the objects say.
             if ref == "refs/heads/main" or ref.startswith(("refs/tags/", "refs/notes/", "refs/replace/")):
                 bad.append(f"{move} (protected: may not change)")
             elif ref.startswith("refs/heads/nucleus/") and old and not new:
                 bad.append(f"{move} (protected: nucleus/* may not be deleted)")
-            elif ref.startswith("refs/heads/nucleus/") and old and not reaches(old, new):
+            # R1 and the fast-forward test are never asked of objects that
+            # fail: their answer is the lie. A deleted ref has nothing to walk.
+            probs = verify_objects(wt, old or pre_head, new) if new else []
+            if probs:
+                bad.extend(f"{move} objects fail verification: {l}" for l in probs)
+                continue
+            hit = next((w for w in worker if reaches(w, new)), None) if new else None
+            if hit:
+                bad.append(f"{move} carries this run's commit {hit[:10]}")
+            if ref.startswith("refs/heads/nucleus/") and old and new and not reaches(old, new):
                 bad.append(f"{move} (protected: nucleus/* may move only as a fast-forward)")
     except subprocess.CalledProcessError as e:
         why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
