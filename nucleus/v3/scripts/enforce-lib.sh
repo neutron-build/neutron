@@ -127,7 +127,7 @@ short_commit_grandfathered() {
 # audited ref is verified once by audit-merges.sh; the skips below say why);
 # every other mode verifies the ranges it reads.
 check_merge() {
-  local id=$1 base=$2 head=$3 mode=$4 card_gate= card_class= queue= merge_sha=
+  local id=$1 base=$2 head=$3 mode=$4 card_gate='' card_class='' queue='' merge_sha=''
   if [ "$mode" = audit ]; then merge_sha=${5:-}; else card_gate=${5:-} card_class=${6:-} queue=${7:-}; fi
   local own="$V3/verdicts/$id.md" errs=() v vid vtmp
   # The verdict's content decides every check below, so its blob is hashed
