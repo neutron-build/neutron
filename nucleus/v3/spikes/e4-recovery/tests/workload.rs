@@ -536,6 +536,63 @@ fn r15a_fold_line_from_a_literal_2_seed_record_set() {
     assert!(campaign::final_line(&[a.clone(), b.clone()]).starts_with("E4 SEEDS=2 "));
 }
 
+/// **X5-R17 pin: the SIZING quota row counts seeds, not rounds** (the
+/// ruling's own words: "`verify`'s SIZING row counts seeds"). Work 5.3
+/// asserts per seed — "every seed must reach, in at least one
+/// checkpoint interval, ≥ 4·F distinct dirtied LPIDs" — so a seed whose
+/// round 0 missed the bound but whose round 1 reached it is **met**;
+/// only a seed no round of which reached it counts. The literal set:
+/// seed A misses r0 and reaches it in r1 (a seed hit); seed B misses
+/// both rounds (a seed miss). The row must read `achieved 1` — the
+/// rounds-based counting this pin reverts to (X-5c-F4 step 1's mutant)
+/// reads 3 and fails here.
+#[test]
+fn x5r17_sizing_row_counts_seeds_not_rounds() {
+    use e4_recovery::workload::{RoundRec, SeedRec};
+    let seed_hit_in_r1 = SeedRec {
+        seed: 0,
+        class: "C".to_owned(),
+        knobs: 1,
+        rounds: vec![
+            RoundRec {
+                sizing_ok: false,
+                ..RoundRec::default()
+            },
+            RoundRec {
+                sizing_ok: true,
+                ..RoundRec::default()
+            },
+        ],
+        ..SeedRec::default()
+    };
+    let seed_all_miss = SeedRec {
+        seed: 1,
+        class: "C".to_owned(),
+        knobs: 2,
+        rounds: vec![
+            RoundRec {
+                sizing_ok: false,
+                ..RoundRec::default()
+            },
+            RoundRec {
+                sizing_ok: false,
+                ..RoundRec::default()
+            },
+        ],
+        ..SeedRec::default()
+    };
+    let rows = workload::quotas(&[seed_hit_in_r1, seed_all_miss], 2);
+    let sizing = rows
+        .iter()
+        .find(|r| r.id == "SIZING")
+        .expect("the SIZING row exists");
+    assert_eq!(
+        sizing.achieved, 1,
+        "one seed misses (the seed no round of which reached 4F); a rounds-based count gives 3"
+    );
+    assert_eq!(sizing.required, 0, "SIZING passes only at zero seed misses");
+}
+
 /// **X5-R15 (b) pin: `verify` reports all three checks before its exit,
 /// and `--no-quotas` does not fail on the quota table.** The exit code
 /// is decided once, at the end, from all three outcomes together

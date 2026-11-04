@@ -1818,8 +1818,18 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
     let mut q16 = 0u64;
     let mut q17 = 0u64;
     let mut q18 = 0u64;
+    // **X5-R17: the SIZING row counts seeds, not rounds** — Work 5.3
+    // asserts per seed ("every seed must reach, in at least one
+    // checkpoint interval, ≥ 4·F distinct dirtied LPIDs"), so a seed
+    // misses iff **no** round of it reached the bound (a seed whose r0
+    // crashed early but whose r1 reached it is met; a round-only miss
+    // is not a seed miss). Pinned by
+    // `x5r17_sizing_row_counts_seeds_not_rounds`.
     let mut sizing_miss = 0u64;
     for rec in recs {
+        if !rec.rounds.iter().any(|r| r.sizing_ok) {
+            sizing_miss += 1;
+        }
         if rec.rounds.iter().any(|r| r.nested >= 1) {
             q2 += 1;
         }
@@ -1889,9 +1899,6 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
             }
             if r.q18_gc_advanced {
                 q18 += 1;
-            }
-            if !r.sizing_ok {
-                sizing_miss += 1;
             }
         }
     }
@@ -2039,7 +2046,7 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
         },
         QuotaRow {
             id: "SIZING",
-            what: "rounds missing Work 5.3's ≥ 4·F dirtied LPIDs (harness defects)".into(),
+            what: "seeds missing Work 5.3's ≥ 4·F dirtied LPIDs (harness defects)".into(),
             achieved: sizing_miss,
             required: 0,
         },
