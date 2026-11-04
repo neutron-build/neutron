@@ -912,11 +912,17 @@ def ref_violations(wt, before, branch, pre_head):
     not make). Any git failure is one entry naming the command, never a pass.
 
     The rules read ancestry through commit objects, and a forged one can bend
-    it (X-6-F1-F2-F3-F1 Finding 2), so verify_objects hash-checks what they
-    walk before they read it (pre_head...own for the worker list, old...new
-    for a moved ref, pre_head...new for a created one): a forged commit fails
-    its hash instead of bending R1 or R2. The residual is the same-uid race
-    between verify and read, as for every verify_objects consumer."""
+    it (X-6-F1-F2-F3-F1 Finding 2). A range's excluded side is computed through
+    the same forged parents, so two forgeries forming a cycle hide from
+    old...new (X-6-F1-F2-F3-F1-F3 Finding 1). So before any ancestry read,
+    every commit in the full ancestry of pre_head, own and each changed ref's
+    old and new is listed with no excluded side and hash-checked: the first
+    forged commit on any path is reached through honest links, so it is listed
+    and fails its hash. On a failure R1 and the fast-forward test are judged
+    for no ref; the rules that need no ancestry still fire. The verify_objects
+    calls over pre_head...own and old...new stay, to name the ref a forgery
+    sits under. The residual is the same-uid race between verify and read, as
+    for every verify_objects consumer."""
     def git(*args):
         cmd = ["git", *args]
         p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -939,6 +945,27 @@ def ref_violations(wt, before, branch, pre_head):
         probs = verify_objects(wt, pre_head, own)
         if probs:
             return [f"{own}: worker commits unverifiable: {l}" for l in probs]
+        # One listing with no negative side (no ^, no ...), so no forged parent
+        # can exclude a forged commit from it; a failed listing is a problem,
+        # never []. Nothing is cached: every call lists and verifies afresh.
+        tips = {pre_head, own}
+        for ref in set(before) | set(after):
+            if before.get(ref) != after.get(ref):
+                tips.update(v for v in (before.get(ref), after.get(ref)) if v)
+        try:
+            d = pathlib.Path(tempfile.mkdtemp())
+        except OSError:
+            unverified = ["ref_violations: cannot create a temporary directory (cannot verify objects)"]
+        else:
+            try:
+                p = subprocess.run(["git", "rev-list", *sorted(tips), "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
+                if p.returncode:
+                    unverified = [f"ref_violations: git rev-list failed (exit {p.returncode}; cannot verify objects)"]
+                else:
+                    unverified = _verify_ids(wt, "ref_violations", p.stdout.split(), d)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        bad.extend(f"refs: objects fail verification: {l}" for l in unverified)
         for ref in sorted(set(before) | set(after)):
             old, new = before.get(ref), after.get(ref)
             if old == new or ref == own:
@@ -954,6 +981,8 @@ def ref_violations(wt, before, branch, pre_head):
             probs = verify_objects(wt, old or pre_head, new) if new else []
             if probs:
                 bad.extend(f"{move} objects fail verification: {l}" for l in probs)
+                continue
+            if unverified:
                 continue
             hit = next((w for w in worker if reaches(w, new)), None) if new else None
             if hit:
