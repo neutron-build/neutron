@@ -1917,7 +1917,8 @@ mod tests {
         wal.log_set(None, "k1", &Value::Text("one".into())).unwrap();
         wal.log_set(None, "k2", &Value::Text("two".into())).unwrap();
         let after_two = std::fs::metadata(&path).unwrap().len() as usize;
-        wal.log_set(None, "k3", &Value::Text("three".into())).unwrap();
+        wal.log_set(None, "k3", &Value::Text("three".into()))
+            .unwrap();
         wal.sync().unwrap();
         drop(wal);
         let full = std::fs::metadata(&path).unwrap().len() as usize;
@@ -1949,7 +1950,10 @@ mod tests {
                 "cut {cut}: prefix lost on second reopen"
             );
             assert!(
-                state2.items.iter().any(|(k, v, _)| k == "sentinel" && *v == Value::Text("post-recovery".into())),
+                state2
+                    .items
+                    .iter()
+                    .any(|(k, v, _)| k == "sentinel" && *v == Value::Text("post-recovery".into())),
                 "cut {cut}: the acknowledged post-recovery sentinel was omitted by the \
                  second recovery (NE-22)"
             );
@@ -1969,13 +1973,8 @@ mod tests {
         wal.sync().unwrap();
 
         wal.tear_next_append();
-        let err = wal
-            .log_set(None, "torn", &Value::Int64(2))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("torn append"),
-            "{err}"
-        );
+        let err = wal.log_set(None, "torn", &Value::Int64(2)).unwrap_err();
+        assert!(err.to_string().contains("torn append"), "{err}");
 
         // The second write must be refused — not appended behind the tear.
         let err = wal.log_set(None, "after", &Value::Int64(3)).unwrap_err();

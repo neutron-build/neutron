@@ -34,7 +34,9 @@ use libfuzzer_sys::fuzz_target;
 use nucleus::types::DataType;
 use nucleus::wire::fuzz_api as w;
 use nucleus::wire::kv_fast_path;
-use pgwire::messages::{DecodeContext, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage};
+use pgwire::messages::{
+    DecodeContext, PgWireFrontendMessage, ProtocolVersion, SslNegotiationMetaMessage,
+};
 
 /// OIDs whose decoding Nucleus implements itself, plus an unknown one.
 const OIDS: &[u32] = &[
@@ -80,8 +82,12 @@ fn check_literal_roundtrip(value: &str) {
         Err(e) => panic!("bound text literal failed to parse: {sql:?}: {e}"),
     };
     assert_eq!(stmts.len(), 1, "bound literal split the statement: {sql:?}");
-    let Statement::Query(q) = &stmts[0] else { panic!("not a query: {sql:?}") };
-    let SetExpr::Select(sel) = q.body.as_ref() else { panic!("not a select: {sql:?}") };
+    let Statement::Query(q) = &stmts[0] else {
+        panic!("not a query: {sql:?}")
+    };
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        panic!("not a select: {sql:?}")
+    };
     assert_eq!(sel.projection.len(), 1, "bound literal escaped: {sql:?}");
     let SelectItem::UnnamedExpr(Expr::Value(v)) = &sel.projection[0] else {
         panic!("bound literal is not a literal: {sql:?}")
@@ -107,7 +113,9 @@ fn on_query(q: &str) -> Option<(u8, bool, bool, bool)> {
     let _ = w::replace_placeholders_with_null(q);
     let _ = w::parse_timeout_ms(q);
     if let Some(rest) = q.to_ascii_lowercase().split("statement_timeout").nth(1) {
-        let v = rest.trim_start_matches([' ', '=']).trim_start_matches("to ");
+        let v = rest
+            .trim_start_matches([' ', '='])
+            .trim_start_matches("to ");
         let _ = w::parse_timeout_ms(v);
     }
     w::detect_copy_from_stdin(q)
@@ -176,7 +184,9 @@ fn wire_stream(data: &[u8], past_startup: bool) {
     let mut copy: Option<((u8, bool, bool, bool), Vec<u8>)> = None;
 
     for _ in 0..64 {
-        let Some(msg) = decode_frontend(&mut buf, &ctx) else { return };
+        let Some(msg) = decode_frontend(&mut buf, &ctx) else {
+            return;
+        };
         match msg {
             PgWireFrontendMessage::SslNegotiation(m) => {
                 ctx.awaiting_ssl = false;
@@ -234,12 +244,16 @@ fn wire_stream(data: &[u8], past_startup: bool) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&mode, rest)) = data.split_first() else { return };
+    let Some((&mode, rest)) = data.split_first() else {
+        return;
+    };
     match mode % 4 {
         0 => wire_stream(rest, false),
         1 => wire_stream(rest, true),
         2 => {
-            let [idx, flags, payload @ ..] = rest else { return };
+            let [idx, flags, payload @ ..] = rest else {
+                return;
+            };
             let oid = OIDS[*idx as usize % OIDS.len()];
             let is_binary = flags & 1 != 0;
             let raw = (flags & 2 == 0).then_some(payload);
@@ -253,8 +267,17 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         _ => {
-            let [flags, delim, payload @ ..] = rest else { return };
-            copy_rows(payload, *delim, flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags >> 3);
+            let [flags, delim, payload @ ..] = rest else {
+                return;
+            };
+            copy_rows(
+                payload,
+                *delim,
+                flags & 1 != 0,
+                flags & 2 != 0,
+                flags & 4 != 0,
+                flags >> 3,
+            );
             if let Ok(text) = std::str::from_utf8(payload) {
                 check_literal_roundtrip(text);
             }

@@ -92,7 +92,11 @@ async fn send_short_bind_and_expect_close(port: u16, expect_state: u8) -> Vec<u8
 async fn short_bind_before_auth_closes_without_panicking() {
     let (port, task) = serve_one(Some("sekret")).await;
     let rest = send_short_bind_and_expect_close(port, b'R').await;
-    assert_eq!(rest.first(), Some(&b'E'), "expected an ErrorResponse: {rest:?}");
+    assert_eq!(
+        rest.first(),
+        Some(&b'E'),
+        "expected an ErrorResponse: {rest:?}"
+    );
     assert!(
         rest.windows(5).any(|w| w == b"08P01"),
         "expected SQLSTATE 08P01: {rest:?}"

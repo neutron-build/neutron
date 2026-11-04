@@ -34,10 +34,15 @@ const SCALARS: &[DataType] = &[
 ];
 
 fn cast_and_render(text: &str, ty: &DataType) {
-    let Ok(v) = Value::Text(text.to_owned()).cast(ty) else { return };
+    let Ok(v) = Value::Text(text.to_owned()).cast(ty) else {
+        return;
+    };
     let rendered = v.to_string();
     let _ = v.cast(&DataType::Text);
-    if matches!(ty, DataType::Numeric | DataType::Date | DataType::Uuid | DataType::Int64) {
+    if matches!(
+        ty,
+        DataType::Numeric | DataType::Date | DataType::Uuid | DataType::Int64
+    ) {
         // The text Nucleus prints for a value must be accepted as input.
         assert!(
             Value::Text(rendered.clone()).cast(ty).is_ok(),
@@ -47,8 +52,12 @@ fn cast_and_render(text: &str, ty: &DataType) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&sel, rest)) = data.split_first() else { return };
-    let Ok(text) = std::str::from_utf8(rest) else { return };
+    let Some((&sel, rest)) = data.split_first() else {
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(rest) else {
+        return;
+    };
 
     for ty in SCALARS {
         cast_and_render(text, ty);
@@ -67,7 +76,10 @@ fuzz_target!(|data: &[u8]| {
         let _ = v.to_string();
     }
 
-    if Value::Text(text.to_owned()).cast(&DataType::Numeric).is_ok() {
+    if Value::Text(text.to_owned())
+        .cast(&DataType::Numeric)
+        .is_ok()
+    {
         let _ = numeric_add(text, text);
         let _ = numeric_mul(text, text);
         let _ = numeric_div(text, "7");

@@ -89,16 +89,16 @@ mod test_observability; // M11: observability ledger surfaces (CHECKPOINT, WAL/t
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
 mod test_pk_write_cost;
 mod test_plan_cache_session_isolation; // the plan-cache key hint must not cross sessions
+mod test_policy_merge_moments; // NE-03/NE-04: staged/live policy snapshot pairing + atomic publication
 mod test_predicate_agreement; // SELECT p ≡ WHERE p, with and without an index
 mod test_query;
 mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rename_table_dependents; // CAT-4: RENAME TO must rewrite FK/view/matview dependents
 mod test_replacing_engine_recovery; // replacing_mergetree engine metadata must survive a restart
-mod test_policy_merge_moments; // NE-03/NE-04: staged/live policy snapshot pairing + atomic publication
 mod test_rls;
-mod test_rls_typed_domains; // NE-05/NE-06: typed policy comparison + NULL three-valued logic
 mod test_rls_fail_closed; // M5: unsupported policy expressions / specialty calls fail closed
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
+mod test_rls_typed_domains; // NE-05/NE-06: typed policy comparison + NULL three-valued logic
 mod test_row_locks; // FOR UPDATE / SKIP LOCKED / NOWAIT row locks + parameterized LIMIT (queue claims)
 mod test_s33_executor_edges; // S33-11/S33-14: hash-join decline + SIMD case-insensitive binding
 mod test_scalar_fns;

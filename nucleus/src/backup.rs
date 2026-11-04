@@ -815,7 +815,11 @@ fn resolve_pseudo(path: &Path) -> PathBuf {
 /// Restores need the same fence: `remove_dir_all(data_dir)` runs before the
 /// copy, so a destination that is the snapshot itself (or its ancestor)
 /// destroys the input before it is read. All checks run before any mutation.
-pub(crate) fn reject_path_overlap(source: &Path, destination: &Path, action: &str) -> io::Result<()> {
+pub(crate) fn reject_path_overlap(
+    source: &Path,
+    destination: &Path,
+    action: &str,
+) -> io::Result<()> {
     let src = resolve_pseudo(source);
     let dst = resolve_pseudo(destination);
     if src == dst {
@@ -1114,7 +1118,11 @@ pub(crate) fn publish_dir_replace(new: &Path, dest: &Path) -> io::Result<()> {
                 "cannot publish the restored image over {}: {e} (the previous database was \
                  preserved{})",
                 dest.display(),
-                if aside.exists() { "" } else { " at the staging sibling" },
+                if aside.exists() {
+                    ""
+                } else {
+                    " at the staging sibling"
+                },
             ),
         ));
     }
@@ -1132,7 +1140,9 @@ pub(crate) fn publish_dir_replace(new: &Path, dest: &Path) -> io::Result<()> {
             ),
         ));
     }
-    if aside.exists() && let Err(e) = std::fs::remove_dir_all(&aside) {
+    if aside.exists()
+        && let Err(e) = std::fs::remove_dir_all(&aside)
+    {
         // The restore itself succeeded and is durable; the retired copy is
         // only reclaimable space. Say so loudly rather than reporting the
         // whole restore failed.
@@ -1926,7 +1936,11 @@ mod tests {
         let debris: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".restore-staging-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".restore-staging-")
+            })
             .collect();
         assert!(debris.is_empty(), "staging debris: {debris:?}");
         let _ = std::fs::remove_dir_all(&root);

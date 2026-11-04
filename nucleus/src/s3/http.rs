@@ -51,7 +51,6 @@ async fn read_line_bounded<R: tokio::io::AsyncRead + Unpin>(
     Ok(BoundedLine::Line(line))
 }
 
-
 #[derive(Debug)]
 pub struct Request {
     pub method: String,
@@ -195,7 +194,9 @@ pub async fn read_request_head<R: tokio::io::AsyncRead + Unpin>(
         return Ok(ReadOutcome::Bad("conflicting content-length headers"));
     }
     if te.is_some() && !cl_values.is_empty() {
-        return Ok(ReadOutcome::Bad("ambiguous content-length and transfer-encoding"));
+        return Ok(ReadOutcome::Bad(
+            "ambiguous content-length and transfer-encoding",
+        ));
     }
     let content_length = cl_values
         .first()
@@ -535,7 +536,10 @@ mod tests {
         let req = b"GET / HTTP/1.1\r\nx-trunc: aa";
         match head_of(req).await {
             ReadOutcome::Bad(msg) => {
-                assert!(msg.contains("mid-headers") || msg.contains("too large"), "got {msg}")
+                assert!(
+                    msg.contains("mid-headers") || msg.contains("too large"),
+                    "got {msg}"
+                )
             }
             other => panic!("expected Bad, got {other:?}"),
         }

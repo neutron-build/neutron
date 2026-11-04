@@ -2027,8 +2027,15 @@ mod tests {
         // fuzz_value_text crash-868ec3f6: a four-byte offset `"\u{079A}1`
         // took the `±HHMM` arm and was sliced at byte 2, inside the char.
         assert!(split_zone_suffix("12:00:00-\"\u{079A}1").is_err());
-        assert!(Value::Text("#\r-\"\u{079A}1".into()).cast(&DataType::Date).is_err());
-        assert_eq!(split_zone_suffix("12:00:00+0530").unwrap(), ("12:00:00", Some(19_800)));
+        assert!(
+            Value::Text("#\r-\"\u{079A}1".into())
+                .cast(&DataType::Date)
+                .is_err()
+        );
+        assert_eq!(
+            split_zone_suffix("12:00:00+0530").unwrap(),
+            ("12:00:00", Some(19_800))
+        );
     }
 
     #[test]

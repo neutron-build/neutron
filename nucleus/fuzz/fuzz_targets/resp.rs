@@ -35,7 +35,9 @@ impl AsyncRead for Chunked<'_> {
         s ^= s >> 17;
         s ^= s << 5;
         self.seed = s;
-        let n = (1 + (s % 16) as usize).min(self.data.len()).min(buf.remaining());
+        let n = (1 + (s % 16) as usize)
+            .min(self.data.len())
+            .min(buf.remaining());
         let (head, tail) = self.data.split_at(n);
         buf.put_slice(head);
         self.data = tail;
@@ -44,8 +46,13 @@ impl AsyncRead for Chunked<'_> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&seed, rest)) = data.split_first() else { return };
-    let reader = Chunked { data: rest, seed: u32::from(seed) | 0x100 };
+    let Some((&seed, rest)) = data.split_first() else {
+        return;
+    };
+    let reader = Chunked {
+        data: rest,
+        seed: u32::from(seed) | 0x100,
+    };
     let mut reader = BufReader::with_capacity(8 + (seed as usize % 64), reader);
     futures::executor::block_on(async {
         for _ in 0..256 {

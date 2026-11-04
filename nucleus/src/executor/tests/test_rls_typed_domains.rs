@@ -19,11 +19,7 @@ async fn rls_session(ex: &Executor, setup: &str, policy: &str) -> u64 {
     for stmt in setup.split(';').filter(|s| !s.trim().is_empty()) {
         exec(ex, stmt).await;
     }
-    exec(
-        ex,
-        "CREATE ROLE viewer LOGIN PASSWORD 'p'",
-    )
-    .await;
+    exec(ex, "CREATE ROLE viewer LOGIN PASSWORD 'p'").await;
     let sid = ex.create_session();
     ex.bind_authenticated_session(sid, "viewer").await.unwrap();
     // Grant and policy are installed after the role exists; the session is

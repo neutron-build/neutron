@@ -289,8 +289,16 @@ fn cmp_decimal_magnitude(l: &str, r: &str) -> std::cmp::Ordering {
         return li.cmp(ri);
     }
     let width = lf.len().max(rf.len());
-    let lf_padded: String = lf.chars().chain(std::iter::repeat('0')).take(width).collect();
-    let rf_padded: String = rf.chars().chain(std::iter::repeat('0')).take(width).collect();
+    let lf_padded: String = lf
+        .chars()
+        .chain(std::iter::repeat('0'))
+        .take(width)
+        .collect();
+    let rf_padded: String = rf
+        .chars()
+        .chain(std::iter::repeat('0'))
+        .take(width)
+        .collect();
     lf_padded.cmp(&rf_padded)
 }
 

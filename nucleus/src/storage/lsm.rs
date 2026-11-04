@@ -333,9 +333,7 @@ impl SSTable {
     /// files: a transient read error became permanent data loss (NE-20).
     /// Point lookups keep the lenient floor deliberately; compaction is the
     /// one place the loss would be DURABLE.
-    pub(crate) fn entries_checked(
-        &self,
-    ) -> io::Result<SstEntries> {
+    pub(crate) fn entries_checked(&self) -> io::Result<SstEntries> {
         let mut out = Vec::with_capacity(self.index.len());
         for (k, loc) in &self.index {
             let value = match loc {
@@ -1171,7 +1169,10 @@ mod tests {
         assert!(sst_files.len() >= 2, "fixture needs multiple runs");
         let victim = &sst_files[0];
         // Snapshot every input file for the byte-identity check.
-        let before: Vec<Vec<u8>> = sst_files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let before: Vec<Vec<u8>> = sst_files
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
         let mut corrupt = before[0].clone();
         // Flip a byte well inside the payload area (past the header).
         corrupt[64] ^= 0xFF;
@@ -1215,7 +1216,8 @@ mod tests {
     // NOT resident. Previously `SSTable` held every value in a Vec, so evicting
     // to "cold" moved bytes from one in-RAM structure to another and a fully
     // evicted 4.8 GB dataset stayed 4.8 GB resident.
-    fn loaded_sstable_holds_offsets_not_values() {        let dir = tempfile::tempdir().unwrap();
+    fn loaded_sstable_holds_offsets_not_values() {
+        let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
         let big = vec![b'x'; 256 * 1024];
         for i in 0..8 {
