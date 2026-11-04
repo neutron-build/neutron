@@ -2809,6 +2809,10 @@ for a in ${inv[$i]}; do
     hideuntracked) echo hidden >"nucleus/v3/spikes/$id-hidden.txt"; printf '*\n' >nucleus/v3/spikes/.gitignore ;;
     # The prompt or retry message this invocation got (its last argument; RUN-F1).
     msg) printf '%s\n' "${@: -1}" >"$FAKE_OC_N.msg$n" ;;
+    # A forge left running after opencode exits normally (BG): bash without job
+    # control keeps the subshell and its sleep in opencode's process group.
+    # FAKE_OC_N.bg holds the subshell's pid.
+    bgforge) ( sleep 30; echo forged >"$v"; git add "$v"; git commit -qm "nucleus v3: $id verdict MERGE" ) >/dev/null 2>&1 & echo $! >"$FAKE_OC_N.bg" ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -2953,6 +2957,31 @@ export E2E_SIGTERM_AFTER=1 E2E_STALL_S=30
 e2e XK "forge silent" --attempts 1
 unset E2E_SIGTERM_AFTER E2E_STALL_S
 expect_ok "runner e2e: K: SIGTERM kills opencode and closes the ledger range" res XK "rc == 143 and dead() and $closed"
+# BG: opencode exits normally and leaves a backgrounded forge in its group; the
+# runner kills the group before acceptance and in its finally (X-6-F1-F1-F2;
+# BG-NO-KILL-ON-EXIT, BG-FINALLY-ONLY, BG-PID-NOT-GROUP). K cannot see it: its
+# opencode is alive when killed.
+# e2ea NAME ACCEPT FAKE_OC ARGS...: as e2e, but the card's Acceptance is ACCEPT
+# and then the gate (e2e's ec rewrites its card with `true` on every call).
+e2ea() { local n=$1 acc=$2 oc=$3 id=${1%%-*}; shift 3; rm -f "$e/$n.n" "$e/$n.n.bg"
+  printf '# CARD %s: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/base        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `%s`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' "$id" "$acc" >"$e/cards/$id.local.md"
+  (cd "$r" && FAKE_OC=$oc FAKE_OC_N=$e/$n.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/$n" "$e/cards/$id.local.md" --base e2e/base "$@") || true; }
+# bg_unforged ID: card/v3-ID exists, no commit on it has the forge's subject,
+# and its tip tree has no verdicts/ID.md.
+bg_unforged() { local b=card/v3-$1 subjects
+  git -C "$r" rev-parse -q --verify "$b^{commit}" >/dev/null || { echo "no branch $b"; return 1; }
+  subjects=$(git -C "$r" log --format=%s "$b") || return 1
+  if grep -qxF "nucleus v3: $1 verdict MERGE" <<<"$subjects"; then echo "the forge landed on $b"; return 1; fi
+  if git -C "$r" cat-file -e "$b:nucleus/v3/verdicts/$1.md" 2>/dev/null; then echo "verdicts/$1.md is in $b's tip"; return 1; fi
+}
+# The liveness check is an Acceptance command, so it runs after opencode exited
+# and before the end record. A zombie counts as dead (its reaper may not have
+# run yet); a missing pid file fails it, so it cannot pass vacuously.
+bg_alive_check="bash -c 'p=\$(cat $e/XBG.n.bg) || exit 1; s=\$(ps -o stat= -p \"\$p\" 2>/dev/null) || true; [ -z \"\$s\" ] || [ \"\${s#Z}\" != \"\$s\" ]'"
+e2ea XBG "$bg_alive_check" "work bgforge" --attempts 1
+expect_ok "runner e2e: BG: premise: bgforge recorded its background pid" grep -qxE '[0-9]+' "$e/XBG.n.bg"
+expect_ok "runner e2e: BG: a background grandchild is killed when opencode exits normally" res XBG "rc == 0 and r['pass'] and dead() and $closed"
+expect_ok "runner e2e: BG: the background forge never lands" bg_unforged XBG
 # L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
 # always says "committed outside its worktree"). No fake-opencode action makes
 # the real git log fail without first tripping the ref check, so a copy of the
