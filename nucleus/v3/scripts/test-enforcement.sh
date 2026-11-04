@@ -3417,6 +3417,26 @@ expect_ok "fresh-gate: FG12: no checkout is left" fg_clean
 restore_forged
 expect_ok "forged objects: FG12 restored" no_state4
 expect_ok "git state: none after the forged-object rows" no_state
+
+# FG15, config-defined hooks (verdict X-6-F1-F2-F2-F1-F1 R4): git 2.47.3 does
+# not run hook.<name>.command, but newer git does, and neither the hooks/
+# check nor core.hooksPath=/dev/null stops it, so the key is refused by name,
+# from the repository config and from the command line. No marker row: on
+# this git the hook would not run either way.
+git -C "$r" config hook.fg15.command "touch $t/fg15.marker"
+git -C "$r" config hook.fg15.event post-checkout
+fgrun card/v3-FG1
+expect_ok "fresh-gate: FG15: a hook.<name>.command in the repository config is refused, by name" fg_refused "hook.fg15.command is 'touch $t/fg15.marker' (file:" "hook.fg15.event is 'post-checkout' (file:"
+expect_ok "fresh-gate: FG15: no checkout is left" fg_clean
+git -C "$r" config --remove-section hook.fg15
+GIT_CONFIG_PARAMETERS="'hook.fg15.command'='true'" fgrun card/v3-FG1
+expect_ok "fresh-gate: FG15: a -c hook.fg15.command is refused, at command-line scope" fg_refused "hook.fg15.command is 'true' (command line:"
+expect_ok "fresh-gate: FG15: no hook config is left" bash -c "[ -z \"\$(git -C '$r' config --get-regexp '^hook\\.')\" ] && [ ! -e '$t/fg15.marker' ]"
+
+# --- GLM rows go here (rework B, owner exception 2026-11-03) ---------------
+# FG11c, FG11d, FG13 and FG14: forged-object rows for the tightened eol
+# exception, an ident path and a symlink. See the card's REWORK section.
+# --- end of GLM rows --------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
 exit $(( fails > 0 ))

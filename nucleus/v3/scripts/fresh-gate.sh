@@ -137,6 +137,10 @@ config_checks() {
   cfg_named '^core\.attributesfile$' 'attributes apply at checkout'
   [ ! -e "$common/info/attributes" ] && [ ! -L "$common/info/attributes" ] || P+=("attributes file $common/info/attributes exists (attributes apply at checkout)")
   cfg_named '^include(if)?\.' 'an include can add any of these'
+  # Config-defined hooks (hook.<name>.command) do not run on git 2.47.3, but
+  # newer git runs them, and neither the hooks/ check nor
+  # core.hooksPath=/dev/null stops them (verdict X-6-F1-F2-F2-F1-F1 R4).
+  cfg_named '^hook\.' 'config hooks run in git calls on newer git'
 }
 config_checks
 refuse_if_any
@@ -237,25 +241,49 @@ mismatch=()
 for i in "${!hp[@]}"; do
   [ "${got[i]}" = "${hid[i]}" ] || mismatch+=("$i")
 done
-# The one exception, eol conversion (the two `text eol=crlf` .ps1 files here):
-# a regular file whose every attribute (check-attr -a) is text, eol or crlf,
-# and whose hash-object --path (which applies that conversion; no filter
-# driver exists, step 2) equals its id. It compares hashes, so a swapped blob
-# is refused under it too. A file with no attribute qualifies: core.autocrlf
-# is then the only conversion, and the hash still decides.
-declare -A conv_bad=()
+# The one exception, eol conversion (the two `text eol=crlf` .ps1 files here).
+# A mismatch passes only for a regular file whose every attribute (check-attr
+# -a) is text, eol or crlf, whose eol attribute is crlf, in which every CR and
+# every LF belongs to a CRLF pair, and whose hash-object --path (which applies
+# the conversion; no filter driver exists, step 2) equals its id.
+# Why so narrow: clean conversion is many-to-one (CRLF and LF both clean to
+# LF), so "cleans to the id" alone accepts a forged blob whose CRs survive the
+# checkout. Under eol=lf (this repository's `* text=auto eol=lf` covers every
+# text file) a blob forged with a CR before some LF checks out byte for byte,
+# gate.sh runs those bytes, and they still clean to the true content (verdict
+# X-6-F1-F2-F2-F1-F1 R1). On an eol=crlf path whose file is pure CRLF, the
+# honest blob checks out to these same bytes (every LF of the cleaned content
+# gets its CR back), so whatever blob produced them changes nothing. A lone LF
+# or a lone CR is refused, because the honest checkout would not write it.
+# Any other attribute is refused outright: ident's clean is many-to-one too
+# (`$Id: anything $` cleans to `$Id$`), and so is working-tree-encoding. A
+# file with no eol attribute (core.autocrlf alone) does not qualify. The
+# exception compares hashes, so a swapped blob is refused under it too.
+declare -A conv_bad=() eol_of=()
 eol=0 mp=()
 for i in "${mismatch[@]}"; do [ "${kind[i]}" != file ] || mp+=("${hn[i]}"); done
 if [ ${#mp[@]} -gt 0 ]; then
   rc=0; printf '%s\0' "${mp[@]}" | g check-attr -a -z --stdin >"$d/attr" || rc=$?
   [ "$rc" -eq 0 ] || die "git check-attr failed (exit $rc; cannot check eol attributes)"
-  while IFS= read -r -d '' p && IFS= read -r -d '' a && IFS= read -r -d '' _; do
-    case $a in text | eol | crlf) ;; *) conv_bad[$p]=1 ;; esac
+  while IFS= read -r -d '' p && IFS= read -r -d '' a && IFS= read -r -d '' v; do
+    case $a in text | crlf) ;; eol) eol_of[$p]=$v ;; *) conv_bad[$p]=1 ;; esac
   done <"$d/attr"
 fi
+# crlf_only FILE: every CR and every LF in FILE belongs to a CRLF pair. od and
+# awk read bytes (a file may hold NUL); awk exits 3 for "no", so any other
+# failure stops the run instead of reading as an answer.
+crlf_only() {
+  local rc=0
+  od -An -v -tx1 -- "$1" | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) { if (($i == "0a") != (p == "0d")) bad = 1; p = $i } } END { if (p == "0d") bad = 1; exit bad ? 3 : 0 }' || rc=$?
+  case $rc in
+    0) return 0 ;;
+    3) return 1 ;;
+    *) die "cannot read the line endings of $1 (exit $rc; cannot check its eol conversion)" ;;
+  esac
+}
 for i in "${mismatch[@]}"; do
   p=${hn[i]}
-  if [ "${kind[i]}" = file ] && [ -z "${conv_bad[$p]:-}" ]; then
+  if [ "${kind[i]}" = file ] && [ -z "${conv_bad[$p]:-}" ] && [ "${eol_of[$p]:-}" = crlf ] && crlf_only "$p"; then
     h=$(g hash-object --path="$p" -- "$p") || die "git hash-object --path failed for $p (cannot check its eol conversion)"
     [ "$h" = "${hid[i]}" ] && { eol=$((eol + 1)); continue; }
   fi
