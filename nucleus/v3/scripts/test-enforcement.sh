@@ -45,7 +45,7 @@ echo "ci" >"$r/.forgejo/workflows/nucleus-v3.yml"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$r/nucleus/v3/scripts/test-enforcement.sh"
 echo base >"$r/nucleus/v3/spikes/base.txt"
 git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: BOOT work"
-printf 'Card: BOOT\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: P\nGate-model: test-model\nGate-session: t\nDate: 2026-10-17\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$r/nucleus/v3/verdicts/BOOT.md"
+printf 'Card: BOOT\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: P\nGate-model: test-model\nGate-session: t\nDate: 2026-10-17\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse HEAD)" >"$r/nucleus/v3/verdicts/BOOT.md"
 git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: BOOT verdict MERGE"
 git -C "$r" checkout -q -b scratch/boot nucleus/v3-scaffold
 if (cd "$r" && bash "$src/scripts/merge-card.sh" BOOT) >"$t/out" 2>&1; then pass "bootstrap: the S-0-shaped P card merges via merge-card"; else fail "bootstrap merge"; sed 's/^/     /' "$t/out"; fi
@@ -78,7 +78,7 @@ branch() {
 verdict() {
   local id=$1 tier=$2 vd=$3 cls=$4 cg=$5 ge=${6:-GATE EXIT=0} fu=${7:-none}
   printf 'Card: %s\nClass: %s\nCard-gate: %s\nVerdict: %s\nGate-tier: %s\nGate-model: test-model\nGate-session: t\nDate: 2026-10-17\nGate-exit: %s\nCommit: %s\nMutants: n/a\nFollowups: %s\n' \
-    "$id" "$cls" "$cg" "$vd" "$tier" "$ge" "$(git -C "$r" rev-parse --short HEAD)" "$fu" >"$(mkdir -p "$v3/verdicts" && echo "$v3/verdicts/$id.md")"
+    "$id" "$cls" "$cg" "$vd" "$tier" "$ge" "$(git -C "$r" rev-parse HEAD)" "$fu" >"$(mkdir -p "$v3/verdicts" && echo "$v3/verdicts/$id.md")"
   git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: $id verdict $vd"
 }
 scratch() { git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold; }
@@ -136,7 +136,7 @@ card MB S standard
 git -C "$mb" checkout -q -b card/v3-MB
 echo MB >"$mb/nucleus/v3/scripts/mb.sh"
 git -C "$mb" add -A && git -C "$mb" commit -qm "nucleus v3: MB work"
-printf 'Card: MB\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-10-20\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$mb" rev-parse --short HEAD)" >"$mb/nucleus/v3/verdicts/MB.md"
+printf 'Card: MB\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-10-20\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$mb" rev-parse HEAD)" >"$mb/nucleus/v3/verdicts/MB.md"
 git -C "$mb" add -A && git -C "$mb" commit -qm "nucleus v3: MB verdict MERGE"
 git -C "$mb" checkout -q nucleus/v3-scaffold
 mbblob=$(git -C "$mb" rev-parse mb-base:nucleus/v3/CORE_PATHS)
@@ -164,7 +164,7 @@ cpcard() {
   git -C "$d" checkout -q -b "card/v3-$id" "$b"
   for f in "$@"; do mkdir -p "$(dirname "$d/$f")"; echo "$id" >"$d/$f"; done
   git -C "$d" add -A && git -C "$d" commit -qm "nucleus v3: $id work"
-  printf 'Card: %s\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-10-31\nGate-exit: %s\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$id" "$ge" "$(git -C "$d" rev-parse --short HEAD)" >"$d/nucleus/v3/verdicts/$id.md"
+  printf 'Card: %s\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-10-31\nGate-exit: %s\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$id" "$ge" "$(git -C "$d" rev-parse HEAD)" >"$d/nucleus/v3/verdicts/$id.md"
   git -C "$d" add -A && git -C "$d" commit -qm "nucleus v3: $id verdict MERGE"
 }
 # cpm DIR ID BASE HEAD: check_merge in the copy DIR, as cm_mb runs it.
@@ -311,13 +311,15 @@ printf 'Card: %s\nClass: %s\nCard-gate: %s\nVerdict: %s\nGate-tier: %s\nGate-mod
   G6F standard S MERGE S "GATE EXIT=0" "$(git -C "$r" rev-parse HEAD)" none >"$v3/verdicts/G6F.md"
 git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: G6F verdict MERGE"
 scratch; expect_ok "a verdict with a full 40-hex Commit merges" mc G6F
-# G4 again, plus a branch named with the verdict's short Commit pointing at the
-# late change. git resolves refs before short object ids, so a lookup of the
-# field follows the branch to tip^; only a ref-free compare refuses G7.
+# G4 again, with the verdict's Commit shortened, plus a branch named with that
+# short id pointing at the late change. git resolves refs before short object
+# ids, so a lookup of the field follows the branch to tip^. Merge mode and an
+# unlisted audit refuse any short id (X-6-F1-F2-F3-F1-F1); the ref-free compare
+# still guards the full form and the merges in SHORT_COMMIT_MERGES.
 card G7 S standard; branch G7 nucleus/v3/spikes/g7.txt; verdict G7 S MERGE standard S
-c7=$(sed -n 's/^Commit: //p' "$v3/verdicts/G7.md")
+c7=$(git -C "$r" rev-parse --short "$(sed -n 's/^Commit: //p' "$v3/verdicts/G7.md")")
 echo late >>"$v3/spikes/g7.txt"; git -C "$r" commit -qam "nucleus v3: G7 late non-core change"
-sed -i 's/^Date: .*/Date: 2026-10-18/' "$v3/verdicts/G7.md"; git -C "$r" commit -qam "nucleus v3: G7 verdict MERGE (re-committed)"
+sed -i -e 's/^Date: .*/Date: 2026-10-18/' -e "s/^Commit: .*/Commit: $c7/" "$v3/verdicts/G7.md"; git -C "$r" commit -qam "nucleus v3: G7 verdict MERGE (re-committed)"
 g7ref=$c7
 git -C "$r" branch "$g7ref" card/v3-G7^
 g7_shadows() { [ "$(git -C "$r" rev-parse -q --verify "$c7^{commit}")" = "$(git -C "$r" rev-parse card/v3-G7^)" ]; }
@@ -378,39 +380,39 @@ g7c_premise() {
     [ "$g7x" != "$g7y" ] && [[ $g7y == "$g7c"* ]] && [ "$(git -C "$r" rev-parse card/v3-G7C^)" = "$g7y" ]
 }
 expect_ok "premise: G7C's X and Y are distinct commits sharing the prefix" g7c_premise
-scratch; expect_no "a verdict whose short Commit also names a ground collision is refused as ambiguous (G7C)" mc G7C
-scratch; expect_ok "G7C's refusal names the ambiguity" bash -c "cd '$v3' && rc=0 && o=\$(bash scripts/merge-card.sh G7C 2>&1) || rc=\$?; echo \"\$o\"; [ \"\$rc\" -ne 0 ] && grep -qF \"verdict Commit '$g7c' is ambiguous\" <<<\"\$o\""
+scratch; expect_no "a verdict whose short Commit also names a ground collision is refused (G7C)" mc G7C
+# Merge mode no longer reaches the ambiguity count (X-6-F1-F2-F3-F1-F1): any
+# short id is refused first. The count itself is the L2 row's (audit, listed).
+scratch; expect_ok "G7C's refusal names the full-id rule" bash -c "cd '$v3' && rc=0 && o=\$(bash scripts/merge-card.sh G7C 2>&1) || rc=\$?; echo \"\$o\"; [ \"\$rc\" -ne 0 ] && grep -qF \"verdict Commit '$g7c' is not a full 40-hex commit id\" <<<\"\$o\""
 # Control: the same Y under a full 40-hex Commit is unambiguous and merges.
 card G7D S standard
 git -C "$r" checkout -q -B card/v3-G7D "$g7y"; g7c_verdict G7D "$g7y"
 scratch; expect_ok "the same Y with a full 40-hex Commit merges (G7D)" mc G7D
-# tip^'s own short id, spelled so git still resolves it to tip^ but the field is
-# not plain lowercase hex: <short>~0 (G6E) and the id in uppercase (G6U). The
+# tip^'s own full id, spelled so git still resolves it to tip^ but the field is
+# not plain lowercase hex: <full>~0 (G6E) and the id in uppercase (G6U). The
 # text compare with tip^'s full id refuses both as well, so a refusal alone
 # cannot show the hex rule is there. The reason pins it: with the end anchor
-# dropped (^...{7,40}, no $) or A-F added to the class, the hex rule passes the
-# value and the refusal names the compare instead.
+# dropped (^...{40}, no $) or A-F added to the class, the 40-hex rule passes
+# the value and the refusal names the compare instead.
 # hexrule_refusal ID VALUE: merge-card refuses ID, naming VALUE under the hex rule.
 hexrule_refusal() { local o rc=0; o=$(mc "$1" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "verdict Commit '$2' is not a hex commit id" <<<"$o"; }
 card G6E S standard; branch G6E nucleus/v3/spikes/g6e.txt
-g6e="$(git -C "$r" rev-parse --short HEAD)~0"; g7c_verdict G6E "$g6e"
+g6e="$(git -C "$r" rev-parse HEAD)~0"; g7c_verdict G6E "$g6e"
 expect_ok "premise: G6E's Commit $g6e resolves to tip^" commit_is_tip_parent G6E
-scratch; expect_no "a verdict Commit of tip^'s short id plus ~0 is refused (G6E)" mc G6E
+scratch; expect_no "a verdict Commit of tip^'s full id plus ~0 is refused (G6E)" mc G6E
 scratch; expect_ok "G6E's refusal names the hex rule (end anchor)" hexrule_refusal G6E "$g6e"
-# An id whose first seven digits are all 0-9 has no uppercase form there, and a
-# letter after them would let a dropped end anchor pass the value too (the
-# unanchored match reads only seven digits), so G6U would not be about case
-# alone. Add work commits until a letter falls in the first seven (about 1 id in
-# 27 lacks one).
+# An id with no letter has no uppercase form, so G6U would not be about case.
+# Add work commits until a letter falls in the first seven digits (about 1 id
+# in 27 lacks one there), which more than ensures one in the full id.
 card G6U S standard; branch G6U nucleus/v3/spikes/g6u.txt
 g6un=0
 while [[ $(git -C "$r" rev-parse HEAD | cut -c1-7) != *[abcdef]* ]] && [ "$g6un" -lt 64 ]; do
   echo "$g6un" >>"$v3/spikes/g6u.txt"; git -C "$r" commit -qam "nucleus v3: G6U work ($g6un)"; g6un=$((g6un + 1))
 done
-g6u=$(git -C "$r" rev-parse --short HEAD | tr abcdef ABCDEF); g7c_verdict G6U "$g6u"
+g6u=$(git -C "$r" rev-parse HEAD | tr abcdef ABCDEF); g7c_verdict G6U "$g6u"
 g6u_premise() { [[ ${g6u:0:7} == *[ABCDEF]* ]] && commit_is_tip_parent G6U; }
 expect_ok "premise: G6U's Commit $g6u has a letter in its first seven digits and resolves to tip^" g6u_premise
-scratch; expect_no "a verdict Commit of tip^'s short id in uppercase is refused (G6U)" mc G6U
+scratch; expect_no "a verdict Commit of tip^'s full id in uppercase is refused (G6U)" mc G6U
 scratch; expect_ok "G6U's refusal names the hex rule (lowercase class)" hexrule_refusal G6U "$g6u"
 
 card R S standard
@@ -868,10 +870,12 @@ git -C "$r" replace -d "$gx" >/dev/null
 expect_ok "git state: R1's replace ref is gone" no_state
 scratch; expect_ok "merge-card: control: GM merges once the replace ref is gone" mc GM
 # The S-0-F2-F1-F1-F1-F1 case: G7C's reviewed X replaced by a blob, so a
-# replace-honouring cat-file sees one commit for the prefix, not two.
+# replace-honouring cat-file sees one commit for the prefix, not two. Merge
+# mode now refuses the short id before any count (X-6-F1-F2-F3-F1-F1), and an
+# audit fails outright while a replace ref exists (git_state_refuse).
 git -C "$r" replace -f "$g7x" "$(echo blob | git -C "$r" hash-object -w --stdin)"
 expect_ok "premise: G7C: plain cat-file reports X as a blob" bash -c "[ \"\$(env -u GIT_NO_REPLACE_OBJECTS git -C '$r' cat-file -t $g7x)\" = blob ]"
-scratch; expect_ok "merge-card: G7C under a replace ref is still refused as ambiguous" out_has "verdict Commit '$g7c' is ambiguous" "refs/replace/$g7x" -- mc G7C
+scratch; expect_ok "merge-card: G7C under a replace ref is still refused (short id)" out_has "verdict Commit '$g7c' is not a full 40-hex commit id" "refs/replace/$g7x" -- mc G7C
 git -C "$r" replace -d "$g7x" >/dev/null
 expect_ok "git state: G7C's replace ref is gone" no_state
 
@@ -1718,7 +1722,7 @@ git -C "$r" checkout -q -b card/v3-OV2 nucleus/v3-scaffold
 echo ov2 >"$v3/spikes/ov2.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OV2 work"
 w2=$(git -C "$r" rev-parse HEAD); w2t=$(git -C "$r" rev-parse "HEAD^{tree}")
 echo ov2 >"$v3/tools/ov2.py"
-printf 'Card: OV2\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: P\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OV2.md"
+printf 'Card: OV2\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: P\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse HEAD)" >"$v3/verdicts/OV2.md"
 git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OV2 verdict MERGE"
 ov2py=$(git -C "$r" rev-parse "card/v3-OV2:nucleus/v3/tools/ov2.py")
 # The tip tree minus the verdict file, built through a scratch index.
@@ -1786,7 +1790,7 @@ card OI S standard
 git -C "$r" checkout -q -b card/v3-OI nucleus/v3-scaffold
 echo oi >"$v3/tools/oi.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OI work"
 ox=$(git -C "$r" rev-parse HEAD)
-printf 'Card: OI\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OI.md"
+printf 'Card: OI\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse HEAD)" >"$v3/verdicts/OI.md"
 git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OI verdict MERGE"
 git -C "$r" checkout -q -B scratch/oc ob
 git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-OI (MERGE, gate S/test-model)" card/v3-OI
@@ -1829,7 +1833,7 @@ expect_ok "(d) both twins name the tree, identically" vparity_bad "$dc" nucleus/
 card OG S standard
 git -C "$r" checkout -q -b card/v3-OG nucleus/v3-scaffold
 echo og >"$v3/spikes/og.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OG work"
-printf 'Card: OG\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OG.md"
+printf 'Card: OG\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse HEAD)" >"$v3/verdicts/OG.md"
 git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OG verdict MERGE"
 gog=$(git -C "$r" rev-parse HEAD); gtog=$(git -C "$r" rev-parse "HEAD^{tree}")
 echo forged >>"$v3/verdicts/OG.md"; git -C "$r" commit -qam "nucleus v3: OG rework"
@@ -1948,7 +1952,7 @@ printf '# kb CORE_PATHS\n' >>"$kb/nucleus/v3/CORE_PATHS"
 git -C "$kb" commit -qam "kb-base CORE_PATHS"
 git -C "$kb" checkout -q -b card/v3-OK kb-base
 echo k >"$kb/nucleus/v3/tools/k.py"; git -C "$kb" add -A; git -C "$kb" commit -qm "nucleus v3: OK work"
-printf 'Card: OK\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$kb" rev-parse --short HEAD)" >"$kb/nucleus/v3/verdicts/OK.md"
+printf 'Card: OK\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$kb" rev-parse HEAD)" >"$kb/nucleus/v3/verdicts/OK.md"
 git -C "$kb" add -A; git -C "$kb" commit -qm "nucleus v3: OK verdict MERGE"
 git -C "$kb" checkout -q -B scratch/ok kb-base
 git -C "$kb" merge -q --no-ff -m "nucleus v3: merge card/v3-OK (MERGE, gate S/test-model)" card/v3-OK
@@ -1974,7 +1978,7 @@ expect_ok "forged objects: (k) restored" no_state4
 card OL P core
 git -C "$r" checkout -q -b card/v3-OL nucleus/v3-scaffold
 echo ol >"$v3/tools/ol.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OL work"
-printf 'Card: OL\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OL.md"
+printf 'Card: OL\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse HEAD)" >"$v3/verdicts/OL.md"
 git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OL verdict MERGE"
 olid=$(git -C "$r" rev-parse "card/v3-OL:nucleus/v3/verdicts/OL.md")
 sed 's/^Gate-tier: S$/Gate-tier: P/' "$v3/verdicts/OL.md" >"$t/ol.p"
@@ -3650,6 +3654,105 @@ expect_ok "forged objects: FG11e restored" no_state4
 expect_ok "fresh-gate: no attribute file is left in the scratch worktree after the GLM rows" bash -c "[ ! -e '$r/.gitattributes' ]"
 expect_ok "git state: none after the GLM forged-object rows" no_state
 # --- end of GLM rows --------------------------------------------------------
+# --- full 40-hex verdict Commit (X-6-F1-F2-F3-F1-F1) ------------------------
+# Merge mode takes only tip^'s full id; an audit takes a short one only for a
+# merge listed in SHORT_COMMIT_MERGES by its exact merge commit id, and then
+# under the old rule, ambiguity count included. Plain merges, no forged object.
+# hcard ID LEN: card/v3-ID with one spikes/ commit, then a verdict naming the
+# first LEN digits of that commit's id (tip^ once the verdict is committed).
+hcard() { card "$1" S standard; branch "$1" "nucleus/v3/spikes/${1,,}.txt"; g7c_verdict "$1" "$(git -C "$r" rev-parse HEAD | cut -c1-"$2")"; }
+# hcommit ID: the Commit field of card/v3-ID's tip verdict.
+hcommit() { git -C "$r" show "card/v3-$1:nucleus/v3/verdicts/$1.md" | sed -n 's/^Commit: //p'; }
+# hpre ID LEN: the Commit is LEN digits long and a prefix of tip^'s full id.
+hpre() { local c; c=$(hcommit "$1"); echo "Commit: $c"; [ "${#c}" -eq "$2" ] && [[ $(git -C "$r" rev-parse "card/v3-$1^") == "$c"* ]]; }
+# hnot ID: the full-id refusal line for card/v3-ID's verdict.
+hnot() { echo "verdict Commit '$(hcommit "$1")' is not a full 40-hex commit id"; }
+# hmerge REF ID TITLE-SUFFIX: REF off nucleus/v3-scaffold with a plain titled
+# merge of card/v3-ID, as an orchestrator bypassing merge-card would make it.
+hmerge() { git -C "$r" checkout -q -B "$1" nucleus/v3-scaffold && git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-$2 ($3)" "card/v3-$2"; }
+hcard H1 12
+expect_ok "premise: H1's Commit is a 12-hex prefix of tip^'s full id" hpre H1 12
+scratch; expect_ok "H1: merge-card refuses a correct 12-hex prefix of tip^, naming the full-id rule" out_has "$(hnot H1)" -- mc H1
+hcard H2 39
+expect_ok "premise: H2's Commit is a 39-hex prefix of tip^'s full id" hpre H2 39
+scratch; expect_ok "H2: merge-card refuses a correct 39-hex prefix of tip^, naming the full-id rule" out_has "$(hnot H2)" -- mc H2
+hmerge scratch/h3 H1 "MERGE, gate S/test-model"
+h3=$(git -C "$r" rev-parse scratch/h3)
+expect_ok "H3: audit fails on a titled merge of H1's branch (unlisted), naming the full-id rule" out_has "audit: H1 (" "$(hnot H1)" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/h3"
+# L2's merge: G7C's branch (Y, sharing X's 7-hex prefix) under a titled merge.
+expect_ok "premise: L2: G7C's X and Y are still distinct commits sharing the prefix" g7c_premise
+hmerge scratch/l2 G7C "MERGE, gate S/test-model"
+l2=$(git -C "$r" rev-parse scratch/l2)
+# L3's merge: G4-shaped, a 12-hex Commit of the reviewed commit, then a late
+# change and the verdict re-committed, so the value is no prefix of tip^.
+card L3 S standard; branch L3 nucleus/v3/spikes/l3.txt
+l3c=$(git -C "$r" rev-parse HEAD | cut -c1-12); g7c_verdict L3 "$l3c"
+echo late >>"$v3/spikes/l3.txt"; git -C "$r" commit -qam "nucleus v3: L3 late non-core change"
+sed -i 's/^Date: .*/Date: 2026-10-18/' "$v3/verdicts/L3.md"; git -C "$r" commit -qam "nucleus v3: L3 verdict MERGE (re-committed)"
+l3_premise() { [ "$(hcommit L3)" = "$l3c" ] && [[ $(git -C "$r" rev-parse card/v3-L3^) != "$l3c"* ]] && [[ $(git -C "$r" rev-parse card/v3-L3~3) == "$l3c"* ]]; }
+expect_ok "premise: L3's Commit names the reviewed commit, not tip^ (a late change sits between)" l3_premise
+hmerge scratch/l3 L3 "MERGE, gate S/test-model"
+l3=$(git -C "$r" rev-parse scratch/l3)
+# L5's merge: H3's merge rebuilt with another title, so the same parents (the
+# same verdict) under a new merge commit id.
+hmerge scratch/l5 H1 "MERGE, gate S/rebuilt"
+l5=$(git -C "$r" rev-parse scratch/l5)
+l5_premise() {
+  local m
+  [ "$l5" != "$h3" ] && [ "$(git -C "$r" rev-parse "$l5^1" "$l5^2")" = "$(git -C "$r" rev-parse "$h3^1" "$h3^2")" ] || return 1
+  for m in "$h3" "$l2" "$l3"; do [ "${l5:0:7}" != "${m:0:7}" ] || return 1; done
+}
+expect_ok "premise: L5's merge has H3's parents, a new id, and no 7-digit prefix shared with a listed id" l5_premise
+# The legacy copy: the scripts in $v3/scripts/.legacy (audit-merges.sh cd's to
+# its own directory's parent, as for audit_novr), the marker block of its
+# enforce-lib.sh holding exactly the test merges named. The real file is never
+# changed. legacy_copy ID...: write it.
+legacy_copy() {
+  local d=$v3/scripts/.legacy m
+  mkdir -p "$d"; cp "$v3"/scripts/*.sh "$d"/
+  {
+    sed -n '1,/^# BEGIN SHORT_COMMIT_MERGES (frozen)$/p' "$v3/scripts/enforce-lib.sh"
+    echo 'SHORT_COMMIT_MERGES=('; for m in "$@"; do echo "  $m # test"; done; echo ')'
+    sed -n '/^# END SHORT_COMMIT_MERGES$/,$p' "$v3/scripts/enforce-lib.sh"
+  } >"$d/enforce-lib.sh"
+}
+legacy_copy "$h3" "$l2" "$l3"
+# The copy differs from the real file only inside the marker block, and lists
+# exactly H3's, L2's and L3's merges.
+legacy_premise() {
+  local d=$v3/scripts/.legacy
+  cmp <(sed '/^# BEGIN SHORT_COMMIT_MERGES (frozen)$/,/^# END SHORT_COMMIT_MERGES$/d' "$v3/scripts/enforce-lib.sh") \
+    <(sed '/^# BEGIN SHORT_COMMIT_MERGES (frozen)$/,/^# END SHORT_COMMIT_MERGES$/d' "$d/enforce-lib.sh") &&
+    [ "$(bash -c '. "$1/enforce-lib.sh" && echo "${SHORT_COMMIT_MERGES[*]}"' _ "$d")" = "$h3 $l2 $l3" ]
+}
+expect_ok "premise: the legacy copy differs only in its marker block, listing H3, L2 and L3" legacy_premise
+audit_legacy() { (cd "$v3" && bash scripts/.legacy/audit-merges.sh "$1"); }
+legacy_ok() { local o rc=0; o=$(audit_legacy "$1" 2>&1) || rc=$?; echo "$o"; [ "$rc" -eq 0 ] && grep -qE "^audit: ok \([0-9]+ commits\)$" <<<"$o"; }
+expect_ok "L1: the copy's audit accepts H3's listed merge (the legacy path works)" legacy_ok scratch/h3
+expect_ok "L2: a listed G7C-shaped merge is still refused as ambiguous (never weaker than today)" out_has "verdict Commit '$g7c' is ambiguous" -- audit_legacy scratch/l2
+expect_ok "L3: a listed merge whose short Commit is not a prefix of tip^ is refused" out_has "verdict Commit '$l3c' is not the commit under the verdict" -- audit_legacy scratch/l3
+scratch; expect_ok "L4: merge-card in the copy still refuses H1's branch (the list has no effect in merge mode)" out_has "$(hnot H1)" -- bash -c "cd '$v3' && bash scripts/.legacy/merge-card.sh H1"
+# L4b: merge mode reads its 5th argument as CARD_GATE, never as a merge id, so
+# even a listed id there leaves the Commit rule at 40 hex.
+cm_legacy() { (cd "$v3" && . scripts/.legacy/core-paths-lib.sh && . scripts/.legacy/enforce-lib.sh && check_merge "$@"); }
+expect_ok "L4b: check_merge in merge mode ignores a listed id given as its 5th argument" out_has "$(hnot H1)" -- cm_legacy H1 nucleus/v3-scaffold card/v3-H1 merge "$h3" standard
+expect_ok "L5: the copy's audit refuses H3's verdict under a rebuilt merge (keyed by the exact merge id)" out_has "audit: H1 (" "$(hnot H1)" -- audit_legacy scratch/l5
+rm -rf "$v3/scripts/.legacy"
+expect_ok "the legacy copy is removed" bash -c "[ ! -e '$v3/scripts/.legacy' ]"
+# R1: the real list, as generated at X-6-F1-F2-F3-F1-F1's base (its comment
+# gives the command): 44 entries, each a full 40-hex id on its own line with a
+# card id comment, all distinct. "command wc": the ledger rows define wc().
+r1_list() {
+  local blk n
+  blk=$(sed -n '/^# BEGIN SHORT_COMMIT_MERGES (frozen)$/,/^# END SHORT_COMMIT_MERGES$/p' "$src/scripts/enforce-lib.sh" | sed '1,2d;$d' | sed '$d')
+  n=$(bash -c '. "$1/scripts/enforce-lib.sh" && printf "%s\n" "${SHORT_COMMIT_MERGES[@]}"' _ "$src" | LC_ALL=C grep -cE '^[0123456789abcdef]{40}$')
+  echo "sourced 40-hex entries: $n; block lines: $(command wc -l <<<"$blk")"
+  [ "$n" -eq 44 ] && [ "$(bash -c '. "$1/scripts/enforce-lib.sh" && echo "${#SHORT_COMMIT_MERGES[@]}"' _ "$src")" -eq 44 ] &&
+    [ "$(command wc -l <<<"$blk")" -eq 44 ] && ! LC_ALL=C grep -vqE '^  [0123456789abcdef]{40} # [A-Za-z0-9._-]+$' <<<"$blk" &&
+    [ "$(awk '{print $1}' <<<"$blk" | LC_ALL=C sort -u | command wc -l)" -eq 44 ]
+}
+expect_ok "R1: the real SHORT_COMMIT_MERGES has 44 distinct full 40-hex ids, one per line with a card id" r1_list
+expect_ok "git state: none after the full-id rows" no_state
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
 exit $(( fails > 0 ))
