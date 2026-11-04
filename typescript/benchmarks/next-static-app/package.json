@@ -8,5 +8,20 @@
     "next": "16.1.6",
     "react": "19.2.4",
     "react-dom": "19.2.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "@prisma/client",
+      "@prisma/engines",
+      "@swc/core",
+      "better-sqlite3",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma",
+      "sharp",
+      "unrs-resolver",
+      "workerd"
+    ]
   }
 }

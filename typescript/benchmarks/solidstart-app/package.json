@@ -12,5 +12,20 @@
     "@solidjs/start": "^1.2.3",
     "solid-js": "^1.9.7",
     "vinxi": "^0.5.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "@prisma/client",
+      "@prisma/engines",
+      "@swc/core",
+      "better-sqlite3",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma",
+      "sharp",
+      "unrs-resolver",
+      "workerd"
+    ]
   }
 }
