@@ -1094,6 +1094,115 @@ fn model_load_entries_are_versions_at_s_l() {
     assert_eq!(m2.scan(7, 30).get(b"k".as_slice()), Some(&None));
 }
 
+/// **X5-R36 pin (i) (P ruling 2026-11-04, `verdicts/X-5c-F3-F3a-F2.md`;
+/// the README's "Carried: X5-R36" block): the drop incarnation.** The
+/// verdict's minimal repro, verbatim in shape: tree 3 created, loaded
+/// and published at ts 1; dropped (with its catalog `Delete`) at ts 2;
+/// re-created and re-published at ts 3. Three cases:
+/// - `scan_at(t, 3, 3)` is empty — the re-created incarnation the cut 3
+///   defines holds only post-drop ops — and a `Put(t, k2, v2)` at ts 3
+///   shows alone;
+/// - `scan_at(t, 1, 3)` is empty (`S < d ≤ c`: at or below the drop the
+///   dropped incarnation serves nothing);
+/// - `scan_at(t, 1, 1)` is `{k: v}` (`c < d`: the drop is not in the
+///   cut, so the pre-drop content stands).
+///
+/// Beside them, the two invariants the ruling leaves unchanged:
+/// `scan(t, S) = scan_at(t, S, S)`, and `published_at` (the catalog is
+/// never dropped) still publishes the re-created id at 3.
+#[test]
+fn x5_r36_scan_at_reads_the_drop_incarnation() {
+    let k = b"k".to_vec();
+    let v = b"v".to_vec();
+    // The verdict's repro: tree 3 created, keyed and published at ts 1;
+    // dropped (with its catalog Delete) at ts 2; re-created and
+    // re-published at ts 3 — one commit per ts, with the fresh
+    // incarnation's `Put(t, k2, v2)` joining ts 3's commit when asked.
+    let build = |put_k2_at_3: bool| {
+        let mut m = Model::new();
+        m.commit(
+            1,
+            Mode::SyncOn,
+            vec![
+                Op::CreateTree { tree: CATALOG },
+                Op::CreateTree { tree: 3 },
+                Op::Put {
+                    tree: CATALOG,
+                    key: to_be64(3),
+                    value: PUBLIC.to_vec(),
+                },
+                Op::Put {
+                    tree: 3,
+                    key: k.clone(),
+                    value: v.clone(),
+                },
+            ],
+        );
+        m.commit(
+            2,
+            Mode::SyncOn,
+            vec![
+                Op::Delete {
+                    tree: CATALOG,
+                    key: to_be64(3),
+                },
+                Op::DropTree { tree: 3 },
+            ],
+        );
+        let mut ops3 = vec![Op::CreateTree { tree: 3 }];
+        if put_k2_at_3 {
+            ops3.push(Op::Put {
+                tree: 3,
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            });
+        }
+        ops3.push(Op::Put {
+            tree: CATALOG,
+            key: to_be64(3),
+            value: PUBLIC.to_vec(),
+        });
+        m.commit(3, Mode::SyncOn, ops3);
+        m
+    };
+    // Case 1: the re-created incarnation at its own cut.
+    let m = build(false);
+    assert!(
+        m.scan_at(3, 3, 3).is_empty(),
+        "scan_at(t, 3, 3) must be empty (the fresh incarnation): {:?}",
+        m.scan_at(3, 3, 3)
+    );
+    assert!(m.scan(3, 3).is_empty(), "scan(t, S) is scan_at(t, S, S)");
+    let m2 = build(true);
+    let got = m2.scan_at(3, 3, 3);
+    assert_eq!(
+        got.len(),
+        1,
+        "a Put at ts 3 in the fresh incarnation shows alone: {got:?}"
+    );
+    assert_eq!(got.get(b"k2".as_slice()), Some(&Some(b"v2".to_vec())));
+    assert!(!got.contains_key(b"k".as_slice()));
+    // Case 2: S < d ≤ c — at or below the drop, nothing is served.
+    assert!(
+        m.scan_at(3, 1, 3).is_empty(),
+        "S < d ≤ c must read empty: {:?}",
+        m.scan_at(3, 1, 3)
+    );
+    // Case 3: c < d — the drop is not in the cut.
+    assert_eq!(
+        m.scan_at(3, 1, 1).get(b"k".as_slice()),
+        Some(&Some(v.clone())),
+        "c < d must keep the pre-drop content"
+    );
+    // Unchanged: the catalog's published set at the re-publish.
+    assert_eq!(m.published_at(3), {
+        let mut s = BTreeSet::new();
+        s.insert(3u64);
+        s
+    });
+    assert!(m.published_at(2).is_empty());
+}
+
 /// Gate REWORK item 6b (pinned): a MISDIRECTED page fault targets its
 /// **landing slot** as well as its source — O-3 (c) must not call a
 /// detection caused by the stray bytes landing on a referenced slot a

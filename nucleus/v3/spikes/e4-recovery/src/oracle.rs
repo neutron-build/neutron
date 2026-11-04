@@ -54,6 +54,14 @@
 //! so a tombstone §10.2 legally elided compares equal to the model's
 //! held tombstone ([`live`]).
 //!
+//! X5-R36 (P ruling 2026-11-04, `verdicts/X-5c-F3-F3a-F2.md`; the README's
+//! "Carried: X5-R36" block is the verbatim text): the model side of O-1
+//! (b) at candidate `c` is `model.scan_at(t, c, c)` and of O-1 (d) at
+//! sample `S` is `model.scan_at(t, S, c)` — the drop incarnation the cut
+//! `c` defines. It removes only the expectation of pre-drop content in a
+//! re-created tree (unservable per S-STORE §6.8); a store that serves
+//! pre-drop content in a re-created tree now fails O-1 (b)/(d).
+//!
 //! X5-R6 (same ruling, fixed before any campaign data was judged): in
 //! class MP with `res` `Ok`, an O-1 comparison whose read through the
 //! store fails with XX001 is a **detected loss**, not a mismatch; every
@@ -947,7 +955,8 @@ fn o1_at(
         }
         match reader.scan(*t, c) {
             Ok(got) => {
-                let want = model.scan(*t, c);
+                // X5-R36 (b): the model at (S = c, cut = c).
+                let want = model.scan_at(*t, c, c);
                 if live(&got) != live(&want) {
                     return Err(format!("O-1(b) at c={c}, tree {t}: scan mismatch"));
                 }
@@ -970,7 +979,10 @@ fn o1_at(
         for s in model.sample_points(ex.gc_w, c, sample_rng) {
             match reader.scan(*t, s) {
                 Ok(got) => {
-                    let want = model.scan(*t, s);
+                    // X5-R36 (b): the model at (S = s, cut = c) — the
+                    // sample reads the store's recovered incarnation,
+                    // which the candidate c names.
+                    let want = model.scan_at(*t, s, c);
                     if live(&got) != live(&want) {
                         return Err(format!("O-1(d) at c={c}, tree {t}, S={s}: scan mismatch"));
                     }

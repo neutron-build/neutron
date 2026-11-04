@@ -1876,3 +1876,94 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
         "the bounds and the frontier travel with the line: {line}"
     );
 }
+
+/// **X5-R36 pin (ii) (P ruling 2026-11-04; a literal-config seed pin).**
+/// Seed 112 round 2 was root cause B's C-DIV repro: `O-1(b) at c=15,
+/// tree 3: scan mismatch` — the drop of tree 3 at ts 8, the re-create
+/// at ts 12, and the model handing the re-created tree its pre-drop
+/// content (owner ts 5) at every candidate. Under `scan_at` the round
+/// must no longer fail with O-1(b) on tree 3; its measured outcome at
+/// the ruling's tip is a full pass (round 2 `lo=hi=c=frontier=15`,
+/// digest 2157138087, recorded in the README's stage record). With
+/// `scan_at` reverted to the pre-ruling `scan` (mutant R36-REVERT) the
+/// old failure returns and this pin fails.
+#[test]
+fn x5_r36_seed112_r2_no_longer_fails_o1b_on_tree_3() {
+    let rec = e4_recovery::workload::run_seed(112, None);
+    let r2 = rec
+        .rounds
+        .get(2)
+        .expect("seed 112 runs at least three rounds");
+    let o1b_tree3 = r2
+        .o1_fail
+        .as_deref()
+        .is_some_and(|t| t.contains("O-1(b)") && t.contains("tree 3"));
+    assert!(
+        !o1b_tree3,
+        "X5-R36: 112 r2 must not fail O-1(b) on tree 3 — got {:?}",
+        r2.o1_fail
+    );
+    assert!(r2.pass, "the measured outcome at the ruling's tip: {r2:?}");
+}
+
+/// **X5-R36 pin (iii): the `reuse_on_dropping` predicate** (X5-R36 (e);
+/// hand-built opened directory, model, `T` and frontier). True exactly
+/// when the opened image's directory holds `t` as `dropping` and the
+/// model holds `CreateTree{t}` at a ts in `(T, frontier]`. With the
+/// flag forced off (mutant REUSE-FLAG-OFF), this pin fails.
+#[test]
+fn x5_r36_reuse_on_dropping_predicate() {
+    let model = |ts: u64| {
+        let mut m = e4_recovery::model::Model::new();
+        m.commit(
+            ts,
+            e4_recovery::model::Mode::SyncOn,
+            vec![e4_recovery::model::Op::CreateTree { tree: 4 }],
+        );
+        m
+    };
+    // The hazard: tree 4 `dropping` in the opened image, a `CreateTree`
+    // replayed above T and at or below the frontier.
+    let dir = {
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(4u64, true);
+        d
+    };
+    assert!(
+        e4_recovery::harness::reuse_on_dropping(&dir, &model(6), 5, 10),
+        "a dropping entry plus a CreateTree above T gives true"
+    );
+    // Not dropping in the image: no hazard.
+    let dir_ok = {
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(4u64, false);
+        d
+    };
+    assert!(!e4_recovery::harness::reuse_on_dropping(
+        &dir_ok,
+        &model(6),
+        5,
+        10
+    ));
+    // The create at or below T (already in the opened image): no hazard.
+    assert!(!e4_recovery::harness::reuse_on_dropping(
+        &dir,
+        &model(5),
+        5,
+        10
+    ));
+    // The create above the frontier (never replayed): no hazard.
+    assert!(!e4_recovery::harness::reuse_on_dropping(
+        &dir,
+        &model(11),
+        5,
+        10
+    ));
+    // An empty directory: no hazard.
+    assert!(!e4_recovery::harness::reuse_on_dropping(
+        &std::collections::BTreeMap::new(),
+        &model(6),
+        5,
+        10
+    ));
+}

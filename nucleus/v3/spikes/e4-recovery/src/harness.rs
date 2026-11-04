@@ -19,7 +19,7 @@
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::model::{CATALOG, LoadRec, Mode, Model, Op, PUBLIC, Scan, to_be64};
+use crate::model::{CATALOG, LoadRec, Mode, Model, Op, PUBLIC, Scan, be64, to_be64};
 use crate::oracle::{
     Extracted, FaultTargets, Finding, OracleCfg, RawEntry, ReadFail, StateReader, TwinInfo, XxSite,
     check_round,
@@ -1686,6 +1686,15 @@ pub struct RoundOutcome {
     pub x33a: u64,
     /// **X5-R33 (e): `wal_loss_explained`** (the record's `x33x`).
     pub x33x: bool,
+    /// **X5-R36 (e): `reuse_on_dropping`** — the opened image's
+    /// directory holds some tree `t` as `dropping` while the model
+    /// holds `CreateTree{t}` at a ts in `(T, frontier]` (the id-reuse
+    /// hazard; see [`reuse_on_dropping`]). Computed on the
+    /// recovery-`Ok` arm from the opened image's durable bytes and the
+    /// model, never store memory. A diagnostic the pass fold never
+    /// reads: the round still runs the full oracle and counts by its
+    /// outcome, and any `true` is an ESCALATE to P with the round.
+    pub reuse_on_dropping: bool,
 }
 
 impl Default for RoundOutcome {
@@ -1746,6 +1755,7 @@ impl Default for RoundOutcome {
             x33h: 0,
             x33a: 0,
             x33x: false,
+            reuse_on_dropping: false,
         }
     }
 }
@@ -3062,6 +3072,19 @@ pub fn run_round(
             let (opened_meta, _opened_xx) = read_opened_meta(&end_disk);
             let opened_t = opened_meta.as_ref().map(|m| m.t).unwrap_or(0);
             let gc_w = opened_meta.as_ref().map(|m| m.gc_w).unwrap_or(0);
+            // **X5-R36 (e): the round's `reuse_on_dropping`** — the
+            // opened image's directory (durable bytes) beside the
+            // model's `CreateTree` replay window `(T, frontier]`. The
+            // hazard needs an image frozen mid-drop, so it is computed
+            // on this arm only (a failed open replayed nothing).
+            let reuse_flag = opened_meta.as_ref().is_some_and(|m| {
+                reuse_on_dropping(
+                    &opened_dir_dropping(&end_disk, pf, m, cfg.map_leaf_cap),
+                    &model,
+                    opened_t,
+                    frontier,
+                )
+            });
             let world = round_world(seed, end_disk.clone(), st.clone());
             let cx = Cx {
                 w: &world,
@@ -3283,7 +3306,11 @@ pub fn run_round(
                         .copied()
                         .collect::<Vec<_>>()
                     {
-                        let (Ok(got), want) = (reader.scan(t, c), model.scan(t, c)) else {
+                        // X5-R36 (b): the model at the read point `c` in
+                        // the incarnation this recovered store defines —
+                        // the cut it recovered at is the frontier.
+                        let (Ok(got), want) = (reader.scan(t, c), model.scan_at(t, c, ex.frontier))
+                        else {
                             continue;
                         };
                         let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
@@ -3363,6 +3390,7 @@ pub fn run_round(
                     round,
                     faults.class,
                     text,
+                    frontier,
                     &model,
                     &mut reader,
                     &wal_commits,
@@ -3595,6 +3623,7 @@ pub fn run_round(
             outcome.frontier = frontier;
             outcome.gc_w = gc_w;
             outcome.opened_t = opened_t;
+            outcome.reuse_on_dropping = reuse_flag;
             outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();
             outcome.acked_lost = verdict.acked_lost.clone();
             outcome.amcheck_ii = findings_ii;
@@ -4476,14 +4505,17 @@ fn dir_entry_of_view(
 /// stderr only, default off, never a digest input). Called from the
 /// O-1 failure point of a recovered round; `o1` is the failing round's
 /// O-1 text (its `c=` and, for O-1(d), its `S=` pick the read the trace
-/// diffs at), `disk` the recovery's end disk, `pf` the page-file inode.
-/// Every input is SimDisk bytes or the model — never store memory.
+/// diffs at), `frontier` the cut the compared (recovered) store state
+/// recovered at (X5-R36 (b)), `disk` the recovery's end disk, `pf` the
+/// page-file inode. Every input is SimDisk bytes or the model — never
+/// store memory.
 #[allow(clippy::too_many_arguments)]
 pub fn key_history_trace(
     seed: u64,
     round: u32,
     class: FaultClass,
     o1: &str,
+    frontier: u64,
     model: &Model,
     reader: &mut StoreReader<'_>,
     wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
@@ -4513,7 +4545,9 @@ pub fn key_history_trace(
         .copied()
         .collect::<Vec<_>>()
     {
-        let (Ok(got), want) = (reader.scan(t, read_ts), model.scan(t, read_ts)) else {
+        // X5-R36 (b): the model at the read point `read_ts` in the
+        // incarnation this recovered store defines (cut = frontier).
+        let (Ok(got), want) = (reader.scan(t, read_ts), model.scan_at(t, read_ts, frontier)) else {
             continue;
         };
         let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
@@ -5120,7 +5154,10 @@ pub fn o1_at_frontier_lines(
         .copied()
         .collect::<Vec<_>>()
     {
-        let (Ok(got), want) = (reader.scan(t, c), model.scan(t, c)) else {
+        // X5-R36 (b): the model at the read point `c` (the clamp of the
+        // frontier) in the incarnation this recovered store defines —
+        // the cut it recovered at is `ex.frontier`.
+        let (Ok(got), want) = (reader.scan(t, c), model.scan_at(t, c, ex.frontier)) else {
             continue;
         };
         let mut keys: BTreeSet<Vec<u8>> = got.keys().cloned().collect();
@@ -6145,6 +6182,107 @@ pub fn read_opened_meta(disk: &SimDisk) -> (Option<crate::store::page::Meta>, ()
         crate::store::page::MetaPick::NoValid => None,
     };
     (best, ())
+}
+
+/// **X5-R36 (e): the `reuse_on_dropping` predicate** — pure in the
+/// opened image's directory, the model, `T` of the opened meta and the
+/// recovered frontier. True when some tree `t` stands `dropping` in the
+/// opened image's directory **and** the model holds a `CreateTree{t}`
+/// at a ts in `(T, frontier]` — pass 2 replayed a create for an id
+/// whose opened image is still mid-drop, so the new incarnation's ops
+/// land in the dropping tree and §14 step 6 frees them. No
+/// spec-conformant history can produce this (S-STORE §6.8: ids are
+/// never reused); it is reachable here only because the workload
+/// re-uses ids. The flag is surfaced, never an exclusion: such a round
+/// still runs the full oracle and counts by its outcome, and any
+/// `true` is an ESCALATE to P with the round.
+pub fn reuse_on_dropping(
+    dir: &BTreeMap<u64, bool>,
+    model: &Model,
+    opened_t: u64,
+    frontier: u64,
+) -> bool {
+    dir.iter().any(|(t, dropping)| {
+        *dropping
+            && model.commits.values().any(|rec| {
+                rec.ts > opened_t
+                    && rec.ts <= frontier
+                    && rec
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op, Op::CreateTree { tree } if tree == t))
+            })
+    })
+}
+
+/// X5-R36 (e): the opened image's directory from durable bytes — every
+/// directory entry's `dropping` flag, read through the same map walk
+/// the image walks use (never store memory). Trees absent from the
+/// image are absent from the map.
+fn opened_dir_dropping(
+    disk: &SimDisk,
+    pf: usize,
+    meta: &crate::store::page::Meta,
+    cap: u64,
+) -> BTreeMap<u64, bool> {
+    let mut out: BTreeMap<u64, bool> = BTreeMap::new();
+    if meta.dir_root == 0 {
+        return out;
+    }
+    let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    let mut sink: Vec<Finding> = Vec::new();
+    let n = ((crate::store::page::PAGE - crate::store::page::HDR) / crate::store::page::MAP_ENTRY)
+        as u64;
+    let span = ckpt::radix_child_span(cap, n, meta.next_lpid);
+    walk_map_disk(
+        disk,
+        pf,
+        meta.map_root,
+        0,
+        span,
+        cap,
+        0,
+        &mut flat,
+        &mut used,
+        &mut sink,
+        false,
+    );
+    let page_of = |lpid: u64| -> Option<Vec<u8>> {
+        flat.get(&lpid)
+            .map(|r| disk.durable_read(pf, r.slot * 4096, crate::store::page::PAGE as u64))
+    };
+    // The whole directory tree from its root (every child of every
+    // inner — the keyed descent [`dir_entry_of_view`] uses needs one
+    // probe id, and this reads them all). Malformed pages stop that
+    // subtree, never panic; the loop bound bounds a cyclic mis-map.
+    let mut stack = vec![meta.dir_root];
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    while let Some(lpid) = stack.pop() {
+        if !seen.insert(lpid) {
+            continue;
+        }
+        let Some(b) = page_of(lpid) else {
+            continue;
+        };
+        if crate::store::page::header_kind(&b) == crate::store::page::KIND_LEAF {
+            if let Ok(s) = crate::store::page::slotted(&b) {
+                for i in 0..s.n {
+                    if let Ok((dk, dv)) = crate::store::page::leaf_cell(&b, i)
+                        && dk.len() == 8
+                        && dv.len() >= 9
+                        && let Some(id) = be64(dk)
+                    {
+                        out.insert(id, dv.get(8) == Some(&1));
+                    }
+                }
+            }
+        } else if let Ok((seps, right)) = tree::inner_seps(&b) {
+            stack.extend(seps.iter().map(|(child, _)| *child));
+            stack.push(right);
+        }
+    }
+    out
 }
 
 /// X5-R5 condition 2: a meta write **covered by a completed sync_all**
