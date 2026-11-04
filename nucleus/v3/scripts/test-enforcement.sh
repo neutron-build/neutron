@@ -1839,7 +1839,7 @@ save_obj "$r" "$wtog"
 forge_from "$r" "$wtog" "$gtog"
 # The premise (NO-VERIFY-GATE-COMMITTED is not equivalent): the runner with
 # the call dropped reads the lie's history and trusts the forged W.
-sed '/^    if verify_objects(wt, base, pre_head):/,+1d' "$v3/tools/run_card.py" >"$t/run_card-nogc.py"
+sed '/^    if _verify_history(wt, base, pre_head):/,+1d' "$v3/tools/run_card.py" >"$t/run_card-nogc.py"
 e_premise() { PYTHONDONTWRITEBYTECODE=1 python3 - "$t/run_card-nogc.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OG.md OG "$wog" <<'P'
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
@@ -2004,6 +2004,130 @@ expect_ok "(n) check_merge refuses when hash-object fails (merge mode)" out_has 
 expect_ok "(n) check_merge refuses when hash-object fails (audit mode)" out_has "verify_blob: git hash-object failed (exit 128; cannot verify objects)" -- gshim hash-object bash -c "cd '$v3' && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge A nucleus/v3-scaffold card/v3-A audit"
 n_ccp() { local o rc=0; o=$(gshim hash-object bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-B" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "verify_blob: git hash-object failed" <<<"$o"; }
 expect_ok "(n) check-core-paths exits 1, not 0, when hash-object fails" n_ccp
+
+# (e')-(e'''') gate_committed's own history set (X-6-F1-F2-F3-F1-F2): the log
+# gate_committed trusts compares every interior commit's tree with its parent's,
+# and row (e) only forged W's tip tree, an endpoint verify_objects already
+# held. Here G, the gate's verdict commit, gets W's bytes: with G's whole root
+# tree file forged in (e'), or only its nucleus/v3/verdicts subtree in (e''),
+# W reads TREESAME at the verdict, the log skips it and returns G, whose
+# subject is the gate's, while verify_objects(base, R) still sees nothing — the
+# interior trees were never in its set. Both forgeries sit in this scratch
+# repository, are preceded by id captures and premise rows, and are restored
+# (no_state4); the new fixtures write the full 40-hex Commit: (git rev-parse
+# HEAD). vhist REPO BASE TIP: _verify_history as a command, as vpy is for
+# verify_objects (its problem lines; exit 0 when there are none). gc_eq RUNNER
+# REPO BASE OWN CARD PRE WANT: gate_committed in the unit mode (ledger None);
+# prints what it returned, exits 0 when it equals WANT (True/False).
+vhist() { PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "$2" "$3" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1] + "/nucleus/v3/tools/run_card.py")
+rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+lines = rc._verify_history(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3])
+for l in lines: print(l)
+sys.exit(1 if lines else 0)
+P
+}
+gc_eq() { PYTHONDONTWRITEBYTECODE=1 python3 - "$@" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+got = rc.gate_committed(pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
+print("gate_committed:", got)
+sys.exit(0 if got is (sys.argv[7] == "True") else 1)
+P
+}
+
+# (e') The interior gate commit: card/v3-OH is work, G = a verdict REWORK
+# commit, W = a worker commit rewriting the verdict to MERGE, R = an honest
+# commit (HEAD stays at R, whose tree is honest, so status works). G's root
+# tree file holds W's root-tree bytes.
+card OH S standard
+git -C "$r" checkout -q -b card/v3-OH nucleus/v3-scaffold
+echo oh >"$v3/spikes/oh.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OH work"
+ohw=$(git -C "$r" rev-parse HEAD)
+printf 'Card: OH\nClass: standard\nCard-gate: S\nVerdict: REWORK\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$ohw" >"$v3/verdicts/OH.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OH verdict REWORK"
+goh=$(git -C "$r" rev-parse HEAD); gtoh=$(git -C "$r" rev-parse "HEAD^{tree}")
+gvoh=$(git -C "$r" rev-parse "HEAD:nucleus/v3/verdicts")
+sed 's/^Verdict: REWORK$/Verdict: MERGE/' "$v3/verdicts/OH.md" >"$t/oh.merge"
+cp "$t/oh.merge" "$v3/verdicts/OH.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OH work"
+woh=$(git -C "$r" rev-parse HEAD); wtoh=$(git -C "$r" rev-parse "HEAD^{tree}")
+wvoh=$(git -C "$r" rev-parse "HEAD:nucleus/v3/verdicts")
+echo oh2 >"$v3/spikes/oh.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OH more work"
+roh=$(git -C "$r" rev-parse HEAD)
+expect_ok "premise: (e') G's and W's root trees are loose objects" bash -c "[ -f '$(objlo "$r" "$gtoh")' ] && [ -f '$(objlo "$r" "$wtoh")' ]"
+save_obj "$r" "$gtoh"
+forge_from "$r" "$gtoh" "$wtoh"
+e1_log() { local h; h=$(plain log -1 --format=%H nucleus/v3-scaffold.."$roh" -- nucleus/v3/verdicts/OH.md); echo "log: $h"; [ "$h" = "$goh" ]; }
+expect_ok "premise: (e') the plain log skips W and returns G (the hide works)" e1_log
+# Step A reverted at the call site (verify_objects' set), built like row (e)'s
+# premise: the old set is not enough — this premise is the card's proof.
+sed 's/^    if _verify_history(wt, base, pre_head):/    if verify_objects(wt, base, pre_head):/' "$v3/tools/run_card.py" >"$t/run_card-e1.py"
+e1_premise() { PYTHONDONTWRITEBYTECODE=1 python3 - "$t/run_card-e1.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OH.md OH "$roh" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, base, own, cid, pre = pathlib.Path(sys.argv[2]), *sys.argv[3:7]
+gc = rc.gate_committed(wt, base, own, cid, pre)
+print("gate_committed:", gc)
+print("verify_objects:", rc.verify_objects(wt, base, pre))
+sys.exit(0 if gc is True and rc.verify_objects(wt, base, pre) == [] else 1)
+P
+}
+expect_ok "premise: (e') Step A reverted: gate_committed trusts the forged G and verify_objects(base, R) is []" e1_premise
+expect_ok "(e') gate_committed(wt, base, f, OH, R) is False" gc_eq "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OH.md OH "$roh" False
+expect_ok "(e') the same with pre_head = W is False" gc_eq "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OH.md OH "$woh" False
+e1_scope() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OH.md OH "$roh" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), sys.argv[3], ["nucleus/v3/spikes/"], sys.argv[4], sys.argv[5])
+print("\n".join(bad) or "(no violations)")
+sys.exit(0 if "nucleus/v3/verdicts/OH.md (protected)" in bad else 1)
+P
+}
+expect_ok "(e') scope_violations lists nucleus/v3/verdicts/OH.md (protected)" e1_scope
+expect_ok "(e') the helper names G's root tree" out_has "object $gtoh fails its hash" -- vhist "$r" nucleus/v3-scaffold "$roh"
+restore_forged
+expect_ok "forged objects: (e') restored" no_state4
+
+# (e'') A subtree: the same G and W (they differ only under
+# nucleus/v3/verdicts/), but G's nucleus/v3/verdicts subtree file holds W's
+# subtree bytes and every root tree stays honest — the hide narrowed to the one
+# subtree the log reads at f.
+expect_ok "premise: (e'') G's and W's verdicts subtrees are loose objects" bash -c "[ -f '$(objlo "$r" "$gvoh")' ] && [ -f '$(objlo "$r" "$wvoh")' ]"
+save_obj "$r" "$gvoh"
+forge_from "$r" "$gvoh" "$wvoh"
+e2_log() { local h; h=$(plain log -1 --format=%H nucleus/v3-scaffold.."$roh" -- nucleus/v3/verdicts/OH.md); echo "log: $h"; [ "$h" = "$goh" ]; }
+expect_ok "premise: (e'') the plain log still skips W and returns G" e2_log
+expect_ok "(e'') gate_committed(wt, base, f, OH, R) is False" gc_eq "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OH.md OH "$roh" False
+expect_ok "(e'') the helper names the forged subtree" out_has "object $gvoh fails its hash" -- vhist "$r" nucleus/v3-scaffold "$roh"
+restore_forged
+expect_ok "forged objects: (e'') restored" no_state4
+
+# (e''') Honest controls: on the unforged card/v3-OH the log's last commit at
+# the verdict is W, a worker commit (no verdict subject), so gate_committed is
+# False; on card/v3-OJ no commit after the gate's verdict touches it, so
+# gate_committed is True; and the helper is clean on a scaffold-only range.
+expect_ok "(e''') on the unforged card/v3-OH gate_committed(wt, base, f, OH, R) is False (W, not G)" gc_eq "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OH.md OH "$roh" False
+card OJ S standard
+git -C "$r" checkout -q -b card/v3-OJ nucleus/v3-scaffold
+echo oj >"$v3/spikes/oj.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OJ work"
+printf 'Card: OJ\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse HEAD)" >"$v3/verdicts/OJ.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OJ verdict MERGE"
+goj=$(git -C "$r" rev-parse HEAD)
+expect_ok "(e''') on card/v3-OJ, whose last verdict commit is the gate's, gate_committed is True" gc_eq "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OJ.md OJ "$goj" True
+expect_ok "(e''') the helper returns nothing on nucleus/v3-scaffold~1..nucleus/v3-scaffold" vhist "$r" nucleus/v3-scaffold~1 nucleus/v3-scaffold
+
+# (e'''') Failure is a problem: only the trees listing fails — gshim refuses
+# the one rev-list call carrying --stdin (the helper's other listings and every
+# other git step run), so the row pins that listing's own failure, not an
+# earlier one's — and gate_committed on the honest card/v3-OJ is False.
+expect_ok "(e'''') a failed trees listing makes gate_committed False (never True)" gshim --stdin gc_eq "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OJ.md OJ "$goj" False
+
+# Cost: the helper on the same widest range as (j), under 2 s; the measured
+# time prints in the row's output.
+e_cost() { local t0 t1 ms rc=0; t0=$(date +%s%N); vhist "$r" "$root" scratch/pass2 || rc=$?; t1=$(date +%s%N); ms=$(((t1 - t0) / 1000000)); echo "     (e cost) _verify_history $root...scratch/pass2: ${ms} ms"; [ "$rc" -eq 0 ] && [ "$ms" -lt 2000 ]; }
+expect_ok "(e cost) _verify_history on the widest range is under 2 s" e_cost
 
 # --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
 # The ref store is shared by every worktree, so ref_violations refuses only ref
