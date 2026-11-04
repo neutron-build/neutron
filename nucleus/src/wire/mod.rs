@@ -14,6 +14,8 @@ pub mod kv_fast_path;
 pub mod overload;
 
 #[cfg(test)]
+mod tests_malformed_frames;
+#[cfg(test)]
 mod tests_row_description;
 
 use std::collections::HashMap;
@@ -6108,7 +6110,8 @@ fn unescape_copy_text(s: &str) -> String {
 ///
 /// This is otherwise a faithful copy of the upstream loop (0.36.3,
 /// `src/tokio/server.rs:522-596`). Keep it that way: the only intended
-/// difference is the `Terminate` arm.
+/// differences are the `Terminate` arm and containing a decoder panic (see
+/// the loop).
 #[cfg(feature = "server")]
 pub async fn process_socket_closing_on_terminate<H>(
     tcp_socket: tokio::net::TcpStream,
@@ -6118,7 +6121,7 @@ pub async fn process_socket_closing_on_terminate<H>(
 where
     H: pgwire::api::PgWireServerHandlers,
 {
-    use futures::SinkExt;
+    use futures::{FutureExt, SinkExt};
     use pgwire::api::{ErrorHandler, PgWireConnectionState};
     use pgwire::messages::PgWireFrontendMessage;
     use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
@@ -6148,17 +6151,48 @@ where
 
     let socket = &mut socket;
     loop {
-        let msg = if matches!(
+        // pgwire 0.36's message body decoders read with unchecked
+        // `Buf::get_*` / `split_to` over the whole read buffer rather than the
+        // frame its length header announced, so a short frame such as a Bind
+        // whose parameter length points past the bytes received panics inside
+        // `socket.next()`. The codec decodes every message type from startup
+        // onward, so this is reachable during authentication. Unwinding out
+        // of here used to skip the caller's per-connection cleanup; it is now
+        // a protocol violation that closes the connection, as PostgreSQL
+        // treats a malformed message.
+        let in_startup = matches!(
             socket.state(),
             PgWireConnectionState::AwaitingStartup
                 | PgWireConnectionState::AuthenticationInProgress
-        ) {
+        );
+        let next = std::panic::AssertUnwindSafe(socket.next()).catch_unwind();
+        let next = if in_startup {
             tokio::select! {
-                _ = &mut startup_timeout => None,
-                msg = socket.next() => msg,
+                _ = &mut startup_timeout => Ok(None),
+                msg = next => msg,
             }
         } else {
-            socket.next().await
+            next.await
+        };
+        let msg = match next {
+            Ok(msg) => msg,
+            Err(_) => {
+                let err = ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    "08P01".to_owned(),
+                    "invalid frontend message format".to_owned(),
+                );
+                let _ = socket
+                    .send(pgwire::messages::PgWireBackendMessage::ErrorResponse(
+                        err.into(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed frontend message (pgwire decoder panicked)",
+                ));
+            }
         };
 
         if let Some(Ok(msg)) = msg {
