@@ -957,7 +957,11 @@ fn split_zone_suffix(time: &str) -> Result<(&str, Option<i64>), String> {
             .map_err(|_| format!("invalid time zone offset: {zone}"))
     };
     let (hours, minutes, seconds) = match fields.as_slice() {
-        [hhmm] if hhmm.len() == 4 => (parse_field(&hhmm[..2])?, parse_field(&hhmm[2..])?, 0),
+        // is_ascii before slicing: four bytes may hold a multibyte char, and
+        // byte 2 is then not a char boundary.
+        [hhmm] if hhmm.len() == 4 && hhmm.is_ascii() => {
+            (parse_field(&hhmm[..2])?, parse_field(&hhmm[2..])?, 0)
+        }
         [hh] => (parse_field(hh)?, 0, 0),
         [hh, mm] => (parse_field(hh)?, parse_field(mm)?, 0),
         [hh, mm, ss] => (parse_field(hh)?, parse_field(mm)?, parse_field(ss)?),
@@ -1043,7 +1047,10 @@ fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
 /// Parse a UUID string (with or without dashes) into 16 bytes.
 pub fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
+    // Hex digits only, checked before slicing: a 32-byte string containing a
+    // multibyte character used to panic at `&hex[i * 2..]` (not a char
+    // boundary), and `from_str_radix` alone would accept a `+` sign.
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("invalid UUID: {s}"));
     }
     let mut bytes = [0u8; 16];
@@ -2013,6 +2020,28 @@ mod tests {
         let bytes = parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(bytes[0], 0x55);
         assert_eq!(bytes[15], 0x00);
+    }
+
+    #[test]
+    fn zone_offset_with_multibyte_char_is_an_error_not_a_panic() {
+        // fuzz_value_text crash-868ec3f6: a four-byte offset `"\u{079A}1`
+        // took the `±HHMM` arm and was sliced at byte 2, inside the char.
+        assert!(split_zone_suffix("12:00:00-\"\u{079A}1").is_err());
+        assert!(Value::Text("#\r-\"\u{079A}1".into()).cast(&DataType::Date).is_err());
+        assert_eq!(split_zone_suffix("12:00:00+0530").unwrap(), ("12:00:00", Some(19_800)));
+    }
+
+    #[test]
+    fn parse_uuid_rejects_non_hex_without_panicking() {
+        // fuzz_value_text crash-5485ab9a: 32 bytes, but a multibyte char at
+        // byte 1, so the pairwise byte slice split a character.
+        let multibyte = format!("{{\u{0681}{}", "0".repeat(29));
+        assert_eq!(multibyte.len(), 32);
+        assert!(parse_uuid(&multibyte).is_err());
+        assert!(Value::Text(multibyte).cast(&DataType::Uuid).is_err());
+        // A sign is not a hex digit.
+        assert!(parse_uuid("+50e8400-e29b-41d4-a716-446655440000").is_err());
+        assert!(parse_uuid("550e8400e29b41d4a716446655440000").is_ok());
     }
 
     #[test]
