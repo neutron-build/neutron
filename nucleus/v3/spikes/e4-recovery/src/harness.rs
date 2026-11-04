@@ -1853,6 +1853,13 @@ pub fn run_round(
     mut twin: Option<&mut Vec<(usize, u64, u64)>>,
 ) -> RoundOutcome {
     // ---- the workload pass ----
+    // **X5-R35 (a):** the event count the incoming disk carries is the
+    // boundary of X5-R34's `E` — everything the capture holds below it
+    // is the previous round's recovery and harness boot checkpoint (the
+    // slice itself is taken after the capture, through
+    // [`x5r34_workload_events`]; no other reader of the capture
+    // changes).
+    let pre_workload = start_disk.events.len();
     let ntasks = script.ntasks();
     let sched = {
         let host = RoundWorld {
@@ -2004,6 +2011,13 @@ pub fn run_round(
     // bindings are read at the end of the workload pass through the one
     // observer accessor this card adds. Never store memory (X5-R34 (i)).
     let p0 = start_store.wal.append;
+    // **X5-R35 (a):** X5-R34's `E` is the workload pass's slice of the
+    // capture (`x5r34_workload_events` above); the previous round's
+    // recovery and boot checkpoint that precede the workload in the
+    // capture — the truncation zero-write and its sync included — are
+    // not in `E`, so a synced zero-fill over an enqueued, never-written
+    // record can never count as its covering write.
+    let e4_events = x5r34_workload_events(&events, pre_workload);
     let wal_bindings = disk.durable_dir_bindings(crate::sim::WAL_DIR);
     // *Guard* (X5-R34 (b) 2): every record in `wal_commits` has
     // `lsn ≥ p0`. A violation is a harness defect and fails the round
@@ -2014,13 +2028,13 @@ pub fn run_round(
         .map(|(ts, (_, lsn, _))| (*ts, *lsn))
         .collect::<Vec<_>>();
     let (written_ts, acked_ts, unparsed_written) =
-        derive_written_acked(&events, &wal_commits, p0, &wal_bindings);
+        derive_written_acked(e4_events, &wal_commits, p0, &wal_bindings);
     // X5-R34 (d) diagnostic (`E4_D_DIAG`, default off, stderr only,
     // never a digest input): `D`, the reason its walk stopped, `Rc`, and
     // each SyncOn commit's verdict — the (h) 1 table's inputs. `D` and
     // `Rc` are computed regardless: the (f) cross-check below reads
     // them.
-    let (d_val, d_stop, d_rc) = x5r34_durable_prefix(&events, &wal_bindings, p0);
+    let (d_val, d_stop, d_rc) = x5r34_durable_prefix(e4_events, &wal_bindings, p0);
     if std::env::var("E4_D_DIAG").is_ok() {
         eprintln!(
             "D diag: seed={seed} round={round} class={:?} p0={p0} D={d_val} stop={d_stop} rc={:?}",
@@ -2076,7 +2090,7 @@ pub fn run_round(
             // The derivation's per-cause verdict for this ts, so the
             // record names the failing half (the walk never yielding
             // the record vs the returned/durable extent tests).
-            let found = ack_record_present(&events, lsn);
+            let found = ack_record_present(e4_events, lsn);
             let why = if derived.contains(ts) {
                 "derived acked: the write/sync events say durable, but the\
                  \ncommitter's own ack wait never returned (crashed in or\
@@ -2094,10 +2108,11 @@ pub fn run_round(
             // The events over the record's own segment (the escalation
             // record's evidence: issue/return/sync order, and any later
             // write into the same file at the same offsets — the
-            // recycle's latest life masking the original).
+            // recycle's latest life masking the original). X5-R35 (a):
+            // the same workload-pass slice `E` the derivation read.
             let seg = crate::store::WAL_SEG;
             let mut ev: Vec<String> = Vec::new();
-            for e in events.iter() {
+            for e in e4_events.iter() {
                 match e {
                     DiskEvent::WriteIssued { inode, off, bytes } if *off < seg => {
                         ev.push(format!("W+ f{inode}@{off}+{}", bytes.len()));
@@ -3529,6 +3544,31 @@ fn magic_ok(hdr: &[u8]) -> bool {
 }
 
 // ---- X5-R34: I-ACK-PREFIX's `durable_end` from SimDisk history ----
+
+/// **X5-R35 (a) (the rework gate's P ruling, binding): X5-R34's `E` is
+/// the workload pass's slice of the captured event stream.**
+/// `run_round` captures `disk.events` at the end of the workload pass,
+/// but the capture begins with the **previous** round's recovery and
+/// harness boot checkpoint: `new_round` clears the list at the end of
+/// the *crashed* round (before its recovery), so round r+1's capture
+/// holds round r's recovery events — the §14 G2 truncation zero-write
+/// and its sync among them — ahead of round r+1's own workload events.
+/// X5-R34 (b) 1's premise ("this round's events only, because
+/// `new_round` cleared the list") is true only of this slice, so `E` is
+/// `captured[pre_workload..]`, where `pre_workload` is the event count
+/// the round's `start_disk` carried (the recovery and boot checkpoint
+/// that precede the workload). Everything else in the capture keeps its
+/// existing readers (the Q12 rename fold, the monitors, X5-R5's R and
+/// X5-R28's `K_ii`): the ruling changes X5-R34's `E` only — "`Rc` and β
+/// are read over this `E`", and (b) 1–5, (c)–(f), (i) are otherwise
+/// unchanged. Without the slice, a truncation zero-write over an
+/// enqueued, never-written SyncOn record counts as (W)'s "last covering
+/// write" and `D` runs past commits whose bytes never reached disk (the
+/// 17 false `frontier < lo` losses of the first run, 403 r1's D=65536
+/// with no WAL write at all among them).
+pub fn x5r34_workload_events(captured: &[DiskEvent], pre_workload: usize) -> &[DiskEvent] {
+    captured.get(pre_workload..).unwrap_or(&[])
+}
 
 /// The segment file name holding LSN `x` (§12.2's `<16 hex>.log` inside
 /// `"/wal/"`; X5-R34 (b) defines `name(x)`).

@@ -1553,6 +1553,66 @@ fn x5r34_genuine_durability_acks() {
     );
 }
 
+/// **X5-R34 (g) 6 / X5-R35 (b) — the recovery truncation's zero-fill is
+/// not the workload's write:** the previous round's recovery truncation
+/// zero-write plus its sync cover an enqueued, never-written SyncOn
+/// record of this round's workload. The record must **not** be acked:
+/// X5-R35 (a) reads X5-R34's rules over the workload pass's slice of
+/// the capture only, so the synced zeros below `E`'s boundary are not
+/// (W)'s "last covering write" of this round's stream. On 13da010b's
+/// derivation — `E` the whole capture — the zero-write covers the
+/// record's offsets and its sync follows, `D` runs past the record and
+/// it is acked (403 r1's shape: no WAL record write at all in the
+/// workload, yet D=65536 and lo raised to 7).
+#[test]
+fn x5r34_recovery_truncation_zeros_never_ack() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let name0 = harness::x5r34_seg_name(0);
+    let inode = 5usize;
+    // The capture, as run_round sees it after a chained round: the
+    // previous round's recovery tail first (the segment create made
+    // durable, then the §14 G2 truncation zero-write over [p0, 65536)
+    // and its sync_data), then this round's workload events (a page
+    // write; the WAL record at p0 is enqueued but never written).
+    let p0 = 3000u64;
+    let mut ev = x5r34::Ev::new();
+    ev.dirop(&format!("create /wal/{name0}"))
+        .dirsync()
+        .write(inode, p0, &vec![0u8; 1000])
+        .sync(inode);
+    let pre_workload = ev.events.len();
+    // ---- the workload pass: no WAL write at all (the boundary itself
+    // is exercised through a page-file write) ----
+    ev.write(1, 0, &vec![3u8; 4096]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(7u64, (true, p0, 500));
+    let bindings = x5r34::Ev::bindings(&[(&name0, inode)]);
+    // X5-R35 (a): E is the workload slice — the same slice run_round
+    // takes through `x5r34_workload_events`.
+    let e = harness::x5r34_workload_events(&ev.events, pre_workload);
+    let (_w, acked, _u) = harness::derive_written_acked(e, &commits, p0, &bindings);
+    assert!(
+        !acked.contains(&7),
+        "a SyncOn record the workload never wrote, covered only by the previous\
+         \nround's synced truncation zeros, must not be acked (X5-R35 (a))"
+    );
+    let (d, _stop, _rc) = harness::x5r34_durable_prefix(e, &bindings, p0);
+    assert_eq!(
+        d, p0,
+        "D stops at p0: no issued write of this round covers the record's bytes"
+    );
+    // Control (the boundary is where this test says it is): over the
+    // whole capture the zeros do cover [p0, 4000) and the sync follows,
+    // so a derivation reading the unsliced capture would ack ts 7 —
+    // exactly the 13da010b behavior the demonstration restores.
+    let (_w2, acked2, _u2) = harness::derive_written_acked(&ev.events, &commits, p0, &bindings);
+    assert!(
+        acked2.contains(&7),
+        "control: the unsliced capture does cover the record (the zeros + sync)"
+    );
+}
+
 /// Segment 1's name (a small readability helper for the test above).
 fn name1_of() -> String {
     e4_recovery::harness::x5r34_seg_name(65536)
