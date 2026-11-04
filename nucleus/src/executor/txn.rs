@@ -418,6 +418,10 @@ impl Executor {
                     return Err(error);
                 }
             }
+            // Without the server there is no durable policy store, so
+            // nothing can fail after publishing and nothing needs reverting.
+            #[cfg(not(feature = "server"))]
+            let _ = (before, published_gen);
         }
 
         Ok(ExecResult::Command {

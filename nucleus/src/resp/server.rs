@@ -406,6 +406,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .expect("server exits on shutdown")
-            .expect("server loop clean");
+            .expect("server loop clean")
+            .expect("server loop returns Ok on shutdown");
     }
 }

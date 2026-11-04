@@ -396,7 +396,7 @@ mod tests {
     ) -> (Result<(), String>, bool) {
         use tokio::io::AsyncReadExt;
         let (a, b) = tokio::io::duplex(4096);
-        let acceptor = pgwire::tokio::tokio_rustls::TlsAcceptor::from(acceptor.clone());
+        let acceptor = acceptor.clone();
         let server = tokio::spawn(async move {
             acceptor
                 .accept(a)
@@ -425,7 +425,7 @@ mod tests {
         let server_result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .expect("server handshake task finishes")
-            .unwrap_or_else(|_| Ok(()));
+            .unwrap_or(Ok(()));
         let client_ok = tokio::time::timeout(std::time::Duration::from_secs(5), client_task)
             .await
             .map(|r| r.unwrap_or(false))
@@ -492,20 +492,25 @@ mod tests {
         let cert_path = write_temp_file(&dir, "server.pem", &server_cert.pem());
         let key_path = write_temp_file(&dir, "server.key", &server_key.serialize_pem());
 
-        let _guard = TLS_ENV_LOCK.lock().unwrap();
-        // SAFETY: test-only env mutation, serialized by TLS_ENV_LOCK and
-        // restored before return.
-        unsafe {
-            std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
-            std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
-        }
-        let acceptor = setup_tls_with_client_ca(Some(&ca_path))
-            .expect("valid mTLS configuration")
-            .expect("acceptor");
-        unsafe {
-            std::env::remove_var("NUCLEUS_TLS_CERT");
-            std::env::remove_var("NUCLEUS_TLS_KEY");
-        }
+        // The env lock is scoped to building the acceptor: it is a std
+        // Mutex, and the handshakes below await.
+        let acceptor = {
+            let _guard = TLS_ENV_LOCK.lock().unwrap();
+            // SAFETY: test-only env mutation, serialized by TLS_ENV_LOCK and
+            // restored before the guard drops.
+            unsafe {
+                std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
+                std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
+            }
+            let acceptor = setup_tls_with_client_ca(Some(&ca_path))
+                .expect("valid mTLS configuration")
+                .expect("acceptor");
+            unsafe {
+                std::env::remove_var("NUCLEUS_TLS_CERT");
+                std::env::remove_var("NUCLEUS_TLS_KEY");
+            }
+            acceptor
+        };
 
         // Client trusts the CA but presents NO certificate. The server MUST
         // abort the handshake. (The client may locally complete its TLS 1.3
