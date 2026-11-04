@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'ts/v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish packages whose version is not yet on npm (trusted publishing, with provenance)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,11 +31,11 @@ jobs:
       NEUTRON_TEST_REDIS_URL: redis://127.0.0.1:6379
       NEUTRON_REDIS_LIVE_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
-          version: 9
-      - uses: actions/setup-node@v4
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -43,3 +49,48 @@ jobs:
         working-directory: typescript
       - run: pnpm --filter "./packages/*" run test
         working-directory: typescript
+
+  # Tokenless publish through npm trusted publishing (OIDC): no long-lived npm
+  # token exists anywhere, and every tarball carries a provenance attestation
+  # linking it to this workflow run. Requires each @neutron-build/* package to
+  # list this repository + workflow as a trusted publisher on npmjs.com.
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: typescript/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@11.6.2
+      - run: pnpm install --frozen-lockfile
+        working-directory: typescript
+      - run: pnpm --filter "./packages/*" run build
+        working-directory: typescript
+      # pnpm pack rewrites workspace: ranges to real versions; npm publishes the
+      # tarball through OIDC. Versions already on the registry are skipped.
+      - name: Publish unreleased versions
+        working-directory: typescript
+        run: |
+          set -euo pipefail
+          mkdir -p .pack
+          for dir in packages/*/; do
+            name=$(node -p "require('./${dir}package.json').name")
+            version=$(node -p "require('./${dir}package.json').version")
+            private=$(node -p "Boolean(require('./${dir}package.json').private)")
+            [ "$private" = "true" ] && continue
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "skip ${name}@${version} (already published)"
+              continue
+            fi
+            tarball=$(cd "$dir" && pnpm pack --pack-destination "$GITHUB_WORKSPACE/typescript/.pack" | tail -1)
+            npm publish "$tarball" --provenance --access public
+          done

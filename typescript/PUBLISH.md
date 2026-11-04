@@ -48,8 +48,18 @@ the new core installs a second copy of core under them.
 
 Publishing is the owner's step. Two routes:
 
-**Locally** (works with 2FA; the CI route fails with EOTP unless the token
-bypasses 2FA):
+**From CI (preferred):** run the `Validate TypeScript Release` workflow by hand
+(`workflow_dispatch`) with `publish` ticked. It builds and tests, then publishes
+every package whose version is not on the registry through npm trusted
+publishing (OIDC): no npm token is stored anywhere, and each tarball carries a
+provenance attestation tied to the workflow run. One-time setup per package on
+npmjs.com: Settings → Trusted publishing → GitHub Actions, repository
+`neutron-build/neutron`, workflow `typescript-publish.yml`. Once every package
+publishes this way, set each package's publishing access to "require two-factor
+authentication and disallow tokens". Pushing a `ts/vX.Y.Z` tag only validates; it
+does not publish.
+
+**Locally** (fallback; works with 2FA):
 
 ```bash
 cd typescript
@@ -58,11 +68,6 @@ pnpm --filter "./packages/*" run build
 npm login --auth-type=web
 pnpm publish -r --access public --no-git-checks
 ```
-
-**From CI:** push a `ts/vX.Y.Z` tag. `.github/workflows/typescript-publish.yml`
-runs build and tests, then `pnpm publish -r` with `secrets.NPM_TOKEN`, which must
-be an npm token that can publish `@neutron-build/*` and
-bypasses 2FA.
 
 If a publish stops partway, fix the cause and run it again: versions already on
 the registry are skipped.
