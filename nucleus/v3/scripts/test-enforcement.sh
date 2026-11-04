@@ -3328,10 +3328,92 @@ expect_ok "fresh-gate: no hook, filter, attribute file or include is left" bash 
 expect_ok "git state: none after the fresh-gate scenarios" no_state
 expect_ok "git state: none of the output-shaping state after the fresh-gate scenarios" no_state3
 
-# FG11, FG11b and FG12 (forged objects) go here, in GLM's separate commit after
-# this one (owner decision 2026-11-03). Reuse fgcard/fgstub, fgrun, fg_refused,
-# fg_clean, and the forged-object helpers above (objlo, save_obj, forge_from,
-# restore_forged, no_state4).
+# FG11, FG11b and FG12, the forged-object rows (owner exception 2026-11-03).
+# A checkout reads every tip blob and nothing hash-checks blobs on that path,
+# so a swapped loose blob checks out as the other bytes while the tree, the
+# index and plain status (fresh stat data) still name its own id: the blind
+# spot the content hash closes. Only loose objects unique to one FG branch are
+# forged; the honest fg.txt blob ("orig") is the source bytes, every id is
+# captured before its object is forged, and each window restores before the
+# next move (no_state4).
+
+# FG11, a swapped blob: card/v3-FG11's fg11.txt blob (unique to it) holds
+# fg.txt's bytes, so a plain checkout writes them while the tree names
+# fg11.txt's own id.
+fgcard FG11
+git -C "$r" checkout -q card/v3-FG11
+printf 'fg11\n' >"$v3/spikes/fg11.txt"
+git -C "$r" add nucleus/v3/spikes/fg11.txt && git -C "$r" commit -qm "nucleus v3: FG11 work"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fg_src=$(git -C "$r" rev-parse card/v3-FG11:nucleus/v3/spikes/fg.txt)
+fg11_id=$(git -C "$r" rev-parse card/v3-FG11:nucleus/v3/spikes/fg11.txt)
+expect_ok "premise: FG11: both blobs are loose objects" bash -c "[ -f '$(objlo "$r" "$fg_src")' ] && [ -f '$(objlo "$r" "$fg11_id")' ]"
+save_obj "$r" "$fg11_id"
+forge_from "$r" "$fg11_id" "$fg_src"
+git -C "$r" worktree add -q --detach "$t/fg11p" card/v3-FG11
+fg11_hidden() {
+  local s
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11p" status --porcelain)
+  echo "status: $s"
+  [ "$(git -C "$r" hash-object --no-filters "$t/fg11p/nucleus/v3/spikes/fg11.txt")" = "$fg_src" ] && [ -z "$s" ]
+}
+expect_ok "premise: FG11: a plain worktree add checks out the other bytes, and plain status there is empty" fg11_hidden
+git -C "$r" worktree remove --force "$t/fg11p"
+fgrun card/v3-FG11
+expect_ok "fresh-gate: FG11: a swapped blob is refused, naming the path and both ids, before the gate runs" fg_refused "nucleus/v3/spikes/fg11.txt: content hashes to $fg_src, tree says $fg11_id"
+expect_ok "fresh-gate: FG11: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG11 restored" no_state4
+
+# FG11b, the same forgery under the eol exception: card/v3-FG8's fg.ps1 (text
+# eol=crlf) blob holds fg.txt's bytes, which the checkout converts to CRLF.
+# The exception must re-hash with the conversion and compare with the tree id
+# (it never trusts a path), and these bytes do not hash to that id either.
+fg11b_id=$(git -C "$r" rev-parse card/v3-FG8:nucleus/v3/spikes/fg.ps1)
+fg11b_got=$(printf 'orig\r\n' | git -C "$r" hash-object --no-filters --stdin)
+expect_ok "premise: FG11b: fg.ps1's blob is a loose object" bash -c "[ -f '$(objlo "$r" "$fg11b_id")' ]"
+save_obj "$r" "$fg11b_id"
+forge_from "$r" "$fg11b_id" "$fg_src"
+git -C "$r" worktree add -q --detach "$t/fg11bp" card/v3-FG8
+fg11b_hidden() {
+  local s
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11bp" status --porcelain)
+  echo "status: $s"
+  [ "$(git -C "$r" hash-object --no-filters "$t/fg11bp/nucleus/v3/spikes/fg.ps1")" = "$fg11b_got" ] && [ -z "$s" ]
+}
+expect_ok "premise: FG11b: the checkout holds the other bytes, eol-converted to CRLF, and plain status there is empty" fg11b_hidden
+git -C "$r" worktree remove --force "$t/fg11bp"
+fgrun card/v3-FG8
+expect_ok "fresh-gate: FG11b: a swapped blob is still refused under the eol exception, naming the path and both ids" fg_refused "nucleus/v3/spikes/fg.ps1: content hashes to $fg11b_got, tree says $fg11b_id"
+expect_ok "fresh-gate: FG11b: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG11b restored" no_state4
+
+# FG12, the base side (X-6-F1-F2-F3-F1 scenario (b)): the base branch's
+# root-tree file holds the card tip's root-tree bytes, so every range read
+# from the base agrees with the lie and nothing at the tip is forged: the
+# checkout and the content check pass, and verify_objects — whose set holds
+# BASE's own trees — is what refuses. The base is a dedicated branch, never
+# the scaffold: checkout and status hash-check HEAD's tree, and $r's HEAD
+# stays on the scaffold throughout.
+git -C "$r" checkout -q -b fg12-base nucleus/v3-scaffold
+printf 'fg12\n' >"$v3/spikes/fg12.txt"
+git -C "$r" add nucleus/v3/spikes/fg12.txt && git -C "$r" commit -qm "nucleus v3: FG12 base"
+git -C "$r" checkout -q nucleus/v3-scaffold
+fgcard FG12 0 fg12-base
+fg12b=$(git -C "$r" rev-parse "fg12-base^{tree}")
+fg12t=$(git -C "$r" rev-parse "card/v3-FG12^{tree}")
+expect_ok "premise: FG12: both root trees are loose objects" bash -c "[ -f '$(objlo "$r" "$fg12b")' ] && [ -f '$(objlo "$r" "$fg12t")' ]"
+save_obj "$r" "$fg12b"
+forge_from "$r" "$fg12b" "$fg12t"
+fg12_hidden() { local d; d=$(plain diff --name-only fg12-base...card/v3-FG12); echo "diff: $d"; [ -z "$d" ]; }
+expect_ok "premise: FG12: under the swap the plain base...tip diff is empty" fg12_hidden
+fgrun --base fg12-base card/v3-FG12
+expect_ok "fresh-gate: FG12: a base-side tree holding the tip's tree bytes is refused, naming the base tree, before the gate runs" fg_refused "object $fg12b fails its hash"
+expect_ok "fresh-gate: FG12: no checkout is left" fg_clean
+restore_forged
+expect_ok "forged objects: FG12 restored" no_state4
+expect_ok "git state: none after the forged-object rows" no_state
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
 exit $(( fails > 0 ))
