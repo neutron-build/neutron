@@ -400,11 +400,32 @@ fn d4_wal_sync_t_only() {
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::WalSyncTOnly),
     );
+    // **X-5c-F3-F3b step 1 (judgment call, recorded):** the §13 step-4
+    // meta-bound fail-stop catches WAL-SYNC-T-ONLY **earlier** than the
+    // named catchers — the mutant's step 1 leaves `durable` below the
+    // flip's `wal_ckpt_end`, the meta write refuses (§9.2, the store
+    // poisoned, task_error "meta bound (13 step 4)"), and the round
+    // fails without ever losing c1. The arm keeps every original
+    // catcher beside the new one and still requires the round to fail —
+    // a widening of the catch, never a weakening (X5-R11 (e)'s shape).
+    let bound_caught = m
+        .task_error
+        .as_deref()
+        .is_some_and(|t| t.contains("meta bound (13 step 4)"));
     assert!(
-        m.o1.is_err() || m.o1.clone().unwrap_or(0) < 2 || m.monitors.contains(&"M-CKPT-T"),
-        "D4 mutant: c1 must be lost or M-CKPT-T must fire — the named catchers (o1={:?}, monitors={:?})",
+        !m.pass,
+        "D4 mutant: the round must fail (o1={:?}, te={:?})",
+        m.o1, m.task_error
+    );
+    assert!(
+        m.o1.is_err()
+            || m.o1.clone().unwrap_or(0) < 2
+            || m.monitors.contains(&"M-CKPT-T")
+            || bound_caught,
+        "D4 mutant: c1 must be lost, M-CKPT-T must fire, or the 13 step-4 bound must refuse the meta — the catchers (o1={:?}, monitors={:?}, te={:?})",
         m.o1,
-        m.monitors
+        m.monitors,
+        m.task_error
     );
 }
 

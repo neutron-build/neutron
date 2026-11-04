@@ -359,6 +359,14 @@ pub struct WalState {
     /// enqueue does **not** remove it, because the flip still needs the
     /// first-chunk LSN while the marker is above `T` (the marked case).
     pub open_chunks: BTreeMap<(u32, u64), u64>,
+    /// **S-1-F3 §13 step 0 (W5 (i); X-5c-F3-F3b step 1):** the commit_ts
+    /// of the last `Commit` or `CommitMarker` this boot enqueued, set in
+    /// [`wal_enqueue`]'s placement step (a `Chunk` or `SegmentEnd`
+    /// placement does not move it). It starts at the frontier the boot
+    /// started from: 0 at `create`, the recovered frontier after
+    /// `recover` — the flip's `ts_ckpt_hi` reads it beside `append`, in
+    /// one step inside the commit critical section's exclusion.
+    pub last_commit_ts: u64,
     /// The flips' enqueue positions, in flip order (M-CKPT-T's hook: the
     /// card names this supply, Work 3.10; read only by the monitors).
     pub flip_enqueue_pos: Vec<u64>,
@@ -439,6 +447,13 @@ pub fn wal_enqueue<H: StoreHost>(
         }
         placed.extend_from_slice(&rec);
         st.wal.buf_tags.insert(rec_lsn, (ts, kind == K_MARKER, txn));
+        // **S-1-F3 §13 step 0 (W5 (i); X-5c-F3-F3b step 1):** the last
+        // `Commit`/`CommitMarker` ts this boot appended — the flip's
+        // `ts_ckpt_hi` supply. A `Chunk` (ts reserved 0) or the
+        // `SegmentEnd` filler never moves it.
+        if kind == K_COMMIT || kind == K_MARKER {
+            st.wal.last_commit_ts = st.wal.last_commit_ts.max(ts);
+        }
         st.wal.buf.extend_from_slice(&placed);
         st.wal.append = lsn0 + placed.len() as u64;
         Ok((rec_lsn, rec_len))
@@ -799,9 +814,15 @@ fn wal_sync_through<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fail> 
 }
 
 /// Step 1: sync the WAL through every record enqueued before the flip
-/// (§13; G5). WAL-SYNC-T-ONLY syncs only through the last record with
+/// (§13; G5). **S-1-F3 §13 step 1 (W5 (ii); X-5c-F3-F3b step 1):** the
+/// step ends only when `durable_end ≥ wal_ckpt_end` (I-ACK-PREFIX,
+/// §12.4) — `wal_wait_durable`'s contiguous-prefix rule supplies exactly
+/// that, so every byte below `wal_ckpt_end` is written and synced, not
+/// just the last batch's. The caller passes the flip's `wal_ckpt_end`
+/// (the append position read inside the commit critical section's
+/// exclusion). WAL-SYNC-T-ONLY syncs only through the last record with
 /// `commit_ts ≤ T`.
-pub fn wal_step1<H: StoreHost>(cx: &Cx<'_, H>, t: u64, enqueue_end: u64) -> Result<(), Fail> {
+pub fn wal_step1<H: StoreHost>(cx: &Cx<'_, H>, t: u64, wal_ckpt_end: u64) -> Result<(), Fail> {
     let end = cx.with("wal_step1:end", |c| {
         let st = c.store();
         if matches!(st.cfg.mutant, Some(Mutant::WalSyncTOnly)) {
@@ -814,7 +835,7 @@ pub fn wal_step1<H: StoreHost>(cx: &Cx<'_, H>, t: u64, enqueue_end: u64) -> Resu
                 .map(|(l, _)| *l)
                 .unwrap_or(0))
         } else {
-            Ok(enqueue_end)
+            Ok(wal_ckpt_end)
         }
     })?;
     wal_wait_durable(cx, end)

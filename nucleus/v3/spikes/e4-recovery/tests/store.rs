@@ -25,12 +25,14 @@ use e4_recovery::store::wal;
 use e4_recovery::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims, tree};
 
 /// The test world: scheduling, disk and store slices plus a small shared
-/// flag board the task bodies coordinate through.
+/// flag board (and a numeric board, X-5c-F3-F3b step 1's After4 record)
+/// the task bodies coordinate through.
 struct TestWorld {
     sched: SchedCore,
     disk: SimDisk,
     st: StoreInner,
     flags: BTreeMap<&'static str, bool>,
+    nums: BTreeMap<&'static str, u64>,
 }
 
 impl SchedHost for TestWorld {
@@ -99,6 +101,7 @@ where
         disk,
         st,
         flags: BTreeMap::new(),
+        nums: BTreeMap::new(),
     };
     let sched = Arc::new(Sched::new(host));
     let body = &body;
@@ -154,6 +157,7 @@ fn pass_world(ntasks: usize, seed: u64, disk: SimDisk, st: StoreInner) -> Sched<
         disk,
         st,
         flags: BTreeMap::new(),
+        nums: BTreeMap::new(),
     };
     Sched::new(host)
 }
@@ -178,6 +182,7 @@ fn create_store(cfg: StoreCfg, seed: u64, with_tree: Option<u64>) -> (SimDisk, S
         disk: SimDisk::new(),
         st: StoreInner::empty(cfg.clone(), 0),
         flags: BTreeMap::new(),
+        nums: BTreeMap::new(),
     };
     let sched = Sched::new(host);
     let cx = Cx {
@@ -1131,6 +1136,7 @@ fn cdiv_syncon_ack_never_crosses_an_unwritten_batch() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -1164,6 +1170,7 @@ fn cdiv_syncon_ack_never_crosses_an_unwritten_batch() {
         disk,
         st,
         flags: BTreeMap::new(),
+        nums: BTreeMap::new(),
     };
     let sched = Arc::new(Sched::new(host));
     fn sf(e: Fail) -> SimFail {
@@ -1352,6 +1359,7 @@ fn segend_valid_end_survives_a_missing_next_segment() {
             disk,
             st,
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -1388,6 +1396,7 @@ fn segend_valid_end_survives_a_missing_next_segment() {
                 disk: d1.clone(),
                 st: StoreInner::empty(cfg.clone(), 0),
                 flags: BTreeMap::new(),
+                nums: BTreeMap::new(),
             };
             let world = Sched::new(host);
             let cx = Cx {
@@ -1437,6 +1446,7 @@ fn segend_valid_end_survives_a_missing_next_segment() {
                     disk: d1.clone(),
                     st: StoreInner::empty(cfg.clone(), 0),
                     flags: BTreeMap::new(),
+                    nums: BTreeMap::new(),
                 };
                 let world = Sched::new(host);
                 let cx = Cx {
@@ -1499,6 +1509,7 @@ fn g8_read_never_poisons_gated_op_does() {
             disk,
             st: _st,
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -1631,6 +1642,7 @@ fn replay_walk_probe_never_swallows_a_recovery_crash() {
             disk,
             st: _st,
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -1666,6 +1678,7 @@ fn replay_walk_probe_never_swallows_a_recovery_crash() {
                 disk: d1.clone(),
                 st: StoreInner::empty(cfg.clone(), 0),
                 flags: BTreeMap::new(),
+                nums: BTreeMap::new(),
             };
             let world = Sched::new(host);
             let cx = Cx {
@@ -1697,6 +1710,7 @@ fn replay_walk_probe_never_swallows_a_recovery_crash() {
                     disk: d1.clone(),
                     st: StoreInner::empty(cfg.clone(), 0),
                     flags: BTreeMap::new(),
+                    nums: BTreeMap::new(),
                 };
                 let world = Sched::new(host);
                 let cx = Cx {
@@ -1805,6 +1819,7 @@ fn wal_exact_segment_end_hops() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -1926,6 +1941,7 @@ fn wal_tail_short_never_placed() {
         disk: SimDisk::new(),
         st: StoreInner::empty(cfg.clone(), 0),
         flags: BTreeMap::new(),
+        nums: BTreeMap::new(),
     };
     let sched = Sched::new(host);
     let cx = Cx {
@@ -2042,6 +2058,7 @@ fn ack_prefix_two_batches_in_flight() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2083,6 +2100,7 @@ fn ack_prefix_two_batches_in_flight() {
             disk: disk.clone(),
             st,
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Arc::new(Sched::new(host));
         fn sf(e: Fail) -> SimFail {
@@ -2398,6 +2416,7 @@ fn txn_ids_never_collide_across_lives() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2449,6 +2468,7 @@ fn txn_ids_never_collide_across_lives() {
         disk: d1.clone(),
         st: StoreInner::empty(cfg.clone(), 0),
         flags: BTreeMap::new(),
+        nums: BTreeMap::new(),
     };
     let sched = Sched::new(host);
     let cx = Cx {
@@ -2565,6 +2585,7 @@ fn stale_boot_record_stops_the_walk() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2752,6 +2773,7 @@ fn meta_rollback_walk_crosses_into_newer_boot() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2781,6 +2803,7 @@ fn meta_rollback_walk_crosses_into_newer_boot() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2851,6 +2874,7 @@ fn boot_id_fresh_after_rollback() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2878,6 +2902,7 @@ fn boot_id_fresh_after_rollback() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -2915,6 +2940,7 @@ fn boot_id_fresh_after_rollback() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3001,6 +3027,7 @@ fn boot_id_after_rollback_raised_then_no_records() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3029,6 +3056,7 @@ fn boot_id_after_rollback_raised_then_no_records() {
                 disk: d,
                 st: StoreInner::empty(cfg.clone(), 0),
                 flags: BTreeMap::new(),
+                nums: BTreeMap::new(),
             };
             let sched = Sched::new(host);
             let cx = Cx {
@@ -3064,6 +3092,7 @@ fn boot_id_after_rollback_raised_then_no_records() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3093,6 +3122,7 @@ fn boot_id_after_rollback_raised_then_no_records() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3178,6 +3208,7 @@ fn wal_start_lsn_ignores_previous_boots_chunks() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3216,6 +3247,7 @@ fn wal_start_lsn_ignores_previous_boots_chunks() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3338,6 +3370,7 @@ fn first_record_older_than_opened_meta_stops_the_walk() {
             disk: SimDisk::new(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3371,6 +3404,7 @@ fn first_record_older_than_opened_meta_stops_the_walk() {
             disk: d,
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3398,6 +3432,7 @@ fn first_record_older_than_opened_meta_stops_the_walk() {
             disk: disk.clone(),
             st: StoreInner::empty(cfg.clone(), 0),
             flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
         };
         let sched = Sched::new(host);
         let cx = Cx {
@@ -3443,4 +3478,454 @@ fn first_record_older_than_opened_meta_stops_the_walk() {
         !scan.contains_key(b"K2".as_slice()),
         "the older boot's stale first record must be excluded: {scan:?}"
     );
+}
+
+/// **X-5c-F3-F3b step 1 pin (S-1-F3 §13 step 1, W5 (ii);
+/// `t_ckpt_sync_prefix`; a literal config).** Step 1 ends only when
+/// `durable_end ≥ wal_ckpt_end` (I-ACK-PREFIX's contiguous prefix), not
+/// at "the latest batch's sync": a flip with batch 1 unwritten — its
+/// holder parked at `writer:prewrite`, the F3-F3a hold — and batch 2,
+/// above it, written and synced by its own group sync.
+///
+/// The config (the shared-budget shape of `ack_prefix_two_batches_in_
+/// flight`, its recorded precedent): the setup fills segment 0 exactly
+/// and segment 1 save one max record, all durable. Task A enqueues a1
+/// (fills segment 1 exactly) through a30 — spanning fresh segments 2..7
+/// — and takes batch 1, parking at `writer:prewrite` (budget 60_000,
+/// drained in the park loop's yields). Task B waits until batch 1 is
+/// taken and nothing is written, enqueues b1 above it and takes batch 2
+/// — parking at the same shared budget, exactly as in the ack_prefix
+/// pin. Task C waits until both batches are in flight and b1 is
+/// enqueued, then runs a checkpoint: its flip reads `wal_ckpt_end` past
+/// both records and its step 1 parks on `WalAcks` (nothing is durable
+/// past the setup). When the budget exhausts, both holders release;
+/// batch 2 (b1, one segment) completes far sooner than batch 1 (six
+/// fresh segments' create/preallocate/dirsync/write/sync), so a step 1
+/// that ended "at the latest batch's sync" would return while batch 1's
+/// bytes were still a hole — and the meta write would proceed over it.
+///
+/// Asserted (both arms): **at the After4 hook — after the meta write —
+/// `wal.durable ≥ wal_ckpt_end`** (the hook records the pair in one
+/// atomic step). In the crash-after-step-5 arm, the world crashes right
+/// after the meta's `sync_all`, F-CRASH drops every volatile write, and
+/// **every byte below the durable meta's `wal_ckpt_end` is durable on
+/// SimDisk** (each issued WAL write below the bound reads back its
+/// issued bytes). Mutant CKPT-SYNC-OVER-HOLE (step 1 ends at the latest
+/// batch's sync) fails the After4 assertion: the meta is written with
+/// `durable` below batch 1's start.
+#[test]
+fn ckpt_step1_waits_for_contiguous_durable() {
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    let maxp = (e4_recovery::store::wal::REC_MAX - fixed) as usize;
+    let seed = 7171u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- setup (single task): segment 0 exact, segment 1 one-max short
+    let (disk, st, setup_end) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        for ts in 1..=4u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp])
+                .expect("setup seg0");
+        }
+        for ts in 5..=7u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp])
+                .expect("setup seg1");
+        }
+        let setup_end = seg + 3 * (maxp as u64 + fixed);
+        wal::wal_wait_durable(&cx, setup_end).expect("setup durable");
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), setup_end)
+    };
+    // a1 fills segment 1 exactly (its 16-KiB tail); a2..a29 fill
+    // segments 2..6 exactly (4 max records each); a30 (small) lands in
+    // segment 7. Batch 1 = [a1..a30] spans six fresh segments, so its
+    // holder's write-out (create + preallocate + dirsync per segment)
+    // is far longer than batch 2's one-segment write.
+    let na2 = 29usize; // a2..a30
+    for arm in 0..2u64 {
+        let mut st = st.clone();
+        st.parks.insert("writer:prewrite", 60_000);
+        let host = TestWorld {
+            sched: SchedCore::new(4, seed + 1 + arm),
+            disk: disk.clone(),
+            st,
+            flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
+        };
+        let sched = Arc::new(Sched::new(host));
+        fn sf(e: Fail) -> SimFail {
+            match e {
+                Fail::Sim(s) => s,
+                _ => SimFail::Internal("wal pin: a non-sim store failure"),
+            }
+        }
+        // Task A: enqueue a1..a30, take batch 1 (parks at prewrite),
+        // then wait for its own ack.
+        let a_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 8), 8, &vec![0u8; maxp]).expect("a1");
+            for i in 0..na2 {
+                wal::wal_enqueue(
+                    &cx,
+                    wal::K_COMMIT,
+                    (0, 9 + i as u64),
+                    9 + i as u64,
+                    &vec![0u8; if i == na2 - 1 { 10 } else { maxp }],
+                )
+                .expect("a2..");
+            }
+            set_flag(sched, "a_enq");
+            let r = wal::wal_writer_step(&cx).map_err(sf);
+            set_flag(sched, "a_released");
+            r?;
+            let end = {
+                let g = sched.lock();
+                g.st.wal.append
+            };
+            wal::wal_wait_durable(&cx, end).map_err(sf)?;
+            set_flag(sched, "a_acked");
+            Ok(())
+        };
+        // Task B: wait for batch 1 taken-and-unwritten, enqueue b1 above
+        // it, take batch 2 (the two-in-flight shape), write and sync it.
+        let b_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            loop {
+                let held = cx
+                    .with("pin:b:gate", |c| {
+                        let st = c.store();
+                        Ok(!st.wal.in_flight.is_empty() && st.wal.written == setup_end)
+                    })
+                    .map_err(sf)?;
+                if held {
+                    break;
+                }
+                cx.yield_now("pin:b:poll").map_err(sf)?;
+            }
+            set_flag(sched, "b_go");
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 99), 99, &[9u8; 10]).map_err(sf)?;
+            set_flag(sched, "b_enq");
+            wal::wal_writer_step(&cx).map_err(sf)?;
+            set_flag(sched, "b_done");
+            let end = {
+                let g = sched.lock();
+                g.st.wal.append
+            };
+            wal::wal_wait_durable(&cx, end).map_err(sf)?;
+            set_flag(sched, "b_acked");
+            Ok(())
+        };
+        // Task C: once both batches are in flight and b1 is enqueued,
+        // run the checkpoint. The After4 hook records (durable,
+        // wal_ckpt_end) in one atomic step; in arm 1 the After5 hook
+        // crashes the world right after the meta's sync_all.
+        let c_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            loop {
+                let two = cx
+                    .with("pin:c:gate", |c| {
+                        let st = c.store();
+                        Ok(st.wal.in_flight.len() == 2)
+                    })
+                    .map_err(sf)?;
+                if two {
+                    break;
+                }
+                cx.yield_now("pin:c:poll").map_err(sf)?;
+            }
+            set_flag(sched, "c_go");
+            let mut hooks = |hook: CkptHook| -> Result<(), Fail> {
+                if hook == CkptHook::After4 {
+                    // Record (durable, wal_ckpt_end) atomically: the
+                    // flip's wal_ckpt_end is the checkpoint's own append
+                    // position at the flip — nothing was enqueued after
+                    // it, so the current append equals it.
+                    let (d, w) = {
+                        let g = sched.lock();
+                        (g.st.wal.durable, g.st.wal.append)
+                    };
+                    let mut g = sched.lock();
+                    g.nums.insert("after4_d", d);
+                    g.nums.insert("after4_w", w);
+                }
+                if arm == 1 && hook == CkptHook::After5 {
+                    // Crash the world right after the meta's sync_all.
+                    sched.deliver_crash();
+                    return Err(Fail::Sim(SimFail::Crashed));
+                }
+                Ok(())
+            };
+            let r = ckpt::checkpoint(&cx, &mut hooks);
+            match r {
+                Err(Fail::Sim(SimFail::Crashed)) => Ok(()),
+                Err(e) => Err(sf(e)),
+                Ok(()) => {
+                    set_flag(sched, "c_done");
+                    Ok(())
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (t, body) in [
+                (
+                    1usize,
+                    &a_body
+                        as &(
+                             dyn Fn(&Sched<TestWorld>, TaskId) -> Result<(), SimFail> + Send + Sync
+                         ),
+                ),
+                (2, &b_body),
+                (3, &c_body),
+            ] {
+                let sched = Arc::clone(&sched);
+                handles.push(scope.spawn(move || {
+                    if let Err(SimFail::Baton(s)) = sched.yield_baton(t) {
+                        panic!("entry barrier refused: Baton at {s}");
+                    }
+                    let r =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&sched, t)));
+                    let is_panic = r.is_err();
+                    sched.finish(t);
+                    assert!(!is_panic, "task {t} panicked");
+                }));
+            }
+            let starter = Arc::clone(&sched);
+            let mut h0 = Some(scope.spawn(move || starter.start()));
+            // The driver: wait until C's checkpoint completes (arm 0) or
+            // the After5 crash fires (arm 1); a 60-s deadline backstops
+            // every park.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let done = {
+                    let g = sched.lock();
+                    g.flags.contains_key("c_done")
+                        || g.sched.crashed
+                        // C ended without completing: the checkpoint
+                        // failed (under CKPT-SYNC-OVER-HOLE the step-4
+                        // bound refuses the meta over the hole).
+                        || g.sched.finished.get(3).copied().unwrap_or(false)
+                };
+                if done || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if arm == 1 {
+                // The After5 hook crashed the world already; backstop any
+                // stragglers (the parked holders drain the shared budget
+                // for ~30k rounds after the crash unwinds them at their
+                // next scheduler call).
+                sched.deliver_crash();
+            }
+            if let Some(h) = h0.take() {
+                let _ = h.join();
+            }
+            for h in std::mem::take(&mut handles) {
+                let _ = h.join();
+            }
+        });
+        // ---- the After4 assertion (both arms) ----
+        let (d4, w4) = {
+            let g = sched.lock();
+            (
+                g.nums.get("after4_d").copied(),
+                g.nums.get("after4_w").copied(),
+            )
+        };
+        let (Some(d4), Some(w4)) = (d4, w4) else {
+            panic!(
+                "arm {arm}: the checkpoint never reached After4 — either it never\
+                 \ncompleted (a_enq={} b_enq={} c_go={}) or its meta write was refused\
+                 \nover a durability hole below wal_ckpt_end (13 step 1, W5 (ii))",
+                flag(&sched, "a_enq"),
+                flag(&sched, "b_enq"),
+                flag(&sched, "c_go")
+            );
+        };
+        assert!(
+            d4 >= w4,
+            "arm {arm}: the meta was written with durable={d4} < wal_ckpt_end={w4}\
+             \n(13 step 1 ends only at the contiguous durable prefix, W5 (ii))"
+        );
+        if arm == 1 {
+            // ---- the crash-after-step-5 variant: every byte below the
+            // durable meta's wal_ckpt_end is durable on SimDisk ----
+            let mut d2 = {
+                let g = sched.lock();
+                g.disk.clone()
+            };
+            let mut frng = e4_recovery::rng::Rng::new(0x5EED_00F1 + arm);
+            d2.apply_crash(
+                &mut frng,
+                &e4_recovery::sim::FaultKnobs {
+                    keep_latest_pm: 0,
+                    tear_pm: 0,
+                },
+            );
+            // The durable meta: the winner of the two slots' durable
+            // bytes.
+            let pf = d2.stat("/pages").expect("page file");
+            let (m, wck) = {
+                let b1 = d2.durable_read(pf, 4096, 4096);
+                let b2 = d2.durable_read(pf, 8192, 4096);
+                match e4_recovery::store::page::select_meta(&b1, &b2, false) {
+                    e4_recovery::store::page::MetaPick::Win { meta, .. } => {
+                        let w = meta.wal_ckpt_end;
+                        (meta, w)
+                    }
+                    _ => panic!("arm {arm}: no durable meta after the crash"),
+                }
+            };
+            assert_eq!(
+                m.wal_ckpt_end, w4,
+                "the durable meta carries the flip's wal_ckpt_end"
+            );
+            assert!(
+                m.ts_ckpt_hi >= m.t,
+                "the durable meta's bound is T <= ts_ckpt_hi"
+            );
+            // Every issued WAL write wholly below wal_ckpt_end reads
+            // back its issued bytes on the durable view, and the verified
+            // writes cover the whole stream [0, wal_ckpt_end): the
+            // records are contiguous from LSN 0 (the setup enqueued the
+            // stream's first records), so a merged-coverage check makes
+            // the byte comparison non-vacuous.
+            let events = d2.events.clone();
+            let mut spans: Vec<(u64, u64)> = Vec::new();
+            let wal_files = d2.list_dir("/wal/");
+            for (name, fid) in wal_files {
+                let Ok(first) = u64::from_str_radix(name.trim_end_matches(".log"), 16) else {
+                    continue;
+                };
+                if first >= wck {
+                    continue;
+                }
+                for e in events.iter() {
+                    if let e4_recovery::sim::DiskEvent::WriteIssued { inode, off, bytes } = e {
+                        if *inode != fid {
+                            continue;
+                        }
+                        let abs = first + off;
+                        let end = abs + bytes.len() as u64;
+                        if abs >= wck || end > wck {
+                            continue;
+                        }
+                        let got = d2.durable_read(fid, *off, bytes.len() as u64);
+                        assert_eq!(
+                            got, *bytes,
+                            "arm {arm}: the WAL bytes at [{abs}, {end}) below\
+                             \nwal_ckpt_end={wck} are not durable (13 step 1, W5 (ii))"
+                        );
+                        spans.push((abs, end));
+                    }
+                }
+            }
+            spans.sort_unstable();
+            let mut cover_end = 0u64;
+            for (a, b) in spans.iter() {
+                assert!(
+                    *a <= cover_end,
+                    "arm {arm}: a hole at {a} below wal_ckpt_end={wck} (covered to {cover_end})"
+                );
+                cover_end = cover_end.max(*b);
+            }
+            assert_eq!(
+                cover_end, wck,
+                "arm {arm}: the verified durable bytes must cover [0, wal_ckpt_end)"
+            );
+        }
+    }
+}
+
+/// **X-5c-F3-F3b step 1 pin (S-1-F3 §14 step 1, W6 (i); the open-time
+/// variants of `t_cover_ts_cross_check`; a literal config).** A meta
+/// forged through `Env` — written and synced like a real one, its CRC
+/// valid — whose `T > ts_ckpt_hi`, or whose
+/// `wal_start_lsn > wal_ckpt_end`, fails the open with XX001
+/// (`Fail::Corrupt`), with no fallback to the older meta. Mutant
+/// META-RANGE-SKIP (the open-time check removed) opens both forgeries.
+#[test]
+fn cover_ts_cross_check_forged_meta() {
+    let seed = 8181u64;
+    let cfg = tcfg(8, 8, 1);
+    // A real store whose meta 1 is durable, then a forged meta 2 whose
+    // bytes are written through Env and synced — the corruption the
+    // open-time range check must refuse.
+    let (disk, m1) = {
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk,
+            st,
+            flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        // One checkpoint, so meta 1 is durable and wins selection; the
+        // forged meta 2 then outranks it (the shape the range check
+        // must refuse — falling back to meta 1 is what W6 (i) bans).
+        let mut hooks = |_hook: CkptHook| Ok(());
+        ckpt::checkpoint(&cx, &mut hooks).expect("setup checkpoint");
+        let m1 = cx.with("pin:m1", |c| Ok(c.store().meta)).expect("meta 1");
+        let g = sched.lock();
+        (g.disk.clone(), m1)
+    };
+    assert_eq!(m1.ckpt_id, 1, "the setup wrote meta 1");
+    for (name, forge) in [
+        ("T above ts_ckpt_hi", {
+            let mut m = m1;
+            m.ckpt_id = 2;
+            m.t = 10;
+            m.ts_ckpt_hi = 7;
+            m
+        }),
+        ("wal_start_lsn above wal_ckpt_end", {
+            let mut m = m1;
+            m.ckpt_id = 2;
+            m.wal_start_lsn = 500;
+            m.wal_ckpt_end = 300;
+            m
+        }),
+    ] {
+        let mut d = disk.clone();
+        let pf = d.stat("/pages").expect("page file");
+        let bytes = e4_recovery::store::page::build_meta(&forge);
+        // Meta 2 goes to its own slot (1 + (2 mod 2) = 1), through Env:
+        // written and synced, exactly as the store would.
+        d.write_at(pf, 4096, &bytes).expect("forge write");
+        d.sync_all(pf).expect("forge sync");
+        let world = pass_world(1, seed + 3, d.clone(), StoreInner::empty(cfg.clone(), 0));
+        let cx = Cx {
+            w: &world,
+            t: HARNESS,
+        };
+        let opened = ckpt::open(&cx, cfg.clone());
+        assert!(
+            matches!(opened, Err(Fail::Corrupt(_))),
+            "{name}: the forged meta (valid CRC, ckpt_id 2) must fail the open\
+             \nwith XX001 and no fallback, got {opened:?}"
+        );
+    }
 }

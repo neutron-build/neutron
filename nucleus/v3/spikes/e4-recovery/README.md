@@ -3406,7 +3406,7 @@ F3-F3a rework gate's own class table** (its README section); no
 deviation to record.
 
 **Step 0′ — the folded follow-up X-5c-F3-F3a-F3 (commit
-29e0d1f7; test-only).** The literal-config harness pin
+9580b10d; test-only).** The literal-config harness pin
 `x5r35_seed403_slice_feeds_the_derivation` runs `run_round` on seed 403
 through round 1 and asserts round 1 derives `lo == 3 ≤ frontier` (4),
 that ts 7 is not acked, and that `ack_over` is empty — X5-R35 (a)'s

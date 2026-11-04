@@ -189,6 +189,11 @@ pub fn create<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg, uuid: u128) -> Result
         next_lpid,
         slot_count,
         wal_start_lsn: 0,
+        // **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** meta 0's WAL bound
+        // is the creating session's append position (0) and its empty
+        // stream's commit frontier (0).
+        wal_ckpt_end: 0,
+        ts_ckpt_hi: 0,
     };
     let bytes = page::build_meta(&meta);
     // §2.2: meta 0 goes to slot 1 + (0 mod 2) = 1.
@@ -256,6 +261,19 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
             ));
         }
     };
+    // **S-1-F3 §14 step 1 (W6 (i); X-5c-F3-F3b step 1):** a meta whose
+    // magic and CRC are valid but whose `T > ts_ckpt_hi` or
+    // `wal_start_lsn > wal_ckpt_end` is corrupt: the open fails with
+    // XX001, with no fallback (§2.2). The two values were read together
+    // inside the commit critical section's exclusion at the flip
+    // (W5 (i)); a meta claiming a bound its own fields contradict can
+    // never describe a stream the WAL covers.
+    if meta.t > meta.ts_ckpt_hi || meta.wal_start_lsn > meta.wal_ckpt_end {
+        return Err(Fail::Corrupt(format!(
+            "meta {} range invalid: T={} > ts_ckpt_hi={} or wal_start_lsn={} > wal_ckpt_end={} (14 step 1, W6 (i))",
+            meta.ckpt_id, meta.t, meta.ts_ckpt_hi, meta.wal_start_lsn, meta.wal_ckpt_end
+        )));
+    }
     // The accept hook: the slot the winner **was read from** — the bytes
     // actually used (card 1.4). Under G7 that is the winner's own slot;
     // under META-WRONG-SLOT it can be the misplaced copy's slot, and the
@@ -545,9 +563,16 @@ enum FlipOut {
     Ok {
         t: u64,
         gc_w: u64,
-        enqueue_end: u64,
         wal_start: u64,
         k: u64,
+        /// **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** the append position
+        /// read at the flip — step 1 ends only when `durable` reaches
+        /// it, and the meta's `wal_ckpt_end` carries it.
+        wal_ckpt_end: u64,
+        /// **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** the last
+        /// `Commit`/`CommitMarker` ts appended before the flip (or the
+        /// boot's starting frontier) — the meta's `ts_ckpt_hi`.
+        ts_ckpt_hi: u64,
     },
     /// The fail-stop abort (gc_w > T; the gate was taken).
     Abort(Fail),
@@ -596,6 +621,25 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
     // Step 0: the flip (§13 step 0): the gate exclusive, take `T`,
     // `gc_w`, `wal_start_lsn`, set `e := k+1`, then release.
     prims::gate_exclusive(cx)?;
+    // **S-1-F3 §13 step 0 (W5 (i); X-5c-F3-F3b step 1):** `wal_ckpt_end`
+    // and `ts_ckpt_hi` are read together, in one entry to the commit
+    // critical section's exclusion (§12.4 I-WAL-TS-ORDER), so they
+    // describe the same point of the stream. The flip waits for the
+    // `commit_cs` flag as a committer does — parking on `Applied`, the
+    // same key a committer's release wakes — and re-tests it. A
+    // committer inside the critical section never needs the epoch gate
+    // (its ts assignment, its enqueue and its marker's group-ack wait
+    // take no gate), so a flip holding the gate exclusively cannot
+    // deadlock against it; `wal_enqueue` is one atomic placement step,
+    // so the append position is never observed mid-record. `Chunk`
+    // placements need no flag (§13 step 0 as amended).
+    loop {
+        let cs_free = cx.with("ckpt:csfree", |c| Ok(!c.store().seq.commit_cs))?;
+        if cs_free {
+            break;
+        }
+        cx.wait_for(crate::sim::WaitKey::Applied)?;
+    }
     let flip = cx.with("ckpt:flip", |c| {
         let st = c.store();
         let k = st.k + 1;
@@ -614,6 +658,16 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         }
         let enqueue_end = st.wal.append;
         st.wal.flip_enqueue_pos.push(enqueue_end);
+        // **S-1-F3 §2.2 (W1) / §13 step 0 (W5 (i); X-5c-F3-F3b step
+        // 1):** the meta's WAL bound, read in this same atomic step
+        // (the flag wait above guarantees no committer holds the
+        // critical section): `wal_ckpt_end` is the append position —
+        // step 1 makes every byte below it durable — and `ts_ckpt_hi`
+        // the last `Commit`/`CommitMarker` ts appended before this
+        // flip, or the frontier this boot started from if none was
+        // (WalState::last_commit_ts, ≥ T).
+        let wal_ckpt_end = st.wal.append;
+        let ts_ckpt_hi = st.wal.last_commit_ts;
         let open_chunks = st.wal.open_chunks.clone();
         let wal_start = wal::wal_start_lsn(st, t, &open_chunks);
         // §12.6 retention: drop exactly the entries whose markers this
@@ -646,19 +700,21 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         Ok(FlipOut::Ok {
             t,
             gc_w,
-            enqueue_end,
             wal_start,
             k,
+            wal_ckpt_end,
+            ts_ckpt_hi,
         })
     })?;
-    let (t, gc_w, enqueue_end, wal_start, k) = match flip {
+    let (t, gc_w, wal_start, k, wal_ckpt_end, ts_ckpt_hi) = match flip {
         FlipOut::Ok {
             t,
             gc_w,
-            enqueue_end,
             wal_start,
             k,
-        } => (t, gc_w, enqueue_end, wal_start, k),
+            wal_ckpt_end,
+            ts_ckpt_hi,
+        } => (t, gc_w, wal_start, k, wal_ckpt_end, ts_ckpt_hi),
         FlipOut::Abort(e) => {
             prims::gate_flip_release(cx);
             return Err(e);
@@ -692,7 +748,10 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         })?;
     }
     // Step 1: WAL through every record enqueued before the flip (G5).
-    wal::wal_step1(cx, t, enqueue_end)?;
+    // **S-1-F3 §13 step 1 (W5 (ii); X-5c-F3-F3b step 1):** the step ends
+    // only when `durable ≥ wal_ckpt_end`, never at the latest batch's
+    // sync.
+    wal::wal_step1(cx, t, wal_ckpt_end)?;
     hooks(CkptHook::After1)?;
     // Step 2: the image. Data phase first (dirty frames with content
     // epoch ≤ k, and epoch copies), then the map, then the free set last.
@@ -776,6 +835,35 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
     // ones the free set actually covered (§13 step 2's convergence);
     // `next_lpid` never shrinks below the live counter's floor for the
     // *current* epoch (allocations after the freeze stay above it).
+    // **S-1-F3 §13 step 4 (W5 (iii); X-5c-F3-F3b step 1):** checked at
+    // the meta write — `T ≤ ts_ckpt_hi` and `wal_start_lsn ≤
+    // wal_ckpt_end ≤ durable_end`. A violation is fail-stop (§9.2), as
+    // for `gc_w ≤ T` (§10.5): the store is poisoned, before any meta
+    // byte is written.
+    {
+        let bound_ok = cx.with("ckpt:walbound", |c| {
+            let st = c.store();
+            Ok((
+                t <= ts_ckpt_hi,
+                wal_start <= wal_ckpt_end && wal_ckpt_end <= st.wal.durable,
+            ))
+        })?;
+        if !bound_ok.0 || !bound_ok.1 {
+            let why = format!(
+                "meta bound at step 4: T={t} > ts_ckpt_hi={ts_ckpt_hi} or \
+                 wal_start_lsn={wal_start} > wal_ckpt_end={wal_ckpt_end} > durable (13 step 4, W5 (iii))"
+            );
+            cx.with("ckpt:walbound:poison", |c| {
+                let st = c.store();
+                if st.poisoned.is_none() {
+                    st.poisoned = Some(why.clone());
+                }
+                Ok(())
+            })
+            .ok();
+            return Err(Fail::Poisoned("meta bound (13 step 4)".into()));
+        }
+    }
     let dir_root = cx.with("ckpt:dirroot", |c| Ok(c.store().meta.dir_root))?;
     let boot_id = cx.with("ckpt:boot", |c| Ok(c.store().boot_id))?;
     let meta = page::Meta {
@@ -792,6 +880,11 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         next_lpid: img_next_lpid,
         slot_count: img_slot_count,
         wal_start_lsn: wal_start,
+        // **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** the meta's WAL
+        // bound — both values read at this checkpoint's flip, inside
+        // the commit critical section's exclusion.
+        wal_ckpt_end,
+        ts_ckpt_hi,
     };
     // The full referenced set of image k (data + map + free-set pages).
     let image_slots = full_image_slots(cx)?;
@@ -1624,6 +1717,11 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         st.wal.buf.clear();
         st.wal.buf_tags.clear();
         st.wal.open_chunks.clear();
+        // **S-1-F3 §13 step 0 (W5 (i); X-5c-F3-F3b step 1):** the boot
+        // starts its commit-ts supply at the recovered frontier — the
+        // `ts_ckpt_hi` a flip reads when this boot has appended no
+        // `Commit`/`CommitMarker` yet.
+        st.wal.last_commit_ts = frontier;
         for rec in replay.iter() {
             if rec.kind == K_COMMIT || rec.kind == K_MARKER || rec.kind == K_CHUNK {
                 st.wal
