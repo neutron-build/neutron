@@ -3672,8 +3672,14 @@ pub fn run_round(
                     eprintln!(
                         "X33 diag: seed={seed} round={round} ERR arm: damaged={:?} om={:?}",
                         x33_damaged,
-                        om.as_ref()
-                            .map(|m| (m.ckpt_id, m.boot_id, m.wal_start_lsn, m.wal_ckpt_end, m.t, m.ts_ckpt_hi))
+                        om.as_ref().map(|m| (
+                            m.ckpt_id,
+                            m.boot_id,
+                            m.wal_start_lsn,
+                            m.wal_ckpt_end,
+                            m.t,
+                            m.ts_ckpt_hi
+                        ))
                     );
                 }
                 if let Some(om) = &om {
