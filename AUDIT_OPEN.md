@@ -1756,7 +1756,6 @@ validation/conflicts/REPL, and the live in-memory KV round trip incl.
 Unicode/newline/semicolon preservation with nonzero SQL error). **MERGE-READY.** Not pushed to main
   (owner decision); release/version/registry steps remain parent-owned per
   the lane's handoff.
-||||||| 90e1606b
 ## 2026-10-07 — ADM-11 private shell command stdin
 
 Source implementation validated in isolated `audit/final-nucleus-stdin` patch
