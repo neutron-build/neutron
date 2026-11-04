@@ -153,20 +153,33 @@ func TestProgrammaticPoolValidationCopiesConfigAndCallbacks(t *testing.T) {
 	}
 }
 
-func TestRequiredBindingRefusedBeforeDial(t *testing.T) {
-	for _, ssl := range []string{"disable", "prefer", "require", "verify-full"} {
-		cfg, err := pgxpool.ParseConfig("postgres://localhost/db?sslmode=" + ssl + "&channel_binding=require")
+func TestRequiredBindingWithoutTLSRefusedBeforeDial(t *testing.T) {
+	cfg, err := pgxpool.ParseConfig("postgres://localhost/db?sslmode=disable&channel_binding=require")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialed := false
+	cfg.ConnConfig.DialFunc = func(context.Context, string, string) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("unexpected dial")
+	}
+	_, err = Connect(context.Background(), "", WithPoolConfig(cfg))
+	if !errors.Is(err, ErrChannelBindingUnsupported) || dialed {
+		t.Fatalf("err=%v dialed=%v", err, dialed)
+	}
+}
+
+func TestRequiredBindingOverTLSIsEnforcedByDriver(t *testing.T) {
+	for _, ssl := range []string{"prefer", "require", "verify-full"} {
+		prepared, err := preparePoolConfig("postgres://localhost/db?sslmode="+ssl+"&channel_binding=require", nil, time.Second)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("ssl=%s: %v", ssl, err)
 		}
-		dialed := false
-		cfg.ConnConfig.DialFunc = func(context.Context, string, string) (net.Conn, error) {
-			dialed = true
-			return nil, errors.New("unexpected dial")
+		if prepared.ConnConfig.ChannelBinding != "require" {
+			t.Fatalf("ssl=%s: channel binding not carried to the driver", ssl)
 		}
-		_, err = Connect(context.Background(), "", WithPoolConfig(cfg))
-		if !errors.Is(err, ErrChannelBindingUnsupported) || dialed {
-			t.Fatalf("ssl=%s err=%v dialed=%v", ssl, err, dialed)
+		if _, sent := prepared.ConnConfig.RuntimeParams["channel_binding"]; sent {
+			t.Fatalf("ssl=%s: channel_binding would be sent as a server setting", ssl)
 		}
 	}
 }
