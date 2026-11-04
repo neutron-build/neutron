@@ -11,7 +11,11 @@ and the G1 first-record floor pinned (313a236b); X5-R35 (c): all 17
 named rounds left `frontier < lo`; Finding 3: the 37 re-run at the
 rework's tip — all pass, `ack_over` empty, no class-C
 `0 < frontier < lo` round named or new in 0..200; the full Acceptance
-(10k, verify, record check, gate.sh) re-run at the final tip (X5-R3).
+(10k, verify, record check, gate.sh) re-run at the final tip (X5-R3):
+test 189/189, the 10k exit 0 (FAILING_ROUNDS 745), verify OK
+(--no-quotas; the six waived misses Q4/Q7/Q8/Q11/Q12/SIZING), the
+record check `ACK_OVER_ROUNDS 0` / `C_FRONTIER_BELOW_LO 0` (the first
+run's 117 all cleared), `GATE EXIT=0`.
 Step 0 committed F3-F1's Acceptance 10k as the triage file of record
 (929ade38), the X5-R33/X5-R34 rulings verbatim before any run
 (31effe00), F3-F1-F5's record fixes (97e85cab) and the class table
@@ -3307,6 +3311,56 @@ Commits, in order: **3c8b038e** (X5-R35 verbatim, before any run),
 - **Finding 4:** no other test's assertion changed. The whole release
   suite passes at 313a236b with no re-pointing (the r30 seed pins
   unmoved: the store fix moved no seeded MP/MW workload in the suite).
+- **The rework's Acceptance at the final tip 6fa80bb5 (X5-R3: a
+  prototype deviation is fixed and the entire 10k re-runs).**
+  - `cargo test -q --release -p e4-recovery`: **PASS** (189 tests:
+    14 + 25 + 24 + 49 + 28 + 26 + 23, 0 failed).
+  - The 10k (`X-5c-F3-F3a.acc.*`, prov `commit=6fa80bb5…`,
+    `status_lines=0`, `exit=0`, json sha256
+    `46297043f583ff9fc69ed8dc4ad58cc5f8b9d2fc63a6297869f52a3058a0c42c`,
+    17:44:50→18:03:07, ~18 min): `E4 SEEDS=10000 O1_FAIL=2510
+    O2_FAIL=34 O3_FAIL=488 DEADLOCK=0 PANIC=0 O1F_FAIL=2516 MONITOR=0`
+    / `E4 FOLD FAILING_SEEDS=766 FAILING_ROUNDS=745
+    TWIN_FAILING_ROUNDS=39 DEFECT_SEEDS=0`.
+  - `verify --no-quotas`: **PASS** — `VERIFY OK (--no-quotas)
+    seeds=10000 digests reproduce`; the six known waived misses (Q4,
+    Q7, **Q8 82/100**, Q11, Q12, SIZING — X-5c-F4's retune list, Q8
+    recorded beside them since the first run's verify). **Anomaly,
+    recorded:** the first verify attempt (prov `verify_start=
+    18:03:28`) was killed by the runner's 60-minute watchdog — the
+    host was co-scheduled with another agent's run (load 22 at the
+    10k's end; the card's Notes ask the orchestrator to keep E4
+    Acceptances off a loaded host). The re-run (quiet host) completed
+    in ~21 min; the killed attempt wrote no verify output and no
+    `verify_exit` line, and the re-run's lines follow it in the prov
+    (the last write wins, as "How to reproduce" records).
+  - The record check: **PASS** — `ACK_OVER_ROUNDS 0`,
+    `C_FRONTIER_BELOW_LO 0`, `MISSING_FIELDS 0`. **Zero failing
+    class-C `0 < frontier < lo` rounds in the whole 10k** (the first
+    run's Acceptance file held 117: the 100 Finding-1 store losses and
+    the 17 X5-R35 false losses — both sets cleared), and no
+    ACK-OVER-HOLE round anywhere.
+  - `bash scripts/gate.sh`: **PASS** — the literal last line
+    `GATE EXIT=0`.
+  - The rework's class table (the step-0 (e) definitions, served
+    rounds split first):
+
+    | Class | Rounds | Notes |
+    |---|---|---|
+    | **Served (split out first)** | 8, **all moved to pass** by X5-R30 (c) | 537, 1887, 2927, 4098, 7528, 8107, 8578, 8728 (all r0, MP, `O-3(a): served corruption`, each `(skx ∨ smx) ∧ pass_na`) |
+    | **C-XX** | 50 | sites within C as before (Open/AmcheckIi); 26 of the first run's 76 were the Finding-1 first-record XX001s, now gone |
+    | **C-DIV** | 256 | (b) 101, (c) 96, (d) 59, **(a) 0** — X-5c-F3-F3a-F2's family (the per-key `≤ T` cut), unchanged in shape |
+    | **MW-ORPHAN** | 406 | F3-F3b's (`wal_ckpt_end`/I-WAL-COVER) |
+    | Other MW** | 14 | the O-1(a)+O-3(d) published-set family (4399, 4919 …) |
+    | **MP O-3(e)(ii)** | 11 | 8 r0, 3 r1 — no O-1(b)/(a) MP round this time |
+    | **Twins** | 39 | 39 failing twin seeds |
+
+    (Primary failing rounds 737 = 745 − the 8 served; the fold's
+    `FAILING_SEEDS=766` counts 21 seeds that fail only through twins
+    or served-amendment accounting. Beside the first run's file: C 390
+    → 306, MW-ORPHAN 445 → 406, MP 10 → 11, twins 68 → 39 — the
+    rework's two derivations account for the C loss; F3-F3b's triage
+    step 0 re-derives the table from this file.)
 
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
@@ -4350,7 +4404,8 @@ then-current tip. The five known quota misses (Q4, Q7, Q11, Q12,
 SIZING) are expected and waived by `--no-quotas` — they are X-5c-F4's.
 X-5c-F3-F3a's own verify (at 4cefcb43) adds a sixth, Q8 (acked SyncOff
 commits lost, 80/100 — the store this card built acks fewer SyncOff
-losses): also waived by `--no-quotas`, also F4's to weigh.
+losses): also waived by `--no-quotas`, also F4's to weigh. The rework's
+verify (at 6fa80bb5) keeps it waived at 82/100.
 X-5c-F3's step 0 commits `$O.campaign.json` after the provenance
 checks (the X5-R25 pattern). Single-seed diagnostics stay allowed
 inside attempts: `E4_MPE_DIAG=1 cargo run -q --release -p e4-recovery
