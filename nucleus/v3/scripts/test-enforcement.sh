@@ -2601,6 +2601,41 @@ rv10_row() {
     ! grep -qF "(no violations)" <<<"$o"
 }
 expect_ok "runner refs: RV10 a failed union rev-list is an entry, never []" rv10_row
+# RV11: the union listing is the full ancestry, second parents included (verdict
+# X-6-F1-F2-F3-F1-F3-F1, Finding 1: G-FIRST-PARENT, a --first-parent union, was
+# UNCAUGHT because every RV1-RV10 construction is linear; the scaffold itself
+# has merge commits). side-rv11 is created at the honest merge G (first parent
+# S, second parent B, and B -> S), then B's loose file becomes its body with a
+# changed message line, under the owner's 2026-11-03 forged-object exception: no
+# ancestry bends, B just fails its hash, and it is reachable from G only as a
+# second parent — exactly a commit a --first-parent union would leave
+# unverified, free to be the excluding half of a cycle against the per-ref
+# ranges. The per-ref line names B as well (old is (none), so the range is
+# pre_head...new): expected, and the row's conjunct is the union line alone,
+# the only one G-FIRST-PARENT drops.
+rv11d=$(rvc)
+rv11b=$(git -C "$rv11d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv11 B")
+rv11g=$(git -C "$rv11d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -p "$rv11b" -m "rv11 G")
+git -C "$rv11d" update-ref refs/heads/side-rv11 "$rv11g"
+rv11_fp() { ! git -C "$rv11d" rev-list --first-parent "$rv11g" -- | grep -qxF "$rv11b"; }
+expect_ok "premise: RV11 rev-list --first-parent G does not list B" rv11_fp
+rv11_full() { git -C "$rv11d" rev-list "$rv11g" -- | grep -qxF "$rv11b"; }
+expect_ok "premise: RV11 rev-list G lists B (the full ancestry)" rv11_full
+expect_ok "premise: RV11 B is a loose object" bash -c "[ -f '$(objlo "$rv11d" "$rv11b")' ]"
+git -C "$rv11d" cat-file commit "$rv11b" >"$t/rv11b.body"
+sed 's/^rv11 B$/rv11 B forged/' "$t/rv11b.body" >"$t/rv11bf.body"
+save_obj "$rv11d" "$rv11b"
+forge_commit "$rv11d" "$rv11b" "$t/rv11bf.body"
+rv11_row() {
+  local o u
+  o=$(rvo "$v3/tools/run_card.py" "$rv11d"); echo "$o"
+  u=$(grep '^refs: objects fail verification: ' <<<"$o")
+  grep -qF "object $rv11b fails its hash" <<<"$u" &&
+    ! grep -qF "(no violations)" <<<"$o"
+}
+expect_ok "runner refs: RV11 a forged commit reachable only as a merge's second parent is named by the union verify" rv11_row
+restore_forged
+expect_ok "forged objects: RV11 restored" no_state4
 
 # --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
 # The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
