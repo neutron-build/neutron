@@ -5915,8 +5915,13 @@ fn parse_copy_binary_rows(
                 row.push(None);
                 continue;
             }
-            let len = len as usize;
-            if pos + len > data.len() {
+            // Only -1 is NULL. Any other negative length cast to a near-
+            // usize::MAX `len`, and `pos + len` then overflowed (debug panic)
+            // or wrapped below `pos` and panicked in the slice (release).
+            let Ok(len) = usize::try_from(len) else {
+                return Err(format!("invalid field length in binary COPY tuple ({len})"));
+            };
+            if len > data.len() - pos {
                 return Err("binary COPY field extends past end of data".into());
             }
             let ty = types.get(i).ok_or_else(|| {
@@ -7816,6 +7821,24 @@ mod security_tests {
             err.contains("field count"),
             "expected a clean field-count error, got: {err}"
         );
+    }
+
+    /// fuzz_wire_protocol: a field length below -1 overflowed `pos + len`
+    /// (debug) or wrapped and panicked in the slice (release).
+    #[test]
+    fn parse_copy_binary_rows_rejects_negative_field_length() {
+        for bad_len in [-2i32, i32::MIN] {
+            let mut data = Vec::new();
+            data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+            data.extend_from_slice(&0i32.to_be_bytes());
+            data.extend_from_slice(&0i32.to_be_bytes());
+            data.extend_from_slice(&1i16.to_be_bytes());
+            data.extend_from_slice(&bad_len.to_be_bytes());
+            data.extend_from_slice(&[0u8; 8]);
+            let err =
+                parse_copy_binary_rows(&data, &[crate::types::DataType::Int32]).unwrap_err();
+            assert!(err.contains("field length"), "{bad_len}: {err}");
+        }
     }
 
     #[test]
