@@ -21,6 +21,7 @@ fn cfg(mutant: Option<Mutant>) -> StoreCfg {
         pool_frames: 16,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     }
 }
 
@@ -1987,6 +1988,7 @@ fn freeset_growth_covers_its_own_slots() {
                     pool_frames: 16,
                     r_epoch,
                     mutant: None,
+                    wal_io_fail: None,
                 };
                 let (disk, st) = harness::create_store(c.clone(), seed, 7).expect("create");
                 let out = harness::run_round(
@@ -2145,6 +2147,7 @@ fn d16_epoch_reserve() {
             pool_frames: 16,
             r_epoch: 1,
             mutant: m,
+            wal_io_fail: None,
         };
         let (disk, st) = harness::create_store(c16.clone(), 2015, 7).expect("create");
         let model = Model::new();
@@ -2282,6 +2285,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
         pool_frames: 24,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     };
     // The faultless base supplies the crashed disk the plant is built
     // from (the same schedule prefix, so the same slots).
@@ -2444,6 +2448,7 @@ fn d17_integrity() {
         pool_frames: 16,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     };
     let ops = vec![
         ScriptOp::Commit {

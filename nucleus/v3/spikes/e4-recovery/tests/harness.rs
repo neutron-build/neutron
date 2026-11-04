@@ -17,6 +17,7 @@ fn cfg(mutant: Option<Mutant>) -> StoreCfg {
         pool_frames: 12,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     }
 }
 

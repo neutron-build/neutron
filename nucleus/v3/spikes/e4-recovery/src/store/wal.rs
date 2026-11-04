@@ -491,6 +491,10 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     // Take the batch (one step).
     let take = cx.with("wal_writer:take", |c| {
         let st = c.store();
+        // G8 (9.2, W8 (e)): the writer issues no env write after the
+        // mark — it checks `alive()` before taking (and so before every
+        // env call of the write-out below).
+        st.alive()?;
         if st.wal.buf.is_empty() {
             return Ok(Take::Empty);
         }
@@ -507,7 +511,22 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     let res = wal_write_batch(cx, &buf, start, end);
     // The holder removes its batch and wakes `WalAcks` on every exit —
     // the error paths above included — so no waiter parked below is
-    // ever stranded.
+    // ever stranded. A non-crash failure poisons the store (W8: the WAL
+    // path) **before** this release step, and the broadcast below (G8
+    // (d)) wakes every other wait key once the batch is released — no
+    // waker holds a tree mutex or a pin here.
+    if let Err(e) = &res
+        && !matches!(e, Fail::Sim(_))
+    {
+        cx.with("wal_writer:poison", |c| {
+            let st = c.store();
+            if st.poisoned.is_none() {
+                st.poisoned = Some(format!("WAL path failure: {e} (9.2, G8)"));
+            }
+            Ok(())
+        })
+        .ok();
+    }
     let _ = cx.with("wal_writer:release", |c| {
         c.store()
             .wal
@@ -516,6 +535,9 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
         Ok(())
     });
     cx.w.wake(crate::sim::WaitKey::WalAcks);
+    if matches!(res, Err(Fail::Io(_)) | Err(Fail::Invalid(_))) {
+        super::prims::poison_broadcast(cx);
+    }
     res
 }
 
@@ -535,6 +557,10 @@ fn wal_write_batch<H: StoreHost>(
     // task can take the batch above it — the two-batches-in-flight
     // shape the frontier rules must hold over.
     cx.park("writer:prewrite")?;
+    // G8 (9.2, W8 (e)): the mark may have landed while this batch was
+    // held at the park — nothing is written after it (each env call
+    // below is guarded by this check and the sync loop's own).
+    cx.with("wal_write_batch:alive", |c| c.store().alive())?;
     let mut lsn = start;
     let mut touched: Vec<u64> = Vec::new();
     let mut i = 0usize;
@@ -563,6 +589,12 @@ fn wal_write_batch<H: StoreHost>(
                     // and durability of the segment's records is never
                     // counted before at least one completed dirsync.
                     let name = format!("/wal/{seg:016x}.log");
+                    // G8 (9.2, W8): a segment's creation, preallocation
+                    // and `/wal/` directory sync are WAL-path operations
+                    // — a non-crash failure there poisons the store (the
+                    // hook below can only fire on the write/sync shapes;
+                    // the create/set_len/dirsync sites share the poison
+                    // rule through their callers' error exit above).
                     let created = cx.env().create(&name);
                     let f = match created {
                         Ok(f) => f,
@@ -594,6 +626,15 @@ fn wal_write_batch<H: StoreHost>(
                 }
             }
         };
+        // **The one store test hook (X-5c-F3-F3b step 3; Limits 3):** a
+        // chosen WAL write returns a non-crash I/O failure. The sim maps
+        // every disk error to a crash, so no non-crash WAL failure is
+        // otherwise reachable; the hook exists only for step 3's
+        // literal-config pins and is default-off (never set by the
+        // workload or the campaign).
+        if wal_io_hook_fails(cx, WalIoOp::Write, start)? {
+            return Err(Fail::Io(format!("WAL write at lsn {lsn} (test hook)")));
+        }
         cx.env().write_at(fid, off, bytes).map_err(Fail::Sim)?;
         if !touched.contains(&seg) {
             touched.push(seg);
@@ -619,6 +660,8 @@ fn wal_write_batch<H: StoreHost>(
     // only thing that can make the batch durable (G5's "except by step
     // 1" shape).
     cx.park("writer:presync")?;
+    // G8 (9.2, W8 (e)): as above — no sync after the mark.
+    cx.with("wal_write_batch:alive2", |c| c.store().alive())?;
     // One sync per touched segment (a batch's group commit). A batch
     // counts synced once a `sync_data` of each segment it touched
     // completes after its write returned — the loop below.
@@ -627,6 +670,16 @@ fn wal_write_batch<H: StoreHost>(
             Ok(c.store().wal.segs.get(&seg).copied())
         })?;
         if let Some(f) = f {
+            // The test hook (see the write site): a chosen WAL
+            // `sync_data` returns a non-crash I/O failure. The failed
+            // sync is never retried and its batch's bytes never count
+            // toward `durable` (the advance step below is unreachable
+            // on this path).
+            if wal_io_hook_fails(cx, WalIoOp::SyncData, start)? {
+                return Err(Fail::Io(format!(
+                    "WAL sync_data of segment {seg:016x} (test hook)"
+                )));
+            }
             cx.env().sync_data(f).map_err(Fail::Sim)?;
         }
     }
@@ -915,6 +968,41 @@ pub fn chunk_txn_marker(st: &StoreInner, txn: &(u32, u64), first: &u64) -> Optio
         .iter()
         .find(|(l, (_, m, tx))| *m && **l > *first && *tx == *txn)
         .map(|(_, (ts, _, _))| *ts)
+}
+
+/// **The one store test hook (X-5c-F3-F3b step 3; Limits 3):** which
+/// WAL-path operation fails, and on which batch (identified by its
+/// start LSN). Default-off (`StoreCfg::wal_io_fail = None`); used only
+/// by step 3's literal-config pins, never by the workload or the
+/// campaign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalIoFail {
+    /// The operation that fails.
+    pub op: WalIoOp,
+    /// The failing batch's start LSN.
+    pub batch_start: u64,
+}
+
+/// The WAL-path operation kinds the hook can fail (see [`WalIoFail`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalIoOp {
+    /// A batch's `write_at`.
+    Write,
+    /// A batch's group `sync_data`.
+    SyncData,
+}
+
+/// Whether this op on the batch starting at `start` is the hooked one.
+/// A poisoned store never retries (the caller's error exit poisons, and
+/// every later take refuses at the alive check).
+fn wal_io_hook_fails<H: StoreHost>(cx: &Cx<'_, H>, op: WalIoOp, start: u64) -> Result<bool, Fail> {
+    cx.with("wal_io:hook", move |c| {
+        let st = c.store();
+        Ok(matches!(
+            st.cfg.wal_io_fail,
+            Some(WalIoFail { op: want, batch_start }) if want == op && batch_start == start
+        ))
+    })
 }
 
 /// Step 6's recycling (§12.1/§13): rename each segment wholly below

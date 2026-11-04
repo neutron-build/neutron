@@ -434,6 +434,9 @@ pub fn commit_txn(
     loop {
         let taken = cx.with("h:cs", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the mark is in the commit critical section
+            // wait's predicate (the park below holds one baton with it).
+            st.alive()?;
             if st.seq.commit_cs {
                 Ok(false)
             } else {
@@ -714,6 +717,8 @@ fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
     loop {
         let advanced = cx.with("h:vis", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the ts-order turn's wait carries the mark.
+            st.alive()?;
             let mut advanced = false;
             while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
                 st.seq.visible_ts += 1;
@@ -977,9 +982,12 @@ fn run_task(
                             Ok(())
                         })
                         .ok();
-                        cx.w.wake(WaitKey::WalAcks);
-                        cx.w.wake(WaitKey::MetaDurable);
-                        cx.w.wake(WaitKey::Applied);
+                        // **X-5c-F3-F3b step 3 (d):** the poisoner's
+                        // exit wakes **every** wait key with a parked
+                        // task (the G8 broadcast — the old three-key
+                        // wake left Pin/Tree/Gate waiters parked; the
+                        // mark in their predicates now returns them).
+                        store_poison_broadcast(&cx);
                     }
                     return Err(match e {
                         Fail::Sim(s) => s,
@@ -1144,12 +1152,62 @@ pub fn gc_sweep(cx: &Cx<'_, RoundWorld>, t: u64, w: Option<u64>) -> Result<(), F
         let Some(root) = root else {
             return Ok(());
         };
-        let next = tree::gc_step(cx, t, root, w, &resume)?;
+        let next = match tree::gc_step(cx, t, root, w, &resume) {
+            Ok(n) => n,
+            Err(e) => {
+                // **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3
+                // (a)):** a background store job's step — the GC sweep
+                // — poisons the store on a non-crash failure, marked
+                // before the sweep's remaining state unwinds (each
+                // `gc_step` releases its own latches on exit; a sim
+                // crash is never a poison), and the G8 (d) broadcast
+                // wakes every parked waiter once it has.
+                if !matches!(e, Fail::Sim(_)) {
+                    cx.with("h:gcpois", |c| {
+                        let st = c.store();
+                        if st.poisoned.is_none() {
+                            st.poisoned =
+                                Some(format!("gc sweep of tree {t} failed: {e} (9.2, G8)"));
+                        }
+                        Ok(())
+                    })
+                    .ok();
+                    store_poison_broadcast(cx);
+                }
+                return Err(e);
+            }
+        };
         if next.is_empty() {
             return Ok(());
         }
         resume = next;
         cx.yield_now("h:gcyield")?;
+    }
+}
+
+/// **X-5c-F3-F3b step 3 (d): the harness-side G8 broadcast** — wake
+/// every wait key that has a parked task (the fixed keys plus every
+/// held tree's), the same set [`crate::store::prims::poison_broadcast`]
+/// wakes, for the poison sites on harness paths (the GC sweep, the
+/// script-op error exit below).
+fn store_poison_broadcast(cx: &Cx<'_, RoundWorld>) {
+    let trees: Vec<u64> = cx
+        .with("h:bcast", |c| {
+            Ok(c.store().tree_mu.keys().copied().collect::<Vec<u64>>())
+        })
+        .unwrap_or_default();
+    for key in [
+        WaitKey::WalAcks,
+        WaitKey::Applied,
+        WaitKey::MetaDurable,
+        WaitKey::Pin,
+        WaitKey::GateShared,
+        WaitKey::GateFlip,
+    ] {
+        cx.w.wake(key);
+    }
+    for t in trees {
+        cx.w.wake(WaitKey::Tree(t));
     }
 }
 
@@ -1241,6 +1299,9 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
 fn wait_ckpt(cx: &Cx<'_, RoundWorld>) -> Result<(), Fail> {
     loop {
         let (pending, open) = cx.with("h:ckptw", |c| {
+            // G8 (9.2, W8): the bulk-load publication wait's predicate
+            // carries the mark.
+            c.store().alive()?;
             let h = c.h();
             Ok((h.force_ckpt, c.store().ckpt_open))
         })?;
@@ -1263,6 +1324,11 @@ fn writer_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
                 if c.sched_mut().crashed {
                     return Ok(false);
                 }
+                // G8 (9.2, W8 (e)): nothing is written after the mark —
+                // the writer checks `alive()` before each turn.
+                if c.store().poisoned.is_some() {
+                    return Ok(false);
+                }
                 Ok(!c.store().wal.buf.is_empty())
             })
             .map_err(fail_of)?;
@@ -1283,7 +1349,9 @@ fn writer_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
 fn evictor_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
     loop {
         let crashed = cx
-            .with("h:ev", |c| Ok(c.sched_mut().crashed))
+            .with("h:ev", |c| {
+                Ok(c.sched_mut().crashed || c.store().poisoned.is_some())
+            })
             .map_err(fail_of)?;
         if crashed {
             return Ok(());
@@ -1313,7 +1381,9 @@ fn checkpointer_body(
     loop {
         let (trigger, final_ckpt) = cx
             .with("h:ck", |c| {
-                if c.sched_mut().crashed {
+                if c.sched_mut().crashed || c.store().poisoned.is_some() {
+                    // G8 (9.2, W8 (e)): the checkpointer issues no step
+                    // after the mark.
                     return Ok((true, true));
                 }
                 let h = c.h();

@@ -586,7 +586,24 @@ enum FlipOut {
 /// after the checkpointer exits (the X-5b rework's D12b hang).
 pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result<(), Fail> {
     let r = checkpoint_inner(cx, hooks);
-    if r.is_err() {
+    if let Err(e) = &r {
+        // **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3 (a)):** a
+        // checkpoint step's non-crash failure poisons the store (a sim
+        // crash is never a poison), marked before the cleanup below
+        // releases the frozen image's pins — and, after the release,
+        // the G8 (d) broadcast wakes every wait key that has a parked
+        // task (the flip-abort paths inside `checkpoint_inner` poison
+        // at their own site, before the gate's release).
+        if !matches!(e, Fail::Sim(_)) {
+            cx.with("ckpt:poison", |c| {
+                let st = c.store();
+                if st.poisoned.is_none() {
+                    st.poisoned = Some(format!("checkpoint step failed: {e} (9.2, G8)"));
+                }
+                Ok(())
+            })
+            .ok();
+        }
         cx.with("ckpt:abort", |c| {
             let st = c.store();
             st.ckpt_open = false;
@@ -597,6 +614,9 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         .ok();
         cx.w.wake(crate::sim::WaitKey::MetaDurable);
         cx.w.wake(crate::sim::WaitKey::Pin);
+        if !matches!(r, Ok(()) | Err(Fail::Sim(_))) {
+            prims::poison_broadcast(cx);
+        }
     }
     r
 }
@@ -1825,7 +1845,12 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             Ok(())
         })?;
     }
-    // §14 step 6: resume `dropping` walks.
+    // §14 step 6: resume `dropping` walks. **G8 (9.2, W8; X-5c-F3-F3b
+    // step 3 (a)):** a background store job's step poisons the store on
+    // a non-crash failure — marked inside `resume_drops` before any
+    // latch it holds is released (its tree mutexes release on the error
+    // unwind below; the store is never installed as serving on this
+    // path anyway, the recovery returning `Err`).
     tree::resume_drops(cx)?;
     let out = cx.with("recover:take", |c| Ok(c.store().clone()))?;
     Ok((out, frontier))

@@ -159,6 +159,7 @@ impl Knobs {
             pool_frames: self.pool_frames(),
             r_epoch: self.r_epoch,
             mutant,
+            wal_io_fail: None,
         }
     }
 

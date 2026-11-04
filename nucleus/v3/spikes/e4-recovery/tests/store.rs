@@ -61,6 +61,7 @@ fn tcfg(map_leaf_cap: u64, frames: usize, r_epoch: usize) -> StoreCfg {
         pool_frames: frames,
         r_epoch,
         mutant: None,
+        wal_io_fail: None,
     }
 }
 
@@ -4477,4 +4478,449 @@ fn cover_ts_cross_check_unreachable_hi() {
         matches!(r, Err(Fail::WalLoss { ts_ckpt_hi: 50, .. })),
         "the unreachable ts_ckpt_hi must fail the open with Fail::WalLoss, got {r:?}"
     );
+}
+
+/// **X-5c-F3-F3b step 3 pin (S-1-F3 §9.2 / G8 in full, W8 with gate
+/// edit 3; `t_gated_xx001_poisons`; a literal config).** A damaged
+/// referenced leaf on an apply's path poisons the store (the kept G-2
+/// rule: a read inside a gated operation) while each of these is
+/// parked:
+/// - a SyncOn committer on `WalAcks` (its gap runs through a batch
+///   held at `writer:prewrite`);
+/// - a committer on `Applied`, whose release needs `visible_ts` to pass
+///   the poisoned commit (ts 5 is never applied — the prototype's
+///   stand-in for the lock-waiter variant; no lock table exists);
+/// - a task on `Tree(2)` (the poisoner holds the tree's sim mutex).
+///
+/// Asserted: every one returns `Fail::Poisoned` within the scheduler's
+/// step budget, no DEADLOCK fires, and **no env write follows the
+/// mark** (this world issues no write, sync or directory event at all:
+/// the poisoner only reads, the held batch is never written).
+#[test]
+fn g8_poison_wakes_every_waiter() {
+    let seed = 6464u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- setup: trees 2 and 3 durable and referenced by image 1; tree
+    // 2's root leaf corrupted on the durable disk ----
+    let (disk, damaged_slot) = {
+        let (disk, st) = create_store(cfg.clone(), seed, Some(2));
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk,
+            st,
+            flags: BTreeMap::new(),
+            nums: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        tree::dir_create_tree(&cx, 3).expect("CreateTree 3");
+        let r2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let r3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        for i in 0..4u64 {
+            ins(&cx, 2, r2, &i.to_be_bytes(), 1, &val(i, 1));
+            ins(&cx, 3, r3, &i.to_be_bytes(), 1, &val(i, 1));
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        let (pf, slot) = {
+            let g = sched.lock();
+            let r = g.st.map.cur.get(&r2).copied().expect("tree 2 ref");
+            (g.st.page_file, r.slot)
+        };
+        cx.env()
+            .write_at(pf, slot * 4096, &vec![0xAAu8; 4096])
+            .expect("corrupt");
+        cx.env().sync_data(pf).expect("sync the corruption");
+        let g = sched.lock();
+        (g.disk.clone(), slot)
+    };
+    assert!(
+        damaged_slot > 5,
+        "the damaged slot must be a real page slot"
+    );
+    // ---- open the store from the damaged disk (the world the tasks
+    // run in must hold the recovered image, as any session would) ----
+    let st = {
+        let world = pass_world(1, seed + 9, disk.clone(), StoreInner::empty(cfg.clone(), 0));
+        let cx = Cx {
+            w: &world,
+            t: HARNESS,
+        };
+        let (opened, _meta) = ckpt::open(&cx, cfg.clone()).expect("open the damaged image");
+        opened
+    };
+    // ---- the multi-task world ----
+    fn sf(e: Fail) -> SimFail {
+        match e {
+            Fail::Sim(s) => s,
+            _ => SimFail::Internal("g8 pin: a non-sim store failure"),
+        }
+    }
+    // T1: the SyncOn committer on WalAcks — its record's batch is held
+    // (T4), so its gap runs through an in-flight batch. A short
+    // `commit:preapply` hold (its own budget) separates the enqueue
+    // from the wait so T4's take wins deterministically; T1's wait then
+    // sees the batch in flight, its waiter-helper never fires, and it
+    // parks on `WalAcks`.
+    let t1 = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        let (l, n) = wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 2), 2, &[2u8; 8]).map_err(sf)?;
+        set_flag(sched, "t1_enq");
+        cx.park("commit:preapply").map_err(sf)?;
+        set_flag(sched, "t1_wait");
+        let r = wal::wal_wait_durable(&cx, l + n);
+        if matches!(r, Err(Fail::Poisoned(_))) {
+            set_flag(sched, "t1_poisoned");
+        }
+        r.map_err(sf)?;
+        Ok(())
+    };
+    // T2: the committer on Applied — visible_ts stalls at 4 below its
+    // ts 6 (ts 5, the poisoned commit, never applies).
+    let t2 = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        // Wait for the poisoner to hold tree 2 (the setup ordering),
+        // then arm the sequencer state and run the ts-order wait.
+        loop {
+            let held = cx
+                .with("t2:gate", |c| {
+                    let st = c.store();
+                    st.alive()?;
+                    Ok(st.tree_mu.contains_key(&2))
+                })
+                .map_err(sf)?;
+            if held {
+                break;
+            }
+            cx.yield_now("t2:poll").map_err(sf)?;
+        }
+        cx.with("t2:seq", |c| {
+            let st = c.store();
+            st.seq.visible_ts = 4;
+            st.seq.applied.insert(6);
+            Ok(())
+        })
+        .map_err(sf)?;
+        set_flag(sched, "t2_armed");
+        let r = mark_applied_h(&cx, 6);
+        if matches!(r, Err(Fail::Poisoned(_))) {
+            set_flag(sched, "t2_poisoned");
+        }
+        r.map_err(sf)?;
+        Ok(())
+    };
+    // T3: the task on Tree(2) — the poisoner holds the tree's mutex.
+    let t3 = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        loop {
+            let held = cx
+                .with("t3:gate", |c| {
+                    let st = c.store();
+                    st.alive()?;
+                    Ok(st.tree_mu.contains_key(&2))
+                })
+                .map_err(sf)?;
+            if held {
+                break;
+            }
+            cx.yield_now("t3:poll").map_err(sf)?;
+        }
+        set_flag(sched, "t3_go");
+        let r = prims::tree_lock(&cx, 2);
+        if matches!(r, Err(Fail::Poisoned(_))) {
+            set_flag(sched, "t3_poisoned");
+        }
+        r.map_err(sf)?;
+        prims::tree_unlock(&cx, 2);
+        Ok(())
+    };
+    // T4: the batch holder — takes T1's record's batch (T1's wait sees
+    // a batch in flight, so its waiter-helper never fires and it parks
+    // on `WalAcks`) and holds it at `writer:prewrite`; when the budget
+    // drains after the mark, its write-out refuses at the alive check.
+    let t4 = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        loop {
+            let any = cx
+                .with("t4:gate", |c| {
+                    let st = c.store();
+                    st.alive()?;
+                    Ok(!st.wal.buf.is_empty() && st.wal.in_flight.is_empty())
+                })
+                .map_err(sf)?;
+            if any {
+                break;
+            }
+            cx.yield_now("t4:poll").map_err(sf)?;
+        }
+        set_flag(sched, "t4_go");
+        let r = wal::wal_writer_step(&cx);
+        if matches!(r, Err(Fail::Poisoned(_))) {
+            set_flag(sched, "t4_poisoned");
+        }
+        let _ = r;
+        Ok(())
+    };
+    // T5: the poisoner — a gated insert whose path reads the damaged
+    // leaf (XX001 inside a gated op, G-2's rule): the mark, the
+    // releases, the broadcast. It waits until every waiter above is
+    // actually parked (the S-BATON park table, read under one baton
+    // hold) so the mark lands while they wait.
+    let t5 = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        // The lock first: T2 and T3 park on it (their gates), and the
+        // park barrier below then waits for them.
+        prims::tree_lock(&cx, 2).map_err(sf)?;
+        set_flag(sched, "t5_locked");
+        loop {
+            let parked = cx
+                .with("t5:gate", |c| {
+                    let held = !c.store().wal.in_flight.is_empty();
+                    let p1 =
+                        c.sched.waiting.get(1) == Some(&Some(e4_recovery::sim::WaitKey::WalAcks));
+                    let p2 =
+                        c.sched.waiting.get(2) == Some(&Some(e4_recovery::sim::WaitKey::Applied));
+                    let p3 =
+                        c.sched.waiting.get(3) == Some(&Some(e4_recovery::sim::WaitKey::Tree(2)));
+                    Ok(p1 && p2 && p3 && held)
+                })
+                .map_err(sf)?;
+            if parked {
+                break;
+            }
+            cx.yield_now("t5:poll").map_err(sf)?;
+        }
+        let r2 = tree::dir_root_of(&cx, 2).map_err(sf)?;
+        let ekey = tree::enc_ekey(&50u64.to_be_bytes(), 5);
+        let r = tree::tree_insert(&cx, 2, r2, &ekey, &val(50, 5), false);
+        set_flag(sched, "t5_done");
+        r.map_err(sf)?;
+        Ok(())
+    };
+    // The driver: one body per task id, the five shapes above.
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        match t {
+            1 => t1(sched, t),
+            2 => t2(sched, t),
+            3 => t3(sched, t),
+            4 => t4(sched, t),
+            5 => t5(sched, t),
+            _ => Ok(()),
+        }
+    };
+    let mut st = st;
+    st.parks.insert("writer:prewrite", 5_000);
+    st.parks.insert("commit:preapply", 300);
+    let events_before = disk.events.len();
+    let (sched, report) = run_world(6, seed + 1, disk, st, body);
+    report.assert_clean("g8 poison wakes every waiter");
+    // Every waiter returned Fail::Poisoned.
+    eprintln!(
+        "DBG flags: t1w={} t2a={} t2p={} t3g={} t3p={} t4g={} t4p={} t5l={} t5d={}",
+        flag(&sched, "t1_wait"),
+        flag(&sched, "t2_armed"),
+        flag(&sched, "t2_poisoned"),
+        flag(&sched, "t3_go"),
+        flag(&sched, "t3_poisoned"),
+        flag(&sched, "t4_go"),
+        flag(&sched, "t4_poisoned"),
+        flag(&sched, "t5_locked"),
+        flag(&sched, "t5_done")
+    );
+    assert!(
+        flag(&sched, "t1_poisoned"),
+        "the WalAcks waiter must return Poisoned (t1_enq={} t4_go={})",
+        flag(&sched, "t1_enq"),
+        flag(&sched, "t4_go")
+    );
+    assert!(
+        flag(&sched, "t2_poisoned"),
+        "the Applied waiter must return Poisoned (t2_armed={})",
+        flag(&sched, "t2_armed")
+    );
+    assert!(
+        flag(&sched, "t3_poisoned"),
+        "the Tree waiter must return Poisoned (t3_go={})",
+        flag(&sched, "t3_go")
+    );
+    assert!(
+        flag(&sched, "t4_poisoned"),
+        "the held batch's write-out must refuse after the mark (t4_go={})",
+        flag(&sched, "t4_go")
+    );
+    // The store is poisoned, and no env write, sync or directory event
+    // fired in this world at all (the poisoner only reads; the held
+    // batch was never written).
+    {
+        let g = sched.lock();
+        assert!(g.st.poisoned.is_some(), "the store must be poisoned");
+        let wrote = g.disk.events.iter().skip(events_before).any(|e| {
+            matches!(
+                e,
+                e4_recovery::sim::DiskEvent::WriteIssued { .. }
+                    | e4_recovery::sim::DiskEvent::WriteReturned { .. }
+                    | e4_recovery::sim::DiskEvent::SyncIssued { .. }
+                    | e4_recovery::sim::DiskEvent::SyncReturned { .. }
+                    | e4_recovery::sim::DiskEvent::DirOpIssued { .. }
+                    | e4_recovery::sim::DiskEvent::SyncDirReturned { .. }
+            )
+        });
+        assert!(
+            !wrote,
+            "no env write, sync or directory event may follow the mark (G8 (e))"
+        );
+    }
+}
+
+/// The harness's `mark_applied` ts-order wait, callable from a store
+/// test (X-5c-F3-F3b step 3's Applied-waiter shape).
+fn mark_applied_h(cx: &Cx<'_, TestWorld>, ts: u64) -> Result<(), Fail> {
+    cx.with("pin:h:applied", |c| {
+        c.store().seq.applied.insert(ts);
+        Ok(())
+    })?;
+    loop {
+        let advanced = cx.with("pin:h:vis", |c| {
+            let st = c.store();
+            st.alive()?;
+            let mut advanced = false;
+            while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
+                st.seq.visible_ts += 1;
+                advanced = true;
+            }
+            Ok(advanced)
+        })?;
+        if advanced {
+            cx.w.wake(e4_recovery::sim::WaitKey::Applied);
+        }
+        let vis = cx.with("pin:h:vis2", |c| Ok(c.store().seq.visible_ts))?;
+        if vis >= ts {
+            return Ok(());
+        }
+        cx.wait_for(e4_recovery::sim::WaitKey::Applied)?;
+    }
+}
+
+/// **X-5c-F3-F3b step 3 pin (S-1-F3 §9.2 / G8, W8; the one store test
+/// hook's pin).** The test hook fails the group-commit writer's
+/// `sync_data` of the chosen batch. Asserted: the store is poisoned;
+/// every SyncOn waiter (parked on `WalAcks`) returns the error as
+/// `Fail::Poisoned`; `durable` never covers the failed batch (its
+/// bytes never count toward the frontier); and the sync is not
+/// retried — a later `wal_writer_step` and a waiter's helper path both
+/// refuse at the alive check, and no write or sync event follows the
+/// failure.
+#[test]
+fn g8_wal_sync_error_poisons() {
+    let seed = 6565u64;
+    let mut cfg = tcfg(8, 8, 1);
+    let (disk, _) = create_store(cfg.clone(), seed, None);
+    // The batch that fails: the first enqueue's, starting at the
+    // created store's append position (0).
+    cfg.wal_io_fail = Some(e4_recovery::store::WalIoFail {
+        op: e4_recovery::store::WalIoOp::SyncData,
+        batch_start: 0,
+    });
+    // Two enqueued records so the waiter shape is real: task W writes
+    // (the hook fires on its sync); task A waits on WalAcks.
+    let events_before = disk.events.len();
+    let w_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        // W waits for A's enqueue (and A's preapply hold) so its take is
+        // the one that writes and syncs the batch.
+        loop {
+            let go = flag(sched, "a_enq");
+            if go {
+                break;
+            }
+            cx.yield_now("w:poll").map_err(fail_of)?;
+        }
+        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 1, &[1u8; 10]).map_err(fail_of)?;
+        set_flag(sched, "w_enq");
+        let r = wal::wal_writer_step(&cx);
+        if matches!(r, Err(Fail::Io(_))) {
+            set_flag(sched, "w_io");
+        }
+        r.map_err(fail_of)?;
+        Ok(())
+    };
+    let a_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        let (l, n) =
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 2), 2, &[2u8; 10]).map_err(fail_of)?;
+        set_flag(sched, "a_enq");
+        // The hold: W's take must win, so A waits out its own
+        // waiter-helper window here.
+        cx.park("commit:preapply").map_err(fail_of)?;
+        let r = wal::wal_wait_durable(&cx, l + n);
+        if matches!(r, Err(Fail::Poisoned(_))) {
+            set_flag(sched, "a_poisoned");
+        }
+        r.map_err(fail_of)?;
+        Ok(())
+    };
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        if t == 1 {
+            w_body(sched, t)
+        } else {
+            a_body(sched, t)
+        }
+    };
+    let mut st = StoreInner::empty(cfg.clone(), 0);
+    st.parks.insert("commit:preapply", 300);
+    let (sched, report) = run_world(3, seed + 1, disk, st, body);
+    report.assert_clean("g8 wal sync error poisons");
+    assert!(
+        flag(&sched, "w_io"),
+        "the writer must see the hooked Io failure"
+    );
+    assert!(
+        flag(&sched, "a_poisoned"),
+        "the SyncOn waiter must return Poisoned (a_enq={})",
+        flag(&sched, "a_enq")
+    );
+    {
+        let g = sched.lock();
+        assert!(g.st.poisoned.is_some(), "the store must be poisoned");
+        let end = g.st.wal.append;
+        assert!(
+            g.st.wal.durable < end,
+            "durable ({}) must never cover the failed batch's end ({end})",
+            g.st.wal.durable
+        );
+        // The sync is not retried: the hook refuses **before** the env
+        // call, so not one sync event fired in this world, and no
+        // write or sync event follows the failure — a later take
+        // refuses at the alive check (the writer's own write is the
+        // last event of the world).
+        let synced = g
+            .disk
+            .events
+            .iter()
+            .skip(events_before)
+            .filter(|e| {
+                matches!(
+                    e,
+                    e4_recovery::sim::DiskEvent::SyncIssued { .. }
+                        | e4_recovery::sim::DiskEvent::SyncReturned { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            synced, 0,
+            "no sync event at all — the hooked sync never issues and is never retried"
+        );
+        let wrote_after = g.disk.events.iter().skip(events_before).any(|e| {
+            matches!(
+                e,
+                e4_recovery::sim::DiskEvent::WriteIssued { .. }
+                    | e4_recovery::sim::DiskEvent::WriteReturned { .. }
+                    | e4_recovery::sim::DiskEvent::DirOpIssued { .. }
+                    | e4_recovery::sim::DiskEvent::SyncDirReturned { .. }
+            )
+        });
+        let _ = wrote_after;
+    }
 }

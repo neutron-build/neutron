@@ -43,6 +43,8 @@ pub mod prims;
 pub mod tree;
 pub mod wal;
 
+pub use wal::{WalIoFail, WalIoOp};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sim::{
@@ -144,6 +146,14 @@ pub struct StoreCfg {
     pub r_epoch: usize,
     /// The active mutant, if any.
     pub mutant: Option<Mutant>,
+    /// **X-5c-F3-F3b step 3 (Limits 3, the one store test hook):** make
+    /// the chosen WAL `write_at` or group `sync_data` of the batch
+    /// starting at `batch_start` return a non-crash I/O failure
+    /// ([`Fail::Io`]). Default off (`None`); used only by step 3's
+    /// literal-config pins, never by the workload or the campaign (the
+    /// sim maps every disk error to a crash, so no non-crash WAL failure
+    /// is otherwise reachable).
+    pub wal_io_fail: Option<wal::WalIoFail>,
 }
 
 /// The store failure type. `Corrupt` is XX001 (§ "Error classes").
@@ -176,6 +186,13 @@ pub enum Fail {
     /// The store is poisoned (I-FAIL-STOP, §9.2).
     #[error("poisoned: {0}")]
     Poisoned(String),
+    /// **S-1-F3 §9.2 (W8; X-5c-F3-F3b step 3):** the I/O class (58030).
+    /// In this sim only the one store test hook
+    /// ([`StoreCfg::wal_io_fail`]) can raise it — every real disk error
+    /// is a crash — and it poisons the store wherever the WAL path
+    /// raises it.
+    #[error("io: {0}")]
+    Io(String),
     /// A precondition was violated (a bug or a bad config).
     #[error("invalid: {0}")]
     Invalid(String),

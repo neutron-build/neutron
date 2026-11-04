@@ -1147,6 +1147,7 @@ pub mod directed_arms {
             pool_frames: 16,
             r_epoch: 2,
             mutant,
+            wal_io_fail: None,
         }
     }
 
@@ -1252,6 +1253,7 @@ pub mod directed_arms {
                     pool_frames: 16,
                     r_epoch: 2,
                     mutant,
+                    wal_io_fail: None,
                 };
                 let ops = vec![
                     ScriptOp::Commit {
