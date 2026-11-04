@@ -1352,7 +1352,10 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             &ch.model,
             ch.cut,
             None,
-            None,
+            Some(&harness::X33In {
+                lives: &x33_lives,
+                started_frontier: x33_prev_frontier,
+            }),
         );
         // **X5-R16 NEVER-FIRED, the class C half** (no twin exists to
         // carry the drawn spec first): a targeted round whose crash
@@ -1497,7 +1500,10 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                         &retry.model,
                         retry.cut,
                         None,
-                        None,
+                        Some(&harness::X33In {
+                            lives: &x33_lives,
+                            started_frontier: x33_prev_frontier,
+                        }),
                     );
                 }
             }

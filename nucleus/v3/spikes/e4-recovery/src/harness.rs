@@ -2946,9 +2946,16 @@ pub fn run_round(
             // round starts from).
             let writing: X33Life;
             let widx: Option<usize>;
+            // Round 0's workload runs on the created store (boot 0), so
+            // the current-boot match comes first; a boot-0 meta that is
+            // not the current life's is the create session's own (meta
+            // 0, whose w = 0 passes every bound under either life).
             if *boot == start_store.boot_id {
                 widx = Some(lives.len() - 1);
                 writing = lives.last().cloned().unwrap_or_default();
+            } else if let Some(i) = lives.iter().position(|l| l.boot == *boot) {
+                widx = Some(i);
+                writing = lives[i].clone();
             } else if *boot == 0 {
                 widx = None;
                 writing = X33Life {
@@ -2958,9 +2965,6 @@ pub fn run_round(
                     started_frontier: 0,
                     append_end: 0,
                 };
-            } else if let Some(i) = lives.iter().position(|l| l.boot == *boot) {
-                widx = Some(i);
-                writing = lives[i].clone();
             } else {
                 // The recovered boot's harness checkpoint (the Ok arm's
                 // only other boot; unknown boots on faulted metas are
@@ -3664,6 +3668,14 @@ pub fn run_round(
                     append_end,
                 });
                 let (om, _unused) = read_opened_meta(&recovery_disk);
+                if std::env::var("E4_X33_DIAG").is_ok() {
+                    eprintln!(
+                        "X33 diag: seed={seed} round={round} ERR arm: damaged={:?} om={:?}",
+                        x33_damaged,
+                        om.as_ref()
+                            .map(|m| (m.ckpt_id, m.boot_id, m.wal_start_lsn, m.wal_ckpt_end, m.t, m.ts_ckpt_hi))
+                    );
+                }
                 if let Some(om) = &om {
                     ex.mw_h = match lives.iter().position(|l| l.boot == om.boot_id) {
                         Some(i) => x33_h_of(&lives, i, om.wal_ckpt_end),

@@ -1,113 +1,31 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F3a reworked (the REWORK verdict at 98313ae3
-applied; first-run steps 0–7 below stand except where the rework
-changes them) — X5-R35 pre-registered verbatim before any run
-(3c8b038e); X5-R35 (a)/(b): E is the workload pass's events only,
-self-test (g) 6 demonstrated failing on 13da010b's derivation and
-reverted (93039525); Finding 1: wal_start_lsn holds back only the
-current boot's unmarked chunks, pinned with START-LSN-PREV-BOOT-CHUNK
-and the G1 first-record floor pinned (313a236b); X5-R35 (c): all 17
-named rounds left `frontier < lo`; Finding 3: the 37 re-run at the
-rework's tip — all pass, `ack_over` empty, no class-C
-`0 < frontier < lo` round named or new in 0..200; the full Acceptance
-(10k, verify, record check, gate.sh) re-run at the final tip (X5-R3):
-test 189/189, the 10k exit 0 (FAILING_ROUNDS 745), verify OK
-(--no-quotas; the six waived misses Q4/Q7/Q8/Q11/Q12/SIZING), the
-record check `ACK_OVER_ROUNDS 0` / `C_FRONTIER_BELOW_LO 0` (the first
-run's 117 all cleared), `GATE EXIT=0`.
-Step 0 committed F3-F1's Acceptance 10k as the triage file of record
-(929ade38), the X5-R33/X5-R34 rulings verbatim before any run
-(31effe00), F3-F1-F5's record fixes (97e85cab) and the class table
-re-derived (b68d948c); step 1 X5-R34 — I-ACK-PREFIX's `durable_end`
-from SimDisk history, the judged `ack_over` cross-check, the 37-round
-table holding P's prediction exactly (13da010b, b9d6824c); step 2 the
-exact-segment-end hop clearing all four boundary store losses
-(ce8f8bbc, 51947e16); step 3 I-ACK-PREFIX with two or more batches in
-flight, interval-set frontiers, the `writer:prewrite` pin (cbf0754c);
-step 4 per-boot ids — the three-way boot-id rule, W4 (i)'s ordered
-stop, the five pins and their five mutants, 186's shape gone and 405
-moved (8b71e560, 8e62b04b); step 5 the F3-F1-F3 pins — the r30 guard
-cases (5482edac) and mf29 (94254d12); step 6 the time-boxed C-XX/C-DIV
-remainder — both C-XX leads cleared, `E4_TXN_DIAG` clean on every
-repro, the per-key cut recorded, the remainder ESCALATED with evidence;
-step 7 this README. The Acceptance 10k (`X-5c-F3-F3a.acc.*`) is the
-runner's and becomes F3-F3b's triage file. The stage before it
-(X-5c-F3-F1) is complete: steps 0–9 done — step 0 committed
-F3's Acceptance 10k as the triage file of record (7b709ccb:
-`E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0
-PANIC=0 O1F_FAIL=2665 MONITOR=0` / `E4 FOLD FAILING_SEEDS=955
-FAILING_ROUNDS=914 TWIN_FAILING_ROUNDS=71 DEFECT_SEEDS=0`, sha256
-`efb7835e…73906c5`) and re-derived the class table (served rounds split
-out first); step 1 the WAL's serialized writer (§12.4 contiguous ack,
-e6ebbdda) with its two-task pin and the ESCALATED ack cross-check
-(55 disagreeing commits over 4,656); step 2 SegmentEnd's valid end
-(001d3b7f) — 6149 r1's serve is gone, now MW-ORPHAN's shape; step 3
-G-2 pinned, G-1/G-1b demonstrated equivalent (G-1 and a §12.2/§12.5
-silence ESCALATED), 26640ebf; step 4 the twin supply carries a failed
-recovery's reads (e81ad13d); step 5 X5-R32 transcribed literally
-(e34b75ef — the one oracle commit; the 17 named rounds: 4 ruled, 13
-moved, no ESCALATE); step 6 X5-R30 (c)'s skx/smx/pass_na fields
-(86b716b4; skx 1897/4718, smx 2927/7528/8728, all pass_na=true); steps
-7–8 within X5-R19's budget: C-XX sub-shape 1 root-caused (the
-directory's duplicate re-put, §6.8) and fixed with its pin, sub-shape 2
-(a replay-made stale parent) and C-DIV's remainder ESCALATED with
-evidence; step 9 this README (the duplicate table removed, the
-MW-ORPHAN column corrected, the rulings copied verbatim). The stage
-before it (X-5c-F3) is complete and merged (all
-its steps 0–8 done): step 0 committed
-F2's Acceptance 10k as the triage file of record (b9dd5a9a:
-`E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41
-PANIC=0 O1F_FAIL=2723 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1070
-FAILING_ROUNDS=1015 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, sha256
-`56e47fb2…f34033`) and re-derived the class table; step 1 fixed two
-C-XX root causes with pins (ad82f7d5: the `next_lpid` shrink — a
-prototype deviation from §4.2/§4.3; open's G3 probe swallowing a
-delivered recovery crash — an env/store instrumentation defect) and
-escalated the O-3(c) cross-round inherited-damage family; step 2
-recorded C-DIV's evidence (an acked SyncOn commit lost through §12.5's
-replay stop — seed 21) and escalated it; step 3 applied G8 (89787d24:
-an XX001 inside a gated operation poisons the store, the poison ends
-the workload at the crash point `poison`); step 4 escalated all 7 MP-A
-rounds with the X5-R16/X5-R30 table; step 5 recorded MW-ORPHAN's
-five-round evidence (never fixed); step 6 classified the twins against
-the primary classes (no separate fix); step 7 recorded the other
-rounds with their families and escalated MP-E shape C unchanged; step
-8 wrote the F4 hand-off. The last class completed: **step 8 (the
-hand-off)**. The Acceptance 10k and its `verify --no-quotas` are the
-runner's (X5-R31): no campaign-class command ran in this card's
-attempts (single-seed and ≤ 200-seed runs only, under the backstop,
-output outside the worktree). The stage before it (X-5c-F2) is
-complete and merged (all its steps 0–4
-done, amended by
-nv3-X-5c-F2-amend-1, 2026-10-31) — step 0 corrected the
-digest-stability step-4 record (54 rows, from the X-5c-F1 gate's truth
-file); step 1 landed the harness hardening (a)–(e) with pins; step 2
-landed X5-R28's kept set `K` (harness + the one oracle commit) and
-X5-R30 (a)'s `served_k` record field — the six completeness-residual
-seeds clear via K, the MP-A served_k table is recorded for F3; step 3
-took X5-R29's branch (c) — seed 4858's faultless twin holds the same
-two orphan map entries, so amcheck is unchanged and shape C is handed
-to F3 with the per-lpid evidence; step 4 is this stage record. The
-Acceptance 10k and its `verify --no-quotas` are the runner's (X5-R31):
-no campaign-class command ran in that card's attempts. Its triage file
-of record was P's c8e578b7 run:
-`E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
-PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
-FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
-reproducing (`verify --no-quotas`, exit 0). Per-class state: shape A
-**fixed** (837200a7, accepted X5-R24), shape B **fixed** (80dc0ff3,
-accepted X5-R24, the anchor-0 judgement call left for P's gate), X5-R21
-(c) **fixed and pinned** (04063d1b, accepted X5-R24), the completeness
-residual **ESCALATED to P** as an oracle question (X5-R23; 31d68b5f
-reverted — no harness-side ground truth may stand in for amcheck),
-shape C **ESCALATED to F2** evidence-only (X5-R24: 6 rounds, the
-provisional classification is a store-side map-exactness deviation),
-NEVER-FIRED and NO-TWIN standing (0 defects / 0 no-twin rounds in the
-esc-2 file). Not this card (X-5c-F2's): C-XX, C-DIV, MP-LIVELOCK,
-MP-A, MW-ORPHAN, the twins, the retune (X5-R17), the sweep, the
-RESULT.** The stages before it (X-5a, X-5b) are complete and merged.
-Opus judges E4 on the RESULT with P's rulings X5-R1–R27.
+Status: **stage X-5c-F3-F3b's steps 0-5 done — step 0 committed F3-F3a's
+Acceptance 10k as the triage file of record (f8251b84) and re-derived the
+class table (MW-ORPHAN 406, the REFRESH's eight named 0..200 rounds);
+step 0' the folded X-5c-F3-F3a-F3 seed-403 pin (9580b10d, RG1/RG2
+demonstrated and reverted); step 1 the meta's WAL bound — wal_ckpt_end/
+ts_ckpt_hi inside the CRC, the flip's commit-cs exclusion, step 1 at the
+contiguous durable prefix, the step-4 fail-stop, the open-time XX001, two
+pins and CKPT-SYNC-OVER-HOLE/META-RANGE-SKIP demonstrated (f5ba9e6b);
+step 2 I-WAL-COVER fail-closed — Fail::WalLoss, nothing written, nine
+variants + two more pins, six mutants demonstrated (4c9905df); step 3 G8
+in full with the WAL path — every wait carries the mark, the broadcast
+after release, the wal_io_fail test hook, two pins and four mutants
+(POISON-AFTER-UNLATCH an equivalent mutant in S-BATON, demonstrated)
+(e724ce05); step 4 X5-R33 in one commit — the harness supply (lives,
+h, a, wal_loss_explained, the (d) cross-check over every meta written),
+the oracle text (lo = max(c_prev, T, h, a); the explained WAL-loss Err),
+mw1/mw2/mf30-32, the record fields and the self-tests with three revert
+demonstrations (86eddb34); step 5 the smoke — the prediction holds: every
+live named round is an explained Err passing, the MW-ORPHAN shape count 0
+in 0..200, 4699 r0 now an explained passing Err, the 37 named rounds all
+frontier >= lo, no MP or C cover_err round (the stage record below). The
+Acceptance 10k is the runner's (X5-R31): no campaign-class command beyond
+the 0..200 runs and single seeds ran in this card's attempts, all under
+the backstop with output outside the worktree. The stages before it
+(X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are complete and
+merged. Opus judges E4 on the RESULT with P's rulings X5-R1-R35.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
