@@ -113,3 +113,49 @@ async fn short_bind_after_startup_closes_without_panicking() {
     assert!(res.is_err());
 }
 
+/// Parse with `$N` past what a Bind can carry is refused with 42P02 and the
+/// connection stays usable (fuzz_wire_protocol crash-9da97719: the number
+/// used to size the parameter-type vectors and abort the process).
+#[tokio::test]
+async fn parse_with_unbindable_placeholder_is_refused() {
+    let (port, task) = serve_one(None).await;
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert_eq!(startup(&mut client).await, b'Z');
+
+    let mut frames = Vec::new();
+    let mut parse = b"\0SELECT $8000000000000000000\0".to_vec();
+    parse.extend_from_slice(&0u16.to_be_bytes());
+    for (tag, body) in [(b'P', parse), (b'S', Vec::new())] {
+        frames.push(tag);
+        frames.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        frames.extend_from_slice(&body);
+    }
+    client.write_all(&frames).await.unwrap();
+
+    let mut saw_error = false;
+    loop {
+        let mut header = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(10), client.read_exact(&mut header))
+            .await
+            .expect("server must answer")
+            .unwrap();
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len - 4];
+        client.read_exact(&mut payload).await.unwrap();
+        match header[0] {
+            b'E' => {
+                assert!(payload.windows(5).any(|w| w == b"42P02"), "{payload:?}");
+                saw_error = true;
+            }
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    assert!(saw_error, "Parse must be refused");
+
+    // Terminate: the connection was not torn down by the refusal.
+    client.write_all(&[b'X', 0, 0, 0, 4]).await.unwrap();
+    task.await.expect("connection task must not panic").unwrap();
+}

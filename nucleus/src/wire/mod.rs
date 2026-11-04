@@ -543,6 +543,21 @@ impl QueryParser for NucleusQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        // A Bind carries at most u16::MAX parameters, so a higher `$N` can
+        // never be bound. Refused here, before anything is sized by it:
+        // `SELECT $8000000000000000000` used to size the parameter-type
+        // vectors at Describe/Bind and abort the whole process on the
+        // allocation failure.
+        let max_param = count_placeholders(sql);
+        if max_param > MAX_BIND_PARAMS {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P02".to_owned(), // undefined_parameter
+                format!(
+                    "there is no parameter ${max_param} (at most {MAX_BIND_PARAMS} parameters can be bound)"
+                ),
+            ))));
+        }
         // Use the executor's AST cache for ~5-10x faster repeated parses.
         // On cache hit, clones the cached AST and substitutes literals via
         // DFS walk instead of re-parsing the SQL string.
@@ -1397,8 +1412,11 @@ impl NucleusHandler {
         ast: Option<&[sqlparser::ast::Statement]>,
         executor: Option<&Arc<Executor>>,
     ) -> Vec<Type> {
-        let param_count = count_placeholders(sql);
-        let count = param_count.max(declared.len());
+        // Clamped: the count sizes the vectors below, and a `$N` past what a
+        // Bind can carry (parse_sql refuses those) must never become an
+        // allocation of N slots.
+        let param_count = count_placeholders(sql).min(MAX_BIND_PARAMS);
+        let count = param_count.max(declared.len()).min(MAX_BIND_PARAMS);
 
         let inferred: Vec<Option<Type>> = match (ast, executor) {
             (Some(stmts), Some(exec)) => infer_param_types_from_ast(stmts, exec, count),
@@ -1720,7 +1738,9 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
             let mut found_digit = false;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 found_digit = true;
-                idx = idx * 10 + (bytes[i] - b'0') as usize;
+                // Saturating, as in count_placeholders: a wrapped index
+                // would substitute a bound value for an out-of-range `$N`.
+                idx = idx.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
                 i += 1;
             }
             if found_digit {
@@ -3714,6 +3734,9 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 /// Count the number of `$N` parameter placeholders in a SQL string.
 ///
 /// Returns the highest `N` found (e.g., `$1, $3` returns 3).
+/// Most parameters a Bind message can carry (its count field is a u16).
+const MAX_BIND_PARAMS: usize = u16::MAX as usize;
+
 fn count_placeholders(sql: &str) -> usize {
     let mut max_idx = 0usize;
     let bytes = sql.as_bytes();
@@ -3794,7 +3817,9 @@ fn count_placeholders(sql: &str) -> usize {
             let mut num = 0usize;
             let mut found_digit = false;
             while i < len && bytes[i].is_ascii_digit() {
-                num = num * 10 + (bytes[i] - b'0') as usize;
+                // Saturating: `$99999999999999999999` must not wrap to a
+                // small (or valid-looking) index.
+                num = num.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
                 found_digit = true;
                 i += 1;
             }
@@ -6996,6 +7021,33 @@ mod tests {
     #[test]
     fn count_placeholders_repeated() {
         assert_eq!(count_placeholders("SELECT $1, $1, $2"), 2);
+    }
+
+    #[test]
+    fn huge_placeholder_number_saturates_and_inference_is_clamped() {
+        // fuzz_wire_protocol crash-9da97719: `$00000008000000000000000`
+        // sized the parameter-type vector and aborted on allocation failure.
+        assert_eq!(count_placeholders("SELECT $99999999999999999999999"), usize::MAX);
+        assert_eq!(count_placeholders("SELECT $00000008000000000000000"), 8_000_000_000_000_000);
+        let types =
+            NucleusHandler::infer_parameter_types_with_ast("SELECT $8000000000000000000", &[], None, None);
+        assert_eq!(types.len(), MAX_BIND_PARAMS);
+        let types = NucleusHandler::infer_parameter_types_with_ast("SELECT $65535", &[], None, None);
+        assert_eq!(types.len(), 65_535);
+    }
+
+    #[test]
+    fn substitution_does_not_wrap_huge_placeholder_numbers() {
+        // fuzz_wire_protocol: `idx * 10` overflowed (debug panic); in release
+        // 2^64 + 1 wrapped to 1 and substituted $1's value.
+        let reps = vec!["'x'".to_owned()];
+        let sql = "SELECT $18446744073709551617";
+        assert_eq!(substitute_positional_placeholders(sql, &reps), sql);
+        assert_eq!(
+            crate::sql::substitute_sql_placeholders(sql, &reps, &Default::default()),
+            sql
+        );
+        assert_eq!(substitute_positional_placeholders("SELECT $1", &reps), "SELECT 'x'");
     }
 
     #[test]
