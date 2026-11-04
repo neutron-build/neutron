@@ -2243,6 +2243,7 @@ P
 # reverts its call by sed: the premise rows prove each hide really hides.
 sed -e 's/^        probs = verify_objects(wt, pre_head, own)$/        probs = []/' \
     -e 's/^            probs = verify_objects(wt, old or pre_head, new) if new else \[\]$/            probs = []/' \
+    -e 's/^                    unverified = _verify_ids(wt, "ref_violations", p.stdout.split(), d)$/                    unverified = []/' \
     "$v3/tools/run_card.py" >"$t/run_card-rv-nover.py"
 # RV1: the R2 rewind dressed as a fast-forward (the gate's reproduction). P
 # sits on the scaffold's first commit and X on P, so nucleus/zz S -> X is a
@@ -2391,6 +2392,215 @@ git -C "$rvcost" update-ref refs/heads/nucleus/zz "$(git -C "$rvcost" commit-tre
 for i in 1 2 3 4 5; do git -C "$rvcost" update-ref "refs/heads/side-rvc$i" "$(git -C "$rvcost" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv cost side $i")"; done
 rv_cost() { local t0 t1 ms o; t0=$(date +%s%N); o=$(rvo "$v3/tools/run_card.py" "$rvcost"); t1=$(date +%s%N); ms=$(((t1 - t0) / 1000000)); echo "$o"; echo "     (RV cost) ref_violations over 10 moved refs: ${ms} ms"; [ "$ms" -lt 2000 ] && [ "$o" = "(no violations)" ]; }
 expect_ok "runner refs: RV cost ten honest moved refs verify in under 2 s" rv_cost
+
+# RV6-RV10 (X-6-F1-F2-F3-F1-F3-F1): the union verify of the full ancestry.
+# Step A lists `rev-list <T> --` (no ^, no ...; T = pre_head, own and every
+# changed ref's old and new) before the ancestry rules, because a symmetric
+# difference's excluded side is computed through the same forged parents it
+# should distrust: two loose forgeries forming a cycle (verdict
+# X-6-F1-F2-F3-F1-F3, Finding 1) hide from old...new and pre_head...new while
+# both verify_objects calls answer []. These rows pin that bypass closed, and
+# are written under the owner's 2026-11-03 forged-object exception (the
+# forgeries stay inside these throwaway copies, as RV1-RV5's do).
+# The one edit above this block (ESC1 ruling 2, on the X-6-F1-F2-F3-F1-F2
+# precedent) inserts a third key into the run_card-rv-nover.py sed: with it
+# the nover copy drops the union verify too, restoring RV1/RV2's original
+# "without the verifies" meaning. Without it the copy keeps the union check
+# and those premises pass only because the union's `refs:` line is no per-ref
+# entry. The canary rows pin both copies' shape. The nounion copy below drops
+# only the union verify: that is e9a5d17b's ref_violations, the behaviour
+# RV6's and RV7's "is fooled" premises probe.
+rv_nover_key() {
+  local o
+  o=$(diff "$v3/tools/run_card.py" "$t/run_card-rv-nover.py")
+  echo "$o"
+  [ "$(printf '%s\n' "$o" | grep -c '^> ')" -eq 3 ] &&
+    [ "$(printf '%s\n' "$o" | sed -n 's/^>  *//p' | LC_ALL=C sort | tr '\n' '|')" = "probs = []|probs = []|unverified = []|" ]
+}
+expect_ok "premise: RV nover copy drops the two verify_objects calls and the union verify" rv_nover_key
+sed -e 's/^                    unverified = _verify_ids(wt, "ref_violations", p.stdout.split(), d)$/                    unverified = []/' "$v3/tools/run_card.py" >"$t/run_card-rv-nounion.py"
+rv_nounion_key() {
+  local o
+  o=$(diff "$v3/tools/run_card.py" "$t/run_card-rv-nounion.py")
+  echo "$o"
+  [ "$(printf '%s\n' "$o" | grep -c '^> ')" -eq 1 ] &&
+    [ "$(printf '%s\n' "$o" | sed -n 's/^>  *//p')" = "unverified = []" ]
+}
+expect_ok "premise: RV nounion copy drops only the union verify" rv_nounion_key
+# rvob RUNNER REPO BEFORE: rvo's body verbatim except the third python
+# argument is "$3", so `before` and pre_head come from BEFORE's honest refs,
+# never from the forged copy (RV8 moves a ref whose old differs from
+# pre_head; the copy's own snapshot cannot supply that old).
+rvob() { PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "$2" "$3" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, b = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+pre = subprocess.run(["git", "rev-parse", "nucleus/v3-scaffold"], cwd=b, capture_output=True, text=True, check=True).stdout.strip()
+print("\n".join(rc.ref_violations(wt, rc.ref_snapshot(b), "card/v3-RV", pre)) or "(no violations)")
+P
+}
+# RV6: the R2 cycle (verdict Finding 1's R2 bend, dated per ESC1 ruling 3).
+# nucleus/zz S -> X over honest X -> Y -> P -> S^1; P is forged to name S and
+# S^1 to name Y, so S -> S^1 -> Y -> P -> S is a cycle and the rewind stops
+# reading as one: is-ancestor S X flips 1 -> 0 and verify_objects(S, X) is []
+# (the symmetric difference is X alone), so e9a5d17b answers (no violations).
+# The bend needs X, Y and P's forged body dated strictly after S (git 2.47.3
+# pops the two-sided paint queue newest committer date first, and with
+# core.commitGraph=false there are no generation numbers), so P, Y and X
+# carry sct+100/+200/+300 and P's forged body keeps that date — RV1-RV3's
+# fixed 1700000000 is older than S and does not bend. The union listing has
+# no excluded side, so P and S^1 are reached through honest links, listed,
+# and fail their hashes.
+rv6d=$(rvc)
+rv6s1=$(git -C "$rv6d" rev-parse nucleus/v3-scaffold~1)
+sct=$(git -C "$rv6d" log -1 --format=%ct "$rvS")
+rv6p=$(GIT_AUTHOR_DATE="@$((sct+100)) +0000" GIT_COMMITTER_DATE="@$((sct+100)) +0000" git -C "$rv6d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv6s1" -m "rv6 P")
+rv6y=$(GIT_AUTHOR_DATE="@$((sct+200)) +0000" GIT_COMMITTER_DATE="@$((sct+200)) +0000" git -C "$rv6d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv6p" -m "rv6 Y")
+rv6x=$(GIT_AUTHOR_DATE="@$((sct+300)) +0000" GIT_COMMITTER_DATE="@$((sct+300)) +0000" git -C "$rv6d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv6y" -m "rv6 X")
+git -C "$rv6d" update-ref refs/heads/nucleus/zz "$rv6x"
+rv6_nocg() { [ ! -e "$rv6d/.git/objects/info/commit-graph" ] && [ ! -e "$rv6d/.git/objects/info/commit-graphs" ]; }
+expect_ok "premise: RV6 the copy has no commit-graph" rv6_nocg
+rv6_rewind() { local rc=0; git -C "$rv6d" merge-base --is-ancestor "$rvS" "$rv6x" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 1 ]; }
+expect_ok "premise: RV6 nucleus/zz S -> X is an honest rewind (is-ancestor exits 1)" rv6_rewind
+rv6_loose() { [ -f "$(objlo "$rv6d" "$rv6p")" ] && [ -f "$(objlo "$rv6d" "$rv6s1")" ]; }
+expect_ok "premise: RV6 P and S^1 are loose objects" rv6_loose
+printf 'tree %s\nparent %s\nauthor t <t@t> %s +0000\ncommitter t <t@t> %s +0000\n\nrv6 P forged\n' "$(git -C "$rv6d" rev-parse "nucleus/v3-scaffold^{tree}")" "$rvS" "$((sct+100))" "$((sct+100))" >"$t/rv6p.body"
+git -C "$rv6d" cat-file commit "$rv6s1" >"$t/rv6s1.body"
+sed "1a parent $rv6y" "$t/rv6s1.body" >"$t/rv6s1f.body"
+save_obj "$rv6d" "$rv6p"
+save_obj "$rv6d" "$rv6s1"
+forge_commit "$rv6d" "$rv6p" "$t/rv6p.body"
+forge_commit "$rv6d" "$rv6s1" "$t/rv6s1f.body"
+rv6_bend() { local rc=0; git -C "$rv6d" merge-base --is-ancestor "$rvS" "$rv6x" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 0 ]; }
+expect_ok "premise: RV6 under the forgery the rewind reads as a fast-forward (is-ancestor exits 0)" rv6_bend
+rv6_old() { local o; o=$(rvo "$t/run_card-rv-nounion.py" "$rv6d"); echo "$o"; [ "$o" = "(no violations)" ]; }
+expect_ok "premise: RV6 the nounion copy (e9a5d17b) is fooled" rv6_old
+rv6_row() {
+  local o u
+  o=$(rvo "$v3/tools/run_card.py" "$rv6d"); echo "$o"
+  u=$(grep '^refs: objects fail verification: ' <<<"$o")
+  { grep -qF "object $rv6p fails its hash" <<<"$u" || grep -qF "object $rv6s1 fails its hash" <<<"$u"; } &&
+    ! grep -qF "may move only as a fast-forward" <<<"$o" &&
+    ! grep -qF "(no violations)" <<<"$o"
+}
+expect_ok "runner refs: RV6 the R2 cycle is refused by the union verify, naming P or S^1" rv6_row
+restore_forged
+expect_ok "forged objects: RV6 restored" no_state4
+# RV7: the R1 cycle (verdict Finding 1's R1 bend; Step A's probe confirmed it,
+# and it is not date-dependent: with M forged, W is unreachable from C under
+# any walk order). side-rv7 is created at C over honest C -> C2 -> M -> W; M
+# is forged to name S and S^1 to name C2, so W drops out of C's ancestry and
+# the taint disappears from every ancestry read while both verifies answer
+# []. The union listing still reaches M and S^1 through honest links.
+rv7d=$(rvc)
+rv7m=$(git -C "$rv7d" commit-tree "card/v3-RV^{tree}" -p "$rvW" -m "rv7 M")
+rv7c2=$(git -C "$rv7d" commit-tree "card/v3-RV^{tree}" -p "$rv7m" -m "rv7 C2")
+rv7c=$(git -C "$rv7d" commit-tree "card/v3-RV^{tree}" -p "$rv7c2" -m "rv7 C")
+git -C "$rv7d" update-ref refs/heads/side-rv7 "$rv7c"
+rv7s1=$(git -C "$rv7d" rev-parse nucleus/v3-scaffold~1)
+rv7_taint() { local rc=0; git -C "$rv7d" merge-base --is-ancestor "$rvW" "$rv7c" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 0 ]; }
+expect_ok "premise: RV7 C descends from the worker commit W" rv7_taint
+git -C "$rv7d" cat-file commit "$rv7m" >"$t/rv7m.body"
+sed "s/^parent $rvW$/parent $rvS/" "$t/rv7m.body" >"$t/rv7mf.body"
+git -C "$rv7d" cat-file commit "$rv7s1" >"$t/rv7s1.body"
+sed "1a parent $rv7c2" "$t/rv7s1.body" >"$t/rv7s1f.body"
+save_obj "$rv7d" "$rv7m"
+save_obj "$rv7d" "$rv7s1"
+forge_commit "$rv7d" "$rv7m" "$t/rv7mf.body"
+forge_commit "$rv7d" "$rv7s1" "$t/rv7s1f.body"
+rv7_hidden() { local rc=0; git -C "$rv7d" merge-base --is-ancestor "$rvW" "$rv7c" || rc=$?; echo "is-ancestor exit: $rc"; [ "$rc" -eq 1 ]; }
+expect_ok "premise: RV7 under the forgery W is no longer an ancestor of C" rv7_hidden
+rv7_old() { local o; o=$(rvo "$t/run_card-rv-nounion.py" "$rv7d"); echo "$o"; [ "$o" = "(no violations)" ]; }
+expect_ok "premise: RV7 the nounion copy (e9a5d17b) is fooled" rv7_old
+rv7_row() {
+  local o u
+  o=$(rvo "$v3/tools/run_card.py" "$rv7d"); echo "$o"
+  u=$(grep '^refs: objects fail verification: ' <<<"$o")
+  { grep -qF "object $rv7m fails its hash" <<<"$u" || grep -qF "object $rv7s1 fails its hash" <<<"$u"; } &&
+    ! grep -qF "carries this run's commit" <<<"$o" &&
+    ! grep -qF "(no violations)" <<<"$o"
+}
+expect_ok "runner refs: RV7 the R1 cycle is refused by the union verify, naming M or S^1" rv7_row
+restore_forged
+expect_ok "forged objects: RV7 restored" no_state4
+# RV8: old != pre_head, the forged commit reachable only from old (ESC1
+# ruling 1). rv8b is the before repository: nucleus/zz moves to O over honest
+# O -> F -> S. The after repository rv8d is a copy of it whose zz moves
+# S -> X (X -> S), so before/after differ exactly on zz, F hangs only from
+# old, and rvob reads `before` (and pre_head) from rv8b's honest refs. F's
+# forgery changes only its message line, so no ancestry bends and F just
+# fails its hash. Two lines must name it: the union's `refs:` line (F is in
+# old's ancestry; catches F3F1-DROP-OLD) and the per-ref old...new line
+# (catches G-OLD-AS-PREHEAD, which verifies pre_head...new and misses F).
+# rv8b itself is never forged.
+rv8b=$(rvc)
+rv8f=$(git -C "$rv8b" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv8 F")
+rv8o=$(git -C "$rv8b" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rv8f" -m "rv8 O")
+git -C "$rv8b" update-ref refs/heads/nucleus/zz "$rv8o"
+rv8d=$(mktemp -d "$t/rv.XXXX")
+cp -a "$rv8b/." "$rv8d"
+rv8x=$(git -C "$rv8d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv8 X")
+git -C "$rv8d" update-ref refs/heads/nucleus/zz "$rv8x"
+rv8_before() { [ "$(git -C "$rv8b" rev-parse refs/heads/nucleus/zz)" = "$rv8o" ]; }
+expect_ok "premise: RV8 the before repository's nucleus/zz is O" rv8_before
+rv8_oldlist() { git -C "$rv8d" rev-list "$rv8o" -- | grep -qxF "$rv8f"; }
+expect_ok "premise: RV8 rev-list O -- lists F (F hangs from old)" rv8_oldlist
+rv8_notips() { ! git -C "$rv8d" rev-list "$rvS" "$rvW" "$rv8x" -- | grep -qxF "$rv8f"; }
+expect_ok "premise: RV8 rev-list S W X -- does not list F (F is reachable only from old)" rv8_notips
+expect_ok "premise: RV8 F is a loose object" bash -c "[ -f '$(objlo "$rv8d" "$rv8f")' ]"
+git -C "$rv8d" cat-file commit "$rv8f" >"$t/rv8f.body"
+sed 's/^rv8 F$/rv8 F forged/' "$t/rv8f.body" >"$t/rv8ff.body"
+save_obj "$rv8d" "$rv8f"
+forge_commit "$rv8d" "$rv8f" "$t/rv8ff.body"
+rv8_row() {
+  local o u
+  o=$(rvob "$v3/tools/run_card.py" "$rv8d" "$rv8b"); echo "$o"
+  u=$(grep '^refs: objects fail verification: ' <<<"$o")
+  grep -qF "object $rv8f fails its hash" <<<"$u" &&
+    grep "^refs/heads/nucleus/zz: $rv8o -> $rv8x objects fail verification: " <<<"$o" | grep -qF "object $rv8f fails its hash" &&
+    ! grep -qF "may move only as a fast-forward" <<<"$o" &&
+    ! grep -qF "(no violations)" <<<"$o"
+}
+expect_ok "runner refs: RV8 a forgery reachable only from old is named by the union line and the per-ref old...new line" rv8_row
+restore_forged
+expect_ok "forged objects: RV8 restored" no_state4
+# RV9: a forged tip. side-rv9 is created at honest C, whose loose file then
+# becomes its body with a changed message line. A plain `rev-list <tips> --`
+# reads a forged tip fine (it exits 0 and lists the lie, unlike the range
+# forms, which hash-check a tip named on the command line and exit 128), so
+# the union verify names C by its hash failure — the per-ref verify's failed
+# git step alone is not the row.
+rv9d=$(rvc)
+rv9c=$(git -C "$rv9d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv9 C")
+git -C "$rv9d" update-ref refs/heads/side-rv9 "$rv9c"
+git -C "$rv9d" cat-file commit "$rv9c" >"$t/rv9c.body"
+sed 's/^rv9 C$/rv9 C forged/' "$t/rv9c.body" >"$t/rv9cf.body"
+save_obj "$rv9d" "$rv9c"
+forge_commit "$rv9d" "$rv9c" "$t/rv9cf.body"
+rv9_row() {
+  local o u
+  o=$(rvo "$v3/tools/run_card.py" "$rv9d"); echo "$o"
+  u=$(grep '^refs: objects fail verification: ' <<<"$o")
+  grep -qF "object $rv9c fails its hash" <<<"$u"
+}
+expect_ok "runner refs: RV9 a forged tip fails the union verify by its hash, not by a failed git step" rv9_row
+restore_forged
+expect_ok "forged objects: RV9 restored" no_state4
+# RV10: a failed union listing is an entry, never [] (F3F1-FAIL-OPEN). No
+# argument is unique to the union `rev-list <sorted tips> --`, so the shim
+# word is side-rv10's full id C: it also fails the per-ref verify's
+# --no-walk listing and C's merge-base, whose entries appear beside the
+# union's own. The row pins that line, exactly.
+rv10d=$(rvc)
+rv10c=$(git -C "$rv10d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv10 C")
+git -C "$rv10d" update-ref refs/heads/side-rv10 "$rv10c"
+rv10_row() {
+  local o
+  o=$(gshim "$rv10c" rvo "$v3/tools/run_card.py" "$rv10d"); echo "$o"
+  grep -qxF "refs: objects fail verification: ref_violations: git rev-list failed (exit 128; cannot verify objects)" <<<"$o" &&
+    ! grep -qF "(no violations)" <<<"$o"
+}
+expect_ok "runner refs: RV10 a failed union rev-list is an entry, never []" rv10_row
 
 # --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
 # The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
