@@ -7,7 +7,23 @@
 set -euo pipefail
 src=$(cd "$(dirname "$0")/.." && pwd)        # the real nucleus/v3
 t=$(mktemp -d)
-trap 'rm -rf "$t"' EXIT
+# --- an abort is a FAIL line (X-6-F1-F2-F3-F1-F4 Step 3) ---------------------
+# aborted_at records the line set -e stopped at (the ERR trap fires only for
+# commands whose failure aborts the script: rows run their commands inside
+# expect_ok's if or behind ||, which suspend it, and functions do not inherit
+# it), and suite_finished marks the planned final exit. The EXIT trap keeps
+# rm -rf "$t" and the exit status, and adds a FAIL line for an early abort —
+# an exit that did not come from the final `exit $(( fails > 0 ))` — so a
+# mutant run reports where it stopped instead of silently losing every later
+# row. The Step 3 self-test row at the end of the suite lifts the marked block
+# verbatim into a throwaway script: removing the print here (TRAP-SILENT)
+# fails that row.
+# BEGIN suite-abort-trap (lifted verbatim by the Step 3 self-test row)
+aborted_at=0
+suite_finished=0
+trap 'aborted_at=$LINENO' ERR
+trap 'rc=$?; if [ "${suite_finished:-0}" -eq 0 ] && [ "$rc" -ne 0 ]; then echo "FAIL suite aborted (set -e) near line ${aborted_at:-0}; later rows did not run"; fi; rm -rf "$t"' EXIT
+# END suite-abort-trap
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1"; fails=$((fails + 1)); }
@@ -1673,6 +1689,28 @@ open(path, "wb").write(bytes(d))
 P
 }
 
+# mc_window_reset P0 BRANCH: after a merge-card window's expect_* row, put the
+# repository back whatever merge-card did, so a mutant that wrongly merges
+# cannot abort the rest of the suite at the next checkout (X-6-F1-F2-F3-F1-F4
+# Step 2). restore_forged goes first — git must not read the worktree under
+# forged bytes — then the scratch branch resets --hard to P0 (recorded before
+# the window; HEAD never left the branch), then a forced checkout re-syncs the
+# worktree to the branch the window started on. Every step is || true and the
+# helper returns 0: a failed step must not abort the suite either. No git
+# clean: untracked fixtures may exist. restore_forged is idempotent, so the
+# window's own restore row still runs after it.
+mc_window_reset() {
+  local p0=$1 b=$2
+  restore_forged || true
+  git -C "$r" reset -q --hard "$p0" || true
+  git -C "$r" checkout -q -f "$b" || true
+  return 0
+}
+# mc_unmoved AFTER P0: exit 1, printing the move, when the scratch branch tip
+# captured right after the window's mc ran (AFTER) is not the P0 recorded
+# before it — a merge-card that merged moved it.
+mc_unmoved() { [ "$1" = "$2" ] || { echo "branch tip moved: $2 -> $1"; return 1; }; }
+
 # (a) Card side: card/v3-OV's tip root tree file holds the scaffold tip's bytes.
 card OV S standard; branch OV nucleus/v3/tools/ov.py; verdict OV S MERGE standard S
 ovt=$(git -C "$r" rev-parse "card/v3-OV^{tree}")
@@ -1708,10 +1746,75 @@ restore_forged
 # merge-card needs HEAD on scratch/*, and no checkout moves under a forged
 # tree: a second forging window with HEAD already in place.
 git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+p0=$(git -C "$r" rev-parse scratch/pass1); pb=$(git -C "$r" rev-parse --abbrev-ref HEAD)
 forge_from "$r" "$ovt" "$sct"
 expect_ok "(a) merge-card refuses, naming the tree" out_has "object $ovt fails its hash" -- mc OV
+pa=$(git -C "$r" rev-parse "$pb")
+mc_window_reset "$p0" "$pb"
+expect_ok "forged objects: (a) merge-card left scratch/pass1 unmoved" mc_unmoved "$pa" "$p0"
 restore_forged
 expect_ok "forged objects: (a) restored" no_state4
+
+# (a″) A forgery that only verification refuses (X-6-F1-F2-F3-F1-F4): T1, the
+# scaffold tip's tree plus V's verdict blob (built through a scratch index as
+# (a′) builds v2y), becomes V's root-tree file's bytes, and W's root-tree file
+# takes the scaffold tip's tree bytes. V's tree then reads as "scaffold +
+# verdict", so the verdict blob is found and verifies (it is honest); the tip
+# diff-tree W V lists only the verdict; diff scaffold...V lists only the
+# verdict, so tools/ov.py is hidden from the S-verdict CORE rule; and the
+# Commit is honest. Every rule except verification passes — the discrimination
+# (a) lacked: its forged tip tree lost the verdict path, so check_merge
+# returned "no verdicts/OV.md at the branch tip" before any verification.
+# HEAD stays where (a)'s window left it (scratch/pass1, whose tree sct is not
+# forged here); (a)'s fixtures (card OV, ovt, sct) are reused after (a)'s
+# window restored them, and every id is captured before its object is forged.
+ovvb=$(git -C "$r" rev-parse "card/v3-OV:nucleus/v3/verdicts/OV.md")
+ovw=$(git -C "$r" rev-parse "card/v3-OV^")
+ovwt=$(git -C "$r" rev-parse "$ovw^{tree}")
+GIT_INDEX_FILE=$t/ov3.idx git -C "$r" read-tree "$sct"
+GIT_INDEX_FILE=$t/ov3.idx git -C "$r" update-index --add --cacheinfo "100644,$ovvb,nucleus/v3/verdicts/OV.md"
+ov3t1=$(GIT_INDEX_FILE=$t/ov3.idx git -C "$r" write-tree)
+rm -f "$t/ov3.idx"
+expect_ok "premise: (a″) T1 (scaffold tree + the verdict blob) is a new loose tree, distinct from both root trees, and W's tree is loose" bash -c "[ '$ov3t1' != '$sct' ] && [ '$ov3t1' != '$ovt' ] && [ '$ov3t1' != '$ovwt' ] && [ -f '$(objlo "$r" "$ov3t1")' ] && [ -f '$(objlo "$r" "$ovwt")' ]"
+save_obj "$r" "$ovt"
+save_obj "$r" "$ovwt"
+forge_from "$r" "$ovt" "$ov3t1"
+forge_from "$r" "$ovwt" "$sct"
+a2_hidden() { local d; d=$(plain diff --name-only nucleus/v3-scaffold...card/v3-OV); echo "diff: $d"; [ "$d" = nucleus/v3/verdicts/OV.md ]; }
+expect_ok "premise: (a″) plain diff scaffold...card/v3-OV prints exactly the verdict path" a2_hidden
+# The discriminating premise: a /tmp copy of the scripts (under $t) with both
+# merge-mode verification points removed — the tip check's verify_objects call,
+# and check_merge's `changed` call replaced by the unverified _changed_names —
+# accepts this forgery in merge mode: only verification refuses. Unlike
+# audit_novr's copy (audit-merges.sh cd's home, so it lives under
+# $v3/scripts), this one is sourced straight and lives under $t with its
+# neighbours; the real scripts are never touched.
+a2lib=$t/a2lib
+mkdir -p "$a2lib"
+cp "$v3"/scripts/*.sh "$a2lib"/
+sed -i 's/^  if \[ "$mode" != audit \] && ! verify_objects "$head^1" "$head"; then$/  if false; then/' "$a2lib/enforce-lib.sh"
+sed -i 's/^  elif ! changed /  elif ! _changed_names /' "$a2lib/enforce-lib.sh"
+a2_libcopy() {
+  local o
+  o=$(diff "$v3/scripts/enforce-lib.sh" "$a2lib/enforce-lib.sh")
+  echo "$o"
+  [ "$(grep -c '^< ' <<<"$o")" -eq 2 ] && [ "$(grep -c '^> ' <<<"$o")" -eq 2 ] &&
+    grep -qF '>   if false; then' <<<"$o" &&
+    grep -qF '>   elif ! _changed_names ' <<<"$o"
+}
+expect_ok "premise: (a″) the /tmp copy drops exactly the two merge-mode verify points" a2_libcopy
+a2_noverifies() {
+  local o rc=0
+  o=$(cd "$v3" && . "$a2lib/core-paths-lib.sh" && . "$a2lib/enforce-lib.sh" && check_merge OV nucleus/v3-scaffold card/v3-OV merge S standard) || rc=$?
+  echo "$o"
+  echo "exit $rc"
+  [ "$rc" -eq 0 ] && [ -z "$o" ]
+}
+expect_ok "premise: (a″) without the two verify points merge-mode check_merge accepts the forgery (only verification refuses)" a2_noverifies
+rm -rf "$a2lib"
+expect_ok "(a″) merge-mode check_merge refuses, naming V's tree" out_has "object $ovt fails its hash" -- cmv OV nucleus/v3-scaffold card/v3-OV S standard
+restore_forged
+expect_ok "forged objects: (a″) restored" no_state4
 
 # (a') The tip check's own range: a verdict tip that also adds tools/ov2.py,
 # with the work commit's root tree swapped for the tip tree minus the verdict,
@@ -1731,11 +1834,15 @@ GIT_INDEX_FILE=$t/ov2.idx git -C "$r" update-index --add --cacheinfo "100644,$ov
 v2y=$(GIT_INDEX_FILE=$t/ov2.idx git -C "$r" write-tree)
 rm -f "$t/ov2.idx"
 git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+p0=$(git -C "$r" rev-parse scratch/pass1); pb=$(git -C "$r" rev-parse --abbrev-ref HEAD)
 save_obj "$r" "$w2t"
 forge_from "$r" "$w2t" "$v2y"
 a2_tip() { local d; d=$(git -C "$r" diff-tree --no-commit-id --name-only -r card/v3-OV2); echo "tip: $d"; [ "$d" = nucleus/v3/verdicts/OV2.md ]; }
 expect_ok "premise: (a') under the swap the tip's diff-tree lists only the verdict" a2_tip
 expect_ok "(a') merge-card refuses through the tip check, naming the work tree" out_has "object $w2t fails its hash" -- mc OV2
+pa=$(git -C "$r" rev-parse "$pb")
+mc_window_reset "$p0" "$pb"
+expect_ok "forged objects: (a') merge-card left scratch/pass1 unmoved" mc_unmoved "$pa" "$p0"
 restore_forged
 expect_ok "forged objects: (a') restored" no_state4
 
@@ -1762,8 +1869,12 @@ restore_forged
 # one; the status read's failure is swallowed by the emptiness test and the
 # verify call before check_merge names the object.
 git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+p0=$(git -C "$r" rev-parse scratch/pass1); pb=$(git -C "$r" rev-parse --abbrev-ref HEAD)
 forge_from "$r" "$sct" "$ovt"
 expect_ok "(b) merge-card refuses, naming the scaffold tree" out_has "object $sct fails its hash" -- mc OV
+pa=$(git -C "$r" rev-parse "$pb")
+mc_window_reset "$p0" "$pb"
+expect_ok "forged objects: (b) merge-card left scratch/pass1 unmoved" mc_unmoved "$pa" "$p0"
 restore_forged
 # (b') merge-card's own call: the scratch tip's tree, which no check_merge
 # range covers (the merge base is below it): the NO-VERIFY-MERGE-CARD row and
@@ -1771,9 +1882,13 @@ restore_forged
 # HEAD moves to pass2 before the forgery (no checkout moves under one).
 git -C "$r" checkout -q scratch/pass2
 p2t=$(git -C "$r" rev-parse "scratch/pass2^{tree}")
+p0=$(git -C "$r" rev-parse scratch/pass2); pb=$(git -C "$r" rev-parse --abbrev-ref HEAD)
 save_obj "$r" "$p2t"
 forge_from "$r" "$p2t" "$sct"
 expect_ok "(b') merge-card refuses on a forged scratch-tip tree outside the card's range" out_has "object $p2t fails its hash" -- mc A
+pa=$(git -C "$r" rev-parse "$pb")
+mc_window_reset "$p0" "$pb"
+expect_ok "forged objects: (b') merge-card left scratch/pass2 unmoved" mc_unmoved "$pa" "$p0"
 restore_forged
 git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
 expect_ok "forged objects: (b) restored" no_state4
@@ -1984,6 +2099,7 @@ olid=$(git -C "$r" rev-parse "card/v3-OL:nucleus/v3/verdicts/OL.md")
 sed 's/^Gate-tier: S$/Gate-tier: P/' "$v3/verdicts/OL.md" >"$t/ol.p"
 olf=$(git -C "$r" hash-object -w "$t/ol.p")
 git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+p0=$(git -C "$r" rev-parse scratch/pass1); pb=$(git -C "$r" rev-parse --abbrev-ref HEAD)
 save_obj "$r" "$olid"
 forge_from "$r" "$olid" "$olf"
 l_premise() { local o; o=$(git -C "$r" show "card/v3-OL:nucleus/v3/verdicts/OL.md"); echo "$o"; grep -qxF "Gate-tier: P" <<<"$o"; }
@@ -1992,6 +2108,9 @@ olv="blob $olid (card/v3-OL:nucleus/v3/verdicts/OL.md) fails its hash"
 expect_ok "(l) merge-mode check_merge refuses, naming the blob" out_has "$olv" -- cmv OL nucleus/v3-scaffold card/v3-OL P core
 expect_ok "(l) audit-mode check_merge refuses, naming the blob" out_has "$olv" -- bash -c "cd '$v3' && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge OL nucleus/v3-scaffold card/v3-OL audit"
 expect_ok "(l) merge-card refuses, naming the blob" out_has "$olv" -- mc OL
+pa=$(git -C "$r" rev-parse "$pb")
+mc_window_reset "$p0" "$pb"
+expect_ok "forged objects: (l) merge-card left scratch/pass1 unmoved" mc_unmoved "$pa" "$p0"
 restore_forged
 expect_ok "forged objects: (l) restored" no_state4
 
@@ -3753,6 +3872,27 @@ r1_list() {
 }
 expect_ok "R1: the real SHORT_COMMIT_MERGES has 44 distinct full 40-hex ids, one per line with a card id" r1_list
 expect_ok "git state: none after the full-id rows" no_state
+# --- Step 3 self-test (X-6-F1-F2-F3-F1-F4) -----------------------------------
+# A throwaway script that sources nothing but the suite's own abort-trap block
+# (lifted verbatim between the markers above) and runs `false` under set -e:
+# its output must have the FAIL aborted line and its exit status must be
+# non-zero, without aborting this suite. Lifting the real block — not a
+# re-implementation — is what makes the TRAP-SILENT mutant (the print removed
+# above) fail this row.
+step3_selftest() {
+  local self=${BASH_SOURCE[0]} s o rc=0
+  s=$t/step3-selftest.sh
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nt=$(mktemp -d) # the lifted trap cleans this\n'
+    sed -n '/^# BEGIN suite-abort-trap (lifted verbatim by the Step 3 self-test row)$/,/^# END suite-abort-trap$/p' "$self" | sed '1d;$d'
+    printf 'false\nsuite_finished=1\nexit 0\n'
+  } >"$s"
+  o=$(bash "$s" 2>&1) || rc=$?
+  printf 'exit %d\n%s\n' "$rc" "$o"
+  [ "$rc" -ne 0 ] && grep -qF "FAIL suite aborted (set -e) near line" <<<"$o"
+}
+expect_ok "Step 3 self-test: a set -e abort prints the FAIL aborted line and exits non-zero" step3_selftest
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
+suite_finished=1
 exit $(( fails > 0 ))
