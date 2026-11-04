@@ -820,6 +820,14 @@ pub fn wal_step1<H: StoreHost>(cx: &Cx<'_, H>, t: u64, enqueue_end: u64) -> Resu
     wal_wait_durable(cx, end)
 }
 
+/// Is boot id `a` **older** than `b` in §12.5's serial-number order
+/// (S-1-F3 W4 (i)): `a` is older than `b` iff `(a − b) mod 2³² ≥ 2³¹`.
+/// The same comparison `recover`'s walk uses for the ordered boot-id
+/// stop; shared with the `wal_start_lsn` filter below.
+pub fn boot_id_older(a: u32, b: u32) -> bool {
+    a.wrapping_sub(b) >= 1u32 << 31
+}
+
 /// Compute `wal_start_lsn` at the flip (§12.6): the minimum of the
 /// LSN of the first **Commit or CommitMarker** with `commit_ts > T`
 /// (or the append position if there is none), and the first Chunk LSN
@@ -828,6 +836,18 @@ pub fn wal_step1<H: StoreHost>(cx: &Cx<'_, H>, t: u64, enqueue_end: u64) -> Resu
 /// them; SegmentEnd fillers likewise never pull the start.)
 /// START-LSN-MARKED-CHUNK drops the marked case; START-LSN-PAST-CHUNK
 /// drops the open-txn case.
+/// **The open-txn (`None`) arm holds back only for chunks of the
+/// current boot** (S-STORE §14 step 8, as merged at the base: "Chunks
+/// of the previous boot that have no marker belong to transactions
+/// that ended without one …, all ended before this flip, so they do
+/// not hold back `wal_start_lsn` (§12.6)"; the X-5c-F3-F3a rework's
+/// Finding 1). A previous boot's unmarked chunk can never gain its
+/// marker — its transaction ended with the boot — so retaining it in
+/// the arm held the start back at an older boot's record, the next
+/// meta's `wal_start_lsn` pointed at it, and §12.5's first-record
+/// floor (the opened meta's `boot_id`) stopped the next walk there,
+/// losing every acked commit of the new boot (100 class-C
+/// `frontier < lo` store losses in the first run's Acceptance file).
 pub fn wal_start_lsn(st: &StoreInner, t: u64, open_chunks: &BTreeMap<(u32, u64), u64>) -> u64 {
     let mut start = st.wal.append;
     for (l, (ts, _marker, _txn)) in st.wal.buf_tags.iter() {
@@ -849,8 +869,14 @@ pub fn wal_start_lsn(st: &StoreInner, t: u64, open_chunks: &BTreeMap<(u32, u64),
                 }
             }
             None => {
-                // An open transaction (no marker yet).
-                if !skip_open {
+                // An open transaction (no marker yet) — of **this boot
+                // only**: a previous boot's unmarked chunk never gains a
+                // marker, so §14 step 8 keeps it out of the hold-back
+                // (the arm's boot filter; the rework's Finding 1). The
+                // chunks still sit in `open_chunks` (a marker of the
+                // same id from a *newer* boot could name them), but the
+                // start never points at an older boot's record.
+                if !skip_open && !boot_id_older(txn.0, st.boot_id) {
                     start = start.min(*first);
                 }
             }
