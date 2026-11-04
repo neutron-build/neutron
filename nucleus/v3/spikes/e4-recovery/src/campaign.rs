@@ -1237,6 +1237,7 @@ pub mod directed_arms {
                     &Model::new(),
                     0,
                     None,
+                    None,
                 );
                 Some(!out.pass && out.o1.is_err())
             }
@@ -1303,6 +1304,7 @@ pub mod directed_arms {
                     &Model::new(),
                     0,
                     None,
+                    None,
                 );
                 let pf = base.crashed_disk.stat(super::super::sim::PAGE_FILE)?;
                 let meta = harness::durable_image(&base.crashed_disk, &cfg254(None)).2?;
@@ -1339,6 +1341,7 @@ pub mod directed_arms {
                     st2,
                     &Model::new(),
                     0,
+                    None,
                     None,
                 );
                 Some(out.served)
@@ -1390,7 +1393,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1427,6 +1430,9 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                     .collect::<Vec<_>>()
                     .join(","),
                 x.cover_err,
+                x.x33h,
+                x.x33a,
+                x.x33x,
                 x.client_xx001,
                 x.pass,
                 x.deadlock,
@@ -1851,6 +1857,9 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "smx" => x.smx = j.boolv()?,
             "pass_na" => x.pass_na = j.opt_bool()?,
             "cover_err" => x.cover_err = j.boolv()?,
+            "x33h" => x.x33h = j.num()? as u64,
+            "x33a" => x.x33a = j.num()? as u64,
+            "x33x" => x.x33x = j.boolv()?,
             "ack_over" => {
                 j.eat(b'[')?;
                 if !j.try_eat(b']') {

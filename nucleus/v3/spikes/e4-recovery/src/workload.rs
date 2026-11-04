@@ -727,6 +727,13 @@ pub struct RoundRec {
     /// match). A diagnostic in the record; the pass fold does not read
     /// it. X5-R33 (h) counts such rounds per class through it.
     pub cover_err: bool,
+    /// **X5-R33 (c): `h`** — the opened meta's writing-life bound.
+    pub x33h: u64,
+    /// **X5-R33 (c): `a`** — the round's largest X5-R34-acked SyncOn ts
+    /// below the first damaged WAL byte.
+    pub x33a: u64,
+    /// **X5-R33 (e): `wal_loss_explained`.**
+    pub x33x: bool,
     /// X-5c: script ops that unwound on a client-visible XX001.
     pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
@@ -995,6 +1002,11 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         model: Model::new(),
         cut: 0,
     });
+    // **X5-R33 (a): the per-seed record-stream lives**, carried like the
+    // model. Each real round's life (p0, its records, its boot, its
+    // starting frontier, its append end) is appended after the round.
+    let mut x33_lives: Vec<harness::X33Life> = Vec::new();
+    let mut x33_prev_frontier = 0u64;
     for round in 0..round_counts {
         let Some(ch) = chain.take() else {
             break;
@@ -1044,6 +1056,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 ch.st.clone(),
                 &ch.model,
                 ch.cut,
+                None,
                 None,
             );
             let k = uniform_yield_point(seed, round, out.sched_yields.max(1));
@@ -1161,6 +1174,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                     &tch.model,
                     tch.cut,
                     Some(&mut reads),
+                    None,
                 );
                 (out, reads)
             };
@@ -1219,6 +1233,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                                 &tch_retry.model,
                                 tch_retry.cut,
                                 Some(&mut reads),
+                                None,
                             );
                             (o, reads)
                         };
@@ -1257,6 +1272,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                             &tch_retry.model,
                             tch_retry.cut,
                             Some(&mut reads),
+                            None,
                         );
                         (o, reads)
                     };
@@ -1335,6 +1351,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             ch.st,
             &ch.model,
             ch.cut,
+            None,
             None,
         );
         // **X5-R16 NEVER-FIRED, the class C half** (no twin exists to
@@ -1422,6 +1439,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                             &tch.model,
                             tch.cut,
                             Some(&mut treads),
+                            None,
                         );
                         if let Some(d) = crash_fired_defect(&tout, &crash_desc)
                             && rec.defect.is_none()
@@ -1479,6 +1497,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                         &retry.model,
                         retry.cut,
                         None,
+                        None,
                     );
                 }
             }
@@ -1534,6 +1553,12 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             // Not a verdict field: the round's own record carries it; a
             // defect at seed level stays create failures only.
         }
+        // X5-R33 (a): append this (final attempt of the) round's life
+        // and carry its frontier as the next round's starting frontier.
+        if let Some(life) = out.x33_life.take() {
+            x33_lives.push(life);
+        }
+        x33_prev_frontier = x33_prev_frontier.max(out.frontier);
         match out.end_store.clone() {
             Some(st) => {
                 // Judgment call (documented in the README): the chain
@@ -1623,6 +1648,9 @@ fn round_rec(
     rr.pass_na = out.pass_na;
     rr.ack_over = out.ack_over.clone();
     rr.cover_err = out.cover_err;
+    rr.x33h = out.x33h;
+    rr.x33a = out.x33a;
+    rr.x33x = out.x33x;
     rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();

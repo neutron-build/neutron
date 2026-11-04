@@ -125,7 +125,7 @@ fn script_with_crash(crash: Option<CrashSpec>) -> Script {
 fn run(seed: u64, script: &Script, f: &RoundFaults, m: Option<Mutant>) -> harness::RoundOutcome {
     let (disk, st) = harness::create_store(cfg(m), seed, 7).expect("create");
     let model = Model::new();
-    harness::run_round(seed, 0, script, f, cfg(m), disk, st, &model, 0, None)
+    harness::run_round(seed, 0, script, f, cfg(m), disk, st, &model, 0, None, None)
 }
 
 /// D1 (every boundary): one fixed workload; for each of the 10 hooks,
@@ -719,6 +719,7 @@ fn d7_zombie_tail() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     // Round 1: the valid end sits at tail 3 (torn), tail 4 intact past
@@ -773,6 +774,7 @@ fn d7_zombie_tail() {
             r1.end_store.clone().expect("D7 round-1 end store"),
             &r1.end_model,
             r1.cut,
+            None,
             None,
         )
     };
@@ -1024,6 +1026,7 @@ fn d10_lost_meta() {
         &Model::new(),
         0,
         Some(&mut twin),
+        None,
     );
     assert!(
         clean.detections.contains(&"open"),
@@ -1067,6 +1070,7 @@ fn d10_lost_meta() {
         &Model::new(),
         0,
         Some(&mut twin),
+        None,
     );
     assert!(
         !m.pass && m.o1.is_err(),
@@ -1197,6 +1201,7 @@ fn d10b_rollback_exception() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     let clean = mk(None, false);
@@ -1417,6 +1422,7 @@ fn r10_sequencer_restarts_at_the_frontier() {
             base.end_store.clone().expect("R10 end store"),
             &base.end_model,
             base.cut,
+            None,
             None,
         )
     };
@@ -2002,6 +2008,7 @@ fn freeset_growth_covers_its_own_slots() {
                     &Model::new(),
                     0,
                     None,
+                    None,
                 );
                 assert!(
                     out.pass && out.o2_fail.is_none() && out.amcheck_i.is_empty(),
@@ -2162,6 +2169,7 @@ fn d16_epoch_reserve() {
             &model,
             0,
             None,
+            None,
         )
     };
     let clean = mk(None);
@@ -2302,6 +2310,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
             &Model::new(),
             0,
             None,
+            None,
         )
     };
     assert!(
@@ -2387,6 +2396,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     let r = run_r4(Some(Mutant::RefCrcSkip));
@@ -2511,6 +2521,7 @@ fn d17_integrity() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     // A faultless crash round supplies the crashed disk the fault is
@@ -2528,6 +2539,7 @@ fn d17_integrity() {
             st,
             &Model::new(),
             0,
+            None,
             None,
         )
     };
@@ -2699,6 +2711,7 @@ fn d17_integrity() {
             &Model::new(),
             0,
             None,
+            None,
         )
     };
     assert!(base2.o1.is_ok(), "D17 REFCRC base: {:?}", base2.o1);
@@ -2792,6 +2805,7 @@ fn d17_integrity() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     // Clean: check (2) is the only discriminator — XX001 at open, never
@@ -2873,6 +2887,7 @@ fn d17_integrity() {
                     st,
                     &Model::new(),
                     0,
+                    None,
                     None,
                 );
                 let pf = b
@@ -3276,6 +3291,7 @@ fn twin_supply_carries_a_failed_recovery_reads() {
         &Model::new(),
         0,
         Some(&mut twin),
+        None,
     );
     // Sanity: this is a failed-recovery round (the recovery-Err branch
     // of the oracle judged it).
