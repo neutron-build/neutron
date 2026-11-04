@@ -1,6 +1,6 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F3b's steps 0-5 done — step 0 committed F3-F3a's
+Status: **stage X-5c-F3-F3b's steps 0-6 done — step 0 committed F3-F3a's
 Acceptance 10k as the triage file of record (f8251b84) and re-derived the
 class table (MW-ORPHAN 406, the REFRESH's eight named 0..200 rounds);
 step 0' the folded X-5c-F3-F3a-F3 seed-403 pin (9580b10d, RG1/RG2
@@ -17,15 +17,21 @@ after release, the wal_io_fail test hook, two pins and four mutants
 h, a, wal_loss_explained, the (d) cross-check over every meta written),
 the oracle text (lo = max(c_prev, T, h, a); the explained WAL-loss Err),
 mw1/mw2/mf30-32, the record fields and the self-tests with three revert
-demonstrations (86eddb34); step 5 the smoke — the prediction holds: every
-live named round is an explained Err passing, the MW-ORPHAN shape count 0
-in 0..200, 4699 r0 now an explained passing Err, the 37 named rounds all
-frontier >= lo, no MP or C cover_err round (the stage record below). The
-Acceptance 10k is the runner's (X5-R31): no campaign-class command beyond
-the 0..200 runs and single seeds ran in this card's attempts, all under
-the backstop with output outside the worktree. The stages before it
-(X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are complete and
-merged. Opus judges E4 on the RESULT with P's rulings X5-R1-R35.
+demonstrations (86eddb34, its X33In wiring fix in c929c2a3); step 5 the
+smoke — the prediction holds: every live named round is an explained Err
+passing, the MW-ORPHAN shape count 0 in 0..200, 4699 r0 now an explained
+passing Err, the 37 named rounds all frontier >= lo, no MP or C cover_err
+round; over the whole Acceptance 10k MW_ORPHAN_SHAPE is 5 (1749/4139/
+5549/5839/7359 r2) — ESCALATED to P with per-round evidence, never a
+local fix; step 6 this README + "How to reproduce" + this line, with the
+full Acceptance (test 204/204, the 10k with prov, verify --no-quotas,
+the record check, gate.sh) at this card's final tip (the stage record
+below). The Acceptance 10k is the runner's (X5-R31): no campaign-class
+command beyond the 0..200 runs and single seeds ran in this card's
+attempts, all under the backstop with output outside the worktree. The
+stages before it (X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are
+complete and merged. Opus judges E4 on the RESULT with P's rulings
+X5-R1-R35.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -3332,7 +3338,421 @@ that ts 7 is not acked, and that `ack_over` is empty — X5-R35 (a)'s
 revert demonstrations (RG1 `pre_workload = 0` in `run_round`, RG2
 `derive_written_acked` fed the unsliced capture `&events`) were applied
 to the real code, shown failing the pin, and reverted clean
-(`git diff` free of each).
+(`git diff` free of each):
+
+```
+cargo test -q --release -p e4-recovery --test harness \
+  x5r35_seed403_slice_feeds_the_derivation
+RG1: assertion `left == right` failed … lo:  left: 7, right: 3
+RG2: the same assertion (the derivation fed the unsliced capture)
+```
+
+**Step 1 — the meta's WAL bound (S-1-F3 D1, D3, W1, W5 (i)–(iii),
+W6 (i); commit f5ba9e6b).**
+
+- **(a) The format (§2.2 W1).** `page::Meta` gains `wal_ckpt_end`
+  (`src/store/page.rs:499`, wire offset 108) and `ts_ckpt_hi`
+  (`src/store/page.rs:504`, offset 116), both inside the CRC (now at
+  124, covering 12..124 — `page.rs:532–536`, decoded `page.rs:572–573`);
+  meta 0 carries `(0, 0)` (`src/store/ckpt.rs:192`). `WalState` gains
+  `last_commit_ts` (`src/store/wal.rs:362–369`), set in `wal_enqueue`'s
+  placement step for `Commit`/`CommitMarker` only (`wal.rs:450–455`),
+  starting at the boot's frontier — 0 at `create`, the recovered
+  frontier after `recover` (`ckpt.rs:1793`). Every harness parser of
+  meta bytes goes through `parse_meta`.
+- **(b) Step 0 (§13 W5 (i)).** Inside `checkpoint_inner`'s flip, the
+  checkpoint waits for the commit critical section's flag as a committer
+  does (parking on `WaitKey::Applied`, re-testing), then reads
+  `wal_ckpt_end := wal.append` and `ts_ckpt_hi := last_commit_ts` in one
+  `cx.with` step (`ckpt.rs:644–681`). **No deadlock exists**: the
+  committers' critical section is a flag turn released before any
+  committer can park on the flip's gate, so the flip's exclusive gate
+  hold cannot starve a flag holder — W5 (i)'s premise held; nothing to
+  escalate. `Chunk` placements need no flag (kept as the spec says).
+- **(c) Step 1 (§13 W5 (ii)).** The step ends only when
+  `durable ≥ wal_ckpt_end` (`ckpt.rs:771`, `wal.rs:870`) — never at
+  "the latest batch's sync".
+- **(d) Step 4 (§13 W5 (iii)).** At the meta write,
+  `T ≤ ts_ckpt_hi` and `wal_start_lsn ≤ wal_ckpt_end ≤ durable` must
+  hold; a violation is fail-stop — the store is poisoned, as for
+  `gc_w > T` (`ckpt.rs:858–874`).
+- **(e) Open (§14 step 1, W6 (i)).** A valid-magic, valid-CRC meta with
+  `T > ts_ckpt_hi` or `wal_start_lsn > wal_ckpt_end` fails the open with
+  XX001 (`Fail::Corrupt`), no fallback (`ckpt.rs:264–273`).
+- **(f) The pins** (literal configs, `tests/store.rs`):
+  `ckpt_step1_waits_for_contiguous_durable` (`tests/store.rs:3552`) —
+  a flip with batch 1 unwritten (parked at F3-F3a's `writer:prewrite`)
+  and batch 2 written and synced above it; asserted at After4,
+  `durable ≥ wal_ckpt_end` after the meta write, and in the
+  crash-after-step-5 arm every byte below the durable meta's
+  `wal_ckpt_end` is durable on SimDisk (merged coverage
+  `[0, wal_ckpt_end)`); and `cover_ts_cross_check_forged_meta`
+  (`tests/store.rs:3901`) — a forged meta through `Env` with a valid
+  CRC and `T > ts_ckpt_hi` gives XX001, and so does one with
+  `wal_start_lsn > wal_ckpt_end`.
+- **(g) The mutants, applied to the real code, shown failing their pin,
+  reverted clean:**
+  - **CKPT-SYNC-OVER-HOLE** (step 1 ends at the latest batch's sync) →
+    the first pin fails — "the checkpoint never reached After4 … or its
+    meta write was refused over a durability hole below wal_ckpt_end
+    (13 step 1, W5 (ii))";
+  - **META-RANGE-SKIP** (the open-time check removed) → the second pin
+    fails — the forged meta (`T=10 > ts_ckpt_hi=7`) opens Ok.
+- **Judgment call (recorded).** D4's mutant arm now catches
+  WAL-SYNC-T-ONLY earlier: the step-4 bound refuses the mutant's
+  under-synced meta (task error "meta bound (13 step 4)", the round
+  fails). The arm keeps every original catcher beside the new one and
+  now also asserts `!pass` — X5-R11 (e)'s re-pointing shape, never a
+  weakening.
+
+**Step 2 — I-WAL-COVER after pass 1, fail-closed (S-1-F3 D2, W6 (ii);
+Q1 = A; commit 4c9905df).**
+
+- **(a) The check (§14 step 3a).** In `ckpt::recover`, after the walk
+  (pass 1) and before `recover:install`, pass 2, any eviction write and
+  `truncate_wal` (`src/store/ckpt.rs:1553–1580`): `hi_read` = the
+  largest commit_ts of the `Commit`/`CommitMarker` records the walk
+  accepted; the WAL covers image `k` iff `valid_end ≥
+  meta.wal_ckpt_end` **and** `max(meta.t, hi_read) ≥ meta.ts_ckpt_hi`
+  (`valid_end` is the walk's stop position, §12.5 as amended, never an
+  end-of-file).
+- **(b) On failure.** `Fail::WalLoss { valid_end, wal_ckpt_end, t,
+  ts_ckpt_hi }` (`src/store/mod.rs:165–180`) — XX001-class, `Display`
+  naming WAL loss with the four values. Nothing is written: no install,
+  no replay mutation, no eviction write, no truncation; the files stay
+  exactly as found. Recovery's step-5 truncation carries the W8 comment
+  (a failure there fails the open, the store is never installed —
+  equivalent to a poisoned, stopped store; no mark needed;
+  `ckpt.rs:1754`).
+- **(c) The harness.** The recovery `Err` arm sets the round field
+  `cover_err` by a typed match on `Fail::WalLoss`, never a text match
+  (`src/harness.rs:1669`, `:2687`, `:2786–2788`; `src/workload.rs:725`);
+  `run` writes it and `verify` parses it. The XX001 site stays `Open`
+  (X5-R11) and the seed ends at that round. The r30 seed pin's 6149 arm
+  is re-pointed r1 → r0 with its assertions unchanged (F3-F1's accepted
+  seed-shape maintenance; the old index fails only at its shape
+  precondition).
+- **(d) The pins** (literal configs, `tests/store.rs`):
+  `wal_loss_below_ckpt_end_fails_closed` (`tests/store.rs:4025`) with
+  **nine variants** — `c` partly applied under LOST, TORN and
+  MISDIRECTED; a record appended but unapplied at the flip; a
+  `SegmentEnd` below `wal_ckpt_end`; a chunk of a marked transaction; a
+  chunk of a transaction that never committed (no committed data lost,
+  still XX001); a bulk load's fence commit `f > T` with loaded entries
+  in image k; and the short segment (cut so its end-of-file lies past
+  the start of a record that runs past it, below `wal_ckpt_end`). Each
+  asserts the typed refusal, no write/sync/directory event during the
+  open, byte-identical inodes and directory bindings before and after,
+  and the same refusal on a second open after a nested crash during the
+  first. Beside it: `cover_ts_cross_check_unreachable_hi`
+  (`tests/store.rs:4428`) — a forged meta whose `ts_ckpt_hi` exceeds
+  every replayable commit gives `Fail::WalLoss` — and
+  `wal_exact_segment_end_hops`'s new flip variant (gate edit 2): a flip
+  after the next segment's records opens Ok.
+- **(e) The mutants, applied, shown failing their pin, reverted clean:**
+  - **COVER-CHECK-SKIP** (the check removed) → the main pin fails (the
+    `c`-partly-applied variant opens Ok), and the named 0..200
+    MW-ORPHAN seeds re-show the orphan shape — 19/39/59/69/109/149/159
+    r0 each `O-1(c) "raw entry above the cut"` (199 r2 had already
+    moved at step 1);
+  - **COVER-END-AT-T** (step 0 writes `wal_ckpt_end` as the first
+    ts>T record's lsn) → the pin fails through the segend fixture —
+    the hop records are never synced by the mutant's step 1 ("segment
+    …1m0000.log unwritten"). The unapplied variant alone still refuses
+    through the check's second condition (`ts_ckpt_hi > max(T,
+    hi_read)`); the too-low-bound shape itself is what X5-R33 (d)'s
+    cross-check catches by name (step 4's self-test) — the mutant is
+    caught, by a different variant than the card guessed, recorded
+    here honestly;
+  - **COVER-AFTER-TRUNCATE** (the check after `truncate_wal`) → "a
+    write/sync/directory event fired during the open" (the truncation's
+    zeros land before the refusal);
+  - **COVER-AT-EOF** (condition 1 against a short segment's
+    end-of-file) → the pin fails — the unmarked-chunk (mid-segment
+    damage) variant opens, and so does the short-segment variant;
+  - **TS-HI-CHECK-SKIP** (the second condition removed) →
+    `cover_ts_cross_check_unreachable_hi` fails (the forged meta's
+    recovery proceeds past the coverage check);
+  - **SEG-EXACT-NO-HOP** (F3-F3a's hop disabled) → the flip variant's
+    fixture fails at F3-F3a's own assertion (frontier 4 ≠ 6) and the
+    flip variant gives a false `Fail::WalLoss`.
+- **(f) Class C.** Over the 0..200 run at this tip and at every later
+  tip: **0 class-C `cover_err` rounds** — no (f) store failure to
+  escalate.
+
+**Step 3 — G8 in full, the WAL path included (S-1-F3 D4/W8 with gate
+edit 3; commit e724ce05).**
+
+- **(a) What poisons.** Each mark is one `cx.with` setting
+  `st.poisoned` if unset, before the failing operation releases its
+  tree mutex, pins or the gate; a sim crash (`Fail::Sim`) is never a
+  poison. The sites: the kept `fetch_page` `inside_op` XX001 rule (G-2);
+  a checkpoint step — `checkpoint()`'s non-Sim error path marks before
+  the `ckpt:abort` cleanup releases the frozen image's pins (the
+  flip-abort paths poison at their own sites, as `gc_w > T` always
+  did); a background store job step — the harness's `gc_sweep` steps
+  and `tree::resume_drops`' drop walk (`src/store/tree.rs:228`,
+  `:1352`); and the WAL path — a batch's write or `sync_data` marks at
+  `wal_writer_step`'s error exit, before the in-flight release step,
+  for `Fail::Io` (through the one store test hook) and for `Fail::Invalid`
+  from `check_wal_inv`'s frontier breach (`src/store/wal.rs:629–678`).
+  `Fail` gains the `Io(String)` variant (the 58030 class;
+  `src/store/mod.rs:189`); only the hook can raise it in this sim.
+- **(b) Recovery's step-5 truncation** — the W8 comment landed with
+  step 2; a failure there fails the open and the store is never
+  installed (equivalent to a poisoned, stopped store), no mark needed.
+- **(c) Every wait includes the mark** — re-tested in the same baton
+  hold as its own predicate and its park: `WalAcks`
+  (`wal_wait_durable`/`wal_wait_written`), `Pin`, `Tree(t)`,
+  `GateShared`, `GateFlip`, the harness's `Applied` waits (the commit
+  critical section, `mark_applied`'s ts-order turn) and `MetaDurable`.
+  A woken waiter that finds the mark returns `Fail::Poisoned`.
+- **(d) The broadcast.** After the poisoner has released its tree
+  mutex, pins and the gate, it wakes every wait key that has a parked
+  task (`src/store/prims.rs:55–67` — the fixed keys plus `Tree(t)` for
+  every held tree; the harness twin `store_poison_broadcast` for the GC
+  sweep and the script-op error exit wakes every key, not three). No
+  waker holds a tree mutex or a pin while it wakes. The harness's
+  existing wake at a task error stays.
+- **(e) Nothing more is written.** The writer checks `alive()` at the
+  take and inside `wal_write_batch` after each park; the checkpointer
+  and evictor bodies exit on the mark; the harness's crash at poison
+  (the process stops) stays as it is.
+- **(f) A failed WAL sync is never retried as if its bytes were
+  safe.** The hook refuses before the env call, the advance step is
+  unreachable on the failure path, and every later take refuses at the
+  alive check; its batch's bytes never count toward `durable`.
+- **(g) The one store test hook.** `StoreCfg::wal_io_fail`
+  (`src/store/mod.rs:149–156`; `WalIoOp::{Write, SyncData}` on a chosen
+  batch start, `src/store/wal.rs:973–988`) — default-off, used only by
+  this step's pins, never by the workload or the campaign.
+- **(h) The pins** (literal configs driving the S-BATON scheduler
+  without the harness's crash at poison): `g8_poison_wakes_every_waiter`
+  (`tests/store.rs:4500`) — a damaged referenced leaf on an apply's
+  path poisons the store while a SyncOn committer parks on `WalAcks`
+  (its gap through a batch held at `writer:prewrite`), a committer
+  parks on `Applied` (its release needs `visible_ts` to pass the
+  poisoned commit — the lock-waiter stand-in; no lock table exists),
+  and a task parks on `Tree(2)`; every one returns `Fail::Poisoned`
+  within the step budget, no DEADLOCK fires, and no env write event
+  fires in the world. `g8_wal_sync_error_poisons`
+  (`tests/store.rs:4816`) — the hook fails the group-commit writer's
+  `sync_data`: the store poisons, every SyncOn waiter returns the
+  error, `durable` never covers the failed batch, no sync event ever
+  issues and none follows. The kept pins stay green:
+  `g8_read_never_poisons_gated_op_does` (G-2, CLIENT-READ-POISONS) and
+  the M-G8a arm (XX001-NOT-POISON).
+- **(i) The mutants, applied, shown failing, reverted clean:**
+  - **POISON-LOST-WAKEUP** (the `alive()` test out of
+    `wal_wait_durable`'s predicate) → the pin fails — "g8 poison wakes
+    every waiter: DEADLOCK";
+  - **POISON-WAITER-PARKED** (the broadcast removed) → the same
+    failure;
+  - **WAL-ERR-NOT-POISON** (the writer's error path returns without
+    the mark) → `g8_wal_sync_error_poisons` fails — "the SyncOn waiter
+    must return Poisoned";
+  - **POISON-AFTER-UNLATCH** (the mark made after the release) → an
+    **equivalent mutant in the S-BATON schedule, demonstrated**:
+    between `fetch_page`'s mark and `tree_insert`'s releases (PinGuard
+    drop, `tree_unlock`, `gate_release`) there is no yield point, env
+    call or park (verified: 0 matches on the unwind), so no other task
+    can run there and the half-changed state is unobservable — the
+    README demonstration the card allows in place of a failing pin.
+
+**Step 4 — X5-R33, the one oracle commit (86eddb34; the frozen oracle's
+single permitted change, one commit whose subject names X5-R33).**
+
+- **(a) The harness supply** — SimDisk history and the model's record
+  positions only; `wal_ckpt_end`/`ts_ckpt_hi` are read from the meta
+  bytes on SimDisk, never from store memory:
+  - the per-seed stream of lives (`X33Life`: `p0`, the life's
+    `Commit`/`CommitMarker` records `(lsn, len, ts)`, its boot, its
+    starting frontier, its append end) carried by `run_seed` beside the
+    model and threaded into `run_round`'s real rounds (`X33In`;
+    twin/probe rounds pass `None`);
+  - `x33_start_log` (the stream at a life's start: each earlier life's
+    records below the lowest later truncation point — X5-R33 (b));
+  - `x33_h_of` (`h`: the largest ts wholly below the opened meta's
+    `wal_ckpt_end` in the stream as it stood when that meta was
+    written);
+  - `x33_damaged_ranges` (the round's MW fault targets and MISDIRECTED
+    destinations on WAL inodes, mapped to absolute LSNs through the
+    first LSN of the segment name bound to the target inode at the
+    crash);
+  - `x33_a_of` (`a`: the largest X5-R34-acked SyncOn ts whose record
+    ends at or below the first damaged WAL byte; with no damaged WAL
+    byte, the round's largest acked SyncOn ts);
+  - `x33_explained` (`wal_loss_explained`: some damaged LSN in
+    `[wal_start_lsn, wal_ckpt_end)` of the opened meta);
+  - `x33_cross_check_meta` (the (d) bounds: no straddling record, every
+    ts ≤ T record ends ≤ w, w ≤ the life's append, `t_hi` = the largest
+    ts below w or the started frontier) — run over **every** meta-slot
+    `DWrite` whose bytes `parse_meta`, identified by its exact bytes,
+    attributed to its writing life by boot id; a mismatch is a store
+    failure of the round through X5-R10's task-error path with the
+    carried text.
+- **(b) The oracle text** (`src/oracle.rs`, `tests/oracle.rs`), clause
+  by clause the carried text above: `Extracted` gains `mw_h`, `mw_a`,
+  `wal_loss`, `wal_loss_explained`, set by both arms of the harness
+  before `check_round`; in class MW with `!cfg.no_r33`,
+  `lo = max(c_prev, ex.opened_t, ex.mw_h, ex.mw_a)` (with `no_r33`,
+  `lo = ex.opened_t`, as before), `hi` unchanged; in class MW with
+  `!ex.ok && ex.wal_loss && !cfg.no_r33` the twin rule does not apply —
+  the round fails O-3 (c) iff `!ex.wal_loss_explained`, with the text
+  `O-3(c): WAL-loss XX001 with no fault in [wal_start_lsn,
+  wal_ckpt_end) (X5-R33)`; `OracleCfg` gains `no_r33`. Unchanged: every
+  other MW `Err`, every MP and C round, every other clause.
+- **(c) The record.** Rounds gain `x33h`/`x33a`/`x33x` beside step 2's
+  `cover_err` — `run` writes them, `verify` parses them; diagnostics
+  the pass fold never reads.
+- **(d) The oracle self-tests** (`tests/oracle.rs:1461–1630`): mw1 (an
+  explained WAL-loss `Err` passes), mw2 (matching only at
+  `c = max(h, a)`), mf30 (matching only at `h − 1`, green under
+  `no_r33`), mf31 (matching only at `a − 1`, green under `no_r33`),
+  mf32 (an unexplained WAL-loss `Err` failing with the carried text,
+  green under `no_r33` through its twin-covered fault), and
+  `instrumentation_removals_are_load_bearing`'s X5-R33 arm: `no_r33`
+  turns mf30, mf31 and mf32 green. Each asserts the `o1`/`o3` text, not
+  only the pass bit.
+- **(e) The harness self-tests** (`tests/harness.rs:1699–1797`): a
+  record superseded by a later truncation never enters `h` (a reissued
+  ts fixture); the cross-check fails a forged low `wal_ckpt_end` and a
+  forged `ts_ckpt_hi`; damage maps through the segment's bound name
+  (source and MISDIRECTED destination alike).
+- **(f) The revert demonstrations, applied to the real code, shown
+  failing their self-test, reverted clean:**
+  - superseded-record-counted (`x33_start_log`'s floor ignored) → "the
+    superseded record never belongs to life 1's stream: `[(50, 60, 9)]`";
+  - cross-check-skipped (`x33_cross_check_meta` returns `None`) → "a
+    forged low `wal_ckpt_end` fails: `None`";
+  - unbound mapping (the first `/wal/` name instead of the bound one)
+    → `left: [(100, 150)]` against the bound-name mapping.
+- **(g) The fix inside step 4 (commit c929c2a3, recorded here because
+  the card's one-commit rule kept the oracle whole).** The first 0..200
+  smoke (after 86eddb34, before any of its output fed a judgement of
+  the prediction) exposed **ten unexplained refusals**: the real-round
+  `X33In` threading initially missed (the bulk signature patch left
+  `None` in its place) and round 0's boot-0 attribution order was
+  wrong (round 0's workload runs on the created store's boot 0, so the
+  current-boot match must precede the create-life arm). With both in
+  place every refusal is explained. The `E4_X33_DIAG` diagnostic
+  (stderr, default off, never a digest input) lands disabled. The
+  first smoke's file (`X-5c-F3-F3b.s5.0200.json`) is
+  **diagnostic-only**: its MW rounds were judged before the fix, it is
+  never cited as a pin or as evidence; the cited smoke is
+  `X-5c-F3-F3b.s5.0200b.json` at the c929c2a3 tip.
+- **(h) Pre-registration order.** X5-R33's code commit 86eddb34
+  (21:58:27) precedes every step-5 output: the first smoke finished at
+  21:58:5x, the cited smoke and all named-seed runs at 22:03–22:04.
+
+**Step 5 — the MW smoke and the owed re-checks (at the c929c2a3 tip;
+`X-5c-F3-F3b.s5.0200b.json` and `X-5c-F3-F3b.s5.seed<N>.json`).**
+
+- **(a) The smoke over 0..200 — the prediction holds.** Every live
+  named MW-ORPHAN round is an explained `Err` (`cover_err ∧ x33x`,
+  passing; the seed ends at that round, `rlen` 1). The eighth named
+  round moved at step 1. **The 0..200 MW-ORPHAN-shape count is 0.**
+
+  | Round | `cover_err` | `x33x` | pass | outcome |
+  |---|---|---|---|---|
+  | 19 r0 | true | true | true | explained WAL-loss `Err` |
+  | 39 r0 | true | true | true | explained WAL-loss `Err` |
+  | 59 r0 | true | true | true | explained WAL-loss `Err` |
+  | 69 r0 | true | true | true | explained WAL-loss `Err` |
+  | 109 r0 | true | true | true | explained WAL-loss `Err` |
+  | 149 r0 | true | true | true | explained WAL-loss `Err` |
+  | 159 r0 | true | true | true | explained WAL-loss `Err` |
+  | 199 r2 | false | false | false | **moved by step 1** (f5ba9e6b) to the other-MW family: `O-1(b) at c=26, tree 4: scan mismatch` + `O-3(d)` |
+
+  The window holds **10 `cover_err` rounds, all MW, all explained
+  (`x33x`), all passing** — 19/39/59/69/79/109/149/159/169/179 r0 (79
+  and 169 were passing `Ok` rounds at the step-1 tip; I-WAL-COVER
+  turns their damaged-below-bound opens into typed, explained
+  refusals). **0 class-C and 0 MP `cover_err` rounds;
+  `ack_over` empty over every judged round; no WAL-loss `Err` with
+  `x33x` false.** The window's 10 failing rounds: 7 C-DIV (63, 104,
+  112, 120, 125, 152, 186 r2 — X-5c-F3-F3a-F2's family), 2 MP
+  O-3(e)(ii) (8 r0, 178 r1), 1 other-MW (199 r2 above).
+- **(b) X5-R32 (d) 2's five MW rounds** (single seeds — S-1-F3's owed
+  re-check; (b) still records all five):
+
+  | Round | outcome |
+  |---|---|
+  | 1889 r2 | pass, silent `Ok`, frontier 29 = lo 29, `ack_over` [] |
+  | 3509 r0 | pass, the published-set `Err` arm (`O-1(a) at c=7`), no `cover_err` |
+  | 4699 r0 | **an explained WAL-loss `Err` (`cover_err ∧ x33x`), passing** — the REFRESH's orphan-shaped round, closed |
+  | 5229 r1 | pass, silent `Ok`, frontier 19 = lo 19, `ack_over` [] |
+  | 8399 r1 | pass, silent `Ok`, frontier 45 ≥ lo 43, `ack_over` [] |
+- **(c) X5-R34 (h) 3 — the 37 named rounds** (single seeds at the
+  tip): **all 37 pass with `frontier ≥ lo`, `ack_over` empty on every
+  round, no round keeps `0 < frontier < lo`** — no store loss to
+  escalate.
+- **(d) Class MP (X5-R33 (h)).** Over 0..200, **no MP round carries
+  `cover_err`** — the MP list is empty; MP rollback rounds keep MP's
+  lower bound (2 MP O-3(e)(ii) rounds remain the window's only MP
+  failures, unchanged by this card).
+- **The five remaining orphan-shaped rounds in the whole 10k
+  (ESCALATED to P — X5-R16/R19; never a local fix).** The card's
+  class-shape test says a remaining orphan-shaped round means the
+  redesign did not close the class: over the Acceptance 10k
+  `MW_ORPHAN_SHAPE` is **5** (the triage file's 406 rounds with the
+  shape are down to 5), and 532 MW rounds in total now take the
+  explained refusal (`MW_UNEXPLAINED 0`). All
+  five are round-2 rounds outside 0..200, each deterministic at the tip
+  (`X-5c-F3-F3b.esc1.seed<N>.*`), each with the shape
+  `O-1(c) "raw entry above the cut"` + `O-3(d) "silent Ok"`, each with
+  `cover_err = false` — the damage never fell in `[wal_start_lsn,
+  wal_ckpt_end)` of the opened meta, so I-WAL-COVER (correctly) did not
+  refuse, and the recovered image serves an entry above every legal
+  cut. Their `E4_D_DIAG` traces (the round's stream, `D` and its stop)
+  are in `X-5c-F3-F3b.esc1.seed<N>.ddiag.out`:
+
+  | Seed/round | crash | faults (lost/mis/torn) | lo | hi | c | frontier | x33h | x33a | the raw entry |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 1749 r2 | After5@2 | 0/1/1 | 40 | 41 | None | 41 | 40 | 0 | ts 41 (SyncOff), lsn 504325..505334, written, `D`=505334 |
+  | 4139 r2 | uniform | 0/0/1 | 14 | 17 | None | 17 | 14 | 0 | ts 17 (SyncOn), lsn 532896..535750, `D`=535750 |
+  | 5549 r2 | After5@1 | 1/1/0 | 30 | 33 | None | 32 | 30 | 21 | ts 32 (SyncOn), lsn 649370..649889, `D`=649889 (ts 33's record ends above `D`, unacked) |
+  | 5839 r2 | uniform | 1/0/0 | 43 | 50 | None | 50 | 43 | 0 | ts 50 (SyncOn), lsn 583368..586077, `D`=586077 |
+  | 7359 r2 | uniform | 0/2/0 | 14 | 15 | None | 12 | 9 | 11 | ts 15 (SyncOff), lsn 413256..415097, `D`=415097 |
+
+  In each, the entry above the cut is the stream's top record, at or
+  below the round's durable end `D`, and above `max(c_prev, T, h, a)`;
+  no candidate `c ∈ [lo, hi]` satisfies every comparison (`c = None`).
+  This is P's judgement — the class is not closed by the carried
+  S-1-F3 design in the prototype; the five repros above are the
+  triage input (F4's step 0 owns the file's full table).
+
+**The 0..200 window at each step's tip** (the F3-F3a rework tip is the
+"before"; steps 1–3 windows were run and read **before step 4's X5-R33
+commit**, so their MW rounds were judged by the old X5-R1 bounds — per
+X5-R33 (a) those three windows are **diagnostic-only shape counts,
+never cited as pins or as evidence**; the step-5 window is the judged
+one):
+
+| Tip | FAILING_ROUNDS | C-XX | C-DIV | MW-ORPHAN | cover_err (C/MP/MW) | ack_over | C `0<frontier<lo` |
+|---|---|---|---|---|---|---|---|
+| before (F3-F3a rework, `rw2.0200`) | 17 | 0 | 7 | 8 | — | 0 | 0 |
+| step 1 (`s1.0200`, diagnostic-only) | 17 | 0 | 7 | 7 | — | 0 | 0 |
+| step 2 (`s2.0200`, diagnostic-only) | 10 | 0 | 7 | 0 | 0/0/10 (passing) | 0 | 0 |
+| step 3 (`s3.0200`, diagnostic-only) | 10 | 0 | 7 | 0 | 0/0/10 (passing) | 0 | 0 |
+| step 5 (`s5.0200b`, judged) | 10 | 0 | 7 | **0** | 0/0/10 (all explained, passing) | 0 | 0 |
+
+(Step 1's MW-ORPHAN 7 = the eight named minus 199 r2, which moved to
+the other-MW published-set family `O-1(a) at c=23` at that tip. Every
+window: DEADLOCK 0, DEFECT_SEEDS 0, MP O-3(e)(ii) 2. No knob retuned,
+no seed excluded, the workload's draws unchanged anywhere.)
+
+**Step 6 — this README section, "How to reproduce" for this card's
+Acceptance (`X-5c-F3-F3b.acc.*`), and the Status line.** The whole
+release suite at the final tip: **204 tests, 0 failed**
+(`cargo test -q --release -p e4-recovery`; fmt and clippy
+`-D warnings` clean). The full Acceptance (10k run with prov,
+`verify --no-quotas`, the record check, `bash scripts/gate.sh`) runs at
+this commit — the card's X5-R31 discipline held: no campaign-class
+command beyond the 0..200 runs and single seeds ran in this card's
+attempts, all under the backstop, output outside the worktree. The
+Acceptance 10k becomes **X-5c-F4's step-0 triage file**; its full
+class table is F4's to report.
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
@@ -4305,7 +4725,7 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (172 tests)
+cargo test -q --release -p e4-recovery      # the whole crate (204 tests)
 cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (20)
 cargo run -q --release -p e4-recovery --example pin   # the pinned CRC32C /
                                                       # splitmix64 values (Work 0)
@@ -4347,6 +4767,25 @@ moved by 8b71e560, will be in it). This card's step-0 file
 (`results/campaign.json`, commit 929ade38) is F3-F1's Acceptance 10k —
 this card's own Acceptance 10k is **not committed** (F3-F3b's step 0
 commits it after its own provenance checks).
+
+**X-5c-F3-F3b's Acceptance** (the same X5-R31 discipline — the
+in-attempt commands of this card's attempts were the 0..200 step
+windows, the named single seeds and the five ESCALATE single seeds,
+each under `ulimit -v 25165824` with output outside the worktree):
+`$HOME/.cache/nv3-review/runlogs/X-5c-F3-F3b.acc.campaign.json` (the
+10k `run --seeds 0..10000 --threads 16`, `ulimit -v 25165824`), its
+prov in `X-5c-F3-F3b.acc.prov`, then `verify --no-quotas` of that file
+(`X-5c-F3-F3b.acc.verify.out`), then this card's record check (the
+python one-liner of the card's Acceptance, printing `MW_ORPHAN_SHAPE`,
+`COVER_ERR` per class, `MW_UNEXPLAINED`, `ACK_OVER_ROUNDS` and
+`MISSING_FIELDS`) and `bash scripts/gate.sh` — all at the card's final
+tip (the README commit), where a README-only change cannot move a
+digest, so the re-run reproduces the same JSON (the prov's `commit=`
+line names that tip; on a retried attempt the last write wins). **Its
+10k becomes X-5c-F4's step-0 triage file** (F4's campaign is the E4
+re-run under the unchanged rule), and the five remaining
+orphan-shaped rounds it holds are ESCALATED to P in the stage record
+above.
 
 **The X-5c-F2 Acceptance 10k is the runner's, never a worker's
 (X5-R31).** Inside an attempt no worker runs `e4-campaign run` over
