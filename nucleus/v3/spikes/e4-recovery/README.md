@@ -1,24 +1,22 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F3a-F2 done (with X-5c-F3-F3b-F1 Work 1-3
-folded in) — the C-DIV "missing <= T entry" remainder root-caused into
-two families: root cause A, the store's `gc_w_used` reset at open
-(S-STORE 10.5), fixed in `ckpt::open` with the pin
-`gc_w_survives_recovery_into_the_boot_checkpoint` (664 r2's (d) shape,
-now passing; the folded MW rounds 4139 r2 and 5839 r2 also now pass);
-root cause B, `Model::scan`'s drop+recreate gap (it never accounts
-`Op::DropTree`, so after DropTree(t)+CreateTree(t) it resurrects
-pre-drop content no correct store can serve) — frozen with the oracle,
-ESCALATED to P with five deterministic traces (112/63 r2 and the
-folded 1749/5549/7359 r2); every C-DIV round in 0..200 carries B's
-shape. The `E4_KEY_DIAG` key-history trace (b7fe409e) and the
-`E4_O1_AT_FRONTIER` frontier-candidate diagnostic with its 1749 r2 pin
-(204afb9a) land default-off. The stages before it (X-5c-F3-F3b,
-X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are complete and
-merged. Opus judges E4 on the RESULT with P's rulings X5-R1-R35.
-(The previous stage's own Status paragraph is preserved in its record
-section below: X-5c-F3-F3b's steps 0-6, from the triage file f8251b84
-through the Acceptance with MW_ORPHAN_SHAPE 5 escalated.)
+Status: **stage X-5c-F4 launched (the X5-R17 retune and the final
+file; the third of X5-R31's stacked cards, from card/v3-X-5c at
+b19ab321) — step 0 done: F3-F3b's Acceptance 10k is the triage file of
+record (sha `8332df8d…`, prov commit 86ecf8ff) with this card's class
+table derived from it: 375 failing seeds / 352 failing rounds / 36
+failing twins / 0 defect seeds, `reuse_on_dropping` 0; one NEW class —
+17 MP poison+task-error rounds (zero in F3-F3a's file) — root-caused
+to the checkpointer's post-G8-mark refusal recorded as a round-failing
+task error, fixed under step 4 (the section below); the retune list is
+SIZING, Q4, Q7, Q8, Q11, Q12, Q18 — Q11's store counter
+(`stale_seg_reads`) has no increment site anywhere in the crate, so
+that quota is structurally unreachable by a workload retune and is
+ESCALATED. The stages before it (X-5c-F3-F3a-F2-F1, X-5c-F3-F3a-F2,
+X-5c-F3-F3b, X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are
+complete and merged. Opus judges E4 on the RESULT with P's rulings
+X5-R1–R36. (The previous stage's own Status paragraph is preserved in
+its record section below: X-5c-F3-F3a-F2's root causes A and B.)
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -4071,8 +4069,73 @@ not a digest input (the `x33h` precedent), and the diagnostics moved
 nothing (verified on/off above). The repro table carries the six
 moved digests; the window's other digests are in `r36.0200.json`.
 
-## The first complete 10k campaign (run 3 of the attempt, committed —
-## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
+## Stage X-5c-F4's record (this card)
+
+**Step 0 — F3-F3b's Acceptance 10k committed as the triage file of
+record (the REFRESH's pointer, `X-5c-F3-F3b.acc.*`), and this card's
+class table re-derived from it.**
+
+- **(a) The provenance checks passed before the copy:** the prov file
+  shows `commit=86ecf8ffa43da89121b0fdb2d4c867dcd418e9db`,
+  `status_lines=0`, `exit=0`, `verify_exit=0`; the JSON's sha256 equals
+  its `json_sha256`
+  (`8332df8d7b6eda073c8bd6f0b93a15b491deb3aad5f70d576d35d4ca46e35202`);
+  `86ecf8ff` is an ancestor of this card's base. The crate diff
+  `86ecf8ff..HEAD` is **not** clean, exactly as the REFRESH records: it
+  is F3-F3a-F2 and F3-F3a-F2-F1's landed work and nothing else
+  (e1bd478b root cause A, b7fe409e `E4_KEY_DIAG`, 204afb9a
+  `E4_O1_AT_FRONTIER` + the 1749 pin, 5a41648b X5-R36, 595887da +
+  20c53912 the frontier pin and the stage records) — so the file
+  **predates root cause A's fix and X5-R36**, and its C-DIV 256-family
+  counts and its MW five are expected to fall (measured below; neither
+  count is quota or judgement evidence).
+- **(b) The triage file:** `results/campaign.json` only, this commit;
+  the message carries the two E4 lines and the quota table.
+
+Final lines, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2625 O2_FAIL=35 O3_FAIL=83 DEADLOCK=0 PANIC=0 O1F_FAIL=2625 MONITOR=0
+E4 FOLD FAILING_SEEDS=375 FAILING_ROUNDS=352 TWIN_FAILING_ROUNDS=36 DEFECT_SEEDS=0
+```
+
+Rounds: C 11,861 / MP 2,190 (+ 2,190 twins) / MW 1,335 (+ 1,335 twins).
+The quota table (the runner's `verify --no-quotas`, verbatim counts):
+**7 misses — Q4 0/1000, Q7 169/200, Q8 80/100, Q11 0/100, Q12 1/100,
+Q18 981/1000, SIZING 14,985 misses** (the row's old, round-based
+accounting; step 1 re-bases it per seed per X5-R17). Every other quota
+is met (Q1's ten hooks 747–800; Q2 4244; Q3 1235; Q5a/b/c 288/8476/7630;
+Q6a/b 1675/1204; Q9 12179; Q10 713; Q13a/b/c 911/977/898; Q14 605; Q15
+1055; Q16 5640; Q17 9024). These seven are the retune list, with Q8
+(added 2026-11-03) and Q18 (added by the REFRESH) beside X5-R17's five.
+
+- **(c) The class table, re-derived from the committed file (the
+  reporting rule: served rounds split out first), judged under X5-R30
+  (c) from the recorded fields — a served round passes iff
+  `(skx ∨ smx) ∧ pass_na` (no re-run).** A **failing** primary round has
+  `pass=false` as amended; a **failing** twin has `pass=false` in the
+  twin record. MW `lo` is read as X5-R33's `max(c_prev, T, h, a)` (the
+  O1F line), never the record's `lo` field (X5-R1's lower bound).
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **Served (split out first)** | 10, **all moved to pass** by X5-R30 (c) | MP/MW round with `served=true`: 537, 1887, 2927, 4098, 7238, 7528, 8107, 8578, 8728, 9358 (all r0, all `mrb=true`, all `O-3(a): served corruption` as recorded) — skx 537/1887/4098, smx 2927/7238/7528/8107/8578/8728/9358, all `pass_na=true`. **No failing served round remains.** | 2927 r0, 7528 r0 |
+| **C-XX** (class C) | 51 | class C failing round with `o2 != null` or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 16, `AmcheckIi` 35 | 310 (r0, `Open`), 332 (r1, `AmcheckIi`) |
+| **C-DIV** | 251 | class C failing round outside C-XX carrying an `o1` text: (b) 99, (c) 90, (d) 62, (a) 0. **0 carry `0 < frontier < lo`**; by round index r2 248, r0 3, r1 0 — the drop+re-create family X5-R36 clears (the F2-F1 gate's 0..200 window showed 0 C-DIV rounds at the fixed tip) | 112 (r2, b), 63 (r2, c) |
+| **C-DIV-in-MW** (the REFRESH's five) | 5 | 1749, 4139, 5549, 5839, 7359 (all r2): `O-1(c) … raw entry above the cut` + `O-3(d)` — root cause B's shape (the drop+recreate gap), carried as C-DIV, **never MW-ORPHAN** (true MW-ORPHAN is 0 in this file: I-WAL-COVER's explained refusals took them); all five pass at the X5-R36 tip (F2-F1's Work 3 table) | 1749 r2, 5549 r2 |
+| **MP O-3(e)(ii)** (carried, X5-R29 (c)) | 11 | MP failing round with `o3` starting `O-3(e): (ii)`: 8, 178, 688, 1298, 2038, 3388, 4767, 5598, 7748, 9118, 9978 (8 r0, 3 r1) | 8 r0, 178 r1 |
+| **MP poison + task error** — **NEW** | 17 | MP failing round with `crash="poison"` and `terr=true`: 747, 788, 967, 2347, 2988, 3607, 3968, 4127, 4347, 5148, 5328, 6767, 7968, 9168, 9388, 9508, 9968 (16 r1, 1 r2); every one fails through a task error recorded beside the poison crash — zero such rounds in F3-F3a's rework file (the class first appears on F3-F3b's workload, G8-in-full). Root-caused and fixed as this card's step-4 treatment (the section below) | 747 r1, 3607 r1 |
+| **Other MW** | 7 | the MW failing rounds outside every class above: 199, 1529, 4349, 5299, 6639, 9699 (O-1(b)/(a)/(d) + `O-3(d)`) and 4419 r1 (O-1(b) only) — the ORPHAN published-set family | 199 r2, 6639 r2 |
+| **`reuse_on_dropping`** | **0** | no round in the file carries `reuse=true` — **no ESCALATE** (X5-R36 (e)) | — |
+| **The twins** | 36 | failing twin rounds: 9 MP + 27 MW; `o1` kinds: MP (a) 3, (b) 6; MW (a) 8, (b) 8, (c) 5, (d) 6 — the classes echo there (the twin is judged as class C) | 199 r2, 849 r1 |
+
+Partition check: 352 = 10 served + 51 C-XX + 251 C-DIV + 5 C-DIV-in-MW +
+11 MP O-3(e)(ii) + 17 poison + 7 other MW; failing seeds 375 =
+`FAILING_SEEDS`; `TWIN_FAILING_ROUNDS=36`; 0 livelock/deadlock rounds, 0
+defect seeds. Every count equals the REFRESH's (375/352/36); no
+deviation to record.
+
+
 
 `run --seeds 0..10000 --threads 16` after the gc fix and X5-R13
 (a)–(d): **exit 0, ~13 min wall on a quiet host (16 threads), peak
