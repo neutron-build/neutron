@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,10 +127,12 @@ func TestHTTPWritesRequireToken(t *testing.T) {
 
 // Review 1 MEDIUM-3: a DNS-rebinding page reaches the listener under its own
 // domain name and, once rebound, is same-origin. Such requests are refused;
-// requests addressed by loopback name, IP literal or the --host name are not.
+// requests addressed by loopback name, loopback IP or the --host name are not.
+// Browser origins are refused unless listed with --allow-origin.
 func TestHTTPRefusesRebindingHosts(t *testing.T) {
-	t.Setenv("NEUTRON_MCP_TOKEN", "")
+	const token = "s3cret"
 	s := &Server{env: &toolEnv{}}
+	s.Configure(Options{AllowOrigins: []string{"http://localhost:3000"}})
 	cases := []struct {
 		bind, host, origin string
 		want               int
@@ -137,14 +140,24 @@ func TestHTTPRefusesRebindingHosts(t *testing.T) {
 		{"127.0.0.1:7792", "attacker.example:7792", "http://attacker.example:7792", http.StatusForbidden},
 		{"127.0.0.1:7792", "attacker.example:7792", "", http.StatusForbidden},
 		{"127.0.0.1:7792", "127.0.0.1:7792", "http://attacker.example", http.StatusForbidden},
+		{"127.0.0.1:7792", "localhost:7792", "http://localhost:4000", http.StatusForbidden},
+		{"127.0.0.1:7792", "192.168.1.20:7792", "", http.StatusForbidden},
 		{"0.0.0.0:7792", "rebind.attacker.example", "", http.StatusForbidden},
 		{"127.0.0.1:7792", "127.0.0.1:7792", "", http.StatusOK},
 		{"127.0.0.1:7792", "localhost:7792", "http://localhost:3000", http.StatusOK},
 		{"127.0.0.1:7792", "[::1]:7792", "", http.StatusOK},
-		{"0.0.0.0:7792", "192.168.1.20:7792", "http://192.168.1.20:7792", http.StatusOK},
+		{"0.0.0.0:7792", "192.168.1.20:7792", "", http.StatusOK},
 		{"devbox:7792", "devbox:7792", "", http.StatusOK},
 	}
 	for _, c := range cases {
+		bindHost, _, _ := net.SplitHostPort(c.bind)
+		auth := ""
+		if !isLoopbackHost(bindHost) {
+			t.Setenv("NEUTRON_MCP_TOKEN", token)
+			auth = "Bearer " + token
+		} else {
+			t.Setenv("NEUTRON_MCP_TOKEN", "")
+		}
 		h, err := s.httpHandler(c.bind)
 		if err != nil {
 			t.Fatal(err)
@@ -154,11 +167,58 @@ func TestHTTPRefusesRebindingHosts(t *testing.T) {
 		if c.origin != "" {
 			req.Header.Set("Origin", c.origin)
 		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != c.want {
 			t.Errorf("bind %s Host %q Origin %q: %d, want %d", c.bind, c.host, c.origin, rec.Code, c.want)
 		}
+	}
+}
+
+func TestHTTPNonLoopbackHostRequiresToken(t *testing.T) {
+	t.Setenv("NEUTRON_MCP_TOKEN", "")
+	s := &Server{env: &toolEnv{}}
+	for _, bind := range []string{"0.0.0.0:7792", ":7792", "192.168.1.20:7792", "devbox:7792", "[::]:7792"} {
+		if _, err := s.httpHandler(bind); err == nil || !strings.Contains(err.Error(), "NEUTRON_MCP_TOKEN") {
+			t.Errorf("bind %s without token: %v", bind, err)
+		}
+	}
+	for _, bind := range []string{"127.0.0.1:7792", "localhost:7792", "[::1]:7792"} {
+		if _, err := s.httpHandler(bind); err != nil {
+			t.Errorf("loopback bind %s: %v", bind, err)
+		}
+	}
+}
+
+func TestHTTPTokenRequiredOnEveryRequest(t *testing.T) {
+	t.Setenv("NEUTRON_MCP_TOKEN", "s3cret")
+	s := &Server{env: &toolEnv{}}
+	h, err := s.httpHandler("127.0.0.1:7792")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, auth := range []string{"", "Bearer wrong", "Bearer s3cre", "s3cret"} {
+		req := httptest.NewRequest(http.MethodGet, "/tools", nil)
+		req.Host = "127.0.0.1:7792"
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("Authorization %q on a read: %d, want 401", auth, rec.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/tools", nil)
+	req.Host = "127.0.0.1:7792"
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("correct token: %d", rec.Code)
 	}
 }
 
