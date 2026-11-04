@@ -4312,6 +4312,44 @@ mod tests {
         assert_eq!(ex.get_session_setting(sid, "statement_timeout"), None);
     }
 
+    #[tokio::test]
+    async fn test_set_statement_timeout_validates_like_postgres() {
+        let ex = setup();
+        let sid = ex.create_session();
+        ex.execute_with_session(sid, "SET statement_timeout = '5s'")
+            .await
+            .unwrap();
+        ex.execute_with_session(sid, "SET statement_timeout = 2147483647")
+            .await
+            .unwrap();
+        ex.execute_with_session(sid, "SET statement_timeout TO DEFAULT")
+            .await
+            .unwrap();
+
+        // Out of range for PostgreSQL's int setting, including values whose
+        // unit multiplication overflows u64: refused, and the previous value
+        // stays.
+        ex.execute_with_session(sid, "SET statement_timeout = 60")
+            .await
+            .unwrap();
+        for bad in [
+            "2147483648",
+            "'18446744073709552s'",
+            "99999999999999999999",
+            "'soon'",
+        ] {
+            let err = ex
+                .execute_with_session(sid, &format!("SET statement_timeout = {bad}"))
+                .await
+                .expect_err(bad);
+            assert!(err.to_string().contains("statement_timeout"), "{bad}: {err}");
+        }
+        assert_eq!(
+            ex.get_session_setting(sid, "statement_timeout"),
+            Some("60".into())
+        );
+    }
+
     // ========================================================================
     // Concurrent session isolation tests
     // ========================================================================
