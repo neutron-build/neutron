@@ -1,7 +1,18 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F3a complete (steps 0–7 done) — step 0
-committed F3-F1's Acceptance 10k as the triage file of record
+Status: **stage X-5c-F3-F3a reworked (the REWORK verdict at 98313ae3
+applied; first-run steps 0–7 below stand except where the rework
+changes them) — X5-R35 pre-registered verbatim before any run
+(3c8b038e); X5-R35 (a)/(b): E is the workload pass's events only,
+self-test (g) 6 demonstrated failing on 13da010b's derivation and
+reverted (93039525); Finding 1: wal_start_lsn holds back only the
+current boot's unmarked chunks, pinned with START-LSN-PREV-BOOT-CHUNK
+and the G1 first-record floor pinned (313a236b); X5-R35 (c): all 17
+named rounds left `frontier < lo`; Finding 3: the 37 re-run at the
+rework's tip — all pass, `ack_over` empty, no class-C
+`0 < frontier < lo` round named or new in 0..200; the full Acceptance
+(10k, verify, record check, gate.sh) re-run at the final tip (X5-R3).
+Step 0 committed F3-F1's Acceptance 10k as the triage file of record
 (929ade38), the X5-R33/X5-R34 rulings verbatim before any run
 (31effe00), F3-F1-F5's record fixes (97e85cab) and the class table
 re-derived (b68d948c); step 1 X5-R34 — I-ACK-PREFIX's `durable_end`
@@ -3138,6 +3149,164 @@ derivation and is timing-only, never cited):
 (C-DIV here is the class-table definition — a failing class-C round
 outside C-XX carrying an `o1` — counted from each run's JSON. No
 retune, no seed exclusion anywhere.)
+
+**The rework (the REWORK verdict at 98313ae3, applied 2026-11-03; its
+Findings 1/3, P ruling X5-R35 and Limits for the rework are binding).**
+Commits, in order: **3c8b038e** (X5-R35 verbatim, before any run),
+**93039525** (X5-R35 (a)/(b)), **313a236b** (Finding 1 + the two pins).
+
+- **Pre-registration order.** The rulings commit 3c8b038e (X5-R35,
+  beside X5-R33/X5-R34 above) precedes every `e4-campaign` command of
+  the rework: the first runs are the single seeds below, all after it.
+- **X5-R35 (a)/(b) — commit 93039525.** `E` is the workload pass's
+  slice of the capture (`harness::x5r34_workload_events`;
+  `pre_workload = start_disk.events.len()`, the recovery and harness
+  boot checkpoint of the *previous* round that `new_round`'s placement
+  leaves ahead of the workload in the capture); `derive_written_acked`,
+  `x5r34_durable_prefix` and the `E4_ACK_DIAG` reads use it, and every
+  other reader of the capture (Q12's rename fold, the monitors,
+  X5-R5's R, X5-R28's `K_ii`) keeps the full stream, exactly as (a)
+  scopes it. Self-test **(g) 6**
+  (`x5r34_recovery_truncation_zeros_never_ack`): a recovery truncation
+  zero-write plus its sync covering an enqueued, never-written SyncOn
+  record never acks it (`D` stops at `p0`). **Demonstrated on
+  13da010b's derivation** (the helper returned the whole capture in
+  place — what `run_round` fed the derivation at 13da010b), then
+  reverted:
+
+  ```
+  cargo test -q --release -p e4-recovery --test harness x5r34
+  x5r34_recovery_truncation_zeros_never_ack --- FAILED
+    'a SyncOn record the workload never wrote, covered only by the previous
+     round's synced truncation zeros, must not be acked (X5-R35 (a))'
+  test result: FAILED. 5 passed; 1 failed   (the (g) 1–5 tests green)
+  ```
+
+  The committed tip is the ruling's derivation (all six green).
+- **X5-R35 (c) — the 17 named rounds at the rework's tip** (single
+  seeds, `X-5c-F3-F3a.rw2.s<seed>.*`; `lo`/`frontier` from the round
+  records, `D` from `E4_D_DIAG`): **every one left `frontier < lo`.**
+  15 pass with no O-1 text; 2 (1174 r2, 4612 r2) now fail **O-1(d) at
+  `frontier == lo`** (a scan mismatch at the matched candidate — the
+  C-DIV remainder family, X-5c-F3-F3a-F2's; "a named round that then
+  fails another clause is classed under that clause", X5-R34 (h) 1).
+  No (h) 3 store loss; (d) holds — no `lo` was raised anywhere.
+
+  | Seed/round | lo | frontier | pass | outcome | ack_over |
+  |---|---|---|---|---|---|
+  | 205 r2 | 68 | 68 | true | none | [] |
+  | 381 r1 | 32 | 32 | true | none | [] |
+  | 403 r1 | 3 | 3 | true | none (was frontier 3 < lo 7) | [] |
+  | 774 r2 | 7 | 7 | true | none | [] |
+  | 1174 r2 | 40 | 40 | false | O-1(d) c=40 | [] |
+  | 1203 r1 | 41 | 42 | true | none | [] |
+  | 3805 r2 | 43 | 43 | true | none | [] |
+  | 3883 r2 | 56 | 56 | true | none | [] |
+  | 4193 r1 | 28 | 28 | true | none | [] |
+  | 4601 r1 | 27 | 27 | true | none | [] |
+  | 4612 r2 | 24 | 24 | false | O-1(d) c=24 | [] |
+  | 5030 r1 | 29 | 29 | true | none | [] |
+  | 7203 r2 | 48 | 48 | true | none | [] |
+  | 7803 r1 | 4 | 4 | true | none (was frontier 4 < lo 8) | [] |
+  | 8200 r2 | 52 | 52 | true | none | [] |
+  | 8404 r1 | 29 | 29 | true | none | [] |
+  | 8825 r2 | 10 | 10 | true | none | [] |
+- **Finding 1 — commit 313a236b** (`src/store/wal.rs`,
+  `wal_start_lsn`'s `None` arm + the shared `wal::boot_id_older`
+  comparison): the arm holds `wal_start_lsn` back only for unmarked
+  chunks of the **current** boot — S-STORE §14 step 8 as merged at the
+  base: "Chunks of the previous boot that have no marker belong to
+  transactions that ended without one …, all ended before this flip,
+  so they do not hold back `wal_start_lsn` (§12.6)". The pre-rework
+  arm pointed meta k+1's `wal_start_lsn` at the previous boot's chunk,
+  §12.5's first-record floor stopped the next walk at it, and every
+  acked commit of the new boot was lost (the 100 class-C
+  `frontier < lo` store losses of the first Acceptance file).
+  - **The pin** `wal_start_lsn_ignores_previous_boots_chunks`
+    (the verdict's fixture): boot b−1 leaves a cut-off chunked txn below p0; boot b's
+    boot checkpoint runs; b appends and acks two SyncOn commits and
+    crashes before its next checkpoint. Asserted: meta 2's
+    `wal_start_lsn` sits at p0 (decoded from the durable stream), and
+    recovery replays both acked commits (frontier = max acked 3, Q1/Q2
+    present, the old boot's unmarked chunks never applied).
+    **Mutant START-LSN-PREV-BOOT-CHUNK (the old arm) fails it**,
+    demonstrated and reverted:
+
+    ```
+    cargo test -q --release -p e4-recovery --test store \
+      wal_start_lsn_ignores_previous_boots_chunks
+    assertion `left == right` failed: meta 2's wal_start_lsn sits at p0 …
+      left: 79   right: 219      (79 = the previous boot's chunk, 219 = p0)
+    ```
+
+  - **The G1 pin** `first_record_older_than_opened_meta_stops_the_walk`
+    (§12.5's first-record floor, which nothing caught — the gate's own
+    floor-drop mutant passed the whole release suite at the first run's
+    tip): a meta whose `wal_start_lsn` is e1 with `boot_id` 2, and an
+    older boot's complete record at e1 (built directly on the segment,
+    the identical walk input a reverted truncation leaves — the
+    recorded precedent of `stale_boot_record_stops_the_walk`). The
+    walk stops at e1: frontier = T, the stale record's key absent.
+    **The gate's G1 mutant (`last_boot.unwrap_or(rec.txn.0)`) fails
+    it**, demonstrated and reverted:
+
+    ```
+    cargo test -q --release -p e4-recovery --test store \
+      first_record_older_than_opened_meta_stops_the_walk
+    assertion `left == right` failed: … never replays (12.5's first-record floor)
+      left: 2   right: 1        (2 = the stale record replayed)
+    ```
+
+    (Both demonstrations were reverted clean — `git diff` free of each
+    afterwards; the two pins pass at the tip.)
+  - **Movement (the five named repros)** — each left
+    `frontier < lo`; all five now **pass**:
+
+    | Seed/round | lo | frontier | pass | was (first run's tip) |
+    |---|---|---|---|---|
+    | 206 r1 | 7 | 9 | true | a first-record stop on a previous-boot K_CHUNK (Finding 1) |
+    | 296 r1 | 13 | 13 | true | same |
+    | 405 r1 | 7 | 7 | true | O-1(b) frontier 4 < lo 7 (moved by 8b71e560, now cleared) |
+    | 705 r1 | 8 | 8 | true | same |
+    | 9823 r1 | 6 | 8 | true | same |
+- **Finding 3 — the (h) 3 tip re-run (the 37 named rounds, single
+  seeds at 313a236b).** **All 37 pass with no O-1 text; `ack_over` is
+  empty on every round; no round keeps `0 < frontier < lo`.** The
+  verdict's two failing rounds both cleared: 403 r1 (frontier 3 =
+  lo 3, was 3 < 7) and 7803 r1 (4 = 4, was 4 < 8). Full table (lo,
+  frontier, pass — every row `frontier ≥ lo`, every `ack_over` empty):
+
+  | Seed/round | lo | frontier | | Seed/round | lo | frontier | | Seed/round | lo | frontier |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 20 r2 | 63 | 63 | | 1585 r1 | 17 | 17 | | 5604 r0 | 24 | 24 |
+  | 115 r1 | 13 | 13 | | 1801 r1 | 35 | 35 | | 6154 r0 | 9 | 10 |
+  | 403 r1 | 3 | 3 | | 2183 r0 | 13 | 16 | | 6200 r2 | 45 | 45 |
+  | 622 r0 | 15 | 15 | | 2525 r2 | 75 | 75 | | 6263 r2 | 21 | 21 |
+  | 780 r2 | 58 | 58 | | 2730 r2 | 49 | 49 | | 6623 r0 | 15 | 15 |
+  | 801 r1 | 28 | 28 | | 2765 r0 | 11 | 12 | | 7405 r1 | 34 | 34 |
+  | 825 r2 | 54 | 54 | | 2812 r1 | 15 | 15 | | 7531 r0 | 4 | 4 |
+  | 830 r1 | 4 | 4 | | 3224 r1 | 7 | 7 | | 7803 r1 | 4 | 4 |
+  | 1001 r0 | 12 | 12 | | 3806 r1 | 31 | 31 | | 7823 r1 | 30 | 30 |
+  | 1064 r1 | 18 | 18 | | 4770 r2 | 68 | 70 | | 8220 r2 | 55 | 55 |
+  | | | | | 4930 r0 | 32 | 33 | | 8363 r0 | 16 | 16 |
+  | | | | | 5054 r1 | 9 | 9 | | 9200 r0 | 21 | 23 |
+  | | | | | 5601 r1 | 46 | 46 | | 9484 r2 | 77 | 77 |
+  | | | | | | | | | 9594 r0 | 18 | 18 |
+
+  (1064 r1, 4770 r2, 5054 r1 and 6263 r2 — the four exact-boundary
+  rounds of (h) 2 — pass at every tip since ce8f8bbc.)
+- **The 0..200 window at the rework's tip**
+  (`X-5c-F3-F3a.rw2.0200.*`, 13.5 s wall): **`ack_over` empty over
+  every judged round; failing class-C rounds with
+  `0 < frontier < lo`: 0** — none named, none new (X5-R34 (h) 3's
+  escalation set is empty). FAILING_ROUNDS 17, C-XX **0**, C-DIV 7
+  (b 3: 112/120/152; c 4: 63/104/125/186 — the identical set and
+  sub-kinds as the first run's step-4 tip, all at
+  `frontier ≥ lo`, X-5c-F3-F3a-F2's family), MW-ORPHAN 8, MP
+  O-3(e)(ii) 2, DEADLOCK 0, DEFECT_SEEDS 0.
+- **Finding 4:** no other test's assertion changed. The whole release
+  suite passes at 313a236b with no re-pointing (the r30 seed pins
+  unmoved: the store fix moved no seeded MP/MW workload in the suite).
 
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
