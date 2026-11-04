@@ -40,14 +40,14 @@ fn smoke_16_seeds() {
         // failed round or a recovery without a store ends the chain —
         // recorded, never hidden).
         assert!(
-            rec.rounds.len() as u32 <= Knobs::derive(seed, 0).rounds,
+            rec.rounds.len() as u32 <= Knobs::derive(seed, 0, &workload::Tuning::BASE).rounds,
             "seed {seed}: round count {} over the knobs",
             rec.rounds.len()
         );
         if !rec.stopped_early {
             assert_eq!(
                 rec.rounds.len() as u32,
-                Knobs::derive(seed, 0).rounds,
+                Knobs::derive(seed, 0, &workload::Tuning::BASE).rounds,
                 "seed {seed}: round count without an early stop"
             );
         }
@@ -86,6 +86,113 @@ fn smoke_16_seeds() {
         assert_eq!(x.seed, y.seed);
         assert_eq!(x.digest, y.digest, "seed {} differs across threads", x.seed);
     }
+}
+
+/// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; this card's step 1): the
+/// frozen-tuning digest-literal pin.** A seed pin's identity is
+/// `(generator, seed)`, not the seed alone: every literal below is the
+/// digest of `run_seed_with(seed, None, &Tuning::BASE)` — 1b0ce54e's
+/// generator, bit for bit — copied from X-5c-F4's Acceptance file
+/// (`$HOME/.cache/nv3-review/runlogs/X-5c-F4.acc.campaign.json`, sha256
+/// `bec7056c4463b5b812f8d27a162046cd42be1f1242970b1da4da458305ab3ac6`,
+/// prov `commit=1b0ce54e63d044b239cae497d22104ccced41cba`). The seed
+/// list is every seed any test passes to a seed runner (found by grep
+/// over `tests/`, cross-checked against P's 43-seed list; the smoke and
+/// round-trip seeds 0–9 are the grep's additions from the file, and P's
+/// 7359 — one of the C-DIV-in-MW five — is run by no test at this tip).
+/// M-BASEDRIFT (one BASE constant changed) fails this pin.
+#[test]
+fn x5_r37_base_tuning_reproduces_1b0ce54e() {
+    const WANT: &[(u64, u64)] = &[
+        (0, 49696441),
+        (1, 1198539130),
+        (2, 927823387),
+        (3, 923362676),
+        (4, 3047956786),
+        (5, 980071820),
+        (6, 2097771150),
+        (7, 2267580514),
+        (8, 861904777),
+        (9, 429574859),
+        (10, 1043516495),
+        (11, 3292953852),
+        (12, 1120327746),
+        (13, 2781612228),
+        (14, 2027633753),
+        (15, 3135194667),
+        (47, 2526989435),
+        (48, 605204002),
+        (60, 2199024193),
+        (66, 123257877),
+        (67, 1488955537),
+        (112, 2157138087),
+        (118, 4034749261),
+        (198, 649857276),
+        (221, 2732451886),
+        (268, 317704428),
+        (308, 522943877),
+        (387, 2151920803),
+        (403, 2657356820),
+        (537, 2279204905),
+        (660, 3256450980),
+        (747, 4071845386),
+        (907, 2332284720),
+        (967, 2847369120),
+        (987, 2492798953),
+        (1267, 1225086008),
+        (1749, 1584051239),
+        (1769, 2372375821),
+        (1787, 1119157608),
+        (1887, 3622450829),
+        (2669, 357787865),
+        (2927, 1901399424),
+        (4049, 2182387428),
+        (4309, 3466635396),
+        (5549, 308297210),
+        (5808, 2754578359),
+        (6149, 2623005576),
+        (7469, 3635220225),
+        (7528, 1612546402),
+        (8728, 3345856243),
+        (9809, 1177349546),
+    ];
+    // The seeds are independent (S-DET/W-DET, pinned), so the pin runs
+    // them across a small thread pool; the digests are byte-identical
+    // to a serial run.
+    let got: Vec<(u64, u64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = WANT
+            .iter()
+            .map(|(seed, _)| {
+                s.spawn(move || {
+                    let rec = workload::run_seed_with(*seed, None, &workload::Tuning::BASE);
+                    (*seed, rec.digest)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or((u64::MAX, u64::MAX)))
+            .collect()
+    });
+    for ((seed, want), (_, actual)) in WANT.iter().zip(got.iter()) {
+        assert_eq!(
+            want, actual,
+            "seed {seed}: Tuning::BASE must reproduce 1b0ce54e's digest bit for bit (X5-R37)"
+        );
+    }
+}
+
+/// **X5-R37: this card does no retune** — `Tuning::FINAL` equals
+/// `Tuning::BASE` at this card's tip (X-5c-F4's relaunch is the only
+/// card that may change FINAL, and the probe shares it sets in step 3
+/// are reverted).
+#[test]
+fn x5_r37_final_equals_base_at_this_tip() {
+    assert_eq!(
+        workload::Tuning::FINAL,
+        workload::Tuning::BASE,
+        "this card builds the machinery only: FINAL == BASE (the card's Goal)"
+    );
 }
 
 /// The scheduler-level uniform crash (5.5's "uniform over the round's
@@ -130,7 +237,7 @@ fn uniform_crash_fires_at_the_counted_yield() {
 #[test]
 fn knobs_derive_in_range() {
     for seed in 0..200u64 {
-        let k = Knobs::derive(seed, 0);
+        let k = Knobs::derive(seed, 0, &workload::Tuning::BASE);
         assert!(
             (2..=4).contains(&k.committers),
             "committers {}",
@@ -153,14 +260,14 @@ fn knobs_derive_in_range() {
         assert!((1..=3).contains(&k.rounds));
         assert!((320..=700).contains(&k.chunked_ops));
         assert!(k.pool_frames() >= 12);
-        let k2 = Knobs::derive(seed, 0);
+        let k2 = Knobs::derive(seed, 0, &workload::Tuning::BASE);
         assert_eq!(k.digest(), k2.digest(), "knob digest not pure");
         // The feature mix is per-round.
         let mix = |r: u32| {
             format!(
                 "{}{}",
-                u8::from(Knobs::derive(seed, r).bulk_load),
-                u8::from(Knobs::derive(seed, r).drop_tree)
+                u8::from(Knobs::derive(seed, r, &workload::Tuning::BASE).bulk_load),
+                u8::from(Knobs::derive(seed, r, &workload::Tuning::BASE).drop_tree)
             )
         };
         assert_ne!(mix(0), "", "empty mix");
@@ -171,7 +278,7 @@ fn knobs_derive_in_range() {
     let mut drops = 0u32;
     for seed in 0..400u64 {
         for r in 0..3 {
-            let k = Knobs::derive(seed, r);
+            let k = Knobs::derive(seed, r, &workload::Tuning::BASE);
             loads += u32::from(k.bulk_load);
             drops += u32::from(k.drop_tree);
         }
@@ -187,10 +294,11 @@ fn knobs_derive_in_range() {
 fn crash_spec_targeting() {
     use e4_recovery::harness::CrashSpec;
     use e4_recovery::store::ckpt::CKPT_HOOKS;
-    let knobs = Knobs::derive(0, 0);
+    let knobs = Knobs::derive(0, 0, &workload::Tuning::BASE);
     let model = e4_recovery::model::Model::new();
     for seed in 0..40u64 {
-        let (script, _d, hook) = workload::build_round(seed, 0, &knobs, &model, 0);
+        let (script, _d, hook) =
+            workload::build_round(seed, 0, &workload::Tuning::BASE, &knobs, &model, 0);
         let total: u64 = script.tasks.iter().map(|t| t.ops.len() as u64).sum();
         assert!(total > 10, "seed {seed}: script too small ({total})");
         if (seed / 10) % 2 == 0 {
@@ -209,9 +317,9 @@ fn crash_spec_targeting() {
 /// directory entry no committer will install.
 #[test]
 fn script_references_only_model_trees() {
-    let knobs = Knobs::derive(3, 0);
+    let knobs = Knobs::derive(3, 0, &workload::Tuning::BASE);
     let model = e4_recovery::model::Model::new();
-    let (script, _, _) = workload::build_round(3, 0, &knobs, &model, 0);
+    let (script, _, _) = workload::build_round(3, 0, &workload::Tuning::BASE, &knobs, &model, 0);
     let trees = workload::trees_at(&model, 0);
     assert!(trees.is_empty(), "the empty model has no trees");
     // Every Put/Delete references a tree the setup commit creates (the
@@ -252,9 +360,9 @@ fn script_references_only_model_trees() {
 #[test]
 fn chunked_txn_spans_two_segments() {
     use e4_recovery::model::Op;
-    let knobs = Knobs::derive(5, 0);
+    let knobs = Knobs::derive(5, 0, &workload::Tuning::BASE);
     let model = e4_recovery::model::Model::new();
-    let (script, _, _) = workload::build_round(5, 0, &knobs, &model, 0);
+    let (script, _, _) = workload::build_round(5, 0, &workload::Tuning::BASE, &knobs, &model, 0);
     let mut spans = 0u32;
     for t in &script.tasks {
         for op in &t.ops {
@@ -350,9 +458,10 @@ fn setup_barrier_guards_the_wal_order() {
     // the generated script is reproduced byte-identically by
     // `build_round`, so the pin does not depend on any code path beyond
     // it.)
-    let knobs = Knobs::derive(3, 0);
+    let knobs = Knobs::derive(3, 0, &workload::Tuning::BASE);
     let cfg3 = knobs.store_cfg(None);
-    let (script_b, _, _) = workload::build_round(3, 0, &knobs, &Model::new(), 0);
+    let (script_b, _, _) =
+        workload::build_round(3, 0, &workload::Tuning::BASE, &knobs, &Model::new(), 0);
     let strip = |s: &Script| Script {
         tasks: s
             .tasks
@@ -654,7 +763,7 @@ fn r15b_verify_reports_all_three_checks_before_failing() {
 #[test]
 fn r16_never_fired_targeted_draws_reach_their_hook() {
     for seed in [60u64, 660] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.defect.is_none(),
             "seed {seed}: the fired-guard defect is back: {:?}",
@@ -691,7 +800,7 @@ fn r16_never_fired_targeted_draws_reach_their_hook() {
 #[test]
 fn r16_no_twin_is_always_supplied() {
     for seed in [1267u64, 1769] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let no_twin = rec
             .rounds
             .iter()
@@ -721,7 +830,7 @@ fn r16_no_twin_is_always_supplied() {
 #[test]
 fn r16_mpe_referenced_set_excludes_the_file_header() {
     for seed in [47u64, 118, 198] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let not_reported = rec
             .rounds
             .iter()
@@ -778,7 +887,7 @@ fn r20_mpe_r_reads_the_issued_write_history() {
     // and every round passing). The assertions are unchanged, and the
     // events-half revert was re-demonstrated on the new configs.
     for seed in [48u64, 308] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let exactness = rec
             .rounds
             .iter()
@@ -823,7 +932,7 @@ fn r20_mpe_r_reads_the_issued_write_history() {
 #[test]
 fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
     for seed in [2669u64, 4049, 4309, 7469, 9809] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.defect.is_none(),
             "seed {seed}: the fired-guard defect is back: {:?}",
@@ -883,7 +992,7 @@ fn f1f2a_empty_masks_are_a_defect_not_a_hang() {
 fn f1f2b_repairs_without_a_store_reseed_the_twin_chain() {
     use e4_recovery::harness::RoundOutcome;
     use e4_recovery::store::StoreInner;
-    let cfg = Knobs::derive(7, 0).store_cfg(None);
+    let cfg = Knobs::derive(7, 0, &workload::Tuning::BASE).store_cfg(None);
     let tout = RoundOutcome {
         cut: 3,
         end_store: None,
@@ -920,7 +1029,7 @@ fn r28_residual_seeds_clear_via_k() {
     // assertions are unchanged and the M-R28g revert was
     // re-demonstrated on both.
     for seed in [1787u64, 5808] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.rounds.iter().any(|r| r.meta_rollback),
             "seed {seed}: the residual round's rollback condition must hold (the K gate)"
@@ -959,7 +1068,7 @@ fn r28_residual_seeds_clear_via_k() {
 #[test]
 fn cxx_highest_lpid_free_never_shrinks_next_lpid_rounds() {
     for seed in [221u64, 66, 907] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         for r in &rec.rounds {
             assert!(
                 r.o2_fail.is_none() && r.o3_fail.is_none(),
@@ -993,7 +1102,7 @@ fn cxx_highest_lpid_free_never_shrinks_next_lpid_rounds() {
 /// text and the round's O-3 (c).
 #[test]
 fn cxx_g3_probe_never_swallows_a_recovery_crash() {
-    let rec = workload::run_seed(1769, None);
+    let rec = workload::run_seed_with(1769, None, &workload::Tuning::BASE);
     for t in &rec.twin {
         assert!(
             t.pass,
@@ -1014,7 +1123,7 @@ fn cxx_g3_probe_never_swallows_a_recovery_crash() {
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let exactness = rec
             .rounds
             .iter()
@@ -1076,7 +1185,7 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
     // passing, no livelock), assertions byte-identical. 987 r1 still
     // holds.
     for seed in [987u64, 387] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let r1 = &rec.rounds[1];
         assert!(
             !r1.deadlock && !r1.livelock,
@@ -1123,7 +1232,7 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
 #[test]
 fn g8_checkpoint_poison_ends_the_workload() {
     for seed in [747u64, 967] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let r1 = &rec.rounds[1];
         assert!(
             r1.crash == "poison",

@@ -515,7 +515,8 @@ fn r28_no_ground_truth_meta_finding() {
         disk.range_tainted(pf, 8192, 4096),
         "slot 2 is tainted (a crash-dropped volatile meta write)"
     );
-    let cfg = e4_recovery::workload::Knobs::derive(0, 0).store_cfg(None);
+    let cfg = e4_recovery::workload::Knobs::derive(0, 0, &e4_recovery::workload::Tuning::BASE)
+        .store_cfg(None);
     let (findings, used, meta) = e4_recovery::harness::durable_image(&disk, &cfg);
     assert!(meta.is_some(), "a valid meta must open (k=2)");
     assert!(
@@ -1061,7 +1062,8 @@ fn cxx_a_crash_at_any_recovery_yield_is_never_corruption() {
 #[test]
 fn r30_skx_and_smx_record_fields() {
     for (seed, want_skx, want_smx) in [(537u64, true, false), (1887, true, false)] {
-        let rec = e4_recovery::workload::run_seed(seed, None);
+        let rec =
+            e4_recovery::workload::run_seed_with(seed, None, &e4_recovery::workload::Tuning::BASE);
         let r = &rec.rounds[0];
         assert!(r.served, "seed {seed} r0: the MP-A serve must hold");
         assert_eq!(
@@ -1079,7 +1081,8 @@ fn r30_skx_and_smx_record_fields() {
         );
     }
     for seed in [2927u64, 7528, 8728] {
-        let rec = e4_recovery::workload::run_seed(seed, None);
+        let rec =
+            e4_recovery::workload::run_seed_with(seed, None, &e4_recovery::workload::Tuning::BASE);
         let r = &rec.rounds[0];
         assert!(r.served, "seed {seed} r0: the meta-slot serve must hold");
         assert!(!r.skx, "seed {seed} r0: a meta-slot serve is not inside K");
@@ -1102,7 +1105,8 @@ fn r30_skx_and_smx_record_fields() {
     // passing detection), and the chain stops there, so the old r1
     // index fails only at its shape precondition (an index out of
     // bounds), exactly as the rule describes.
-    let rec = e4_recovery::workload::run_seed(6149, None);
+    let rec =
+        e4_recovery::workload::run_seed_with(6149, None, &e4_recovery::workload::Tuning::BASE);
     let r = &rec.rounds[0];
     assert!(!r.served, "seed 6149 r0: the serve is gone after step 2");
     assert!(!r.skx && !r.smx, "seed 6149 r0: skx = smx = false");
@@ -1651,7 +1655,7 @@ fn name1_of() -> String {
 /// clean.
 #[test]
 fn x5r35_seed403_slice_feeds_the_derivation() {
-    let rec = e4_recovery::workload::run_seed(403, None);
+    let rec = e4_recovery::workload::run_seed_with(403, None, &e4_recovery::workload::Tuning::BASE);
     let create_failed = rec
         .defect
         .as_deref()
@@ -1853,7 +1857,8 @@ fn x33_damage_maps_through_the_bound_name() {
 #[test]
 fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
     e4_recovery::harness::o1f_capture_arm();
-    let rec = e4_recovery::workload::run_seed(1749, None);
+    let rec =
+        e4_recovery::workload::run_seed_with(1749, None, &e4_recovery::workload::Tuning::BASE);
     let lines = e4_recovery::harness::o1f_capture_take();
     assert!(
         !lines.is_empty(),
@@ -1895,7 +1900,8 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
 #[test]
 fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
     e4_recovery::harness::o1f_capture_arm();
-    let rec = e4_recovery::workload::run_seed(5549, None);
+    let rec =
+        e4_recovery::workload::run_seed_with(5549, None, &e4_recovery::workload::Tuning::BASE);
     let lines = e4_recovery::harness::o1f_capture_take();
     assert!(
         !lines.is_empty(),
@@ -1973,7 +1979,7 @@ fn check_le_t_agrees_with_owner_and_t(line: &str) {
 /// old failure returns and this pin fails.
 #[test]
 fn x5_r36_seed112_r2_no_longer_fails_o1b_on_tree_3() {
-    let rec = e4_recovery::workload::run_seed(112, None);
+    let rec = e4_recovery::workload::run_seed_with(112, None, &e4_recovery::workload::Tuning::BASE);
     let r2 = rec
         .rounds
         .get(2)

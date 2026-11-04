@@ -48,6 +48,193 @@ const S_GEN: u64 = 10;
 /// round's checkpoints actually reach).
 const S_HOOK: u64 = 11;
 
+/// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
+/// frozen tuning.** Every generator constant the X-5c-F4 retune may
+/// change, in one place. A seed pin's identity is `(generator, seed)`,
+/// not the seed alone, so the generator is a named value with two
+/// instances:
+///
+/// - [`Tuning::BASE`] — 1b0ce54e's generator, bit for bit. It is
+///   **never edited** (a later store fix that moves a BASE digest
+///   updates that digest literal in its own commit, naming the seeds
+///   and why — X5-R37's moved-digest rule). Every seed pin runs BASE.
+/// - [`Tuning::FINAL`] — the campaign's generator (`run`/`verify`
+///   re-run seeds under it). At this card's tip `FINAL == BASE`: this
+///   card builds the machinery and does no retune. X-5c-F4's relaunch
+///   changes FINAL only.
+///
+/// The knob-derivation streams and the draw order are unchanged by this
+/// refactor: with `Tuning::BASE` every draw consumes the same stream
+/// state with the same arguments as before, which the digest-literal
+/// pin `x5_r37_base_tuning_reproduces_1b0ce54e` proves over every seed
+/// any test passes to a seed runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tuning {
+    // ---- Knobs::derive's ranges and tables (5.1) ----
+    /// Committer tasks: `lo + below(span)` (2–4).
+    pub committers_lo: usize,
+    /// The committer span.
+    pub committers_span: u64,
+    /// User trees: `lo + below(span)` (2–4).
+    pub trees_lo: u64,
+    /// The tree span.
+    pub trees_span: u64,
+    /// Keys per tree: `lo + below(span)`.
+    pub keyspace_lo: u64,
+    /// The keyspace span.
+    pub keyspace_span: u64,
+    /// The SyncOff fraction table, in tenths.
+    pub syncoff_table: [u64; 3],
+    /// The `map_leaf_cap` table.
+    pub map_leaf_cap_table: [u64; 3],
+    /// The `freeset_leaf_bits` table.
+    pub freeset_leaf_bits_table: [u64; 3],
+    /// The `R_EPOCH` table.
+    pub r_epoch_table: [usize; 3],
+    /// The F-CRASH `keep_latest_pm` table (per-mille).
+    pub keep_latest_pm_table: [u32; 5],
+    /// The F-CRASH `tear_pm` table (per-mille).
+    pub tear_pm_table: [u32; 5],
+    /// The round count by `below(10)` draw (weights 50/30/20).
+    pub rounds_weights: [u32; 10],
+    /// The targeted checkpoint index: `below(span)`.
+    pub target_ckpt_span: u64,
+    /// Checkpoint trigger: `(lo + below(span)).max(1)` commits.
+    pub ckpt_every_lo: u64,
+    /// The checkpoint-trigger span.
+    pub ckpt_every_span: u64,
+    // ---- the commit and chunked op counts and the value range ----
+    /// The shared commit budget per round: `lo + below(span)`.
+    pub commit_budget_lo: u64,
+    /// The commit-budget span.
+    pub commit_budget_span: u64,
+    /// Ops per small commit: `lo + below(span)`.
+    pub commit_ops_lo: u64,
+    /// The per-commit op span.
+    pub commit_ops_span: u64,
+    /// The chunked transaction's op count: `lo + below(span)`.
+    pub chunked_ops_lo: u64,
+    /// The chunked op span.
+    pub chunked_ops_span: u64,
+    /// The small-commit value floor (B); values draw in
+    /// `[value_lo, value_hi]`.
+    pub value_lo: u64,
+    /// The value ceiling (B) — `V_INLINE`'s 400 B cap.
+    pub value_hi: u64,
+    // ---- the delete rate ----
+    /// A commit op is a Delete iff `below(delete_one_in) == 0`.
+    pub delete_one_in: u64,
+    // ---- the GC sweep count ----
+    /// GC sweeps per GC task: `lo + below(span)`.
+    pub gc_sweeps_lo: u64,
+    /// The GC sweep span.
+    pub gc_sweeps_span: u64,
+    // ---- the bulk-load/drop shares ----
+    /// A round runs a bulk load iff `below(bulk_load_one_in) == 0`.
+    pub bulk_load_one_in: u64,
+    /// A non-bulk round runs a DropTree iff `below(drop_one_in) == 0`.
+    pub drop_one_in: u64,
+    // ---- new fields, both 0 in BASE and so not drawn ----
+    /// **Delete bursts** (X-5c-F4's Q4 candidate, from P's probe of
+    /// 2026-11-04): the permille of one tree's chunked keys a round
+    /// deletes in one contiguous burst, as commits of at most 20 ops.
+    /// 0 in BASE: no burst is built and no burst draw is made.
+    pub burst_frac: u64,
+    /// Extra GC sweeps on the burst's tree after the burst (P's probe
+    /// used 8). 0 in BASE: none run.
+    pub burst_gc_loops: u64,
+    /// **X5-R38's W11 share** (permille): in a uniform-mode round with
+    /// `w11_share + w12_share > 0`, the probability the crash point is
+    /// drawn over the W11 window list (a completed WAL sync leaving the
+    /// synced end exactly at an untouched recycled segment boundary)
+    /// instead of the uniform draw. F4's knob, each share in
+    /// `[0.05, 0.20]`; 0 in BASE.
+    pub w11_share: u32,
+    /// **X5-R38's W12 share** (permille): the same, over the W12 window
+    /// list (a `wal_recycle` rename returned, its `sync_dir` not yet
+    /// complete). 0 in BASE.
+    pub w12_share: u32,
+}
+
+impl Tuning {
+    /// 1b0ce54e's generator, bit for bit (X5-R37). Never edited.
+    pub const BASE: Tuning = Tuning {
+        committers_lo: 2,
+        committers_span: 3,
+        trees_lo: 2,
+        trees_span: 3,
+        keyspace_lo: 1200,
+        keyspace_span: 1801,
+        syncoff_table: [0, 3, 7],
+        map_leaf_cap_table: [8, 16, 254],
+        freeset_leaf_bits_table: [128, 512, 32_576],
+        r_epoch_table: [1, 2, 4],
+        keep_latest_pm_table: [100, 300, 500, 700, 900],
+        tear_pm_table: [100, 300, 500, 700, 900],
+        rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
+        target_ckpt_span: 3,
+        ckpt_every_lo: 4,
+        ckpt_every_span: 5,
+        commit_budget_lo: 18,
+        commit_budget_span: 20,
+        commit_ops_lo: 1,
+        commit_ops_span: 20,
+        chunked_ops_lo: 320,
+        chunked_ops_span: 381,
+        value_lo: 8,
+        value_hi: 400,
+        delete_one_in: 4,
+        gc_sweeps_lo: 2,
+        gc_sweeps_span: 3,
+        bulk_load_one_in: 4,
+        drop_one_in: 3,
+        burst_frac: 0,
+        burst_gc_loops: 0,
+        w11_share: 0,
+        w12_share: 0,
+    };
+
+    /// The campaign's generator (`run`/`verify` re-run under it).
+    /// **Equal to [`Tuning::BASE`] at this card's tip** (this card does
+    /// no retune); X-5c-F4's relaunch changes it — pinned by
+    /// `x5_r37_final_equals_base_at_this_tip`.
+    pub const FINAL: Tuning = Tuning {
+        committers_lo: 2,
+        committers_span: 3,
+        trees_lo: 2,
+        trees_span: 3,
+        keyspace_lo: 1200,
+        keyspace_span: 1801,
+        syncoff_table: [0, 3, 7],
+        map_leaf_cap_table: [8, 16, 254],
+        freeset_leaf_bits_table: [128, 512, 32_576],
+        r_epoch_table: [1, 2, 4],
+        keep_latest_pm_table: [100, 300, 500, 700, 900],
+        tear_pm_table: [100, 300, 500, 700, 900],
+        rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
+        target_ckpt_span: 3,
+        ckpt_every_lo: 4,
+        ckpt_every_span: 5,
+        commit_budget_lo: 18,
+        commit_budget_span: 20,
+        commit_ops_lo: 1,
+        commit_ops_span: 20,
+        chunked_ops_lo: 320,
+        chunked_ops_span: 381,
+        value_lo: 8,
+        value_hi: 400,
+        delete_one_in: 4,
+        gc_sweeps_lo: 2,
+        gc_sweeps_span: 3,
+        bulk_load_one_in: 4,
+        drop_one_in: 3,
+        burst_frac: 0,
+        burst_gc_loops: 0,
+        w11_share: 0,
+        w12_share: 0,
+    };
+}
+
 /// The per-seed knobs (card Work 5.1, sized against the ≤ 20 min
 /// campaign budget of 5.3 — per-seed work shrinks, never the seed count).
 #[derive(Debug, Clone)]
@@ -91,39 +278,37 @@ pub struct Knobs {
 }
 
 impl Knobs {
-    /// Derive every knob from the seed (5.1). `round` shapes the
-    /// per-round feature mix (5.2): every round's stream is an
-    /// independent derivation, so the mix is a pure function of
-    /// `(seed, round)`.
-    pub fn derive(seed: u64, round: u32) -> Self {
+    /// Derive every knob from the seed (5.1), under the generator
+    /// constants of `tun` (X5-R37: the tuning is a named input, so a
+    /// seed pin can pin `(Tuning::BASE, seed)` while the campaign runs
+    /// `Tuning::FINAL`). `round` shapes the per-round feature mix
+    /// (5.2): every round's stream is an independent derivation, so the
+    /// mix is a pure function of `(seed, round)`.
+    pub fn derive(seed: u64, round: u32, tun: &Tuning) -> Self {
         let mut r = Rng::new(derive(seed, S_WORK));
-        let committers = 2 + r.below(3) as usize;
-        let trees = 2 + r.below(3);
-        let keyspace = 1200 + r.below(1801);
-        let syncoff_tenths = [0u64, 3, 7][r.below(3) as usize];
-        let map_leaf_cap = [8u64, 16, 254][r.below(3) as usize];
-        let freeset_leaf_bits = [128u64, 512, 32_576][r.below(3) as usize];
-        let r_epoch = [1usize, 2, 4][r.below(3) as usize];
-        let commit_budget = 18 + r.below(20);
+        let committers = tun.committers_lo + r.below(tun.committers_span) as usize;
+        let trees = tun.trees_lo + r.below(tun.trees_span);
+        let keyspace = tun.keyspace_lo + r.below(tun.keyspace_span);
+        let syncoff_tenths = tun.syncoff_table[r.below(3) as usize];
+        let map_leaf_cap = tun.map_leaf_cap_table[r.below(3) as usize];
+        let freeset_leaf_bits = tun.freeset_leaf_bits_table[r.below(3) as usize];
+        let r_epoch = tun.r_epoch_table[r.below(3) as usize];
+        let commit_budget = tun.commit_budget_lo + r.below(tun.commit_budget_span);
         // ≥ 3 checkpoints per round (the targeted index ≤ 2 must exist),
         // and intervals short enough that many separate the dirtied set.
-        let ckpt_every = (4 + r.below(5)).max(1);
+        let ckpt_every = (tun.ckpt_every_lo + r.below(tun.ckpt_every_span)).max(1);
         let fault = FaultKnobs {
-            keep_latest_pm: [100u32, 300, 500, 700, 900][r.below(5) as usize],
-            tear_pm: [100u32, 300, 500, 700, 900][r.below(5) as usize],
+            keep_latest_pm: tun.keep_latest_pm_table[r.below(5) as usize],
+            tear_pm: tun.tear_pm_table[r.below(5) as usize],
         };
-        let rounds = match r.below(10) {
-            0..=4 => 1,
-            5..=7 => 2,
-            _ => 3,
-        };
-        let target_ckpt = r.below(3);
-        let chunked_ops = 320 + r.below(381);
+        let rounds = tun.rounds_weights[r.below(10) as usize];
+        let target_ckpt = r.below(tun.target_ckpt_span);
+        let chunked_ops = tun.chunked_ops_lo + r.below(tun.chunked_ops_span);
         let _ = round;
         // The per-round feature mix (5.2) from the round's own stream.
         let mut fr = Rng::new(derive(seed * 1_000_003 + round as u64, S_GEN));
-        let bulk_load = fr.below(4) == 0;
-        let drop_tree = !bulk_load && fr.below(3) == 0;
+        let bulk_load = fr.below(tun.bulk_load_one_in) == 0;
+        let drop_tree = !bulk_load && fr.below(tun.drop_one_in) == 0;
         Self {
             committers,
             trees,
@@ -233,13 +418,15 @@ pub fn trees_at(model: &Model, cut: u64) -> BTreeSet<u64> {
     trees
 }
 
-/// Build round `round`'s script (5.1's task mix, 5.2's feature mix).
-/// Pure in `(seed, round, knobs, model at the previous cut)` (W-DET).
+/// Build round `round`'s script (5.1's task mix, 5.2's feature mix),
+/// under the generator constants of `tun` (X5-R37). Pure in
+/// `(seed, round, tun, knobs, model at the previous cut)` (W-DET).
 /// Returns the script, the crash description, and the targeted hook's
 /// name (empty for uniform crashes).
 pub fn build_round(
     seed: u64,
     round: u32,
+    tun: &Tuning,
     knobs: &Knobs,
     model: &Model,
     cut: u64,
@@ -325,7 +512,7 @@ pub fn build_round(
     // I-ENTRY-UNIQUE, exactly like the small commits).
     let need = 132 * 1024u64;
     let v_min = (need.saturating_sub(24 * n)).div_ceil(n);
-    let v_lo = v_min.clamp(8, 400);
+    let v_lo = v_min.clamp(tun.value_lo, tun.value_hi);
     let mut chunked_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut chunked_ops: Vec<Op> = Vec::new();
     while chunked_ops.len() < n as usize {
@@ -336,18 +523,66 @@ pub fn build_round(
         chunked_ops.push(Op::Put {
             tree: 2 + rng.below(write_max - 1),
             key,
-            value: value_of(&mut rng, v_lo),
+            value: value_of(&mut rng, v_lo, tun),
         });
     }
+    // **X5-R37's delete-burst knobs** (X-5c-F4's Q4 candidate; P's
+    // probe of 2026-11-04): with `burst_frac > 0`, one burst per round
+    // deletes a contiguous `burst_frac` permille of one tree's chunked
+    // keys as commits of at most 20 ops, and `burst_gc_loops` extra GC
+    // sweeps run on that tree (the block at the GC task below). The
+    // draws live inside these two blocks, so BASE (`burst_frac == 0`)
+    // consumes no stream state on them and its scripts are bit-for-bit
+    // the pre-refactor generator's.
+    let (burst_tree, burst_keys) = if tun.burst_frac > 0 {
+        let tb = 2 + rng.below(write_max - 1);
+        let mut mine: Vec<Vec<u8>> = chunked_ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::Put { tree, key, .. } if *tree == tb => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        mine.sort();
+        let run = mine.len() as u64 * tun.burst_frac / 1000;
+        let start = if !mine.is_empty() && mine.len() as u64 > run {
+            rng.below(mine.len() as u64 - run) as usize
+        } else {
+            0
+        };
+        let burst: Vec<Vec<u8>> = mine
+            .iter()
+            .skip(start)
+            .take(run as usize)
+            .cloned()
+            .collect();
+        (tb, burst)
+    } else {
+        (0, Vec::new())
+    };
     committers[chunked_task - 1].push(ScriptOp::Chunked {
         sync_on: rng.below(10) >= knobs.syncoff_tenths,
         ops: chunked_ops,
     });
+    // The burst's delete commits (empty in BASE: nothing is pushed and
+    // no draw is made).
+    for ch in burst_keys.chunks(20) {
+        committers[chunked_task - 1].push(ScriptOp::Commit {
+            sync_on: true,
+            ops: ch
+                .iter()
+                .map(|k| Op::Delete {
+                    tree: burst_tree,
+                    key: k.clone(),
+                })
+                .collect(),
+        });
+    }
     // The small commits: the shared budget of commits, round-robin over
     // the committers, 1–20 ops each (5.1), the SyncOff mix, 25% deletes.
     let mut ci = 0usize;
     for _ in 0..knobs.commit_budget {
-        let take = 1 + rng.below(20);
+        let take = tun.commit_ops_lo + rng.below(tun.commit_ops_span);
         // One op per (tree, key) per commit: two ops on the same entry
         // key in one transaction would carry the same ts, and only an
         // identical re-insert is legal (I-ENTRY-UNIQUE; D13's domain) —
@@ -360,13 +595,13 @@ pub fn build_round(
             if !seen.insert((tree, key.clone())) {
                 continue;
             }
-            if rng.below(4) == 0 {
+            if rng.below(tun.delete_one_in) == 0 {
                 ops.push(Op::Delete { tree, key });
             } else {
                 ops.push(Op::Put {
                     tree,
                     key,
-                    value: value_of(&mut rng, 8),
+                    value: value_of(&mut rng, tun.value_lo, tun),
                 });
             }
         }
@@ -389,10 +624,18 @@ pub fn build_round(
     // ---- the GC sweeper task: sweeps concurrent with checkpoints ----
     let mut gc_ops: Vec<ScriptOp> = Vec::new();
     barrier(&mut gc_ops);
-    for _ in 0..2 + rng.below(3) {
+    for _ in 0..tun.gc_sweeps_lo + rng.below(tun.gc_sweeps_span) {
         let tree = 2 + rng.below(write_max - 1);
         gc_ops.push(ScriptOp::Yields(1 + rng.below(4)));
         gc_ops.push(ScriptOp::Gc { tree, w: None });
+    }
+    // The burst's extra GC sweeps on its own tree (empty in BASE).
+    for _ in 0..tun.burst_gc_loops {
+        gc_ops.push(ScriptOp::Yields(2 + rng.below(6)));
+        gc_ops.push(ScriptOp::Gc {
+            tree: burst_tree,
+            w: None,
+        });
     }
     // ---- the DDL/bulk task ----
     let mut ddl_ops: Vec<ScriptOp> = Vec::new();
@@ -403,7 +646,12 @@ pub fn build_round(
         let tree = 50 + round as u64;
         let n = 90 + rng.below(71);
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
-            .map(|i| (to_be64(i % (4 * knobs.keyspace / 5)), value_of(&mut rng, 8)))
+            .map(|i| {
+                (
+                    to_be64(i % (4 * knobs.keyspace / 5)),
+                    value_of(&mut rng, tun.value_lo, tun),
+                )
+            })
             .collect();
         ddl_ops.push(ScriptOp::Yields(1 + rng.below(3)));
         ddl_ops.push(ScriptOp::BulkLoad { tree, entries });
@@ -453,10 +701,10 @@ fn keyspace_of(knobs: &Knobs) -> u64 {
     knobs.keyspace
 }
 
-/// A value of length drawn in `[lo, 400]` (always ≤ `V_INLINE`; no
-/// overflow chains — declared).
-fn value_of(rng: &mut Rng, lo: u64) -> Vec<u8> {
-    let hi = 400u64;
+/// A value of length drawn in `[lo, tun.value_hi]` (always ≤ `V_INLINE`;
+/// no overflow chains — declared).
+fn value_of(rng: &mut Rng, lo: u64, tun: &Tuning) -> Vec<u8> {
+    let hi = tun.value_hi;
     let len = lo + rng.below(hi - lo + 1);
     let mut v = Vec::with_capacity(len as usize);
     for _ in 0..len {
@@ -980,9 +1228,19 @@ pub fn twin_chain_after_repair(tout: &harness::RoundOutcome) -> Option<Chain> {
 
 /// Run one seed: create, then 1–3 rounds (each with its twin first for
 /// MP/MW), collecting the record. Pure in `(seed, mutant)` (W-DET).
+/// Runs `Tuning::FINAL` — the campaign's generator (X5-R37).
 pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
+    run_seed_with(seed, mutant, &Tuning::FINAL)
+}
+
+/// **X5-R37 (card X-5c-F4-F1 step 1):** [`run_seed`] under an explicit
+/// generator. Every seed pin runs `Tuning::BASE` (1b0ce54e's generator,
+/// bit for bit) so a pin's identity is `(Tuning::BASE, seed)` and
+/// X-5c-F4's retune of `Tuning::FINAL` cannot move it; the campaign's
+/// `run`/`verify` keep [`run_seed`]'s FINAL.
+pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec {
     let class = class_of(seed);
-    let base_knobs = Knobs::derive(seed, 0);
+    let base_knobs = Knobs::derive(seed, 0, tun);
     let round_counts = base_knobs.rounds;
     let mut rec = SeedRec {
         seed,
@@ -1020,9 +1278,10 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         let Some(ch) = chain.take() else {
             break;
         };
-        let knobs = Knobs::derive(seed, round);
+        let knobs = Knobs::derive(seed, round, tun);
         let cfg = knobs.store_cfg(mutant);
-        let (base, _crash_desc, crash_hook) = build_round(seed, round, &knobs, &ch.model, ch.cut);
+        let (base, _crash_desc, crash_hook) =
+            build_round(seed, round, tun, &knobs, &ch.model, ch.cut);
         // The uniform crash is scheduler-yield-level: a counting pass on
         // a throwaway clone of the round's start (the crash disabled)
         // measures the total, then the real round — and its twin, which
