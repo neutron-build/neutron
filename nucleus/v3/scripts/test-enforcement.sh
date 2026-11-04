@@ -3116,7 +3116,27 @@ expect_ok "runner e2e: M: attempt 2's message lists the failing STEP line from o
 # nothing from the run is left.
 git -C "$r" checkout -q nucleus/v3-scaffold
 # FG10's commit: the widest branch tip, taken before this section adds any.
-fgw=$(for c in $(git -C "$r" for-each-ref --format='%(objectname)' refs/heads/); do echo "$(git -C "$r" ls-tree -r --full-tree "$c" | wc -l) $c"; done | sort -n | tail -n 1 | cut -d ' ' -f 2)
+# "command wc": the runner-ledger rows above define a shell function wc(),
+# which prints nothing here, so a plain wc made every width empty and the pick
+# random (verdict X-6-F1-F2-F2-F1-F1 R5; a pick of scratch/prev3, which has no
+# nucleus/v3, aborted the suite).
+fgw=$(for c in $(git -C "$r" for-each-ref --format='%(objectname)' refs/heads/); do echo "$(git -C "$r" ls-tree -r --full-tree "$c" | command wc -l) $c"; done | sort -n | tail -n 1 | cut -d ' ' -f 2)
+# The premise counts with grep -c, not wc, so it does not share the pick's
+# counter: $fgw is a nonempty commit holding nucleus/v3/scripts, and no branch
+# tip is wider.
+fgw_widest() {
+  local n m c
+  n=$(git -C "$r" ls-tree -r --full-tree "$fgw" | grep -c '') || return 1
+  echo "pick: $fgw ($n entries)"
+  case $n in '' | *[!0-9]*) return 1 ;; esac
+  [ "$n" -gt 0 ] && [ "$(git -C "$r" cat-file -t "$fgw:nucleus/v3/scripts")" = tree ] || return 1
+  for c in $(git -C "$r" for-each-ref --format='%(objectname)' refs/heads/); do
+    m=$(git -C "$r" ls-tree -r --full-tree "$c" | grep -c '') || m=0
+    [ "$m" -le "$n" ] || { echo "wider: $c ($m entries)"; return 1; }
+  done
+}
+expect_ok "premise: FG10: the pick is the widest branch tip, nonempty, and holds nucleus/v3/scripts" fgw_widest
+echo "     (FG10) widest commit $fgw, $(git -C "$r" ls-tree -r --full-tree "$fgw" | grep -c '') entries"
 fg_orig=$(printf 'orig\n' | sha1sum | cut -d ' ' -f 1)
 fg_edit=$(printf 'EDIT\n' | sha1sum | cut -d ' ' -f 1)
 # fgstub DIR ID [EXIT]: in DIR (a worktree of $r on card/v3-ID), commit the stub
@@ -3585,6 +3605,9 @@ expect_ok "fresh-gate: FG14: a swapped symlink blob is refused, naming the path 
 expect_ok "fresh-gate: FG14: no checkout is left" fg_clean
 restore_forged
 expect_ok "forged objects: FG14 restored" no_state4
+# FG11e goes here (GLM, verdict X-6-F1-F2-F2-F1-F1 R6): a lone-CR forgery
+# under text eol=crlf (blob x=1\r\n, source x=1\r\r\n), in the FG11d
+# pattern; mutant FG-LONE-CR-OK must fail it. Not written yet.
 expect_ok "fresh-gate: no attribute file is left in the scratch worktree after the GLM rows" bash -c "[ ! -e '$r/.gitattributes' ]"
 expect_ok "git state: none after the GLM forged-object rows" no_state
 # --- end of GLM rows --------------------------------------------------------
