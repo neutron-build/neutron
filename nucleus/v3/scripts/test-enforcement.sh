@@ -3330,9 +3330,12 @@ expect_ok "git state: none of the output-shaping state after the fresh-gate scen
 
 # FG11, FG11b and FG12, the forged-object rows (owner exception 2026-11-03).
 # A checkout reads every tip blob and nothing hash-checks blobs on that path,
-# so a swapped loose blob checks out as the other bytes while the tree, the
-# index and plain status (fresh stat data) still name its own id: the blind
-# spot the content hash closes. Only loose objects unique to one FG branch are
+# so a swapped loose blob checks out as the other bytes while the tree and the
+# checkout's index (ls-files -s) still name its own id: the blind spot the
+# content hash closes. Plain status is asserted neither way (ruling esc-1): on
+# tmpfs the checkout's files and its index share one timestamp granule, every
+# entry is racily clean, and status re-hashes it, so whether it sees the swap
+# depends on the fs clock. Only loose objects unique to one FG branch are
 # forged; the honest fg.txt blob ("orig") is the source bytes, every id is
 # captured before its object is forged, and each window restores before the
 # next move (no_state4).
@@ -3353,11 +3356,11 @@ forge_from "$r" "$fg11_id" "$fg_src"
 git -C "$r" worktree add -q --detach "$t/fg11p" card/v3-FG11
 fg11_hidden() {
   local s
-  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11p" status --porcelain)
-  echo "status: $s"
-  [ "$(git -C "$r" hash-object --no-filters "$t/fg11p/nucleus/v3/spikes/fg11.txt")" = "$fg_src" ] && [ -z "$s" ]
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11p" ls-files -s -- nucleus/v3/spikes/fg11.txt)
+  echo "index: $s"
+  [ "$(git -C "$r" hash-object --no-filters "$t/fg11p/nucleus/v3/spikes/fg11.txt")" = "$fg_src" ] && [ "$s" = "$(printf '100644 %s 0\tnucleus/v3/spikes/fg11.txt' "$fg11_id")" ]
 }
-expect_ok "premise: FG11: a plain worktree add checks out the other bytes, and plain status there is empty" fg11_hidden
+expect_ok "premise: FG11: a plain worktree add checks out the other bytes, and the checkout's index names the tree's own id" fg11_hidden
 git -C "$r" worktree remove --force "$t/fg11p"
 fgrun card/v3-FG11
 expect_ok "fresh-gate: FG11: a swapped blob is refused, naming the path and both ids, before the gate runs" fg_refused "nucleus/v3/spikes/fg11.txt: content hashes to $fg_src, tree says $fg11_id"
@@ -3377,11 +3380,11 @@ forge_from "$r" "$fg11b_id" "$fg_src"
 git -C "$r" worktree add -q --detach "$t/fg11bp" card/v3-FG8
 fg11b_hidden() {
   local s
-  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11bp" status --porcelain)
-  echo "status: $s"
-  [ "$(git -C "$r" hash-object --no-filters "$t/fg11bp/nucleus/v3/spikes/fg.ps1")" = "$fg11b_got" ] && [ -z "$s" ]
+  s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$t/fg11bp" ls-files -s -- nucleus/v3/spikes/fg.ps1)
+  echo "index: $s"
+  [ "$(git -C "$r" hash-object --no-filters "$t/fg11bp/nucleus/v3/spikes/fg.ps1")" = "$fg11b_got" ] && [ "$s" = "$(printf '100644 %s 0\tnucleus/v3/spikes/fg.ps1' "$fg11b_id")" ]
 }
-expect_ok "premise: FG11b: the checkout holds the other bytes, eol-converted to CRLF, and plain status there is empty" fg11b_hidden
+expect_ok "premise: FG11b: the checkout holds the other bytes, eol-converted to CRLF, and the checkout's index names the tree's own id" fg11b_hidden
 git -C "$r" worktree remove --force "$t/fg11bp"
 fgrun card/v3-FG8
 expect_ok "fresh-gate: FG11b: a swapped blob is still refused under the eol exception, naming the path and both ids" fg_refused "nucleus/v3/spikes/fg.ps1: content hashes to $fg11b_got, tree says $fg11b_id"
