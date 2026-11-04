@@ -3104,6 +3104,234 @@ expect_ok "runner e2e: M: a run whose first Acceptance command always fails does
 expect_ok "runner e2e: M: attempt 2's message lists the failing STEP line from outside the tail" \
   res XMSG "'Failing steps (from the full output):\nSTEP fmt EXIT=1\n' in open('$e/XMSG.n.msg2').read()"
 
+
+# --- fresh-gate.sh (X-6-F1-F2-F2-F1-F1) -------------------------------------
+# fresh-gate.sh refuses hooks, filter drivers, attribute files and includes
+# before it makes a fresh checkout with hooks off, then checks the checkout's
+# index and files against the commit by hash, and only then runs the commit's
+# own gate.sh. Every card commit here carries a stub gate.sh (the real one
+# would run these tests recursively) that prints the sha1sum of the tracked
+# spikes/fg.txt, so a row can tell which bytes the gate ran on, then its
+# GATE EXIT line. Each run gets its own empty TMPDIR, so a row can check that
+# nothing from the run is left.
+git -C "$r" checkout -q nucleus/v3-scaffold
+# FG10's commit: the widest branch tip, taken before this section adds any.
+fgw=$(for c in $(git -C "$r" for-each-ref --format='%(objectname)' refs/heads/); do echo "$(git -C "$r" ls-tree -r --full-tree "$c" | wc -l) $c"; done | sort -n | tail -n 1 | cut -d ' ' -f 2)
+fg_orig=$(printf 'orig\n' | sha1sum | cut -d ' ' -f 1)
+fg_edit=$(printf 'EDIT\n' | sha1sum | cut -d ' ' -f 1)
+# fgstub DIR ID [EXIT]: in DIR (a worktree of $r on card/v3-ID), commit the stub
+# gate.sh (printing GATE EXIT=EXIT, default 0) and spikes/fg.txt holding "orig".
+fgstub() {
+  local ge=${3:-0}
+  printf '#!/usr/bin/env bash\ncd "$(dirname "$0")/.." && sha1sum spikes/fg.txt && echo "GATE EXIT=%s"\nexit %s\n' "$ge" "$ge" >"$1/nucleus/v3/scripts/gate.sh"
+  printf 'orig\n' >"$1/nucleus/v3/spikes/fg.txt"
+  git -C "$1" add nucleus/v3/scripts/gate.sh nucleus/v3/spikes/fg.txt && git -C "$1" commit -qm "nucleus v3: $2 work"
+}
+# fgcard ID [EXIT] [BASE]: card/v3-ID off BASE (default the scaffold) with the
+# stub, made in $r, which is left back on the scaffold.
+fgcard() { git -C "$r" checkout -q -b "card/v3-$1" "${3:-nucleus/v3-scaffold}" && fgstub "$r" "$1" "${2:-0}" && git -C "$r" checkout -q nucleus/v3-scaffold; }
+# fgrun [--shim WORD] ARGS...: fresh-gate.sh ARGS from $v3 (under gshim WORD),
+# with a fresh empty TMPDIR; stdout, stderr and the exit status go to
+# $t/fg.out, $t/fg.err and $t/fg.rc, and the worktree list before the run to
+# $t/fg.wt0.
+fgrun() {
+  local shim=() rc=0
+  if [ "$1" = --shim ]; then shim=(gshim "$2"); shift 2; fi
+  rm -rf "$t/fgtmp"; mkdir "$t/fgtmp"
+  plain worktree list --porcelain >"$t/fg.wt0"
+  (cd "$v3" && TMPDIR=$t/fgtmp "${shim[@]}" bash scripts/fresh-gate.sh "$@") >"$t/fg.out" 2>"$t/fg.err" || rc=$?
+  echo "$rc" >"$t/fg.rc"
+}
+fg_show() { echo "exit $(cat "$t/fg.rc")"; sed 's/^/out: /' "$t/fg.out"; sed 's/^/err: /' "$t/fg.err"; }
+# fg_gate N ID: the run reached the gate: exit N, last stdout line GATE EXIT=N,
+# card/v3-ID named by its full id, and the stub hashed "orig".
+fg_gate() { fg_show; [ "$(cat "$t/fg.rc")" = "$1" ] && [ "$(tail -n 1 "$t/fg.out")" = "GATE EXIT=$1" ] && grep -qxF "fresh-gate: commit $(git -C "$r" rev-parse "card/v3-$2")" "$t/fg.out" && grep -qxF "$fg_orig  spikes/fg.txt" "$t/fg.out"; }
+# fg_refused WANT...: a refusal: exit 2, last stdout line FRESH-GATE REFUSED,
+# no GATE EXIT= line anywhere, and stderr names every WANT.
+fg_refused() {
+  local x; fg_show
+  [ "$(cat "$t/fg.rc")" = 2 ] && [ "$(tail -n 1 "$t/fg.out")" = "FRESH-GATE REFUSED" ] && ! grep -qF 'GATE EXIT=' "$t/fg.out" "$t/fg.err" || return 1
+  for x in "$@"; do grep -F -- "$x" "$t/fg.err" | grep -q '^fresh-gate: ' || { echo "missing: fresh-gate: ...$x"; return 1; }; done
+}
+# fg_clean: the worktree list is as it was before the run, and nothing is left
+# in the run's TMPDIR.
+fg_clean() { local w; w=$(plain worktree list --porcelain); echo "$w"; ls -A "$t/fgtmp"; [ "$w" = "$(cat "$t/fg.wt0")" ] && [ -z "$(ls -A "$t/fgtmp")" ]; }
+
+# FG1 honest control, FG2 a failing gate.
+fgcard FG1
+fgrun card/v3-FG1
+expect_ok "fresh-gate: FG1: an honest commit reaches its gate (exit 0, last line GATE EXIT=0, commit named in full)" fg_gate 0 FG1
+expect_ok "fresh-gate: FG1: the checkout is removed and nothing is left in TMPDIR" fg_clean
+fgcard FG2 1
+fgrun card/v3-FG2
+expect_ok "fresh-gate: FG2: a failing gate: exit 1, last line GATE EXIT=1" fg_gate 1 FG2
+expect_ok "fresh-gate: FG2: the checkout is removed" fg_clean
+
+# FG3, the index-stat poisoning ESCALATE (verdict X-6-F1-F2-F2-F1): in a card
+# worktree, a same-size EDIT passes one status under a transient clean filter,
+# which writes EDIT's stat into the index. The mtime is set back 10 s so the
+# entry is not racy (git would re-read a racy one). Then the attribute and
+# the config are gone, and plain status still lists nothing.
+w3=$t/fg3w
+git -C "$r" worktree add -q -b card/v3-FG3 "$w3" nucleus/v3-scaffold
+fgstub "$w3" FG3
+sleep 1.2
+printf 'EDIT\n' >"$w3/nucleus/v3/spikes/fg.txt"
+touch -m -d "@$(($(date +%s) - 10))" "$w3/nucleus/v3/spikes/fg.txt"
+echo 'nucleus/v3/spikes/fg.txt filter=h' >"$r/.git/info/attributes"
+git -C "$w3" -c filter.h.clean='echo orig' status --porcelain >/dev/null
+rm -f "$r/.git/info/attributes"
+# fg_poisoned DIR: plain status in DIR lists nothing while fg.txt holds EDIT.
+fg_poisoned() { local s; s=$(env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$1" status --porcelain); echo "status: $s"; [ -z "$s" ] && [ "$(cat "$1/nucleus/v3/spikes/fg.txt")" = EDIT ]; }
+expect_ok "premise: FG3: after a transient clean filter, plain status in the card worktree is empty while fg.txt holds EDIT" fg_poisoned "$w3"
+# fg_ran_orig: the gate ran, and the stub hashed the committed bytes, not EDIT.
+fg_ran_orig() { fg_gate 0 FG3 && ! grep -qF "$fg_edit" "$t/fg.out"; }
+fgrun card/v3-FG3
+expect_ok "fresh-gate: FG3: the gate runs on the committed content (the stub hashes orig, not EDIT)" fg_ran_orig
+expect_ok "fresh-gate: FG3: the checkout is removed" fg_clean
+# FG3b, the same by a direct index write: --cacheinfo gives the entry the
+# committed id (and zero stat data), and the stat touch writes the edited
+# file's stat into that entry, as a hand-written index would.
+# idx_stat INDEX PATH FILE: in the v2/v3 index INDEX, PATH's entry gets FILE's
+# stat data (ctime, mtime, dev, ino, uid, gid, size; mode kept), checksum
+# rewritten.
+idx_stat() { python3 -I - "$@" <<'P'
+import hashlib, os, struct, sys
+idx, path, f = sys.argv[1], os.fsencode(sys.argv[2]), sys.argv[3]
+d = bytearray(open(idx, "rb").read())
+sig, ver, n = struct.unpack(">4sII", d[:12])
+if sig != b"DIRC" or ver not in (2, 3):
+    raise SystemExit(f"idx_stat: unsupported index (version {ver})")
+p = 12
+for _ in range(n):
+    flags = struct.unpack(">H", d[p + 60:p + 62])[0]
+    q = p + 62 + (2 if ver == 3 and flags & 0x4000 else 0)
+    end = d.index(b"\0", q)
+    if bytes(d[q:end]) == path:
+        st = os.stat(f)
+        struct.pack_into(">IIIIII", d, p, int(st.st_ctime), st.st_ctime_ns % 10**9, int(st.st_mtime), st.st_mtime_ns % 10**9, st.st_dev & 0xFFFFFFFF, st.st_ino & 0xFFFFFFFF)
+        struct.pack_into(">III", d, p + 28, st.st_uid, st.st_gid, st.st_size & 0xFFFFFFFF)
+        d[-20:] = hashlib.sha1(bytes(d[:-20])).digest()
+        open(idx, "wb").write(bytes(d))
+        sys.exit(0)
+    p += (q - p + (end - q) + 8) & ~7
+raise SystemExit(f"idx_stat: {sys.argv[2]} is not in the index")
+P
+}
+w3b=$t/fg3bw
+git -C "$r" worktree add -q --detach "$w3b" card/v3-FG3
+printf 'EDIT\n' >"$w3b/nucleus/v3/spikes/fg.txt"
+touch -m -d "@$(($(date +%s) - 10))" "$w3b/nucleus/v3/spikes/fg.txt"
+git -C "$w3b" update-index --cacheinfo "100644,$(git -C "$r" rev-parse card/v3-FG3:nucleus/v3/spikes/fg.txt),nucleus/v3/spikes/fg.txt"
+idx_stat "$(git -C "$w3b" rev-parse --path-format=absolute --git-path index)" nucleus/v3/spikes/fg.txt "$w3b/nucleus/v3/spikes/fg.txt"
+expect_ok "premise: FG3b: after a direct index write, plain status in the worktree is empty while fg.txt holds EDIT" fg_poisoned "$w3b"
+fgrun card/v3-FG3
+expect_ok "fresh-gate: FG3b: the gate runs on the committed content (the stub hashes orig, not EDIT)" fg_ran_orig
+expect_ok "fresh-gate: FG3b: the checkout is removed" fg_clean
+git -C "$r" worktree remove --force "$w3"
+git -C "$r" worktree remove --force "$w3b"
+
+# FG4, a post-checkout hook in the common dir: it writes a marker outside the
+# checkout and rewrites a tracked file. Planted only while $r stays on the
+# scaffold (its own checkouts would run it).
+fgcard FG4
+fghook=$r/.git/hooks/post-checkout
+printf '#!/bin/sh\ntouch "%s"\necho hooked >nucleus/v3/spikes/fg.txt\n' "$t/fg4.marker" >"$fghook"
+chmod +x "$fghook"
+git -C "$r" worktree add -q --detach "$t/fg4p" card/v3-FG4
+expect_ok "premise: FG4: a plain worktree add runs the hook (marker written)" test -e "$t/fg4.marker"
+git -C "$r" worktree remove --force "$t/fg4p"; rm -f "$t/fg4.marker"
+fgrun card/v3-FG4
+expect_ok "fresh-gate: FG4: a post-checkout hook is refused, by name (exit 2, no GATE EXIT= line)" fg_refused "hook " "hooks/post-checkout"
+expect_ok "fresh-gate: FG4: the hook never ran (no marker)" test ! -e "$t/fg4.marker"
+expect_ok "fresh-gate: FG4: no checkout is left" fg_clean
+rm -f "$fghook"
+
+# FG5, a smudge filter: repo config plus info/attributes. The command writes a
+# marker, so a check made after the checkout would come too late.
+fgcard FG5
+git -C "$r" config filter.fg.smudge "touch '$t/fg5.marker'; cat"
+echo 'nucleus/v3/spikes/fg.txt filter=fg' >"$r/.git/info/attributes"
+git -C "$r" worktree add -q --detach "$t/fg5p" card/v3-FG5
+expect_ok "premise: FG5: a plain worktree add runs the smudge filter (marker written)" test -e "$t/fg5.marker"
+git -C "$r" worktree remove --force "$t/fg5p"; rm -f "$t/fg5.marker"
+fgrun card/v3-FG5
+expect_ok "fresh-gate: FG5: a smudge filter is refused, naming filter.fg.smudge and info/attributes" fg_refused "filter.fg.smudge is 'touch '$t/fg5.marker'; cat' (file:" "info/attributes exists"
+expect_ok "fresh-gate: FG5: the refusal comes before the checkout (no marker)" test ! -e "$t/fg5.marker"
+expect_ok "fresh-gate: FG5: no checkout is left" fg_clean
+git -C "$r" config --remove-section filter.fg
+rm -f "$r/.git/info/attributes"
+
+# FG6, a filter from the command line (GIT_CONFIG_PARAMETERS), and a driver
+# named `set` (verdict R1: check-attr prints `set` for a bare attribute too,
+# but git runs filter.set.smudge for filter=set).
+fg6() { GIT_CONFIG_PARAMETERS=$1 fgrun card/v3-FG1; }
+fg6 "'filter.fg.smudge'='cat'"
+expect_ok "fresh-gate: FG6: a -c filter.fg.smudge is refused, at command-line scope" fg_refused "filter.fg.smudge is 'cat' (command line:"
+fg6 "'filter.set.smudge'='cat'"
+expect_ok "fresh-gate: FG6: a -c filter.set.smudge (a driver named set) is refused" fg_refused "filter.set.smudge is 'cat' (command line:"
+expect_ok "fresh-gate: FG6: no checkout is left" fg_clean
+
+# FG7, config includes: they can bring in any of the above.
+printf '[nv3]\n\tprobe = fg7\n' >"$t/fg7.inc"
+git -C "$r" config include.path "$t/fg7.inc"
+fgrun card/v3-FG1
+expect_ok "fresh-gate: FG7: an include.path in the repository config is refused, by name" fg_refused "include.path is '$t/fg7.inc' (file:"
+git -C "$r" config --remove-section include
+git -C "$r" config "includeIf.onbranch:fg7/**.path" "$t/fg7.inc"
+fgrun card/v3-FG1
+expect_ok "fresh-gate: FG7: an includeIf path is refused, by name" fg_refused "includeif.onbranch:fg7/**.path is '$t/fg7.inc' (file:"
+git -C "$r" config --remove-section "includeIf.onbranch:fg7/**"
+rm -f "$t/fg7.inc"
+
+# FG8, the eol exception's control: a committed `text eol=crlf` attribute and
+# an LF-only file, which the checkout writes with CRLF.
+git -C "$r" checkout -q -b card/v3-FG8 nucleus/v3-scaffold
+fgstub "$r" FG8
+printf 'nucleus/v3/spikes/fg.ps1 text eol=crlf\n' >"$r/.gitattributes"
+printf 'one\ntwo\n' >"$v3/spikes/fg.ps1"
+git -C "$r" add .gitattributes nucleus/v3/spikes/fg.ps1 2>/dev/null && git -C "$r" commit -qm "nucleus v3: FG8 crlf file"
+git -C "$r" checkout -q nucleus/v3-scaffold
+git -C "$r" worktree add -q --detach "$t/fg8p" card/v3-FG8
+fg8_crlf() { local h b; h=$(git -C "$r" hash-object --no-filters "$t/fg8p/nucleus/v3/spikes/fg.ps1"); b=$(git -C "$r" rev-parse card/v3-FG8:nucleus/v3/spikes/fg.ps1); echo "checkout $h, blob $b"; [ "$h" != "$b" ] && grep -q $'\r' "$t/fg8p/nucleus/v3/spikes/fg.ps1"; }
+expect_ok "premise: FG8: the checkout's fg.ps1 (CRLF) does not hash to its blob (LF)" fg8_crlf
+git -C "$r" worktree remove --force "$t/fg8p"
+fg8_ok() { fg_gate 0 FG8 && grep -qxF "fresh-gate: 1 file(s) matched through their eol conversion" "$t/fg.out"; }
+fgrun card/v3-FG8
+expect_ok "fresh-gate: FG8: a text eol=crlf file passes through its eol conversion, and the gate runs" fg8_ok
+expect_ok "fresh-gate: FG8: the checkout is removed" fg_clean
+
+# FG9, a failed step is a refusal, never a pass: exit 2, FRESH-GATE REFUSED,
+# no GATE EXIT= line, no checkout left.
+fgrun --shim worktree card/v3-FG1
+expect_ok "fresh-gate: FG9: a failed worktree add is a refusal" fg_refused "git worktree add failed (exit 128)"
+expect_ok "fresh-gate: FG9: (worktree) no checkout is left" fg_clean
+fgrun --shim hash-object card/v3-FG1
+expect_ok "fresh-gate: FG9: a failed hash-object is a refusal" fg_refused "git hash-object failed (exit 128; cannot check the content)"
+expect_ok "fresh-gate: FG9: (hash-object) no checkout is left" fg_clean
+fgrun --shim ls-tree card/v3-FG1
+expect_ok "fresh-gate: FG9: a failed ls-tree is a refusal" fg_refused "git ls-tree failed (exit 128; cannot read the commit's tree)"
+expect_ok "fresh-gate: FG9: (ls-tree) no checkout is left" fg_clean
+fgrun card/v3-FG-NOSUCH
+expect_ok "fresh-gate: FG9: a commit that does not resolve is a refusal" fg_refused "cannot resolve commit 'card/v3-FG-NOSUCH'"
+expect_ok "fresh-gate: FG9: (no commit) nothing is left" fg_clean
+
+# FG10, cost: the checks (the script's own timing, which stops before the
+# gate) on $r's widest branch tip ($fgw, above), with the stub on top.
+fgcard FG10 0 "$fgw"
+fgrun card/v3-FG10
+sed -n 's/^fresh-gate: checks passed/     (FG10) checks passed/p' "$t/fg.out"
+fg10() { local s; fg_gate 0 FG10 || return 1; s=$(sed -n 's/^fresh-gate: checks passed ([0-9]* files hashed in \([0-9]*\)\.[0-9]* s)$/\1/p' "$t/fg.out"); [ -n "$s" ] && [ "$s" -lt 5 ]; }
+expect_ok "fresh-gate: FG10: the checks on the widest commit finish in under 5 s" fg10
+
+expect_ok "fresh-gate: no hook, filter, attribute file or include is left" bash -c "[ -z \"\$(find '$r/.git/hooks' -mindepth 1 ! -name '*.sample')\" ] && [ ! -e '$r/.git/info/attributes' ] && [ -z \"\$(git -C '$r' config --get-regexp '^(filter|include|includeif)\\.')\" ]"
+expect_ok "git state: none after the fresh-gate scenarios" no_state
+expect_ok "git state: none of the output-shaping state after the fresh-gate scenarios" no_state3
+
+# FG11, FG11b and FG12 (forged objects) go here, in GLM's separate commit after
+# this one (owner decision 2026-11-03). Reuse fgcard/fgstub, fgrun, fg_refused,
+# fg_clean, and the forged-object helpers above (objlo, save_obj, forge_from,
+# restore_forged, no_state4).
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
 exit $(( fails > 0 ))
