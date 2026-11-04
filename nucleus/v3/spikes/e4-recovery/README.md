@@ -1,31 +1,257 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4 (the X5-R17 retune and the final file) —
-steps 0, 1 and 4 landed; **the retune is ESCALATED, pin-blocked above
-all** (the record below carries the measured frontier and the
-runner's own Acceptance feedback): step 0 committed F3-F3b's
-Acceptance 10k as the triage file of record (sha `8332df8d…`, prov
-commit 86ecf8ff) with this card's class table (375 failing seeds /
-352 failing rounds / 36 failing twins / 0 defect seeds,
-`reuse_on_dropping` 0); step 1 re-based X5-R17's SIZING row on seeds
-(9,628 of 10,000 miss in the Acceptance file) with its pin; step 4
-fixed the file's one NEW class — 17 MP poison+task-error rounds, the
-checkpointer's post-G8-mark refusal recorded as a round failure
-(`g8_checkpoint_poison_ends_the_workload`). The Acceptance's plain
-`verify` (the runner's, 17.3 min) exits 2 on the seven carried quota
-misses with the digests and the seed set reproducing. The probes
-established: the reachable retune (attempt 2's knobs ≈ 38 min/10k —
-the 17.1-min Acceptance datum corrects the budget reading; SIZING →
-~5,600 misses, Q8 ~450, Q18 ~1,150) is blocked **solely** by the r30
-seed pin's five served MP-A rounds (~1/1,000 seeds; 0 in every window
-measured) — no retune can land until P amends that pin; SIZING, Q4
-and Q12 are structurally short at any budget; Q11's
-`stale_seg_reads` counter has no increment site anywhere in the crate.
-The stages before it (X-5c-F3-F3a-F2-F1, X-5c-F3-F3a-F2,
-X-5c-F3-F3b, X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are
-complete and merged. Opus judges E4 on the RESULT with P's rulings
-X5-R1–R36. (The previous stage's own Status paragraph is preserved in
-its record section below: X-5c-F3-F3a-F2's root causes A and B.)
+Status: **stage X-5c-F4-F1 (E4 quota machinery: the frozen-tuning seed
+pins (X5-R37), the Q11 counter wired, X5-R38's window crashes, SIZING
+crash-cut accounting, the M-CKPOISON arms) — all six steps landed; the
+gate is green.** The record below carries P's nv3-X-5c-F4-esc-1 rulings
+verbatim and this card's five work records. `Tuning::FINAL ==
+Tuning::BASE` at this tip (this card does no retune); every seed pin
+runs `Tuning::BASE` (1b0ce54e's generator, bit for bit, pinned by
+`x5_r37_base_tuning_reproduces_1b0ce54e` over all 51 seeds any test
+passes to a seed runner); the only BASE digest that moved is seed 4's
+(Q11's wiring, its r0 flag, updated in the wiring's own commit). The
+stages before it (X-5c-F4, X-5c-F3-F3b and back to X-5c) are complete
+and merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R38.
+
+## P ruling nv3-X-5c-F4-esc-1, verbatim (2026-11-04; binding)
+
+Copied verbatim from the card before any other change of this stage
+(the step-0 discipline, as X5-R6–R36 before it). The four ESCALATE
+rulings and the two amendments:
+
+- **ESCALATE 1 → X5-R37.** A seed pin's identity is (generator, seed),
+  not seed alone. Every seed pin runs `Tuning::BASE`, 1b0ce54e's
+  generator bit for bit, which a digest-literal pin proves. The retune
+  changes only `Tuning::FINAL`.
+  - BASE is never edited.
+  - A later store fix that moves a BASE digest updates that literal in
+    its own commit, naming the seeds and why. The pinned assertions
+    must still hold under BASE, or the fix is wrong.
+  - Under BASE, re-pointing a shape is a lookup in F4's file (its ten
+    served rounds are 537, 1887, 2927, 4098, 7238, 7528, 8107, 8578,
+    8728 and 9358, all r0), never a luck scan.
+  - The final workload's served rounds are judged from the final file
+    by X5-R30 (c) rule 4, as before. The predicates' semantics stay
+    pinned by `r30_predicate_conditions_are_load_bearing`.
+- **ESCALATE 2.**
+  - **The accounting is correct:** pool LPIDs only.
+  - **"Every seed" cannot be met as defined.** 5.5's uniform crash can
+    land before any interval reaches 4·F, and 50% of seeds have one
+    round. So zero misses is unreachable by construction, not only by
+    budget.
+  - Changing SIZING's definition is an **owner question (OQ-1)**.
+    Until it is decided, `szc` is a diagnostic.
+- **ESCALATE 3.** The quota is sound and the counter was never wired
+  (re-measured by P: no increment site; the only writes are the
+  declaration and the initialiser). It is wired here. X5-R38's W11
+  window supplies the rate.
+- **ESCALATE 4 is refuted by measurement.** Merges need underfull leaf
+  pairs, and deletes make them; skewing the value size does not.
+  - *P's probe, 0..200 at 1b0ce54e plus: one burst per round deleting
+    a contiguous 60% of one tree's chunked keys (commits of ≤ 20 ops),
+    and 8 extra GC sweeps on that tree.*
+  - *Results: Q4 132 of 309 rounds (×50 ≈ 6,600 per 10k against
+    1,000), Q18 49 rounds, 0 failing rounds, 19.3 s against 15.4 s per
+    200 seeds (quiet host). Probe, not evidence.*
+  - Q4 is reachable by retune (F4).
+- **X5-R38 (window crashes; a 5.5 amendment, pre-registered before the
+  final run).** In uniform-mode rounds, a seeded share of crash points
+  is drawn uniformly over the recycle's rename→dirsync yields (W12) or
+  over the yields where the synced WAL end sits at a recycled segment's
+  untouched start (W11). The rest stays 5.5's uniform draw. Targeted
+  (hook) rounds are untouched.
+  - **Why.** Q11 and Q12 are sub-step windows of one or two yields
+    among thousands, which uniform crashes reach at about 1–15 per
+    10k. The plan row's "a crash between every step 0–6" covers step
+    6's recycle, and these windows are its two G1/§12.5 edges.
+  - **Bounds.** The shares are F4's knobs, each in [0.05, 0.20]. Every
+    quota is still checked on the whole file.
+- **(c)** The poison_fail_stop fix is accepted.
+  - The flag only routes an external G8 mark to the poison end that
+    G8's contract prescribes. The oracle still judges the round.
+  - Fail-stops keep the loud path: D12b and D4 were re-verified by the
+    worker.
+  - The single-arm gap is closed in step 5.
+
+## Stage X-5c-F4-F1's record (this card)
+
+**Step 1 — X5-R37's `Tuning` (commit 5270264a).** Every generator
+constant F4's retune may change lives in `pub struct Tuning` (5.1's
+ranges and tables, the commit and chunked op counts and the value
+range, the delete rate, the GC sweep count, the bulk-load/drop shares,
+and two new knob pairs both 0 in BASE and so never drawn: the
+delete-burst `burst_frac`/`burst_gc_loops` — P's Q4 probe above — and
+X5-R38's `w11_share`/`w12_share` in permille). `Tuning::BASE` is
+1b0ce54e's generator bit for bit; `Tuning::FINAL` equals it at this tip
+(pinned by `x5_r37_final_equals_base_at_this_tip`).
+`run_seed_with(seed, mutant, &Tuning)` runs a seed under an explicit
+generator; `run_seed` delegates to FINAL, so the campaign's
+`run`/`verify` are unchanged. **The digest-literal list** (pin
+`x5_r37_base_tuning_reproduces_1b0ce54e`, the literals copied from
+X-5c-F4's Acceptance file, sha `bec7056c…3ab6c5`, commit 1b0ce54e):
+all **51** seeds any test passes to a seed runner — the smoke and
+round-trip seeds 0–15, and 47, 48, 60, 66, 67, 112, 118, 198, 221,
+268, 308, 387, 403, 537, 660, 747, 907, 967, 987, 1267, 1749, 1769,
+1787, 1887, 2669, 2927, 4049, 4309, 5549, 5808, 6149, 7469, 7528,
+8728, 9809 — cross-checked against P's 43-seed list: the grep's
+additions from the file are 0–6 and 8–9 (the smoke/round-trip seeds),
+and P's 7359 — one of the C-DIV-in-MW five — is run by no test at this
+tip (no pin). Every seed pin (the X5-R36 pins, the 1749/5549 frontier
+pins, `r30_skx_and_smx_record_fields`,
+`g8_checkpoint_poison_ends_the_workload`, the R16/R20/R21/R28/G8/C-XX
+pins) re-points to `run_seed_with(…, &Tuning::BASE)` — only the calls
+changed; the 16-seed smoke, the uniform-fired property test, the JSON
+round-trip and `campaign.rs`'s own runs stay on FINAL. M-BASEDRIFT
+(GC sweeps `2 + below(3)` → `3 + below(3)` in BASE) fails the pin
+(seed 3's digest moved) — applied, shown, reverted clean. The knob
+property tests derive under BASE (they assert 5.1's card ranges).
+
+**Step 2 — the Q11 counter (commit f10d4d63).**
+`wal::is_stale_record(b, lsn, seg_end)` — true iff magic, `len` and
+CRC are valid and the embedded lsn ≠ the position — implemented through
+`dec_record_inner` (the skip-lsn-check decode succeeds where the
+checked decode fails; never a second copy of the check). In `recover`'s
+walk, where the decode fails at `off == 0` and the bytes are a stale
+record, `st.stale_seg_reads` increments and the walk stops exactly as
+before (stale content at a segment's start can only be a recycled
+segment's: a fresh segment starts zeroed). Pins:
+`q11_stale_record_at_recycled_segment_start_counts` (a literal fixture
+— a meta replaying from a `SegmentEnd` at 64 KiB+100 that hops into a
+recycled segment B whose offset-0 bytes are its previous life's valid
+record: the counter is 1 and `wal.append` — the valid end — is B's
+first LSN, identical to the walk without the increment) and
+`q11_mid_segment_stale_does_not_count` (a valid Chunk then stale bytes
+at +45, mid-segment: the counter stays 0, the valid end is the stale
+record's start). M-Q11UNWIRED (the increment removed) fails the first;
+M-Q11ANY (the `off == 0` guard removed) fails the second — both
+applied, shown, reverted clean. Seed pin: `run_seed_with(4, None,
+&Tuning::BASE)` — r0's Q11 flag is true (P's probe hit, 2026-11-04).
+**The movement list:** all 51 pinned seeds re-run under BASE — exactly
+one digest moved, **seed 4** (`3047956786 → 1441374082`), its r0 Q11
+flag flipping 0→1, the only digest input the wiring touches; the
+literal is updated in the wiring's own commit per X5-R37's
+moved-digest rule. Every other seed's digest is byte-identical.
+
+**Step 3 — X5-R38's window crashes (commit a5fc0eb1).** Store
+observables (flags only, never behaviour inputs): **W12** opens when a
+`wal_recycle` rename returns and closes when its `sync_dir` completes;
+**W11** opens when a completed WAL `sync_data` of the segment below a
+boundary `b` leaves the synced end durable exactly through `b` while
+`b` is a recycled segment whose own content is not yet durable
+(`wal.recycled_unsynced`; the note fires at both sync sites — the
+writer's group-sync loop and `wal_sync_through`'s helper loop) and
+closes when a sync at or above `b` completes. The counting pass records
+each opening's first crashable yield index (`current + 1`; the set runs
+between two yield events) into `WorkloadObs::w11_yields`/`w12_yields`.
+In a uniform-mode round with `w11_share + w12_share > 0`, one draw from
+the new per-round stream `S_CWIN` picks W12 (prob `w12_share`), W11
+(prob `w11_share`) or the unchanged uniform point; a picked window
+takes its point uniformly over its list, an empty list falls back.
+Record field `cwin` (`u`/`w11`/`w12`/`w11-`/`w12-`), a digest input
+only when it is not `u` — BASE digests never move (the whole pre-step
+suite is unchanged); `campaign.json` gains `cwin` (old files parse
+unchanged). **Judgment call, for P's gate:** the card's W11 text ("set
+when a completed WAL sync leaves the synced end exactly at a segment
+boundary `b` … cleared when any write at ≥ `b` is issued") implemented
+literally never opens — measured **0 openings in 500 rounds** (its
+precondition is a batch ending exactly at a boundary, which the
+placement's filler+record atomicity makes never happen) — while the
+natural Q11 hit (seed 4 r0) crashes in the per-segment sync loop's
+window: the segment below `b` synced through `b`, `b`'s own record
+written but its sync pending, the crash dropping it. X5-R38's own
+summary names "the yields where the synced WAL end sits at a recycled
+segment's untouched start" — exactly the implemented window; the
+deviation (the close is the sync of a segment at or above `b`, not the
+write's issue) is recorded here. Pins:
+`x5_r38_w12_crash_drops_the_rename` (keep-latest table zeroed,
+`w12_share` 1000: seed 11 r0, cwin `w12`, fired, Q12 true, passes) and
+`x5_r38_w11_crash_reads_stale_at_start` (`w11_share` 1000: seed 276
+r0, cwin `w11`, fired, Q11 true, passes). M-W12ALL (the W12 draw over
+all yields) fails the W12 pin — applied, shown, reverted clean.
+**Probe, not evidence** (FINAL's shares temporarily 0.10/0.10, then
+reverted): `run --seeds 0..200 --threads 16`, 305 rounds — **Q11 1,
+Q12 5, Q5a 3; cwin picks w11 14 / w12 18; empty fallbacks `w11-` 1 /
+`w12-` 0**; `FAILING_SEEDS=2` (the pre-existing 8/178 pair),
+`DEFECT_SEEDS=0`, 34 s wall.
+
+**Step 4 — SIZING crash-cut accounting (commit 02bf978f).** Store
+observable `ckpt_closed_dirty`: the `n` the **open** checkpoint's begin
+step folded (0 when no checkpoint is open — reset at `ckpt:end` and on
+the abort path). Round field `szc`: the crash fired and either
+`dirty_now_len ≥ 4·F`, or a checkpoint was open at the crash with
+`ckpt_closed_dirty ≥ 4·F` (`szc_of`/`sizing_ok_of` are pub and pure in
+the observables; serialized in `campaign.json`, never a digest input,
+never an exit input). `verify` prints exactly one INFO line — `INFO
+SIZING-C crash rounds cutting a >= 4*F interval: C <n> MP <n> MW <n>` —
+after the quota table, before the exit decision. The accounting itself
+is unchanged (P's ruling: pool LPIDs only). Pins:
+`szc_crash_cuts_an_open_4f_interval` (pool 6 so 4·F = 24; a 3,000-put
+chunked txn, no checkpoint, crash at the next op — `szc` and
+`sizing_ok` both true) and `szc_a_completed_4f_interval_and_a_small_cut`
+(the same txn, then a completed forced checkpoint folding the ≥ 4·F
+interval into `dirty_max`, then one small commit before the crash —
+`sizing_ok` true, `szc` false, `ckpt_closed_dirty` 0). M-SZC-ANY
+(`szc := sizing_ok`) fails the small-cut pin — applied, shown, reverted
+clean. **The MP gap root-caused — a workload property, not an
+accounting defect:** in F4's file the flag is 0 in **all 10,000 round-0
+rounds** (C 0/7000, MP 0/2000, MW 0/1000) — one round's universe cannot
+dirty 4·F = 172–232 distinct pool LPIDs in one interval; the flag
+concentrates in later rounds (C r1 47/3468 = 1.4%, r2 331/1393 =
+23.8%), and MP/MW chains stop after r0 far more often (MP 1,792 of
+2,000 seeds stop early — a failed r0 or a recovery without a store),
+leaving MP 190 r1+ rounds against C's 4,861; per-index rates are
+comparable (MP r1 1/182, r2 1/8). Single seeds: MP 537 stops at its
+failing r0 (no later round exists); C 10 runs three passing rounds and
+its r2 is the `sizing_ok` hit. The `obs` snapshot is the same store —
+no accounting defect to fix.
+
+**Step 5 — P ruling (c), the M-CKPOISON arms (commit 5392901d).** The
+`h:ck` **poll arm is deleted** (unreachable alone): with the
+mid-checkpoint `Fail::Poisoned` arm in place, every schedule it covered
+— an external G8 mark observed at the poll — produces an identical
+record through the draft poll path's final checkpoint, whose
+`ckpt:begin` refuses on `alive()` with the same `Fail::Poisoned` and
+ends the workload at the same poison crash; the checkpointer holds the
+baton throughout (`cx.with` steps are atomic), so no interleaving
+window and no record field can differ. **Demonstrated** with the
+literal poll-side schedule (round 0 an R6 detection round — a directed
+LOST fault on a mapped tree page, recovery Ok, passing; round 1 a
+600-put chunked txn on the damaged tree with `every` unreachable): the
+round digest is **1585665090 both with the arm present and with it
+deleted**, byte-identical. The **mid-checkpoint arm keeps its behaviour
+and is pinned alone**
+(`g8_poison_mid_checkpoint_ends_the_workload_quietly`: a 4,000-put
+SyncOff chunked txn on a fresh clean tree triggers the `every = 1`
+checkpoint with a large dirty set — step 2 runs long — and the
+600-put poisoner on the damaged tree lands the mark from the LAST
+script task's apply while the checkpointer is inside its checkpoint:
+fired, crash `poison`, no task error). **M-CKPOISONb** (the arm forced
+to the draft's loud path) fails it with the exact 17-round class text
+("checkpoint failed: Poisoned(\"XX001 in gated op: lpid 14 slot 10 (G8,
+9.2)\")", no crash delivered) — applied, shown, reverted clean. **The
+full revert** (the remaining quiet path gone) still fails
+`g8_checkpoint_poison_ends_the_workload` (seed 747 r1, the same class
+text) — shown. The post-deletion poll path stays quiet and pinned
+(`g8_poison_poll_path_stays_quiet_through_the_final_checkpoint`).
+Neither arm's behaviour changed.
+
+**The hand-off to X-5c-F4's relaunch (REFRESH 4, `--keep` once OQ-1 is
+decided):**
+- `Tuning::FINAL` is F4's to change (BASE is frozen; the seed pins run
+  BASE and cannot move).
+- The X5-R38 shares `w11_share`/`w12_share` (permille, each in
+  [50, 200]); at 100/100 the 200-seed probe measured Q11 1 / Q12 5 /
+  Q5a 3 with 14/18 window picks and 1 empty fallback (above, "probe,
+  not evidence") — F4 tunes from there.
+- The delete-burst knobs `burst_frac`/`burst_gc_loops` (P's probe:
+  600/8 — a contiguous 60% of one tree's chunked keys as commits of
+  ≤ 20 ops, plus 8 extra GC sweeps on that tree; Q4 132/309 rounds in
+  P's 0..200 probe).
+- `verify`'s INFO SIZING-C line prints the crash-cut diagnostic per
+  class; `szc`/`cwin` are in `campaign.json` for the file-side
+  judgement.
+- The W11 window semantics deviation (step 3's judgment call) is P's
+  to confirm or amend.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
