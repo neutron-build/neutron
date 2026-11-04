@@ -3363,6 +3363,59 @@ Commits, in order: **3c8b038e** (X5-R35 verbatim, before any run),
     step 0 re-derives the table from this file.)
 
 
+## Stage X-5c-F3-F3b's record (this card)
+
+**Step 0 — the triage file of record (commit f8251b84) and the class
+table.**
+
+- **(a) The provenance checks passed before the copy:** the prov file
+  shows `commit=3c743d30e85981dca06a593921935be8e135e50a`,
+  `status_lines=0`, `exit=0`, `verify_exit=0`; the JSON's sha256 equals
+  its `json_sha256`
+  (`46297043f583ff9fc69ed8dc4ad58cc5f8b9d2fc63a6297869f52a3058a0c42c`);
+  `commit=` equals `git log -1 --format=%H HEAD -- spikes/e4-recovery
+  Cargo.lock`; `git diff --quiet 3c743d30 HEAD -- spikes/e4-recovery
+  Cargo.lock` exits 0.
+- **(b) The triage file:** committed at f8251b84
+  (`results/campaign.json` only), the message carrying the two E4 lines,
+  the quota table and the prov lines.
+- **(c) The class table, re-derived from `results/campaign.json` (the
+  reporting rule: served rounds split out first), judged under X5-R30 (c)
+  from the recorded fields — a served round passes iff
+  `(skx ∨ smx) ∧ pass_na` (no re-run).** A **failing** primary round has
+  `pass=false` as amended; a **failing** twin has `pass=false` in the
+  twin record.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **Served (split out first)** | 8, **all moved to pass** by X5-R30 (c) | MP/MW round with `served=true`: 537, 1887, 2927, 4098, 7528, 8107, 8578, 8728 (all r0, all `O-3(a): served corruption` as recorded) — each passes the amendment (`(skx ∨ smx) ∧ pass_na`). **No failing served round remains.** | 2927 r0, 7528 r0 |
+| **C-XX** (class C) | 50 | class C failing round with `o2 != null` or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 16, `AmcheckIi` 34 (47 also carry an `o1`) | 310 (r0, `Open`), 332 (r1, `AmcheckIi`) |
+| **C-DIV** | 256 | class C failing round outside C-XX carrying an `o1` text: (b) 101, (c) 96, (d) 59, (a) 0. **0 carry `0 < frontier < lo`** (by round index: r0 3, r2 253) — X-5c-F3-F3a-F2's family (the per-key `≤ T` cut) | 63 (r2, c), 104 (r2, c), 112 (r2, b) |
+| **MW-ORPHAN** | 406 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` — **this card's** (`wal_ckpt_end`/I-WAL-COVER) target; in 0..200 exactly the eight named rounds: 19 r0, 39 r0, 59 r0, 69 r0, 109 r0, 149 r0, 159 r0, 199 r2 (the REFRESH set) | 19 r0, 199 r2 |
+| **Other MW** | 14 | the MW failing rounds outside ORPHAN: 13 `O-1(a)`+`O-3(d)`, 1 no-`o1`+no-`o3` — the ORPHAN published-set family; none in 0..200 | 4399, 6399 |
+| **MP O-3(e)(ii)** | 11 | MP failing round with `o3` starting `O-3(e): (ii)`: 8 r0, 3 r1, each "reported slot N that is neither tainted nor in R" | 8 r0, 178 r1 |
+| **Other MP** | 0 | no MP round fails outside the served set and (ii) — the rework file's shape holds | — |
+| **The twins** | 39 | failing twin rounds: 8 MP + 31 MW; `o1` kinds: (a) 13, (b) 14, (c) 8, (d) 4 | — |
+| **`ack_over`** | 0 | no round carries a non-empty `ack_over` (X5-R34 (f)'s cross-check clean) | — |
+
+Partition check: primary failing rounds (amended) **737** = 745 recorded
+− the 8 served; C 306 = 50 + 256; MP 11; MW 420 = 406 + 14; the fold's
+`FAILING_SEEDS=766` counts the seeds failing only through twins or
+served-amendment accounting beside these. **Every count equals the
+F3-F3a rework gate's own class table** (its README section); no
+deviation to record.
+
+**Step 0′ — the folded follow-up X-5c-F3-F3a-F3 (commit
+29e0d1f7; test-only).** The literal-config harness pin
+`x5r35_seed403_slice_feeds_the_derivation` runs `run_round` on seed 403
+through round 1 and asserts round 1 derives `lo == 3 ≤ frontier` (4),
+that ts 7 is not acked, and that `ack_over` is empty — X5-R35 (a)'s
+`slicing rule held by a seed, not only by the (g) 6 event fixture. Both
+revert demonstrations (RG1 `pre_workload = 0` in `run_round`, RG2
+`derive_written_acked` fed the unsliced capture `&events`) were applied
+to the real code, shown failing the pin, and reverted clean
+(`git diff` free of each).
+
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
 

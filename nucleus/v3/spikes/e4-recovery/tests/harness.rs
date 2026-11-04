@@ -1617,3 +1617,60 @@ fn x5r34_recovery_truncation_zeros_never_ack() {
 fn name1_of() -> String {
     e4_recovery::harness::x5r34_seg_name(65536)
 }
+
+/// **X-5c-F3-F3a-F3, the folded follow-up (S, test-only; F3-F3b's step
+/// 0′): X5-R35 (a)'s slicing rule held on a real seed, not only by the
+/// (g) 6 event fixture.** The seed driver runs seed 403 through round 1:
+/// round 1 enqueues a SyncOn commit at ts 7 whose record the workload
+/// never writes, over bytes the **previous** round's §14 G2 truncation
+/// zero-write left synced — the exact shape the slice exists to exclude.
+/// Asserted from round 1's record: `lo == 3 ≤ frontier` (the unsliced
+/// derivation raises `lo` to 7 by counting the synced zeros as the
+/// record's covering write), `hi == 3` and `ackl == 0` (ts 7 was never
+/// written and never acked — an acked ts 7 above the cut would appear in
+/// the acked-lost list and in `lo`), and `ack_over` empty (no
+/// ACK-OVER-HOLE store failure).
+///
+/// Reverting the slice breaks the pin either way: **RG1** (`pre_workload
+/// = 0` in `run_round`) and **RG2** (`derive_written_acked` fed the
+/// unsliced capture `&events`) both re-derive `lo = 7`; both
+/// demonstrations were applied, shown failing this test, and reverted
+/// clean.
+#[test]
+fn x5r35_seed403_slice_feeds_the_derivation() {
+    let rec = e4_recovery::workload::run_seed(403, None);
+    let create_failed = rec
+        .defect
+        .as_deref()
+        .is_some_and(|d| d.starts_with("create failed"));
+    assert!(!create_failed, "seed 403 must create: {:?}", rec.defect);
+    let rr = rec
+        .rounds
+        .get(1)
+        .expect("seed 403 must reach round 1 (the pin's subject)");
+    assert_eq!(
+        rr.lo, 3,
+        "round 1 derives lo = 3 (X5-R35 (a): the synced truncation zeros of\
+         \nround 0 never cover round 1's unwritten record)"
+    );
+    assert!(
+        rr.frontier >= rr.lo,
+        "lo must sit at or below the frontier (frontier = {})",
+        rr.frontier
+    );
+    assert_eq!(
+        rr.hi, 3,
+        "nothing above ts 3 was written this round — ts 7's record never\
+         \nreached the disk"
+    );
+    assert_eq!(
+        rr.acked_lost, 0,
+        "ts 7 (SyncOn, above the cut) was never acked — an acked commit\
+         \nabove the cut would be reported here"
+    );
+    assert!(
+        rr.ack_over.is_empty(),
+        "ack_over must be empty (no ACK-OVER-HOLE): {:?}",
+        rr.ack_over
+    );
+}
