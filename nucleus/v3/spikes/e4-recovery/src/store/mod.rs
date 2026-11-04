@@ -451,6 +451,30 @@ pub struct StoreInner {
     pub freeset_grew: bool,
     /// Stale-record stops at renamed segment starts (Q11).
     pub stale_seg_reads: u64,
+    /// **X5-R38 (card X-5c-F4-F1 step 3; a store observable, flags
+    /// only — never a behaviour input): the W12 window is open** — a
+    /// `wal_recycle` rename returned and its `sync_dir` has not yet
+    /// completed. A crash in this window leaves the rename volatile, so
+    /// F-CRASH's directory draw can drop it (Q12's shape).
+    pub w12_window: bool,
+    /// **X5-R38:** the W11 window's boundary — a completed WAL sync
+    /// left the synced end exactly at a segment boundary `b` whose
+    /// recycled segment file exists with no write since its recycling
+    /// rename. A crash in this window makes the recovery walk hop into
+    /// `b` and read its previous life's records (Q11's shape). `None`
+    /// = closed (cleared the moment any write at ≥ `b` is issued).
+    pub w11_window: Option<u64>,
+    /// **X5-R38:** the scheduler-yield indices of the open windows'
+    /// first crashable yields (one entry per window opening): the
+    /// current yield count plus one, read at the set — the set itself
+    /// happens between two yield events, so the next yield index is
+    /// the first a `CrashSpec::Yield(k)` can land on with the window
+    /// open (the set's own index names a yield that has already fired,
+    /// and arming it would never trip). Recorded by the counting pass
+    /// through [`crate::harness::WorkloadObs`]; a diagnostic only.
+    pub w11_yields: Vec<u64>,
+    /// **X5-R38:** the same for the W12 windows.
+    pub w12_yields: Vec<u64>,
     /// Named park points (card Work 13: the D5 split parking): name →
     /// remaining yields. `park()` at a named point yields while a budget
     /// remains.
@@ -561,6 +585,10 @@ impl StoreInner {
             epoch_exhausted: 0,
             freeset_grew: false,
             stale_seg_reads: 0,
+            w12_window: false,
+            w11_window: None,
+            w11_yields: Vec::new(),
+            w12_yields: Vec::new(),
             parks: BTreeMap::new(),
             meta_durable_k: 0,
             fs_building: BTreeSet::new(),

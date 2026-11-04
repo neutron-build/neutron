@@ -47,6 +47,11 @@ const S_GEN: u64 = 10;
 /// X5-R16 NEVER-FIRED: the targeted fallback draw's stream (a hook the
 /// round's checkpoints actually reach).
 const S_HOOK: u64 = 11;
+/// **X5-R38 (card X-5c-F4-F1 step 3):** the uniform crash's
+/// window-picker stream — one draw per uniform-mode round when
+/// `w11_share + w12_share > 0`, never drawn (and never constructed)
+/// when both shares are 0, so BASE consumes no stream state on it.
+const S_CWIN: u64 = 12;
 
 /// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
 /// frozen tuning.** Every generator constant the X-5c-F4 retune may
@@ -846,6 +851,47 @@ pub fn uniform_yield_point(seed: u64, round: u32, counted: u64) -> u64 {
     1 + rng.below(counted.max(1))
 }
 
+/// **X5-R38 (card X-5c-F4-F1 step 3; a 5.5 amendment, pre-registered
+/// before the final run): the uniform crash's window pick.** In a
+/// uniform-mode round whose tuning has `w11_share + w12_share > 0`, one
+/// draw from the round's own `S_CWIN` stream picks the W12 window with
+/// probability `w12_share`, the W11 window with probability
+/// `w11_share`, and otherwise the existing uniform point unchanged; a
+/// picked window takes its point uniformly over the counting pass's
+/// yield list for that window, and an empty list falls back to the
+/// uniform point (recorded as `w12-`/`w11-`). With both shares 0 (BASE,
+/// and this card's FINAL) nothing is drawn and the uniform point stands
+/// — BASE digests never move on it.
+pub fn window_crash_point(
+    seed: u64,
+    round: u32,
+    obs: &harness::WorkloadObs,
+    tun: &Tuning,
+    counted: u64,
+) -> (u64, Option<&'static str>) {
+    if tun.w11_share as u64 + tun.w12_share as u64 == 0 {
+        return (uniform_yield_point(seed, round, counted), None);
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_CWIN));
+    let d = r.below(1000);
+    let w12 = tun.w12_share as u64;
+    let w11 = tun.w11_share as u64;
+    let pick = |list: &[u64], r: &mut Rng| list.get(r.below(list.len() as u64) as usize).copied();
+    if d < w12 {
+        match pick(&obs.w12_yields, &mut r) {
+            Some(k) => (k, Some("w12")),
+            None => (uniform_yield_point(seed, round, counted), Some("w12-")),
+        }
+    } else if d < w12 + w11 {
+        match pick(&obs.w11_yields, &mut r) {
+            Some(k) => (k, Some("w11")),
+            None => (uniform_yield_point(seed, round, counted), Some("w11-")),
+        }
+    } else {
+        (uniform_yield_point(seed, round, counted), None)
+    }
+}
+
 /// A round whose crash spec never fired is a **harness defect** (5.5
 /// step 2: every round crashes). A silent no-crash round would leave
 /// every downstream field — faults, recovery, the oracle inputs —
@@ -999,6 +1045,14 @@ pub struct RoundRec {
     pub r_len: usize,
     /// The round passed (the seed pass fold).
     pub pass: bool,
+    /// **X5-R38 (card X-5c-F4-F1 step 3):** the uniform crash's window
+    /// pick — `None` (the plain uniform point, and every targeted
+    /// round), or `Some("w11" | "w12")` (a picked window's yield) or
+    /// `Some("w11-" | "w12-")` (the window's list was empty; the
+    /// uniform point stood). A digest input **only when it is not the
+    /// plain uniform** (`Some`), so BASE digests do not move; never a
+    /// quota or judgement input.
+    pub cwin: Option<&'static str>,
     /// Per-seed failure flags.
     pub deadlock: bool,
     /// A livelock occurred (X5-R13 (b)): some world of the round
@@ -1184,6 +1238,12 @@ impl SeedRec {
                     + 16 * (r.sizing_ok as u8),
                 r.acked_lost,
             ));
+            // **X5-R38:** the window pick enters the digest only when it
+            // is not the plain uniform point, so BASE digests (no
+            // shares, every pick `None`) never move on it.
+            if let Some(w) = r.cwin {
+                s.push_str(&format!("|cwin:{w}"));
+            }
         }
         for t in &self.twin {
             s.push_str(&format!("|{}|{:?}", t.pass, t.o1_fail));
@@ -1300,6 +1360,9 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // fired") — a harness defect, never a pass.
         let uniform = (seed / 10) % 2 == 1;
         let (script_twin, mut script_real, mut crash_desc);
+        // X5-R38: the round's window pick (`None` for every targeted
+        // round and every plain uniform draw).
+        let mut cwin_pick: Option<&'static str> = None;
         if uniform {
             let probe = Script {
                 crash: None,
@@ -1327,7 +1390,13 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                 None,
                 None,
             );
-            let k = uniform_yield_point(seed, round, out.sched_yields.max(1));
+            // **X5-R38 (step 3):** the uniform point — or, when the
+            // tuning's window shares are non-zero, one S_CWIN draw
+            // that picks a W11/W12 window yield list recorded by the
+            // counting pass. BASE (shares 0) draws nothing here: the
+            // plain uniform point stands and no digest moves.
+            let (k, cwin) = window_crash_point(seed, round, &out.obs, tun, out.sched_yields.max(1));
+            cwin_pick = cwin;
             script_twin = Script {
                 crash: Some(CrashSpec::Yield(k)),
                 ..base.clone()
@@ -1819,7 +1888,10 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         if out.r5_anchor0_defect && rec.defect.is_none() {
             rec.defect = Some(harness::R5_ANCHOR0_DEFECT.to_owned());
         }
-        let rr = round_rec(&knobs, &cfg, &out, &crash_desc, &crash_hook);
+        let mut rr = round_rec(&knobs, &cfg, &out, &crash_desc, &crash_hook);
+        // X5-R38: the window pick of record (a digest input only when
+        // set — see `RoundRec::cwin`).
+        rr.cwin = cwin_pick;
         rec.deadlock |= rr.deadlock;
         rec.panic |= rr.panic;
         rec.baton |= rr.baton;

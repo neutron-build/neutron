@@ -1393,7 +1393,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1442,6 +1442,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.panic,
                 x.baton,
                 x.task_error.is_some(),
+                esc(x.cwin.unwrap_or("u")),
                 u8::from(x.q4_split_merge),
                 u8::from(x.q5_open),
                 u8::from(x.q5_marked),
@@ -1886,6 +1887,17 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "terr" => {
                 let b = j.boolv()?;
                 x.task_error = b.then(|| "task error (see digest)".to_owned());
+            }
+            "cwin" => {
+                // X5-R38: the window pick of record ("u" = the plain
+                // uniform point / a targeted round).
+                x.cwin = match j.string()?.as_str() {
+                    "w11" => Some("w11"),
+                    "w12" => Some("w12"),
+                    "w11-" => Some("w11-"),
+                    "w12-" => Some("w12-"),
+                    _ => None,
+                };
             }
             "q" => {
                 j.eat(b'[')?;

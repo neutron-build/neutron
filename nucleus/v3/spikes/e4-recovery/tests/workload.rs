@@ -216,6 +216,77 @@ fn q11_seed4_round0_reads_a_stale_record_at_a_recycled_segment_start() {
     );
 }
 
+/// **X5-R38's W12 pin (card X-5c-F4-F1 step 3; a literal config): the
+/// share-forced crash at the rename→dirsync window drops the rename
+/// (Q12).** The tuning is BASE with `keep_latest_pm_table` zeroed
+/// (every F-CRASH directory draw drops the volatile prefix) and the
+/// W12 share at 1000 permille (every uniform draw takes the window
+/// list); seed 11's round 0 is the pinned shape. M-W12ALL (the W12
+/// draw over all yields) moves the crash out of the window and fails
+/// this pin.
+#[test]
+fn x5_r38_w12_crash_drops_the_rename() {
+    let mut tun = workload::Tuning::BASE;
+    tun.keep_latest_pm_table = [0, 0, 0, 0, 0];
+    tun.w12_share = 1000;
+    let rec = workload::run_seed_with(11, None, &tun);
+    assert!(rec.defect.is_none(), "seed 11: {:?}", rec.defect);
+    let r0 = &rec.rounds[0];
+    assert_eq!(
+        r0.cwin,
+        Some("w12"),
+        "seed 11 r0: the crash must be drawn from the W12 window list"
+    );
+    assert!(
+        r0.fired,
+        "seed 11 r0: the window crash fired (never a NEVER-FIRED)"
+    );
+    assert!(
+        r0.q12_dropped_rename,
+        "seed 11 r0: the crash in the rename→dirsync window with keep-latest 0 must drop the G1 rename (Q12)"
+    );
+    assert!(
+        r0.pass,
+        "seed 11 r0: the round passes (o1={:?} o2={:?} o3={:?})",
+        r0.o1_fail, r0.o2_fail, r0.o3_fail
+    );
+}
+
+/// **X5-R38's W11 pin (card X-5c-F4-F1 step 3; a literal config): the
+/// share-forced crash in the recycled-segment window reads the stale
+/// record (Q11).** The tuning is BASE with `w11_share` at 1000
+/// permille. Seed 276's round 0 crashes inside the window — after the
+/// segment below the recycled boundary `b` synced durable through
+/// `b`, before `b`'s own sync — so the crash drops `b`'s volatile
+/// record, and the recovery walk hops into `b` and reads its previous
+/// life's bytes.
+#[test]
+fn x5_r38_w11_crash_reads_stale_at_start() {
+    let mut tun = workload::Tuning::BASE;
+    tun.w11_share = 1000;
+    let rec = workload::run_seed_with(276, None, &tun);
+    assert!(rec.defect.is_none(), "seed 276: {:?}", rec.defect);
+    let r0 = &rec.rounds[0];
+    assert_eq!(
+        r0.cwin,
+        Some("w11"),
+        "seed 276 r0: the crash must be drawn from the W11 window list"
+    );
+    assert!(
+        r0.fired,
+        "seed 276 r0: the window crash fired (never a NEVER-FIRED)"
+    );
+    assert!(
+        r0.q11_stale_seg,
+        "seed 276 r0: the crash in the recycled-segment window must make the walk read the stale record (Q11)"
+    );
+    assert!(
+        r0.pass,
+        "seed 276 r0: the round passes (o1={:?} o2={:?} o3={:?})",
+        r0.o1_fail, r0.o2_fail, r0.o3_fail
+    );
+}
+
 /// The scheduler-level uniform crash (5.5's "uniform over the round's
 /// yield points"): the counting pass measures the round's true yield
 /// total, the drawn point is always reachable — every round of the

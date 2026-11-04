@@ -1994,6 +1994,16 @@ pub struct WorkloadObs {
     pub freeset_grew: bool,
     /// Stale-record stops at renamed segment starts (Q11).
     pub stale_seg_reads: u64,
+    /// **X5-R38 (card X-5c-F4-F1 step 3):** the scheduler-yield indices
+    /// of the W11 windows that opened during the pass — a completed WAL
+    /// sync left the synced end exactly at a boundary of a recycled
+    /// segment no write has touched since its rename. The counting
+    /// pass records them (the crash draw's window list); a diagnostic
+    /// only.
+    pub w11_yields: Vec<u64>,
+    /// **X5-R38:** the same for the W12 windows — a `wal_recycle`
+    /// rename returned, its `sync_dir` not yet complete.
+    pub w12_yields: Vec<u64>,
     /// Flips whose image held part of a commit above `T` (Q9).
     pub q9_partial_flips: u64,
     /// LPIDs dirtied in the still-open interval (Work 5.3's crash-time
@@ -2342,6 +2352,8 @@ pub fn run_round(
             epoch_exhausted: st.epoch_exhausted,
             freeset_grew: st.freeset_grew,
             stale_seg_reads: st.stale_seg_reads,
+            w11_yields: st.w11_yields.clone(),
+            w12_yields: st.w12_yields.clone(),
             q9_partial_flips: st.q9_partial_flips,
             dirty_now_len: st.dirty_now.len() as u64,
             dirty_max: st.dirty_max,
