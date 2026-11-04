@@ -2809,10 +2809,14 @@ for a in ${inv[$i]}; do
     hideuntracked) echo hidden >"nucleus/v3/spikes/$id-hidden.txt"; printf '*\n' >nucleus/v3/spikes/.gitignore ;;
     # The prompt or retry message this invocation got (its last argument; RUN-F1).
     msg) printf '%s\n' "${@: -1}" >"$FAKE_OC_N.msg$n" ;;
-    # A forge left running after opencode exits normally (BG): bash without job
-    # control keeps the subshell and its sleep in opencode's process group.
+    # A forge left running after opencode exits normally (BG): this fake's bash,
+    # without job control, keeps the subshell and its sleep in opencode's process
+    # group. Real opencode 2.2.5 does not: it starts tool shells in a new session,
+    # so they escape the group kill (verdict X-6-F1-F1-F2, card X-6-F1-F1-F2-F1).
+    # TERM is ignored from before the fork, so no race leaves the subshell
+    # killable by TERM and a kill that is not SIGKILL leaves it alive (OWN-SIGTERM).
     # FAKE_OC_N.bg holds the subshell's pid.
-    bgforge) ( sleep 30; echo forged >"$v"; git add "$v"; git commit -qm "nucleus v3: $id verdict MERGE" ) >/dev/null 2>&1 & echo $! >"$FAKE_OC_N.bg" ;;
+    bgforge) trap '' TERM; ( sleep 30; echo forged >"$v"; git add "$v"; git commit -qm "nucleus v3: $id verdict MERGE" ) >/dev/null 2>&1 & echo $! >"$FAKE_OC_N.bg"; trap - TERM ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -2958,9 +2962,11 @@ e2e XK "forge silent" --attempts 1
 unset E2E_SIGTERM_AFTER E2E_STALL_S
 expect_ok "runner e2e: K: SIGTERM kills opencode and closes the ledger range" res XK "rc == 143 and dead() and $closed"
 # BG: opencode exits normally and leaves a backgrounded forge in its group; the
-# runner kills the group before acceptance and in its finally (X-6-F1-F1-F2;
-# BG-NO-KILL-ON-EXIT, BG-FINALLY-ONLY, BG-PID-NOT-GROUP). K cannot see it: its
-# opencode is alive when killed.
+# runner kills the group before acceptance (X-6-F1-F1-F2; BG-NO-KILL-ON-EXIT,
+# BG-FINALLY-ONLY, BG-PID-NOT-GROUP, OWN-SIGTERM). K cannot see it: its opencode
+# is alive when killed. This covers same-group children only, so it proves nothing
+# about real opencode, whose tool shells are in their own sessions and escape the
+# kill (verdict X-6-F1-F1-F2 R1). Containing those is X-6-F1-F1-F2-F1.
 # e2ea NAME ACCEPT FAKE_OC ARGS...: as e2e, but the card's Acceptance is ACCEPT
 # and then the gate (e2e's ec rewrites its card with `true` on every call).
 e2ea() { local n=$1 acc=$2 oc=$3 id=${1%%-*}; shift 3; rm -f "$e/$n.n" "$e/$n.n.bg"
@@ -2980,8 +2986,48 @@ bg_unforged() { local b=card/v3-$1 subjects
 bg_alive_check="bash -c 'p=\$(cat $e/XBG.n.bg) || exit 1; s=\$(ps -o stat= -p \"\$p\" 2>/dev/null) || true; [ -z \"\$s\" ] || [ \"\${s#Z}\" != \"\$s\" ]'"
 e2ea XBG "$bg_alive_check" "work bgforge" --attempts 1
 expect_ok "runner e2e: BG: premise: bgforge recorded its background pid" grep -qxE '[0-9]+' "$e/XBG.n.bg"
-expect_ok "runner e2e: BG: a background grandchild is killed when opencode exits normally" res XBG "rc == 0 and r['pass'] and dead() and $closed"
-expect_ok "runner e2e: BG: the background forge never lands" bg_unforged XBG
+expect_ok "runner e2e: BG: a same-group background child is killed when opencode exits normally (fake only; real tool shells escape, X-6-F1-F1-F2-F1)" res XBG "rc == 0 and r['pass'] and dead() and $closed"
+expect_ok "runner e2e: BG: a same-group background forge never lands (fake only; real tool shells escape, X-6-F1-F1-F2-F1)" bg_unforged XBG
+# The finally's kill_child must not killpg again: by then the pid may be an
+# unrelated job's pgid (verdict R2). Driver copies change os.killpg, as L's copy
+# changes stray_commits; the premises prove the copies were patched.
+# XKP logs each killpg and passes it on: one normal exit, exactly one killpg.
+sed '/^spec = importlib.util.spec_from_file_location/a real_kp = os.killpg; os.killpg = lambda pid, sig: (open(os.environ["KP_LOG"], "a").write(f"{pid} {int(sig)}\\n"), real_kp(pid, sig))[1]' "$t/e2e.py" >"$t/e2e-kp.py"
+expect_ok "runner e2e: BG: premise: the driver copy logs killpg" grep -qF 'os.environ["KP_LOG"]' "$t/e2e-kp.py"
+rm -f "$e/XKP.n" "$e/XKP.kp"
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XKP.n KP_LOG=$e/XKP.kp E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-kp.py" "$v3/tools/run_card.py" "$e/XKP" "$(ec XKP)" --base e2e/base --attempts 1) || true
+bg_one_kill() { local want got; want="$(cat "$e/XKP.n.pid") $(python3 -c 'import signal; print(int(signal.SIGKILL))')"; got=$(cat "$e/XKP.kp"); echo "want: $want"; echo "got: $got"; [ "$got" = "$want" ]; }
+expect_ok "runner e2e: BG: a normal exit calls killpg once, with SIGKILL, on opencode's group" bg_one_kill
+expect_ok "runner e2e: BG: the one-killpg run passes and closes its range" res XKP "rc == 0 and r['pass'] and dead() and $closed"
+# XPE: killpg raises PermissionError after a normal exit. It stays uncaught and
+# fails the run, and the mark lets the finally write the end record (verdict R3).
+sed '/^spec = importlib.util.spec_from_file_location/a os.killpg = lambda pid, sig: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted (row)"))' "$t/e2e.py" >"$t/e2e-pe.py"
+expect_ok "runner e2e: BG: premise: the driver copy makes killpg raise" grep -qF 'Operation not permitted (row)' "$t/e2e-pe.py"
+rm -f "$e/XPE.n"
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XPE.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-pe.py" "$v3/tools/run_card.py" "$e/XPE" "$(ec XPE)" --base e2e/base --attempts 1) || true
+expect_ok "runner e2e: BG: a raising killpg after a normal exit crashes the run and still leaves an end record" res XPE "rc == 1 and not r.get('pass') and 'PermissionError' in out and $closed"
+# A marked child whose leader is still alive is killed again, not waited on
+# forever: the first killpg raises, the second call must still kill. timeout
+# turns a hang into a failure.
+bg_live_leader() { PYTHONDONTWRITEBYTECODE=1 timeout 20 python3 - "$v3/tools/run_card.py" <<'P'
+import importlib.util, os, signal, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+c = subprocess.Popen(["sleep", "30"], process_group=0)
+real = os.killpg
+def deny(pid, sig):
+    raise PermissionError(1, "Operation not permitted (row)")
+os.killpg = deny
+try:
+    rc.kill_child(c)
+    sys.exit("the first kill_child did not raise")
+except PermissionError:
+    pass
+os.killpg = real
+rc.kill_child(c)
+sys.exit(0 if c.returncode == -signal.SIGKILL else f"returncode {c.returncode}")
+P
+}
+expect_ok "runner e2e: BG: a second kill_child still kills a leader that is alive" bg_live_leader
 # L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
 # always says "committed outside its worktree"). No fake-opencode action makes
 # the real git log fail without first tripping the ref check, so a copy of the
