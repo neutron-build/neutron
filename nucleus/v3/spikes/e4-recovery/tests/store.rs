@@ -4929,15 +4929,17 @@ fn g8_wal_sync_error_poisons() {
 /// `gc_w_used` starts at the recovered meta's `gc_w` at open, so a
 /// checkpoint taken before the first GC mutation of the new boot — the
 /// boot checkpoint of §14 step 8 above all — still records the image's
-/// bound. Fixture: a store that GC'd at `w = 5` and checkpointed it
-/// (its meta carries `gc_w = 5`), a clean crash, and a recovery that
+/// bound. Fixture: a store that GC'd at `w = 4` and checkpointed it
+/// (its meta carries `gc_w = 4`), a clean crash, and a recovery that
 /// runs no GC before its boot checkpoint. The pin decodes the winning
 /// meta's bytes from the durable stream (never store memory) and
-/// asserts `gc_w = 5`. With the fix reverted (open leaving `gc_w_used`
+/// asserts `gc_w = 4`. With the fix reverted (open leaving `gc_w_used`
 /// at 0), the boot checkpoint records 0 and this pin fails — the
 /// X-5c-F3-F3a-F2 trace of 664 r2 (image 3 `gc_w = 8`, its recovery's
 /// boot checkpoint `gc_w = 0`, O-1 (d) sampling S = 5 below the true
-/// bound and failing on a version legally pruned at `w = 8`).
+/// bound and failing on a version legally pruned at `w = 8`). (The
+/// comment's `w = 5`/`gc_w = 5` were off by one from the fixture;
+/// corrected comment-only by X-5c-F3-F3a-F2-F1, verdict finding 5.)
 #[test]
 fn gc_w_survives_recovery_into_the_boot_checkpoint() {
     let seed = 7111u64;
@@ -4987,7 +4989,7 @@ fn gc_w_survives_recovery_into_the_boot_checkpoint() {
         g.disk.clone()
     };
     // Life 2: a clean crash, a recovery that runs no GC, and its boot
-    // checkpoint. The winning meta must still carry gc_w = 5.
+    // checkpoint. The winning meta must still carry gc_w = 4.
     let mut d2 = disk;
     crash_clean(&mut d2, seed + 1);
     let sched2 = pass_world(1, seed + 2, d2, StoreInner::empty(cfg.clone(), 0));
