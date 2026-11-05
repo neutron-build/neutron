@@ -6,7 +6,7 @@ Date: 2026-08-19 (audit) — **updated 2026-08-20: migration applied (S91)**
 
 Toolchain: conda `mojo 1.0.0` + `max 26.5.0` from `https://conda.modular.com/max/`
 (stable channel), resolved by pixi inside `neutron-mojo/` (`mojoproject.toml`:
-`mojo = ">=1.0"`, `max = ">=26.5"`). Validation: `scripts/validate-core.sh` →
+`mojo = "==1.0.0"`, `max = ">=26.5,<26.6"`). Validation: `scripts/validate-core.sh` →
 125 passed, 0 failed (see `reports/core-validation-latest.md`). All three
 benchmark harnesses also compile and run.
 

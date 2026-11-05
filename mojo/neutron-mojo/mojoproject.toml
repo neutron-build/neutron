@@ -11,8 +11,8 @@ homepage = "https://github.com/neutron-build/neutron"
 repository = "https://github.com/neutron-build/neutron"
 
 [dependencies]
-mojo = ">=1.0"
-max = ">=26.5"
+mojo = "==1.0.0"
+max = ">=26.5,<26.6"
 
 [tool.mojo]
 src = "src"
