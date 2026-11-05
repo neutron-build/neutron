@@ -1,25 +1,17 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1 (E4 quota machinery: the frozen-tuning seed
-pins (X5-R37), the Q11 counter wired, X5-R38's window crashes, SIZING
-crash-cut accounting, the M-CKPOISON arms) — all six steps landed, and
-the P gate's REWORK (verdict `verdicts/X-5c-F4-F1.md`, 2026-11-04)
-consumed: the sim-crash unwind keeps `ckpt_closed_dirty` (finding 1),
-W11 opens only at `wal.written ≥ b` (ruling (i), finding 2), `cwin` is
-pinned as a digest input (finding 5), and the record below carries the
-corrected four-seed movement list, the MP root cause, the re-measured
-probe and ESCALATE 4's correction.** The record below carries P's
-nv3-X-5c-F4-esc-1 rulings verbatim and this card's work records.
-`Tuning::FINAL == Tuning::BASE` at this tip (this card does no retune);
-every seed pin runs `Tuning::BASE` (1b0ce54e's generator, bit for bit,
-pinned by `x5_r37_base_tuning_reproduces_1b0ce54e` over all 53 seeds
-any test passes to a seed runner — 41 and 303 joined with the rework's
-pins); the only BASE digests that moved are the Q11 wiring's four
-(seeds 4, 8422, 9226 and 9606, each on the q11 flag alone — seed 4's
-literal updated in the wiring's own commit; the other three are run by
-no test and stay unpinned). The stages before it (X-5c-F4, X-5c-F3-F3b
-and back to X-5c) are complete and merged. Opus judges E4 on the RESULT
-with P's rulings X5-R1–R38.
+Status: **stage X-5c-F4-F1-F1 (E4 Q4 reachability: the split and merge
+halves measured, the re-gate's findings 1/2/4 closed, X5-R40 the SMO
+alignment, three settings probed) — complete, and the card's decision
+rule is NOT MET by all three settings: Q4 is 0 of ~310 rounds at every
+setting (ESCALATE, the record below).** `Tuning::FINAL ==
+Tuning::BASE` at this tip (this card does no retune); every seed pin
+runs `Tuning::BASE` (1b0ce54e's generator, bit for bit,
+pinned by `x5_r37_base_tuning_reproduces_1b0ce54e` over all 54 seeds
+any test passes to a seed runner — 41, 303 and 2376 joined with the
+rework's and step 0a's pins); no BASE digest moved. The stages before
+it (X-5c-F4-F1, X-5c-F4, X-5c-F3-F3b and back to X-5c) are complete
+and merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R40.
 
 ## P ruling nv3-X-5c-F4-esc-1, verbatim (2026-11-04; binding)
 
@@ -347,6 +339,152 @@ decided):**
 - REFRESH 6 of the F4 card (pasted by the gate verdict) supersedes the
   older REFRESH text where they differ — F4 relaunches only after this
   rework's gate and X-5c-F4-F1-F1.
+
+## Card X-5c-F4-F1-F1's record (Q4 reachability: the halves, X5-R40)
+
+The question: is Q4 ≥ 1,000 per 10k reachable without changing Q4's
+definition or threshold? **Answer, by this card's rule: not by any of
+its three settings — ESCALATE (step 4 below).** The halves measurement
+says why: the merge half never reaches the crash's window at BASE or
+at the burst knobs alone, and even with the X5-R40 alignment the two
+halves land in-window in *different* rounds — only 1 round in 1,239
+carries both (the pin hunt).
+
+**Step 0 — the re-gate's findings closed (verdict X-5c-F4-F1
+MERGE-WITH-FOLLOWUPS, findings 1, 2 and 4; commits dc156302, ebf30ee9,
+26a969e0), before any probe.**
+- **(a) `wal_recycle` must not swallow a delivered crash.** The
+  rename's error now returns through a crashed-flag check — never a
+  plain `?`, which would also return the quiet uncrashed-world failure
+  ("`to` exists") the store relies on skipping. Pin
+  `szc_rename_crash_keeps_the_open_fold`: `run_seed_with(2376, None,
+  &Tuning::BASE)`, r2 crash `uniform@y:17768`, `szc` true; 2376 joined
+  the X5-R37 literal list (54 seeds now) with F4's own literal — no
+  digest moves (the gate ran the change over the whole 10k: only seed
+  2376 r2's non-digest `szc` changed). M-RENAME-SWALLOW (`is_ok()`
+  restored) fails the new pin, and M-RENAME-ANYERR (a plain `?`)
+  fails `x5_r37_base_tuning_reproduces_1b0ce54e` — applied, shown,
+  reverted clean.
+- **(b) `x5_r38_w11_needs_no_completed_sync_since`:** BASE with
+  `w11_share` 1000, seed 30 r0, `cwin` `w11-` (the W11 list empty —
+  the `recycled_unsynced.retain` retire line is what empties it).
+  G-W11-NORETIRE fails it — applied, shown, reverted clean.
+- **(c) `szc_non_crash_abort_resets_the_fold`:** a literal
+  `wal_io_fail` schedule whose open checkpoint has folded 2 (proven by
+  `dirty_max`) fails with a non-`Sim` error and ends the round with
+  `ckpt_closed_dirty` 0. G-SZC-ABORTNORESET fails it — applied, shown,
+  reverted clean. The README's ruling (i) and the `wal.rs` doc now
+  read `≥ b` exactly as the verdict (finding 4's backtick).
+
+**Step 1 — the two halves (commit a2c2d979).** Per-round record fields
+`q4sp` (splits) and `q4mg` (merges): the store's
+`ckpt_splits`/`ckpt_merges` at the crash-time `obs` snapshot — reset at
+each `ckpt:begin`, counting only while a checkpoint is open, so at the
+crash they read the interrupted window's own counts. Serialized in
+`campaign.json` (old files parse unchanged), never digest inputs,
+never quota inputs; the JSON round-trip asserts them. **Probe, not
+evidence** (`run --seeds 0..200 --threads 16`, output outside the
+worktree, re-verified at this tip):
+
+- **BASE:** 305 rounds, 84 in the Q4 window (crash at position code
+  1–6), **7 with a split, 0 with a merge, 0 with both** (Q5a 3, Q7 5,
+  Q18 20; failing rounds 2 — the pre-existing 8/178 pair; 72 s).
+- **bursts 600/8:** 309 rounds, 87 in the window, **7 splits, 0
+  merges, 0 both** (Q5a 4, Q7 10, Q18 47; 0 failing; 75 s) — matching
+  the gate's re-measurement (600/8: 0 of 309; 900/16: 0 of 308).
+
+**The cause of the rare in-window merge, found by single seeds** (the
+`E4_SMO_DIAG`/`Q4DIAG` probes, since removed): **`w` held back — by
+the chunked transaction's single atomic apply, not by readers — plus
+the merge-capable sweep landing after the windows.** The burst's
+deletes are durable in the WAL but sit above the apply frontier until
+the chunked txn's marker syncs, and `gc_locked` elides (the step that
+makes leaf pairs underfull — `count_merge`'s precondition, the GC's
+merge condition) only below the boot watermark: the early sweeps read
+`w` = 0–2 with the deletes durable but unapplied (seed 11's diag: ten
+sweeps, all `w` ≤ 2, all merges 0; probe s1000b: 0 in-window merges in
+43 rounds). When `w` does advance, later in the round, the sweeps'
+merges land with no window open (seed 81's diag: 13 merges in the
+round, every one at `ckpt_open=false`, the in-window counters 0). At
+BASE the merge condition itself rarely has material — the 1-in-4
+deletes scatter over random keys of 2–4 trees and seldom leave
+adjacent underfull pairs — so BASE shows no merge half at all (0 of
+84 window rounds).
+
+**Step 2 — X5-R40, the SMO alignment (commit f9c4405d; a 5.2
+amendment, pre-registered before every probe above).** `Tuning` gains
+`smo_share` (permille, **0 in BASE and FINAL**); the independent
+per-round stream `S_SMO` (`smo_pick`) draws only when the share is
+non-zero, so BASE consumes no stream state and an unselected round's
+script is bit-for-bit the pre-X5-R40 generator's. In a selected round
+the GC task's front becomes `AwaitCkptOpen` (a spin-yield gate on
+`ckpt_open`, the checkpointer's own poll pattern — no wait key is
+woken at `ckpt:begin`, so a parked waiter could only observe a window
+after it closed; a deterministic turn budget `AWAIT_CKPT_OPEN_TURNS`
+1024 backstops the circular livelock where the spinner itself is the
+last unfinished task, probe s1000a seeds 4/20) → half the burst's
+sweeps → one split-seeding commit (≤ 20 Puts into a dense run of
+consecutive fresh keys at the value ceiling of a tree *other* than the
+burst tree, so it cannot refill the holes the sweeps merge) → the
+other half → the base sweeps. Targeted rounds keep their hook and
+uniform rounds keep their draw: the crash spec is untouched. Pins:
+`x5_r40_smo_not_drawn_at_base` (the draw-count contract — the `S_SMO`
+stream is independent, so no digest can see the draw),
+`x5_r40_awaitckptopen_parks_until_a_window` (a gated commit must not
+record while no window can open), `x5_r40_selected_round_digest_is_pinned`
+(seed 0 under the literal SMO tuning, digest 3330201367) and the
+card's named `x5_r40_aligned_round_has_split_and_merge_in_window`:
+**seed 886 round 2** (crash `After2@2`), `q4_split_merge` true with
+`q4sp` 2 / `q4mg` 1, digest 2522830599 — the pin-hunt hit (seeds
+200..1000 at smo 1000 / burst 900/8). M-SMO-NOWAIT (the gate returns
+at once) and M-SMO-NOMERGE (the aligned sweeps removed) both fail the
+named pin and the digest pin; M-SMO-DRAW (`S_SMO` drawn at share 0)
+fails the draw-count pin while
+`x5_r37_base_tuning_reproduces_1b0ce54e` still passes — all three
+applied, shown, reverted clean.
+
+**Step 3 — the three settings (probe, not evidence).** Each is
+`run --seeds 0..200 --threads 16` with only (`smo_share`, `burst_frac`,
+`burst_gc_loops`) changed, then reverted; BASE re-measured the same
+way, back-to-back on one host (72 s). "In window" = the crash at a
+position code 1–6 hook; split/merge = `q4sp`/`q4mg` ≥ 1.
+
+| setting (smo/burst/gc) | rounds | in window | split | merge | Q4 | Q5a | Q7 | Q18 | failing rounds | wall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1000 / 600 / 8   | 313 | 87 | 10 | 2 | **0** | 2 | 4 | 184 | 1 (seed 151 r1, O-1(a)) | 85 s |
+| 1000 / 900 / 16  | 306 | 83 | 12 | 2 | **0** | 5 | 5 | 176 | 1 (151 r1) + 1 twin (seed 9) | 94 s |
+| 1000 / 900 / 8   | 309 | 85 | 8  | 4 | **0** | 3 | 3 | 180 | 2 (151 r1, 190 r1) | 88 s |
+
+The alignment works as designed — each half now reaches windows (8–12
+split rounds, 2–4 merge rounds per ~310) — but **never the same
+round**: 0 rounds with both at every setting. The pin hunt at
+1000/900/8 over seeds 200..1000 measured the joint rate: 1,239 rounds,
+33 split rounds, 11 merge rounds, **exactly one with both** (seed 886
+r2) ≈ 1.25 per 1,000 seeds ≈ 12–13 per 10k against the 1,000 required.
+The two failing seeds (151 r1, 190 r1) are new under these
+probe-only schedules (BASE keeps 8/178 alone); `defect` is none of
+them — they are ordinary oracle failures on modified generators, and
+the settings are reverted.
+
+**Step 4 — the decision rule, applied verbatim (fixed before any
+probe).** *Met* needs: Q4 × 50 ≥ 1,500, at wall ≤ +25% of BASE (72 s →
+90 s), with no Q5a, Q7 or Q18 below the lower of its row and BASE's
+own count × 50 on the same seeds (BASE: Q5a 3, Q7 5, Q18 20 — floors
+150, 200, 1,000).
+- Setting 1 (1000/600/8): Q4 0 → 0 × 50 = 0 ≥ 1,500 **false**
+  (and Q5a 2 × 50 = 100 < the 150 floor).
+- Setting 2 (1000/900/16): Q4 0 → **false** (and wall 94 s > 90 s).
+- Setting 3 (1000/900/8): Q4 0 → **false** (and Q7 3 × 50 = 150 <
+  the 200 floor).
+
+**Not met by all three → ESCALATE with the numbers.** Q4's definition
+and threshold are unchanged — no card, gate or orchestrator lowers or
+redefines them. P takes the reachability question to the owner.
+
+**The hand-off: none.** No setting meets the rule, so F4's REFRESH
+gets no Q4 knob from this card. The X5-R40 machinery stays in the
+tree, inert at BASE and FINAL (`smo_share` 0, no draw, no op
+inserted), for whatever the owner decides.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
