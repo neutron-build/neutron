@@ -861,6 +861,15 @@ fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) ->
             .ok_or_else(|| Fail::Invalid("frame".to_owned()))?;
         Ok((f.key, f.bytes.clone()))
     })?;
+    // X-5c-F4-F1-F1-F2: the exhausted path's named park point. This
+    // write-out is the only yield between a first touch's freeze and
+    // its install (the free-reserve path is two atomic steps), so it is
+    // exactly where a copy can still be "on its way" while step 2
+    // writes the page's normal frame and `ckpt:freecopies` frees the
+    // reserve — the late-copy leak of verdict X-5c-F4-F1-F1 finding 1.
+    // A directed test holds a copy here by setting a budget; with no
+    // budget (every run but those tests) this returns at once.
+    cx.park("epochcopy:prewrite")?;
     let r = write_fresh(cx, &bytes_out)?;
     cx.with("epoch_copy:record", |c| {
         let st = c.store();

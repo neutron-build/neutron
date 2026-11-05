@@ -760,6 +760,286 @@ fn step2_fixpoint_writes_late_epoch_copies() {
     }
 }
 
+/// **X-5c-F4-F1-F1-F2 step 0: the late epoch copy's literal schedule**
+/// (verdict X-5c-F4-F1-F1, finding 1 — a silent class-C loss, no
+/// injected fault). `freeze_first_touch` parks a first touch's copy in
+/// the exhausted reserve path (the `epochcopy:prewrite` park) while the
+/// checkpointer's step 2 writes the page's *normal* frame — the mutator
+/// is the parked task, so the frame still holds its epoch-`k` bytes and
+/// the scan writes them, resolving `Img::CopyPending` to `Img::At` —
+/// then `ckpt:freecopies` frees the reserve and the checkpoint
+/// completes. The copy then installs **late**: a dirty, `is_epoch_copy`
+/// frame with `f.epoch = e − 1` that its own checkpoint never cleaned.
+/// The next checkpoint's scan accepts it (`f.is_epoch_copy || f.epoch
+/// <= k`) and its record path maps the LPID to the old content while
+/// `T` says replay need not restore it — image k+1 is silently stale.
+///
+/// The schedule (one world seed, flags and the park budget are the only
+/// coordination): P's first touch — performed by the first Mid2 hook,
+/// deterministically, while the scan cursor is still at the bottom of
+/// the pool — fills the `R_EPOCH = 1` reserve; B's first touch (the
+/// mutator task) takes the exhausted path and parks; step 2 writes P's
+/// copy (the fixpoint re-scan) and B's normal frame; the `After2` hook
+/// (past `ckpt:freecopies`) releases the parked copy; between the
+/// checkpoints, B's frame is evicted so checkpoint 2's scan cannot
+/// overwrite the leaked entry with the frame's newer content; crash
+/// after checkpoint 2's meta (`crash_clean` — its step 5 synced), then
+/// reopen from meta 2 and from meta 1 (reverted).
+///
+/// At the pre-fix tip this pin **fails**: image 2 maps B's page to the
+/// leaked copy's flip-1 bytes, so the reopen's B scan misses the key
+/// inserted during window 1. The fix (the install guard at
+/// `epoch_copy:install`) drops the late copy — B's page comes from the
+/// evicted home and both scans read the right cut.
+#[test]
+fn late_epoch_copy_must_not_enter_the_next_image() {
+    // The world seed is pinned: the schedule's races (the mutator's two
+    // first touches before the scan cursor reaches B's frame; the late
+    // install between `ckpt:freecopies` and step 5) are deterministic
+    // per seed and this one lands them (verified at the pre-fix tip,
+    // where the pin must fail).
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // ---- phase A (the harness pre-pass): three one-page trees,
+        // each with one dirty entry. Creation order fixes frame order
+        // (dir, A, P, B), so the step-2 scan reaches B's frame last —
+        // the mutator's two touches land while the cursor is still
+        // below them.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    // P (the filler, tree 11) and B (the victim, tree
+                    // 12) carry one dirty entry and own the two highest
+                    // frames; trees 1..10 are empty padding — a dozen
+                    // writes — so the lottery scheduler cannot race the
+                    // cursor past B before the mutator's touch parks.
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            // Hold any exhausted-path copy until the After2 hook
+            // releases it (freecopies has run by then).
+            cx.with("late:budget", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 900_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        // ---- phase B: the mutator (task 1) and the checkpointer
+        // (task 2). The reserve is filled deterministically: the first
+        // Mid2 hook (inside the checkpointer, after step 2's first
+        // write) performs P's first touch, whose copy takes the free
+        // reserve frame. The mutator then performs B's first touch —
+        // the reserve is full, so the copy takes the exhausted path and
+        // parks at `epochcopy:prewrite`, several writes below the
+        // cursor (the padding trees keep it there).
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("late:wait-fill").map_err(fail_of)?;
+                    }
+                    ins(&cx, 12, root_b, &2u64.to_be_bytes(), 2, &val(2, 2));
+                    set_flag(sched, "m1_done");
+                    while !flag(sched, "ckpt1_done") {
+                        cx.yield_now("late:wait-ckpt1").map_err(fail_of)?;
+                    }
+                    // Evict B's frame (the post-park store placed the
+                    // {1, 2} leaf in it): checkpoint 2's scan must find
+                    // no eligible frame for B whose record could
+                    // overwrite the leaked copy's image entry.
+                    loop {
+                        let gone = cx
+                            .with("late:chk", |c| {
+                                Ok(!c
+                                    .store()
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root_b && !f.is_epoch_copy))
+                            })
+                            .map_err(fail_of)?;
+                        if gone {
+                            break;
+                        }
+                        if !prims::evict_one(&cx, false).map_err(fail_of)? {
+                            cx.wait_for(e4_recovery::sim::WaitKey::Pin)
+                                .map_err(fail_of)?;
+                        }
+                        cx.yield_now("late:evict").map_err(fail_of)?;
+                    }
+                    set_flag(sched, "evicted");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            // Step 2's first write is done and the
+                            // cursor sits just above it: P's frame (and
+                            // B's, above the padding) are still dirty
+                            // and unscanned. P's first touch fills the
+                            // reserve inside this hook — deterministically.
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        if hook == CkptHook::After2 {
+                            // Past freecopies: release the parked copy —
+                            // its install is now late.
+                            let mut g = sched.lock();
+                            g.st.parks.insert("epochcopy:prewrite", 0);
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    while !flag(sched, "evicted") {
+                        cx.yield_now("late:wait-evict").map_err(fail_of)?;
+                    }
+                    // Nobody touches B in window 2: the only frame its
+                    // scan could take for B is the leaked copy.
+                    ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("late:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the late-copy literal schedule");
+        assert!(flag(&sched, "m1_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        let no_served = g.disk.served.is_empty();
+        let no_uncovered = g.disk.uncovered_accepts.is_empty();
+        drop(g);
+        assert!(
+            no_served,
+            "seed {seed}: served corruption in an uncrashed round"
+        );
+        assert!(
+            no_uncovered,
+            "seed {seed}: uncovered accepts in an uncrashed round"
+        );
+        // The crash after checkpoint 2's meta: everything synced stays
+        // (step 5 synced the meta), nothing volatile does.
+        crash_clean(&mut disk_after, seed + 50);
+        // ---- reopen from meta 2: image 2 holds the flip-2 cut — both
+        // of P's entries and both of B's. At the pre-fix tip B reads the
+        // leaked copy's flip-1 leaf and loses key 2 (the pin's
+        // failure).
+        let want_two = |i: u64, j: u64| -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+            [
+                (1u64.to_be_bytes().to_vec(), Some(val(i, 1)[1..].to_vec())),
+                (2u64.to_be_bytes().to_vec(), Some(val(j, 2)[1..].to_vec())),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let want_b2 = want_two(1, 2);
+        {
+            let sched2 = pass_world(
+                1,
+                seed + 100,
+                disk_after.clone(),
+                StoreInner::empty(cfg.clone(), 0),
+            );
+            let cx2 = Cx {
+                w: &sched2,
+                t: HARNESS,
+            };
+            let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+            assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+            cx2.with("late:install2", |c| {
+                *c.store() = opened;
+                Ok(())
+            })
+            .expect("install2");
+            let scan_p = tree::tree_scan(&cx2, root_p, 10).expect("scan P after meta 2");
+            assert_eq!(
+                scan_p, want_b2,
+                "seed {seed}: image 2 holds P's flip-2 cut (both entries)"
+            );
+            let scan_b = tree::tree_scan(&cx2, root_b, 10).expect("scan B after meta 2");
+            assert_eq!(
+                scan_b, want_b2,
+                "seed {seed}: image 2 must hold B's flip-2 cut — a late epoch copy \
+                 must not enter the next image (the leaked copy maps B to its \
+                 flip-1 content and key 2 is lost)"
+            );
+        }
+        // ---- reopen from meta 1 (its durable write reverts): image 1
+        // is the flip-1 cut — one entry per tree. This half also pins
+        // the copy machinery itself: with every copy dropped
+        // (M-LATECOPY-DROPALWAYS), P's `CopyPending` never resolves,
+        // image 1 leaves P's page unmapped, and this reopen fails.
+        {
+            revert_meta_write(&mut disk_after, 2);
+            crash_clean(&mut disk_after, seed + 60);
+            let sched1 = pass_world(
+                1,
+                seed + 101,
+                disk_after.clone(),
+                StoreInner::empty(cfg.clone(), 0),
+            );
+            let cx1 = Cx {
+                w: &sched1,
+                t: HARNESS,
+            };
+            let (opened, meta) = ckpt::open(&cx1, cfg.clone()).expect("reopen meta 1");
+            assert_eq!(meta.ckpt_id, 1, "seed {seed}: meta 1 after the revert");
+            cx1.with("late:install1", |c| {
+                *c.store() = opened;
+                Ok(())
+            })
+            .expect("install1");
+            let want_one = |i: u64| -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+                [(1u64.to_be_bytes().to_vec(), Some(val(i, 1)[1..].to_vec()))]
+                    .into_iter()
+                    .collect()
+            };
+            let scan_p = tree::tree_scan(&cx1, root_p, 10).expect("scan P after meta 1");
+            assert_eq!(
+                scan_p,
+                want_one(1),
+                "seed {seed}: image 1 holds P's flip-1 cut (the epoch copy resolved)"
+            );
+            let scan_b = tree::tree_scan(&cx1, root_b, 10).expect("scan B after meta 1");
+            assert_eq!(
+                scan_b,
+                want_one(1),
+                "seed {seed}: image 1 holds B's flip-1 cut (step 2 wrote the normal frame)"
+            );
+        }
+    }
+}
+
 /// G7's meta-selection semantics (P's ruling on the round-3 F3,
 /// 2026-10-26): the winner is the highest placed-valid meta; a
 /// misplaced valid meta that does not outrank it is a loser (ignored);
