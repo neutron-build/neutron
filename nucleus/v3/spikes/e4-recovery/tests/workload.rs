@@ -133,26 +133,26 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (47, 2526989435),
         (48, 605204002),
         (60, 2199024193),
-        (66, 123257877),
+        (66, 3628190779),
         (67, 1488955537),
-        (112, 2157138087),
+        (112, 2438489582),
         (118, 4034749261),
-        (198, 649857276),
+        (198, 95622311),
         (221, 2732451886),
         (268, 317704428),
-        (303, 859193035),
+        (303, 4147169426),
         (308, 522943877),
         (387, 2151920803),
         (403, 2657356820),
         (537, 2279204905),
         (660, 3256450980),
         (747, 4071845386),
-        (907, 2332284720),
+        (907, 1749572610),
         (967, 2847369120),
         (987, 2492798953),
         (1267, 1225086008),
         (1749, 1584051239),
-        (1769, 2372375821),
+        (1769, 1311732889),
         (1787, 1119157608),
         (1887, 3622450829),
         (2376, 3116539881),
@@ -162,9 +162,9 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (4309, 3466635396),
         (5549, 308297210),
         (5808, 2754578359),
-        (6149, 2623005576),
-        (7469, 3635220225),
-        (7528, 1612546402),
+        (6149, 123186068),
+        (7469, 3658720859),
+        (7528, 122281874),
         (8728, 3345856243),
         (9809, 1177349546),
     ];
@@ -225,7 +225,11 @@ fn x5_r37_final_equals_base_at_this_tip() {
 /// … nothing else"), so the pin holds the mechanism through the seeds
 /// that hit the path, at the record level: their post-fix digests are
 /// pinned, and 96 and 190 moved (83795711 → 4266526636 and 813405985 →
-/// 4013865743) — the drop is the only difference. Reverting the guard
+/// 4013865743) — the drop is the only difference. X-5c-F4-F1-F1-CXX
+/// moved 190 again (4013865743 → 679383372): its Work 1 re-validation
+/// closes the exhausted path's second outcome the -F2 verdict named
+/// (the schedule the -F2 guard had moved onto B1 now resolves).
+/// Reverting the guard
 /// (M-LATECOPY-INSTALL) restores the pre-fix digests and fails this
 /// pin; the directed pin
 /// (`late_epoch_copy_must_not_enter_the_next_image`, `tests/store.rs`)
@@ -239,7 +243,7 @@ fn late_copy_count_is_zero_at_base() {
         (96, 4266526636),
         (104, 3776021738),
         (161, 3908247512),
-        (190, 4013865743),
+        (190, 679383372),
     ];
     for (seed, want) in WANT {
         let rec = workload::run_seed_with(*seed, None, &workload::Tuning::BASE);
@@ -466,10 +470,13 @@ fn szc_rename_crash_keeps_the_open_fold() {
 /// segment at or above `b` retires every boundary `≤ s`
 /// (`w11_window_note`'s `recycled_unsynced.retain`), so the window list
 /// the crash draw reads holds only still-unsynced boundaries. Literal
-/// config: BASE with `w11_share` 1000, seed 30 round 0 — the round's
-/// every recycled boundary was synced over by the crash point, the
-/// window list is empty, and the pick records the fallback `w11-` (the
-/// plain uniform point stood). **G-W11-NORETIRE** (the retain line
+/// config: BASE with `w11_share` 1000, seed 11 round 0 (X-5c-F4-F1-F1-CXX
+/// moved the literal from seed 30: the drop rework restructured the walk's
+/// steps, so seed 30's schedule now retires no boundary in time and its
+/// pick reads `w11` — the fallback shape itself is schedule-derived and was
+/// re-measured) — the round's every recycled boundary was synced over by
+/// the crash point, the window list is empty, and the pick records the
+/// fallback `w11-` (the plain uniform point stood). **G-W11-NORETIRE** (the retain line
 /// removed) fails this pin: the boundaries stay in the set, the list is
 /// non-empty, and the pick reads `w11` instead (the gate measured 9 of
 /// 200 digests moving at share 1000, picks 79 → 88).
@@ -477,18 +484,18 @@ fn szc_rename_crash_keeps_the_open_fold() {
 fn x5_r38_w11_needs_no_completed_sync_since() {
     let mut tun = workload::Tuning::BASE;
     tun.w11_share = 1000;
-    let rec = workload::run_seed_with(30, None, &tun);
-    assert!(rec.defect.is_none(), "seed 30: {:?}", rec.defect);
+    let rec = workload::run_seed_with(11, None, &tun);
+    assert!(rec.defect.is_none(), "seed 11: {:?}", rec.defect);
     let r0 = &rec.rounds[0];
     assert_eq!(
         r0.cwin,
         Some("w11-"),
-        "seed 30 r0: every recycled boundary has had a completed sync since its rename, \
+        "seed 11 r0: every recycled boundary has had a completed sync since its rename, \
          so the W11 window list must be empty and the pick must record the fallback"
     );
     assert!(
         r0.fired,
-        "seed 30 r0: the fallback uniform crash fired (never a NEVER-FIRED)"
+        "seed 11 r0: the fallback uniform crash fired (never a NEVER-FIRED)"
     );
 }
 
