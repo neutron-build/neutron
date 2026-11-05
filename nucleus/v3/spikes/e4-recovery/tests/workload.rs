@@ -414,6 +414,40 @@ fn szc_rename_crash_keeps_the_open_fold() {
     );
 }
 
+/// **The re-gate's finding 2, first half (verdict X-5c-F4-F1;
+/// card X-5c-F4-F1-F1 step 0 (b)): W11 needs "no completed `sync_data`
+/// since" — the retire of `recycled_unsynced` is load-bearing.** Ruling
+/// (i) opens the window only while the boundary `b` "has had no
+/// completed `sync_data` since" its rename; a completed sync of a
+/// segment at or above `b` retires every boundary `≤ s`
+/// (`w11_window_note`'s `recycled_unsynced.retain`), so the window list
+/// the crash draw reads holds only still-unsynced boundaries. Literal
+/// config: BASE with `w11_share` 1000, seed 30 round 0 — the round's
+/// every recycled boundary was synced over by the crash point, the
+/// window list is empty, and the pick records the fallback `w11-` (the
+/// plain uniform point stood). **G-W11-NORETIRE** (the retain line
+/// removed) fails this pin: the boundaries stay in the set, the list is
+/// non-empty, and the pick reads `w11` instead (the gate measured 9 of
+/// 200 digests moving at share 1000, picks 79 → 88).
+#[test]
+fn x5_r38_w11_needs_no_completed_sync_since() {
+    let mut tun = workload::Tuning::BASE;
+    tun.w11_share = 1000;
+    let rec = workload::run_seed_with(30, None, &tun);
+    assert!(rec.defect.is_none(), "seed 30: {:?}", rec.defect);
+    let r0 = &rec.rounds[0];
+    assert_eq!(
+        r0.cwin,
+        Some("w11-"),
+        "seed 30 r0: every recycled boundary has had a completed sync since its rename, \
+         so the W11 window list must be empty and the pick must record the fallback"
+    );
+    assert!(
+        r0.fired,
+        "seed 30 r0: the fallback uniform crash fired (never a NEVER-FIRED)"
+    );
+}
+
 /// **Rework 2 (P gate verdict X-5c-F4-F1, ruling (i); the verdict's
 /// added pin): a W11 crash's walk reaches `b`.** Ruling (i): the window
 /// opens "when a `sync_data` of the segment below `b` completes with
