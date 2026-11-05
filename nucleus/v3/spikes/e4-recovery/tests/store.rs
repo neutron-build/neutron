@@ -4925,6 +4925,92 @@ fn g8_wal_sync_error_poisons() {
     }
 }
 
+/// **The re-gate's finding 2, second half (verdict X-5c-F4-F1,
+/// MERGE-WITH-FOLLOWUPS; card X-5c-F4-F1-F1 step 0 (c)): a checkpoint
+/// that fails with a non-`Sim` error resets the SIZING-C fold —
+/// `ckpt_closed_dirty` ends at 0.** Rework 1 keeps the folded `n`
+/// across a **sim-crash** unwind (the crash-time `obs` snapshot must
+/// see it); the non-crash half of the same abort rule — no checkpoint
+/// is open once the abort path has run, so the observable is 0 — is
+/// what G-SZC-ABORTNORESET removes. The verdict measured the reset as
+/// latent (no effect across the file's 67 poison rounds) but REFRESH 6
+/// tells X-5c-F4 to copy this rule for `ckpt_unflipped`, so it is
+/// pinned here. Literal schedule (the `wal_io_fail` shape the card
+/// names): a store with a dirtied tree — the begin step folds `n` ≥ 1,
+/// which `dirty_max` (never reset) proves — and one
+/// enqueued-but-unsynced WAL batch whose group `sync_data` the one
+/// store test hook fails; the checkpoint's step 1 drains the buffer
+/// into the hooked batch and fails `Fail::Io` (a non-`Sim` error no
+/// real disk error can produce in this sim), the WAL path poisons the
+/// store, and the abort path resets `ckpt_closed_dirty` to 0 with
+/// `ckpt_open` false. Under G-SZC-ABORTNORESET (the
+/// `if !crash_unwind { st.ckpt_closed_dirty = 0; }` reset removed) the
+/// fold survives the abort and this pin fails.
+#[test]
+fn szc_non_crash_abort_resets_the_fold() {
+    let seed = 6566u64;
+    let cfg = tcfg(8, 8, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, Some(2));
+    let sched = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Dirty ≥ 1 pool LPID: inserts into tree 2 (every store_page adds
+    // its LPID to dirty_now — the interval the checkpoint's begin step
+    // folds).
+    let root = tree::dir_root_of(&cx, 2).expect("root");
+    for i in 0..40u64 {
+        ins(&cx, 2, root, &i.to_be_bytes(), 10 + i, &val(i, 1));
+    }
+    // One enqueued commit, left unsynced: the checkpoint's step 1 must
+    // drain it, and the hook fails the batch's group sync.
+    let batch_start = cx
+        .with("pin:append0", |c| Ok(c.store().wal.append))
+        .expect("append position");
+    let mut payload = Vec::new();
+    wal::enc_op(&op_put_key(b"Z", 1), &mut payload);
+    wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 100, &payload).expect("enqueue");
+    cx.with("pin:hook", |c| {
+        c.store().cfg.wal_io_fail = Some(e4_recovery::store::WalIoFail {
+            op: e4_recovery::store::WalIoOp::SyncData,
+            batch_start,
+        });
+        Ok(())
+    })
+    .expect("set the io hook");
+    let mut hooks = |_hook: CkptHook| Ok(());
+    let r = ckpt::checkpoint(&cx, &mut hooks);
+    assert!(
+        matches!(r, Err(Fail::Io(_))),
+        "the checkpoint must fail with the hook's non-Sim I/O error: {r:?}"
+    );
+    let (fold, dmax, open, poisoned) = cx
+        .with("pin:after", |c| {
+            let st = c.store();
+            Ok((
+                st.ckpt_closed_dirty,
+                st.dirty_max,
+                st.ckpt_open,
+                st.poisoned.is_some(),
+            ))
+        })
+        .expect("read the fold");
+    assert!(
+        dmax >= 1,
+        "the begin step folded ≥ 1 dirtied LPID (dirty_max, never reset, proves it: {dmax})"
+    );
+    assert_eq!(
+        fold, 0,
+        "a non-crash abort resets ckpt_closed_dirty to 0 (G-SZC-ABORTNORESET keeps the fold)"
+    );
+    assert!(!open, "no checkpoint is open after the abort path");
+    assert!(
+        poisoned,
+        "the WAL-path I/O failure poisons the store (G8, 9.2 W8)"
+    );
+}
+
 /// **X-5c-F3-F3a-F2 Work 4 pin (S-STORE §10.5; a literal config).**
 /// `gc_w_used` starts at the recovered meta's `gc_w` at open, so a
 /// checkpoint taken before the first GC mutation of the new boot — the

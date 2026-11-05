@@ -104,7 +104,7 @@ W11 bullet and X5-R38's W11 clause above — carried verbatim, binding:
 > `wal.written ≥ b`: that segment's whole extent, filler or
 > boundary-ending record included, is then durable, so the walk reaches
 > `b`. It closes when a `sync_data` of a segment at or above `b`
-> completes. "Untouched" means the durable image: a write at ≥ `b` may
+> completes. "Untouched" means the durable image: a write at `≥ b` may
 > be issued and still volatile, and F-CRASH decides whether it survives.
 > Q11 then requires that `b`'s first sector does not survive with new
 > content.

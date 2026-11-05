@@ -766,7 +766,7 @@ fn check_wal_inv(st: &StoreInner) -> Result<(), Fail> {
 /// segment's whole extent, filler or boundary-ending record included,
 /// is then durable, so the walk reaches `b`. It closes when a
 /// `sync_data` of a segment at or above `b` completes. 'Untouched'
-/// means the durable image: a write at ≥ `b` may be issued and still
+/// means the durable image: a write at `≥ b` may be issued and still
 /// volatile, and F-CRASH decides whether it survives. Q11 then requires
 /// that `b`'s first sector does not survive with new content." The
 /// `wal.written ≥ b` term is the rework's fix (the gate's finding 2):
