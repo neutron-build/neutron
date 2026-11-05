@@ -1,34 +1,118 @@
 Card: X-5c-F4-F1
 Class: experiment
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code (X-5c-F4-F1 P gate, 2026-11-04)
+Gate-session: T3 review sub-agent, Claude Code (X-5c-F4-F1 P re-gate, 2026-11-04)
 Date: 2026-11-04
 Gate-exit: GATE EXIT=0
-Commit: 46443a6d1fe58ce83e0470b78798c46a4db309fd
-Mutants: M-BASEDRIFT -> x5_r37_base_tuning_reproduces_1b0ce54e, M-Q11UNWIRED -> q11_stale_record_at_recycled_segment_start_counts, M-Q11ANY -> q11_mid_segment_stale_does_not_count, M-W12ALL -> x5_r38_w12_crash_drops_the_rename, M-SZC-ANY (at szc_of) -> szc_a_completed_4f_interval_and_a_small_cut, M-SZC-ANY (at round_rec, the card's literal `szc := sizing_ok`) -> UNCAUGHT, M-CKPOISONb -> g8_poison_mid_checkpoint_ends_the_workload_quietly, M-CKPOISONa -> arm deleted (step 5 option 2; accepted), G-SZC-NOCK (disjunct 2 removed) -> UNCAUGHT, G-SZC-NOFOLD (ckpt_closed_dirty never set) -> UNCAUGHT, G-W11ALL -> x5_r38_w11_crash_reads_stale_at_start, G-W11ANYB -> x5_r38_w11_crash_reads_stale_at_start, G-CWIN-NODIGEST -> UNCAUGHT, G-STALE-NOLSN -> UNCAUGHT (equivalent at the only call site)
+Commit: 5b93857d3376a0482bc81c3718e47075f425c0d9
+Mutants: M-SZC-ABORTRESET -> szc_survives_the_sim_crash_unwind_into_the_record, M-SZC-NOCK -> szc_survives_the_sim_crash_unwind_into_the_record, M-SZC-ANY (at round_rec) -> szc_a_completed_interval_never_sets_the_record_flag, M-SZC-ANY (at szc_of) -> szc_a_completed_4f_interval_and_a_small_cut, M-W11-ANYSYNC -> x5_r38_w11_crash_walk_reaches_the_boundary, G-CWIN-NODIGEST -> cwin_is_a_digest_input_only_when_set, M-BASEDRIFT -> x5_r37_base_tuning_reproduces_1b0ce54e, M-Q11UNWIRED -> q11_stale_record_at_recycled_segment_start_counts, M-Q11ANY -> q11_mid_segment_stale_does_not_count, M-W12ALL -> x5_r38_w12_crash_drops_the_rename, M-CKPOISONb -> g8_poison_mid_checkpoint_ends_the_workload_quietly, M-CKPOISONa -> arm deleted (accepted, REWORK verdict ruling (iv)), G-SZC-NOFOLD -> szc_survives_the_sim_crash_unwind_into_the_record, G-SZC-ENDNORESET -> szc_a_completed_4f_interval_and_a_small_cut, G-W11-NORETIRE -> UNCAUGHT (behaviour moves; pin handed to X-5c-F4-F1-F1), G-SZC-ABORTNORESET -> UNCAUGHT (no effect in the file; pin handed to X-5c-F4-F1-F1), G-W11-NOCLOSE -> UNCAUGHT (no effect on two samples), G-W11-GT -> UNCAUGHT (no effect on two samples)
 Followups: X-5c-F4-F1-F1
 
-The card's Author line is P, and the request says this role wrote it (ruling nv3-X-5c-F4-esc-1). This gate is a separate session with no context from that ruling, and finding 3 below reverses part of it. The orchestrator requested the gate knowing this.
+This verdict overwrites REWORK c1db3197. The card's Author line is P, and P's earlier ruling and REWORK verdict are the source of the rework list; this is a separate session, and the orchestrator requested the gate knowing this. REFRESH 6 and X-5c-F4-F1-F1 point into this file, so what they need is carried verbatim under "Carried from REWORK c1db3197".
 
 ## How the gate was run
 
-- **Fresh gate.** The scaffold's `fresh-gate.sh`, extracted through the `--no-local` clone, scaffold 1ca11c89e54560535d33c220b877550716f34f6a, on the full commit, from `~/Workspace/neutron-v3`, as a background task. Lines: `fresh-gate: commit 46443a6d…`, `fresh-gate: base 1ca11c89…`, `fresh-gate: checks passed (4506 files hashed in 1.23 s)`, `fresh-gate: 2 file(s) matched through their eol conversion`. Every STEP EXIT=0. Literal last line `GATE EXIT=0`. stderr empty. `$fg` removed.
-- **Stacked-card friction: none in the script.** No refusal, about 6 min, no `--base` needed. The only friction is GATE-PROMPT step 2's `git diff nucleus/v3-scaffold...HEAD`, which lists the whole X-5c stack (other cards' verdicts included) on a card this far out. Scope was read against `card/v3-X-5c-F4...HEAD`, as the request says: all changes are in `nucleus/v3/spikes/e4-recovery/`. No new non-test `unwrap`/`expect`/`panic`/`unsafe` in `src/`.
-- **Mutants and probes** ran in scratch exports of the commit under `~/.cache/nv3-review/gate-X-5c-F4-F1/`, never in the worker's worktree, which stayed clean. Scratch fixes and diagnostics are `probe-variant.patch` there; they are not in this commit.
+- **Fresh gate.** The scaffold's `fresh-gate.sh`, extracted through the `--no-local` clone, scaffold 3fb03646a7e3739c7d2897578aeae67b42f01833, on the full commit, from `~/Workspace/neutron-v3`, as a background task. Lines: `fresh-gate: commit 5b93857d…`, `fresh-gate: base 3fb03646…`, `fresh-gate: checks passed (4507 files hashed in 1.26 s)`, `fresh-gate: 2 file(s) matched through their eol conversion`. Every STEP EXIT=0. Literal last line `GATE EXIT=0`. stderr empty. `$fg` removed.
+- **Scope.** `git diff c1db3197..HEAD` touches only `nucleus/v3/spikes/e4-recovery/` (README, `harness.rs`, `ckpt.rs`, `mod.rs`, `wal.rs`, `tests/workload.rs`). No new non-test `unwrap`/`expect`/`panic`/`unsafe`. The only removed test line is a doc comment on the X5-R37 list. The worktree is clean and the tip is unchanged. The dead first runner left nothing: the four commits are the only ones after c1db3197.
+- **Scratch.** All mutants, probes and variants ran on `git archive` exports under `~/.cache/nv3-review/regate-X-5c-F4-F1/`, never in the worktree. The diagnostic build adds a snapshot taken at the instant the crash fires, inside the scheduler's fire branch and `deliver_crash`, plus record fields; digest code is untouched. Run-hygiene note: the gate's wide runs are the gate's own, as in the REWORK gate.
+
+## REWORK items: all closed
+
+| Item | Result |
+|---|---|
+| 1. `ckpt.rs` abort path | Closed. Reset only when `!matches!(e, Fail::Sim(_))`. Pins on seeds 41 r2 and 303 r2 and 660 r2; all three named mutants fail a pin. See finding 1 for the remainder. |
+| 2. `wal.rs` W11 | Closed. `st.wal.written >= b` added, doc corrected, walk pin added, `E4_W11_DIAG` gone. 276 still hits. The `w11_open` field in `harness.rs` is a small observable serving the required pin, never a digest input; accepted. |
+| 3. `cwin` digest pin | Closed. |
+| 4. README | Closed, one markup nit (finding 4). Four-seed list re-derived from the files: exact. MP root cause, probe and finding-3 correction present. |
 
 ## Measurements re-run by the gate
 
-**Full 10k at the tip** (`run --seeds 0..10000 --threads 16`; a build differing only by extra JSON diagnostic fields, digest code untouched; output `full.json`, 1,180 s on a shared host). Against F4's file (sha `bec7056c…`):
-- `E4 SEEDS=10000 O1_FAIL=2365 O2_FAIL=35 O3_FAIL=72 DEADLOCK=0 PANIC=0 O1F_FAIL=2365 MONITOR=0` and `FAILING_SEEDS=94 FAILING_ROUNDS=76 TWIN_FAILING_ROUNDS=20 DEFECT_SEEDS=0`: both lines identical to F4's.
-- **Exactly 4 digests moved: 4, 8422, 9226, 9606.** Each differs only in the q11 flag (6 rounds). The card's "every digest equals 1b0ce54e's except Q11 hits" holds over the whole file.
-- **All 67 poison rounds' seeds are unmoved**, which settles step 5 across every schedule the campaign has.
-- **`ckpt_closed_dirty` is 0 in all 15,386 rounds** (finding 1).
-- By class, rounds / recovered state / `sizing_ok` / `szc`: C 11,861 / 11,845 / 378 / 58; MP 2,190 / 409 / 2 / 0; MW 1,335 / 802 / 19 / 0. Round 0's `sizing_ok` is 0 of 10,000. The worker's numbers reproduce.
+**Full 10k at the tip** (`run --seeds 0..10000 --threads 12`, diagnostic build), against F4's file (sha `bec7056c…`):
+- `E4 SEEDS=10000 O1_FAIL=2365 O2_FAIL=35 O3_FAIL=72 DEADLOCK=0 PANIC=0 O1F_FAIL=2365 MONITOR=0` and `FAILING_SEEDS=94 FAILING_ROUNDS=76 TWIN_FAILING_ROUNDS=20 DEFECT_SEEDS=0`: identical to F4's.
+- **Digest set: exactly 4, 8422, 9226, 9606 moved**, on the q11 flag alone: 4 r0, 8422 r1 and r2, 9226 r0 and r1, 9606 r0. Same round counts everywhere. All 53 literals in `x5_r37_base_tuning_reproduces_1b0ce54e` match the file, including 41 and 303; seed 4's differs from F4's by its own listed movement.
+- **`ckpt_closed_dirty` is alive:** non-zero in 7,972 of 15,386 rounds, ≥ 4·F in 91. It was 0 in all rounds at the REWORK tip.
+- **`szc`:** 149 rounds (C 145, MP 1, MW 3): 58 through the cut arm, 91 through the checkpoint arm. It was 58 at the REWORK tip. With a recovered state: 147 (C 145, MP 0, MW 2).
 
-**Stopped seeds.** MP 1,792: **1,771 passed with no recovered state**, 21 failed. MW 534: 533 and 1. C 54: all failed.
+**`szc` against the A+ arm, compared per round with the at-fire snapshot** (`fired` and either `dirty_now ≥ 4·F` at the fire, or `ckpt_open` at the fire with its fold ≥ 4·F): **15,385 of 15,386 agree; one undercounts** (finding 1). No stale value: an observable with no open checkpoint occurs 0 times, at the fire or in `obs`. All 67 poison ends have `szc` false. `szc` is never true where the at-fire state says false.
+
+**W11 and W12 probes, reproduced exactly** (probe, not evidence). Shares 100/100 over 0..200: 304 rounds, Q11 8, Q12 5, Q5a 3, picks w11 9 / w12 18, `w11-` 5, W11 yield 4/9, W12 yield 5/18: every RESULT number. `w11_share` 1000 over 0..200: W11 yield 45/79, `w11-` 72. Per-pick checks, which the single-seed pin cannot give: the window is open at the fire in 79 of 79 picks, and every pick that recovered a state has its walk at or past `b` (73 of 73). The ruling's "so the walk reaches `b`" holds across the driver's own picks.
+
+**REFRESH 6's table still stands.** k5's knobs at this tip against the REWORK gate's scratch build: 0 of 100 digests moved. The table's numbers were taken with the fixes this tip now carries.
+
+## Findings
+
+1. **Non-blocking, handed to X-5c-F4-F1-F1 step 0: `szc` undercounts by one, from a pre-existing swallowed crash.** Seed 2376 r2, `uniform@y:17768`: at the fire the checkpoint is open with a fold of 235 ≥ 4·F = 184, yet `szc` is false; `obs` shows closed 9, open 0. In all, 15 rounds of 15,386 (all uniform) have the observable move after the fire. The trace: `wal_recycle` tests `cx.env().rename(…).map_err(Fail::Sim).is_ok()` (`src/store/wal.rs:1108`, there since X-5b B1, unchanged by this card). A crash delivered at the rename's yield therefore reads as "not renamed", so `wal_recycle` returns `Ok`; `After6` and `ckpt:end` run after the crash; the checkpointer's next poll takes its final checkpoint; and that `ckpt:begin` folds again before the gate's yield unwinds it. That also clears `ckpt_splits`/`ckpt_merges` and sets the Q4 position code to `Before0`, so X-5c-F4-F1-F1's in-window count needs it fixed first.
+   - **The direction is conservative:** a false negative only, so it cannot pass a quota it should not. It sits outside this card's Limits (store observables only), and the rework did not cause it, so it does not block this card. It must land before F4's file, because MP ≥ 100 may be tight.
+   - **A plain `?` is wrong; measured.** The same call returns `Err` in a world that has not crashed: "`to` exists" is routine (111 occurrences over 0..200, counted in the plain-`?` variant), and the store relies on the quiet skip. A plain `?` moved 67 of 200 digests, and 3 of the pinned seeds in 0..200.
+   - **The fix below was run over the full 10k in scratch:** `szc` equals the at-fire arm in 15,386 of 15,386, 0 rounds move after the fire, **0 digests move**, and the only non-diagnostic record change in the file is seed 2376 r2's `szc`. Counts become: `szc` 150, of which C 146, MP 1, MW 3; checkpoint arm 92; with a state 148.
+2. **Non-blocking, handed to X-5c-F4-F1-F1 step 0: two ruling clauses have no failing test.**
+   - **G-W11-NORETIRE** (`recycled_unsynced` never retired, breaking ruling (i)'s "no completed `sync_data` since"): passes all 227 tests while moving 9 of 200 digests at share 1000 (picks 79 → 88). Seed 30 r0 reads `w11-` at the tip and `w11` under the mutant.
+   - **G-SZC-ABORTNORESET** (the non-crash reset removed): passes all 227. It changed nothing across the file's 67 poison rounds, so it is latent, but REFRESH 6 tells F4 to copy this rule for `ckpt_unflipped`.
+3. **No action: two mutants measured equivalent.** G-W11-NOCLOSE and G-W11-GT pass all 227 and move 0 digests at share 1000 over 0..200 and on k5 over 0..100: one window per pass there, and `written == b` never decides. Nothing is required. If F4 sees several windows in a pass, the close clause becomes load-bearing and a pin is due.
+4. **Nit: ruling (i) in the README is word-for-word, with one backtick moved** (`≥ b` in backticks in the ruling, ≥ `b` in the README, and the same in the `wal.rs` doc). The request asked for verbatim, so it is reported; the meaning is unchanged. X-5c-F4-F1-F1's README step fixes it.
+5. **Noted: X-5c-F4-F1-F1's decision rule could escalate falsely** (my own text). See the card change below.
+6. **Finding 7 of the REWORK verdict did not recur:** `ack_prefix_two_batches_in_flight` passed in all six full-suite mutant runs at load about 30, with the gate's 12-thread campaign running. The worker's non-reproduction stands. Earlier failures are not explained by this; treat it as a load-sensitive test with no card.
+
+M-W12ALL and M-CKPOISONb as "minimal semantic equivalents": accepted; they are the same edits this gate used in c1db3197.
+
+## Verdict reasoning
+
+Every REWORK item is closed, the digest set holds, the owner's arm is measured live, and the one exception is a pre-existing conservative undercount with a tested fix, outside this card's Limits. Hence MERGE-WITH-FOLLOWUPS. No threshold moved and none is proposed.
+
+## X-5c-F4-F1-F1 card changes (paste verbatim; it stays Status: waiting until this verdict's commit is on `card/v3-X-5c-F4-F1`, then ready)
+
+Replace Limit 2 and the `Do not` line "Change the store, the oracle, the model, the sim, K or R." with:
+
+> 2. **Store:** step 0's one change in `wal_recycle`, and nothing else.
+
+> - Change the store beyond step 0, the oracle, the model, the sim, K or R.
+
+Insert before step 1 of Work:
+
+> 0. **Close the re-gate's findings (verdict X-5c-F4-F1 MERGE-WITH-FOLLOWUPS, findings 1, 2 and 4). Three commits, each naming its finding, before any probe.**
+>    - **(a) `wal_recycle` must not swallow a delivered crash.** In `src/store/wal.rs`, replace `if cx.env().rename(&name, &to_name).map_err(Fail::Sim).is_ok() {` with:
+>      ```rust
+>      let renamed = cx.env().rename(&name, &to_name).map_err(Fail::Sim);
+>      if let Err(e) = &renamed
+>          && cx.with("wal_recycle:crashed", |c| Ok(c.sched_mut().crashed))?
+>      {
+>          return Err(e.clone());
+>      }
+>      if renamed.is_ok() {
+>      ```
+>      **Do not use a plain `?`.** The rename also fails in an uncrashed world ("`to` exists"), and the store relies on that quiet skip.
+>      Pin `szc_rename_crash_keeps_the_open_fold`: `run_seed_with(2376, None, &Tuning::BASE)` r2 has crash `uniform@y:17768` and `szc` true. Add `(2376, 3116539881)` to the X5-R37 list, from F4's file. No digest moves: the gate ran this change over the whole 10k, and only seed 2376 r2's `szc` changed.
+>    - **(b) Pin `x5_r38_w11_needs_no_completed_sync_since`:** BASE with `w11_share` 1000, seed 30 r0 has `cwin` `Some("w11-")`.
+>    - **(c) Pin `szc_non_crash_abort_resets_the_fold`:** a literal schedule in which a checkpoint with a non-zero fold fails with a non-`Sim` error (the `g8_poison_mid_checkpoint_ends_the_workload_quietly` shape or `wal_io_fail`) ends with `ckpt_closed_dirty` 0. If no such schedule exists, show why with a literal schedule and stop for P; do not delete the reset.
+>    - **README:** move the one backtick so ruling (i) reads `≥ b` exactly as in the verdict, in the README and the `wal.rs` doc.
+
+Add to the mutant table:
+
+> | M-RENAME-SWALLOW: `is_ok()` restored | `szc_rename_crash_keeps_the_open_fold` |
+> | M-RENAME-ANYERR: a plain `?` on the rename | `x5_r37_base_tuning_reproduces_1b0ce54e` |
+> | G-W11-NORETIRE: the `recycled_unsynced.retain` line removed | `x5_r38_w11_needs_no_completed_sync_since` |
+> | G-SZC-ABORTNORESET: the non-crash reset removed | `szc_non_crash_abort_resets_the_fold` |
+
+In step 4's "Met" bullet, replace "with no Q5a, Q7 or Q18 falling below its row" with:
+
+> with no Q5a, Q7 or Q18 below the lower of its row and BASE's own count × 50 on the same seeds (from F4's file over 0..200: Q5a 3, Q7 5, Q18 20; so floors of 150, 200 and 1,000)
+
+*Why:* BASE itself reads Q5a 3 (150 per 10k against a row of 200) on these 200 seeds, while the whole file reads 288. As written, the rule would escalate to the owner on a sampling artefact before Q4 was even judged. This changes a probe's stop rule, fixed before any probe. **No quota row changes:** F4's whole file is still judged at every row. In the same bullet, measure BASE's wall in the same session as the setting's.
+
+In "Read", `verdicts/X-5c-F4-F1.md`'s finding 3 and probe table are now under "Carried from REWORK c1db3197".
+
+## X-5c-F4 card changes (paste as REFRESH 7, after REFRESH 6, overriding it where they differ)
+
+> **REFRESH 7 (P re-gate X-5c-F4-F1, MERGE-WITH-FOLLOWUPS, 2026-11-04).**
+> - **Status.** X-5c-F4-F1's rework has passed. F4 is blocked only on X-5c-F4-F1-F1: fast-forward `card/v3-X-5c-F4` to **its** gated tip, which carries the `wal_recycle` crash fix and the pins, then relaunch `--keep`. F4 must not start from this card's tip alone.
+> - **"This verdict" in REFRESH 6** now means the "Carried from REWORK c1db3197" section of `verdicts/X-5c-F4-F1.md`: ruling (i), the probe table and the seeds. The text is unchanged. Every REFRESH 6 instruction stands; the `ckpt_unflipped` rule was re-checked against the code at this tip.
+> - **The baseline for X5-R39's rows (BASE, whole file, with the crash fix; measured by the gate, not evidence for FINAL):** `szq` 148 (C 146, MP 0, MW 2). Checkpoint arm with a state, 90 rounds, by hook: After0 15, Mid2 11, After2 11, After4 10, After5 9, After3 8, Before0 8, Mid6 6, After6 5, After1 3, uniform 4. So SZI starts near 60 against 300.
+> - **Q11 and the rename skip.** A failed recycling rename ("`to` exists") is routine and binds no window. If Q11 falls short, report how often it happens on FINAL before escalating. Do not change it.
+
+## Carried from REWORK c1db3197 (verbatim; REFRESH 6 and X-5c-F4-F1-F1 refer here)
 
 **Probes (0..N, labelled, never evidence).** Abort fix and diagnostics applied; rows marked `+W11` also have finding 2's fix. `szq`/`szi` are computed from the diagnostics per REFRESH 5's definitions. Wall × (10000/N) on a host with other load: BASE is 15.6 min/10k.
 
@@ -45,20 +129,15 @@ All counts × (10000/N). MP rests on 1–7 raw hits per row, so read it as ±40%
 
 **Window yields, per pick.** W11 as built, `w11_share` 1000, BASE, 0..200: **0 of 150 picks hit Q11**. W11 with finding 2's fix, same seeds: **45 of 79 (57%)**; 72 empty fallbacks. On k4/k5, 18/44 and 6/24. W12: 46 of 151 at BASE; 15/67 and 17/65 on k4/k5, consistent with the worker's prefix explanation.
 
-## Findings
+**Finding 3 of c1db3197.**
 
-1. **REWORK: `szc`'s second disjunct is dead.** `checkpoint()`'s `ckpt:abort` runs on every `Err`, including a sim crash, because the unwinding task gets its turn; it sets `ckpt_closed_dirty = 0` before `run_round` snapshots `obs`. Result: 0 in 15,386 rounds, including 120 of 305 in 0..200 crashing at a mid-checkpoint hook. No pin covers the disjunct (G-SZC-NOCK and G-SZC-NOFOLD pass the whole suite), and no pin reads `RoundRec.szc` (the card's literal M-SZC-ANY survives; the worker mutated `szc_of`). REFRESH 5's `szi` needs this field and would be always 0, and its `ckpt_unflipped` ("cleared wherever `ckpt_open` is cleared") has the same bug. SZI ≥ 300 would have gone to the owner as a false unreachable.
-2. **REWORK: W11 opens at the wrong sync.** `w11_window_note` fires on any completed sync of the segment below `b`, not only one whose extent reaches `b`. Traces: seed 11 opens with the walk stopping at offset 22,477 of a 65,536-byte segment; seed 10 at 59,723. The crash lands there, the walk stops on zeros below `b`, and Q11 cannot hit. Because the window then stays open, the true opening is never recorded. The worker's 1-in-14 was a small sample, and the pin's seed 276 is one of the rare hits (k1 and k2 together: 1 of 95). Q11 at share 0.20 would have been about 10 per 10k, and F4 would have escalated it as unreachable. Adding `st.wal.written >= b` fixes it (57%).
 3. **P's error, not the worker's: ESCALATE 4's refutation is withdrawn.** The "Q4 132 of 309" in ruling nv3-X-5c-F4-esc-1 is q[3], **Q5-partial**. In P's saved file (`X-5c-F4-esc1-q4probe-0..200.json`) q[0] is 0 and q[3] is 132; its 309 rounds and q[19] = 49 (Q18) match the ruling's other figures. P's patch re-run here: Q4 0 of 309. The worker's burst knobs reproduce that: 600/8 gives 0 of 309, 900/16 gives 0 of 308. In-window hook rounds at 900/16: 88, of which 5 have a split and 0 a merge. Probes top out at 62 per 10k against 1,000. REFRESH 4's Q4 bullet is wrong and F4 cannot meet Q4 with it. See follow-up X-5c-F4-F1-F1.
-4. **REWORK: README record.** Step 2's movement list says seed 4 only; that was the pinned subset, and the file has four. The MP root cause says "a failed r0 or a recovery without a store"; it is 1,771 of 1,792 recoveries legitimately refusing (detection), with only 21 failures.
-5. **REWORK: `cwin` is unpinned as a digest input** (G-CWIN-NODIGEST). The card requires it.
-6. **Minor.** `E4_W11_DIAG` eprintlns remain in `wal.rs` and `recover`; remove them in the rework. G-STALE-NOLSN is equivalent at the only call site, since the checked decode has already failed there.
-7. **Pre-existing, no card.** `ack_prefix_two_batches_in_flight` has a 30 s wall-clock deadline. It failed 3 of 3 at both this tip and base 1b0ce54e while a 16-thread campaign ran, and passes in about 4 s on a quieter host. X5-R31 already forbids that co-scheduling. It ended three of my first suite runs, so those three mutants were re-run with `--no-fail-fast`.
+
+**Finding 8 of c1db3197.**
+
 8. **New-class notice for F4 step 4 (probes only).** Class C `O-3(b): XX001` with O-1 failures appear on retuned knobs: k4 seed 221 r1 (After0, AmcheckIi), k4 seed 370 r1 (Open), k5 seed 423 r0 (After0, AmcheckIi). Seeds 221 and 423 reproduce with shares at 0; 370 does not. These are not part of this card, and X5-R16 applies. They may be real.
 
-Accepted as they stand: X5-R37 and its 51 literals (P's 7359 is simply unpinned at this tip); the generic property tests on FINAL; `current + 1` list entries; the Q11 walk and `is_stale_record`; no test assertion changed.
-
-## Rulings
+### Rulings of c1db3197
 
 **(i) W11.** The worker's reading is accepted in substance: `durable == b` never occurs, because `durable` advances only after the batch's sync loop and the batch already holds `b`'s record (seed 4: durable 261147, written 263952, `b` 262144). The implementation is not accepted (finding 2). This text replaces step 3's W11 bullet and X5-R38's W11 clause:
 
@@ -72,16 +151,7 @@ Accepted as they stand: X5-R37 and its 51 literals (P's 7359 is simply unpinned 
 
 **(v) F4 cannot relaunch.** It waits for this card's rework gate and X-5c-F4-F1-F1. Paste the text under "F4 card changes".
 
-## REWORK list (one commit each, same run hygiene; re-gate by P)
-
-1. **`ckpt.rs`, the abort path:** a sim-crash unwind must not reset the observable. Keep `st.ckpt_closed_dirty = 0` only when `!matches!(e, Fail::Sim(_))`. `ckpt_open` and the rest are unchanged. Pins: `run_seed_with(41, None, &Tuning::BASE)` r2 (After1) and seed 303 r2 (After3) have `RoundRec.szc` true with the open interval below 4·F (the record shows `szc` itself; add `ckpt_closed_dirty` to the assertion through `run_round` if needed). No digest moves: `szc` is not an input. Mutants: **M-SZC-ABORTRESET** (reset on every `Err`), **M-SZC-NOCK**, and the card's M-SZC-ANY at `round_rec`, each failing a pin.
-2. **`wal.rs`:** add `st.wal.written >= b` to the W11 open condition, and correct the doc comment. Re-derive `x5_r38_w11_crash_reads_stale_at_start`'s seed by lookup if 276 no longer hits. Add a pin that a W11 crash's walk reaches `b`. Mutant **M-W11-ANYSYNC** fails it. Remove `E4_W11_DIAG`.
-3. **`cwin` digest pin:** two records differing only in `cwin` have different digests; both `None` leaves it unchanged. Mutant: G-CWIN-NODIGEST.
-4. **README:** the (i) text verbatim; the four-seed movement list with rounds and flags (literal list stays as is: 8422, 9226 and 9606 are unpinned); the MP root cause with finding 4's numbers; the re-measured probe with W11 yield; and this verdict's finding 3 as a correction beside ESCALATE 4.
-
-Allowed by this list beyond the card's Limits: only the above. Then fmt, clippy, `cargo test -q --release -p e4-recovery`, end of attempt.
-
-## F4 card changes (paste as REFRESH 6, overriding older text where they differ)
+### REFRESH 6 as issued (already pasted in the F4 card)
 
 **REFRESH 6 (P gate X-5c-F4-F1, REWORK, 2026-11-04).**
 - **Status.** Blocked until X-5c-F4-F1's rework passes its P gate and `card/v3-X-5c-F4` is fast-forwarded to it, **and** X-5c-F4-F1-F1 is done. Then relaunch `--keep`.
@@ -93,11 +163,11 @@ Allowed by this list beyond the card's Limits: only the above. Then fmt, clippy,
 - **Step 4 notice.** Class C XX001 on retuned knobs (seeds 221, 423, 370 in this verdict) gets X5-R16's treatment if it recurs on FINAL.
 - **Pin.** Add `x5_r37_final_stays_in_card_ranges`: FINAL stays inside 5.1 and 5.2's ranges, since the existing knob-range tests derive under BASE.
 
-## Owner items
+### Owner items (both still open, unchanged)
 
 1. **MP ≥ 100, the refused-round exclusion and the 40-minute budget may not all fit.** Measured: 88 at 50 min, 12 at 39 min, 175 at 61 min. Nothing is changed. F4 tries first and escalates with numbers if it falls short. The thresholds are the owner's, and X5-R17 calls the budget a time budget, not a correctness rule. The owner needs to choose only if F4 escalates.
 2. **Q4 ≥ 1,000: the evidence given before was wrong.** The ruling that told the worker Q4 was reachable misread a column. Measured, with REFRESH 4's knobs: at most 62 per 10k. X-5c-F4-F1-F1 tries a pre-registered alignment first. If it cannot reach 1,000, this returns to the owner under the standing rule, and nothing is lowered.
 
 ## Follow-ups
 
-**X-5c-F4-F1-F1** (Status: waiting; `cards/X-5c-F4-F1-F1.local.md`). Q4's reachability: separate per-round split and merge counts in the record, a pre-registered X5-R40 script alignment that runs burst GC inside an open checkpoint, three settings over 0..200 at most, and a fixed decision rule, with an unmet rule going to the owner.
+**X-5c-F4-F1-F1** (the existing card, `cards/X-5c-F4-F1-F1.local.md`, changed as above). Step 0 closes this verdict's findings 1, 2 and 4: the `wal_recycle` crash fix and three pins. Then Q4's reachability: separate per-round split and merge counts in the record, a pre-registered X5-R40 script alignment that runs burst GC inside an open checkpoint, three settings over 0..200 at most, and a fixed decision rule, with an unmet rule going to the owner.
