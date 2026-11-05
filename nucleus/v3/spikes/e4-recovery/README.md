@@ -620,6 +620,167 @@ condition, and `docs/` (P decides at this card's gate whether S-STORE
 §5.6 needs its "re-test the copy condition after any wait on the
 reserve" sentence, as its own Class: spec card).
 
+## Card X-5c-F4-F1-F1-O1C's record (the three faultless class C
+## O-1(c) rounds with no owner: the recovered frontier above the
+## model's upper bound)
+
+Diagnosis only, per the card's Limits: **no fix** (the oracle, the
+model, `upper_bound`, the sim, K, R, the generators, every quota and
+the store are untouched; `docs/`, `cards/` and `verdicts/` untouched).
+The one code change is the diagnostic the card prescribes:
+**`E4_O1C_TRACE`** (stderr only, default off, never a digest input,
+verified below) — the harness side prints the trace of any round whose
+`frontier > model.upper_bound(lower_bound(c_prev))` (the exact bounds
+`check_round` derives; `hi` is class-independent in the oracle), and
+`ckpt::recover`'s walk prints its own accepted-record list beside the
+opened meta's bounds (`O1C walk:` lines), so the replayed side and the
+event side can be matched record for record. The harness side also
+re-runs `derive_written_acked`'s stitched-write walk step for step
+(`o1c_stitched_walk`) with a per-inode path log, so a record the
+`written` half missed is located on the walk's own path.
+
+**The three rounds, each reproduced twice** (single seeds under
+`ulimit -v 25165824`, output outside the worktree; digests identical
+across the two runs and equal to `X-5c-F4.acc.campaign.json`'s and P's
+`o_base.json`/`o_allf.json` — the rounds are unchanged at this tip):
+
+| Seed/round | crash | lo | hi | frontier | digest (×2) | o1 |
+|---|---|---|---|---|---|---|
+| 1066 r0 | `Mid2@2` | 20 | 20 | **21** | 1383263257 | `O-1(c) at c=20, tree 2: raw entry above the cut (max ts 21)` |
+| 6555 r0 | `uniform@y:11624` | 22 | 23 | **24** | 3687676066 | `O-1(c) at c=22, tree 2: raw entry above the cut (max ts 24)` |
+| 7590 r0 | `uniform@y:10872` | 19 | 20 | **21** | 3340396508 | `O-1(c) at c=19, tree 2: raw entry above the cut (max ts 21)` |
+
+All three are round 0, faultless (`lost/mis/torn` 0), no nested
+recovery crashes, `served=false`, amcheck clean — REFRESH 8's "a class
+C O-1 **with no XX001**" shape, escalated below.
+
+**The trace, one mechanism in all three.** Each round's chunked
+transaction fills segment 0 early (writes spanning tens of KiB of the
+file); a mid-round checkpoint recycles segments 0 and 1 (§13 step 6 —
+renamed to segments 3 and 4, each rename `sync_dir`'d); the renamed
+file then receives the round's last commits as its **new life**. The
+record above `hi` is always the round's last commit, its bytes written
+and synced before the crash inside the new life — and the harness's
+`written` derivation never sees them:
+
+- **1066 r0.** The old life of inode 2 (created as segment 0 at E[0])
+  wrote `E[31] W+ f2@206+10691` — file bytes [206, 10897). The recycle
+  `rename /wal/0000000000000000.log -> /wal/0000000000030000.log`
+  lands at E[1685] (dir-synced E[1687]). The new life's single batch
+  `E[1806] W+ f2@0+5046` / `E[1807] W=` (returned), sync `E[1812]/E[1813]`,
+  with `|E| = 1819` — **the write returned 12 events before the crash,
+  the sync 6 before** (the crash is `Mid2@2`, the checkpointer's
+  step-2 write hook). The batch holds ts 20's record [0, 2453) and
+  **ts 21's record [2453, 5046) — `Commit`, txn (0,19), lsn 199061,
+  len 2593**. The model recorded ts 21 at the enqueue's `h:model` step
+  (`owner_in_model=true`, mode `SyncOff`); the derivation's stitched
+  walk decodes ts 20 at off 0 (the new write's key 0 replaced the old
+  life's key-0 write, and the whole [0,2453) fetch is one chunk), then
+  at **off 2453 `stitched` picks the greatest map key ≤ 2453 — the old
+  life's key 206 (issued E[31]), which still covers 2453 — over the
+  later-issued new write at key 0** (issued E[1806]). The fetched
+  header is the old segment-0 body: magic fails, the walk jumps to
+  10897, and **ts 21's record never enters `ts_pos`** → `written=false`
+  → `hi = 20`. The walk path, verbatim:
+  `off=0: rec ts=20 … end=2453`, `off=2453: undecodable, jump to
+  10897`, then the old life's chunks to 58239, stop.
+- **6555 r0.** Old life write `E[58] W+ f2@24454+30070` ([24454,
+  54524)); recycle at E[1689] (dir-sync E[1692]); the new life's last
+  batch `E[2269] W+ f2@22864+5037` / `E[2270] W=`, sync
+  `E[2271]/E[2272]`, `|E| = 2301` (**write returned 31 events before
+  the crash, sync 29**). The batch holds ts 23's record [22864,
+  24895) and **ts 24's record [24895, 27901) — `Commit`, txn (0,24),
+  lsn 221503, len 3006**; the model holds ts 24 (`SyncOff`). The walk
+  decodes the new life's records up to ts 23 (each record's start is
+  its own write's key: 17919, 21164, 22864), then at **off 24895 the
+  greatest covering key ≤ 24895 is the old write's 24454** (issued
+  E[58], 2200 events earlier) — magic fails, jump to 54524 (the old
+  life's chunks), and ts 24 never enters `ts_pos` → `hi = 23`.
+- **7590 r0.** Old life write `E[16] W+ f2@2379+29226` ([2379,
+  31605)); recycle at E[1770] (dir-sync E[1774]); the new life's batch
+  `E[1981] W+ f2@2120+4408` / `E[1982] W=`, syncs `E[1983]/E[1984]`
+  and `E[1985]/E[1986]`, `|E| = 2084` (**write returned 102 events
+  before the crash, the first sync 100**). The batch holds ts 20's
+  record [2120, 4994) and **ts 21's record [4994, 6528) — `Commit`,
+  txn (0,20), lsn 201602, len 1534**; the model holds ts 21
+  (`SyncOff`). The walk decodes ts 19 at 0 and ts 20 at 2120 (the new
+  write's own key), then at **off 4994 the greatest covering key ≤
+  4994 is the old write's 2379** (issued E[16], ~1965 events earlier)
+  — magic fails, jump to 31605, and ts 21 never enters `ts_pos` →
+  `hi = 20`.
+
+**The store's side, all three.** `ckpt::recover`'s walk reads the
+renamed file's **current** view (`read_at` — later writes overwrite
+earlier ones in the disk), so it decodes the new life's records
+correctly and stops where the old bytes begin: 1066 replays ts 11–21
+(`valid_end = 201654` = ts 21's end), 6555 ts 17–24 (`valid_end =
+224509`), 7590 ts 19–21 (`valid_end = 203136`). The frontier equals
+the last replayed ts in each — the records' bytes are durable (X5-R34's
+`D` covers each record's end exactly; `D`'s own stop reason names the
+same old write and the recycle binding: "the last covering write (ev
+31, [206,10897)) precedes the durable binding (ev 1685) — stale bytes
+of an earlier segment name"), the recycle is consistent with §12.6's
+rule (segments 0 and 1 lie wholly below the opened meta's
+`wal_start_lsn`: 179837 / 203646 / 196608), and the replays are
+ts-ordered with LSN (I-WAL-TS-ORDER holds across every walk record).
+
+**Work 2's answer.** In all three rounds the replayed commit is **a
+commit the model should have counted as WAL-written** — not a commit
+that should not be in the WAL. Evidence per card Work 1, holding for
+all three: the commit was enqueued and the model recorded it before
+the crash (`owner_in_model=true`; `h:model` runs the step after
+`wal_enqueue` returns, so the recording itself dates the enqueue
+before the crash); the record's bytes were **written and synced
+before the crash** (the write and sync events with their returns sit
+inside `E`, 6–102 events before its end — the exact indices above);
+the bytes are durable by X5-R34's own rules (`D` ends exactly at the
+record's end); and recovery replayed them per §12.5/§14, which is
+what a correct store must do with a durable record. The commit is not
+spurious, stale or mis-positioned: the record decodes at its own lsn
+under the file's current view, its boot id is this round's boot 0,
+and its ts is the largest in the stream (a previous life's stale bytes
+would carry an older lsn and fail §12.5's position rule — the walk's
+stop at the old bytes shows that rule working).
+
+**Which side is at fault under S-STORE §14's oracle text.** **Neither
+`upper_bound` nor the store.** §14's oracle bounds `c` by "the last
+WAL-written commit" — a property of the durable WAL, which in these
+three rounds **includes** the replayed ts (its write and sync
+returned before the crash; `D` covers it). The store's replay is
+exactly §14 step 4's rule applied to a durable, correctly-positioned
+record, and the frontier is §14's "largest replayed `commit_ts`". The
+defect is in the **harness accounting that feeds `hi`**:
+`derive_written_acked`'s written half builds a per-inode,
+per-offset-latest-issued-bytes map (`files.insert(off, …)`) and
+`stitched` resolves a byte by the **greatest map key ≤ the cursor**,
+ignoring issue order — so when a recycled file's earlier-life write
+starts at a key between the new life's write key and the new record's
+start, and still covers that start, the **old** bytes shadow the
+**new** record (the exact masking family the `E4_ACK_DIAG`
+cross-check's escalation already recorded for `acked`, X-5c-F3-F1
+step 1 (e) shape 2 — there the same per-offset map hid an original
+record behind a recycled life's bytes; here it hides the new life's
+record behind the old life's write, and the victim is `written`, the
+`hi` input). `upper_bound` itself faithfully reports
+`max{ts : recorded ∧ written}` over what it is given; the derivation
+never marked ts 21/24/21 written, so `hi` sits one commit below the
+true last WAL-written commit, the candidate set excludes the
+frontier, and O-1(c) fails at every candidate. A fix (resolving
+`stitched`'s cover by issue order, or keying the map by interval
+supersession, as X5-R34's per-NAME view with its β binding-index
+already does correctly for `acked`) is P's ruling — this card's
+Limit 1 forbids it, and the oracle and model are frozen.
+
+**What did not change:** the oracle, the model, `upper_bound`, the
+sim, K, R, the generators, every quota, the store, `docs/`, `cards/`,
+`verdicts/`. The diagnostic is default-off and moves no digest
+(verified: seeds 1066/6555/7590 produce identical digests with
+`E4_O1C_TRACE` on and off, and both trace runs are byte-identical in
+stderr). Artifacts: `/tmp/opencode` is not durable, so the trace
+stderrs live beside the runner's logs at
+`$HOME/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-O1C.*` (copied there
+by this card's commands: `t<seed>.{a,b}.{err,json}`).
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
