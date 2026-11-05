@@ -43,9 +43,25 @@ Inside and outside the container (CONTAIN): opencode and each Acceptance command
 of their own, each with a fresh TMPDIR, and everything they start dies with that namespace before this
 runner reads the branch or writes an end record. So worker-written code an Acceptance command runs (a
 test, a build script) cannot outlive its line (X-6-F1-F1-F2-F1-F1). This runner and its git checks run
-outside. A namespace contains processes, not their effects: a daemon outside can still be asked to run
-something, and a planted file can still run later, a planted `unshare` on PATH included. Those are
-X-6-F1-F1-F2-F1-F2's.
+outside. A namespace contains processes, not their effects, so the container also masks what a
+same-uid worker could reach outside it (X-6-F1-F1-F2-F1-F2): the runtime dir /run/user/<uid> (the user
+manager's bus: `systemd-run --user` from inside cannot reach it, measured by a connect-only probe),
+~/.ssh and cards/logs are covered read-only or hidden, $HOME is read-only with the worktree, the
+repository's common git dir, TARGET_DIR/<id>, ~/.cargo/registry, ~/.cargo/git, opencode's data dir and
+the per-run TMPDIR bound back writable. A `Container: podman` card line opts one card out of the
+runtime-dir mask only (the owner's approval is podman-only), and the run's output says so. The
+runner's own `unshare` and `git` (and the setup shell's `mount`) are absolute paths from
+os.confstr("CS_PATH"), never PATH, so a file planted in a PATH directory cannot switch containment off
+or become the runner's git; each is refused by name if missing, never fallen back from.
+
+What stays reachable from inside, measured, not assumed (X-6-F1-F1-F2-F1-F2 Work 6; the card's RESULT
+has the commands): loopback TCP (the worker needs the network for its provider, and a network
+namespace is a separate design) — 127.0.0.1:22 answered a connect-only probe from inside a container
+(and whatever else listens on it; a mask cannot close it); abstract unix sockets, which live in the
+shared network namespace; /tmp and every path not under $HOME or /run/user/<uid> (same-uid files there
+stay as they are); the system instance's sockets under /run/systemd (its bus refuses a non-root peer);
+and the writable exceptions themselves, ref and object writes in the common git dir included, which
+the existing scope, ref and object checks judge.
 
 What a contained command cannot do: start a real NBench row. `systemctl --user` and `systemd-run --user
 --unit ...` fail inside a PID namespace (`Failed to connect to user scope bus via local transport: No
@@ -71,6 +87,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -87,31 +104,155 @@ STALL_S = 30 * 60  # a log silent for this long: kill the attempt
 ATTEMPT_S = 60 * 60  # an attempt running this long: kill it
 POLL_S = 5
 ACCEPT_S = 60 * 60  # one Acceptance command running this long: end its container and stop the run
-# The container opencode and each Acceptance command run in (X-6-F1-F1-F2-F1, verdict
-# X-6-F1-F1-F2 R1; Acceptance: X-6-F1-F1-F2-F1-F1). opencode
-# 2.2.5 starts each shell tool command detached, in a new session, so no process
-# group holds them: a forge left in a tool shell landed after the group kill.
-# A PID namespace does: when its init dies the kernel SIGKILLs every member and
-# waits for them, whatever session they moved to. opencode is that init.
+# The container opencode and each Acceptance command run in (X-6-F1-F1-F2-F1,
+# verdict X-6-F1-F1-F2 R1; Acceptance: X-6-F1-F1-F2-F1-F1; the two-stage form and
+# the masks: X-6-F1-F1-F2-F1-F2). opencode 2.2.5 starts each shell tool command
+# detached, in a new session, so no process group holds them: a forge left in a
+# tool shell landed after the group kill. A PID namespace does: when its init
+# dies the kernel SIGKILLs every member and waits for them, whatever session they
+# moved to. opencode is that init.
 # Why this and not the card's other candidates: a cgroup scope needs systemd-run,
 # which leaves this session's NoNewPrivs (the verdict rules it out), and
 # PR_SET_CHILD_SUBREAPER needs a process walk, which this runner does not do.
-# Measured under this mapping (the card's RESULT has the commands): git commits,
-# ~/.cargo and the target dir stay owned by the real uid, the network is the
-# host's (no --net), and the worker holds no capabilities (CapEff 0). opencode as
-# init ignores `kill -9 1` from inside and reaps no orphans; their zombies go with
-# the namespace.
-# --map-current-user: uid and gid stay the real ones, so git sees its own files.
 # --mount-proc: without a private /proc the worker reads the host's process table
 # and, being the same uid, can open other processes' /proc/<pid>/mem. A nested
 # user namespace cannot unmount this one either (EINVAL, measured).
 # --kill-child: unshare's death kills the init even if the init left unshare's
 # process group, so kill_child's killpg reaches the namespace either way.
-CONTAIN = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--kill-child", "--mount-proc", "--"]
-# What the namespace must look like from inside: pid 1 in a private /proc, real ids.
-CONTAIN_PROBE = 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm)"'
+# Measured under this mapping (the card's RESULT has the commands): git commits,
+# ~/.cargo and the target dir stay owned by the real uid, the network is the
+# host's (no --net), and the worker holds no capabilities (CapEff 0). opencode as
+# init ignores `kill -9 1` from inside and reaps no orphans; their zombies go with
+# the namespace.
+#
+# The two-stage form (X-6-F1-F1-F2-F1-F2 Work 1), plain shell, no compiled helper,
+# every line inspectable in CONTAIN_SETUP below:
+#   stage 1  unshare --user --map-current-user --pid --fork --kill-child --mount-proc
+#   stage 2  unshare --user --map-root-user --mount --propagation slave, in a shell
+#   stage 3  unshare --user --map-user=$uid --map-group=$gid, in the same shell
+# Why two stages: `--map-current-user` drops capabilities at exec — the exec'd
+# shell is uid 1000 in the namespace, not 0, so it cannot mount anything (that is
+# measured: the probe's first form failed with "must be superuser to use mount").
+# Stage 2 maps the current user to root *of a new user namespace* (still the real
+# uid outside), which keeps CAP_SYS_ADMIN over the new mount namespace across
+# exec: enough to run the mounts below, and nothing more, since capabilities in a
+# user namespace govern that namespace only. The mounts must exist before stage 3,
+# which moves to a namespace mapping that uid to itself, so the payload is uid
+# 1000 in it and drops every capability at exec (CapEff 0, measured), while the
+# files it writes carry the real uid. The mount(8) binary is setuid root, but
+# these sessions run with NoNewPrivs set, so that bit is inert: the mounts live on
+# the user-namespace capability alone.
+# --propagation slave on stage 2: the host's / is shared, so without detaching,
+# stage 2's mounts would propagate back onto the host (measured: they do not; the
+# host's /run/user/<uid> keeps its sockets through every run).
+# What the payload cannot do about the masks, measured (spike, card Work 1):
+# umount2 direct -> EPERM (no capabilities); umount2 after unshare(CLONE_NEWUSER|
+# CLONE_NEWNS) -> EINVAL, mounts copied into a less-privileged namespace are
+# locked; mounting a fresh tmpfs over a masked path inside a nested namespace
+# only stacks in that namespace's private copy — it can hide more, never reveal.
+# The masks (Work 2 and 3): $HOME is bound read-only with the writable exceptions
+# bound back from a private read-write view of $HOME taken before the read-only
+# bind (bind mounts inherit the source's flags, so the exceptions cannot bind
+# from the masked view); /run/user/<uid> and ~/.ssh are covered by an empty
+# tmpfs; cards/logs (the ledger) is bound read-only on its own, so the mask holds
+# even where CARDS is repointed outside $HOME. The attempt log is written by the
+# runner through its own descriptor (the _relay thread), never by the worker.
+# Fail closed: `set -eu`, and any mount that fails ends the container before the
+# payload runs (an unshare exit with no probe output is a refusal, not a run).
+# The runner's own binaries come from the trusted path, not PATH (Work 4):
+# os.confstr("CS_PATH") is where a POSIX shell looks when PATH is unset, and its
+# directories are root-owned, so a same-uid worker cannot plant there. A file
+# planted in a PATH directory (~/.cargo/bin and ~/.local/bin are on the
+# Acceptance PATH) cannot become this runner's unshare — which would switch
+# containment off — or its git, which runs outside every container (verdict
+# X-6-F1-F1-F2-F1 F2 measured exactly that with the suite's no-op shim: pass
+# true, forge landed). Missing means a named refusal, never a PATH fallback.
+CS_PATH = os.confstr("CS_PATH") or "/bin:/usr/bin"
+
+
+def trusted_bin(name):
+    """The first executable file named `name` directly inside a CS_PATH directory,
+    as an absolute path, or None when no such file exists. CS_PATH's directories
+    are root-owned, so what this returns is not a same-uid worker's to replace."""
+    for d in CS_PATH.split(os.pathsep):
+        p = pathlib.Path(d) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+# The suite's seam (Work 4): its driver repoints UNSHARE at its shim and every
+# spawn follows (contain_argv and mask_env read it at call time), as its driver
+# already repoints CARDS. GIT, MOUNT and UMOUNT have no seam: nothing fakes them.
+UNSHARE = trusted_bin("unshare")  # starts every container, and each stage inside it
+GIT = trusted_bin("git")  # every git call of this runner, outside the containers
+MOUNT = trusted_bin("mount")  # the container's setup shell mounts with it
+UMOUNT = trusted_bin("umount")  # ... and drops the private read-write view with it
+
+# The setup script the container's stages run, verbatim: stage 2's shell (root of
+# the inner user namespace, CAP_SYS_ADMIN over the new mount namespace) applies
+# the masks and then execs stage 3, which drops capabilities at exec. All values
+# come from the NV3_* environment the runner sets (mask_env); the script embeds
+# no paths, so the same text serves every container, and every binary it runs is
+# an absolute trusted path carried in that environment — mount and umount hold
+# the capability over the mount namespace, so a planted one on PATH must never
+# run here. fresh-gate.sh carries a copy that a suite row compares against this
+# one. Every directory it touches is runner-created (the alt dir by
+# spawn_contained, under the container's own TMPDIR), and a word containing
+# whitespace would break the for-loops; none of the runner's constants has one.
+CONTAIN_SETUP = """set -eu
+test -n "${HOME:-}" || exit 91
+alt=${TMPDIR:-/tmp}/nv3-alt
+test -d "$HOME" || exit 92
+test -d "$alt" || exit 93
+"$NV3_MOUNT" --bind "$HOME" "$alt"
+"$NV3_MOUNT" --bind "$HOME" "$HOME"
+"$NV3_MOUNT" -o remount,bind,ro -- "$HOME"
+for d in ${NV3_RO:-}; do
+  test -n "$d" || continue
+  test -d "$d" || continue
+  "$NV3_MOUNT" --bind "$d" "$d"
+  "$NV3_MOUNT" -o remount,bind,ro -- "$d"
+done
+for d in ${NV3_HIDE:-}; do
+  test -n "$d" || continue
+  test -d "$d" || continue
+  "$NV3_MOUNT" -t tmpfs tmpfs -- "$d"
+done
+for d in ${NV3_RW:-}; do
+  test -n "$d" || continue
+  test -d "$d" || continue
+  case "$d" in
+    "$HOME"/*) "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d" ;;
+  esac
+done
+"$NV3_UMOUNT" -- "$alt"
+exec "$NV3_UNSHARE" --user --map-user="$NV3_UID" --map-group="$NV3_GID" -- "$@"
+"""
+
+
+def contain_argv():
+    """The argv prefix that starts a container: stage 1's unshare plus the flags,
+    then the plain-shell stage shells, whose "$@" is the payload. Read at call
+    time so the suite's seam (UNSHARE repointed by its driver) is honoured
+    without production ever doing a PATH lookup."""
+    outer = "exec \"$NV3_UNSHARE\" --user --map-root-user --mount --propagation slave -- /bin/sh -c '" + CONTAIN_SETUP + "' nv3 \"$@\""
+    return [UNSHARE, "--user", "--map-current-user", "--pid", "--fork", "--kill-child", "--mount-proc", "--", "/bin/sh", "-c", outer, "nv3"]
+
+
+CONTAIN = contain_argv()  # the same prefix, frozen at import for readers
+# What the container must look like from inside: pid 1 in a private /proc, the
+# real ids, no capabilities at all, and the runtime dir's mask in place.
+CONTAIN_PROBE = 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm) CapEff=$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/$$/status) runhide=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)"'
 # Where the per-card trust ledgers live (ledger_path()); the scenarios repoint it.
 LEDGER_DIR = CARDS / "logs"
+# The writable exceptions under $HOME (Work 3): the cargo registry and cargo's git
+# dependency cache (measured: cargo build and cargo test need no other write under
+# ~/.cargo — the .package-cache lock file is only read when nothing is downloaded),
+# and opencode's data dir (its session and log storage; measured with 2.2.5).
+CARGO_REGISTRY = pathlib.Path.home() / ".cargo" / "registry"
+CARGO_GIT = pathlib.Path.home() / ".cargo" / "git"
+OPENCODE_DATA = pathlib.Path.home() / ".local" / "share" / "opencode"
 PROTECTED = [
     "nucleus/v3/docs/",
     "nucleus/v3/cards/",
@@ -282,7 +423,13 @@ def parse_card(path):
 
     touch = [m.strip().strip("`") for m in re.findall(r"^- (.+)$", section("Touch only"), re.M)]
     accept = re.findall(r"^- `([^`]+)`", section("Acceptance"), re.M)
-    return card_id, touch, accept
+    # The per-card container opt-in (Work 5): a line `Container: podman` keeps the
+    # runtime dir mounted for this card only, because the user manager's bus is the
+    # one route a card may need (NBench's systemd-run forms). Anything else, or no
+    # such line, leaves the mask on — fail closed. Only podman is honoured: the
+    # owner's approval is podman-only (cards/ORCHESTRATOR.local.md rule 8).
+    container = "podman" if re.search(r"^Container:[ \t]*podman[ \t]*$", text, re.M) else None
+    return card_id, touch, accept, container
 
 
 def validate_card(touch, accept):
@@ -369,7 +516,7 @@ def git_paths(args, wt):
     ("nucleus/v3/docs/\\303\\251.md"), which then match no PROTECTED prefix.
     A failed git raises CalledProcessError: an empty listing would read as
     "nothing changed" and pass every scope rule."""
-    cmd = ["git", args[0], "-z", *args[1:]]
+    cmd = [GIT, args[0], "-z", *args[1:]]
     p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
     if p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -397,7 +544,7 @@ def worktree_changes(wt):
     if not ignored:
         return out
     tracked = set(git_paths(["ls-files", "--full-name", "--", ":(top,glob)**/.gitignore"], wt))
-    cmd = ["git", "check-ignore", "-v", "-z", "--stdin"]
+    cmd = [GIT, "check-ignore", "-v", "-z", "--stdin"]
     p = subprocess.run(cmd, cwd=wt, env=git_env(), input="".join(f + "\0" for f in ignored), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
     if p.returncode not in (0, 1):  # 1: no path matched, so none is dropped
         raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -437,20 +584,20 @@ def _verify_ids(wt, name, want, d):
     def failed(step, p):
         return [f"{name}: git {step} failed (exit {p.returncode}; cannot verify objects)"]
 
-    p = subprocess.run(["git", "rev-parse", "--show-object-format"], cwd=wt, env=env, capture_output=True, text=True)
+    p = subprocess.run([GIT, "rev-parse", "--show-object-format"], cwd=wt, env=env, capture_output=True, text=True)
     if p.returncode:
         return failed("rev-parse", p)
     fmt = p.stdout.strip()
     with open(d / "p.pack", "wb") as fh:
-        cmd = ["git", "pack-objects", "--stdout", "-q", "--no-reuse-object", "--window=0", "--compression=0"]
+        cmd = [GIT, "pack-objects", "--stdout", "-q", "--no-reuse-object", "--window=0", "--compression=0"]
         p = subprocess.run(cmd, cwd=wt, env=env, input="".join(i + "\n" for i in want).encode(), stdout=fh, stderr=subprocess.PIPE)
     if p.returncode:
         return failed("pack-objects", p)
-    p = subprocess.run(["git", "index-pack", f"--object-format={fmt}", "-o", "p.idx", "p.pack"], cwd=d, env=out, capture_output=True)
+    p = subprocess.run([GIT, "index-pack", f"--object-format={fmt}", "-o", "p.idx", "p.pack"], cwd=d, env=out, capture_output=True)
     if p.returncode:
         return failed("index-pack", p)
     with open(d / "p.idx", "rb") as fh:
-        p = subprocess.run(["git", "show-index", f"--object-format={fmt}"], cwd=d, env=out, stdin=fh, capture_output=True, text=True)
+        p = subprocess.run([GIT, "show-index", f"--object-format={fmt}"], cwd=d, env=out, stdin=fh, capture_output=True, text=True)
     if p.returncode:
         return failed("show-index", p)
     # show-index prints "<offset> <id> (<crc>)".
@@ -474,16 +621,16 @@ def verify_objects(wt, base, tip):
     except OSError:
         return ["verify_objects: cannot create a temporary directory (cannot verify objects)"]
     try:
-        p = subprocess.run(["git", "rev-list", "--boundary", f"{base}...{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "rev-list", "--boundary", f"{base}...{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode:
             return failed("rev-list", p)
         commits = [c.lstrip("-") for c in p.stdout.split()]
         # Exit 1 is no merge base (unrelated histories); anything else fails.
-        p = subprocess.run(["git", "merge-base", "--all", base, tip], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "merge-base", "--all", base, tip], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode > 1:
             return failed("merge-base", p)
         mbs = p.stdout.split()
-        p = subprocess.run(["git", "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", base, tip, *mbs, "--"], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", base, tip, *mbs, "--"], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode:
             return failed("rev-list", p)
         roots = p.stdout.split()
@@ -521,8 +668,8 @@ def changed_since(wt, rev, f):
     staged, unstaged or untracked). Diffs rev itself, not a merge-base, so an
     amend or rebase that drops rev's commits cannot hide the change; any git
     error counts as changed."""
-    rc, diff = run(["git", "diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", rev, "--", f], wt)
-    rc2, untracked = run(["git", "ls-files", "--others", "--", f], wt)
+    rc, diff = run([GIT, "diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", rev, "--", f], wt)
+    rc2, untracked = run([GIT, "ls-files", "--others", "--", f], wt)
     return bool(rc or rc2 or diff.strip() or untracked.strip())
 
 
@@ -615,7 +762,7 @@ def worker_commits(wt, base, path):
         # git reading any later word as an option (base is operator input, from
         # --base), and the exclusions are spelled ^REV rather than --not because,
         # after --end-of-options, --not would itself be read as a revision.
-        p = subprocess.run(["git", "rev-list", "--end-of-options", ends.get(run_id) or "HEAD", f"^{start}", f"^{base}", "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
+        p = subprocess.run([GIT, "rev-list", "--end-of-options", ends.get(run_id) or "HEAD", f"^{start}", f"^{base}", "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
         if p.returncode != 0:
             return None
         worker.update(p.stdout.split())
@@ -658,7 +805,7 @@ def ledger_rewritten(wt, path):
             ends[r["run"]] = r["end"]  # the last end wins, as in worker_commits
     gone = []
     for end in dict.fromkeys(e for run_id, e in ends.items() if run_id in starts and e):
-        p = subprocess.run(["git", "merge-base", "--is-ancestor", end, "HEAD"], cwd=wt, env=git_env(), capture_output=True, text=True)
+        p = subprocess.run([GIT, "merge-base", "--is-ancestor", end, "HEAD"], cwd=wt, env=git_env(), capture_output=True, text=True)
         if p.returncode == 1:
             gone.append(end)
         elif p.returncode != 0:
@@ -687,21 +834,21 @@ def _verify_history(wt, base, tip):
         return ["verify_objects: cannot create a temporary directory (cannot verify objects)"]
     try:
         # verify_objects' three listings, repeated (its set is the floor).
-        p = subprocess.run(["git", "rev-list", "--boundary", f"{base}...{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "rev-list", "--boundary", f"{base}...{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode:
             return failed("rev-list", p)
         commits = [c.lstrip("-") for c in p.stdout.split()]
         # Exit 1 is no merge base (unrelated histories); anything else fails.
-        p = subprocess.run(["git", "merge-base", "--all", base, tip], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "merge-base", "--all", base, tip], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode > 1:
             return failed("merge-base", p)
         mbs = p.stdout.split()
-        p = subprocess.run(["git", "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", base, tip, *mbs, "--"], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", base, tip, *mbs, "--"], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode:
             return failed("rev-list", p)
         roots = p.stdout.split()
         # The log's own range, boundary included, marker stripped.
-        p = subprocess.run(["git", "rev-list", "--boundary", f"{base}..{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([GIT, "rev-list", "--boundary", f"{base}..{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
         if p.returncode:
             return failed("rev-list", p)
         hist = list(dict.fromkeys(c.lstrip("-") for c in p.stdout.split()))
@@ -714,7 +861,7 @@ def _verify_history(wt, base, tip):
         # range stays off argv.
         trees = []
         if hist:
-            cmd = ["git", "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", "--stdin"]
+            cmd = [GIT, "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", "--stdin"]
             p = subprocess.run(cmd, cwd=wt, env=env, input="".join(c + "\n" for c in hist), capture_output=True, text=True)
             if p.returncode:
                 return failed("rev-list", p)
@@ -740,7 +887,7 @@ def gate_committed(wt, base, f, card_id, pre_head, ledger=None):
     (X-6-F1-F2-F3-F1 Finding 1)."""
     if _verify_history(wt, base, pre_head):
         return False
-    _, out = run(["git", "log", "-1", "--format=%H %s", f"{base}..{pre_head}", "--", f], wt)
+    _, out = run([GIT, "log", "-1", "--format=%H %s", f"{base}..{pre_head}", "--", f], wt)
     sha, _, subject = out.strip().partition(" ")
     if not subject.startswith(f"nucleus v3: {card_id} verdict "):
         return False
@@ -779,7 +926,7 @@ def git_state_problems(wt, index=True):
     their only layer. A git failure is one line, never [].
     Nothing is cleared: the operator decides."""
     def git(*args, override=True, ok=(0,)):
-        cmd = ["git", *args]
+        cmd = [GIT, *args]
         p = subprocess.run(cmd, cwd=wt, env=git_env(override=override), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
         if p.returncode not in ok:
             raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -793,7 +940,7 @@ def git_state_problems(wt, index=True):
         cmd = ("rev-parse", "--path-format=absolute", "--is-shallow-repository", "--git-path", "shallow", "--git-path", "objects/info/alternates")
         shallow, spath, apath = (git(*cmd).stdout.splitlines() + ["", "", ""])[:3]
         if not apath:
-            raise subprocess.CalledProcessError(0, ["git", *cmd], "", "no alternates path in its output")
+            raise subprocess.CalledProcessError(0, [GIT, *cmd], "", "no alternates path in its output")
         if shallow == "true":
             probs.append(f"shallow repository ({os.environ.get('GIT_SHALLOW_FILE') or spath})")
         if os.path.lexists(apath):
@@ -840,7 +987,7 @@ def git_state_problems(wt, index=True):
             # relative to its cwd.
             top = git("rev-parse", "--show-toplevel").stdout.rstrip("\n")
             paths = git("ls-files", "-z", "--full-name", "--", ":/").stdout
-            cmd = ["git", "check-attr", "-z", "--stdin", "filter"]
+            cmd = [GIT, "check-attr", "-z", "--stdin", "filter"]
             p = subprocess.run(cmd, cwd=top, env=git_env(), input=paths, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
             if p.returncode != 0:
                 raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -905,7 +1052,7 @@ def stray_commits(card_id, branch, since):
     would read as "no stray commits" and the run would go on. stderr stays out
     of the parsed lines (run() folds it in, which only by accident made an
     "unknown revision 'card/v3-<ID>'" error match the card id)."""
-    cmd = ["git", "log", "--branches", "--not", branch, f"--since=@{int(since)}", "--format=%h %s"]
+    cmd = [GIT, "log", "--branches", "--not", branch, f"--since=@{int(since)}", "--format=%h %s"]
     p = subprocess.run(cmd, cwd=ROOT, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
@@ -920,7 +1067,7 @@ def ref_snapshot(wt):
     other sessions on this machine push and drop it at any time. A refname
     cannot hold a control character, so one line per ref with a NUL before the
     oid parses every name."""
-    cmd = ["git", "for-each-ref", "--format=%(refname)%00%(objectname)"]
+    cmd = [GIT, "for-each-ref", "--format=%(refname)%00%(objectname)"]
     p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
     if p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -965,7 +1112,7 @@ def ref_violations(wt, before, branch, pre_head):
     sits under. The residual is the same-uid race between verify and read, as
     for every verify_objects consumer."""
     def git(*args):
-        cmd = ["git", *args]
+        cmd = [GIT, *args]
         p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if p.returncode not in ((0, 1) if args[0] == "merge-base" else (0,)):
             raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
@@ -999,7 +1146,7 @@ def ref_violations(wt, before, branch, pre_head):
             unverified = ["ref_violations: cannot create a temporary directory (cannot verify objects)"]
         else:
             try:
-                p = subprocess.run(["git", "rev-list", *sorted(tips), "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
+                p = subprocess.run([GIT, "rev-list", *sorted(tips), "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
                 if p.returncode:
                     unverified = [f"ref_violations: git rev-list failed (exit {p.returncode}; cannot verify objects)"]
                 else:
@@ -1053,31 +1200,98 @@ def parse_tokens(log_path):
     return tot, session
 
 
+_GIT_COMMON = {}
+
+
+def git_common_dir(wt):
+    """The absolute path of wt's git common dir (the object and ref store every
+    worktree of that repository shares), or None when git cannot name it. One
+    trusted-path git call per directory per process, cached: the container's
+    writable-exception list needs it on every spawn. None means no exception is
+    made for it, so a worker in that directory cannot commit — it fails closed,
+    loudly."""
+    wt = str(pathlib.Path(wt).resolve())
+    if wt not in _GIT_COMMON:
+        p = subprocess.run([GIT, "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=wt, env=git_env(), capture_output=True, text=True)
+        _GIT_COMMON[wt] = p.stdout.strip() if p.returncode == 0 and p.stdout.strip().startswith("/") else None
+    return _GIT_COMMON[wt]
+
+
+def mask_env(env, cwd=None, keep_runtime=False):
+    """env plus the NV3_* variables CONTAIN_SETUP reads: what to hide under an
+    empty tmpfs, what to bind read-only, which directories to bind back writable
+    from the private read-write view of $HOME it takes first, and the binary and
+    ids its stages use. The values are this runner's own paths (module constants
+    and cwd), never worker input, so a payload cannot reshape its own mask by
+    editing them later: the setup shell ran before it started, and it has no
+    capability to mount. keep_runtime drops the /run/user/<uid> mask only — a
+    `Container: podman` card's opt-in (Work 5); ~/.ssh stays hidden either way."""
+    hide = [pathlib.Path.home() / ".ssh"]
+    if not keep_runtime:
+        hide.insert(0, pathlib.Path(f"/run/user/{os.getuid()}"))
+    rw = [p for p in (CARGO_REGISTRY, CARGO_GIT, OPENCODE_DATA) if p.is_dir()]
+    if cwd is not None:
+        wt = pathlib.Path(cwd).resolve()
+        rw.append(wt)
+        common = git_common_dir(wt)
+        if common is not None:
+            rw.append(pathlib.Path(common))
+        # The worktree's name is the card id (WT_ROOT / card_id), so the shared
+        # target dir's per-card subdirectory is the exception, not the whole dir.
+        target = TARGET_DIR / wt.name
+        if target.is_dir():
+            rw.append(target)
+    e = dict(env)
+    e["NV3_HIDE"] = " ".join(str(p) for p in hide)
+    e["NV3_RO"] = str(LEDGER_DIR) if LEDGER_DIR.is_dir() else ""
+    e["NV3_RW"] = " ".join(dict.fromkeys(str(p) for p in rw))
+    e["NV3_UNSHARE"] = str(UNSHARE)
+    e["NV3_MOUNT"] = str(MOUNT)
+    e["NV3_UMOUNT"] = str(UMOUNT)
+    e["NV3_UID"] = str(os.getuid())
+    e["NV3_GID"] = str(os.getgid())
+    return e
+
+
 def containment_problem():
     """Why opencode and the Acceptance commands cannot be contained on this host, or
     None if they can.
 
     Fails closed: main() refuses the card on any answer but None and never falls
-    back to the group kill, which reaches no real tool shell. Everything kill_child
-    relies on is checked by running it, so a host with unprivileged user namespaces
-    switched off (a sysctl, AppArmor, a container's seccomp or masked /proc) is
-    named here, before the worktree is touched. Enabling them needs root and is the
-    owner's call."""
-    if shutil.which("unshare") is None:
-        return "unshare (util-linux) is not on PATH"
+    back to the group kill, which reaches no real tool shell. Everything the
+    container relies on is checked by running it, so a host with unprivileged user
+    namespaces switched off (a sysctl, AppArmor, a container's seccomp or masked
+    /proc), a trusted path without unshare or mount, or a kernel that refuses the
+    two-stage form's mounts is named here, before the worktree is touched. Enabling
+    any of them needs root and is the owner's call."""
+    if UNSHARE is None:
+        return f"unshare (util-linux) is not in the trusted path ({CS_PATH})"
+    if MOUNT is None or UMOUNT is None:
+        missing = "mount (util-linux)" if MOUNT is None else "umount (util-linux)"
+        return f"{missing} is not in the trusted path ({CS_PATH})"
     if not hasattr(os, "pidfd_open"):
         return "this Python has no os.pidfd_open (kill_child waits on the namespace's init with it)"
     me = os.getpid()
     if not pathlib.Path(f"/proc/{me}/task/{me}/children").exists():
         return f"/proc/{me}/task/{me}/children is missing (a kernel without CONFIG_PROC_CHILDREN; kill_child finds the namespace's init there)"
+    head = " ".join(contain_argv()[:8])
+    scratch = tempfile.mkdtemp(prefix="nv3-contain-probe-")
+    (pathlib.Path(scratch) / "nv3-alt").mkdir()
     try:
-        p = subprocess.run([*CONTAIN, "sh", "-c", CONTAIN_PROBE], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        # The probe's container carries the masks (the runtime dir among them), so
+        # a host where the setup shell cannot run is refused here, in one go with
+        # everything else the container needs, not discovered mid-run.
+        (pathlib.Path(scratch) / "marker").write_text("x")
+        env = mask_env(dict(os.environ, TMPDIR=scratch))
+        p = subprocess.run([*contain_argv(), "sh", "-c", CONTAIN_PROBE], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as e:
-        return f"{' '.join(CONTAIN)} sh failed: {e}"
-    want = f"1 {os.geteuid()} {os.getegid()} sh"
+        shutil.rmtree(scratch, ignore_errors=True)
+        return f"{head} sh failed: {e}"
+    shutil.rmtree(scratch, ignore_errors=True)
+    want = f"1 {os.geteuid()} {os.getegid()} sh CapEff=0000000000000000 runhide=0"
     if p.returncode or p.stdout.strip() != want:
         why = (p.stderr or "").strip().splitlines() or ["no stderr"]
-        return f"{' '.join(CONTAIN)} sh: exit {p.returncode}, inside it printed {p.stdout.strip()!r} (want {want!r}): {why[0]}"
+        return f"{head} sh: exit {p.returncode}, inside it printed {p.stdout.strip()!r} (want {want!r}): {why[0]}"
     return None
 
 
@@ -1170,9 +1384,11 @@ def kill_child(proc):
         os.close(fd)
 
 
-def spawn_contained(argv, cwd, env, **popen_args):
-    """Start argv in a new container (CONTAIN) with a fresh TMPDIR, as the leader of
-    its own process group, and return its Popen. end_container ends it.
+def spawn_contained(argv, cwd, env, keep_runtime=False, **popen_args):
+    """Start argv in a new container (contain_argv) with a fresh TMPDIR and the
+    NV3_* mask variables, as the leader of its own process group, and return its
+    Popen. end_container ends it. keep_runtime is the podman opt-in passed
+    through to mask_env (Work 5).
 
     The TMPDIR is per container because contained PIDs restart near 1, so paths keyed
     on the process id (bench/nbench's and spikes/e1-*'s `std::process::id()` scratch
@@ -1185,8 +1401,12 @@ def spawn_contained(argv, cwd, env, **popen_args):
     a process group that is not the terminal's foreground group stops on a terminal
     read (SIGTTIN), which would hold a run started from a terminal for good."""
     tmp = tempfile.mkdtemp(prefix="nv3-container-")
+    # The setup shell's scratch mountpoint for the private read-write view of
+    # $HOME: created here, trusted-path binaries only inside, and the whole
+    # directory goes when the container does.
+    (pathlib.Path(tmp) / "nv3-alt").mkdir()
     try:
-        proc = subprocess.Popen([*CONTAIN, *argv], cwd=cwd, env=dict(env, TMPDIR=tmp), stdin=subprocess.DEVNULL, process_group=0, **popen_args)
+        proc = subprocess.Popen([*contain_argv(), *argv], cwd=cwd, env=mask_env(dict(env, TMPDIR=tmp), cwd=cwd, keep_runtime=keep_runtime), stdin=subprocess.DEVNULL, process_group=0, **popen_args)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -1223,6 +1443,27 @@ def finish_contained(proc, timeout):
     return proc.returncode, stdout + stderr
 
 
+def _relay(child, fh):
+    """Append the container child's stdout to fh as it arrives (the attempt log).
+
+    cards/logs is read-only inside the container (X-6-F1-F1-F2-F1-F2 Work 3), and a
+    write through an inherited descriptor onto a read-only mount fails with EROFS,
+    so the runner writes the attempt log itself, through its own descriptor, from
+    the pipe the child's stdout is: the worker cannot touch the log at all, and the
+    loop's stall detection keeps reading the file this thread flushes. EOF is
+    guaranteed once end_container killed the child, so a join after the attempt
+    never waits long."""
+    try:
+        while True:
+            b = os.read(child.stdout.fileno(), 65536)
+            if not b:
+                break
+            fh.write(b)
+            fh.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def _sigterm(signum, frame):
     # SIGTERM's default action skips main()'s finally, and with it the kill
     # and the ledger's end record.
@@ -1243,26 +1484,38 @@ def main():
 
     card_path = pathlib.Path(args.card)
     card_path = card_path if card_path.is_absolute() else (pathlib.Path.cwd() / card_path).resolve()
-    card_id, touch, accept = parse_card(card_path)
+    card_id, touch, accept, container = parse_card(card_path)
     err = validate_card(touch, accept)
     if err:
         sys.exit(f"card {card_id}: {err} (PLAN-v3 §7.2)")
+    # The runner's git runs outside every container, so it must be the trusted
+    # path's binary or none at all: a planted git on PATH is the same forgery
+    # route as a planted unshare (X-6-F1-F1-F2-F1-F2 Work 4). Refused by name,
+    # never fallen back, before anything is touched.
+    if GIT is None:
+        sys.exit(f"[{card_id}] git is not in the trusted path ({CS_PATH}); not starting (nothing was changed)")
     # Before anything touches the worktree: a run that cannot contain its worker
     # never starts. There is no fallback to the group kill (kill_child).
     why = containment_problem()
     if why:
         sys.exit(f"[{card_id}] cannot contain opencode, so not starting (nothing was changed): {why}. Unprivileged user namespaces are needed; enabling them needs root and is the owner's call.")
+    # The podman opt-in (Work 5): only the runtime-dir mask comes off, only for
+    # this card, and the run's output says so. An opt-in card's verdict needs the
+    # Gate-session spot-check (podman run -v can mount the worktree).
+    bus = container == "podman"
+    if bus:
+        print(f"[{card_id}] Container: podman: the runtime dir /run/user/{os.getuid()} stays mounted for this card (the user manager's bus is reachable; podman-only approval)", flush=True)
 
     wt = WT_ROOT / card_id
     branch = f"card/v3-{card_id}"
     ledger = ledger_path(card_id)
     WT_ROOT.mkdir(parents=True, exist_ok=True)
     if wt.exists() and not args.keep:
-        run(["git", "worktree", "remove", "--force", str(wt)], ROOT)
+        run([GIT, "worktree", "remove", "--force", str(wt)], ROOT)
         shutil.rmtree(wt, ignore_errors=True)
     kept = wt.exists()
     if not kept:
-        rc, out = run(["git", "worktree", "add", "-B", branch, str(wt), args.base], ROOT)
+        rc, out = run([GIT, "worktree", "add", "-B", branch, str(wt), args.base], ROOT)
         if rc:
             sys.exit(out)
         # A recreated branch starts a new ledger; the old one is kept for the record.
@@ -1278,7 +1531,7 @@ def main():
     def trust_head():
         # The operator's --trust-existing: a closed range at HEAD, so nothing
         # on the branch now counts as a worker's commit.
-        _, head = run(["git", "rev-parse", "HEAD"], wt)
+        _, head = run([GIT, "rev-parse", "HEAD"], wt)
         trusted = uuid.uuid4().hex
         ledger_append(ledger, {"run": trusted, "start": head.strip(), "t": time.time(), "trust-existing": True})
         ledger_append(ledger, {"run": trusted, "end": head.strip(), "t": time.time()})
@@ -1301,7 +1554,7 @@ def main():
     if kept and not ledger.exists():
         # A worktree from before the ledger: nothing says which of its commits a
         # worker made, so a verdict-subject commit on it cannot be told from a forgery.
-        rc, subjects = run(["git", "log", "--format=%s", f"{args.base}..HEAD"], wt)
+        rc, subjects = run([GIT, "log", "--format=%s", f"{args.base}..HEAD"], wt)
         verdict_subject = rc or any(l.startswith(f"nucleus v3: {card_id} verdict ") for l in subjects.splitlines())
         if args.trust_existing:
             head = trust_head()
@@ -1312,6 +1565,12 @@ def main():
     # worker runs in the checkout the runner was started from.
     # one target per card: concurrent cards on a shared target serialize on its lock
     env = git_env(dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR / card_id), PWD=str(wt)))
+    # The container binds TARGET_DIR/<card_id> back writable, and a mask never
+    # binds a directory that does not exist, so it is created here, runner-side,
+    # before the first attempt (a fresh host would otherwise fail every build
+    # inside the container with EROFS on its first run).
+    TARGET_DIR.mkdir(parents=True, exist_ok=True)
+    (TARGET_DIR / card_id).mkdir(exist_ok=True)
     # --keep resumes unfinished work, which need not be formatted yet
     rc, out = (0, "") if args.keep else run("cd nucleus/v3 && cargo fmt --all -- --check", wt, env=env)
     if rc:
@@ -1333,7 +1592,7 @@ def main():
     prompt += f"\n\nYour card is `nucleus/v3/cards/{card_path.name}`. Base branch: `{args.base}`. Begin.\n"
 
     # Anything on the branch before the first attempt was not written by this run's worker.
-    _, pre_head = run(["git", "rev-parse", "HEAD"], wt)
+    _, pre_head = run([GIT, "rev-parse", "HEAD"], wt)
     pre_head = pre_head.strip()
     # Once per run, never per attempt: a ref an earlier (or killed) attempt moved
     # must still differ at every later check.
@@ -1387,11 +1646,16 @@ def main():
             finished = False
             killed = None  # "silence" or "timeout"; a no-output restart is not a kill of the attempt
             for start in range(3):
-                with open(log, "w") as fh:
+                pump = None
+                with open(log, "wb") as fh:
                     # In its own container and process group. The group does not reach
                     # opencode's children (its tool shells leave it); the container
-                    # does. See CONTAIN and kill_child.
-                    child = spawn_contained(cmd, wt, env, stdout=fh, stderr=subprocess.STDOUT)
+                    # does. See CONTAIN and kill_child. Its stdout comes through the
+                    # _relay thread: cards/logs is read-only inside the container, so
+                    # the runner writes the attempt log through its own descriptor.
+                    child = spawn_contained(cmd, wt, env, keep_runtime=bus, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    pump = threading.Thread(target=_relay, args=(child, fh), daemon=True)
+                    pump.start()
                     t_start = time.time()
                     while child.poll() is None:
                         time.sleep(POLL_S)
@@ -1420,6 +1684,10 @@ def main():
                         # whatever session or group they moved to.
                         end_container(child)
                         finished = True
+                # The relay's flushes precede its EOF, so once the container is
+                # dead and this join returns, the log file holds every byte.
+                if pump is not None:
+                    pump.join(30)
                 if finished or killed:
                     break
             if '"provider.quota"' in log.read_text(errors="replace"):
@@ -1443,8 +1711,10 @@ def main():
             stray = stray_commits(card_id, branch, t0)
             if stray:
                 result["scope"] = "OUTSIDE"
-                # Listed commits start with a hash; only the failure entry starts with "git log ".
-                what = "cannot list commits to check for stray ones" if stray[0].startswith("git log ") else "worker committed outside its worktree"
+                # The failure entry names the trusted-path git it ran, so the
+                # selector reads the entry's fixed suffix, not the command's
+                # first word.
+                what = "cannot list commits to check for stray ones" if stray[0].endswith("(cannot list commits; treating as stray)") else "worker committed outside its worktree"
                 print(f"[{card_id}] {what}; stopping:\n" + "\n".join(stray), flush=True)
                 break
             bad = scope_violations(wt, args.base, touch, card_id, pre_head, ledger)
@@ -1459,7 +1729,8 @@ def main():
                 # One container per command, ended before the next one starts, so
                 # nothing a line starts is alive for the next line or the end record.
                 # In `child`, so a signal during the wait still reaches the finally.
-                child = spawn_contained(["/bin/sh", "-c", c], wt, git_env(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                # keep_runtime carries the card's podman opt-in (Work 5).
+                child = spawn_contained(["/bin/sh", "-c", c], wt, git_env(env), keep_runtime=bus, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 rc, out = finish_contained(child, ACCEPT_S)
                 if c.strip() == GATE_CMD and not gate_passed(rc, out):
                     rc, out = 1, out + "\nthe gate's last line was not GATE EXIT=0"
@@ -1509,7 +1780,7 @@ def main():
         # child is the latest container: each earlier one was ended before it started.
         if child is not None:
             end_container(child)
-        _, head = run(["git", "rev-parse", "HEAD"], wt)
+        _, head = run([GIT, "rev-parse", "HEAD"], wt)
         head = head.strip()
         ledger_append(ledger, {"run": run_id, "end": head if OID_RE.fullmatch(head) else None, "t": time.time()})
         if not refs_final:  # an exit that skipped the final check (quota, disk, exception, signal)
