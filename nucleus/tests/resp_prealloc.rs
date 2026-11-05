@@ -86,5 +86,8 @@ fn nested_huge_array_headers_do_not_reserve_per_level() {
     let input = b"*1000000\r\n".repeat(100);
     let (err, largest) = parse_and_measure(input);
     assert_eq!(err, Some(ErrorKind::UnexpectedEof));
-    assert!(largest < LIMIT, "nested array headers reserved {largest} bytes");
+    assert!(
+        largest < LIMIT,
+        "nested array headers reserved {largest} bytes"
+    );
 }

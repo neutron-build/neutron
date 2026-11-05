@@ -4342,7 +4342,10 @@ mod tests {
                 .execute_with_session(sid, &format!("SET statement_timeout = {bad}"))
                 .await
                 .expect_err(bad);
-            assert!(err.to_string().contains("statement_timeout"), "{bad}: {err}");
+            assert!(
+                err.to_string().contains("statement_timeout"),
+                "{bad}: {err}"
+            );
         }
         assert_eq!(
             ex.get_session_setting(sid, "statement_timeout"),

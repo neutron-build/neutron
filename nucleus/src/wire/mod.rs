@@ -1734,7 +1734,9 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
                 found_digit = true;
                 // Saturating, as in count_placeholders: a wrapped index
                 // would substitute a bound value for an out-of-range `$N`.
-                idx = idx.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
+                idx = idx
+                    .saturating_mul(10)
+                    .saturating_add((bytes[i] - b'0') as usize);
                 i += 1;
             }
             if found_digit {
@@ -3813,7 +3815,9 @@ fn count_placeholders(sql: &str) -> usize {
             while i < len && bytes[i].is_ascii_digit() {
                 // Saturating: `$99999999999999999999` must not wrap to a
                 // small (or valid-looking) index.
-                num = num.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
+                num = num
+                    .saturating_mul(10)
+                    .saturating_add((bytes[i] - b'0') as usize);
                 found_digit = true;
                 i += 1;
             }
@@ -6907,12 +6911,23 @@ mod tests {
     fn huge_placeholder_number_saturates_and_inference_is_clamped() {
         // fuzz_wire_protocol crash-9da97719: `$00000008000000000000000`
         // sized the parameter-type vector and aborted on allocation failure.
-        assert_eq!(count_placeholders("SELECT $99999999999999999999999"), usize::MAX);
-        assert_eq!(count_placeholders("SELECT $00000008000000000000000"), 8_000_000_000_000_000);
-        let types =
-            NucleusHandler::infer_parameter_types_with_ast("SELECT $8000000000000000000", &[], None, None);
+        assert_eq!(
+            count_placeholders("SELECT $99999999999999999999999"),
+            usize::MAX
+        );
+        assert_eq!(
+            count_placeholders("SELECT $00000008000000000000000"),
+            8_000_000_000_000_000
+        );
+        let types = NucleusHandler::infer_parameter_types_with_ast(
+            "SELECT $8000000000000000000",
+            &[],
+            None,
+            None,
+        );
         assert_eq!(types.len(), MAX_BIND_PARAMS);
-        let types = NucleusHandler::infer_parameter_types_with_ast("SELECT $65535", &[], None, None);
+        let types =
+            NucleusHandler::infer_parameter_types_with_ast("SELECT $65535", &[], None, None);
         assert_eq!(types.len(), 65_535);
     }
 
@@ -6927,7 +6942,10 @@ mod tests {
             crate::sql::substitute_sql_placeholders(sql, &reps, &Default::default()),
             sql
         );
-        assert_eq!(substitute_positional_placeholders("SELECT $1", &reps), "SELECT 'x'");
+        assert_eq!(
+            substitute_positional_placeholders("SELECT $1", &reps),
+            "SELECT 'x'"
+        );
     }
 
     #[test]
@@ -7710,8 +7728,7 @@ mod security_tests {
             data.extend_from_slice(&1i16.to_be_bytes());
             data.extend_from_slice(&bad_len.to_be_bytes());
             data.extend_from_slice(&[0u8; 8]);
-            let err =
-                parse_copy_binary_rows(&data, &[crate::types::DataType::Int32]).unwrap_err();
+            let err = parse_copy_binary_rows(&data, &[crate::types::DataType::Int32]).unwrap_err();
             assert!(err.contains("field length"), "{bad_len}: {err}");
         }
     }

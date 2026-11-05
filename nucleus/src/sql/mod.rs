@@ -1155,7 +1155,9 @@ pub(crate) fn substitute_sql_placeholders(
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     // Saturating: a wrapped index would substitute an
                     // argument for an out-of-range `$N`.
-                    idx = idx.saturating_mul(10).saturating_add((bytes[i] - b'0') as usize);
+                    idx = idx
+                        .saturating_mul(10)
+                        .saturating_add((bytes[i] - b'0') as usize);
                     i += 1;
                 }
                 if idx > 0 && idx <= positional.len() {
