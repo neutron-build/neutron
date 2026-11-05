@@ -13,23 +13,23 @@ that a version has been published; check the registry before releasing.
 
 | Package | Version |
 |---|---|
-| `@neutron-build/sql` | 0.2.0 |
-| `@neutron-build/nucleus` | 0.3.0 |
-| `@neutron-build/data` | 0.3.0 |
-| `@neutron-build/agents` | 0.2.0 |
-| `@neutron-build/core` | 0.5.2 |
-| `@neutron-build/cli` | 0.5.2 |
-| `@neutron-build/create` | 0.1.11 |
-| `@neutron-build/auth` | 0.1.6 |
+| `@neutron-build/sql` | 0.2.1 |
+| `@neutron-build/nucleus` | 0.3.1 |
+| `@neutron-build/data` | 0.3.1 |
+| `@neutron-build/agents` | 0.3.0 |
+| `@neutron-build/core` | 0.5.3 |
+| `@neutron-build/cli` | 0.5.3 |
+| `@neutron-build/create` | 0.1.12 |
+| `@neutron-build/auth` | 0.1.7 |
 | `@neutron-build/cache-redis` | 0.2.1 |
 | `@neutron-build/security` | 0.1.6 |
-| `@neutron-build/ai` | 0.1.2 |
-| `@neutron-build/mcp` | 0.1.1 |
-| `@neutron-build/workflow` | 0.1.1 |
+| `@neutron-build/ai` | 0.1.3 |
+| `@neutron-build/mcp` | 0.1.2 |
+| `@neutron-build/workflow` | 0.1.2 |
 | `@neutron-build/ops` | 0.1.5 |
 | `@neutron-build/otel` | 0.1.5 |
 
-`@neutron-build/mail` (0.1.0) is unchanged and stays on the registry as it is.
+`@neutron-build/mail` is at 0.2.0.
 What changed in each package is in `CHANGELOG.md`. Check the registry for what is
 live: `npm view <package> version`.
 
