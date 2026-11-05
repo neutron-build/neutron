@@ -232,9 +232,14 @@ test -n "${HOME:-}" || exit 91
 alt=${TMPDIR:-/tmp}/nv3-alt
 test -d "$HOME" || exit 92
 test -d "$alt" || exit 93
-"$NV3_MOUNT" --bind "$HOME" "$alt"
-"$NV3_MOUNT" --bind "$HOME" "$HOME"
-"$NV3_MOUNT" -o remount,bind,ro -- "$HOME"
+altok=0
+if "$NV3_MOUNT" --bind "$HOME" "$alt" 2>/dev/null; then
+  altok=1
+  "$NV3_MOUNT" --bind "$HOME" "$HOME"
+  "$NV3_MOUNT" -o remount,bind,ro -- "$HOME"
+else
+  ( : >"$HOME/.nv3-mount-refused" ) 2>/dev/null && exit 94
+fi
 for d in ${NV3_RO:-}; do
   test -n "$d" || continue
   test -d "$d" || continue
@@ -250,10 +255,10 @@ for d in ${NV3_RW:-}; do
   test -n "$d" || continue
   test -d "$d" || continue
   case "$d" in
-    "$HOME"/*) "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d" ;;
+    "$HOME"/*) if [ "$altok" = 1 ]; then "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d"; fi ;;
   esac
 done
-"$NV3_UMOUNT" -- "$alt"
+if [ "$altok" = 1 ]; then "$NV3_UMOUNT" -- "$alt"; fi
 exec "$NV3_UNSHARE" --user --map-user="$NV3_UID" --map-group="$NV3_GID" -- "$@"
 S
 )
@@ -449,7 +454,7 @@ mkdir "$d/tmp"
 mkdir -p -- "$CARGO_TARGET_DIR" "$d/tmp/nv3-alt"
 export NV3_HIDE="/run/user/$(id -u) $HOME/.ssh"
 export NV3_RO=""
-export NV3_RW="$CARGO_TARGET_DIR $HOME/.cargo/registry $HOME/.cargo/git"
+export NV3_RW="$CARGO_TARGET_DIR $HOME/.cargo/registry $HOME/.cargo/git $HOME/.cargo/advisory-dbs"
 export NV3_UNSHARE="$UNSHARE" NV3_MOUNT="$MOUNT" NV3_UMOUNT="$UMOUNT" NV3_UID="$(id -u)" NV3_GID="$(id -g)"
 rc=0
 gate_running=1

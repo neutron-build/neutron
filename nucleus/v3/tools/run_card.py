@@ -56,12 +56,15 @@ or become the runner's git; each is refused by name if missing, never fallen bac
 
 What stays reachable from inside, measured, not assumed (X-6-F1-F1-F2-F1-F2 Work 6; the card's RESULT
 has the commands): loopback TCP (the worker needs the network for its provider, and a network
-namespace is a separate design) — 127.0.0.1:22 answered a connect-only probe from inside a container
-(and whatever else listens on it; a mask cannot close it); abstract unix sockets, which live in the
-shared network namespace; /tmp and every path not under $HOME or /run/user/<uid> (same-uid files there
+namespace is a separate design) — 127.0.0.1:22 and :3773 answered a connect-only probe from inside a
+masked container (:36667 refused; a mask cannot close any of them); abstract unix sockets, which live
+in the shared network namespace (measured: names under /proc/net/unix answer or refuse on their own,
+one X socket answered); /tmp and every path not under $HOME or /run/user/<uid> (same-uid files there
 stay as they are); the system instance's sockets under /run/systemd (its bus refuses a non-root peer);
 and the writable exceptions themselves, ref and object writes in the common git dir included, which
-the existing scope, ref and object checks judge.
+the existing scope, ref and object checks judge. The runtime dir and ~/.ssh are hidden by an empty
+tmpfs: the mountpoint itself stays writable, its contents — the bus, the sway and ssh sockets, the
+keys — are unreachable.
 
 What a contained command cannot do: start a real NBench row. `systemctl --user` and `systemd-run --user
 --unit ...` fail inside a PID namespace (`Failed to connect to user scope bus via local transport: No
@@ -157,6 +160,12 @@ ACCEPT_S = 60 * 60  # one Acceptance command running this long: end its containe
 # tmpfs; cards/logs (the ledger) is bound read-only on its own, so the mask holds
 # even where CARDS is repointed outside $HOME. The attempt log is written by the
 # runner through its own descriptor (the _relay thread), never by the worker.
+# A container started inside an already-masked container cannot take that private
+# view (a locked read-only mount refuses the bind), so it masks everything the
+# outer one left writable and skips the exceptions it can no longer grant:
+# nesting hides further, never reveals (the suite's nested row and its own run
+# under the gate's container prove it), and a $HOME that is writable but
+# unbindable is a refusal (exit 94), never an unmasked run.
 # Fail closed: `set -eu`, and any mount that fails ends the container before the
 # payload runs (an unshare exit with no probe output is a refusal, not a run).
 # The runner's own binaries come from the trusted path, not PATH (Work 4):
@@ -205,9 +214,14 @@ test -n "${HOME:-}" || exit 91
 alt=${TMPDIR:-/tmp}/nv3-alt
 test -d "$HOME" || exit 92
 test -d "$alt" || exit 93
-"$NV3_MOUNT" --bind "$HOME" "$alt"
-"$NV3_MOUNT" --bind "$HOME" "$HOME"
-"$NV3_MOUNT" -o remount,bind,ro -- "$HOME"
+altok=0
+if "$NV3_MOUNT" --bind "$HOME" "$alt" 2>/dev/null; then
+  altok=1
+  "$NV3_MOUNT" --bind "$HOME" "$HOME"
+  "$NV3_MOUNT" -o remount,bind,ro -- "$HOME"
+else
+  ( : >"$HOME/.nv3-mount-refused" ) 2>/dev/null && exit 94
+fi
 for d in ${NV3_RO:-}; do
   test -n "$d" || continue
   test -d "$d" || continue
@@ -223,10 +237,10 @@ for d in ${NV3_RW:-}; do
   test -n "$d" || continue
   test -d "$d" || continue
   case "$d" in
-    "$HOME"/*) "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d" ;;
+    "$HOME"/*) if [ "$altok" = 1 ]; then "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d"; fi ;;
   esac
 done
-"$NV3_UMOUNT" -- "$alt"
+if [ "$altok" = 1 ]; then "$NV3_UMOUNT" -- "$alt"; fi
 exec "$NV3_UNSHARE" --user --map-user="$NV3_UID" --map-group="$NV3_GID" -- "$@"
 """
 
@@ -249,9 +263,12 @@ LEDGER_DIR = CARDS / "logs"
 # The writable exceptions under $HOME (Work 3): the cargo registry and cargo's git
 # dependency cache (measured: cargo build and cargo test need no other write under
 # ~/.cargo — the .package-cache lock file is only read when nothing is downloaded),
+# cargo-deny's advisory database (measured: `cargo deny check`, a gate step, takes
+# an exclusive lock on ~/.cargo/advisory-dbs/db.lock even when nothing is fetched),
 # and opencode's data dir (its session and log storage; measured with 2.2.5).
 CARGO_REGISTRY = pathlib.Path.home() / ".cargo" / "registry"
 CARGO_GIT = pathlib.Path.home() / ".cargo" / "git"
+CARGO_DENY_DB = pathlib.Path.home() / ".cargo" / "advisory-dbs"
 OPENCODE_DATA = pathlib.Path.home() / ".local" / "share" / "opencode"
 PROTECTED = [
     "nucleus/v3/docs/",
@@ -1229,7 +1246,7 @@ def mask_env(env, cwd=None, keep_runtime=False):
     hide = [pathlib.Path.home() / ".ssh"]
     if not keep_runtime:
         hide.insert(0, pathlib.Path(f"/run/user/{os.getuid()}"))
-    rw = [p for p in (CARGO_REGISTRY, CARGO_GIT, OPENCODE_DATA) if p.is_dir()]
+    rw = [p for p in (CARGO_REGISTRY, CARGO_GIT, CARGO_DENY_DB, OPENCODE_DATA) if p.is_dir()]
     if cwd is not None:
         wt = pathlib.Path(cwd).resolve()
         rw.append(wt)

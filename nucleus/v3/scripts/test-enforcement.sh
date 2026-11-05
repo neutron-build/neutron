@@ -3737,10 +3737,26 @@ else:
     print("nested", umount2(RT, 0), umount2(RT, 2))
 print("leftovers", os.listdir(RT) if os.path.isdir(RT) else "gone")
 M
-msk_rc() { PYTHONDONTWRITEBYTECODE=1 timeout 90 python3 - "$v3/tools/run_card.py" "$@" <<'P'
+cat >"$t/msk-nested.py" <<'M'
+import importlib.util, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", os.environ["MSK_RUNNER"])
+rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+# This payload already runs inside a masked container ($HOME read-only from an
+# outer one); the container it starts must still mask, never refuse or reveal.
+c = rc.spawn_contained(["sh", "-c", 'echo "rt=[$(ls -A /run/user/$(id -u) 2>/dev/null | tr "\\n" ",")]"; (echo x >>"$HOME/.nv3-nested-probe") 2>/dev/null && echo WROTE-BAD || echo REFUSED'], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+code, out = rc.finish_contained(c, 60)
+print(code)
+print(out)
+M
+msk_rc() { PYTHONDONTWRITEBYTECODE=1 timeout 120 python3 - "$v3/tools/run_card.py" "$@" <<'P'
 import importlib.util, os, pathlib, subprocess, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
 which, extra = sys.argv[2], dict(os.environ)
+if which == "nested":
+    env = dict(os.environ, E2E_NS="real", MSK_RUNNER=os.path.abspath(sys.argv[1]))
+    code, out = rc.finish_contained(rc.spawn_contained(["python3", os.environ["MSK_T"] + "/msk-nested.py"], os.getcwd(), env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 90)
+    print(out)
+    sys.exit(0 if code == 0 and "rt=[]" in out and "REFUSED" in out and "WROTE-BAD" not in out else 1)
 if which == "mask-runtime":
     code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-rt.sh", "/run/user/" + str(os.getuid())], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
     print(out)
@@ -3782,6 +3798,7 @@ expect_ok "runner mask: premise: the ledger file is writable in this environment
 expect_ok "runner mask: the ledger dir is read-only inside a container (LOGS-WRITABLE)" msk_rc ledger-ro
 expect_ok "runner mask: neither the payload nor a nested namespace can unmask the runtime dir: EPERM, then EINVAL, nothing revealed (MASK-UNDOABLE)" msk_rc unmask
 expect_ok "runner mask: with unshare, mount, umount and git off PATH the runner still contains (no PATH lookup)" msk_rc path-strip
+expect_ok "runner mask: a container inside a masked container still masks, and refuses to plant (nesting hides further)" msk_rc nested
 # A planted unshare and git earlier on PATH are not executed: they record the pid
 # namespace they run in, and no record may carry this suite's.
 mkdir -p "$t/plant"
