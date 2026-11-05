@@ -851,8 +851,9 @@ expect_ok "git state: none in the test repository before these scenarios" no_sta
 # HIDDEN as protected ("-" skips that half) and a "(git state hides changes)"
 # line containing STATE ("-" skips that half, "none" requires no such line).
 gs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$@" <<'P'
-import importlib.util, pathlib, sys
+import importlib.util, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 base, hidden, state = sys.argv[3:6]
 bad = rc.scope_violations(pathlib.Path(sys.argv[2]), base, ["nucleus/v3/spikes/"], *sys.argv[6:8])
 print("\n".join(bad) or "(no violations)")
@@ -1070,8 +1071,9 @@ expect_ok "queue-check: a failed for-each-ref refs/replace/ fails it" out_has "g
 # gsp) gives an entry ending "(cannot check git state)" that holds "exit 128"
 # and the shim's refusal of WORD.
 gsp() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
-import importlib.util, os, pathlib, sys
+import importlib.util, os, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 probs = rc.git_state_problems(pathlib.Path(sys.argv[2]), index=True)
 print(probs)
 w = f"gshim refused {os.environ['GSHIM_FAIL']}"
@@ -1414,8 +1416,9 @@ expect_ok "promote: EX (f): under a -c core.excludesFile the worktree is not cle
 # listing raises (the dirty check's and scope_violations' listing alike), and
 # promote-pass dies.
 wtc_raises() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
-import importlib.util, pathlib, subprocess, sys
+import importlib.util, os, pathlib, subprocess, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 try:
     print("listed:", rc.worktree_changes(pathlib.Path(sys.argv[2])))
 except subprocess.CalledProcessError as e:
@@ -1426,11 +1429,12 @@ P
 }
 expect_ok "runner: EX: a failed check-ignore makes worktree_changes raise (the dirty check's listing)" ex_a gshim check-ignore wtc_raises
 ci_gs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
-import importlib.util, pathlib, sys
+import importlib.util, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 bad = rc.scope_violations(pathlib.Path(sys.argv[2]), "nucleus/v3-scaffold", ["nucleus/v3/spikes/"])
 print("\n".join(bad) or "(no violations)")
-sys.exit(0 if any(b.startswith("git check-ignore ") and "gshim refused check-ignore" in b and b.endswith("(cannot list changed files)") for b in bad) else 1)
+sys.exit(0 if any(" check-ignore -v -z --stdin failed" in b and "gshim refused check-ignore" in b and b.endswith("(cannot list changed files)") for b in bad) else 1)
 P
 }
 expect_ok "runner: EX: scope_violations reports a failed check-ignore, not a listing" ex_a gshim check-ignore ci_gs
@@ -1638,9 +1642,10 @@ no_state4() { local i; for i in "${!forged_oid[@]}"; do cmp -s "${forged_save[$i
 # row can run: each prints the problem lines and exits 0 when there are none.
 vsh() { local repo=$1; (cd "$repo/nucleus/v3" && . scripts/git-env.sh && { verify_objects "$2" "$3" || { printf '%s\n' "$VERIFY_PROBLEMS"; return 1; }; }); }
 vpy() { PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "$2" "$3" <<'P'
-import importlib.util, pathlib, sys
+import importlib.util, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1] + "/nucleus/v3/tools/run_card.py")
 rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 lines = rc.verify_objects(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3])
 for l in lines: print(l)
 sys.exit(1 if lines else 0)
@@ -2191,8 +2196,9 @@ sys.exit(1 if lines else 0)
 P
 }
 gc_eq() { PYTHONDONTWRITEBYTECODE=1 python3 - "$@" <<'P'
-import importlib.util, pathlib, sys
+import importlib.util, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 got = rc.gate_committed(pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
 print("gate_committed:", got)
 sys.exit(0 if got is (sys.argv[7] == "True") else 1)
@@ -2394,8 +2400,9 @@ rvc() { local d; d=$(mktemp -d "$t/rv.XXXX"); cp -a "$rv0/." "$d"; printf '%s\n'
 # and merge-base all exit 128 on a forged tip), so the harness itself must
 # never resolve one.
 rvo() { PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "$2" "$rv0" <<'P'
-import importlib.util, pathlib, subprocess, sys
+import importlib.util, os, pathlib, subprocess, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.GIT = next((f"{d}/git" for d in os.environ.get("PATH", "").split(":") if d and (pathlib.Path(d) / "git").is_file()), rc.GIT)  # this row's driver repoints the constant, as the card allows
 wt, b = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
 pre = subprocess.run(["git", "rev-parse", "nucleus/v3-scaffold"], cwd=b, capture_output=True, text=True, check=True).stdout.strip()
 print("\n".join(rc.ref_violations(wt, rc.ref_snapshot(b), "card/v3-RV", pre)) or "(no violations)")
@@ -2896,16 +2903,17 @@ done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
 F
 chmod +x "$t/bin/opencode"
-# The runner starts opencode through `unshare` (CONTAIN). In a real namespace the
-# fake's $$ is a namespace pid, and .n.pid, res's kill, the XKP killpg row and the
-# XBG `ps` check all read that number as a host pid. So those rows run through this
-# no-op shim: it drops the flags and execs, and the fake keeps its host pid. They
-# test the runner's logic and the group kill of same-group children, as before. The
-# CT rows below set E2E_NS=real and get the real binary. The seam is here on PATH,
-# not in the runner, so nothing in run_card.py can switch containment off.
-# E2E_NS: unset, the no-op (and it answers the runner's probe as a namespace would);
-# real, the real unshare; fail, a host with user namespaces off; lie, the flags are
-# dropped and the probe runs for real, so it reports no namespace.
+# The runner starts every container through trusted-path `unshare` (contain_argv);
+# the suite's seam is rc.UNSHARE, repointed by the e2e driver below at this shim,
+# as it repoints CARDS — production never does a PATH lookup. The no-op mode
+# stands for a working container for rows that test the runner's logic and the
+# group kill of same-group children, as before; the fake keeps its host pid.
+# The CT rows below set E2E_NS=real and get the real binary. Both stage shells
+# hand the payload over the same way: after a "--" come either the stage shell
+# (four words: /bin/sh -c <script> <name>) or the payload itself.
+# E2E_NS: unset/noop, no container (the probe is answered canned); real, the real
+# binary; fail, a host with user namespaces off; lie, the probe runs for real, so
+# it reports no namespace.
 E2E_REAL_UNSHARE=$(command -v unshare || true); export E2E_REAL_UNSHARE
 cat >"$t/bin/unshare" <<'F'
 #!/usr/bin/env bash
@@ -2913,11 +2921,16 @@ case ${E2E_NS:-noop} in
   real) exec "$E2E_REAL_UNSHARE" "$@" ;;
   fail) echo "unshare: unshare failed: Operation not permitted" >&2; exit 1 ;;
 esac
-while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
-if [ "$1" = sh ] && [ "${E2E_NS:-noop}" = noop ]; then echo "1 $(id -u) $(id -g) sh"; exit 0; fi
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+if [ "$1" = /bin/sh ] && [ "$2" = -c ]; then shift 4; fi
+if [ "$1" = sh ] && [ "$2" = -c ] && [ "${E2E_NS:-noop}" = noop ] && [[ $3 == 'echo "$$ '* ]]; then
+  echo "1 $(id -u) $(id -g) sh CapEff=0000000000000000 runhide=0"; exit 0
+fi
 exec "$@"
 F
 chmod +x "$t/bin/unshare"
+export E2E_UNSHARE=$t/bin/unshare
 # The driver: one main() call, stdout captured, SystemExit caught. Writes
 # OUT.out (stdout plus any exit message), OUT.rc and OUT.json (the result line).
 # E2E_SIGTERM_AFTER sends SIGTERM to the runner that many seconds in.
@@ -2926,6 +2939,15 @@ import contextlib, importlib.util, io, os, pathlib, signal, sys, threading, trac
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
 out, e = pathlib.Path(sys.argv[2]), pathlib.Path(os.environ["E2E"])
 rc.WT_ROOT, rc.TARGET_DIR, rc.CARDS, rc.LEDGER_DIR = e / "wt", e / "target", e / "cards", e / "cards" / "logs"
+# The container seam (X-6-F1-F1-F2-F1-F2 Work 4): rc.UNSHARE repointed at the
+# shim above, as CARDS is repointed; every spawn reads it at call time
+# (contain_argv). E2E_NO_UNSHARE/E2E_NO_GIT empty it for the refusal rows.
+if os.environ.get("E2E_UNSHARE"):
+    rc.UNSHARE = os.environ["E2E_UNSHARE"]
+if os.environ.get("E2E_NO_UNSHARE"):
+    rc.UNSHARE = None
+if os.environ.get("E2E_NO_GIT"):
+    rc.GIT = None
 rc.NO_OUTPUT_S, rc.STALL_S = int(os.environ.get("E2E_NO_OUTPUT_S", 1)), int(os.environ.get("E2E_STALL_S", 1))
 rc.ATTEMPT_S, rc.POLL_S = 60, 0.1
 sys.argv = ["run_card.py", *sys.argv[3:], "--min-free-gb", "0"]
@@ -3281,7 +3303,7 @@ elif which == "real-empty":
                     pass
         return hits
     env = dict(os.environ, E2E_NS="real", E2E_CT_MARK=mark.decode().split("=", 1)[1])
-    c = subprocess.Popen([*rc.CONTAIN, "bash", "-c", "setsid sleep 30 & setsid sleep 30 & sleep 30"], env=env, process_group=0)
+    c = rc.spawn_contained(["bash", "-c", "setsid sleep 30 & setsid sleep 30 & sleep 30"], os.getcwd(), env)
     for _ in range(300):
         if len(members()) >= 4:  # unshare, the init and its two sessions
             break
@@ -3296,10 +3318,14 @@ elif which == "unavailable":
     # Each host-feature check names itself, and the suite's own host passes them.
     if rc.containment_problem() is not None:
         sys.exit(f"premise: refused on this host: {rc.containment_problem()}")
-    real_which, shutil.which = shutil.which, lambda *a: None
-    if "unshare (util-linux) is not on PATH" not in (rc.containment_problem() or ""):
+    real_unshare, rc.UNSHARE = rc.UNSHARE, None
+    if "unshare (util-linux) is not in the trusted path" not in (rc.containment_problem() or ""):
         sys.exit("no unshare is not refused")
-    shutil.which = real_which
+    rc.UNSHARE = real_unshare
+    real_mount, rc.MOUNT = rc.MOUNT, None
+    if "mount (util-linux) is not in the trusted path" not in (rc.containment_problem() or ""):
+        sys.exit("no mount is not refused")
+    rc.MOUNT = real_mount
     real_pidfd = os.pidfd_open
     del os.pidfd_open
     if "os.pidfd_open" not in (rc.containment_problem() or ""):
@@ -3319,7 +3345,7 @@ expect_ok "runner e2e: CT: a SIGTERM during the init wait leaves the finally's c
 expect_ok "runner e2e: CT: one child's mark does not skip the next child's group kill (G2-MARK-CLASS-WIDE)" ct_rc second-child
 expect_ok "runner e2e: CT: a repeat kill on a live leader reaches its group (G2-SECOND-KILLS-PID-ONLY)" ct_rc second-group
 expect_ok "runner e2e: CT: a SIGTERM just before killpg leaves no mark, so the finally kills (verdict F1)" ct_rc signal-window
-expect_ok "runner e2e: CT: no unshare, pidfd_open or children file is refused by name" ct_rc unavailable
+expect_ok "runner e2e: CT: no unshare, mount, pidfd_open or children file is refused by name" ct_rc unavailable
 # ct-alive.sh FAKE_OC_N: fails if a process carrying the forge's mark is alive. As
 # an Acceptance command it runs after opencode's exit and before the end record.
 cat >"$t/ct-alive.sh" <<'S'
@@ -3523,7 +3549,7 @@ elif which == "tmpdir":
         sys.exit(f"TMPDIRs: {seen}, inherited {shared}, cwd {os.getcwd()}")
 elif which == "no-fallback":
     # A container that stops working after the probe is a failed line, never a bare run.
-    rc.CONTAIN = ["/bin/false"]
+    rc.contain_argv = lambda: ["/bin/false"]
     marker = os.path.join(os.environ["ACC_T"], "acc-nofallback")
     code, _ = rc.finish_contained(sp(f": >{marker}"), 10)
     if code == 0 or os.path.exists(marker):
@@ -3657,6 +3683,159 @@ expect_ok "runner e2e: ACC: premise: through the no-op shim that run still passe
 # The heartbeat's premise: with no container the same line sees the forge beat.
 e2ea XHP "$acc_hb_still" "work hbforge" --attempts 1
 expect_ok "runner e2e: ACC: premise: through the no-op shim a line sees the opencode forge's heartbeat" res XHP "not r.get('pass') and 'FAIL: a=' in out"
+# --- the container's masks and the trusted path (X-6-F1-F1-F2-F1-F2) -----------
+# Every row here spawns a real container (the runner's own trusted-path unshare,
+# not the shim): the masks are kernel facts, so the contrast comes from a marker
+# the row plants in its own view of the runtime dir (writable in this suite's
+# environment, under the gate's container and on a bare host alike) and from a
+# fake $HOME the row controls outright — never from assuming this suite itself
+# runs unmasked.
+RT=/run/user/$(id -u)
+SUITE_NS=$(readlink /proc/self/ns/pid)
+export MSK_T=$t
+touch "$RT/nv3-suite-marker"
+expect_ok "runner mask: premise: the marker is visible in this environment's runtime dir" test -e "$RT/nv3-suite-marker"
+# Payloads for the rows: connect-only probes (nothing is ever sent), a plant
+# attempt in a fake $HOME, and kernel-level unmask attempts (no mount(8) uid gate).
+cat >"$t/msk-rt.sh" <<'M'
+#!/usr/bin/env bash
+ls -A "$1"
+echo "ssh-entries $(ls -A "$HOME/.ssh" 2>/dev/null | grep -c .)"
+python3 - "$1/bus" <<'Q'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(2)
+try:
+    s.connect(sys.argv[1]); print("connect-ok BAD")
+except OSError as e:
+    print("connect-failed", e.strerror)
+Q
+M
+mkdir -p "$t/fakehome/.ssh"; printf 'orig\n' >"$t/fakehome/.bashrc"; printf 'key\n' >"$t/fakehome/.ssh/id_probe"
+cat >"$t/msk-ro.sh" <<'M'
+#!/usr/bin/env bash
+echo "ssh-entries $(ls -A "$HOME/.ssh" 2>/dev/null | grep -c .)"
+( echo planted >>"$HOME/.bashrc" ) 2>/dev/null && echo WROTE-BAD || echo REFUSED
+M
+mkdir -p "$t/msklogs"; printf 'ledger\n' >"$t/msklogs/msk.ledger.jsonl"
+cat >"$t/msk-logs.sh" <<'M'
+#!/usr/bin/env bash
+( echo forged >>"$1" ) 2>/dev/null && echo WROTE-BAD || echo REFUSED
+( : >"$1.new" ) 2>/dev/null && echo NEWFILE-BAD || echo REFUSED
+M
+cat >"$t/msk-unm.py" <<'M'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+RT = f"/run/user/{os.getuid()}"
+def umount2(path, flags):
+    r = libc.umount2(ctypes.c_char_p(path.encode()), ctypes.c_int(flags))
+    return "ok-BAD" if r == 0 else errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno())
+print("direct", umount2(RT, 0), umount2(RT, 2))
+r = libc.unshare(0x10000000 | 0x00020000)  # CLONE_NEWUSER | CLONE_NEWNS
+if r != 0:
+    print("nested-unshare", errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno()))
+else:
+    print("nested", umount2(RT, 0), umount2(RT, 2))
+print("leftovers", os.listdir(RT) if os.path.isdir(RT) else "gone")
+M
+msk_rc() { PYTHONDONTWRITEBYTECODE=1 timeout 90 python3 - "$v3/tools/run_card.py" "$@" <<'P'
+import importlib.util, os, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+which, extra = sys.argv[2], dict(os.environ)
+if which == "mask-runtime":
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-rt.sh", "/run/user/" + str(os.getuid())], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
+    print(out)
+    sys.exit(0 if code == 0 and "nv3-suite-marker" not in out and "connect-failed" in out and "connect-ok" not in out and "ssh-entries 0" in out else 1)
+if which == "ro-home":
+    env = dict(os.environ, HOME=os.environ["MSK_T"] + "/fakehome", E2E_NS="real")
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-ro.sh"], os.getcwd(), env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
+    wrote = pathlib.Path(env["HOME"], ".bashrc").read_text()
+    print(out, repr(wrote))
+    sys.exit(0 if code == 0 and "REFUSED" in out and "WROTE-BAD" not in out and wrote == "orig\n" else 1)
+if which == "ledger-ro":
+    lp = pathlib.Path(os.environ["MSK_T"]) / "msklogs" / "msk.ledger.jsonl"
+    rc.LEDGER_DIR = lp.parent
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-logs.sh", str(lp)], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
+    print(out, repr(lp.read_text()), repr((lp.parent / "msk.ledger.jsonl.new").exists()))
+    sys.exit(0 if code == 0 and out.count("REFUSED") == 2 and "WROTE-BAD" not in out and "NEWFILE-BAD" not in out and lp.read_text() == "ledger\n" and not (lp.parent / "msk.ledger.jsonl.new").exists() else 1)
+if which == "unmask":
+    code, out = rc.finish_contained(rc.spawn_contained(["python3", os.environ["MSK_T"] + "/msk-unm.py"], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
+    print(out)
+    ok = code == 0 and "ok-BAD" not in out and "direct EPERM EPERM" in out and "nested EINVAL EINVAL" in out and "leftovers []" in out
+    sys.exit(0 if ok else 1)
+if which == "path-strip":
+    # PATH without unshare, mount, umount or git: the runner resolves all of them
+    # from the trusted path, so its probe answers and a real container still starts.
+    os.environ["PATH"] = os.environ["MSK_T"] + "/nobin"
+    if rc.containment_problem() is not None:
+        sys.exit(f"refused without PATH binaries: {rc.containment_problem()}")
+    code, out = rc.finish_contained(rc.spawn_contained(["sh", "-c", "readlink /proc/self/ns/pid"], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
+    print(out, "suite", os.readlink("/proc/self/ns/pid"))
+    sys.exit(0 if code == 0 and out.strip() and out.strip() != os.readlink("/proc/self/ns/pid") else 1)
+sys.exit("unknown " + which)
+P
+}
+mkdir "$t/nobin"; ln -s /usr/bin/* "$t/nobin/"; rm -f "$t/nobin/unshare" "$t/nobin/git" "$t/nobin/mount" "$t/nobin/umount"
+expect_ok "runner mask: the runtime dir is empty inside a container, and a connect-only probe to the bus fails (MASK-NONE)" msk_rc mask-runtime
+expect_ok "runner mask: premise: a plant into a fake \$HOME succeeds outside the container" bash -c 'echo planted >>"$1/.bashrc" && grep -q planted "$1/.bashrc" && printf "orig\n" >"$1/.bashrc"' _ "$t/fakehome"
+expect_ok "runner mask: \$HOME is read-only inside a container: a plant into it is refused (RO-NONE)" msk_rc ro-home
+expect_ok "runner mask: premise: the ledger file is writable in this environment" bash -c 'echo x >>"$1" && grep -qx x "$1" && printf "ledger\n" >"$1"' _ "$t/msklogs/msk.ledger.jsonl"
+expect_ok "runner mask: the ledger dir is read-only inside a container (LOGS-WRITABLE)" msk_rc ledger-ro
+expect_ok "runner mask: neither the payload nor a nested namespace can unmask the runtime dir: EPERM, then EINVAL, nothing revealed (MASK-UNDOABLE)" msk_rc unmask
+expect_ok "runner mask: with unshare, mount, umount and git off PATH the runner still contains (no PATH lookup)" msk_rc path-strip
+# A planted unshare and git earlier on PATH are not executed: they record the pid
+# namespace they run in, and no record may carry this suite's.
+mkdir -p "$t/plant"
+cat >"$t/plant/unshare" <<'M'
+#!/usr/bin/env bash
+echo "$(readlink /proc/self/ns/pid)" >>"${E2E_PLANT_MARK:?}"
+exec "$E2E_REAL_UNSHARE" "$@"
+M
+cat >"$t/plant/git" <<'M'
+#!/usr/bin/env bash
+echo "$(readlink /proc/self/ns/pid)" >>"${E2E_PLANT_MARK:?}"
+exec /usr/bin/git "$@"
+M
+chmod +x "$t/plant/unshare" "$t/plant/git"
+rm -f "$t/plant.mark"
+plant_clean() { local l; [ -f "$1" ] || { echo "no plant ran at all"; return 0; }; while IFS= read -r l; do [ "$l" != "$2" ] || { echo "the plant ran outside a container: $l"; return 1; }; done <"$1"; echo "only contained invocations:"; cat "$1"; }
+export E2E_PLANT_MARK=$t/plant.mark
+acc_ns='readlink /proc/self/ns/pid >"$FAKE_OC_N".nsacc'
+E2E_NS=real PATH=$t/plant:$PATH e2ea XPU "$acc_ns" work --attempts 1
+rm -f "$e/XPU.n.pid"
+expect_ok "runner trust: a planted unshare earlier on PATH is not executed (PATH-UNSHARE)" plant_clean "$t/plant.mark" "$SUITE_NS"
+expect_ok "runner trust: that run was contained: its Acceptance line ran in another pid namespace" bash -c '[ "$(cat "$1")" != "$2" ]' _ "$e/XPU.n.nsacc" "$SUITE_NS"
+expect_ok "runner trust: the planted-unshare run still passes" res XPU "rc == 0 and r['pass'] and $closed"
+rm -f "$t/plant.mark"
+E2E_NS=real PATH=$t/plant:$PATH e2ea XPG 'git log --oneline -1 >"$FAKE_OC_N".gitline' work --attempts 1
+rm -f "$e/XPG.n.pid"
+expect_ok "runner trust: a planted git earlier on PATH never runs outside a container (PATH-GIT)" plant_clean "$t/plant.mark" "$SUITE_NS"
+expect_ok "runner trust: the planted-git run still passes, with the runner's git doing its work" res XPG "rc == 0 and r['pass'] and r['scope'] == 'ok' and $closed"
+unset E2E_PLANT_MARK
+# The trusted path's binaries missing is a named refusal, never a fallback.
+E2E_NO_UNSHARE=1 e2e XNU work --attempts 1
+expect_ok "runner trust: no unshare in the trusted path refuses by name, before anything starts" \
+  res XNU "rc == 1 and 'cannot contain opencode' in out and 'unshare (util-linux) is not in the trusted path' in out and 'attempt 1:' not in out and L == []"
+expect_ok "runner trust: that refusal started no opencode, worktree or branch" ct_untouched XNU
+E2E_NO_GIT=1 e2e XNG work --attempts 1
+expect_ok "runner trust: no git in the trusted path refuses by name, before anything starts" \
+  res XNG "rc == 1 and 'git is not in the trusted path' in out and 'attempt 1:' not in out and L == []"
+expect_ok "runner trust: that refusal started nothing either" ct_untouched XNG
+# The podman opt-in (Work 5): without the line the mask holds; with it, the runtime
+# dir stays mounted for that card only, and the run's output says so.
+rt_listing='ls -A /run/user/$(id -u) >"$FAKE_OC_N".rt'
+E2E_NS=real e2ea XOM "$rt_listing" work --attempts 1
+rm -f "$e/XOM.n.pid"
+expect_ok "runner opt-in: a card with no Container line keeps the runtime dir masked" bash -c '! grep -qx nv3-suite-marker "$1"' _ "$e/XOM.n.rt"
+expect_ok "runner opt-in: the no-line run passes, contained" res XOM "rc == 0 and r['pass'] and $closed"
+e2eac() { local n=$1 acc=$2 oc=$3 id=${1%%-*}; shift 3; rm -f "$e/$n.n"
+  printf '# CARD %s: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/base        Depends: —        Gate: S\nContainer: podman\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `%s`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' "$id" "$acc" >"$e/cards/$id.local.md"
+  (cd "$r" && FAKE_OC=$oc FAKE_OC_N=$e/$n.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/$n" "$e/cards/$id.local.md" --base e2e/base "$@") || true; }
+E2E_NS=real e2eac XOI "$rt_listing" work --attempts 1
+rm -f "$e/XOI.n.pid"
+expect_ok "runner opt-in: a Container: podman line keeps the runtime dir for that card" bash -c 'grep -qx nv3-suite-marker "$1"' _ "$e/XOI.n.rt"
+expect_ok "runner opt-in: the opt-in run passes and its output says the runtime dir stays mounted" \
+  res XOI "rc == 0 and r['pass'] and $closed and '[XOI] Container: podman: the runtime dir' in out"
+rm -f "$RT/nv3-suite-marker"
 # ACC-NO-END: a same-group child of one line, the only thing kill_child's killpg (not
 # the namespace) reaches, must be dead when the next line starts. Through the no-op
 # shim, where the group kill is all there is, as for BG. .sg proves line 1 ran.
@@ -3677,7 +3856,7 @@ expect_ok "runner e2e: L: premise: the driver copy points stray_commits at a mis
 rm -f "$e/XLF.n"
 (cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XLF.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-lf.py" "$v3/tools/run_card.py" "$e/XLF" "$(ec XLF)" --base e2e/base --attempts 2) || true
 expect_ok "runner e2e: L: a failed stray-commit listing stops the run and is named as one" \
-  res XLF "rc == 1 and not r['pass'] and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and '[XLF] cannot list commits to check for stray ones; stopping:' in out.splitlines() and 'committed outside its worktree' not in out and any(l.startswith('git log ') and 'no-such-branch' in l and 'failed (exit' in l and l.endswith('(cannot list commits; treating as stray)') for l in out.splitlines())"
+  res XLF "rc == 1 and not r['pass'] and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and '[XLF] cannot list commits to check for stray ones; stopping:' in out.splitlines() and 'committed outside its worktree' not in out and any(l.endswith('(cannot list commits; treating as stray)') and 'log --branches --not no-such-branch' in l and 'failed (exit' in l for l in out.splitlines())"
 # Control: a real stray commit (the side action names the card on side-XOW, which
 # the ref check allows) gets the other message, so the selector is not constant.
 e2e XOW side --attempts 2
@@ -3960,7 +4139,7 @@ echo "$e/cards/$1.local.md"; }
 msg_premise() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$(ecm XMSG)" <<'P'
 import importlib.util, pathlib, subprocess, sys
 spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
-cid, touch, accept = rc.parse_card(pathlib.Path(sys.argv[2]))
+cid, touch, accept, container = rc.parse_card(pathlib.Path(sys.argv[2]))
 p = subprocess.run(["bash", "-c", accept[0]], capture_output=True, text=True)
 lines = (p.stdout + p.stderr).splitlines()
 print(cid, accept, p.returncode, lines[:2], len(lines))
@@ -4024,12 +4203,15 @@ fgcard() { git -C "$r" checkout -q -b "card/v3-$1" "${3:-nucleus/v3-scaffold}" &
 # fgrun [--shim WORD] ARGS...: fresh-gate.sh ARGS from $v3 (under gshim WORD),
 # with a fresh empty TMPDIR; stdout, stderr and the exit status go to
 # $t/fg.out, $t/fg.err and $t/fg.rc, and the worktree list before the run to
-# $t/fg.wt0.
+# $t/fg.wt0. SUITE_PATH is this suite's own PATH, captured here: rows that
+# pollute PATH for fresh-gate (no binaries, plants) must not break the suite's
+# own `plain git` snapshots around the run.
+SUITE_PATH=$PATH
 fgrun() {
   local shim=() rc=0
   if [ "$1" = --shim ]; then shim=(gshim "$2"); shift 2; fi
   rm -rf "$t/fgtmp"; mkdir "$t/fgtmp"
-  plain worktree list --porcelain >"$t/fg.wt0"
+  PATH=$SUITE_PATH plain worktree list --porcelain >"$t/fg.wt0"
   (cd "$v3" && TMPDIR=$t/fgtmp "${shim[@]}" bash scripts/fresh-gate.sh "$@") >"$t/fg.out" 2>"$t/fg.err" || rc=$?
   echo "$rc" >"$t/fg.rc"
 }
@@ -4046,7 +4228,7 @@ fg_refused() {
 }
 # fg_clean: the worktree list is as it was before the run, and nothing is left
 # in the run's TMPDIR.
-fg_clean() { local w; w=$(plain worktree list --porcelain); echo "$w"; ls -A "$t/fgtmp"; [ "$w" = "$(cat "$t/fg.wt0")" ] && [ -z "$(ls -A "$t/fgtmp")" ]; }
+fg_clean() { local w; w=$(PATH=$SUITE_PATH plain worktree list --porcelain); echo "$w"; ls -A "$t/fgtmp"; [ "$w" = "$(cat "$t/fg.wt0")" ] && [ -z "$(ls -A "$t/fgtmp")" ]; }
 
 # FG1 honest control, FG2 a failing gate.
 fgcard FG1
@@ -4105,41 +4287,76 @@ sleep 5
 expect_ok "fresh-gate: FGC: the forge never lands" fgc_nope "$t/fgc1"
 expect_ok "fresh-gate: FGC: the forge never lands (second run)" fgc_nope "$t/fgc2"
 expect_ok "fresh-gate: FGC: the forge never lands (SIGTERM)" fgc_nope "$t/fgc3"
-# Premise, the same commit with no container (the no-op shim): the forge lands.
-FG_MARK=$t/fgc4 fgrun card/v3-FGC
-fgc_landed() { local i; for i in {1..300}; do [ -e "$t/fgc4.landed" ] && return 0; sleep 0.1; done; echo "the forge never landed"; return 1; }
-expect_ok "fresh-gate: FGC: premise: through the no-op shim the gate's forge lands" fgc_landed
-git -C "$r" update-ref -d refs/fgforge/fgc4
+expect_ok "fresh-gate: FGC: the forge never lands (planted PATH)" fgc_nope "$t/fgc5"
+# The old no-container premise rows are gone with the seam they used: fresh-gate
+# resolves unshare from the trusted path, so no PATH file can answer its probe or
+# drop its flags, and the runner-level XAP/XCP premise rows carry that contrast.
 # No container, no gate: refused by name, nothing checked out, the gate never ran.
 fgcard FGR
-E2E_NS=fail fgrun card/v3-FGR
-expect_ok "fresh-gate: FGC: user namespaces off: refused by name (FG-FALLBACK)" fg_refused "cannot contain the gate, so not running it" "Operation not permitted" "the owner's call"
+# No unshare or git on PATH at all (everything else there, as links): the gate
+# still runs contained, because both are resolved from the trusted path, never
+# PATH. A bare `unshare`/`git` there (the mutants) finds nothing and fails here.
+mkdir "$t/fgnoun"; ln -s /usr/bin/* "$t/fgnoun/"; rm -f "$t/fgnoun/unshare" "$t/fgnoun/git"
+PATH=$t/fgnoun fgrun card/v3-FG1
+expect_ok "fresh-gate: FGC: no unshare or git on PATH: the gate still runs contained and passes" fg_gate 0 FG1
+expect_ok "fresh-gate: FGC: (no PATH binaries) nothing is left" fg_clean
+# Planted unshare and git earlier on PATH do not run the gate uncontained either:
+# the gate runs in its container, the plants only ever inside one (if at all), and
+# the gate's own forge dies with the container as before.
+rm -f "$t/plant.mark"
+FG_MARK=$t/fgc5 E2E_NS=real E2E_PLANT_MARK=$t/plant.mark PATH=$t/plant:$PATH fgrun card/v3-FGC
+expect_ok "fresh-gate: FGC: planted unshare and git on PATH: the gate still runs contained and passes" fgc_ran "$t/fgc5"
+expect_ok "fresh-gate: FGC: the plants never ran outside a container" plant_clean "$t/plant.mark" "$SUITE_NS"
+expect_ok "fresh-gate: FGC: (planted PATH) nothing is left" fg_clean
+# A HOME whose masks cannot be set up: the setup shell's first mount fails, the
+# probe never answers, and the whole thing is a refusal — the gate never ran.
+HOME=$t/fg-no-such-home fgrun card/v3-FGR
+expect_ok "fresh-gate: FGC: a container that cannot be set up is a refusal by name, the gate never ran (FG-FALLBACK)" fg_refused "cannot contain the gate, so not running it" "exit 92" "the owner's call"
 expect_ok "fresh-gate: FGC: that refusal ran no gate" bash -c "! grep -qF '$fg_orig' '$t/fg.out'"
 expect_ok "fresh-gate: FGC: that refusal leaves nothing" fg_clean
-E2E_NS=lie fgrun card/v3-FGR
-expect_ok "fresh-gate: FGC: an unshare that exits 0 with no namespace is refused too" fg_refused "cannot contain the gate, so not running it" "(want '1 "
-expect_ok "fresh-gate: FGC: that refusal ran no gate" bash -c "! grep -qF '$fg_orig' '$t/fg.out'"
-# No unshare at all: everything else on PATH, as links.
-mkdir "$t/fgnoun"; ln -s /usr/bin/* "$t/fgnoun/"; rm -f "$t/fgnoun/unshare"
-PATH=$t/fgnoun fgrun card/v3-FGR
-expect_ok "fresh-gate: FGC: no unshare on PATH is refused by name" fg_refused "unshare (util-linux) is not on PATH"
-# A container that answers the probe and then fails to start: a refusal, not a gate result.
-mkdir "$t/fgnostart"
-cat >"$t/fgnostart/unshare" <<'F'
+# The runner and the gate use one container form: fresh-gate's OUTER= and CONTAIN=
+# lines, read raw and expanded by a bash with this runner's UNSHARE and
+# CONTAIN_SETUP in its environment, print contain_argv() element for element.
+# Both sides are built from the same values, so equality pins the form.
+cat >"$t/fgc-same.sh" <<'S'
 #!/usr/bin/env bash
-while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
-if [ "$1" = sh ]; then echo "1 $(id -u) $(id -g) sh"; exit 0; fi
-echo "unshare: unshare failed: Operation not permitted" >&2
-exit 1
-F
-chmod +x "$t/fgnostart/unshare"
-PATH=$t/fgnostart:$PATH fgrun card/v3-FGR
-expect_ok "fresh-gate: FGC: a container that fails to start is a refusal, the gate never ran" fg_refused "the gate's container did not start (unshare exit 1)"
-expect_ok "fresh-gate: FGC: that refusal ran no gate" bash -c "! grep -qF '$fg_orig' '$t/fg.out'"
-expect_ok "fresh-gate: FGC: that refusal leaves nothing" fg_clean
-# The runner and the gate use one container form.
-fgc_same() { local a b; a=$(sed -n 's/^CONTAIN=(\(.*\))$/\1/p' "$v3/scripts/fresh-gate.sh"); b=$(PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("rc",sys.argv[1]); rc=importlib.util.module_from_spec(s); s.loader.exec_module(rc); print(" ".join(rc.CONTAIN))' "$v3/tools/run_card.py"); echo "fresh-gate: $a"; echo "runner: $b"; [ -n "$a" ] && [ "$a" = "$b" ]; }
-expect_ok "fresh-gate: FGC: its container flags equal the runner's CONTAIN" fgc_same
+set -euo pipefail
+v3=$1
+exp=$(PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" <<'P2'
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(s); s.loader.exec_module(rc)
+print("\n".join(rc.contain_argv()))
+P2
+)
+un=$(PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" <<'P3'
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(s); s.loader.exec_module(rc)
+print(rc.UNSHARE)
+P3
+)
+setup=$(PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" <<'P4'
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(s); s.loader.exec_module(rc)
+sys.stdout.write(rc.CONTAIN_SETUP)
+P4
+)
+# command substitution stripped the trailing newline the runner's constant keeps
+setup="$setup"$'\n'
+d=$(mktemp -d)
+sed -n '/^OUTER=/p;/^CONTAIN=(/p' "$v3/scripts/fresh-gate.sh" >"$d/lines"
+printf 'printf "%%s\\n" "${CONTAIN[@]}"\n' >>"$d/lines"
+UNSHARE="$un" SETUP="$setup" bash -s <"$d/lines" >"$d/got"
+if diff <(printf '%s\n' "$exp") "$d/got" >&2; then
+  echo "runner and fresh-gate container forms agree"
+else
+  echo "the runner's container and fresh-gate's differ (see the diff above)"
+  exit 1
+fi
+rm -rf "$d"
+S
+chmod +x "$t/fgc-same.sh"
+fgc_same() { bash "$t/fgc-same.sh" "$v3"; }
+expect_ok "fresh-gate: FGC: its container equals the runner's, element for element" fgc_same
 
 # FG3, the index-stat poisoning ESCALATE (verdict X-6-F1-F2-F2-F1): in a card
 # worktree, a same-size EDIT passes one status under a transient clean filter,
@@ -4276,16 +4493,25 @@ expect_ok "fresh-gate: FG8: a text eol=crlf file passes through its eol conversi
 expect_ok "fresh-gate: FG8: the checkout is removed" fg_clean
 
 # FG9, a failed step is a refusal, never a pass: exit 2, FRESH-GATE REFUSED,
-# no GATE EXIT= line, no checkout left.
-fgrun --shim worktree card/v3-FG1
-expect_ok "fresh-gate: FG9: a failed worktree add is a refusal" fg_refused "git worktree add failed (exit 128)"
-expect_ok "fresh-gate: FG9: (worktree) no checkout is left" fg_clean
-fgrun --shim hash-object card/v3-FG1
-expect_ok "fresh-gate: FG9: a failed hash-object is a refusal" fg_refused "git hash-object failed (exit 128; cannot check the content)"
-expect_ok "fresh-gate: FG9: (hash-object) no checkout is left" fg_clean
-fgrun --shim ls-tree card/v3-FG1
-expect_ok "fresh-gate: FG9: a failed ls-tree is a refusal" fg_refused "git ls-tree failed (exit 128; cannot read the commit's tree)"
-expect_ok "fresh-gate: FG9: (ls-tree) no checkout is left" fg_clean
+# no GATE EXIT= line, no checkout left. The old gshim rows (a PATH git made to
+# fail worktree add, hash-object or ls-tree) are gone with the seam they used:
+# fresh-gate runs git from the trusted path, so no PATH file can fail it, and
+# these rows fail the same steps from the outside instead.
+mkdir -p "$t/fgro"; chmod 500 "$t/fgro"
+PATH=$SUITE_PATH plain worktree list --porcelain >"$t/fg.wt0"
+rc=0; (cd "$v3" && TMPDIR=$t/fgro bash scripts/fresh-gate.sh card/v3-FG1) >"$t/fg.out" 2>"$t/fg.err" || rc=$?
+echo "$rc" >"$t/fg.rc"
+expect_ok "fresh-gate: FG9: a TMPDIR where no scratch dir can be made is a refusal" fg_refused "cannot create a temporary directory"
+expect_ok "fresh-gate: FG9: (ro TMPDIR) no checkout is left" fg_clean
+chmod 700 "$t/fgro"; rmdir "$t/fgro"
+fgrun --base no-such-ref card/v3-FG1
+expect_ok "fresh-gate: FG9: a base that does not resolve is a refusal" fg_refused "cannot resolve base 'no-such-ref'"
+expect_ok "fresh-gate: FG9: (no base) no checkout is left" fg_clean
+fg9c=$(git -C "$r" commit-tree "$(git -C "$r" hash-object -t tree /dev/null)" -m "no gate.sh")
+git -C "$r" update-ref refs/heads/card/v3-FG9N "$fg9c"
+fgrun card/v3-FG9N
+expect_ok "fresh-gate: FG9: a commit with no nucleus/v3/scripts/gate.sh is a refusal" fg_refused "the commit has no nucleus/v3/scripts/gate.sh"
+expect_ok "fresh-gate: FG9: (no gate.sh) no checkout is left" fg_clean
 fgrun card/v3-FG-NOSUCH
 expect_ok "fresh-gate: FG9: a commit that does not resolve is a refusal" fg_refused "cannot resolve commit 'card/v3-FG-NOSUCH'"
 expect_ok "fresh-gate: FG9: (no commit) nothing is left" fg_clean
