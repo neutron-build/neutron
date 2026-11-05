@@ -6126,8 +6126,8 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
     let root_l2 = roots[12];
     // The After2 capture: at `ckpt:freeze` neither exhausting LPID may
     // still be `CopyPending`, and the frozen image must map both.
-    let at_after2: std::sync::Arc<std::sync::Mutex<Option<(bool, bool, bool, bool)>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+    type After2Capture = std::sync::Arc<std::sync::Mutex<Option<(bool, bool, bool, bool)>>>;
+    let at_after2: After2Capture = std::sync::Arc::new(std::sync::Mutex::new(None));
     let cap = std::sync::Arc::clone(&at_after2);
     let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
         let cx = Cx { w: sched, t };
@@ -6154,7 +6154,7 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
                         set_flag(sched, "filled");
                     }
                     if hook == CkptHook::After2 {
-                        let mut g = sched.lock();
+                        let g = sched.lock();
                         let st = &g.st;
                         let l1_res = !matches!(
                             st.map.img.get(&root_l1),
