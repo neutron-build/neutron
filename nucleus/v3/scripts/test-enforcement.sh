@@ -30,6 +30,45 @@ fail() { echo "FAIL $1"; fails=$((fails + 1)); }
 # expect_ok NAME CMD... / expect_no NAME CMD...
 expect_ok() { local n=$1; shift; if "$@" >"$t/out" 2>&1; then pass "$n"; else fail "$n"; sed 's/^/     /' "$t/out"; fi; }
 expect_no() { local n=$1; shift; if "$@" >"$t/out" 2>&1; then fail "$n (was accepted)"; sed 's/^/     /' "$t/out"; else pass "$n"; fi; }
+# --- listings are captured, never piped into grep -q (X-6-F1-F1-F2-F2) --------
+# Under pipefail `producer | grep -q X` has a race on a match: grep exits at
+# once, and a producer with another write to make (git rev-list makes one per
+# commit when stdout is a pipe) dies of SIGPIPE, so the pipeline exits 141.
+# Both directions are wrong: a true `lists X` reads false (RV8 refused a promote
+# this way), and a `! ... | grep -q X` reads TRUE when X really is listed, so a
+# false negative premise passes. A `! git ...` also reads true when git fails.
+# lists and lacks read the whole listing first, so no pipe is left to break, and
+# they require the command to have succeeded. A `bash -c "..."` row does not
+# inherit pipefail (the status is grep's alone), so those rows can keep the pipe.
+# lists ID CMD...: CMD exits 0 and prints a line that is exactly ID.
+lists() {
+  local want=$1 out; shift
+  out=$("$@") || { echo "lists: exit $?: $*"; return 1; }
+  grep -qxF -- "$want" <<<"$out" || { printf 'lists: no line %s in:\n%s\n' "$want" "$out"; return 1; }
+}
+# lacks ID CMD...: CMD exits 0 and prints no line that is exactly ID.
+lacks() {
+  local want=$1 out; shift
+  out=$("$@") || { echo "lacks: exit $?: $*"; return 1; }
+  if grep -qxF -- "$want" <<<"$out"; then printf 'lacks: line %s is in:\n%s\n' "$want" "$out"; return 1; fi
+}
+# yes writes until its reader is gone, so SIGPIPE is certain, not a matter of
+# timing; the two premises hold whatever the machine's load is. The status is
+# only required to be non-zero: an inherited ignored SIGPIPE turns 141 into
+# yes's own exit 1, and the premise is the same.
+lp_race() { local rc=0; yes b | grep -qxF b || rc=$?; echo "pipeline exit $rc"; [ "$rc" -ne 0 ]; }
+lp_race_neg() { ! yes b | grep -qxF b; }
+# lp_slow lists b, then writes again after a pause, as rev-list does.
+lp_slow() { echo a; echo b; sleep 0.1; echo c; }
+lp_bad() { echo b; return 3; }
+expect_ok "premise: pipe race: producer | grep -q on a line that IS listed exits non-zero under pipefail" lp_race
+expect_ok "premise: pipe race: ! producer | grep -q reads true on a line that IS listed" lp_race_neg
+expect_ok "lists: finds a line with a slow producer still writing after it" lists b lp_slow
+expect_no "lists: refuses a line the listing lacks" lists z lp_slow
+expect_no "lists: refuses when the command fails, even with the line printed" lists b lp_bad
+expect_ok "lacks: accepts a line the listing lacks" lacks z lp_slow
+expect_no "lacks: refuses a line that is listed, with a slow producer still writing after it" lacks b lp_slow
+expect_no "lacks: refuses when the command fails" lacks z lp_bad
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # The git-state scenarios (X-6-F1-F2) check that the runner and the scripts
@@ -157,7 +196,7 @@ git -C "$mb" add -A && git -C "$mb" commit -qm "nucleus v3: MB verdict MERGE"
 git -C "$mb" checkout -q nucleus/v3-scaffold
 mbblob=$(git -C "$mb" rev-parse mb-base:nucleus/v3/CORE_PATHS)
 rm -f "$mb/.git/objects/${mbblob:0:2}/${mbblob:2}"
-mb_diffs() { git -C "$mb" diff -z --name-only mb-base...card/v3-MB >"$t/mbl" && tr '\0' '\n' <"$t/mbl" | grep -qxF nucleus/v3/scripts/mb.sh; }
+mb_diffs() { git -C "$mb" diff -z --name-only mb-base...card/v3-MB >"$t/mbl" && lists nucleus/v3/scripts/mb.sh tr '\0' '\n' <"$t/mbl"; }
 expect_ok "premise: git diff mb-base...card/v3-MB succeeds and lists scripts/mb.sh" mb_diffs
 expect_no "premise: git show mb-base:nucleus/v3/CORE_PATHS fails (blob deleted)" git -C "$mb" show mb-base:nucleus/v3/CORE_PATHS
 expect_ok "check-core-paths: a base whose CORE_PATHS blob is missing is refused" ccp_refused "$mb/nucleus/v3" mb-base card/v3-MB
@@ -1341,7 +1380,7 @@ echo dsc >"$v3/spikes/dsc.txt"; git -C "$r" add nucleus/v3/spikes/dsc.txt; git -
 mkdir -p "$v3/tools/ds"; git -C "$r" update-index --add --cacheinfo "160000,$(git -C "$r" rev-parse nucleus/v3-scaffold),nucleus/v3/tools/ds"
 verdict DSC S MERGE standard S
 mv "$t/ds.gitmodules" "$r/.gitmodules"
-dsc_hidden() { local d; d=$(git -C "$r" diff-tree --no-commit-id --name-only -r card/v3-DSC); echo "$d"; [ "$d" = nucleus/v3/verdicts/DSC.md ] && git -C "$r" ls-tree card/v3-DSC nucleus/v3/tools/ds | grep -q '^160000 '; }
+dsc_hidden() { local d l; d=$(git -C "$r" diff-tree --no-commit-id --name-only -r card/v3-DSC); echo "$d"; [ "$d" = nucleus/v3/verdicts/DSC.md ] && l=$(git -C "$r" ls-tree card/v3-DSC nucleus/v3/tools/ds) && grep -q '^160000 ' <<<"$l"; }
 expect_ok "premise: DS (c): with .gitmodules ignore=all plain diff-tree lists only the verdict" dsc_hidden
 scratch
 expect_ok "merge-card: DS (c): the tip check still names a gitlink the verdict commit adds" out_has "it changes: nucleus/v3/tools/ds nucleus/v3/verdicts/DSC.md" -- mc DSC
@@ -1454,7 +1493,7 @@ cp "$v3/tools/st.py" "$t/st.orig"
 touch -m -d "@$(($(date +%s) - 10))" "$v3/tools/st.py"; plain status --porcelain >/dev/null; sleep 1
 touch -r "$v3/tools/st.py" "$t/st.ref"; printf 'print("ST")\n' >"$v3/tools/st.py"; touch -m -r "$t/st.ref" "$v3/tools/st.py"
 st_hidden() { local s; s=$(plain status --porcelain); echo "$s"; [ -z "$s" ]; }
-st_sh() { (cd "$v3" && . scripts/git-env.sh && git status --porcelain | grep -qxF ' M nucleus/v3/tools/st.py'); }
+st_sh() { (cd "$v3" && . scripts/git-env.sh && lists ' M nucleus/v3/tools/st.py' git status --porcelain); }
 st_refuse() { (cd "$v3" && bash -c '. scripts/git-env.sh; git_state_refuse'); }
 expect_ok "premise: ST: control: plain status lists the edit" bash -c "git -C '$r' status --porcelain | grep -qxF ' M nucleus/v3/tools/st.py'"
 for st in "core.trustctime false" "core.checkStat minimal"; do
@@ -1507,7 +1546,7 @@ st_blob=$(git -C "$r" rev-parse st-base:nucleus/v3/tools/st.py)
 for sd in set unset unspecified; do
   echo "nucleus/v3/tools/st.py filter=$sd" >"$r/.git/info/attributes"
   xsd="'filter.$sd.clean'='cat $t/st.orig'"
-  sd_hash() { (cd "$v3" && . scripts/git-env.sh && GIT_CONFIG_PARAMETERS=$xsd git -C "$r" hash-object --path=nucleus/v3/tools/st.py nucleus/v3/tools/st.py) | grep -qxF "$st_blob" && ! git -C "$r" hash-object --no-filters nucleus/v3/tools/st.py | grep -qxF "$st_blob"; }
+  sd_hash() { (cd "$v3" && . scripts/git-env.sh && lists "$st_blob" env GIT_CONFIG_PARAMETERS="$xsd" git -C "$r" hash-object --path=nucleus/v3/tools/st.py nucleus/v3/tools/st.py) && lacks "$st_blob" git -C "$r" hash-object --no-filters nucleus/v3/tools/st.py; }
   expect_ok "premise: SF: git runs filter.$sd.clean for filter=$sd: the edit hashes to the committed blob" sd_hash
   sd_line=", and filter.$sd.clean is 'cat $t/st.orig' (command line:)"
   [ "$sd" = unspecified ] || sd_line="filter=$sd is on 1 tracked path(s) (first: nucleus/v3/tools/st.py)$sd_line"
@@ -2666,9 +2705,9 @@ rv8x=$(git -C "$rv8d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv8
 git -C "$rv8d" update-ref refs/heads/nucleus/zz "$rv8x"
 rv8_before() { [ "$(git -C "$rv8b" rev-parse refs/heads/nucleus/zz)" = "$rv8o" ]; }
 expect_ok "premise: RV8 the before repository's nucleus/zz is O" rv8_before
-rv8_oldlist() { git -C "$rv8d" rev-list "$rv8o" -- | grep -qxF "$rv8f"; }
+rv8_oldlist() { lists "$rv8f" git -C "$rv8d" rev-list "$rv8o" --; }
 expect_ok "premise: RV8 rev-list O -- lists F (F hangs from old)" rv8_oldlist
-rv8_notips() { ! git -C "$rv8d" rev-list "$rvS" "$rvW" "$rv8x" -- | grep -qxF "$rv8f"; }
+rv8_notips() { lacks "$rv8f" git -C "$rv8d" rev-list "$rvS" "$rvW" "$rv8x" --; }
 expect_ok "premise: RV8 rev-list S W X -- does not list F (F is reachable only from old)" rv8_notips
 expect_ok "premise: RV8 F is a loose object" bash -c "[ -f '$(objlo "$rv8d" "$rv8f")' ]"
 git -C "$rv8d" cat-file commit "$rv8f" >"$t/rv8f.body"
@@ -2676,11 +2715,12 @@ sed 's/^rv8 F$/rv8 F forged/' "$t/rv8f.body" >"$t/rv8ff.body"
 save_obj "$rv8d" "$rv8f"
 forge_commit "$rv8d" "$rv8f" "$t/rv8ff.body"
 rv8_row() {
-  local o u
+  local o u l
   o=$(rvob "$v3/tools/run_card.py" "$rv8d" "$rv8b"); echo "$o"
   u=$(grep '^refs: objects fail verification: ' <<<"$o")
   grep -qF "object $rv8f fails its hash" <<<"$u" &&
-    grep "^refs/heads/nucleus/zz: $rv8o -> $rv8x objects fail verification: " <<<"$o" | grep -qF "object $rv8f fails its hash" &&
+    l=$(grep "^refs/heads/nucleus/zz: $rv8o -> $rv8x objects fail verification: " <<<"$o") &&
+    grep -qF "object $rv8f fails its hash" <<<"$l" &&
     ! grep -qF "may move only as a fast-forward" <<<"$o" &&
     ! grep -qF "(no violations)" <<<"$o"
 }
@@ -2740,9 +2780,9 @@ rv11d=$(rvc)
 rv11b=$(git -C "$rv11d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -m "rv11 B")
 rv11g=$(git -C "$rv11d" commit-tree "nucleus/v3-scaffold^{tree}" -p "$rvS" -p "$rv11b" -m "rv11 G")
 git -C "$rv11d" update-ref refs/heads/side-rv11 "$rv11g"
-rv11_fp() { ! git -C "$rv11d" rev-list --first-parent "$rv11g" -- | grep -qxF "$rv11b"; }
+rv11_fp() { lacks "$rv11b" git -C "$rv11d" rev-list --first-parent "$rv11g" --; }
 expect_ok "premise: RV11 rev-list --first-parent G does not list B" rv11_fp
-rv11_full() { git -C "$rv11d" rev-list "$rv11g" -- | grep -qxF "$rv11b"; }
+rv11_full() { lists "$rv11b" git -C "$rv11d" rev-list "$rv11g" --; }
 expect_ok "premise: RV11 rev-list G lists B (the full ancestry)" rv11_full
 expect_ok "premise: RV11 B is a loose object" bash -c "[ -f '$(objlo "$rv11d" "$rv11b")' ]"
 git -C "$rv11d" cat-file commit "$rv11b" >"$t/rv11b.body"
@@ -3710,9 +3750,9 @@ fg_gate() { fg_show; [ "$(cat "$t/fg.rc")" = "$1" ] && [ "$(tail -n 1 "$t/fg.out
 # fg_refused WANT...: a refusal: exit 2, last stdout line FRESH-GATE REFUSED,
 # no GATE EXIT= line anywhere, and stderr names every WANT.
 fg_refused() {
-  local x; fg_show
+  local x l; fg_show
   [ "$(cat "$t/fg.rc")" = 2 ] && [ "$(tail -n 1 "$t/fg.out")" = "FRESH-GATE REFUSED" ] && ! grep -qF 'GATE EXIT=' "$t/fg.out" "$t/fg.err" || return 1
-  for x in "$@"; do grep -F -- "$x" "$t/fg.err" | grep -q '^fresh-gate: ' || { echo "missing: fresh-gate: ...$x"; return 1; }; done
+  for x in "$@"; do { l=$(grep -F -- "$x" "$t/fg.err") && grep -q '^fresh-gate: ' <<<"$l"; } || { echo "missing: fresh-gate: ...$x"; return 1; }; done
 }
 # fg_clean: the worktree list is as it was before the run, and nothing is left
 # in the run's TMPDIR.
