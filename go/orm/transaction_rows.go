@@ -6,7 +6,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // scopeRows retains the scope operation lease for the whole result lifetime.
@@ -42,8 +41,7 @@ func (r *scopeRows) closeLocked() {
 		r.op.finish()
 	}
 }
-func (r *scopeRows) Close()               { r.mu.Lock(); defer r.mu.Unlock(); r.closeLocked() }
-func (r *scopeRows) TypeMap() *pgtype.Map { return r.rows.TypeMap() }
+func (r *scopeRows) Close() { r.mu.Lock(); defer r.mu.Unlock(); r.closeLocked() }
 func (r *scopeRows) Err() error {
 	if !r.enter() {
 		return ErrConcurrentUse
