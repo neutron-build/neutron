@@ -20,6 +20,9 @@ class AuditOutput(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             (Path(d)/'Nucleus.Empty.log').write_text(output([]))
             with self.assertRaises(ValueError): summarize(d)
+    def test_lean_identifier_characters(self):
+        names=['Nucleus.A.find?_map',"Nucleus.A.foo'",'Nucleus.A.get!_x','Nucleus.A.h₁']
+        self.assertEqual(parse(output(names)),names)
     def test_bad_transports(self):
         good=output(['Nucleus.One.t'])
         for bad in ['', 'AXIOM AUDIT OK: nope',good+good,good.replace('1 theorems','2 theorems'),good+'error: Nucleus.One.t depends on unlisted axiom bad',good.replace('AXIOM AUDIT OK:', 'AXIOM AUDIT OK: garbage')]:

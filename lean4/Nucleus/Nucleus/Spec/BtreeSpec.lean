@@ -44,20 +44,25 @@ private theorem leaf_unrelated (entries : List (Entry α)) (k query : Nat)
   | nil => rfl
   | cons entry rest ih =>
     by_cases hk : entry.key = k
-    · have hq : entry.key ≠ query := by intro eq; exact h (eq.symm.trans hk)
-      simp [List.filter, List.find?, hk, hq, ih]
-    · by_cases hq : entry.key = query <;> simp [List.filter, List.find?, hk, hq, ih]
+    · have hq : (entry.key == query) = false := by
+        simp only [beq_eq_false_iff_ne]; intro eq; exact h (eq.symm.trans hk)
+      have hne : (entry.key != k) = false := by simp [hk]
+      simp [List.filter, List.find?, hne, hq, ih]
+    · have hne : (entry.key != k) = true := by simpa using hk
+      simp [List.filter, List.find?, hne, ih]
 
 /-- Preservation for the actual same BTree.insert/get operations, not AbstractMap. -/
 theorem insert_get_unrelated (tree : BTree α) (k query : Nat) (v : α)
     (h : query ≠ k) : (tree.insert k v).get query = tree.get query := by
   cases tree with
   | leaf entries =>
-    have hk : k ≠ query := Ne.symm h
+    have hk : (k == query) = false := by simpa using Ne.symm h
     simp [BTree.insert, BTree.get, List.find?, hk, leaf_unrelated entries k query h]
   | internal keys children =>
     cases children with
-    | nil => simp [BTree.insert, BTree.get, List.find?, Ne.symm h]
+    | nil =>
+      have hk : (k == query) = false := by simpa using Ne.symm h
+      simp [BTree.insert, BTree.get, List.find?, hk]
     | cons child rest =>
       simpa [BTree.insert, BTree.get] using insert_get_unrelated child k query v h
 termination_by sizeOf tree
@@ -174,7 +179,8 @@ inductive WellFormed : Tree → Nat → Prop where
   | leaf (es : List (Entry Nat)) (capacity : es.length ≤ 2) (ordered : sorted es) :
       WellFormed (.leaf es) 0
   | branch (cs : List Tree) (d : Nat) (degree : 2 ≤ cs.length ∧ cs.length ≤ 3)
-      (children : ∀ c ∈ cs, WellFormed c d ∧ (entries c).length > 0)
+      (children : ∀ c ∈ cs, WellFormed c d)
+      (nonempty : ∀ c ∈ cs, (entries c).length > 0)
       (ordered : sorted (cs.flatMap entries)) : WellFormed (.branch cs) (d+1)
 
 def empty : Tree := .leaf []
