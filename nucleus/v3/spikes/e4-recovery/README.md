@@ -486,6 +486,137 @@ gets no Q4 knob from this card. The X5-R40 machinery stays in the
 tree, inert at BASE and FINAL (`smo_share` 0, no draw, no op
 inserted), for whatever the owner decides.
 
+## Card X-5c-F4-F1-F1-CXX's record (C-XX's two remaining causes: the DropTree straddle and the exhausted reserve's double evict)
+
+QUEUE row X-5c-F3-F1-F2: 51 faultless class C rounds failing O-3(b)
+XX001 in `X-5c-F4.acc.campaign.json` (16 `[Open]`, 35 `[AmcheckIi]`).
+P classified all 51 on a clean export of a4c1f869 (the census,
+`~/.cache/nv3-review/pxx/evidence/census-51.txt`; the per-seed class
+table is reproduced below). Three causes:
+
+| Cause | Rounds | Mechanism | Fixed by |
+|---|---|---|---|
+| **A** (spec) | 27, plus 3 with B1 | S-6.8's cut between the root free and the entry removal | this card, per S-1-F7 |
+| **B1** (prototype) | 18, plus 3 with A | two exhausted first touches evict the same copy; the second clears the frame the first refilled | this card |
+| **B2** (prototype) | 3 | a late copy outlives its checkpoint | -F2's install guard (the previous section) |
+
+The 3 with both are 4784 (needs both fixes), 1612 and 9433 (either fix
+alone moves the schedule off them). Probes over the 51 seeds
+(single-seed runs, P's `pxx` toggles on scratch exports): A-fix alone
+21 rounds still fail; B1-fix alone 31; -F2's guard alone 48 (it clears
+exactly 5706, 8725, 8956); all three **0** — and this card's re-run of
+the 54 seeds (51 + 190, 6195, 6990, the three the -F2 guard moved onto
+B1) shows **0 failing rounds, no defect, deadlock or panic**.
+
+**Census (class per seed, P's, verbatim from the evidence):** 27 `A
+need:A`, 16 `B1 need:B1`, 2 `A/B1 need:either`, 2 `A/B1 need:B1`, 2
+`B2 need:B2`, 1 `A/B1 need:A/B1` (4784), 1 `B2 need:either`.
+
+**Cause B1's mechanism — a correction to the older "late copy" account
+for B1's rounds.** The -F2 record above left the exhausted path's
+*record* as its ESCALATE sibling; the draft's Cause B reading ("the
+`ckpt:freecopies` clear destroys these copies") was wrong for most of
+its rounds. `ckpt:freecopies` is not what destroys them: in
+`record_image_copy`'s exhausted path, tasks T1 and T2 both read
+`oldest = frame i` holding copy X and both proceed into `write_fresh`;
+T1's `epoch_copy:record` records X and clears frame i, and T1's retry
+installs copy Y there; T2's `epoch_copy:record` then clears frame i
+**again**, with no re-validation after its yield — Y is destroyed
+unwritten, `map.img[Y]` stays `CopyPending`, and the freeze maps Y to
+nothing. 3534 r1: `exhaustion frame 0 no longer holds 16`, then
+`FREEZE unresolved CopyPending lpids=[29] k=3` — an `[Open]`/`[AmcheckIi]`
+XX001 with no injected fault. The same step has a **second, silent
+outcome** (verdict X-5c-F4-F1-F1-F2's sibling): when the record lands
+after its checkpoint's post-5 it inserts `Img::At(flip-k bytes)` into
+the cleared map, nothing clears it, the next freeze takes it over
+`cur`, and the next image loses the mutations between the flips with
+no XX001. One re-validation closes both (Work 1).
+
+**The two schedules, with traces.**
+
+- **Pin 1, `drop_cut_never_names_a_freed_root` (310 r0's shape, seed
+  1).** Phase A: trees 2 (a leaf root, one entry) and 4, one durable
+  checkpoint. Phase B: t1 drops tree 2 — the walk's first step *is*
+  the last (a leaf root), so at this tip the root frees inside the
+  walk's gate hold and `dir_remove_entry` runs in its **own** hold; t2
+  (the checkpointer) spins for the straddle and flips inside the gap.
+  The image: `dropping tree2 -> root 1` with `free = {1}`. Crash,
+  `ckpt::recover`: the resumed walk descends the unmapped root —
+  `Corrupt("lpid 1 unmapped")` at `[Open]` (rule: I-LPID-EXACT /
+  I-LINK-ATOMIC, S-6.8 as amended). The pin failed at the pre-fix tip
+  and passes at this one.
+- **Pin 2, `drop_cut_never_names_a_reused_root` (8010 r1's shape, seed
+  77).** The same cut with t3 splitting tree 4 onto the freed LPID
+  before the flip (S-4.2's immediate reuse: the freed root is the
+  lowest free LPID; tree 4 holds eight 400-byte cells, t3's ninth goes
+  in pre-positioned at the mark, and the tenth splits). The opened
+  image reaches lpid 1 from trees 2 and 4 — rule: one page, two
+  references — and the resumed walk frees tree 4's live child; its
+  scan after recovery fails (`Corrupt`, the page gone). Under the fix
+  the reuse happens only after the entry removal, so no image names a
+  reused root.
+
+**The fixes.** Work 1 (B1): `epoch_copy:record` re-validates its
+reserve frame after the write-out's yield, in the record's own atomic
+step — if the frame no longer holds `(key, is_epoch_copy)` another
+task resolved it, so the write is an orphan: its slot leaves
+`used_cur` and neither the image map nor the frame changes
+(`PR-EXHAUST-REVALIDATE`). Work 2 (A, per S-1-F7's amended S-6.8): a
+walk step reads first and frees nothing until it knows the topmost
+page it empties; the last step, in its one gate hold, removes the
+directory entry and the in-memory record **first**, then frees the
+path top-down root first — the two mutexes never nest, the gate is
+never taken twice. Work 3 (S-14 step 4 as amended): pass 2's
+`DropTree` sets `dropping` only (`dir_drop_tree_replay`); the walk is
+step 6's; the live apply is unchanged.
+
+**The pins and their mutants** (each mutant applied to the real code,
+shown failing, reverted clean):
+
+| Mutant | Failing pins |
+|---|---|
+| M-DROP-ENTRY-SPLIT (the entry removal in its own gate hold — today's code; also a `mutants`-table row) | `drop_cut_never_names_a_freed_root` ("recover: Corrupt(lpid 1 unmapped)"), `drop_cut_never_names_a_reused_root` (tree 4's scan Corrupt on the freed page) |
+| M-EXHAUST-NO-REVALIDATE (`epoch_copy:record` clears unconditionally — today's code; also a row) | `exhausted_reserve_keeps_both_copies` (a `CopyPending` at `ckpt:freeze`), `exhausted_record_stays_out_of_the_next_window` (image 2 maps P to its flip-1 leaf) |
+| M-EXHAUST-RECORD-FIRST (the clear guarded, `record_image_at` unconditional) | `exhausted_record_stays_out_of_the_next_window` |
+| M-REPLAY-DROP-WALK (pass 2 walks) | `drop_replay_only_marks` (the freed root mapped again after recovery) |
+| M-DROP-FREE-FIRST (inside the one hold, the root freed before the entry is removed) | `drop_entry_gone_before_root_free` (the watcher sees an entry name an unmapped root) |
+
+Plus two more directed pins: `exhausted_reserve_keeps_both_copies`
+itself (3534 r1's shape — one frame, two first touches in
+`write_fresh`; no `CopyPending` at `ckpt:freeze`, both LPIDs in the
+image), and `drop_entry_gone_before_root_free`'s watcher (at each
+atomic step, no entry — persisted or in `dir` — names an unmapped
+root; the in-memory record outlives the persisted one, so one check
+covers both).
+
+**Digest movement (Work 5).** The 54 seeds re-run one seed per process
+under `ulimit -v 25165824`: 0 failing rounds. X5-R37's literals moved
+at 9 seeds — 66 `123257877 -> 3628190779`, 112 `2157138087 ->
+2438489582`, 198 `649857276 -> 95622311`, 303 `859193035 ->
+4147169426`, 907 `2332284720 -> 1749572610`, 1769 `2372375821 ->
+1311732889`, 6149 `2623005576 -> 123186068`, 7469 `3635220225 ->
+3658720859`, 7528 `1612546402 -> 122281874` (the drop rework
+restructured the walk's steps, so every drop-bearing schedule
+re-derived; each value is this card's own measurement).
+`late_copy_count_is_zero_at_base` moved at one seed: 190
+`4013865743 -> 679383372` — the -F2 verdict's probe value under Work 1
+alone, now with all three fixes in. The W11 fallback literal
+(`x5_r38_w11_needs_no_completed_sync_since`) moved from seed 30 to
+seed 11 — a Limit-3 deviation recorded in the card's RESULT (the pin
+is a schedule literal of the X5-R37 class that Limit 3 did not name;
+the invariant and the assertion are unchanged).
+
+**A correction to -F2's record above:** its "no seed fails before or
+after" is false — at -F2's tip, 190 r1 fails and passed before (the
+verdict's finding 1). B1 was already there; the -F2 guard moved the
+schedule onto it. This card clears it (190 passes above).
+
+**What did not change:** the oracle, the model, the sim, K, R, the
+generators, every quota's definition and threshold, `verify`'s exit
+rule, `ckpt2:scan`'s condition, `resume_drops`' error handling,
+DROP-ROOT-FIRST, and `docs/` (S-1-F7 carries the spec text; it is not
+merged into this branch's `docs/`, which this card may not edit).
+
 ## Card X-5c-F4-F1-F1-F2's record (finding 1: the late epoch copy)
 
 Verdict X-5c-F4-F1-F1, finding 1, confirmed by a literal schedule and
