@@ -368,6 +368,112 @@ fn x5_r38_w11_crash_reads_stale_at_start() {
     );
 }
 
+/// **Rework 2 (P gate verdict X-5c-F4-F1, ruling (i); the verdict's
+/// added pin): a W11 crash's walk reaches `b`.** Ruling (i): the window
+/// opens "when a `sync_data` of the segment below `b` completes with
+/// `wal.written ≥ b`: that segment's whole extent … is then durable, so
+/// the walk reaches `b`". The literal config mirrors the driver's
+/// uniform-round machinery by hand: the counting pass (crash disabled,
+/// `w11_share` 1000) records the round's W11 window openings, the real
+/// round crashes at the first recorded window yield, and the recovered
+/// store's `wal.append` — the walk's valid end — must be at or above
+/// the boundary the crash-time snapshot names (`WorkloadObs::w11_open`,
+/// the open window's `b`). Seed 10 round 0 is the pinned shape (the
+/// gate's post-fix 0..200 probe measured it a Q11 hit, which is this
+/// property plus `b`'s first sector not surviving). **M-W11-ANYSYNC**
+/// (the window opened on **any** completed sync of the segment below
+/// `b`, the `wal.written ≥ b` term removed — the gate's finding 2)
+/// fails this pin: the crash lands where the walk stops on the
+/// not-yet-durable tail below `b` (0 of 150 picks hit Q11 as built).
+#[test]
+fn x5_r38_w11_crash_walk_reaches_the_boundary() {
+    use e4_recovery::harness::{self, CrashSpec, MediaDraw, RoundFaults, Script};
+    use e4_recovery::model::Model;
+    use e4_recovery::sim::FaultClass;
+
+    let seed = 10u64;
+    let mut tun = workload::Tuning::BASE;
+    tun.w11_share = 1000;
+    let knobs = Knobs::derive(seed, 0, &tun);
+    let cfg = knobs.store_cfg(None);
+    let (base, _desc, _hook) = workload::build_round(seed, 0, &tun, &knobs, &Model::new(), 0);
+    let probe_faults = RoundFaults {
+        class: FaultClass::C,
+        knobs: knobs.fault,
+        directed: Vec::new(),
+        no_r_taint: false,
+        media: MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
+        probe_pass: true,
+    };
+    let (disk, st0) = harness::create_store(cfg.clone(), seed, seed as u128).expect("create");
+    let probe = harness::run_round(
+        seed,
+        0,
+        &Script {
+            crash: None,
+            ..base.clone()
+        },
+        &probe_faults,
+        cfg.clone(),
+        disk.clone(),
+        st0.clone(),
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    let k = *probe
+        .obs
+        .w11_yields
+        .first()
+        .expect("the counting pass opens a W11 window (seed 10 r0)");
+    let real = harness::run_round(
+        seed,
+        0,
+        &Script {
+            crash: Some(CrashSpec::Yield(k)),
+            ..base
+        },
+        &RoundFaults {
+            class: FaultClass::C,
+            knobs: knobs.fault,
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg.clone(),
+        disk,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(
+        real.obs.crash_fired,
+        "seed 10 r0: the window crash at yield {k} fired (never a NEVER-FIRED)"
+    );
+    let b = real
+        .obs
+        .w11_open
+        .expect("the W11 window was open at the crash");
+    let end = real
+        .end_store
+        .as_ref()
+        .expect("the round's recovery produced a store");
+    assert!(
+        end.wal.append >= b,
+        "the walk's valid end ({}) must reach the window's boundary b={b}: \
+         everything below b was durable at the crash (ruling (i))",
+        end.wal.append
+    );
+}
+
 /// The scheduler-level uniform crash (5.5's "uniform over the round's
 /// yield points"): the counting pass measures the round's true yield
 /// total, the drawn point is always reachable — every round of the

@@ -755,42 +755,44 @@ fn check_wal_inv(st: &StoreInner) -> Result<(), Fail> {
     Ok(())
 }
 
-/// **X5-R38 (card X-5c-F4-F1 step 3; observables only): the W11 window
-/// note, called right after a WAL `sync_data` of segment `seg`
-/// completes** (the writer's group-sync loop and `wal_sync_through`'s
-/// helper loop — the two sync sites). The completed sync leaves the
-/// synced end of the segment below boundary `b = seg + WAL_SEG` durable
-/// exactly through `b`, so a recovery walk reaches `b` and hops into
-/// it; when `b` is a recycled segment whose own content is not yet
-/// durable (`recycled_unsynced` — its start still holds the previous
-/// life's records), a crash in this window makes the walk read those
-/// stale bytes (Q11's shape — seed 4 r0's natural hit crashes exactly
-/// here: the segment below `b` synced through `b`, `b`'s record written
-/// but its sync pending, the crash dropping it). The window closes when
-/// the sync of a segment at or above `b` completes (the set removal
-/// below), one or two yields later. `y` is the next yield index (the
-/// caller's current count + 1 — the window's first crashable yield; the
-/// note runs between two yield events, so the current count itself
-/// names a yield that has already fired).
+/// **X5-R38 (card X-5c-F4-F1 step 3; observables only; rework 2 of the
+/// P gate verdict X-5c-F4-F1, ruling (i) binding): the W11 window note,
+/// called right after a WAL `sync_data` of segment `seg` completes**
+/// (the writer's group-sync loop and `wal_sync_through`'s helper loop —
+/// the two sync sites). Ruling (i): "**W11.** Let `b` be a segment
+/// boundary whose segment a `wal_recycle` rename bound and which has
+/// had no completed `sync_data` since. W11 opens when a `sync_data` of
+/// the segment below `b` completes with `wal.written ≥ b`: that
+/// segment's whole extent, filler or boundary-ending record included,
+/// is then durable, so the walk reaches `b`. It closes when a
+/// `sync_data` of a segment at or above `b` completes. 'Untouched'
+/// means the durable image: a write at ≥ `b` may be issued and still
+/// volatile, and F-CRASH decides whether it survives. Q11 then requires
+/// that `b`'s first sector does not survive with new content." The
+/// `wal.written ≥ b` term is the rework's fix (the gate's finding 2):
+/// without it the window opened on **any** completed sync of the
+/// segment below `b` — durable 261,147, written 263,952, `b` 262,144
+/// at seed 4 — so the crash landed where the walk stops on zeros below
+/// `b` and Q11 could never hit (0 of 150 picks as built; 45 of 79 with
+/// the fix over 0..200, gate-measured). `y` is the next yield index
+/// (the caller's current count + 1 — the window's first crashable
+/// yield; the note runs between two yield events, so the current count
+/// itself names a yield that has already fired).
 fn w11_window_note(st: &mut StoreInner, seg: u64, y: u64) {
     let b = seg + WAL_SEG;
-    if std::env::var("E4_W11_DIAG").is_ok() {
-        eprintln!(
-            "W11 note: seg={seg} b={b} pending_before={:?} segs_has={} open={:?}",
-            st.wal.recycled_unsynced.iter().collect::<Vec<_>>(),
-            st.wal.segs.contains_key(&b),
-            st.w11_window
-        );
-    }
-    // This sync made segment `seg`'s extent — through `b` — durable:
-    // every pending boundary at or below `seg` is retired, and a W11
-    // window whose own boundary just became durable closes.
+    // This sync made segment `seg`'s extent durable — every pending
+    // boundary at or below `seg` is retired, and a W11 window whose own
+    // boundary just became durable closes.
     if st.w11_window.is_some_and(|w| w <= seg) {
         st.w11_window = None;
     }
     st.wal.recycled_unsynced.retain(|x| *x > seg);
     if st.wal.segs.contains_key(&b)
         && st.wal.recycled_unsynced.contains(&b)
+        // Ruling (i)'s opening term: the segment below `b` synced only
+        // with its whole extent written — `written ≥ b` — does the walk
+        // reach `b` (the rework's fix).
+        && st.wal.written >= b
         && st.w11_window.is_none()
     {
         st.w11_window = Some(b);

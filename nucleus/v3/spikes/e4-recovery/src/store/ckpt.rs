@@ -1602,16 +1602,6 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     // the counter (an observable only).
                     if off == 0 && wal::is_stale_record(&bytes, lsn, seg + WAL_SEG) {
                         st.stale_seg_reads += 1;
-                        if std::env::var("E4_W11_DIAG").is_ok() {
-                            eprintln!(
-                                "Q11 HIT: lsn={lsn} seg={seg} append={} durable={} written={} segs={:?} unwritten={:?}",
-                                st.wal.append,
-                                st.wal.durable,
-                                st.wal.written,
-                                st.wal.segs.keys().collect::<Vec<_>>(),
-                                st.wal.recycled_unsynced.iter().collect::<Vec<_>>()
-                            );
-                        }
                     }
                     break 'outer;
                 }

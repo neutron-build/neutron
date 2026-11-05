@@ -457,12 +457,17 @@ pub struct StoreInner {
     /// completed. A crash in this window leaves the rename volatile, so
     /// F-CRASH's directory draw can drop it (Q12's shape).
     pub w12_window: bool,
-    /// **X5-R38:** the W11 window's boundary — a completed WAL sync
-    /// left the synced end exactly at a segment boundary `b` whose
-    /// recycled segment file exists with no write since its recycling
-    /// rename. A crash in this window makes the recovery walk hop into
-    /// `b` and read its previous life's records (Q11's shape). `None`
-    /// = closed (cleared the moment any write at ≥ `b` is issued).
+    /// **X5-R38 (card X-5c-F4-F1 step 3; rework 2 of the P gate verdict
+    /// X-5c-F4-F1, ruling (i) binding): the W11 window's boundary `b`**
+    /// — a segment boundary whose segment a `wal_recycle` rename bound
+    /// and which has had no completed `sync_data` since, opened when a
+    /// `sync_data` of the segment below `b` completes with
+    /// `wal.written ≥ b` (that segment's whole extent is then durable,
+    /// so a recovery walk reaches `b`; a crash in the window makes the
+    /// walk hop into `b` and read its previous life's records — Q11's
+    /// shape). Closes when a `sync_data` of a segment at or above `b`
+    /// completes. `None` = closed. A store observable, flags only —
+    /// never a behaviour input.
     pub w11_window: Option<u64>,
     /// **X5-R38:** the scheduler-yield indices of the open windows'
     /// first crashable yields (one entry per window opening): the

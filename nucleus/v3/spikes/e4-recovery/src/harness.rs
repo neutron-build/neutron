@@ -1988,11 +1988,12 @@ pub struct WorkloadObs {
     /// Stale-record stops at renamed segment starts (Q11).
     pub stale_seg_reads: u64,
     /// **X5-R38 (card X-5c-F4-F1 step 3):** the scheduler-yield indices
-    /// of the W11 windows that opened during the pass — a completed WAL
-    /// sync left the synced end exactly at a boundary of a recycled
-    /// segment no write has touched since its rename. The counting
-    /// pass records them (the crash draw's window list); a diagnostic
-    /// only.
+    /// of the W11 windows that opened during the pass — ruling (i) of
+    /// the rework gate: a `sync_data` of the segment below a boundary
+    /// `b` completed with `wal.written ≥ b`, while `b` is a recycled
+    /// segment with no completed `sync_data` since its rename. The
+    /// counting pass records them (the crash draw's window list); a
+    /// diagnostic only.
     pub w11_yields: Vec<u64>,
     /// **X5-R38:** the same for the W12 windows — a `wal_recycle`
     /// rename returned, its `sync_dir` not yet complete.
@@ -2002,6 +2003,15 @@ pub struct WorkloadObs {
     /// open at the crash). A diagnostic pending OQ-1, never an exit
     /// input.
     pub ckpt_closed_dirty: u64,
+    /// **X5-R38, rework 2 (P gate verdict X-5c-F4-F1): the W11 window's
+    /// boundary at the crash** — a snapshot of the store's open
+    /// [`crate::store::StoreInner::w11_window`] (`Some(b)`: the crash
+    /// landed inside a W11 window whose guarantee is "the walk reaches
+    /// `b`"). A diagnostic only, never a behaviour input or a digest
+    /// input; it exists so the rework's pin can assert the walk
+    /// property itself (ruling (i): "so the walk reaches `b`") beside
+    /// the Q11 outcome.
+    pub w11_open: Option<u64>,
     /// Flips whose image held part of a commit above `T` (Q9).
     pub q9_partial_flips: u64,
     /// LPIDs dirtied in the still-open interval (Work 5.3's crash-time
@@ -2352,6 +2362,7 @@ pub fn run_round(
             stale_seg_reads: st.stale_seg_reads,
             w11_yields: st.w11_yields.clone(),
             w12_yields: st.w12_yields.clone(),
+            w11_open: st.w11_window,
             ckpt_closed_dirty: st.ckpt_closed_dirty,
             q9_partial_flips: st.q9_partial_flips,
             dirty_now_len: st.dirty_now.len() as u64,
