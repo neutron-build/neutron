@@ -82,13 +82,15 @@ POLL_S = 5
 # Why this and not the card's other candidates: a cgroup scope needs systemd-run,
 # which leaves this session's NoNewPrivs (the verdict rules it out), and
 # PR_SET_CHILD_SUBREAPER needs a process walk, which this runner does not do.
-# Measured under this mapping (the gate's RESULT has the commands): git commits,
+# Measured under this mapping (the card's RESULT has the commands): git commits,
 # ~/.cargo and the target dir stay owned by the real uid, the network is the
-# host's (no --net), and the worker holds no capabilities (CapEff 0).
+# host's (no --net), and the worker holds no capabilities (CapEff 0). opencode as
+# init ignores `kill -9 1` from inside and reaps no orphans; their zombies go with
+# the namespace.
 # --map-current-user: uid and gid stay the real ones, so git sees its own files.
 # --mount-proc: without a private /proc the worker reads the host's process table
-# and, being the same uid, can open other processes' /proc/<pid>/mem. It holds no
-# capability to unmount this one.
+# and, being the same uid, can open other processes' /proc/<pid>/mem. A nested
+# user namespace cannot unmount this one either (EINVAL, measured).
 # --kill-child: unshare's death kills the init even if the init left unshare's
 # process group, so kill_child's killpg reaches the namespace either way.
 CONTAIN = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--kill-child", "--mount-proc", "--"]
