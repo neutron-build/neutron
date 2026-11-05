@@ -30,7 +30,8 @@
       "fastify@<5.12.2": "^5.12.2",
       "follow-redirects@<1.16.2": "^1.16.2",
       "handlebars@<4.7.10": "^4.7.10",
-      "launch-editor@<2.14.2": "^2.14.2"
+      "launch-editor@<2.14.2": "^2.14.2",
+      "image-size@<2.0.3": "^2.0.3"
     }
   }
 }
