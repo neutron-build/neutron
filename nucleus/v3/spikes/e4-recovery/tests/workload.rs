@@ -474,6 +474,49 @@ fn x5_r38_w11_crash_walk_reaches_the_boundary() {
     );
 }
 
+/// **Rework 3 (P gate verdict X-5c-F4-F1, finding 5): `cwin` is a
+/// digest input — pinned at the record level.** Two per-seed records
+/// differing only in a round's `cwin` have different digests (a window
+/// pick `Some("w11")`/`Some("w12")` against the plain uniform `None`),
+/// and two records whose shared round carries `None` on both sides are
+/// unchanged by it (BASE's shape — every pick `None`, which is why BASE
+/// digests never move on the field). **G-CWIN-NODIGEST** (the `cwin`
+/// contribution removed from `SeedRec::finish`) fails this pin.
+#[test]
+fn cwin_is_a_digest_input_only_when_set() {
+    use e4_recovery::workload::{RoundRec, SeedRec};
+    let rec_of = |cwin: Option<&'static str>| {
+        let mut rec = SeedRec {
+            seed: 12,
+            class: "C".to_owned(),
+            knobs: 99,
+            rounds: vec![RoundRec {
+                cwin,
+                ..RoundRec::default()
+            }],
+            ..SeedRec::default()
+        };
+        rec.finish();
+        rec
+    };
+    let none = rec_of(None).digest;
+    let w11 = rec_of(Some("w11")).digest;
+    let w12 = rec_of(Some("w12")).digest;
+    assert_ne!(
+        none, w11,
+        "a round picked into the W11 window must move the digest (G-CWIN-NODIGEST reverts this)"
+    );
+    assert_ne!(
+        w11, w12,
+        "the two windows are different digest inputs (a round picked into W12 vs W11)"
+    );
+    assert_eq!(
+        none,
+        rec_of(None).digest,
+        "both `None` leaves the digest unchanged (BASE's shape: no shares, every pick None)"
+    );
+}
+
 /// The scheduler-level uniform crash (5.5's "uniform over the round's
 /// yield points"): the counting pass measures the round's true yield
 /// total, the drawn point is always reachable — every round of the
