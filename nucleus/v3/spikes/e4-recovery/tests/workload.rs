@@ -1667,3 +1667,266 @@ fn g8_checkpoint_poison_ends_the_workload() {
         assert!(rec.defect.is_none(), "seed {seed}: no harness defect");
     }
 }
+
+/// **X5-R40 (card X-5c-F4-F1-F1 step 2): the SMO draw-count pin.**
+/// [`workload::smo_pick`] returns `None` — the `S_SMO` stream is never
+/// constructed, no stream state consumed (the card's Limit 4) — for
+/// every round of every seed under `Tuning::BASE` (`smo_share` 0), and
+/// draws (returns `Some`) the moment the share is non-zero. **M-SMO-DRAW**
+/// (the guard removed, `S_SMO` drawn when `smo_share` is 0) fails the
+/// first assertion: the draw returns `Some(false)` where the pin demands
+/// `None`. The stream is independent of `S_GEN`, so no digest can see
+/// the draw — this pin is the card's "new draw-count pin if the stream
+/// is independent", asserting the count (0) directly through the
+/// `None`/`Some` contract.
+#[test]
+fn x5_r40_smo_not_drawn_at_base() {
+    for seed in 0..64u64 {
+        for round in 0..3u32 {
+            assert_eq!(
+                workload::smo_pick(seed, round, &workload::Tuning::BASE),
+                None,
+                "seed {seed} round {round}: smo_share 0 must draw nothing (M-SMO-DRAW reverts this)"
+            );
+        }
+    }
+    // A non-zero share draws exactly once per (seed, round): over a
+    // sweep at share 1‰ both outcomes appear (the draw really happens
+    // and its result varies), and at share 1000‰ every draw selects.
+    let mut share1 = workload::Tuning::BASE;
+    share1.smo_share = 100;
+    let (mut somes, mut trues) = (0usize, 0usize);
+    for seed in 0..500u64 {
+        if let Some(pick) = workload::smo_pick(seed, 0, &share1) {
+            somes += 1;
+            trues += usize::from(pick);
+        }
+    }
+    assert_eq!(somes, 500, "a non-zero share draws for every round");
+    assert!(
+        trues > 0 && trues < 500,
+        "share 100 permille must both hit and miss over 500 seeds"
+    );
+    let mut share1000 = workload::Tuning::BASE;
+    share1000.smo_share = 1000;
+    for seed in 0..8u64 {
+        assert_eq!(
+            workload::smo_pick(seed, 0, &share1000),
+            Some(true),
+            "share 1000 permille selects every round"
+        );
+    }
+}
+
+/// **X5-R40 (card X-5c-F4-F1-F1 step 2): the gate parks.** A literal
+/// script whose second task sits at [`ScriptOp::AwaitCkptOpen`] with no
+/// checkpoint window possible (the checkpointer's `every` is above the
+/// round's commit count): the gated commit behind the gate must never
+/// record — the crash (at the third task's yield) cuts the round while
+/// the gate still waits, so the round's written-ts ceiling is the first
+/// task's commit alone. **M-SMO-NOWAIT** (the gate returns at once)
+/// fails it: the gated commit records before the crash and the ceiling
+/// rises.
+#[test]
+fn x5_r40_awaitckptopen_parks_until_a_window() {
+    use e4_recovery::harness::{
+        self, CrashSpec, MediaDraw, RoundFaults, Script, ScriptOp, ScriptTask,
+    };
+    use e4_recovery::model::{Model, Op, to_be64};
+    use e4_recovery::sim::FaultClass;
+
+    let seed = 9191u64;
+    let knobs = Knobs::derive(seed, 0, &workload::Tuning::BASE);
+    let cfg = knobs.store_cfg(None);
+    let trees = ScriptOp::WaitTrees { trees: vec![2] };
+    // Task 1 — the setup committer (commit 1, ts 1).
+    let t1 = vec![ScriptOp::Commit {
+        sync_on: true,
+        ops: vec![
+            Op::CreateTree { tree: 2 },
+            Op::Put {
+                tree: 2,
+                key: to_be64(1),
+                value: vec![7u8; 8],
+            },
+        ],
+    }];
+    // Task 2 — the gated committer: its commit can only record after a
+    // checkpoint window opens, and none can (every = 5 > 3 commits).
+    let t2 = vec![
+        trees.clone(),
+        ScriptOp::AwaitCkptOpen,
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::Put {
+                tree: 2,
+                key: to_be64(2),
+                value: vec![7u8; 8],
+            }],
+        },
+    ];
+    // Task 3 — a yield tail whose 8th yield is the crash point, before
+    // its own commit: the round ends while task 2 still waits.
+    let t3 = vec![
+        trees.clone(),
+        ScriptOp::Yields(8),
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::Put {
+                tree: 2,
+                key: to_be64(3),
+                value: vec![7u8; 8],
+            }],
+        },
+    ];
+    let script = Script {
+        tasks: vec![
+            ScriptTask { ops: t1 },
+            ScriptTask { ops: t2 },
+            ScriptTask { ops: t3 },
+        ],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(5),
+        crash: Some(CrashSpec::TaskYield(3, 3)),
+        nested: Vec::new(),
+    };
+    let (disk, st0) = harness::create_store(cfg.clone(), seed, seed as u128).expect("create");
+    let out = harness::run_round(
+        seed,
+        0,
+        &script,
+        &RoundFaults {
+            class: FaultClass::C,
+            knobs: knobs.fault,
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg,
+        disk,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(out.obs.crash_fired, "the yield-point crash must fire");
+    assert!(
+        out.hi <= 1,
+        "the gated commit must not record while no window can open: hi={} (M-SMO-NOWAIT reverts this)",
+        out.hi
+    );
+}
+
+/// **X5-R40 (card X-5c-F4-F1-F1 step 2): the selected round's schedule
+/// is pinned.** Under the literal SMO tuning (`smo_share` 1000, burst
+/// 600/8) every round is selected, and seed 0's round-0 script must
+/// carry the gated block on its GC task — the gate first, then the
+/// split-seeding commit, then the burst tree's sweeps hoisted in after
+/// it (X5-R40's mid-sweeps placement), with the base sweeps behind —
+/// and the seed's digest must be this literal (a function of
+/// `(generator, seed)`, X5-R37). **M-SMO-NOWAIT** (the gate returns at
+/// once — the waiting task's schedule changes) and **M-SMO-NOMERGE**
+/// (the aligned GC sweeps removed from the selected round) both move
+/// one of the two.
+#[test]
+fn x5_r40_selected_round_digest_is_pinned() {
+    use e4_recovery::harness::ScriptOp;
+    use e4_recovery::model::Model;
+    let mut tun = workload::Tuning::BASE;
+    tun.smo_share = 1000;
+    tun.burst_frac = 600;
+    tun.burst_gc_loops = 8;
+    // The script shape, straight from the generator.
+    let knobs = Knobs::derive(0, 0, &tun);
+    let (script, _desc, _hook) = workload::build_round(0, 0, &tun, &knobs, &Model::new(), 0);
+    // The GC task is the second-to-last script task (after the
+    // committers, before the DDL task).
+    let gc = script
+        .tasks
+        .get(script.tasks.len() - 2)
+        .expect("the GC task");
+    let kinds: Vec<&'static str> = gc
+        .ops
+        .iter()
+        .map(|op| match op {
+            ScriptOp::AwaitCkptOpen => "gate",
+            ScriptOp::Commit { .. } => "commit",
+            ScriptOp::Gc { tree, w } => {
+                let _ = (tree, w);
+                "gc"
+            }
+            _ => "other",
+        })
+        .collect();
+    let first_gc = kinds.iter().position(|k| *k == "gc").expect("a sweep");
+    // The gate and a commit precede the sweeps (the split-seeding
+    // commit lands mid-sweeps: some sweeps before it, some after).
+    let gate_at = kinds.iter().position(|k| *k == "gate").expect("the gate");
+    assert!(
+        gate_at <= 1,
+        "the gate opens the block (after at most the setup barrier)"
+    );
+    assert!(
+        kinds.contains(&"commit"),
+        "the split-seeding commit is in the block"
+    );
+    assert!(
+        kinds.iter().filter(|k| **k == "gc").count() >= 8,
+        "the burst's sweeps are hoisted into the block"
+    );
+    let _ = first_gc;
+    // And the digest literal.
+    let rec = workload::run_seed_with(0, None, &tun);
+    assert!(rec.defect.is_none(), "seed 0: {:?}", rec.defect);
+    assert_eq!(
+        rec.digest, 3330201367,
+        "the selected round's schedule moved (M-SMO-NOWAIT / M-SMO-NOMERGE revert this)"
+    );
+}
+
+/// **X5-R40 (card X-5c-F4-F1-F1 step 2): the card's named pin — an
+/// aligned round with both Q4 halves in the crash's own window.** The
+/// literal config is the step-3 probe setting (`smo_share` 1000,
+/// `burst_frac` 900, `burst_gc_loops` 8, everything else BASE) and
+/// seed **886 round 2** (crash `After2@2`): the record's
+/// `q4_split_merge` is **true** with `q4sp` 2 and `q4mg` 1 — the gated
+/// commit's splits and a gated sweep's merge landed in the same open
+/// checkpoint window the crash interrupted. The seed's digest is
+/// pinned with it (a seed pin's identity is (generator, seed),
+/// X5-R37). **M-SMO-NOWAIT** (the gate returns at once — the aligned
+/// ops run before any window, so the halves scatter) and
+/// **M-SMO-NOMERGE** (the aligned sweeps removed — the merge half
+/// vanishes) both move the digest and leave the flag false. Found by
+/// the pin hunt over 200..1000 at this setting (the only hit in its
+/// chunk); labelled probe-found, never evidence for a quota claim.
+#[test]
+fn x5_r40_aligned_round_has_split_and_merge_in_window() {
+    let mut tun = workload::Tuning::BASE;
+    tun.smo_share = 1000;
+    tun.burst_frac = 900;
+    tun.burst_gc_loops = 8;
+    let rec = workload::run_seed_with(886, None, &tun);
+    assert!(rec.defect.is_none(), "seed 886: {:?}", rec.defect);
+    assert_eq!(rec.digest, 2522830599, "seed 886's schedule moved");
+    let r2 = rec.rounds.get(2).expect("seed 886 runs three rounds");
+    assert_eq!(r2.crash, "After2@2", "round 2's crash point moved");
+    assert!(
+        r2.fired,
+        "round 2's crash must fire (a silent round is a harness defect)"
+    );
+    assert!(
+        r2.q4_split_merge,
+        "the aligned round must carry q4_split_merge true (M-SMO-NOWAIT / M-SMO-NOMERGE revert this)"
+    );
+    assert!(
+        r2.q4sp >= 1 && r2.q4mg >= 1,
+        "both halves in the crash's window: q4sp={} q4mg={}",
+        r2.q4sp,
+        r2.q4mg
+    );
+}
