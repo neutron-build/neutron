@@ -3266,9 +3266,12 @@ ct_gone() { bash "$t/ct-alive.sh" "$e/$1.n"; }
 ct_unforged() { bg_unforged "$1" && [ ! -e "$ewt/$1/nucleus/v3/verdicts/$1.md" ]; }
 # ct_ids NAME: the forge's pgid and sid both differ from the fake's, and it leads
 # its own session, so these rows cannot pass the way a same-group forge would.
-ct_ids() { local op os fp fs; read -r op os <"$e/$1.n.ocid"; read -r fp fs <"$e/$1.n.forgeid"; echo "fake $op $os, forge $fp $fs"; [ "$op" != "$fp" ] && [ "$os" != "$fs" ] && [ "$fp" = "$fs" ]; }
+# Each `local x=` and read's || matters: a refused run writes no file, and an unset
+# name under set -u would end the whole suite with its stdout still in expect_ok's
+# redirect, so its abort line would be lost with the file.
+ct_ids() { local op= os= fp= fs=; read -r op os <"$e/$1.n.ocid" || return 1; read -r fp fs <"$e/$1.n.forgeid" || return 1; echo "fake $op $os, forge $fp $fs"; [ "$op" != "$fp" ] && [ "$os" != "$fs" ] && [ "$fp" = "$fs" ]; }
 # ct_in_ns NAME: the fake ran as pid 1 of another pid namespace, with the real uid.
-ct_in_ns() { local ns p u; read -r ns p u <"$e/$1.n.ocns"; echo "$ns $p $u; suite $(readlink /proc/self/ns/pid) $(id -u)"; [ "$ns" != "$(readlink /proc/self/ns/pid)" ] && [ "$p" = 1 ] && [ "$u" = "$(id -u)" ]; }
+ct_in_ns() { local ns= p= u=; read -r ns p u <"$e/$1.n.ocns" || return 1; echo "$ns $p $u; suite $(readlink /proc/self/ns/pid) $(id -u)"; [ "$ns" != "$(readlink /proc/self/ns/pid)" ] && [ "$p" = 1 ] && [ "$u" = "$(id -u)" ]; }
 # ct_owner ID: the honest commit made inside landed, under the suite's identity,
 # and its file and objects belong to the real uid.
 ct_owner() { local c=$ewt/$1 h f o me; me=$(id -u)
