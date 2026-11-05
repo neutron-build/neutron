@@ -1151,6 +1151,10 @@ pub mod directed_arms {
         (Mutant::DupDifferentAccepted, "d13_dup"),
         (Mutant::InplaceEvict, "d14_frees"),
         (Mutant::DropRootFirst, "d15_drop_lpid_exact"),
+        (
+            Mutant::ExhaustNoRevalidate,
+            "exhausted_reserve_keeps_both_copies / exhausted_record_stays_out_of_the_next_window",
+        ),
         (Mutant::RenameNoDirsync, "d9_dropped_rename"),
         (Mutant::TruncateLogicalOnly, "d7_zombie_tail"),
         (Mutant::StartSegmentMissingOk, "d10_start_segment"),

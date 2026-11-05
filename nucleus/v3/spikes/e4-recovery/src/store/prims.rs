@@ -31,6 +31,12 @@
 //!   while its ordering freeze (`Img::CopyPending`) still holds — §5.6's
 //!   copy condition, re-tested after the exhausted path's wait; a late
 //!   copy is dropped, never installed past its own checkpoint.
+//! - PR-EXHAUST-REVALIDATE (§5.6, X-5c-F4-F1-F1-CXX): the exhausted
+//!   path's write-out records only while its reserve frame still holds
+//!   the copy it read as oldest — re-validated after the write-out's
+//!   yield, in the record's own atomic step (Work 11 rule 1); an
+//!   orphaned write releases its slot and touches neither the image
+//!   map nor the frame.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -904,6 +910,37 @@ fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) ->
     let r = write_fresh(cx, &bytes_out)?;
     cx.with("epoch_copy:record", |c| {
         let st = c.store();
+        // **X-5c-F4-F1-F1-CXX Work 1 (cause B1): re-validate the frame
+        // after the write-out's yield, in the same atomic step as the
+        // record.** Two exhausted tasks can both read `oldest = idx`
+        // and both proceed into `write_fresh`; the first one's record
+        // clears the frame and its retry installs its own LPID's copy
+        // there, so by the time the second one records, the frame no
+        // longer holds `(key, is_epoch_copy)` — another task resolved
+        // it. Recording anyway would clear the frame a second time and
+        // destroy the first task's copy unwritten (`map.img` keeps its
+        // `CopyPending`, `ckpt:freeze` maps the LPID to nothing — the
+        // 18 B1 rounds), and a record landing past its checkpoint's
+        // post-5 inserts `Img::At(flip-k bytes)` into the cleared map,
+        // which the next freeze takes over `cur` (the silent sibling
+        // of verdict X-5c-F4-F1-F1-F2: `ckpt:freecopies` has already
+        // cleared the frame). So the write is an orphan: release its
+        // slot from `used_cur` and touch neither `map.img` nor the
+        // frame. M-EXHAUST-NO-REVALIDATE (the unconditional clear,
+        // today's code) skips exactly this test; M-EXHAUST-RECORD-FIRST
+        // guards only the frame clear and still records.
+        let no_revalidate = matches!(st.cfg.mutant, Some(Mutant::ExhaustNoRevalidate));
+        if !no_revalidate {
+            let same = st
+                .reserve_frames_mut()
+                .get(idx)
+                .map(|f| f.key == key && f.is_epoch_copy)
+                .unwrap_or(false);
+            if !same {
+                st.slots.used_cur.remove(&r.slot);
+                return Ok(());
+            }
+        }
         record_image_at(st, key, r);
         if let Some(f) = st.reserve_frames_mut().get_mut(idx) {
             f.key = 0;

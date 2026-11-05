@@ -114,6 +114,12 @@ pub enum Mutant {
     InplaceEvict,
     /// I-LPID-EXACT: DropTree frees the root first.
     DropRootFirst,
+    /// I-CKPT-AT-T (X-5c-F4-F1-F1-CXX, cause B1): `epoch_copy:record`
+    /// clears the exhausted reserve's frame unconditionally — the
+    /// re-validation after the write-out's yield is skipped, so a second
+    /// exhausted task destroys the copy the first refilled (today's
+    /// code, the 18 B1 rounds of the C-XX census).
+    ExhaustNoRevalidate,
     /// G1: no `sync_dir` after segment create/rename.
     RenameNoDirsync,
     /// G2: recovery truncates logically, not physically.
