@@ -56,7 +56,7 @@ pub open spec fn independent_uniform_pairs(domain:int,sample_space:int,
     pair_count:spec_fn(int,int)->int) -> bool {
     domain > 0 && sample_space > 0 &&
     forall|a:int,b:int| 0 <= a < domain && 0 <= b < domain ==>
-        pair_count(a,b) >= 0 && pair_count(a,b)*domain*domain == sample_space
+        #[trigger] pair_count(a,b) >= 0 && pair_count(a,b)*domain*domain == sample_space
 }
 pub proof fn constant_distribution_not_uniform(domain:int,sample_space:int,
     pair_count:spec_fn(int,int)->int)
