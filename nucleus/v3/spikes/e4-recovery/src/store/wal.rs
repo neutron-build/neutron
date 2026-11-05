@@ -1087,6 +1087,19 @@ fn wal_io_hook_fails<H: StoreHost>(cx: &Cx<'_, H>, op: WalIoOp, start: u64) -> R
 /// `wal_start_lsn` to a future first LSN (the next boundaries after the
 /// append position), with G1's dirsync after each rename. Returns the
 /// number of recycled segments.
+///
+/// **A rename that fails while the world has crashed is a delivered
+/// crash and is returned, never swallowed** (X-5c-F4-F1's re-gate,
+/// finding 1; card X-5c-F4-F1-F1 step 0 (a)): the sim's env maps every
+/// disk error to `SimFail::Crashed`, so a crash delivered at the
+/// rename's yield and a plain "`to` exists" failure carry the same
+/// `Err` — the world's `crashed` flag is what tells them apart. A plain
+/// `?` would be wrong (measured by the gate: "`to` exists" is routine,
+/// 111 times over 0..200, and the store relies on that quiet skip —
+/// `M-RENAME-ANYERR` moved 67 of 200 digests); swallowing the crash let
+/// step 6's tail (`After6`, `ckpt:end`, the next poll's final
+/// checkpoint) run on a crashed world and clear the SIZING-C fold, so
+/// seed 2376 r2 undercounted (`szc` false with the fold at 235 ≥ 4·F).
 pub fn wal_recycle<H: StoreHost>(cx: &Cx<'_, H>, wal_start: u64) -> Result<u64, Fail> {
     let mut recycled = 0u64;
     let plan = cx.with("wal_recycle:plan", |c| {
@@ -1105,7 +1118,13 @@ pub fn wal_recycle<H: StoreHost>(cx: &Cx<'_, H>, wal_start: u64) -> Result<u64, 
     for (first, fid, to) in plan {
         let name = format!("/wal/{first:016x}.log");
         let to_name = format!("/wal/{to:016x}.log");
-        if cx.env().rename(&name, &to_name).map_err(Fail::Sim).is_ok() {
+        let renamed = cx.env().rename(&name, &to_name).map_err(Fail::Sim);
+        if let Err(e) = &renamed
+            && cx.with("wal_recycle:crashed", |c| Ok(c.sched_mut().crashed))?
+        {
+            return Err(e.clone());
+        }
+        if renamed.is_ok() {
             recycled += 1;
             let skip = cx.with("wal_recycle:mut", |c| {
                 Ok(matches!(

@@ -105,7 +105,10 @@ fn smoke_16_seeds() {
 /// 7359 — one of the C-DIV-in-MW five — is run by no test at this tip;
 /// the rework-1 pins added 41 and 303, their literals taken from the
 /// same file — neither moved with the rework's store fixes, `szc` not
-/// being a digest input).
+/// being a digest input; X-5c-F4-F1-F1 step 0 (a) added 2376, its
+/// literal F4's own — the `wal_recycle` crash fix moves no digest
+/// (gate-measured over the whole 10k; only seed 2376 r2's non-digest
+/// `szc` changed)).
 /// M-BASEDRIFT (one BASE constant changed) fails this pin.
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
@@ -152,6 +155,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (1769, 2372375821),
         (1787, 1119157608),
         (1887, 3622450829),
+        (2376, 3116539881),
         (2669, 357787865),
         (2927, 1901399424),
         (4049, 2182387428),
@@ -365,6 +369,48 @@ fn x5_r38_w11_crash_reads_stale_at_start() {
         r0.pass,
         "seed 276 r0: the round passes (o1={:?} o2={:?} o3={:?})",
         r0.o1_fail, r0.o2_fail, r0.o3_fail
+    );
+}
+
+/// **The re-gate's finding 1 (verdict X-5c-F4-F1, MERGE-WITH-FOLLOWUPS;
+/// card X-5c-F4-F1-F1 step 0 (a)): `wal_recycle` must not swallow a
+/// delivered crash — `szc` keeps the open fold.** The sim's env maps
+/// every disk error to `SimFail::Crashed`, so the pre-fix
+/// `.map_err(Fail::Sim).is_ok()` read a crash delivered at the rename's
+/// yield as "not renamed" and quietly skipped on: `After6` and
+/// `ckpt:end` ran on the crashed world, the checkpointer's next poll
+/// took its final checkpoint, and that `ckpt:begin` folded again before
+/// the gate's yield unwound it — clearing `ckpt_closed_dirty` (and
+/// `ckpt_splits`/`ckpt_merges`) after the crash, so the crash-time
+/// snapshot undercounted. Literal config: seed 2376 round 2, under
+/// `Tuning::BASE` — the crash `uniform@y:17768` lands at the rename's
+/// yield with a checkpoint open whose begin step folded 235 ≥ 4·F = 184
+/// dirtied LPIDs, so the record's `szc` can only be true through the
+/// fold surviving the unwind into the snapshot. **M-RENAME-SWALLOW**
+/// (the `is_ok()` form restored) fails this pin (`szc` false, the
+/// gate's measurement: 15 of 15,386 rounds had the observable move
+/// after the fire); **M-RENAME-ANYERR** (a plain `?` on the rename —
+/// wrong because "`to` exists" is a routine uncrashed skip, 111 times
+/// over 0..200) fails the X5-R37 digest pin (67 of 200 digests moved).
+/// No digest moves on the fix itself (seed 2376's X5-R37 literal is
+/// F4's own).
+#[test]
+fn szc_rename_crash_keeps_the_open_fold() {
+    let rec = workload::run_seed_with(2376, None, &workload::Tuning::BASE);
+    assert!(rec.defect.is_none(), "seed 2376: {:?}", rec.defect);
+    let r2 = rec
+        .rounds
+        .get(2)
+        .unwrap_or_else(|| panic!("seed 2376: three rounds"));
+    assert_eq!(
+        r2.crash, "uniform@y:17768",
+        "seed 2376 r2: the pinned uniform crash at the recycle rename's yield"
+    );
+    assert!(r2.fired, "seed 2376 r2: the crash fired");
+    assert!(
+        r2.szc,
+        "seed 2376 r2: szc must be true — the open checkpoint folded 235 ≥ 4·F = 184 \
+         LPIDs and the rename's delivered crash must not let ckpt:end clear it"
     );
 }
 
