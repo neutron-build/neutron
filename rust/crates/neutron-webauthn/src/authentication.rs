@@ -1,7 +1,6 @@
 //! WebAuthn authentication ceremony.
 
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-use p256::EncodedPoint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -157,10 +156,8 @@ fn verify_es256_signature(
     uncompressed[0] = 0x04;
     uncompressed[1..33].copy_from_slice(&cose_key.x);
     uncompressed[33..].copy_from_slice(&cose_key.y);
-    let point =
-        EncodedPoint::from_bytes(uncompressed).map_err(|_| WebAuthnError::InvalidSignature)?;
-    let verifying_key =
-        VerifyingKey::from_encoded_point(&point).map_err(|_| WebAuthnError::InvalidSignature)?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&uncompressed)
+        .map_err(|_| WebAuthnError::InvalidSignature)?;
 
     let signature = Signature::from_der(sig_der).map_err(|_| WebAuthnError::InvalidSignature)?;
 
@@ -333,11 +330,10 @@ mod tests {
     #[test]
     fn p256_signature_verification_with_generated_key() {
         use p256::ecdsa::{signature::Signer, SigningKey};
-        use rand::rngs::OsRng;
 
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let verifying_key = signing_key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
+        let point = verifying_key.to_sec1_point(false);
         let x = point.x().unwrap().to_vec();
         let y = point.y().unwrap().to_vec();
 
@@ -369,11 +365,10 @@ mod tests {
     #[test]
     fn p256_wrong_signature_fails() {
         use p256::ecdsa::{signature::Signer, SigningKey};
-        use rand::rngs::OsRng;
 
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let verifying_key = signing_key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
+        let point = verifying_key.to_sec1_point(false);
         let x = point.x().unwrap().to_vec();
         let y = point.y().unwrap().to_vec();
 
