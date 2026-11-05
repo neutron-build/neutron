@@ -340,7 +340,8 @@ Iterators are **streaming**: a range scan never materialises its range. The spik
 ### 6.7 Overflow chains
 An entry whose value exceeds `V_INLINE` stores a reference `(len u64, first LPID)` in its value, with tag 4 or 5 (§7.3). The chain is a list of Overflow pages.
 - **Immutability.** Chains are immutable once written (versions are immutable).
-- **Freeing.** A chain is freed **in the same gated operation** that deletes its entry (§10), or that replaces its entry's value: a provisional rewrite (C-T0 v8 §2.4) or a superseding replay op (§14), unless the new value is the same chain. **Exception:** a conversion of a tag-8 provisional entry (C-T0 v8 §2.4) moves the chain to the new tag-4 or tag-5 entry and deletes the provisional entry without freeing it. Both happen in one gated operation, so no image holds two references to one chain. A chain free therefore holds the flip for the chain's length. A-5 measures this at the maximum value size; if it is too long, A-5 proposes a resumable free, which is an edit of this file.
+- **Building.** A chain is mapped in the gated operation that inserts its entry, as it is freed with its entry (I-LINK-ATOMIC, §5.6).
+- **Freeing.** A chain is freed **in the same gated operation** that deletes its entry (§10), or that replaces its entry's value: a provisional rewrite (C-T0 v8 §2.4) or a superseding replay op (§14), unless the new value is the same chain. **Exception:** a conversion of a tag-8 provisional entry (C-T0 v8 §2.4) moves the chain to the new tag-4 or tag-5 entry and deletes the provisional entry without freeing it. Both happen in one gated operation, so no image holds two references to one chain. A chain build or free therefore holds the flip for the chain's length. A-5 measures the flip hold for the build as well as the free, at the maximum value size; if either is too long, A-5 proposes a resumable build or free, which is an edit of this file (§19 item 6).
 - **Reading without the leaf latch.** A reader that holds a registered snapshot `S ≥ W` may read the chain after releasing the leaf latch. GC never deletes a version that is the newest `≤ S` for any registered `S` (I-GC-READEQ), so a version that a registered snapshot reads cannot lose its chain while the reader holds that registration.
 
 ### 6.8 Tree directory
@@ -846,6 +847,8 @@ A transaction is chunked **iff** it is large (C-T0 v8 §2.1). Its `Chunk` record
 3. **Publication.** The publishing commit (C-T6 write-only → public) may be issued only after that checkpoint's meta is durable (§13 step 5). Catch-up from the WAL (PLAN-v3 §3.5 step 3) is ordinary logged writing.
 4. **Crash before publication.** The recovered tree holds only its logged content plus whatever the last image caught of the load. S-3 must treat such a tree as an unfinished build: restart or discard it.
 
+**Pages (I-LINK-ATOMIC).** §13's Exception exempts a load's *entries* from I-CKPT-AT-T, not its pages from I-LINK-ATOMIC (§5.6). Each load step links what it maps, so a discarded build (item 4) can be walked (§6.8) and leaks nothing.
+
 Mutant: PUBLISH-BEFORE-META.
 
 **Why not page images.** Under (b), a load writes versions at a registered snapshot ts `S`. Such versions may be `≤ T` of a later checkpoint, so a replay filtered by `commit_ts > T` (§14) could never place a logged copy of them. Page images would also carry LPIDs, which are meaningless to logical consumers (N14's replicas and CDC).
@@ -1181,7 +1184,7 @@ This file wins over the plan (precedence above). The plan should be updated thro
 3. **Optimistic latches and pointer swizzling** (N8/N9): only on the E0/E7 triggers (PLAN-v3 §3.12).
 4. ~~**Provisional entries.**~~ Closed by the S-2 co-edit: §7.1, §7.3 tags 6–8, §8, §12.7, I-CKPT-AT-T (c), §14 (C-T0 v8 §2.4).
 5. **PITR and replicas across a §12.8 bulk load** (D-6).
-6. **Resumable overflow-chain free** if A-5 measures the flip hold as too long (§6.7).
+6. **Resumable overflow-chain free or build** if A-5 measures the flip hold as too long (§6.7). A resumable chain free or build must keep I-LINK-ATOMIC (§5.6).
 
 **Known costs of (b), accepted, with revisit triggers (from the decision block, restated so the storage cards carry them):**
 - **T1: latest-snapshot scans.** 8.2× slower than (c) at 10 versions/key (W3). Mitigations: GC at the watermark (B-3) and version skipping (§8.3, A-4e/B-3). **Trigger:** after both mitigations, the NBench OLTP range rows or E9 miss target, and a profile attributes more than 20% of scan CPU to stepping over invisible versions. Then an Opus card re-opens N3.
