@@ -1040,6 +1040,206 @@ fn late_epoch_copy_must_not_enter_the_next_image() {
     }
 }
 
+/// **X-5c-F4-F1-F1-F2: the freed-LPID form of the late copy**
+/// (M-LATECOPY-ATONLY's pin: a guard that tests only `Img::At` —
+/// dropping exactly the installs whose override resolved to `At` —
+/// still installs a copy whose LPID left the map entirely). The same
+/// park holds B's first touch across **two** flips: the release comes
+/// at checkpoint 2's `After0`, so by then checkpoint 1 has completed
+/// (its post-5 cleared the map), B's LPID has been freed, and window 2
+/// is open with `map.img` holding nothing for B. The late install then
+/// finds **no entry at all**: the real guard drops it (an absent entry
+/// is not `Img::CopyPending`), and image 2 leaves the freed LPID
+/// unmapped — the free-set bitmap marks it, and the reopened store's
+/// current map has no entry for it. Under the mutant the copy still
+/// installs; checkpoint 2's scan takes it (`f.is_epoch_copy`), and its
+/// record path maps the freed LPID to epoch-`k` bytes — the reopened
+/// store's `map.cur` contains a page no tree reaches.
+///
+/// Two schedule compressions, stated plainly. (1) B's LPID is freed
+/// directly (`prims::free_lpid`) between the checkpoints: the tree
+/// layer's own free paths hold the tree mutex, which a *bounded* copy
+/// wait would release and re-acquire around — the park stands in for
+/// that wait, so the free is done the way it would land in that gap.
+/// (2) The exhausted path's write-out of the **oldest** copy (P's)
+/// lands with the late install, and its own `record_image_at` for P is
+/// then stale (window 2's map gets P's flip-1 content) — a sibling
+/// deviation this card's prescribed fix does not touch, reported under
+/// ESCALATE with its own reproduction; this pin therefore asserts only
+/// the late copy's own LPID (B) and an untouched padding tree.
+#[test]
+fn freed_lpids_late_copy_never_remaps() {
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // The same phase A as the main pin: P (tree 11) fills the
+        // reserve, B (tree 12) is the victim above ten padding trees.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            cx.with("late:budget2", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 900_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        let pad_roots: Vec<u64> = roots.iter().take(10).copied().collect();
+        // B's own bytes, taken in the pre-pass (the raw `store_page`
+        // below re-stores them; the freeze fires on the dirty frame
+        // either way — the content is not what this pin asserts).
+        let b_bytes = {
+            let sched = pass_world(1, seed + 3, disk.clone(), st.clone());
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let (bytes, _) = prims::fetch_page(&cx, root_b, false).expect("fetch B");
+            prims::unpin(&cx, root_b);
+            bytes
+        };
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("late2:wait-fill").map_err(fail_of)?;
+                    }
+                    // A raw `store_page`, deliberately: a tree insert
+                    // would hold the epoch gate across the parked copy
+                    // wait and the next flip could not start until the
+                    // park ended. The raw touch parks holding nothing,
+                    // so checkpoint 2's flip runs while the copy waits —
+                    // the shape a bounded copy wait reaches in the real
+                    // system when the freeing operation is not on the
+                    // gated path that produced the copy.
+                    prims::store_page(&cx, root_b, b_bytes.clone()).map_err(fail_of)?;
+                    set_flag(sched, "m_done");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    // Free B's LPID between the checkpoints: at the next
+                    // flip B is unmapped, and a late copy of it must not
+                    // put it back. (The raw touch above holds no gate,
+                    // so this checkpoint's flip does not wait on the
+                    // parked copy; the After0 hook that releases it is
+                    // reachable.)
+                    prims::free_lpid(&cx, root_b).map_err(fail_of)?;
+                    // Dirty the padding trees so checkpoint 2's data
+                    // phase is a dozen writes long: the released copy
+                    // must land behind the scan cursor (the re-scan
+                    // then takes it), not after the final pass.
+                    for (id, root) in pad_roots.iter().enumerate() {
+                        let id = id as u64 + 1;
+                        ins(&cx, id, *root, &2u64.to_be_bytes(), 2, &val(2, 2));
+                    }
+                    ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            // Window 2 is open and the map holds nothing
+                            // for B: release the parked copy now.
+                            let mut g = sched.lock();
+                            g.st.parks.insert("epochcopy:prewrite", 0);
+                        }
+                        Ok(())
+                    })
+                    .map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("late2:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the freed-LPID late-copy schedule");
+        assert!(flag(&sched, "m_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        drop(g);
+        crash_clean(&mut disk_after, seed + 70);
+        let sched2 = pass_world(1, seed + 102, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+        assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+        cx2.with("late2:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        // A padding tree carries exactly its between-checkpoints entry
+        // (pre-flip-2, so image 2 legitimately holds it): the image
+        // itself is structurally readable.
+        let scan_pad = tree::tree_scan(&cx2, roots[0], 10).expect("scan pad 1");
+        let want_pad: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            [(2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec()))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            scan_pad, want_pad,
+            "seed {seed}: the padding tree holds its pre-flip-2 entry"
+        );
+        // The pin: the freed LPID must not re-enter the image's map.
+        let mapped = cx2
+            .with("late2:chk", |c| Ok(c.store().map.cur.contains_key(&root_b)))
+            .expect("map check");
+        assert!(
+            !mapped,
+            "seed {seed}: a freed LPID's late copy must not remap it in the next \
+             image (the copy installs onto an absent entry and the scan's \
+             is_epoch_copy arm records it — M-LATECOPY-ATONLY)"
+        );
+        let freed = cx2
+            .with("late2:free", |c| {
+                Ok(c.store().slots.free_lpids.contains(&root_b))
+            })
+            .expect("free check");
+        assert!(
+            freed,
+            "seed {seed}: the freed LPID stays in the free set (the bitmap marks \
+             every LPID the image leaves unmapped)"
+        );
+    }
+}
+
 /// G7's meta-selection semantics (P's ruling on the round-3 F3,
 /// 2026-10-26): the winner is the highest placed-valid meta; a
 /// misplaced valid meta that does not outrank it is a loser (ignored);
