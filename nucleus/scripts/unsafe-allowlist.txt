@@ -38,3 +38,7 @@ src/config/mod.rs
 # concurrently is spawned.
 src/bin/compete.rs
 src/bin/probe_soak.rs
+
+# The same `std::env::set_var` / `remove_var`, in `#[cfg(test)]` code only; each
+# block holds TLS_ENV_LOCK and restores the variables before releasing it.
+src/tls.rs
