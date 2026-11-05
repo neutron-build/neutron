@@ -5905,10 +5905,20 @@ fn exhausted_record_stays_out_of_the_next_window() {
 /// clean crash (every unsynced write reverts; both checkpoints' metas
 /// are synced) and `ckpt::recover`.
 fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
-    let cfg = tcfg(8, 18, 1);
+    drop_cut_body_m(seed, reuse, None)
+}
+
+fn drop_cut_body_m(seed: u64, reuse: bool, m: Option<Mutant>) -> Result<(), String> {
+    let cfg = StoreCfg {
+        mutant: m,
+        ..tcfg(8, 18, 1)
+    };
     let (disk, st) = create_store(cfg.clone(), seed, None);
     // ---- phase A: tree 2 (the victim, a leaf root) and tree 4 (the
-    // reuser, pre-filled under its split edge), one durable checkpoint.
+    // reuser), one durable checkpoint. Tree 4 holds eight of the ~10
+    // 400-byte cells a leaf holds: t3's pre-positioned ninth cell does
+    // not split, and the one that follows splits onto the freed LPID
+    // (the lowest free LPID at that moment).
     let (disk, st, root2, root4) = {
         let sched = pass_world(1, seed, disk, st);
         let cx = Cx {
@@ -5921,14 +5931,14 @@ fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
         let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
         let root4 = tree::dir_root_of(&cx, 4).expect("root 4");
         ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
-        for i in 0..6u64 {
-            ins(&cx, 4, root4, &i.to_be_bytes(), 1, &[7u8; 400]);
+        for i in 0..8u64 {
+            ins(&cx, 4, root4, &i.to_be_bytes(), 1, &[0u8; 400]);
         }
         cx_checkpoint(&sched, |_| Ok(()));
         let g = sched.lock();
         (g.disk.clone(), g.st.clone(), root2, root4)
     };
-    // ---- phase B: the drop, the flip, and (pin 2) the reuse.
+    // ---- phase B: the drop (t1), the flip (t2) and the reuse (t3).
     let ntasks = if reuse { 4 } else { 3 };
     let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
         let cx = Cx { w: sched, t };
@@ -5939,26 +5949,26 @@ fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
                 Ok(())
             }
             2 => {
-                // Wait for the gap: the straddle (pin 1), or the freed
-                // LPID taken by tree 4's split (pin 2). Under the fix
-                // neither state exists, so the fallback is the drop's
-                // own completion — the flip then lands harmlessly.
+                // Wait for the gap: at this tip the straddle — the
+                // entry present with the root freed — is exactly the
+                // window a flip must cut. Under the fix the state never
+                // exists, so the fallbacks are the reuse (pin 2) or the
+                // drop's own completion; the flip then lands harmlessly.
                 loop {
-                    let elsewhere = flag(sched, "d_done") || (reuse && flag(sched, "reused"));
-                    let go = elsewhere
-                        || cx
-                            .with("cut:t2wait", |c| {
-                                let st = c.store();
-                                Ok(st.dir.contains_key(&2)
-                                    && !st.map.cur.contains_key(&root2)
-                                    && !st
-                                        .pool
-                                        .frames
-                                        .iter()
-                                        .any(|f| f.key == root2 && !f.is_epoch_copy))
-                            })
-                            .map_err(fail_of)?;
-                    if go {
+                    let elsewhere = flag(sched, "d_done") || flag(sched, "reused");
+                    let straddle = cx
+                        .with("cut:t2wait", |c| {
+                            let st = c.store();
+                            Ok(st.dir.contains_key(&2)
+                                && !st.map.cur.contains_key(&root2)
+                                && !st
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root2 && !f.is_epoch_copy))
+                        })
+                        .map_err(fail_of)?;
+                    if elsewhere || straddle {
                         break;
                     }
                     cx.yield_now("cut:t2spin").map_err(fail_of)?;
@@ -5968,6 +5978,31 @@ fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
                 Ok(())
             }
             3 if reuse => {
+                // Pre-position: the ninth cell (no split yet) goes in
+                // as soon as tree 2 is `dropping` — before the gap
+                // opens — so a single insert is all that remains.
+                loop {
+                    let marked = cx
+                        .with("cut:t3mark", |c| {
+                            Ok(c.store().dir.get(&2).is_some_and(|e| e.dropping))
+                        })
+                        .map_err(fail_of)?;
+                    if marked || flag(sched, "d_done") {
+                        break;
+                    }
+                    cx.yield_now("cut:t3mspin").map_err(fail_of)?;
+                }
+                if flag(sched, "d_done") {
+                    // The drop finished before the mark was seen; there
+                    // is no gap to race. The flip (t2) falls back to
+                    // this flag too, so the world still terminates.
+                    set_flag(sched, "reused");
+                    return Ok(());
+                }
+                ins(&cx, 4, root4, &8u64.to_be_bytes(), 1, &[0u8; 400]);
+                // The gap: the freed LPID. The next insert splits tree
+                // 4, and its first allocation is the lowest free LPID —
+                // root2.
                 loop {
                     let freed = cx
                         .with("cut:t3wait", |c| {
@@ -5979,30 +6014,7 @@ fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
                     }
                     cx.yield_now("cut:t3spin").map_err(fail_of)?;
                 }
-                // Split tree 4 onto the freed LPID: the first
-                // allocation is the lowest free LPID — root2.
-                let mut n = 6u64;
-                loop {
-                    ins(&cx, 4, root4, &n.to_be_bytes(), 1, &[7u8; 400]);
-                    n += 1;
-                    let took = cx
-                        .with("cut:t3chk", |c| {
-                            let st = c.store();
-                            Ok(st.map.cur.contains_key(&root2)
-                                || st
-                                    .pool
-                                    .frames
-                                    .iter()
-                                    .any(|f| f.key == root2 && !f.is_epoch_copy))
-                        })
-                        .map_err(fail_of)?;
-                    if took {
-                        break;
-                    }
-                    if n > 40 {
-                        return Err(SimFail::Internal("tree 4 never split"));
-                    }
-                }
+                ins(&cx, 4, root4, &9u64.to_be_bytes(), 1, &[0u8; 400]);
                 set_flag(sched, "reused");
                 Ok(())
             }
@@ -6051,16 +6063,22 @@ fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
         return Err(format!("seed {seed}: tree 2's entry survived recovery"));
     }
     if reuse {
-        // Tree 4 must be whole: the resumed walk of the straddling
-        // entry must not have freed its reused page.
+        // Tree 4 must be whole: the resumed walk of a straddling entry
+        // must not have freed the page the split reused. The image
+        // holds the flip-time cut, so the ninth and tenth cells may or
+        // may not be in it — but the eight phase-A cells were durably
+        // checkpointed before the world began and must all read back.
         let scan = tree::tree_scan(&cx2, root4, 1000).map_err(|e| {
             format!("seed {seed}: tree 4 scan after recovery: {e:?} (a reused page was freed)")
         })?;
         let n = scan.len();
-        if n < 8 {
-            return Err(format!(
-                "seed {seed}: tree 4 lost pages: {n} of >= 8 entries ({scan:?})"
-            ));
+        if n < 9 {
+            return Err(format!("seed {seed}: tree 4 lost durable pages: {n} of 9"));
+        }
+        for i in 0..9u64 {
+            if !scan.contains_key(i.to_be_bytes().as_slice()) {
+                return Err(format!("seed {seed}: tree 4 lost durable key {i}"));
+            }
         }
     }
     Ok(())
@@ -6077,7 +6095,7 @@ fn drop_cut_never_names_a_freed_root() {
 /// the image must never name a reused root.
 #[test]
 fn drop_cut_never_names_a_reused_root() {
-    drop_cut_body(7, true).expect("pin 2");
+    drop_cut_body_m(77, true, None).expect("pin 2");
 }
 
 /// **X-5c-F4-F1-F1-CXX step 0, pin 3: the exhausted reserve's double
@@ -6256,4 +6274,129 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
 #[test]
 fn exhausted_reserve_keeps_both_copies() {
     exhausted_reserve_body(1).expect("pin 3");
+}
+
+/// **X-5c-F4-F1-F1-CXX Work 2: `drop_entry_gone_before_root_free`.**
+/// I-LINK-ATOMIC's cut side (§6.8 as amended by S-1-F7): a directory
+/// entry must never name an unmapped root — not even between two
+/// atomic steps of the last gated operation, because §4.2's immediate
+/// reuse can hand the LPID to another tree inside the same hold. The
+/// fix removes the entry **before** freeing the path; M-DROP-FREE-FIRST
+/// (inside the one gate hold, the root is freed before the entry is
+/// removed) opens exactly that window. A watcher task asserts, at each
+/// of its steps, that no unmapped root has an entry — in the persisted
+/// directory tree or in the in-memory `dir` — while the dropper walks
+/// tree 2 (a leaf root: the last step at once) and tree 3 (an inner
+/// root: one bounded step first, so the Stepped arm is exercised too).
+#[test]
+fn drop_entry_gone_before_root_free() {
+    drop_entry_gone_body(4);
+}
+
+fn drop_entry_gone_body(seed: u64) {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // Phase A: tree 2 = one page; tree 3 = an inner root over two
+    // leaves (twelve 400-byte cells split it once).
+    let (disk, st) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 3] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let root3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        for i in 0..12u64 {
+            ins(&cx, 3, root3, &i.to_be_bytes(), 1, &[0u8; 400]);
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone())
+    };
+    // Phase B: the dropper and the watcher. The watcher's check: every
+    // entry the directory holds (persisted and in memory) names a root
+    // that is still mapped (in the current map or resident in a pool
+    // frame).
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                tree::dir_drop_tree(&cx, 3).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                let mut checks = 0u64;
+                while !flag(sched, "d_done") {
+                    let dir_root = cx
+                        .with("watch:dr", |c| Ok(c.store().meta.dir_root))
+                        .map_err(fail_of)?;
+                    // The persisted directory's entries.
+                    let cells = tree::raw_cells(&cx, dir_root, false).map_err(|e| {
+                        SimFail::Internal(Box::leak(
+                            format!("watch raw_cells: {e:?}").into_boxed_str(),
+                        ))
+                    })?;
+                    let bad = cx
+                        .with("watch:chk", |c| {
+                            let st = c.store();
+                            let mapped = |lpid: u64| {
+                                st.map.cur.contains_key(&lpid)
+                                    || st
+                                        .pool
+                                        .frames
+                                        .iter()
+                                        .any(|f| f.key == lpid && !f.is_epoch_copy)
+                            };
+                            // In memory: no entry may name an unmapped root.
+                            for (id, en) in st.dir.iter() {
+                                if !mapped(en.root) {
+                                    return Ok(Some(format!(
+                                        "dir entry {id} names unmapped root {}",
+                                        en.root
+                                    )));
+                                }
+                            }
+                            // Persisted: no directory cell may either.
+                            for (k, v) in cells.iter() {
+                                if k.len() != 8 || v.len() != 9 {
+                                    continue;
+                                }
+                                let mut rb = [0u8; 8];
+                                if let Some(sb) = v.get(0..8) {
+                                    rb.copy_from_slice(sb);
+                                }
+                                let root = u64::from_le_bytes(rb);
+                                if !mapped(root) {
+                                    let id = u64::from_be_bytes(
+                                        k.as_slice().try_into().unwrap_or([0; 8]),
+                                    );
+                                    return Ok(Some(format!(
+                                        "directory cell {id} names unmapped root {root}"
+                                    )));
+                                }
+                            }
+                            Ok(None)
+                        })
+                        .map_err(fail_of)?;
+                    if let Some(what) = bad {
+                        panic!("watcher: {what}");
+                    }
+                    checks += 1;
+                    cx.yield_now("watch:spin").map_err(fail_of)?;
+                }
+                eprintln!("watcher made {checks} clean checks");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the drop watcher schedule");
+    assert!(flag(&sched, "d_done"), "seed {seed}: both drops ran");
 }

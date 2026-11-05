@@ -1155,6 +1155,10 @@ pub mod directed_arms {
             Mutant::ExhaustNoRevalidate,
             "exhausted_reserve_keeps_both_copies / exhausted_record_stays_out_of_the_next_window",
         ),
+        (
+            Mutant::DropEntrySplit,
+            "drop_cut_never_names_a_freed_root / drop_cut_never_names_a_reused_root",
+        ),
         (Mutant::RenameNoDirsync, "d9_dropped_rename"),
         (Mutant::TruncateLogicalOnly, "d7_zombie_tail"),
         (Mutant::StartSegmentMissingOk, "d10_start_segment"),

@@ -120,6 +120,12 @@ pub enum Mutant {
     /// exhausted task destroys the copy the first refilled (today's
     /// code, the 18 B1 rounds of the C-XX census).
     ExhaustNoRevalidate,
+    /// I-LINK-ATOMIC (X-5c-F4-F1-F1-CXX, cause A): the DropTree walk's
+    /// last step frees the path inside its gate hold and the directory
+    /// entry's removal runs in its **own** hold afterwards — the
+    /// straddle a flip can cut (today's code, the 27 A rounds of the
+    /// C-XX census).
+    DropEntrySplit,
     /// G1: no `sync_dir` after segment create/rename.
     RenameNoDirsync,
     /// G2: recovery truncates logically, not physically.
