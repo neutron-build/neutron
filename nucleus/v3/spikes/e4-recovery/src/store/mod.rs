@@ -514,8 +514,10 @@ pub struct StoreInner {
     /// **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2 — a store
     /// observable, a diagnostic pending OQ-1):** the `n` the **open**
     /// checkpoint's begin step folded (the interval it closed). 0 when
-    /// no checkpoint is open (reset at `ckpt:end` and on the abort
-    /// path). Never a behaviour input.
+    /// no checkpoint is open (reset at `ckpt:end` and on the abort path
+    /// of a non-crash failure — **never on a sim-crash unwind**, so the
+    /// crash-time `obs` snapshot sees the folded interval; rework 1 of
+    /// the P gate verdict X-5c-F4-F1). Never a behaviour input.
     pub ckpt_closed_dirty: u64,
     /// Poison reason (I-FAIL-STOP).
     pub poisoned: Option<String>,

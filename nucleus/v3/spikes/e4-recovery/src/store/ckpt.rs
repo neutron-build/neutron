@@ -620,13 +620,27 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
             })
             .ok();
         }
+        // **Rework 1 (P gate verdict X-5c-F4-F1, finding 1): a sim-crash
+        // unwind must not reset the SIZING-C observable.** `obs` is
+        // snapshotted when the tasks end — after the unwinding
+        // checkpointer gets its turn — so resetting here made
+        // `ckpt_closed_dirty` 0 in every crash round (0 of 15,386 at the
+        // first attempt's tip), and `szc`'s second disjunct was dead. A
+        // non-crash failure keeps the reset (no checkpoint is open once
+        // the abort path has run); `ckpt_open` and the rest reset on
+        // every `Err` exactly as before.
+        let crash_unwind = matches!(e, Fail::Sim(_));
         cx.with("ckpt:abort", |c| {
             let st = c.store();
             st.ckpt_open = false;
             st.flip_window = false;
             st.image_frozen = None;
-            // SIZING-C: no checkpoint is open (the abort path).
-            st.ckpt_closed_dirty = 0;
+            // SIZING-C: no checkpoint is open (the abort path) — except
+            // across a sim-crash unwind, where the observable must
+            // survive into the crash-time `obs` snapshot.
+            if !crash_unwind {
+                st.ckpt_closed_dirty = 0;
+            }
             Ok(())
         })
         .ok();

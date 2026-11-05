@@ -102,7 +102,10 @@ fn smoke_16_seeds() {
 /// list is every seed any test passes to a seed runner (found by grep
 /// over `tests/`, cross-checked against P's 43-seed list; the smoke and
 /// round-trip seeds 0–9 are the grep's additions from the file, and P's
-/// 7359 — one of the C-DIV-in-MW five — is run by no test at this tip).
+/// 7359 — one of the C-DIV-in-MW five — is run by no test at this tip;
+/// the rework-1 pins added 41 and 303, their literals taken from the
+/// same file — neither moved with the rework's store fixes, `szc` not
+/// being a digest input).
 /// M-BASEDRIFT (one BASE constant changed) fails this pin.
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
@@ -123,6 +126,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (13, 2781612228),
         (14, 2027633753),
         (15, 3135194667),
+        (41, 2325274127),
         (47, 2526989435),
         (48, 605204002),
         (60, 2199024193),
@@ -133,6 +137,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (198, 649857276),
         (221, 2732451886),
         (268, 317704428),
+        (303, 859193035),
         (308, 522943877),
         (387, 2151920803),
         (403, 2657356820),
@@ -213,6 +218,82 @@ fn q11_seed4_round0_reads_a_stale_record_at_a_recycled_segment_start() {
     assert!(
         r0.q11_stale_seg,
         "seed 4 r0: the stale record read at the recycled segment's start must set the Q11 flag"
+    );
+}
+
+/// **Rework 1 (P gate verdict X-5c-F4-F1, finding 1; the verdict's
+/// named pins): a sim-crash unwind must not reset `ckpt_closed_dirty`
+/// — `RoundRec.szc` is true through the second disjunct.** The verdict:
+/// "`checkpoint()`'s `ckpt:abort` runs on every `Err`, including a sim
+/// crash, because the unwinding task gets its turn; it sets
+/// `ckpt_closed_dirty = 0` before `run_round` snapshots `obs`" — 0 in
+/// 15,386 rounds at the first attempt's tip, the second disjunct dead.
+/// With the fix, the folded `n` survives the unwind into the crash-time
+/// snapshot. Literal configs (both measured, under `Tuning::BASE`):
+/// **seed 41 round 2** crashes at `After1@0` and **seed 303 round 2**
+/// at `After3@0` — a checkpoint open at the crash whose begin step
+/// folded 221 (41; 4·F = 208) and 241 (303; 4·F = 196) dirtied LPIDs
+/// while the open interval at the crash held only 1 and 3 — so the
+/// record's `szc` can only be true through `ckpt_closed_dirty ≥ 4·F`.
+/// The record shows `szc` itself (the verdict's form); that the pins
+/// pin the disjunct and the unwind is proven by the mutants:
+/// M-SZC-ABORTRESET (reset on every `Err`) and M-SZC-NOCK (the
+/// disjunct removed) each fail this pin. `szc` is not a digest input —
+/// no digest moves (both seeds' literals in the X5-R37 pin are F4's
+/// own).
+#[test]
+fn szc_survives_the_sim_crash_unwind_into_the_record() {
+    for (seed, hook, four_f) in [(41u64, "After1@0", 208u64), (303, "After3@0", 196)] {
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
+        assert!(rec.defect.is_none(), "seed {seed}: {:?}", rec.defect);
+        let r2 = rec
+            .rounds
+            .get(2)
+            .unwrap_or_else(|| panic!("seed {seed}: three rounds"));
+        assert_eq!(
+            r2.crash, hook,
+            "seed {seed} r2: the pinned hook crash (the open checkpoint at the crash)"
+        );
+        assert!(r2.fired, "seed {seed} r2: the crash fired");
+        assert!(
+            r2.szc,
+            "seed {seed} r2: szc must be true — the open checkpoint folded \
+             ≥ 4·F = {four_f} LPIDs and the unwind must not reset it"
+        );
+        assert!(
+            r2.pass,
+            "seed {seed} r2: the round passes: o1={:?} o2={:?} o3={:?}",
+            r2.o1_fail, r2.o2_fail, r2.o3_fail
+        );
+    }
+}
+
+/// **Rework 1, the record-level M-SZC-ANY pin (the card's own mutant
+/// `szc := sizing_ok` at `round_rec`, UNCAUGHT at the first attempt's
+/// gate): a completed ≥ 4·F interval never makes the record's `szc`
+/// true.** Literal config: seed 660 round 2, under `Tuning::BASE` —
+/// the crash (`Mid2@3`) cut a checkpoint whose begin step folded a
+/// small interval while `dirty_max` = 250 ≥ 4·F = 184 from an earlier,
+/// completed one — so the record carries `sizing_ok` true and `szc`
+/// false. The literal `szc := sizing_ok` at `round_rec` flips this
+/// round's `szc` to true and fails this pin (the function-level pin
+/// `szc_a_completed_4f_interval_and_a_small_cut` reads `szc_of`
+/// directly and cannot see it).
+#[test]
+fn szc_a_completed_interval_never_sets_the_record_flag() {
+    let rec = workload::run_seed_with(660, None, &workload::Tuning::BASE);
+    let r2 = rec
+        .rounds
+        .get(2)
+        .unwrap_or_else(|| panic!("seed 660: three rounds"));
+    assert!(
+        r2.sizing_ok,
+        "seed 660 r2: an earlier interval reached 4·F (dirty_max 250 ≥ 184)"
+    );
+    assert!(
+        !r2.szc,
+        "seed 660 r2: the crash cut a small open interval (dirty_now 0 < 184) \
+         with the open checkpoint's own fold small — szc must stay false"
     );
 }
 
