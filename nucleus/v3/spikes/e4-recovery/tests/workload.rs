@@ -207,6 +207,50 @@ fn x5_r37_final_equals_base_at_this_tip() {
     );
 }
 
+/// **X-5c-F4-F1-F1-F2 step 3: no late epoch copy installs at BASE**
+/// (verdict X-5c-F4-F1-F1 finding 1). The late-copy events this card
+/// fixes occur at BASE on their own (7 over 0..200: seed 96 twice, 104,
+/// 161 and 190 three times, counted with the gate prototype's
+/// `LATECOPY` probe on a scratch export of the pre-fix and post-fix
+/// tips): a first touch's copy parks in the exhausted reserve path, the
+/// checkpoint's step 2 resolves the override to `Img::At` (or the
+/// window closes) while it waits, and the install — pre-fix — landed
+/// past `ckpt:freecopies`. With the fix (`epoch_copy:install` installs
+/// only while `Img::CopyPending` still holds) every one of those
+/// installs is a **drop**: the count of late *installs* at BASE is
+/// zero, which is what this pin holds.
+///
+/// The count itself is not observable inside this card's limits (a new
+/// store counter would touch `StoreInner`, outside "record_image_copy
+/// … nothing else"), so the pin holds the mechanism through the seeds
+/// that hit the path, at the record level: their post-fix digests are
+/// pinned, and 96 and 190 moved (83795711 → 4266526636 and 813405985 →
+/// 4013865743) — the drop is the only difference. Reverting the guard
+/// (M-LATECOPY-INSTALL) restores the pre-fix digests and fails this
+/// pin; the directed pin
+/// (`late_epoch_copy_must_not_enter_the_next_image`, `tests/store.rs`)
+/// holds the schedule itself.
+#[test]
+fn late_copy_count_is_zero_at_base() {
+    // (seed, post-fix digest); 104 and 161 hit the path too but their
+    // late installs were observably benign pre-fix — the digest is the
+    // same either side, and pinning it keeps them under the pin.
+    const WANT: &[(u64, u64)] = &[
+        (96, 4266526636),
+        (104, 3776021738),
+        (161, 3908247512),
+        (190, 4013865743),
+    ];
+    for (seed, want) in WANT {
+        let rec = workload::run_seed_with(*seed, None, &workload::Tuning::BASE);
+        assert_eq!(
+            rec.digest, *want,
+            "seed {seed}: the late-copy drop is part of BASE — a moved digest means \
+             the install guard is gone (M-LATECOPY-INSTALL) or the drop changed"
+        );
+    }
+}
+
 /// **Q11's seed pin (card X-5c-F4-F1 step 2): P's probe hit.** Seed 4
 /// round 0, under `Tuning::BASE`: the round's WAL crossed into a
 /// recycled segment whose start still held its previous life's
