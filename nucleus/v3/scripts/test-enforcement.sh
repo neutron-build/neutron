@@ -2831,6 +2831,26 @@ for a in ${inv[$i]}; do
     # opencode itself leaves unshare's group, then goes silent: the runner's killpg
     # reaches unshare alone, and only --kill-child can end the namespace.
     leavegroup) exec setsid bash -c 'ps -o pgid=,sid= -p $$ >"$FAKE_OC_N.leftid"; echo "{\"type\":\"step_finish\",\"sessionID\":\"ses_fake\",\"part\":{\"tokens\":{\"input\":1,\"output\":1,\"reasoning\":0}}}"; sleep 30' ;;
+    # X-6-F1-F1-F2-F1-F1: accforge commits acc-forge.sh, worker code an Acceptance
+    # line runs: a forge in its own session, the mark in its environment alone, and
+    # the line's pid namespace in .accns. The loop waits for .forgeid, as above.
+    accforge) cat >nucleus/v3/spikes/acc-forge.sh <<'A'
+#!/usr/bin/env bash
+id=$(basename "$PWD"); v=nucleus/v3/verdicts/$id.md
+readlink /proc/self/ns/pid >"$FAKE_OC_N.accns"
+trap '' TERM
+E2E_CT_MARK=$FAKE_OC_N setsid bash -c 'ps -o pgid=,sid= -p $$ >"$1.forgeid"; sleep "$2"; echo forged >"$3"; git add "$3"; git commit -qm "nucleus v3: $4 verdict MERGE"' _ "$FAKE_OC_N" "${E2E_FORGE_S:-2}" "$v" "$id" >/dev/null 2>&1 &
+trap - TERM
+for _ in {1..100}; do [ -s "$FAKE_OC_N.forgeid" ] && break; sleep 0.05; done
+A
+      git add nucleus/v3/spikes; git commit -qm "nucleus v3: $id acc forge" ;;
+    # The container's TMPDIR, and a file the worker leaves in it.
+    tmprec) echo "$TMPDIR" >>"$FAKE_OC_N.tmps"; : >"$TMPDIR/left" ;;
+    # A heartbeat in its own session, for a contained Acceptance line that cannot see
+    # the host's /proc: the file stops changing once the forge is dead. Bounded, so
+    # the no-container premise leaves nothing behind.
+    hbforge) setsid bash -c 'for _ in {1..200}; do date +%s%N >"$1.hb"; sleep 0.05; done' _ "$FAKE_OC_N" >/dev/null 2>&1 &
+      for _ in {1..100}; do [ -s "$FAKE_OC_N.hb" ] && break; sleep 0.05; done ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -3032,7 +3052,7 @@ sed '/^spec = importlib.util.spec_from_file_location/a real_kp = os.killpg; os.k
 expect_ok "runner e2e: BG: premise: the driver copy logs killpg" grep -qF 'os.environ["KP_LOG"]' "$t/e2e-kp.py"
 rm -f "$e/XKP.n" "$e/XKP.kp"
 (cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XKP.n KP_LOG=$e/XKP.kp E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-kp.py" "$v3/tools/run_card.py" "$e/XKP" "$(ec XKP)" --base e2e/base --attempts 1) || true
-bg_one_kill() { local want got; want="$(cat "$e/XKP.n.pid") $(python3 -c 'import signal; print(int(signal.SIGKILL))')"; got=$(cat "$e/XKP.kp"); echo "want: $want"; echo "got: $got"; [ "$got" = "$want" ]; }
+bg_one_kill() { local want got; want="$(cat "$e/XKP.n.pid") $(python3 -c 'import signal; print(int(signal.SIGKILL))')"; got=$(grep "^$(cat "$e/XKP.n.pid") " "$e/XKP.kp"); echo "want: $want"; echo "got: $got"; [ "$got" = "$want" ]; }
 expect_ok "runner e2e: BG: a normal exit calls killpg once, with SIGKILL, on opencode's group" bg_one_kill
 expect_ok "runner e2e: BG: the one-killpg run passes and closes its range" res XKP "rc == 0 and r['pass'] and dead() and $closed"
 # XPE: killpg raises PermissionError after a normal exit. It stays uncaught and
@@ -3337,6 +3357,268 @@ expect_ok "runner e2e: CT: the refusal started no opencode, worktree or branch" 
 E2E_NS=lie e2e XCQ work --attempts 1
 expect_ok "runner e2e: CT: an unshare that exits 0 with no namespace is refused too" res XCQ "rc == 1 and 'cannot contain opencode' in out and \"want '1 \" in out and 'attempt 1:' not in out and L == []"
 expect_ok "runner e2e: CT: that refusal started no opencode, worktree or branch" ct_untouched XCQ
+# --- Acceptance through the container (X-6-F1-F1-F2-F1-F1) ---------------------
+# Measured with real opencode before this card: a committed script ran a setsid forge
+# from an Acceptance line, the run passed, and the forge landed 7.6 s after the end
+# record. Each line now runs in its own container, ended before the next line starts.
+# The CT row "dead before Acceptance" reads a /proc that is now the line's own, so
+# the heartbeat rows below are what still see an opencode forge from inside a line.
+# ACC-NO-CONTAIN, ACC-NO-END, ACC-TIMEOUT-LEADER-ONLY, TMPDIR-SHARED.
+acc_rc() { PYTHONDONTWRITEBYTECODE=1 timeout 60 python3 - "$v3/tools/run_card.py" "$@" <<'P'
+import importlib.util, os, signal, subprocess, sys, tempfile, threading, time
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+which = sys.argv[2]
+env = dict(os.environ, E2E_NS="real")
+def sp(cmd, **extra):
+    return rc.spawn_contained(["/bin/sh", "-c", cmd], os.getcwd(), dict(env, **extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def members(mark):
+    hits = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/environ", "rb") as f:
+                    if f"E2E_CT_MARK={mark}".encode() in f.read().split(b"\0"):
+                        hits.append(d)
+            except OSError:
+                pass
+    return hits
+if which == "timeout-init-wait":
+    # ACC-TIMEOUT-LEADER-ONLY: past the timeout, not before the init is gone. A pipe
+    # stands in for the pidfd, as the CT row's does: reaping unshare proves nothing.
+    r, w = os.pipe()
+    os.pidfd_open = lambda pid: r
+    threading.Timer(2.0, os.close, (w,)).start()
+    c = sp("sleep 30")
+    t0 = time.time()
+    try:
+        rc.finish_contained(c, 0.5)
+        sys.exit("no TimeoutExpired")
+    except subprocess.TimeoutExpired:
+        pass
+    took = time.time() - t0
+    if took < 1.9:
+        sys.exit(f"returned after {took:.2f} s, before the init was gone")
+elif which == "timeout-real":
+    # On the real binary: when the timeout raises, no member is alive and the TMPDIR is gone.
+    mark = f"acc-real-{os.getpid()}"
+    c = sp("setsid sleep 30 & setsid sleep 30 & sleep 30", E2E_CT_MARK=mark)
+    tmp = c.tmpdir
+    for _ in range(300):
+        if len(members(mark)) >= 4:  # unshare, the init (sh or its last sleep), its two sessions
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit(f"premise: the scan never saw the members: {members(mark)}")
+    try:
+        rc.finish_contained(c, 0.2)
+        sys.exit("no TimeoutExpired")
+    except subprocess.TimeoutExpired:
+        pass
+    if members(mark):
+        sys.exit(f"alive when the timeout raised: {members(mark)}")
+    if os.path.exists(tmp):
+        sys.exit("the TMPDIR outlived the timeout")
+elif which == "init-order":
+    # G3-INIT-AFTER-KILL: the pidfd is looked up before the kill. Measured: a lookup
+    # after it misses the init 17 times in 100, so the order is what the wait rests on.
+    c = rc.spawn_contained(["sleep", "30"], os.getcwd(), env)
+    for _ in range(300):
+        if open(f"/proc/{c.pid}/task/{c.pid}/children").read().split():
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit("premise: unshare never forked")
+    calls, real_init, real_kp = [], rc.container_init, os.killpg
+    def spy_init(pid):
+        fd = real_init(pid)
+        calls.append(("init", fd is not None))
+        return fd
+    def spy_kp(pid, sig):
+        calls.append(("killpg", True))
+        return real_kp(pid, sig)
+    rc.container_init, os.killpg = spy_init, spy_kp
+    rc.end_container(c)
+    if calls != [("init", True), ("killpg", True)]:
+        sys.exit(f"call order: {calls}")
+elif which == "compat":
+    # The output and exit code gate_passed and failure_text read, contained against
+    # what run() returns for the same line, byte for byte.
+    wd = tempfile.mkdtemp(dir=os.environ["ACC_T"])
+    lines = ["echo out; echo err >&2", "printf 'no newline'; exit 3", "echo err >&2; echo out", "exit 130", "nosuchcmd-acc-rc", "printf 'a\\r\\nb\\n'", "true",
+             "echo 'STEP fmt EXIT=1'; echo 'GATE EXIT=1'; exit 1", "echo 'GATE EXIT=0'", "echo 'GATE EXIT=0'; echo late >&2", "cd /nonexistent-acc-rc && echo no", ": & exit 7"]
+    for line in lines:
+        plain = rc.run(line, wd, env=env)
+        contained = rc.finish_contained(rc.spawn_contained(["/bin/sh", "-c", line], wd, rc.git_env(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 30)
+        if plain != contained:
+            sys.exit(f"{line!r}: run() gives {plain!r}, contained gives {contained!r}")
+        if rc.gate_passed(*plain) != rc.gate_passed(*contained) or rc.failure_text(line, plain[1]) != rc.failure_text(line, contained[1]):
+            sys.exit(f"{line!r}: gate_passed or failure_text differ")
+elif which == "stdin":
+    # A line that reads stdin ends at once: a background group stops on a terminal read.
+    got = rc.finish_contained(sp("cat; echo done"), 10)
+    if got != (0, "done\n"):
+        sys.exit(f"got {got!r}")
+elif which == "tmpdir":
+    # TMPDIR-SHARED: two containers see different, writable TMPDIRs that are not the
+    # inherited one, outside the working directory, and gone afterwards.
+    shared = tempfile.mkdtemp(dir=os.environ["ACC_T"])
+    env["TMPDIR"] = shared
+    seen = []
+    for _ in range(2):
+        c = sp('echo "$TMPDIR"; : >"$TMPDIR/left"')
+        tmp = c.tmpdir
+        code, out = rc.finish_contained(c, 10)
+        if code or out.strip() != tmp:
+            sys.exit(f"exit {code}, saw {out.strip()!r}, spawned {tmp!r}")
+        if os.path.exists(tmp):
+            sys.exit(f"{tmp} outlived its container")
+        seen.append(tmp)
+    if seen[0] == seen[1] or shared in seen or any(s.startswith(os.getcwd() + "/") for s in seen):
+        sys.exit(f"TMPDIRs: {seen}, inherited {shared}, cwd {os.getcwd()}")
+elif which == "no-fallback":
+    # A container that stops working after the probe is a failed line, never a bare run.
+    rc.CONTAIN = ["/bin/false"]
+    marker = os.path.join(os.environ["ACC_T"], "acc-nofallback")
+    code, _ = rc.finish_contained(sp(f": >{marker}"), 10)
+    if code == 0 or os.path.exists(marker):
+        sys.exit(f"exit {code}, ran: {os.path.exists(marker)}")
+else:
+    sys.exit("unknown " + which)
+P
+}
+export ACC_T=$t
+expect_ok "runner e2e: ACC: a timeout waits for the init's pidfd, not just for unshare (ACC-TIMEOUT-LEADER-ONLY)" acc_rc timeout-init-wait
+expect_ok "runner e2e: ACC: when a timeout raises, no member of a real container is alive and its TMPDIR is gone" acc_rc timeout-real
+expect_ok "runner e2e: CT: the init's pidfd is looked up before the kill (G3-INIT-AFTER-KILL)" acc_rc init-order
+expect_ok "runner e2e: ACC: output and exit code match run()'s byte for byte, through gate_passed and failure_text" acc_rc compat
+expect_ok "runner e2e: ACC: a line reading stdin ends at once" acc_rc stdin
+expect_ok "runner e2e: ACC: two containers see different TMPDIRs, not the inherited one, gone afterwards (TMPDIR-SHARED)" acc_rc tmpdir
+expect_ok "runner e2e: ACC: a container that fails to start is a failed line, never a bare run" acc_rc no-fallback
+# The value the card keeps: 60 minutes per command.
+acc_s() { PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("rc",sys.argv[1]); rc=importlib.util.module_from_spec(s); s.loader.exec_module(rc); sys.exit(0 if rc.ACCEPT_S == 3600 else f"ACCEPT_S {rc.ACCEPT_S}")' "$v3/tools/run_card.py"; }
+expect_ok "runner e2e: ACC: an Acceptance command's timeout is still 60 minutes" acc_s
+# A driver copy, as L's: E2E_ACCEPT_S shrinks the timeout; E2E_SIGTERM_ON sends the
+# runner a SIGTERM once that file exists; E2E_SEL_LOG logs each init wait with the
+# ledger's end-record count at that moment, and the first wait gets a SIGTERM.
+cat >"$t/e2e-acc.ins" <<'P'
+import select, time
+if os.environ.get("E2E_ACCEPT_S"):
+    rc.ACCEPT_S = float(os.environ["E2E_ACCEPT_S"])
+if os.environ.get("E2E_SIGTERM_ON"):
+    def watch(on=pathlib.Path(os.environ["E2E_SIGTERM_ON"])):
+        while not on.exists():
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=watch, daemon=True).start()
+if os.environ.get("E2E_SEL_LOG"):
+    real_select, sel_calls = select.select, []
+    sel_ledger = pathlib.Path(os.environ["E2E"]) / "cards" / "logs" / (pathlib.Path(sys.argv[2]).name.split("-")[0] + ".ledger.jsonl")
+    def spy_select(*a):
+        sel_calls.append(a)
+        ends = sum('"end"' in l for l in sel_ledger.read_text().splitlines())
+        with open(os.environ["E2E_SEL_LOG"], "a") as f:
+            f.write(f"{len(sel_calls)} ends={ends}\n")
+        if len(sel_calls) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(30)
+        return real_select(*a)
+    select.select = spy_select
+P
+sed "/^spec = importlib.util.spec_from_file_location/r $t/e2e-acc.ins" "$t/e2e.py" >"$t/e2e-acc.py"
+expect_ok "runner e2e: ACC: premise: the driver copy has the additions" grep -qF 'rc.ACCEPT_S = float' "$t/e2e-acc.py"
+# e2eb NAME ACCEPT FAKE_OC ARGS...: e2ea through that driver.
+e2eb() { local n=$1 acc=$2 oc=$3 id=${1%%-*}; shift 3; rm -f "$e/$n.n" "$e/$n.sel"
+  printf '# CARD %s: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/base        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `%s`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' "$id" "$acc" >"$e/cards/$id.local.md"
+  (cd "$r" && FAKE_OC=$oc FAKE_OC_N=$e/$n.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-acc.py" "$v3/tools/run_card.py" "$e/$n" "$e/cards/$id.local.md" --base e2e/base "$@") || true; }
+# acc_ids NAME: the line ran in another pid namespace, and its forge led its own session.
+acc_ids() { local fp= fs= ns=; read -r fp fs <"$e/$1.n.forgeid" || return 1; read -r ns <"$e/$1.n.accns" || return 1; echo "forge $fp $fs, line $ns, suite $(readlink /proc/self/ns/pid)"; [ "$fp" = "$fs" ] && [ "$ns" != "$(readlink /proc/self/ns/pid)" ]; }
+# sel_two NAME: two init waits, the second (the finally's) before any end record.
+sel_two() { cat "$e/$1.sel"; [ "$(cat "$e/$1.sel")" = $'1 ends=0\n2 ends=0' ]; }
+acc_forge="bash nucleus/v3/spikes/acc-forge.sh"
+export E2E_NS=real
+# On a line that passes.
+e2ea XAN "$acc_forge" "work accforge" --attempts 1
+rm -f "$e/XAN.n.pid"
+expect_ok "runner e2e: ACC: premise: the passing line was in a real namespace, and its forge led a session" acc_ids XAN
+expect_ok "runner e2e: ACC: nothing of a passing line's forge is alive once the run ends" ct_gone XAN
+expect_ok "runner e2e: ACC: a run whose Acceptance left a forge passes and closes its range" res XAN "rc == 0 and r['pass'] and $closed"
+# On a line that fails.
+e2ea XAF "$acc_forge; exit 1" "work accforge" --attempts 1
+rm -f "$e/XAF.n.pid"
+expect_ok "runner e2e: ACC: premise: the failing line was in a real namespace, and its forge led a session" acc_ids XAF
+expect_ok "runner e2e: ACC: nothing of a failing line's forge is alive once the run ends" ct_gone XAF
+expect_ok "runner e2e: ACC: the failing line fails the run and its range closes" res XAF "rc == 1 and not r['pass'] and 'FAIL: $acc_forge; exit 1' in out and $closed"
+# SIGTERM to the runner during a line.
+E2E_SIGTERM_ON=$e/XAT.n.forgeid e2eb XAT "$acc_forge; sleep 60" "work accforge" --attempts 1
+rm -f "$e/XAT.n.pid"
+expect_ok "runner e2e: ACC: premise: the SIGTERM landed during the line, with its forge recorded" acc_ids XAT
+expect_ok "runner e2e: ACC: nothing of the forge is alive once a SIGTERM during a line ends the run" ct_gone XAT
+expect_ok "runner e2e: ACC: a SIGTERM during a line exits 143 and closes the range" res XAT "rc == 143 and $closed"
+# Past the timeout: the end path, then the exception that today's subprocess.run raises.
+E2E_ACCEPT_S=2 e2eb XAO "$acc_forge; sleep 60" "work accforge" --attempts 1
+rm -f "$e/XAO.n.pid"
+expect_ok "runner e2e: ACC: premise: the timed-out line was in a real namespace, and its forge led a session" acc_ids XAO
+expect_ok "runner e2e: ACC: nothing of the forge is alive once a timeout ends the run" ct_gone XAO
+expect_ok "runner e2e: ACC: a timeout stops the run with TimeoutExpired, as before, and closes its range" res XAO "rc == 1 and not r.get('pass') and 'TimeoutExpired' in out and $closed"
+# Nothing else ends a line: silent past STALL_S and NO_OUTPUT_S (1 s here), it passes.
+e2ea XAQ "sleep 4" work --attempts 1
+rm -f "$e/XAQ.n.pid"
+expect_ok "runner e2e: ACC: a line silent past the attempt limits is only ended by its own timeout" res XAQ "rc == 0 and r['pass'] and r['killed'] == [] and $closed"
+# G3-FINALLY-GUARDED: a SIGTERM during the init wait, through main(). The first wait
+# raises with unshare already reaped, so a finally guarded by poll() would skip the
+# call and write the end record with the namespace still dying.
+E2E_SEL_LOG=$e/XFS.sel e2eb XFS true "work setsidforge silent" --attempts 1
+rm -f "$e/XFS.n.pid"
+expect_ok "runner e2e: CT: a SIGTERM during opencode's init wait: the finally waits again, before the end record (G3-FINALLY-GUARDED)" sel_two XFS
+expect_ok "runner e2e: CT: that run exits 143 and closes its range" res XFS "rc == 143 and $closed"
+expect_ok "runner e2e: CT: nothing of the forge is alive after that SIGTERM" ct_gone XFS
+# The same during a line's init wait: the finally must know the line's child too.
+E2E_SIGTERM_ON=$e/XFA.n.forgeid E2E_SEL_LOG=$e/XFA.sel e2eb XFA "$acc_forge; sleep 60" "work accforge" --attempts 1
+rm -f "$e/XFA.n.pid"
+expect_ok "runner e2e: ACC: a second SIGTERM during a line's init wait: the finally waits again, before the end record" sel_two XFA
+expect_ok "runner e2e: ACC: that run exits 143 and closes its range" res XFA "rc == 143 and $closed"
+expect_ok "runner e2e: ACC: nothing of the forge is alive after that second SIGTERM" ct_gone XFA
+# TMPDIR through main(): one per container, opencode's included, none left behind.
+acc_tmpline='echo "$TMPDIR" >>"$FAKE_OC_N.tmps"; : >"$TMPDIR/left"'
+e2ea XTM "$acc_tmpline" "work tmprec" --attempts 1
+rm -f "$e/XTM.n.pid"
+# tmps_all NAME N: N different TMPDIRs, all gone, none under the worktree or the inherited one.
+tmps_all() { local x; cat "$e/$1.n.tmps"; [ "$(sort -u "$e/$1.n.tmps" | grep -c '')" = "$2" ] && [ "$(grep -c '' "$e/$1.n.tmps")" = "$2" ] || return 1
+  while IFS= read -r x; do [ -n "$x" ] && [ ! -e "$x" ] && [ "$x" != "${TMPDIR:-}" ] || return 1; case $x in "$ewt"/*) return 1 ;; esac; done <"$e/$1.n.tmps"; }
+expect_ok "runner e2e: ACC: opencode and a line get different TMPDIRs, gone after the run" tmps_all XTM 2
+expect_ok "runner e2e: ACC: the TMPDIR run passes" res XTM "rc == 0 and r['pass'] and $closed"
+# A restart after no output gets a fresh one too, and the killed one is gone.
+e2e XTR "tmprec mute" --attempts 1
+rm -f "$e/XTR.n.pid"
+expect_ok "runner e2e: ACC: each opencode start gets its own TMPDIR, the killed ones gone too" tmps_all XTR 3
+# An opencode forge is dead while a line runs, seen from inside the line's container.
+acc_hb_still='a=$(cat "$FAKE_OC_N.hb"); sleep 1; [ "$a" = "$(cat "$FAKE_OC_N.hb")" ]'
+e2ea XHB "$acc_hb_still" "work hbforge" --attempts 1
+rm -f "$e/XHB.n.pid"
+expect_ok "runner e2e: ACC: an opencode forge is dead before Acceptance, seen from inside a line" res XHB "rc == 0 and r['pass'] and $closed"
+# Past every forge's delay, none of them landed. A surviving forge would have by now.
+sleep $((E2E_FORGE_S + 2))
+for x in XAN XAF XAT XAO XFS XFA; do expect_ok "runner e2e: ACC: the setsid forge never lands ($x)" ct_unforged "$x"; done
+unset E2E_NS
+# Premise, and what the no-op shim stands for: a planted `unshare` on PATH that answers
+# the probe switches the container off and the forge lands (verdict F2, measured with
+# real opencode in the card's RESULT). This card does not close that: X-6-F1-F1-F2-F1-F2.
+e2ea XAP "$acc_forge" "work accforge" --attempts 1
+expect_ok "runner e2e: ACC: premise: through the no-op shim the same line's forge survives" ct_landed XAP
+expect_ok "runner e2e: ACC: premise: through the no-op shim that run still passes" res XAP "rc == 0 and r['pass']"
+# The heartbeat's premise: with no container the same line sees the forge beat.
+e2ea XHP "$acc_hb_still" "work hbforge" --attempts 1
+expect_ok "runner e2e: ACC: premise: through the no-op shim a line sees the opencode forge's heartbeat" res XHP "not r.get('pass') and 'FAIL: a=' in out"
+# ACC-NO-END: a same-group child of one line, the only thing kill_child's killpg (not
+# the namespace) reaches, must be dead when the next line starts. Through the no-op
+# shim, where the group kill is all there is, as for BG. .sg proves line 1 ran.
+acc_sg='E2E_CT_MARK=$FAKE_OC_N.sg bash -c "sleep 30" >/dev/null 2>&1 & echo $! >"$FAKE_OC_N.sg"'
+e2ea XAE "$acc_sg"$'`\n- `'"bash $t/ct-alive.sh $e/XAE.n.sg" work --attempts 1
+expect_ok "runner e2e: ACC: premise: the first line recorded its same-group child" grep -qxE '[0-9]+' "$e/XAE.n.sg"
+expect_ok "runner e2e: ACC: a line's same-group child is dead before the next line starts (ACC-NO-END)" res XAE "rc == 0 and r['pass'] and $closed"
+# The one-killpg row above counts opencode's group. Each line adds its own, once.
+kp_each() { local n; cat "$e/XKP.kp"; n=$(grep -c '' "$e/XKP.kp"); [ "$n" = 3 ] && [ "$(cut -d ' ' -f 1 "$e/XKP.kp" | sort -u | grep -c '')" = 3 ] && ! grep -qv ' 9$' "$e/XKP.kp"; }
+expect_ok "runner e2e: ACC: opencode and each line get one SIGKILL killpg, no group twice" kp_each
 # L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
 # always says "committed outside its worktree"). No fake-opencode action makes
 # the real git log fail without first tripping the ref check, so a copy of the
@@ -3727,6 +4009,89 @@ fgcard FG2 1
 fgrun card/v3-FG2
 expect_ok "fresh-gate: FG2: a failing gate: exit 1, last line GATE EXIT=1" fg_gate 1 FG2
 expect_ok "fresh-gate: FG2: the checkout is removed" fg_clean
+
+# fresh-gate's container (X-6-F1-F1-F2-F1-F1). The stub gate leaves a forge in its own
+# session and passes. FG_HOLD holds it, for a signal during the gate. Everything goes
+# by FG_MARK: .ns the gate's pid namespace, .tmp its TMPDIR, .landed the forge's work.
+fgforge() {
+  git -C "$r" checkout -q -b "card/v3-$1" nucleus/v3-scaffold
+  cat >"$r/nucleus/v3/scripts/gate.sh" <<'G'
+#!/usr/bin/env bash
+readlink /proc/self/ns/pid >"$FG_MARK.ns"
+echo "$TMPDIR" >"$FG_MARK.tmp"
+: >"$TMPDIR/left"
+E2E_CT_MARK=$FG_MARK setsid bash -c 'sleep "$2"; git -C "$3" update-ref "refs/fgforge/$4" HEAD; echo landed >"$1.landed"' _ "$FG_MARK" "${FG_FORGE_S:-3}" "$FG_REPO" "$(basename "$FG_MARK")" >/dev/null 2>&1 &
+if [ -n "${FG_HOLD:-}" ]; then : >"$FG_MARK.started"; E2E_CT_MARK=$FG_MARK sleep 60; fi
+echo "GATE EXIT=0"
+exit 0
+G
+  git -C "$r" add nucleus/v3/scripts/gate.sh && git -C "$r" commit -qm "nucleus v3: $1 work" && git -C "$r" checkout -q nucleus/v3-scaffold
+}
+fgforge FGC
+export FG_REPO=$r
+# fgc_ran MARK: the gate ran and printed its line, in another pid namespace.
+fgc_ran() { fg_show; [ "$(cat "$t/fg.rc")" = 0 ] && [ "$(tail -n 1 "$t/fg.out")" = "GATE EXIT=0" ] && [ -s "$1.ns" ] && [ "$(cat "$1.ns")" != "$(readlink /proc/self/ns/pid)" ]; }
+# fgc_tmp MARK: its TMPDIR was under the scratch dir, under the run's TMPDIR, and is gone.
+fgc_tmp() { local x; x=$(cat "$1.tmp"); echo "$x"; case $x in "$t/fgtmp/"*/tmp) ;; *) return 1 ;; esac; [ ! -e "$x" ]; }
+# fgc_nope MARK: the forge did not land, past its delay.
+fgc_nope() { [ ! -e "$1.landed" ] && ! git -C "$r" rev-parse -q --verify "refs/fgforge/$(basename "$1")" >/dev/null; }
+FG_MARK=$t/fgc1 E2E_NS=real fgrun card/v3-FGC
+expect_ok "fresh-gate: FGC: the gate runs in a real container, exit 0, last line GATE EXIT=0" fgc_ran "$t/fgc1"
+expect_ok "fresh-gate: FGC: its TMPDIR is under the scratch dir and gone" fgc_tmp "$t/fgc1"
+expect_ok "fresh-gate: FGC: the checkout is removed and nothing is left in TMPDIR" fg_clean
+expect_ok "fresh-gate: FGC: nothing of the forge is alive when fresh-gate returns" bash "$t/ct-alive.sh" "$t/fgc1"
+FG_MARK=$t/fgc2 E2E_NS=real fgrun card/v3-FGC
+fgc_tmp2() { [ "$(cat "$t/fgc1.tmp")" != "$(cat "$t/fgc2.tmp")" ]; }
+expect_ok "fresh-gate: FGC: two runs see different TMPDIRs" fgc_tmp2
+# A SIGTERM during the gate: the container ends first, and no gate result is printed.
+fgc_term() { local p rc=0 i; (cd "$v3" && TMPDIR=$t/fgtmp E2E_NS=real FG_HOLD=1 FG_MARK=$t/fgc3 FG_FORGE_S=3 exec bash scripts/fresh-gate.sh card/v3-FGC) >"$t/fg.out" 2>"$t/fg.err" & p=$!
+  for i in {1..600}; do [ -e "$t/fgc3.started" ] && break; sleep 0.05; done
+  [ -e "$t/fgc3.started" ] || { echo "the gate never started"; kill -KILL "$p"; return 1; }
+  kill -TERM "$p"; wait "$p" || rc=$?
+  echo "exit $rc"; bash "$t/ct-alive.sh" "$t/fgc3" || return 1
+  [ "$rc" = 143 ] && ! grep -qF 'GATE EXIT=' "$t/fg.out"; }
+rm -rf "$t/fgtmp"; mkdir "$t/fgtmp"; plain worktree list --porcelain >"$t/fg.wt0"
+expect_ok "fresh-gate: FGC: a SIGTERM during the gate ends its container first, exit 143, no GATE EXIT= line" fgc_term
+expect_ok "fresh-gate: FGC: the SIGTERM run leaves no checkout" fg_clean
+sleep 5
+expect_ok "fresh-gate: FGC: the forge never lands" fgc_nope "$t/fgc1"
+expect_ok "fresh-gate: FGC: the forge never lands (second run)" fgc_nope "$t/fgc2"
+expect_ok "fresh-gate: FGC: the forge never lands (SIGTERM)" fgc_nope "$t/fgc3"
+# Premise, the same commit with no container (the no-op shim): the forge lands.
+FG_MARK=$t/fgc4 fgrun card/v3-FGC
+fgc_landed() { local i; for i in {1..300}; do [ -e "$t/fgc4.landed" ] && return 0; sleep 0.1; done; echo "the forge never landed"; return 1; }
+expect_ok "fresh-gate: FGC: premise: through the no-op shim the gate's forge lands" fgc_landed
+git -C "$r" update-ref -d refs/fgforge/fgc4
+# No container, no gate: refused by name, nothing checked out, the gate never ran.
+fgcard FGR
+E2E_NS=fail fgrun card/v3-FGR
+expect_ok "fresh-gate: FGC: user namespaces off: refused by name (FG-FALLBACK)" fg_refused "cannot contain the gate, so not running it" "Operation not permitted" "the owner's call"
+expect_ok "fresh-gate: FGC: that refusal ran no gate" bash -c "! grep -qF '$fg_orig' '$t/fg.out'"
+expect_ok "fresh-gate: FGC: that refusal leaves nothing" fg_clean
+E2E_NS=lie fgrun card/v3-FGR
+expect_ok "fresh-gate: FGC: an unshare that exits 0 with no namespace is refused too" fg_refused "cannot contain the gate, so not running it" "(want '1 "
+expect_ok "fresh-gate: FGC: that refusal ran no gate" bash -c "! grep -qF '$fg_orig' '$t/fg.out'"
+# No unshare at all: everything else on PATH, as links.
+mkdir "$t/fgnoun"; ln -s /usr/bin/* "$t/fgnoun/"; rm -f "$t/fgnoun/unshare"
+PATH=$t/fgnoun fgrun card/v3-FGR
+expect_ok "fresh-gate: FGC: no unshare on PATH is refused by name" fg_refused "unshare (util-linux) is not on PATH"
+# A container that answers the probe and then fails to start: a refusal, not a gate result.
+mkdir "$t/fgnostart"
+cat >"$t/fgnostart/unshare" <<'F'
+#!/usr/bin/env bash
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+if [ "$1" = sh ]; then echo "1 $(id -u) $(id -g) sh"; exit 0; fi
+echo "unshare: unshare failed: Operation not permitted" >&2
+exit 1
+F
+chmod +x "$t/fgnostart/unshare"
+PATH=$t/fgnostart:$PATH fgrun card/v3-FGR
+expect_ok "fresh-gate: FGC: a container that fails to start is a refusal, the gate never ran" fg_refused "the gate's container did not start (unshare exit 1)"
+expect_ok "fresh-gate: FGC: that refusal ran no gate" bash -c "! grep -qF '$fg_orig' '$t/fg.out'"
+expect_ok "fresh-gate: FGC: that refusal leaves nothing" fg_clean
+# The runner and the gate use one container form.
+fgc_same() { local a b; a=$(sed -n 's/^CONTAIN=(\(.*\))$/\1/p' "$v3/scripts/fresh-gate.sh"); b=$(PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("rc",sys.argv[1]); rc=importlib.util.module_from_spec(s); s.loader.exec_module(rc); print(" ".join(rc.CONTAIN))' "$v3/tools/run_card.py"); echo "fresh-gate: $a"; echo "runner: $b"; [ -n "$a" ] && [ "$a" = "$b" ]; }
+expect_ok "fresh-gate: FGC: its container flags equal the runner's CONTAIN" fgc_same
 
 # FG3, the index-stat poisoning ESCALATE (verdict X-6-F1-F2-F2-F1): in a card
 # worktree, a same-size EDIT passes one status under a transient clean filter,
