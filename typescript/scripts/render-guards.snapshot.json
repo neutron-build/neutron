@@ -7,7 +7,7 @@
     ".neutron-public/blog/static-vs-app-routes/index.html": "f965df45ca7deb8b3a950dd8290f2e300f9b473dd159340b2d87dad7ca0eaecf",
     ".neutron-public/error-demo/index.html": "6b5009eb8402e5d4633845f68ed04b0dfcb2d5dc4dcbc44f748ba2a49644474d",
     ".neutron-public/index.html": "5548e77cb1cb1b3119c58be8d7613bd7352335d96024ec61fe206773e7e9c530",
-    ".neutron-public/islands/index.html": "173bd52ce5c52747d839caa51ea874bd8fc48a01cc770e7041d39a199b450792",
+    ".neutron-public/islands/index.html": "a9fb409ea331754a735a18c6e0393136c696efb901bd33abb8257ad2758909cc",
     ".neutron-public/login/index.html": "4930dbf0345af94c6f7ea0e83036a8b38e4d411e0c097382068e5cee1a2cbc5b",
     "about/index.html": "6a8bf4eaa35b1b93b9b1517cdbce758f76562e7befa0db20ecbeea352ff44c5e",
     "blog/getting-started/index.html": "a6a608e90187429f5eb7e5870c14ddbcdba5020945b571b1029cac66e60d76fc",
@@ -16,8 +16,8 @@
     "blog/static-vs-app-routes/index.html": "f965df45ca7deb8b3a950dd8290f2e300f9b473dd159340b2d87dad7ca0eaecf",
     "error-demo/index.html": "6b5009eb8402e5d4633845f68ed04b0dfcb2d5dc4dcbc44f748ba2a49644474d",
     "index.html": "5548e77cb1cb1b3119c58be8d7613bd7352335d96024ec61fe206773e7e9c530",
-    "islands/index.html": "173bd52ce5c52747d839caa51ea874bd8fc48a01cc770e7041d39a199b450792",
+    "islands/index.html": "a9fb409ea331754a735a18c6e0393136c696efb901bd33abb8257ad2758909cc",
     "login/index.html": "4930dbf0345af94c6f7ea0e83036a8b38e4d411e0c097382068e5cee1a2cbc5b"
   },
-  "serverBundleGzBytes": 57765
+  "serverBundleGzBytes": 60346
 }
