@@ -242,7 +242,10 @@ func backfillValidateRelations(ctx context.Context, q pgQueryer, s BackfillSpec,
 		}
 	}
 	var constraints int
-	if err := q.QueryRow(ctx, `SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint WHERE conrelid=$1`, checkpoint.OID).Scan(&constraints); err != nil {
+	// PostgreSQL 18 catalogs each NOT NULL as a contype 'n' row. The column loop
+	// above already requires attnotnull, but attnotnull is also set for a NOT VALID
+	// constraint that may still admit NULLs, so only validated ones are excluded.
+	if err := q.QueryRow(ctx, `SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint WHERE conrelid=$1 AND NOT (contype='n' AND convalidated)`, checkpoint.OID).Scan(&constraints); err != nil {
 		return err
 	}
 	if constraints != 1 {

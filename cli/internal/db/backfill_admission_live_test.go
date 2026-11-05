@@ -97,6 +97,7 @@ func TestBackfillNativeCatalogAndPolicyAdmission(t *testing.T) {
 		"extra checkpoint column": `ALTER TABLE public.progress ADD COLUMN unknown text`,
 		"checkpoint domain":       `CREATE DOMAIN public.text AS pg_catalog.text;ALTER TABLE public.progress ALTER COLUMN format TYPE public.text`,
 		"unlogged checkpoint":     `ALTER TABLE public.progress SET UNLOGGED`,
+		"extra_checkpoint_check":  `ALTER TABLE public.progress ADD CONSTRAINT extra CHECK (chunks >= 0)`,
 	}
 	for name, ddl := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -113,5 +114,18 @@ func TestBackfillNativeCatalogAndPolicyAdmission(t *testing.T) {
 				t.Fatal("admission refusal mutated native state")
 			}
 		})
+	}
+}
+
+// PostgreSQL 18 only: a NOT VALID NOT NULL sets attnotnull while NULLs may remain,
+// so it must not count as the validated NOT NULL a checkpoint column requires.
+func TestBackfillNativeRefusesNotValidCheckpointNotNull(t *testing.T) {
+	h, job := newBackfillHarness(t)
+	if h.queryOne(`SELECT (current_setting('server_version_num')::int < 180000)::text`) == "true" {
+		t.Skip("NOT VALID NOT NULL constraints require PostgreSQL 18")
+	}
+	h.exec(`ALTER TABLE public.progress ALTER COLUMN chunks DROP NOT NULL;ALTER TABLE public.progress ADD CONSTRAINT chunks_set NOT NULL chunks NOT VALID`)
+	if _, err := InspectBackfillJob(context.Background(), h.client, job.Spec); err == nil {
+		t.Fatal("NOT VALID checkpoint NOT NULL admitted")
 	}
 }
