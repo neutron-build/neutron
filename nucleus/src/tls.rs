@@ -396,7 +396,7 @@ mod tests {
     ) -> (Result<(), String>, bool) {
         use tokio::io::AsyncReadExt;
         let (a, b) = tokio::io::duplex(4096);
-        let acceptor = pgwire::tokio::tokio_rustls::TlsAcceptor::from(acceptor.clone());
+        let acceptor = acceptor.clone();
         let server = tokio::spawn(async move {
             acceptor
                 .accept(a)
@@ -407,30 +407,25 @@ mod tests {
         let name = rustls::pki_types::ServerName::try_from("localhost".to_string())
             .expect("valid server name");
         let client_task = tokio::spawn(async move {
-            let connected = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.connect(name, b),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.ok());
+            let connected =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.connect(name, b))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok());
             let Some(mut stream) = connected else {
                 return false;
             };
             // Hold the connection open until the server side finishes and
             // drops its end (EOF) or errors.
             let mut buf = [0u8; 64];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                stream.read(&mut buf),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+                .await;
             true
         });
         let server_result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .expect("server handshake task finishes")
-            .unwrap_or_else(|_| Ok(()));
+            .unwrap_or(Ok(()));
         let client_ok = tokio::time::timeout(std::time::Duration::from_secs(5), client_task)
             .await
             .map(|r| r.unwrap_or(false))
@@ -438,10 +433,7 @@ mod tests {
         (server_result, client_ok)
     }
 
-    fn client_connector(
-        ca_pem: &str,
-        client_cert_pem: Option<(&str, &str)>,
-    ) -> TlsConnector {
+    fn client_connector(ca_pem: &str, client_cert_pem: Option<(&str, &str)>) -> TlsConnector {
         let mut roots = rustls::RootCertStore::empty();
         let ca = rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
@@ -479,14 +471,12 @@ mod tests {
     async fn mtls_acceptor_rejects_certless_handshake() {
         // Build a real CA and have it sign both the server and a client cert.
         let ca_key = rcgen::KeyPair::generate().unwrap();
-        let mut ca_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let server_key = rcgen::KeyPair::generate().unwrap();
-        let server_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let server_cert = server_params
             .signed_by(&server_key, &ca_cert, &ca_key)
             .unwrap();
@@ -502,20 +492,25 @@ mod tests {
         let cert_path = write_temp_file(&dir, "server.pem", &server_cert.pem());
         let key_path = write_temp_file(&dir, "server.key", &server_key.serialize_pem());
 
-        let _guard = TLS_ENV_LOCK.lock().unwrap();
-        // SAFETY: test-only env mutation, serialized by TLS_ENV_LOCK and
-        // restored before return.
-        unsafe {
-            std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
-            std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
-        }
-        let acceptor = setup_tls_with_client_ca(Some(&ca_path))
-            .expect("valid mTLS configuration")
-            .expect("acceptor");
-        unsafe {
-            std::env::remove_var("NUCLEUS_TLS_CERT");
-            std::env::remove_var("NUCLEUS_TLS_KEY");
-        }
+        // The env lock is scoped to building the acceptor: it is a std
+        // Mutex, and the handshakes below await.
+        let acceptor = {
+            let _guard = TLS_ENV_LOCK.lock().unwrap();
+            // SAFETY: test-only env mutation, serialized by TLS_ENV_LOCK and
+            // restored before the guard drops.
+            unsafe {
+                std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
+                std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
+            }
+            let acceptor = setup_tls_with_client_ca(Some(&ca_path))
+                .expect("valid mTLS configuration")
+                .expect("acceptor");
+            unsafe {
+                std::env::remove_var("NUCLEUS_TLS_CERT");
+                std::env::remove_var("NUCLEUS_TLS_KEY");
+            }
+            acceptor
+        };
 
         // Client trusts the CA but presents NO certificate. The server MUST
         // abort the handshake. (The client may locally complete its TLS 1.3

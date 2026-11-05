@@ -3,18 +3,29 @@ use tauri::Wry;
 
 pub fn init() -> TauriPlugin<Wry> {
     tauri::plugin::Builder::new("neutron-shell")
-        .invoke_handler(tauri::generate_handler![open_url, open_path, reveal_in_finder])
+        .invoke_handler(tauri::generate_handler![open_url, reveal_in_finder])
         .build()
+}
+
+/// URL schemes `open_url` hands to the OS. Anything else (file:, custom
+/// protocol handlers, javascript:, ...) could launch local programs or files.
+const ALLOWED_URL_SCHEMES: &[&str] = &["https", "mailto"];
+
+fn check_url(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    if !ALLOWED_URL_SCHEMES.contains(&parsed.scheme()) {
+        return Err(format!(
+            "URL scheme not allowed: {} (allowed: https, mailto)",
+            parsed.scheme()
+        ));
+    }
+    Ok(parsed)
 }
 
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
-    open::that(&url).map_err(|e| format!("failed to open URL: {e}"))
-}
-
-#[tauri::command]
-async fn open_path(path: String) -> Result<(), String> {
-    open::that(&path).map_err(|e| format!("failed to open path: {e}"))
+    let parsed = check_url(&url)?;
+    open::that(parsed.as_str()).map_err(|e| format!("failed to open URL: {e}"))
 }
 
 /// Reveal a file or folder in the platform file manager (Finder, Explorer, Nautilus).
@@ -60,5 +71,21 @@ mod tests {
     fn test_init_creates_plugin() {
         // Verify the plugin builder doesn't panic
         let _plugin = super::init();
+    }
+
+    #[test]
+    fn open_url_allows_only_https_and_mailto() {
+        assert!(super::check_url("https://neutron.build/docs").is_ok());
+        assert!(super::check_url("mailto:hello@example.com").is_ok());
+        for bad in [
+            "http://example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "smb://host/share",
+            "/Applications/Calculator.app",
+            "not a url",
+        ] {
+            assert!(super::check_url(bad).is_err(), "{bad} must be refused");
+        }
     }
 }

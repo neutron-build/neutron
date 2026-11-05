@@ -149,9 +149,11 @@ started with `--allow-writes`; it runs one statement in its own transaction,
 commits it, and reports the touched models' actual limits. `query_sql` stays
 read-only either way. Over HTTP, `--allow-writes` also requires
 `NEUTRON_MCP_TOKEN`, and the HTTP transport binds `127.0.0.1` unless `--host`
-says otherwise. The HTTP transport answers only requests addressed to
-`localhost`, an IP address or the `--host` name, and only browser origins
-that are localhost or that same address (DNS-rebinding protection).
+says otherwise; a non-loopback `--host` requires `NEUTRON_MCP_TOKEN`, which is
+then checked on every request. The HTTP transport answers only requests
+addressed to `localhost`, a loopback address or the `--host` name, and only
+browser origins listed with `--allow-origin` (default none; DNS-rebinding
+protection).
 `migration_status` reads only the `--migrations` directory.
 
 **Structured, redacted results.** Each result carries the engine, the access

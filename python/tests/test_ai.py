@@ -921,15 +921,32 @@ class TestMemory:
 # ============================================================================
 
 
+def _allow(request):
+    return {"name": "test"}
+
+
+async def _bearer_auth(request):
+    if request.headers.get("authorization") == "Bearer good":
+        return {"name": "agent"}
+    return None
+
+
+_AUTH = {"Authorization": "Bearer good"}
+
+
 class TestMCPServer:
+    def test_mcp_server_requires_authorize(self):
+        with pytest.raises(TypeError):
+            MCPServer()  # type: ignore[call-arg]
+
     def test_mcp_server_init(self):
-        mcp = MCPServer(name="test-tools")
+        mcp = MCPServer(name="test-tools", authorize=_allow)
         assert mcp.name == "test-tools"
         assert mcp._tools == {}
         assert mcp._resources == {}
 
     def test_mcp_tool_registration(self):
-        mcp = MCPServer()
+        mcp = MCPServer(authorize=_allow)
 
         @mcp.tool()
         async def search(query: str) -> list:
@@ -941,7 +958,7 @@ class TestMCPServer:
         assert mcp._tools["search"].description == "Search the database."
 
     def test_mcp_tool_custom_name(self):
-        mcp = MCPServer()
+        mcp = MCPServer(authorize=_allow)
 
         @mcp.tool(name="custom_search")
         async def search(query: str) -> list:
@@ -952,7 +969,7 @@ class TestMCPServer:
         assert "search" not in mcp._tools
 
     def test_mcp_resource_registration(self):
-        mcp = MCPServer()
+        mcp = MCPServer(authorize=_allow)
 
         @mcp.resource("users://{user_id}")
         async def get_user(user_id: str) -> dict:
@@ -985,7 +1002,12 @@ class TestMCPServerHTTP:
     """Test MCP server via ASGI (httpx + ASGITransport)."""
 
     def _build_mcp(self) -> MCPServer:
-        mcp = MCPServer(name="test-server", version="1.0.0")
+        mcp = MCPServer(
+            name="test-server",
+            version="1.0.0",
+            authorize=_bearer_auth,
+            allowed_origins=["https://app.example"],
+        )
 
         @mcp.tool()
         async def add(a: int, b: int) -> int:
@@ -1004,7 +1026,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/")
             assert resp.status_code == 200
             data = resp.json()
@@ -1017,7 +1041,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/tools")
             assert resp.status_code == 200
             tools = resp.json()["tools"]
@@ -1029,7 +1055,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.post("/tools/add", json={"a": 3, "b": 4})
             assert resp.status_code == 200
             assert resp.json()["result"] == 7
@@ -1039,7 +1067,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.post("/tools/nonexistent", json={})
             assert resp.status_code == 404
 
@@ -1048,7 +1078,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/resources")
             assert resp.status_code == 200
             resources = resp.json()["resources"]
@@ -1060,7 +1092,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/resources/items://42")
             assert resp.status_code == 200
             assert resp.json()["result"]["id"] == "42"
@@ -1070,7 +1104,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/resources/unknown://foo")
             assert resp.status_code == 404
 
@@ -1090,7 +1126,9 @@ class TestMCPServerHTTP:
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/")
             assert resp.status_code == 200
             resp = await client.get("/tools")
@@ -1098,13 +1136,100 @@ class TestMCPServerHTTP:
 
         assert len(calls) == 1
 
+    async def _client(self, mcp, headers=None):
+        import httpx
+
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp),
+            base_url="http://test",
+            headers=headers if headers is not None else _AUTH,
+        )
+
+    async def test_missing_credentials_rejected(self):
+        mcp = self._build_mcp()
+        async with await self._client(mcp, headers={}) as client:
+            assert (await client.get("/tools")).status_code == 401
+            resp = await client.post("/tools/add", json={"a": 1, "b": 2})
+            assert resp.status_code == 401
+            assert (await client.get("/resources/items://1")).status_code == 401
+
+    async def test_wrong_credentials_rejected(self):
+        mcp = self._build_mcp()
+        async with await self._client(mcp, headers={"Authorization": "Bearer bad"}) as client:
+            resp = await client.post("/tools/add", json={"a": 1, "b": 2})
+            assert resp.status_code == 401
+
+    async def test_call_tool_requires_json_content_type(self):
+        mcp = self._build_mcp()
+        async with await self._client(mcp) as client:
+            resp = await client.post(
+                "/tools/add",
+                content=json.dumps({"a": 1, "b": 2}),
+                headers={"Content-Type": "text/plain"},
+            )
+            assert resp.status_code == 415
+            resp = await client.post("/tools/add", content=b"{}")
+            assert resp.status_code == 415
+
+    async def test_foreign_origin_rejected(self):
+        mcp = self._build_mcp()
+        async with await self._client(mcp) as client:
+            resp = await client.post(
+                "/tools/add",
+                json={"a": 1, "b": 2},
+                headers={"Origin": "https://evil.example"},
+            )
+            assert resp.status_code == 403
+
+    async def test_allowlisted_origin_accepted(self):
+        mcp = self._build_mcp()
+        async with await self._client(mcp) as client:
+            resp = await client.post(
+                "/tools/add",
+                json={"a": 1, "b": 2},
+                headers={"Origin": "https://app.example"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["result"] == 3
+
+    async def test_tool_error_is_generic(self, caplog):
+        mcp = self._build_mcp()
+
+        @mcp.tool()
+        async def boom() -> None:
+            raise RuntimeError("secret internal detail")
+
+        async with await self._client(mcp) as client:
+            with caplog.at_level("ERROR", logger="neutron.ai.mcp"):
+                resp = await client.post("/tools/boom", json={})
+            assert resp.status_code == 500
+            data = resp.json()
+            assert "secret internal detail" not in json.dumps(data)
+            assert data["error"] == "Internal error"
+            assert data["error_id"] in caplog.text
+            assert "secret internal detail" in caplog.text
+
+    async def test_resource_error_is_generic(self):
+        mcp = self._build_mcp()
+
+        @mcp.resource("bad://{x}")
+        async def bad(x: str) -> None:
+            raise RuntimeError("secret internal detail")
+
+        async with await self._client(mcp) as client:
+            resp = await client.get("/resources/bad://1")
+            assert resp.status_code == 500
+            assert "secret internal detail" not in resp.text
+
     async def test_tool_registered_after_first_request(self):
         """Tools registered after the first request are still served."""
         import httpx
 
         mcp = self._build_mcp()
         transport = httpx.ASGITransport(app=mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=_AUTH
+        ) as client:
             resp = await client.get("/tools")
             assert [t["name"] for t in resp.json()["tools"]] == ["add"]
 

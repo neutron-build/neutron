@@ -145,7 +145,10 @@ impl CacheTier {
         }
 
         let now = Instant::now();
-        let expires_at = ttl_secs.map(|s| now + Duration::from_secs(s));
+        // checked_add: `Instant + Duration` panics on overflow, and the TTL is
+        // client-supplied (`CACHE_SET('k', 'v', 18446744073709551615)`). A TTL
+        // past the representable range is effectively "never expires".
+        let expires_at = ttl_secs.and_then(|s| now.checked_add(Duration::from_secs(s)));
 
         let entry = CacheEntry {
             value: value.to_string(),
@@ -729,7 +732,7 @@ impl LfShard {
         let now = Instant::now();
         let entry = LfCacheEntry {
             value: Arc::new(value.to_string()),
-            expires_at: ttl_secs.map(|s| now + Duration::from_secs(s)),
+            expires_at: ttl_secs.and_then(|s| now.checked_add(Duration::from_secs(s))),
             inserted_at: now,
             access_count: AtomicU64::new(0),
             size_bytes: entry_size,
@@ -1080,6 +1083,20 @@ mod tests {
         cache.set("k", "v", Some(10));
         // Should still be alive.
         assert_eq!(cache.get("k"), Some("v"));
+    }
+
+    #[test]
+    fn huge_ttl_does_not_overflow_instant() {
+        // CACHE_SET's TTL is client-supplied; `Instant + Duration` panics on
+        // overflow. An unrepresentable TTL means "never expires".
+        let mut cache = CacheTier::new(1024);
+        cache.set("k", "v", Some(u64::MAX));
+        assert_eq!(cache.get("k"), Some("v"));
+        assert_eq!(cache.ttl("k"), None);
+
+        let lf = LockFreeCache::new(4, 1024);
+        lf.set("k", "v", Some(u64::MAX));
+        assert_eq!(lf.get("k").as_deref(), Some("v"));
     }
 
     #[test]

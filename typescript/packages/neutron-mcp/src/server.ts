@@ -105,6 +105,14 @@ export interface McpServerOptions {
   instructions?: string;
   /** Required. There is no permissive default, because that would turn one forgotten line into an open remote-execution endpoint. */
   authorize: Authorizer;
+  /**
+   * Browser origins allowed to call this endpoint. When set, a request with an
+   * `Origin` header not in the list is refused with 403 before `authorize`
+   * runs (DNS-rebinding and cross-site defence). When unset, no Origin check
+   * is made — safe only when `authorize` reads a credential a browser never
+   * attaches on its own (a bearer header), never a cookie.
+   */
+  allowedOrigins?: string[];
   tools?: McpTool[];
   logger?: { info: (msg: string, meta?: unknown) => void; warn: (msg: string, meta?: unknown) => void };
 }
@@ -279,6 +287,7 @@ export function createMcpServer(options: McpServerOptions): McpServer {
   const order: string[] = [];
   const tools = new Map<string, McpTool>();
   const log = options.logger;
+  const allowedOrigins = options.allowedOrigins !== undefined ? new Set(options.allowedOrigins) : undefined;
 
   const server: McpServer = {
     register(...added: McpTool[]) {
@@ -298,6 +307,11 @@ export function createMcpServer(options: McpServerOptions): McpServer {
           status: 405,
           headers: { allow: "POST" },
         });
+      }
+
+      const origin = request.headers.get("origin");
+      if (allowedOrigins !== undefined && origin !== null && !allowedOrigins.has(origin)) {
+        return new Response("origin not allowed", { status: 403 });
       }
 
       // Authorization comes before the body is read, let alone parsed: an

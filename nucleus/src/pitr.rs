@@ -783,7 +783,9 @@ mod tests {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {

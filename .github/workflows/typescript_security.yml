@@ -19,19 +19,19 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # `version: latest` resolved to pnpm 12, whose store layout breaks
       # setup-node@v4's cache save (post-step "Path Validation Error").
       # Read the version from typescript/package.json — one source of truth,
       # same as typescript.yml.
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: typescript/package.json
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -41,12 +41,10 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: typescript
 
-      # Reported (not yet gating) while the pre-existing advisory backlog is
-      # triaged. Flip `continue-on-error` to false to make high+ severities block.
+      # Gating: any high or critical advisory fails the job.
       - name: pnpm audit (high+)
         run: pnpm audit --audit-level=high
         working-directory: typescript
-        continue-on-error: true
 
   semgrep:
     name: Static analysis (Semgrep)
@@ -54,7 +52,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Rulesets target the exact bug classes hardened in this codebase:
       # XSS sinks (dangerouslySetInnerHTML), regex sanitizers, ReDoS, weak

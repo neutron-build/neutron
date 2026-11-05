@@ -9,7 +9,7 @@ import path from "node:path";
 // package is ACTUALLY tested against by resolving every optional peer from
 // this package's own node_modules (npm-ls-style), checking each installed
 // version against the declared peer range (caret semantics, including the
-// 0.x rule where ^0.44.5 means >=0.44.5 <0.45.0), and dynamically importing
+// 0.x rule where ^0.45.2 means >=0.45.2 <0.46.0), and dynamically importing
 // each installed combination's connector modules. The supported-peer claims
 // in the README cite exactly these resolutions.
 //
@@ -145,5 +145,5 @@ test("peer-matrix: version facts match the ranges this package documents", () =>
   // tested combination fails loudly instead of silently widening the claim.
   const drizzle = resolveInstalled("drizzle-orm");
   assert.ok(drizzle, "drizzle-orm must be installed in the development workspace for the wrapper suites to run");
-  assert.match(drizzle.version, /^0\.44\./, `expected the 0.44.x drizzle-orm line, found ${drizzle.version}`);
+  assert.match(drizzle.version, /^0\.45\./, `expected the 0.45.x drizzle-orm line, found ${drizzle.version}`);
 });

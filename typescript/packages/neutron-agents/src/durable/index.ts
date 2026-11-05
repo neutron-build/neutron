@@ -33,10 +33,23 @@ export interface AgentWorkflowOutput {
  */
 export function agentWorkflow(
   agent: LoadedAgent,
-  options: { executor?: AgentExecutor; name?: string; runTimeout?: string | number } = {},
+  options: {
+    executor?: AgentExecutor;
+    /** Override the exec tool's approval gate (default: required for LocalExecutor). */
+    execNeedsApproval?: boolean;
+    name?: string;
+    runTimeout?: string | number;
+  } = {},
 ): WorkflowDefinition<AgentWorkflowInput, AgentWorkflowOutput> {
   const tools: Tool[] = [...agent.tools];
-  if (options.executor !== undefined) tools.push(execTool(options.executor));
+  if (options.executor !== undefined) {
+    tools.push(
+      execTool(
+        options.executor,
+        options.execNeedsApproval !== undefined ? { needsApproval: options.execNeedsApproval } : {},
+      ),
+    );
+  }
   if (agent.skills !== undefined && agent.skills.length > 0) {
     for (const skill of agent.skills) tools.push(...skill.tools);
     tools.push(skillTool(agent.skills));

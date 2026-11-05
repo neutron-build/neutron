@@ -71,8 +71,13 @@ Agents act on compute through one interface — `AgentExecutor`
 
 ```ts
 import { createAgentHandler } from "@neutron-build/agents";
-export const POST = createAgentHandler({ agent, executor }); // any mode:"api" route
+export const POST = createAgentHandler({ agent, executor, auth }); // any mode:"api" route
 ```
+
+`auth` (return a Response to refuse, `null` to continue) is required when the
+agent has any tools. Clients send `input` and plain user/assistant text
+`messages`; approval resumes happen server-side. Against a `LocalExecutor`
+the `exec` tool needs approval unless `execNeedsApproval: false`.
 
 ## Status
 

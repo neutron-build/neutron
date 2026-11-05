@@ -4412,7 +4412,7 @@ mod tests {
         let _ = std::fs::remove_file(db_path.with_extension("wal"));
 
         let catalog = Arc::new(Catalog::new());
-        let err = DiskEngine::open(&db_path, catalog).err().expect("must refuse");
+        let err = DiskEngine::open(&db_path, catalog).expect_err("must refuse");
         assert!(
             err.to_string().contains("predate the v3 overflow layout"),
             "refusal must name the legacy overflow defect: {err}"

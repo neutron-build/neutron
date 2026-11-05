@@ -3,7 +3,7 @@ module neutron-go-orm-comparison
 go 1.26.0
 
 require (
-	github.com/jackc/pgx/v5 v5.7.2
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/neutron-build/neutron/go v0.0.0
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1

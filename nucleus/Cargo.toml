@@ -119,6 +119,9 @@ mongodb = ["dep:mongodb"]
 clickhouse = ["dep:clickhouse", "dep:urlencoding", "dep:reqwest"]
 otel = ["server", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 onnx = ["ort", "ndarray"]
+# Exposes `wire::fuzz_api` / `executor::fuzz_api` for the cargo-fuzz crate in
+# fuzz/. Never enabled by the server build.
+fuzz-api = ["server"]
 
 # --- Allocator features (pick exactly one if you want a custom allocator) ---
 mimalloc-allocator = ["dep:mimalloc"]

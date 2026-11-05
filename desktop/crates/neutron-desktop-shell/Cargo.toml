@@ -10,3 +10,4 @@ tauri = { workspace = true }
 tauri-plugin = { workspace = true }
 serde = { workspace = true }
 open = "5"
+url = { workspace = true }

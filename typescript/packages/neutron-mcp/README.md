@@ -41,6 +41,11 @@ export const POST = ({ request }) => server.handler(request);
 `authorize` is required and there is no permissive default — that would turn one
 forgotten line into an open remote-execution endpoint.
 
+Pass `allowedOrigins` to refuse browser requests from any other `Origin` (403,
+before `authorize` runs). Without it there is no Origin check, which is only
+safe when `authorize` reads a bearer header — never authorize from cookies
+without an allowlist.
+
 Scoping is an allow-list. A tool with a `scope` is hidden from a principal that
 lacks it *and* refused if named anyway; hiding is a courtesy to well-behaved
 clients, not access control.

@@ -3,7 +3,7 @@ module example.local/neutron-data-api
 go 1.26.0
 
 require (
-	github.com/jackc/pgx/v5 v5.7.2
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/neutron-build/neutron/go v0.3.0
 )
 

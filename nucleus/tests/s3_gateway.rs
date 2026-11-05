@@ -32,9 +32,7 @@ async fn spawn_gateway() -> (u16, Arc<tokio::sync::Notify>) {
 
 /// Like [`spawn_gateway`] but over a caller-built executor (used to attach a
 /// service state the test can flip).
-async fn spawn_gateway_with(
-    executor: Arc<Executor>,
-) -> (u16, Arc<tokio::sync::Notify>) {
+async fn spawn_gateway_with(executor: Arc<Executor>) -> (u16, Arc<tokio::sync::Notify>) {
     let config = Arc::new(S3Config {
         access_key: ACCESS.to_string(),
         secret_key: SECRET.to_string(),
@@ -605,7 +603,10 @@ async fn s3_unsigned_copy_source_cannot_hijack_put() {
     let scope = format!("{}/local/s3/aws4_request", &amz_date[..8]);
     let credential = aws_uri_encode(&format!("{ACCESS}/{scope}"), true);
     let query_pairs = vec![
-        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
         ("X-Amz-Credential".to_string(), format!("{ACCESS}/{scope}")),
         ("X-Amz-Date".to_string(), amz_date.clone()),
         ("X-Amz-Expires".to_string(), "300".to_string()),
@@ -725,20 +726,38 @@ async fn s3_delimiter_pagination_advances() {
 
     let (last_page, truncated, _) = pages.last().unwrap();
     assert!(!truncated, "pagination must terminate");
-    assert_eq!(last_page, &vec!["b/".to_string()], "second group is the final page");
+    assert_eq!(
+        last_page,
+        &vec!["b/".to_string()],
+        "second group is the final page"
+    );
     let mut all: Vec<String> = pages.iter().flat_map(|(p, _, _)| p.clone()).collect();
     all.sort();
     all.dedup();
     assert_eq!(all, vec!["a/".to_string(), "b/".to_string()]);
 
     // max-keys=0 is a probe: not truncated, no loop.
-    let r = request(port, "GET", "/delim?list-type=2&delimiter=%2F&max-keys=0", b"", None).await;
+    let r = request(
+        port,
+        "GET",
+        "/delim?list-type=2&delimiter=%2F&max-keys=0",
+        b"",
+        None,
+    )
+    .await;
     assert_eq!(r.status, 200);
     assert!(r.text().contains("<IsTruncated>false</IsTruncated>"));
     assert!(r.text().contains("<KeyCount>0</KeyCount>"));
 
     // Control: a larger page covers everything in one response.
-    let r = request(port, "GET", "/delim?list-type=2&delimiter=%2F&max-keys=10", b"", None).await;
+    let r = request(
+        port,
+        "GET",
+        "/delim?list-type=2&delimiter=%2F&max-keys=10",
+        b"",
+        None,
+    )
+    .await;
     assert!(r.text().contains("<IsTruncated>false</IsTruncated>"));
 }
 
@@ -772,14 +791,7 @@ async fn read_only_server_refuses_s3_mutations_but_serves_reads() {
     let list = request(port, "GET", "/robucket?uploads", b"", None).await; // (may be empty)
     let _ = list;
     let upload_id = {
-        let r = request(
-            port,
-            "POST",
-            "/robucket/mpu.txt?uploads",
-            b"",
-            None,
-        )
-        .await;
+        let r = request(port, "POST", "/robucket/mpu.txt?uploads", b"", None).await;
         assert_eq!(r.status, 200, "{}", r.text());
         r.text()
             .split("<UploadId>")
@@ -794,20 +806,43 @@ async fn read_only_server_refuses_s3_mutations_but_serves_reads() {
     service.enter_read_only(DegradeReason::Operator, "test hold");
 
     // Every mutator must refuse with 503, and none may mutate state.
-    assert_eq!(request(port, "PUT", "/robucket/new.txt", b"x", None).await.status, 503);
-    assert_eq!(request(port, "PUT", "/robucket2", b"", None).await.status, 503); // create bucket
-    assert_eq!(request(port, "DELETE", "/robucket/keep.txt", b"", None).await.status, 503);
-    assert_eq!(request(port, "POST", "/robucket/m2.txt?uploads", b"", None).await.status, 503);
     assert_eq!(
-        request(port, "PUT", &format!("/robucket/part.txt?partNumber=1&uploadId={upload_id}"), b"p", None)
+        request(port, "PUT", "/robucket/new.txt", b"x", None)
             .await
             .status,
         503
     );
+    assert_eq!(
+        request(port, "PUT", "/robucket2", b"", None).await.status,
+        503
+    ); // create bucket
+    assert_eq!(
+        request(port, "DELETE", "/robucket/keep.txt", b"", None)
+            .await
+            .status,
+        503
+    );
+    assert_eq!(
+        request(port, "POST", "/robucket/m2.txt?uploads", b"", None)
+            .await
+            .status,
+        503
+    );
+    assert_eq!(
+        request(
+            port,
+            "PUT",
+            &format!("/robucket/part.txt?partNumber=1&uploadId={upload_id}"),
+            b"p",
+            None
+        )
+        .await
+        .status,
+        503
+    );
     // Complete-multipart: valid XML (validated before admission) so the
     // read-only refusal, not a parse error, is what answers.
-    let complete_xml =
-        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>";
+    let complete_xml = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>";
     assert_eq!(
         request(
             port,
@@ -821,9 +856,15 @@ async fn read_only_server_refuses_s3_mutations_but_serves_reads() {
         503
     );
     assert_eq!(
-        request(port, "DELETE", &format!("/robucket/mpu.txt?uploadId={upload_id}"), b"", None)
-            .await
-            .status,
+        request(
+            port,
+            "DELETE",
+            &format!("/robucket/mpu.txt?uploadId={upload_id}"),
+            b"",
+            None
+        )
+        .await
+        .status,
         503
     );
 
@@ -831,15 +872,35 @@ async fn read_only_server_refuses_s3_mutations_but_serves_reads() {
     let r = request(port, "GET", "/robucket/keep.txt", b"", None).await;
     assert_eq!(r.status, 200, "GET must keep working while read-only");
     assert_eq!(r.body, b"kept");
-    assert_eq!(request(port, "HEAD", "/robucket/keep.txt", b"", None).await.status, 200);
-    assert_eq!(request(port, "GET", "/robucket?list-type=2", b"", None).await.status, 200);
-    let body = request(port, "GET", "/robucket?list-type=2", b"", None).await.text();
-    assert!(body.contains("keep.txt"), "the pre-degradation object must list");
+    assert_eq!(
+        request(port, "HEAD", "/robucket/keep.txt", b"", None)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        request(port, "GET", "/robucket?list-type=2", b"", None)
+            .await
+            .status,
+        200
+    );
+    let body = request(port, "GET", "/robucket?list-type=2", b"", None)
+        .await
+        .text();
+    assert!(
+        body.contains("keep.txt"),
+        "the pre-degradation object must list"
+    );
     assert!(!body.contains("new.txt"), "no refused mutation may appear");
 
     // Recovery: after the hold clears, mutations work again.
     service.resume_if(DegradeReason::Operator);
-    assert_eq!(request(port, "PUT", "/robucket/new.txt", b"y", None).await.status, 200);
+    assert_eq!(
+        request(port, "PUT", "/robucket/new.txt", b"y", None)
+            .await
+            .status,
+        200
+    );
     let r = request(port, "GET", "/robucket/new.txt", b"", None).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.body, b"y");

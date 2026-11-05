@@ -7,13 +7,13 @@ package mcp
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -22,52 +22,57 @@ import (
 	"github.com/neutron-build/neutron/cli/internal/inspect"
 )
 
-// isLocalhostOrigin checks whether an Origin header refers to a localhost address.
-func isLocalhostOrigin(origin string) bool {
-	return strings.HasPrefix(origin, "http://localhost:") ||
-		strings.HasPrefix(origin, "http://127.0.0.1:") ||
-		strings.HasPrefix(origin, "http://[::1]:") ||
-		origin == "http://localhost" ||
-		origin == "http://127.0.0.1"
+// isLoopbackHost reports whether a bind or Host name is loopback-only:
+// "localhost" or a loopback IP literal. An empty host (all interfaces) is not.
+func isLoopbackHost(h string) bool {
+	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // allowedHost reports whether a request's Host header names this server in
-// a form DNS rebinding cannot forge: an IP literal, localhost, or the
-// configured bind host. A rebinding page reaches the listener under its own
-// domain name, which is none of these.
+// a form DNS rebinding cannot forge: localhost, a loopback IP literal, the
+// configured bind host, or (only when bound to all interfaces, which
+// requires the token) any IP literal. A rebinding page reaches the listener
+// under its own domain name, which is none of these.
 func allowedHost(hostHeader, bindHost string) bool {
 	h := hostHeader
 	if hh, _, err := net.SplitHostPort(hostHeader); err == nil {
 		h = hh
 	}
 	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
-	switch {
-	case h == "":
+	if h == "" {
 		return false
-	case strings.EqualFold(h, "localhost"), net.ParseIP(h) != nil:
+	}
+	if isLoopbackHost(h) {
 		return true
 	}
-	return bindHost != "" && net.ParseIP(bindHost) == nil && strings.EqualFold(h, bindHost)
+	if bindHost != "" && strings.EqualFold(h, bindHost) {
+		return true
+	}
+	if bindIP := net.ParseIP(bindHost); bindHost == "" || (bindIP != nil && bindIP.IsUnspecified()) {
+		return net.ParseIP(h) != nil
+	}
+	return false
 }
 
-// allowedOrigin reports whether a browser Origin may call this server: a
-// localhost origin, or the same origin the request is addressed to (a
-// Host that already passed allowedHost).
-func allowedOrigin(origin, hostHeader string) bool {
-	if origin == "" || isLocalhostOrigin(origin) {
-		return true
-	}
-	u, err := url.Parse(origin)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, hostHeader)
+// tokenMatches compares an Authorization header against the bearer token in
+// constant time.
+func tokenMatches(authHeader, token string) bool {
+	return subtle.ConstantTimeCompare([]byte(authHeader), []byte("Bearer "+token)) == 1
 }
 
 const protocolVersion = "2024-11-05"
 
 // Server is the MCP server.
 type Server struct {
-	client  *db.Client
-	version string
-	env     *toolEnv
+	client       *db.Client
+	version      string
+	env          *toolEnv
+	allowOrigins map[string]bool
 }
 
 // Options are the operator's settings. The zero value is the default:
@@ -79,6 +84,9 @@ type Options struct {
 	NoRedact bool
 	// MigrationsDir is the application's migrations directory.
 	MigrationsDir string
+	// AllowOrigins lists the browser origins the HTTP transport accepts
+	// (exact match). Empty means no browser origin is allowed.
+	AllowOrigins []string
 }
 
 // NewServer creates a new MCP server connected to the given database URL
@@ -104,6 +112,10 @@ func (s *Server) Configure(o Options) {
 	s.env.redactor = inspect.Redactor{Enabled: !o.NoRedact}
 	if o.MigrationsDir != "" {
 		s.env.migrationsDir = o.MigrationsDir
+	}
+	s.allowOrigins = make(map[string]bool, len(o.AllowOrigins))
+	for _, origin := range o.AllowOrigins {
+		s.allowOrigins[origin] = true
 	}
 }
 
@@ -253,36 +265,39 @@ func (s *Server) RunHTTP(ctx context.Context, addr string) error {
 func (s *Server) httpHandler(addr string) (http.Handler, error) {
 	mux := http.NewServeMux()
 
-	// Optional bearer token auth via NEUTRON_MCP_TOKEN. Write tools over
-	// HTTP are only offered behind it: an unauthenticated network listener
-	// must never be a mutation path.
+	// Bearer token auth via NEUTRON_MCP_TOKEN; when set it is required on
+	// every request. Write tools and any non-loopback bind are only offered
+	// behind it: an unauthenticated network listener must never be reachable
+	// from other machines or be a mutation path.
 	mcpToken := os.Getenv("NEUTRON_MCP_TOKEN")
 	if s.env.allowWrites && mcpToken == "" {
 		return nil, fmt.Errorf("--allow-writes over the HTTP transport requires NEUTRON_MCP_TOKEN (bearer authentication)")
 	}
 
 	bindHost, _, _ := net.SplitHostPort(addr)
+	if !isLoopbackHost(bindHost) && mcpToken == "" {
+		return nil, fmt.Errorf("a non-loopback --host requires NEUTRON_MCP_TOKEN (bearer authentication)")
+	}
 
 	// Middleware wrapping all handlers: Host/Origin checks against DNS
-	// rebinding, CORS for localhost origins only, optional auth.
+	// rebinding, CORS for --allow-origin entries only, auth when configured.
 	wrap := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			// The unauthenticated listener answers only requests addressed
-			// to it by IP, localhost or its bind name, and only browser
-			// origins that are localhost or that same address.
+			// Answer only requests addressed to this server by a name DNS
+			// rebinding cannot forge, and only browser origins the operator
+			// listed with --allow-origin.
 			if !allowedHost(r.Host, bindHost) {
-				http.Error(w, "Forbidden: Host must be localhost, an IP address or the --host name", http.StatusForbidden)
+				http.Error(w, "Forbidden: Host must be localhost, a loopback address or the --host name", http.StatusForbidden)
 				return
 			}
 			origin := r.Header.Get("Origin")
-			if !allowedOrigin(origin, r.Host) {
-				http.Error(w, "Forbidden: cross-origin request", http.StatusForbidden)
-				return
-			}
-			if origin == "" || isLocalhostOrigin(origin) {
-				if origin != "" {
-					w.Header().Set("Access-Control-Allow-Origin", origin)
+			if origin != "" {
+				if !s.allowOrigins[origin] {
+					http.Error(w, "Forbidden: origin not in --allow-origin", http.StatusForbidden)
+					return
 				}
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -292,8 +307,7 @@ func (s *Server) httpHandler(addr string) (http.Handler, error) {
 			}
 			// Enforce bearer token if NEUTRON_MCP_TOKEN is set
 			if mcpToken != "" {
-				authHeader := r.Header.Get("Authorization")
-				if authHeader != "Bearer "+mcpToken {
+				if !tokenMatches(r.Header.Get("Authorization"), mcpToken) {
 					http.Error(w, "Unauthorized", http.StatusUnauthorized)
 					return
 				}

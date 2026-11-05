@@ -133,7 +133,7 @@ drift outside the declared ranges):
 
 | Peer | Declared range | Version under test |
 |---|---|---|
-| `drizzle-orm` | `^0.44.5` | 0.44.7 |
+| `drizzle-orm` | `^0.45.2` | 0.45.2 |
 | `postgres` | `^3.4.7` | 3.4.8 |
 | `@libsql/client` | `^0.17.0` | 0.17.0 |
 | `@neutron-build/nucleus` | `^0.2.0` | 0.2.0 (import + connect-failure path only; no live Nucleus engine is claimed) |

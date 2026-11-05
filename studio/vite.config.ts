@@ -32,8 +32,6 @@ export default defineConfig({
           'table': ['@tanstack/react-table'],
           // TimeSeries module: Observable Plot (lazy-loaded)
           'observable-plot': ['@observablehq/plot'],
-          // Geo module: MapLibre GL (lazy-loaded)
-          'maplibre': ['maplibre-gl'],
         },
       },
     },

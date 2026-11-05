@@ -8,7 +8,7 @@
     "typecheck: per TypeScript version, types/instantiations of the generated 100-table depth-3 consumer project (deterministic); regressionPct is the V16 20% allowance."
   ],
   "referenceTools": {
-    "drizzle-orm": "0.45.1"
+    "drizzle-orm": "0.45.2"
   },
   "serverRatioVsHandMax": 1.35,
   "sameMachine": {

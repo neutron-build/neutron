@@ -16,5 +16,20 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "vite": "^6.3.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "@prisma/client",
+      "@prisma/engines",
+      "@swc/core",
+      "better-sqlite3",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma",
+      "sharp",
+      "unrs-resolver",
+      "workerd"
+    ]
   }
 }

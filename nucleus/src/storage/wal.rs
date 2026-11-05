@@ -3676,11 +3676,17 @@ mod archive_tests {
         wal.sync().unwrap();
 
         // Read-only archive: the copy into it fails.
-        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o555))
-            .unwrap();
+        std::fs::set_permissions(
+            &archive,
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
         let r = wal.archive_active();
-        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            &archive,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         assert!(
             r.is_err(),
             "archive_active must not claim the archive holds the tail when its copy failed \
@@ -3697,9 +3703,8 @@ mod archive_tests {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("t.wal.d");
         let archive = dir.path().join("archive");
-        let wal =
-            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
-                .unwrap();
+        let wal = SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
+            .unwrap();
         let page = [5u8; PAGE_SIZE];
         for txn in 1..=6u64 {
             wal.log_page_write(txn, txn as u32, &page).unwrap();
@@ -3721,9 +3726,8 @@ mod archive_tests {
         // Reopen and force the archive guard: truncate_before re-archives
         // (idempotently) before deleting — the content check must detect the
         // corruption and replace the copy with the live original.
-        let wal =
-            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
-                .unwrap();
+        let wal = SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
+            .unwrap();
         let last = wal.current_lsn().saturating_sub(1);
         wal.truncate_before(last + 1).unwrap();
         drop(wal);
@@ -3745,14 +3749,16 @@ mod archive_tests {
         let archive = dir.path().join("archive");
         std::fs::create_dir_all(&archive).unwrap();
         // Small segments so several seal and rotate.
-        let wal =
-            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
-                .unwrap();
+        let wal = SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
+            .unwrap();
         // Read-only BEFORE the first rotation, so NO segment is ever archived
         // (rotation's own archive attempt fails too — deliberately
         // best-effort — leaving every sealed segment un-archived on disk).
-        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o555))
-            .unwrap();
+        std::fs::set_permissions(
+            &archive,
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
         let page = [9u8; PAGE_SIZE];
         for txn in 1..=12u64 {
             wal.log_page_write(txn, txn as u32, &page).unwrap();
@@ -3763,8 +3769,11 @@ mod archive_tests {
         let live_before: Vec<_> = list_segments(&wal_dir).unwrap();
         let last = wal.current_lsn().saturating_sub(1);
         wal.truncate_before(last + 1).unwrap();
-        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            &archive,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let live_after: Vec<_> = list_segments(&wal_dir).unwrap();
         assert!(

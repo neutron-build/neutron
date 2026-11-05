@@ -23,7 +23,8 @@ func init() {
 	mcpCmd.Flags().Int("port", 7700, "HTTP port (only used with --transport http)")
 	mcpCmd.Flags().String("dump-schema", "", "Print tool schema and exit: openai, mcp, or markdown")
 	mcpCmd.Flags().Bool("allow-writes", false, "Offer the execute_sql write tool (default: read-only; over HTTP also requires NEUTRON_MCP_TOKEN)")
-	mcpCmd.Flags().String("host", "127.0.0.1", "HTTP bind address (only used with --transport http)")
+	mcpCmd.Flags().String("host", "127.0.0.1", "HTTP bind address (only used with --transport http; non-loopback requires NEUTRON_MCP_TOKEN)")
+	mcpCmd.Flags().StringSlice("allow-origin", nil, "Browser origin allowed to call the HTTP transport (repeatable, exact match; default: none)")
 	mcpCmd.Flags().Bool("no-redact", false, "Return values under secret-looking names (password, token, api_key, ...) instead of redacting them")
 	mcpCmd.Flags().String("migrations", "migrations", "Application migrations directory for migration_status and inspect_table")
 	rootCmd.AddCommand(mcpCmd)
@@ -50,8 +51,10 @@ disable). Results carry the engine identity and the touched models' actual
 transaction/durability limits (engine_limits reports all of them).
 --allow-writes adds one explicit write tool, execute_sql; over HTTP it also
 requires NEUTRON_MCP_TOKEN. The HTTP transport binds 127.0.0.1 unless --host
-says otherwise and answers only requests addressed to localhost, an IP
-address or the --host name.
+says otherwise; a non-loopback --host requires NEUTRON_MCP_TOKEN, which is
+then checked on every request. It answers only requests addressed to
+localhost, a loopback address or the --host name, and refuses browser
+origins not listed with --allow-origin.
 
 Supports three transports:
 
@@ -134,7 +137,8 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 	allowWrites, _ := cmd.Flags().GetBool("allow-writes")
 	noRedact, _ := cmd.Flags().GetBool("no-redact")
 	migrationsDir, _ := cmd.Flags().GetString("migrations")
-	srv.Configure(mcp.Options{AllowWrites: allowWrites, NoRedact: noRedact, MigrationsDir: migrationsDir})
+	allowOrigins, _ := cmd.Flags().GetStringSlice("allow-origin")
+	srv.Configure(mcp.Options{AllowWrites: allowWrites, NoRedact: noRedact, MigrationsDir: migrationsDir, AllowOrigins: allowOrigins})
 
 	transport, _ := cmd.Flags().GetString("transport")
 	switch transport {

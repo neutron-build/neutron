@@ -40,20 +40,22 @@ jobs:
     name: contract matrix (go × rust × python × ts × elixir × zig)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Each SDK's runner descriptor skips gracefully when its toolchain is
       # absent (never fails), so the gate stays green even if one setup breaks —
       # it only goes red on a real contract FAIL. We provision all six.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "stable"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -72,7 +74,7 @@ jobs:
         run: pip install -e ./python
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           elixir-version: "1.17"
           otp-version: "27"
@@ -83,12 +85,12 @@ jobs:
         # like 0.15.* could silently move to a 0.15.x the SDK has never seen.
         # The runner's zig descriptor resolves the toolchain from PATH; without
         # this step --strict fails on a registered-but-absent SDK.
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: "0.15.2"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           # Every other workflow pins this. Without it the action looks for a
           # `packageManager` key in a root package.json that does not exist,
@@ -96,7 +98,7 @@ jobs:
           version: 9
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: pnpm

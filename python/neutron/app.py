@@ -527,7 +527,10 @@ class App:
         """Run the application server.
 
         Args:
-            host: Bind address. Defaults to ``NEUTRON_HOST``, then ``0.0.0.0``.
+            host: Bind address. Defaults to ``NEUTRON_HOST``, then ``0.0.0.0``
+                (all interfaces, per FRAMEWORK_CONTRACT.md, for containers).
+                Pass ``"127.0.0.1"`` or set ``NEUTRON_HOST`` for local-only
+                development; every exposed route must carry its own auth.
             port: Bind port. Defaults to ``NEUTRON_PORT``, then ``8000``.
             server: Server backend — ``"uvicorn"`` (default) or ``"granian"``
                 (Rust/Tokio, faster, HTTP/2 support).

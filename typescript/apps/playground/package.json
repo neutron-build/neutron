@@ -34,7 +34,7 @@
     "@preact/preset-vite": "^2.10.4",
     "drizzle-kit": "^0.31.5",
     "typescript": "^5.7.2",
-    "vite": "^8.3.2"
+    "vite": "^8.3.3"
   },
   "peerDependencies": {}
 }

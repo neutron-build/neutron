@@ -33,8 +33,14 @@ async fn oauth_factories_mount_on_router() {
     let resp = client.get("/auth/github").send().await;
     assert_eq!(resp.status(), http::StatusCode::FOUND);
     let location = resp.header("location").unwrap().to_string();
-    assert!(location.starts_with("https://github.com/login/oauth/authorize"), "{location}");
-    assert!(location.contains("state="), "PKCE/CSRF state parameter: {location}");
+    assert!(
+        location.starts_with("https://github.com/login/oauth/authorize"),
+        "{location}"
+    );
+    assert!(
+        location.contains("state="),
+        "PKCE/CSRF state parameter: {location}"
+    );
 
     // The callback handler must be REACHABLE (missing code → 400 with the
     // error surfaced, never a routing failure).

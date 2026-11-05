@@ -14,6 +14,8 @@ pub mod kv_fast_path;
 pub mod overload;
 
 #[cfg(test)]
+mod tests_malformed_frames;
+#[cfg(test)]
 mod tests_row_description;
 
 use std::collections::HashMap;
@@ -541,6 +543,21 @@ impl QueryParser for NucleusQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        // A Bind carries at most u16::MAX parameters, so a higher `$N` can
+        // never be bound. Refused here, before anything is sized by it:
+        // `SELECT $8000000000000000000` used to size the parameter-type
+        // vectors at Describe/Bind and abort the whole process on the
+        // allocation failure.
+        let max_param = count_placeholders(sql);
+        if max_param > MAX_BIND_PARAMS {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42P02".to_owned(), // undefined_parameter
+                format!(
+                    "there is no parameter ${max_param} (at most {MAX_BIND_PARAMS} parameters can be bound)"
+                ),
+            ))));
+        }
         // Use the executor's AST cache for ~5-10x faster repeated parses.
         // On cache hit, clones the cached AST and substitutes literals via
         // DFS walk instead of re-parsing the SQL string.
@@ -1344,7 +1361,7 @@ impl NucleusHandler {
             .executor
             .get_session_setting(session_id, "statement_timeout")
             .and_then(|v| parse_timeout_ms(&v))
-            .unwrap_or(self.statement_timeout_secs * 1000);
+            .unwrap_or(self.statement_timeout_secs.saturating_mul(1000));
 
         if timeout_ms > 0 {
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
@@ -1395,8 +1412,11 @@ impl NucleusHandler {
         ast: Option<&[sqlparser::ast::Statement]>,
         executor: Option<&Arc<Executor>>,
     ) -> Vec<Type> {
-        let param_count = count_placeholders(sql);
-        let count = param_count.max(declared.len());
+        // Clamped: the count sizes the vectors below, and a `$N` past what a
+        // Bind can carry (parse_sql refuses those) must never become an
+        // allocation of N slots.
+        let param_count = count_placeholders(sql).min(MAX_BIND_PARAMS);
+        let count = param_count.max(declared.len()).min(MAX_BIND_PARAMS);
 
         let inferred: Vec<Option<Type>> = match (ast, executor) {
             (Some(stmts), Some(exec)) => infer_param_types_from_ast(stmts, exec, count),
@@ -1718,7 +1738,11 @@ fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> Str
             let mut found_digit = false;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 found_digit = true;
-                idx = idx * 10 + (bytes[i] - b'0') as usize;
+                // Saturating, as in count_placeholders: a wrapped index
+                // would substitute a bound value for an out-of-range `$N`.
+                idx = idx
+                    .saturating_mul(10)
+                    .saturating_add((bytes[i] - b'0') as usize);
                 i += 1;
             }
             if found_digit {
@@ -3688,21 +3712,10 @@ impl CancelHandler for NucleusHandler {
 
 /// Parse a statement_timeout setting into milliseconds, following
 /// PostgreSQL's convention: bare integers are milliseconds; "s"/"ms"/"min"
-/// suffixes are honoured. Returns None for unparseable values.
+/// suffixes are honoured. Returns None for unparseable or out-of-range
+/// values (see `executor::parse_statement_timeout`).
 fn parse_timeout_ms(v: &str) -> Option<u64> {
-    let v = v.trim().trim_matches('\'');
-    if let Ok(n) = v.parse::<u64>() {
-        return Some(n);
-    }
-    let (num, unit) = v.split_at(v.find(|c: char| c.is_ascii_alphabetic())?);
-    let n = num.trim().parse::<u64>().ok()?;
-    match unit.trim() {
-        "ms" => Some(n),
-        "s" => Some(n * 1000),
-        "min" => Some(n * 60_000),
-        "h" => Some(n * 3_600_000),
-        _ => None,
-    }
+    crate::executor::parse_statement_timeout(v).ok()
 }
 
 // ============================================================================
@@ -3723,6 +3736,9 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 /// Count the number of `$N` parameter placeholders in a SQL string.
 ///
 /// Returns the highest `N` found (e.g., `$1, $3` returns 3).
+/// Most parameters a Bind message can carry (its count field is a u16).
+const MAX_BIND_PARAMS: usize = u16::MAX as usize;
+
 fn count_placeholders(sql: &str) -> usize {
     let mut max_idx = 0usize;
     let bytes = sql.as_bytes();
@@ -3803,7 +3819,11 @@ fn count_placeholders(sql: &str) -> usize {
             let mut num = 0usize;
             let mut found_digit = false;
             while i < len && bytes[i].is_ascii_digit() {
-                num = num * 10 + (bytes[i] - b'0') as usize;
+                // Saturating: `$99999999999999999999` must not wrap to a
+                // small (or valid-looking) index.
+                num = num
+                    .saturating_mul(10)
+                    .saturating_add((bytes[i] - b'0') as usize);
                 found_digit = true;
                 i += 1;
             }
@@ -4156,10 +4176,23 @@ fn decode_pg_param(
     type_hint: &Type,
 ) -> Option<DecodedParam> {
     let raw = portal.parameters.get(idx)?;
-    let Some(bytes) = raw.as_ref() else {
+    decode_param_bytes(
+        raw.as_deref(),
+        portal.parameter_format.is_binary(idx),
+        type_hint,
+    )
+}
+
+/// The portal-free body of [`decode_pg_param`]: one bound value as the client
+/// sent it (`None` = SQL NULL), its format code, and the resolved type.
+fn decode_param_bytes(
+    raw: Option<&[u8]>,
+    is_binary: bool,
+    type_hint: &Type,
+) -> Option<DecodedParam> {
+    let Some(bytes) = raw else {
         return Some(DecodedParam::Null);
     };
-    let is_binary = portal.parameter_format.is_binary(idx);
 
     // A malformed or unrepresentable declared binary array must never fall
     // through to the unknown-OID integer/UTF-8 guesses. Its array cast refuses
@@ -5886,8 +5919,13 @@ fn parse_copy_binary_rows(
                 row.push(None);
                 continue;
             }
-            let len = len as usize;
-            if pos + len > data.len() {
+            // Only -1 is NULL. Any other negative length cast to a near-
+            // usize::MAX `len`, and `pos + len` then overflowed (debug panic)
+            // or wrapped below `pos` and panicked in the slice (release).
+            let Ok(len) = usize::try_from(len) else {
+                return Err(format!("invalid field length in binary COPY tuple ({len})"));
+            };
+            if len > data.len() - pos {
                 return Err("binary COPY field extends past end of data".into());
             }
             let ty = types.get(i).ok_or_else(|| {
@@ -6125,7 +6163,8 @@ fn unescape_copy_text(s: &str) -> String {
 ///
 /// This is otherwise a faithful copy of the upstream loop (0.36.3,
 /// `src/tokio/server.rs:522-596`). Keep it that way: the only intended
-/// difference is the `Terminate` arm.
+/// differences are the `Terminate` arm and containing a decoder panic (see
+/// the loop).
 #[cfg(feature = "server")]
 pub async fn process_socket_closing_on_terminate<H>(
     tcp_socket: tokio::net::TcpStream,
@@ -6135,7 +6174,7 @@ pub async fn process_socket_closing_on_terminate<H>(
 where
     H: pgwire::api::PgWireServerHandlers,
 {
-    use futures::SinkExt;
+    use futures::{FutureExt, SinkExt};
     use pgwire::api::{ErrorHandler, PgWireConnectionState};
     use pgwire::messages::PgWireFrontendMessage;
     use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
@@ -6165,17 +6204,48 @@ where
 
     let socket = &mut socket;
     loop {
-        let msg = if matches!(
+        // pgwire 0.36's message body decoders read with unchecked
+        // `Buf::get_*` / `split_to` over the whole read buffer rather than the
+        // frame its length header announced, so a short frame such as a Bind
+        // whose parameter length points past the bytes received panics inside
+        // `socket.next()`. The codec decodes every message type from startup
+        // onward, so this is reachable during authentication. Unwinding out
+        // of here used to skip the caller's per-connection cleanup; it is now
+        // a protocol violation that closes the connection, as PostgreSQL
+        // treats a malformed message.
+        let in_startup = matches!(
             socket.state(),
             PgWireConnectionState::AwaitingStartup
                 | PgWireConnectionState::AuthenticationInProgress
-        ) {
+        );
+        let next = std::panic::AssertUnwindSafe(socket.next()).catch_unwind();
+        let next = if in_startup {
             tokio::select! {
-                _ = &mut startup_timeout => None,
-                msg = socket.next() => msg,
+                _ = &mut startup_timeout => Ok(None),
+                msg = next => msg,
             }
         } else {
-            socket.next().await
+            next.await
+        };
+        let msg = match next {
+            Ok(msg) => msg,
+            Err(_) => {
+                let err = ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    "08P01".to_owned(),
+                    "invalid frontend message format".to_owned(),
+                );
+                let _ = socket
+                    .send(pgwire::messages::PgWireBackendMessage::ErrorResponse(
+                        err.into(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed frontend message (pgwire decoder panicked)",
+                ));
+            }
         };
 
         if let Some(Ok(msg)) = msg {
@@ -6211,6 +6281,95 @@ where
         }
     }
     Ok(())
+}
+
+/// Entry points for the cargo-fuzz crate (`fuzz/`): Nucleus's own handling of
+/// client-supplied pgwire content, reachable without a socket or executor.
+/// Not a stable API.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub mod fuzz_api {
+    use super::*;
+
+    /// A Bind parameter as `substitute_parameters` renders it into SQL text,
+    /// or `None` when the decoder yields nothing. `oid` is the Parse-declared
+    /// (or inferred) parameter type; an unknown OID is treated as UNKNOWN.
+    pub fn bind_param_sql(raw: Option<&[u8]>, is_binary: bool, oid: u32) -> Option<String> {
+        let ty = Type::from_oid(oid).unwrap_or(Type::UNKNOWN);
+        Some(match decode_param_bytes(raw, is_binary, &ty)? {
+            DecodedParam::Null => "NULL".to_owned(),
+            DecodedParam::Numeric(s) | DecodedParam::Bool(s) => s,
+            DecodedParam::Text(s) => format!("'{}'", sanitize_sql_text_literal(&s)),
+        })
+    }
+
+    /// A Bind parameter as the cached-AST path turns it into a `Value`.
+    pub fn bind_param_value(raw: Option<&[u8]>, is_binary: bool, oid: u32) -> Value {
+        let ty = Type::from_oid(oid).unwrap_or(Type::UNKNOWN);
+        match decode_param_bytes(raw, is_binary, &ty) {
+            Some(DecodedParam::Null) | None => Value::Null,
+            Some(DecodedParam::Numeric(s))
+            | Some(DecodedParam::Bool(s))
+            | Some(DecodedParam::Text(s)) => NucleusHandler::pg_string_to_value(&s, &ty),
+        }
+    }
+
+    pub fn sanitize_text_literal(value: &str) -> String {
+        sanitize_sql_text_literal(value)
+    }
+
+    pub fn substitute_placeholders(sql: &str, replacements: &[String]) -> String {
+        substitute_positional_placeholders(sql, replacements)
+    }
+
+    pub fn count_placeholders(sql: &str) -> usize {
+        super::count_placeholders(sql)
+    }
+
+    pub fn replace_placeholders_with_null(sql: &str) -> String {
+        super::replace_placeholders_with_null(sql)
+    }
+
+    /// Parameter-type inference for a Parse message (no catalog).
+    pub fn infer_parameter_oids(sql: &str, declared: &[u32]) -> Vec<u32> {
+        let declared: Vec<Option<Type>> = declared.iter().map(|o| Type::from_oid(*o)).collect();
+        NucleusHandler::infer_parameter_types_with_ast(sql, &declared, None, None)
+            .iter()
+            .map(Type::oid)
+            .collect()
+    }
+
+    pub fn parse_timeout_ms(v: &str) -> Option<u64> {
+        super::parse_timeout_ms(v)
+    }
+
+    /// `Some((delimiter, is_csv, is_binary, has_header))` for COPY ... FROM STDIN.
+    pub fn detect_copy_from_stdin(sql: &str) -> Option<(u8, bool, bool, bool)> {
+        super::detect_copy_from_stdin(sql)
+            .map(|c| (c.delimiter, c.is_csv, c.is_binary, c.has_header))
+    }
+
+    pub fn parse_copy_rows(
+        data: &[u8],
+        delimiter: u8,
+        is_csv: bool,
+        has_header: bool,
+    ) -> Result<Vec<Vec<Option<String>>>, String> {
+        super::parse_copy_rows(data, delimiter, is_csv, has_header)
+    }
+
+    pub fn parse_copy_binary_rows(
+        data: &[u8],
+        types: &[DataType],
+    ) -> Result<Vec<Vec<Option<String>>>, String> {
+        super::parse_copy_binary_rows(data, types)
+    }
+
+    /// The cancel-key comparison `on_cancel_request` runs on a decoded
+    /// CancelRequest.
+    pub fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+        super::constant_time_eq(lhs, rhs)
+    }
 }
 
 // ============================================================================
@@ -6395,6 +6554,26 @@ mod tests {
     fn statement_timeout_parsing_refuses_garbage_rather_than_guessing() {
         for bad in ["soon", "10parsecs", "-5", "1.5s", ""] {
             assert_eq!(parse_timeout_ms(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn statement_timeout_parsing_refuses_overflow_and_out_of_range() {
+        // The unit multiplication used to be unchecked: a huge value panicked
+        // a debug build and wrapped to a short timeout in release.
+        assert_eq!(parse_timeout_ms("2147483647"), Some(2_147_483_647));
+        assert_eq!(parse_timeout_ms("2147483s"), Some(2_147_483_000));
+        for bad in [
+            "2147483648",
+            "2147484s",
+            "35792min",
+            "597h",
+            "18446744073709551615",
+            "18446744073709552s",
+            "18446744073709551616",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(parse_timeout_ms(bad), None, "{bad:?} must be out of range");
         }
     }
 
@@ -6851,6 +7030,47 @@ mod tests {
     #[test]
     fn count_placeholders_repeated() {
         assert_eq!(count_placeholders("SELECT $1, $1, $2"), 2);
+    }
+
+    #[test]
+    fn huge_placeholder_number_saturates_and_inference_is_clamped() {
+        // fuzz_wire_protocol crash-9da97719: `$00000008000000000000000`
+        // sized the parameter-type vector and aborted on allocation failure.
+        assert_eq!(
+            count_placeholders("SELECT $99999999999999999999999"),
+            usize::MAX
+        );
+        assert_eq!(
+            count_placeholders("SELECT $00000008000000000000000"),
+            8_000_000_000_000_000
+        );
+        let types = NucleusHandler::infer_parameter_types_with_ast(
+            "SELECT $8000000000000000000",
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(types.len(), MAX_BIND_PARAMS);
+        let types =
+            NucleusHandler::infer_parameter_types_with_ast("SELECT $65535", &[], None, None);
+        assert_eq!(types.len(), 65_535);
+    }
+
+    #[test]
+    fn substitution_does_not_wrap_huge_placeholder_numbers() {
+        // fuzz_wire_protocol: `idx * 10` overflowed (debug panic); in release
+        // 2^64 + 1 wrapped to 1 and substituted $1's value.
+        let reps = vec!["'x'".to_owned()];
+        let sql = "SELECT $18446744073709551617";
+        assert_eq!(substitute_positional_placeholders(sql, &reps), sql);
+        assert_eq!(
+            crate::sql::substitute_sql_placeholders(sql, &reps, &Default::default()),
+            sql
+        );
+        assert_eq!(
+            substitute_positional_placeholders("SELECT $1", &reps),
+            "SELECT 'x'"
+        );
     }
 
     #[test]
@@ -7619,6 +7839,23 @@ mod security_tests {
             err.contains("field count"),
             "expected a clean field-count error, got: {err}"
         );
+    }
+
+    /// fuzz_wire_protocol: a field length below -1 overflowed `pos + len`
+    /// (debug) or wrapped and panicked in the slice (release).
+    #[test]
+    fn parse_copy_binary_rows_rejects_negative_field_length() {
+        for bad_len in [-2i32, i32::MIN] {
+            let mut data = Vec::new();
+            data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+            data.extend_from_slice(&0i32.to_be_bytes());
+            data.extend_from_slice(&0i32.to_be_bytes());
+            data.extend_from_slice(&1i16.to_be_bytes());
+            data.extend_from_slice(&bad_len.to_be_bytes());
+            data.extend_from_slice(&[0u8; 8]);
+            let err = parse_copy_binary_rows(&data, &[crate::types::DataType::Int32]).unwrap_err();
+            assert!(err.contains("field length"), "{bad_len}: {err}");
+        }
     }
 
     #[test]

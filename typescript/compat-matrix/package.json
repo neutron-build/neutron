@@ -32,9 +32,9 @@
 
     "@excalidraw/excalidraw": "0.18.1",
     "@monaco-editor/react": "4.7.0",
-    "@tiptap/pm": "3.30.1",
-    "@tiptap/react": "3.30.1",
-    "@tiptap/starter-kit": "3.30.1",
+    "@tiptap/pm": "3.32.2",
+    "@tiptap/react": "3.32.2",
+    "@tiptap/starter-kit": "3.32.2",
     "@xyflow/react": "12.11.3",
     "cmdk": "1.1.1",
     "lucide-react": "0.562.0",

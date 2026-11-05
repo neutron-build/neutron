@@ -221,6 +221,30 @@ async fn acquire_requires_a_transaction_and_rejects_second_holder() {
 }
 
 #[tokio::test]
+async fn huge_timeout_is_refused_not_overflowed() {
+    // `Instant + Duration::from_millis(u64::MAX)` panics; the TIMEOUT is
+    // client-supplied, so it is range-checked before any deadline is built.
+    let ex = std::sync::Arc::new(test_executor());
+    ex.execute_with_session(1, "BEGIN").await.unwrap();
+    let err = ex
+        .execute_with_session(1, "ACQUIRE SNAPSHOT LEASE TIMEOUT 18446744073709551615")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("at most"), "{err}");
+    // The ceiling itself is accepted.
+    ex.execute_with_session(
+        1,
+        &format!(
+            "ACQUIRE SNAPSHOT LEASE TIMEOUT {}",
+            super::snapshot_lease::MAX_TIMEOUT_MS
+        ),
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(1, "ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
 async fn rollback_releases_the_lease() {
     let ex = std::sync::Arc::new(test_executor());
     exec(&ex, "CREATE TABLE t (id INT)").await;

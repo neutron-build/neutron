@@ -98,11 +98,11 @@ Core is minimal. OS integrations are opt-in (12 plugin crates; one shared TypeSc
 | Crate | Provides |
 |-------|----------|
 | `neutron-desktop` | Core: window, `neutron://` bridge, dev server, embedded Nucleus |
-| `neutron-desktop-fs` | File system |
+| `neutron-desktop-fs` | File system, scoped to app directories (`base` + relative `path`) |
 | `neutron-desktop-notifications` | OS notifications |
 | `neutron-desktop-tray` | System tray icon + menu |
 | `neutron-desktop-updater` | Auto-update with signature verification |
-| `neutron-desktop-shell` | Open files/URLs with OS default app |
+| `neutron-desktop-shell` | Open `https:`/`mailto:` URLs with the OS default app; reveal in file manager |
 | `neutron-desktop-clipboard` | Clipboard read/write |
 | `neutron-desktop-global-hotkeys` | System-wide keyboard shortcuts |
 | `neutron-desktop-autostart` | Launch at OS startup |
@@ -153,7 +153,7 @@ desktop/
 - **Nucleus in-process** — zero IPC overhead, `Arc<Mutex<Client>>` handles concurrent access
 - **Signals over `useState`** — desktop apps run for hours; signals don't leak across navigations
 - **Explicit desktop handlers** — register typed bridge routes in the Rust builder
-- **Application CSP ownership** — the starter currently has `csp: null`; provision and verify a policy for the shipped WebView content
+- **Application CSP ownership** — the starter ships a strict CSP (`script-src 'self'`, no inline script or style, `connect-src` limited to IPC and `neutron://`); apps extend it for what their content actually loads
 - **Explicit native adapters** — TypeScript wrappers call the Tauri plugin commands
 
 ## Status

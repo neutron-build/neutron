@@ -52,6 +52,12 @@ use std::time::Duration;
 /// wedge writers for a meaningful multiple of it.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Longest lease TIMEOUT accepted, in milliseconds (`i32::MAX`, the same
+/// ceiling PostgreSQL puts on its millisecond timeouts). The deadline is
+/// `Instant + Duration`, which panics on overflow, and the value comes from
+/// the client.
+pub const MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
+
 /// One held lease.
 ///
 /// Deadlines use tokio's clock so a paused-time test (start_paused) sees
@@ -135,7 +141,7 @@ impl SnapshotLeaseRegistry {
         // Same session re-acquire, or an expired lease: replace.
         *guard = Some(Lease {
             session_id,
-            deadline: now + Duration::from_millis(timeout_ms),
+            deadline: now + Duration::from_millis(timeout_ms.min(MAX_TIMEOUT_MS)),
         });
         Ok(())
     }
@@ -301,6 +307,11 @@ impl super::Executor {
                 "ACQUIRE SNAPSHOT LEASE: TIMEOUT must be at least 1 ms".into(),
             ));
         }
+        if timeout_ms > MAX_TIMEOUT_MS {
+            return Err(super::ExecError::Unsupported(format!(
+                "ACQUIRE SNAPSHOT LEASE: TIMEOUT must be at most {MAX_TIMEOUT_MS} ms"
+            )));
+        }
         let session_id = super::unique_gate::gate_session_id();
         if let Some((holder, _)) = self.snapshot_leases.holder()
             && holder == session_id
@@ -335,7 +346,8 @@ impl super::Executor {
         // engines without versioning its uncommitted rows are readable
         // outright). An idle transaction that has written nothing does not
         // block.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(timeout_ms.min(MAX_TIMEOUT_MS));
         loop {
             let blockers = self.foreign_write_bearing_txns(session_id).await;
             if blockers == 0 {
@@ -419,6 +431,14 @@ mod tests {
         assert!(!reg.release(1), "release is idempotent-once");
         reg.try_acquire(2, 60_000).unwrap();
         assert_eq!(reg.holder().map(|(s, _)| s), Some(2));
+    }
+
+    #[tokio::test]
+    async fn registry_clamps_an_overflowing_timeout() {
+        // Callers range-check first; the registry still must not panic.
+        let reg = SnapshotLeaseRegistry::new();
+        reg.try_acquire(1, u64::MAX).unwrap();
+        assert_eq!(reg.holder().map(|(s, _)| s), Some(1));
     }
 
     #[tokio::test]

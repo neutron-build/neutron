@@ -104,12 +104,18 @@ pub async fn serve_resp_connections(
     if tls_acceptor.is_some() {
         tracing::info!(
             "RESP server listening on {} (TLS enabled)",
-            listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+            listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default()
         );
     } else {
         tracing::info!(
             "RESP server listening on {}",
-            listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+            listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default()
         );
     }
 
@@ -400,6 +406,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .expect("server exits on shutdown")
-            .expect("server loop clean");
+            .expect("server loop clean")
+            .expect("server loop returns Ok on shutdown");
     }
 }

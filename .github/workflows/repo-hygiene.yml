@@ -19,7 +19,7 @@ jobs:
     name: No tracked file is matched by an ignore rule
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Validate YAML without duplicate keys
         run: |
           python3 -m pip install PyYAML==6.0.2
@@ -38,7 +38,7 @@ jobs:
     name: No file flips its line-ending style
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # The check compares each modified file against its previous version,
           # so it needs the parent commit as well as the tip.
@@ -65,8 +65,8 @@ jobs:
     name: The contract IR agrees with the prose contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       # Lives here rather than in the conformance workflow because that one is

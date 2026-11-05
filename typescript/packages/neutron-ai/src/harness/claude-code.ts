@@ -73,6 +73,8 @@ interface StreamJsonEvent {
   is_error?: boolean;
 }
 
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 class ClaudeCodeRun implements AgentRun {
   #settings: ClaudeCodeSettings;
   #options: AgentRunOptions;
@@ -96,8 +98,13 @@ class ClaudeCodeRun implements AgentRun {
   #buildArgs(): string[] {
     const options = this.#options;
     const settings = this.#settings;
-    const args = ["-p", options.prompt!, "--output-format", "stream-json", "--verbose"];
-    if (options.sessionId !== undefined) args.push("--resume", options.sessionId);
+    const args = ["-p", "--output-format", "stream-json", "--verbose"];
+    if (options.sessionId !== undefined) {
+      if (!SESSION_ID_PATTERN.test(options.sessionId)) {
+        throw new AIError(problemFromStatus(400, "sessionId must be a UUID."));
+      }
+      args.push("--resume", options.sessionId);
+    }
     if (options.model !== undefined) args.push("--model", options.model);
     if (settings.permissionMode !== undefined) args.push("--permission-mode", settings.permissionMode);
     if (settings.allowedTools !== undefined && settings.allowedTools.length > 0) {
@@ -106,6 +113,8 @@ class ClaudeCodeRun implements AgentRun {
     if (settings.appendSystemPrompt !== undefined) {
       args.push("--append-system-prompt", settings.appendSystemPrompt);
     }
+    // After "--" the prompt is always positional, never parsed as an option.
+    args.push("--", options.prompt!);
     return args;
   }
 

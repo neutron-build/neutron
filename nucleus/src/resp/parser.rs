@@ -19,10 +19,18 @@ const MAX_ARRAY_COUNT: usize = 1_000_000;
 /// (`*1\r\n*1\r\n*1\r\n…`) before authentication.
 const MAX_NESTING_DEPTH: usize = 128;
 
+/// Upper bound on what a length or count header may reserve before the
+/// payload it announces has arrived. Larger values still parse; their buffers
+/// grow with the bytes actually received, so a ~20-byte `$536870912\r\n` or
+/// `*1000000\r\n` header (pre-auth) no longer reserves the full claimed
+/// amount up front.
+const MAX_PREALLOC_BYTES: usize = 64 * 1024;
+const MAX_PREALLOC_ITEMS: usize = 1024;
+
 /// Maximum length of a RESP line (64 KiB, Redis inline-command parity).
 /// Type-prefix lines (`$5\r\n`, `*3\r\n`) are a handful of bytes; anything
 /// larger is a hostile peer. Bulk payloads are NOT affected — they are read
-/// with `read_exact` and capped by MAX_BULK_STRING_LEN.
+/// incrementally and capped by MAX_BULK_STRING_LEN.
 const MAX_LINE_LEN: usize = 64 * 1024;
 
 /// A RESP2 protocol value.
@@ -119,8 +127,17 @@ async fn read_value_inner<R: AsyncBufRead + Unpin>(
                     format!("bulk string length {len} exceeds maximum {MAX_BULK_STRING_LEN}"),
                 ));
             }
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
+            let mut buf = Vec::with_capacity(len.min(MAX_PREALLOC_BYTES));
+            (&mut *reader)
+                .take(len as u64)
+                .read_to_end(&mut buf)
+                .await?;
+            if buf.len() < len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed inside a bulk string",
+                ));
+            }
             // The payload must be terminated by CRLF. The bytes were read and
             // discarded before; verifying them rejects desynchronized framing
             // instead of silently resynchronizing mid-stream.
@@ -158,7 +175,7 @@ async fn read_value_inner<R: AsyncBufRead + Unpin>(
                     format!("array nesting depth exceeds maximum {MAX_NESTING_DEPTH}"),
                 ));
             }
-            let mut items = Vec::with_capacity(count);
+            let mut items = Vec::with_capacity(count.min(MAX_PREALLOC_ITEMS));
             for _ in 0..count {
                 items.push(Box::pin(read_value_inner(reader, depth + 1)).await?);
             }
@@ -295,8 +312,8 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_overlong_line() {
         // A type-prefix line past the cap must error instead of buffering an
-        // unbounded prefix line (WIR-8). Bulk payloads are read with
-        // read_exact and are not affected.
+        // unbounded prefix line (WIR-8). Bulk payloads are read separately
+        // and are not affected.
         let data = vec![b'A'; 70 * 1024];
         let mut reader = BufReader::new(Cursor::new(data));
         let err = read_value(&mut reader).await.unwrap_err();
@@ -358,6 +375,49 @@ mod tests {
             err.to_string().contains("CRLF"),
             "expected CRLF error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_string_larger_than_prealloc_parses() {
+        // A payload past MAX_PREALLOC_BYTES grows its buffer as it arrives
+        // and still comes back whole.
+        let len = MAX_PREALLOC_BYTES * 3 + 7;
+        let mut data = format!("${len}\r\n").into_bytes();
+        data.extend((0..len).map(|i| (i % 251) as u8));
+        data.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(Cursor::new(data));
+        match read_value(&mut reader).await.unwrap() {
+            RespValue::BulkString(Some(buf)) => {
+                assert_eq!(buf.len(), len);
+                assert!(buf.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+            }
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_bulk_string_is_eof_without_full_buffer() {
+        // A header claiming 512 MiB followed by a few bytes and EOF: the
+        // reader must report EOF, having buffered only what arrived.
+        let mut data = format!("${MAX_BULK_STRING_LEN}\r\n").into_bytes();
+        data.extend_from_slice(b"abc");
+        let mut reader = BufReader::new(Cursor::new(data));
+        let err = read_value(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn array_larger_than_prealloc_parses() {
+        let count = MAX_PREALLOC_ITEMS * 2 + 1;
+        let mut data = format!("*{count}\r\n").into_bytes();
+        for _ in 0..count {
+            data.extend_from_slice(b":1\r\n");
+        }
+        let mut reader = BufReader::new(Cursor::new(data));
+        match read_value(&mut reader).await.unwrap() {
+            RespValue::Array(Some(items)) => assert_eq!(items.len(), count),
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 
     #[tokio::test]

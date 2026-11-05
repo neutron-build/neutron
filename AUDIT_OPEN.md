@@ -13,6 +13,54 @@ NU-01's bounded compaction subset. The ORM program's N1–N16 findings are
 tracked below as verified bounded contracts and remaining unsupported
 behavior; their original blanket open status no longer describes the source.
 
+## 2026-11-03 security sweep
+
+Framework-code findings from the 2026-11-03 review (branch
+`security/hardening-2026-11-03`). Status per item; commits on that branch.
+
+- **S1 HIGH — Python `MCPServer` unauthenticated, cross-site callable.**
+  Fixed `b062f9a0`: `authorize` is a required constructor argument (principal
+  or None => 401) checked on every route; a present `Origin` not in
+  `allowed_origins` is 403; tool calls require an `application/json` object
+  body (415/400). `App.run()` keeps the `0.0.0.0` default because
+  FRAMEWORK_CONTRACT.md mandates it for `NEUTRON_HOST`; documented in the
+  docstring instead.
+- **S2 MED — agents `exec` tool ungated, env denylist.** Fixed `20a285d1`:
+  exec needs approval against a `LocalExecutor` by default
+  (`execNeedsApproval: false` opts out); the child env is built from an
+  allowlist (`PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR` + `inheritEnv`).
+- **S3 MED — agents http channel auth only with an executor; client
+  history trusted.** Fixed `20a285d1`: auth (or `allowUnauthenticated`)
+  required whenever the turn has any tools; client `messages` limited to
+  user/assistant text; client `toolApprovals` refused. Approval resumes are
+  server-side only (`agentWorkflow` / `runTurn`).
+- **S4 MED — desktop fs/shell unscoped, starter `csp: null`.** Fixed
+  `46b06d4a`: fs commands take a base-dir enum + relative path (absolute and
+  `..` refused, canonicalized prefix check); `open_url` limited to `https:` /
+  `mailto:`; `open_path` removed; starter ships a strict CSP + devCsp.
+  **Deferred:** Tauri v2 permission manifests — the plugin crates have no
+  `build.rs`/`links` key, so shipping ACL manifests means adopting the
+  `tauri-plugin` build pipeline per crate; not done in this sweep. The dialog
+  commands still return absolute paths that the scoped fs commands will not
+  accept (by design).
+- **S5 MED — CLI `neutron mcp` HTTP served without token off loopback, any
+  IP Host, any-localhost CORS.** Fixed `a3b717e2`: non-loopback `--host`
+  refused without `NEUTRON_MCP_TOKEN`; token required on every request when
+  set; Host accepts loopback/--host (any IP literal only on an all-interfaces
+  bind, which needs the token); CORS only for `--allow-origin` entries
+  (default none).
+- **S6 LOW — claude-code harness argv.** Fixed `fbbe94f9`: prompt passed after
+  `--` (verified against the claude CLI: an option-like prompt after `--` is
+  treated as the prompt); `sessionId` must be a UUID.
+- **S7 LOW — non-constant-time token compares.** Fixed: CLI uses
+  `crypto/subtle` (`a3b717e2`); desktop dev server uses a constant-time byte
+  compare (`bd86d765`).
+- **S8 LOW — Python MCP tool/resource errors leak `str(e)`.** Fixed
+  `b062f9a0`: logged server-side, generic error + `error_id` returned.
+- **S9 INFO — TS `neutron-mcp` Origin before authorize.** Fixed `20d499cd`:
+  opt-in `allowedOrigins` (403 before `authorize`); README documents
+  bearer-only behaviour when unset.
+
 ## Resolved 2026-09-18 (round 5 — lease-scope closure + NU-01 compaction subset)
 
 Two work items from the observe backup session's upstream reports and the
@@ -1708,7 +1756,6 @@ validation/conflicts/REPL, and the live in-memory KV round trip incl.
 Unicode/newline/semicolon preservation with nonzero SQL error). **MERGE-READY.** Not pushed to main
   (owner decision); release/version/registry steps remain parent-owned per
   the lane's handoff.
-||||||| 90e1606b
 ## 2026-10-07 — ADM-11 private shell command stdin
 
 Source implementation validated in isolated `audit/final-nucleus-stdin` patch

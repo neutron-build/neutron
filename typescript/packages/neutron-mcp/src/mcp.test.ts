@@ -168,6 +168,33 @@ test("an unauthorized caller reaches nothing", async () => {
   assert.equal(calls(), 0);
 });
 
+test("allowedOrigins refuses a foreign Origin before authorize runs", async () => {
+  let authorized = 0;
+  const server = createMcpServer({
+    name: "origin-test",
+    version: "1.0.0",
+    allowedOrigins: ["https://app.example"],
+    authorize: () => {
+      authorized++;
+      return { name: "caller" };
+    },
+  });
+  const call = (origin?: string) =>
+    server.handler(
+      new Request("http://mcp.test/api/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(origin !== undefined ? { origin } : {}) },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      }),
+    );
+
+  assert.equal((await call("https://evil.example")).status, 403);
+  assert.equal(authorized, 0, "a refused origin must not reach authorize");
+  assert.equal((await call("https://app.example")).status, 200);
+  assert.equal((await call()).status, 200, "non-browser callers send no Origin");
+  assert.equal(authorized, 2);
+});
+
 test("GET is refused and notifications are accepted", async () => {
   const { server } = fixture({ name: "owner" });
 

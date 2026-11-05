@@ -71,42 +71,18 @@ export interface LocalExecutorOptions {
   shell?: string;
   env?: Record<string, string>;
   /**
-   * Env var NAMES stripped from the inherited environment before every
-   * exec — secret scoping for agent workloads sharing the host process
-   * (an agent's `env` must not read the operator's tokens). Explicit
-   * `env` values (constructor or per-exec) still win over the strip.
-   *
-   * Fail-safe default: a curated list of well-known credential variables is
-   * stripped even when this option is omitted. Pass `[]` to restore full
-   * inheritance.
+   * Extra env var NAMES inherited from the host process, on top of the
+   * baseline allowlist (PATH, HOME, LANG, LC_*, TERM, TMPDIR). Nothing else
+   * from the host environment reaches the child — a model-chosen shell
+   * command must not read the operator's tokens just because it shares the
+   * host process. Explicit `env` values (constructor or per-exec) are always
+   * passed.
    */
-  envDenylist?: string[];
+  inheritEnv?: string[];
 }
 
-/**
- * Well-known credential-carrying env var names stripped by default. Not a
- * sandbox — but a model-chosen shell command must not read the operator's
- * tokens just because it shares the host process.
- */
-const DEFAULT_SECRET_ENV_DENYLIST = [
-  "ANTHROPIC_API_KEY",
-  "OPENAI_API_KEY",
-  "GEMINI_API_KEY",
-  "GOOGLE_API_KEY",
-  "AWS_ACCESS_KEY_ID",
-  "AWS_SECRET_ACCESS_KEY",
-  "AWS_SESSION_TOKEN",
-  "AZURE_CLIENT_SECRET",
-  "GITHUB_TOKEN",
-  "GH_TOKEN",
-  "GITLAB_TOKEN",
-  "FORGEJO_TOKEN",
-  "NPM_TOKEN",
-  "PYPI_TOKEN",
-  "STRIPE_SECRET_KEY",
-  "DATABASE_URL",
-  "REDIS_URL",
-];
+/** Host env var names a child inherits by default; `LC_*` is matched by prefix. */
+const BASE_ENV_ALLOWLIST = ["PATH", "HOME", "LANG", "TERM", "TMPDIR"];
 
 /**
  * Runs commands as child processes under a root directory. Path arguments
@@ -118,19 +94,21 @@ export class LocalExecutor implements AgentExecutor {
   #root: string;
   #shell: string;
   #env?: Record<string, string>;
-  #envDenylist: string[];
+  #inheritEnv: Set<string>;
   #destroyed = false;
 
   constructor(options: LocalExecutorOptions) {
     this.#root = resolve(options.root);
     this.#shell = options.shell ?? "/bin/sh";
     if (options.env !== undefined) this.#env = options.env;
-    this.#envDenylist = options.envDenylist ?? DEFAULT_SECRET_ENV_DENYLIST;
+    this.#inheritEnv = new Set([...BASE_ENV_ALLOWLIST, ...(options.inheritEnv ?? [])]);
   }
 
   #execEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const name of this.#envDenylist) delete env[name];
+    const env: NodeJS.ProcessEnv = {};
+    for (const [name, value] of Object.entries(process.env)) {
+      if (value !== undefined && (this.#inheritEnv.has(name) || name.startsWith("LC_"))) env[name] = value;
+    }
     return { ...env, ...this.#env, ...overrides };
   }
 

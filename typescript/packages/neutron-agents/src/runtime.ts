@@ -8,6 +8,7 @@ import type {
 } from "@neutron-build/ai";
 
 import type { LoadedAgent } from "./agent.js";
+import { LocalExecutor } from "./executor.js";
 import type { AgentExecutor } from "./executor.js";
 import { skillTool } from "./skills.js";
 import type { Skill } from "./skills.js";
@@ -19,6 +20,8 @@ export interface RunTurnOptions {
   messages?: Message[];
   /** Compute for the built-in exec tool; without it the tool is absent. */
   executor?: AgentExecutor;
+  /** Override the exec tool's approval gate (default: required for LocalExecutor). See execTool. */
+  execNeedsApproval?: boolean;
   /** Extra skills for this turn, on top of the agent's own. */
   skills?: Skill[];
   onApprovalRequest?: (request: ToolApprovalRequest) => boolean | Promise<boolean>;
@@ -37,7 +40,12 @@ export interface RunTurnOptions {
 export async function runTurn(agent: LoadedAgent, options: RunTurnOptions): Promise<GenerateTextResult> {
   const tools: Tool[] = [...agent.tools];
   if (options.executor !== undefined) {
-    tools.push(execTool(options.executor));
+    tools.push(
+      execTool(
+        options.executor,
+        options.execNeedsApproval !== undefined ? { needsApproval: options.execNeedsApproval } : {},
+      ),
+    );
   }
   const skills = [...(agent.skills ?? []), ...(options.skills ?? [])];
   if (skills.length > 0) {
@@ -66,10 +74,18 @@ export async function runTurn(agent: LoadedAgent, options: RunTurnOptions): Prom
   });
 }
 
-/** The built-in shell tool the runtime wires to an AgentExecutor. */
-export function execTool(executor: AgentExecutor): Tool {
+/**
+ * The built-in shell tool the runtime wires to an AgentExecutor.
+ *
+ * LocalExecutor runs commands as the host user (it is not a sandbox), so
+ * against one the tool requires human approval by default; pass
+ * `needsApproval: false` to opt out explicitly. Other executors (e.g.
+ * SandboxExecutor) default to no approval gate.
+ */
+export function execTool(executor: AgentExecutor, options: { needsApproval?: boolean } = {}): Tool {
   return {
     name: "exec",
+    needsApproval: options.needsApproval ?? executor instanceof LocalExecutor,
     description:
       "Run a shell command in the agent workspace. Returns exit code, stdout, and stderr.",
     inputSchema: jsonSchema({

@@ -708,11 +708,25 @@ mod tests {
             presigned: false,
         };
         // Multibyte char spanning byte 8 (é at bytes 7-8).
-        assert!(verify("s", &mk("2013052éT000000Z", "20130524/x/s3/aws4_request"), &input, 0)
+        assert!(
+            verify(
+                "s",
+                &mk("2013052éT000000Z", "20130524/x/s3/aws4_request"),
+                &input,
+                0
+            )
             .unwrap_err()
-            .contains("malformed"));
+            .contains("malformed")
+        );
         // Plain non-ASCII, short, empty, impossible and out-of-range forms.
-        for date in ["é0101T000000Z", "2013", "", "20130524T0000", "99999999T999999Z", "00000000T000000Z"] {
+        for date in [
+            "é0101T000000Z",
+            "2013",
+            "",
+            "20130524T0000",
+            "99999999T999999Z",
+            "00000000T000000Z",
+        ] {
             let err = verify("s", &mk(date, "20130524/x/s3/aws4_request"), &input, 0).unwrap_err();
             assert!(
                 err.contains("malformed") || err.contains("scope"),

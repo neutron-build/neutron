@@ -1,0 +1,6 @@
+body { font-family: system-ui, sans-serif; margin: 40px; background: #0a0a0a; color: #e5e5e5; }
+h1 { font-size: 2rem; }
+pre { background: #1a1a1a; padding: 16px; border-radius: 8px; overflow-x: auto; }
+button { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 1rem; }
+button:hover { background: #2563eb; }
+#result { margin-top: 16px; }

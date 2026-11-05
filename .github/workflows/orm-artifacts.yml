@@ -92,11 +92,11 @@ jobs:
       NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       NEUTRON_LIVE_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: typescript/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
@@ -106,14 +106,14 @@ jobs:
       - name: Pack, install and check (pg only, postgres.js only)
         run: node scripts/installed-gate.mjs --keep-tarball "$RUNNER_TEMP/pack" --out installed-gate.local.json
         working-directory: typescript/packages/neutron-sql
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: neutron-sql-installed-node${{ matrix.node }}-${{ github.run_id }}
           path: typescript/packages/neutron-sql/installed-gate.local.json
           if-no-files-found: warn
           retention-days: 14
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: matrix.node == 22
         with:
           name: neutron-sql-tarball
@@ -125,14 +125,16 @@ jobs:
     name: Build engine for installed SDK consumers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: nucleus
       - run: cargo build --release --bin nucleus --features server
         working-directory: nucleus
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nucleus-bin-installed
           path: nucleus/target/release/nucleus
@@ -167,22 +169,22 @@ jobs:
       NEUTRON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
       NEUTRON_NUCLEUS_TEST_URL: postgres://postgres@127.0.0.1:55432/postgres
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nucleus-bin-installed
           path: ${{ runner.temp }}/installed-engine
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: typescript/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
           cache-dependency-path: typescript/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile --filter '@neutron-build/sql' --filter '@neutron-build/nucleus' --filter '@neutron-build/data' --filter '@neutron-build/core'
         working-directory: typescript
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: matrix.package == 'nucleus'
         with:
           go-version: "1.26"
@@ -228,7 +230,7 @@ jobs:
           done
       - name: Pack and install into real clean consumers
         run: node typescript/scripts/installed-sdk-gate.mjs --package '${{ matrix.package }}' --keep-tarball "$RUNNER_TEMP/sdk-pack" --out installed-sdk.local.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: neutron-${{ matrix.package }}-installed-node${{ matrix.node }}-${{ github.run_id }}
@@ -259,8 +261,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
       - name: Build Studio (writes dist/studio-manifest.json)
@@ -268,7 +270,7 @@ jobs:
         working-directory: studio
       - name: Embed this build
         run: rm -rf cli/internal/studio/dist && cp -R studio/dist cli/internal/studio/dist
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26"
           cache-dependency-path: cli/go.sum
@@ -286,14 +288,14 @@ jobs:
       - name: Served Studio is this build, and renders in Chrome
         run: node scripts/embed-gate.mjs --cli "$CLI_BIN" --out embed-gate.local.json
         working-directory: studio
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: studio-embed-${{ matrix.os }}-${{ github.run_id }}
           path: studio/embed-gate.local.json
           if-no-files-found: warn
           retention-days: 14
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Linux'
         with:
           name: neutron-cli-linux
@@ -322,12 +324,12 @@ jobs:
     env:
       NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: neutron-sql-tarball
           path: ${{ runner.temp }}/pack
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: neutron-cli-linux
           path: ${{ runner.temp }}/archive
@@ -335,7 +337,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/cli"
           tar -xzf "$RUNNER_TEMP"/archive/neutron_*_linux_amd64.tar.gz -C "$RUNNER_TEMP/cli"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
       - run: npm ci
@@ -343,7 +345,7 @@ jobs:
       - name: Fresh project and legacy upgrade, from the docs
         run: node scripts/onboarding.mjs --cli "$RUNNER_TEMP/cli/neutron" --tarball "$(ls "$RUNNER_TEMP"/pack/*.tgz)" --out onboarding.local.json
         working-directory: studio
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: onboarding-${{ github.run_id }}

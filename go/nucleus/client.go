@@ -283,9 +283,9 @@ func detectFeatures(ctx context.Context, pool *pgxpool.Pool) (Features, error) {
 // errors and panic values may contain passwords in supported DSN spellings.
 var ErrInvalidConfig = errors.New("nucleus: invalid connection configuration")
 
-// ErrChannelBindingUnsupported means this SDK's driver cannot enforce the
-// requested SCRAM channel-binding contract. Refusal precedes network I/O.
-var ErrChannelBindingUnsupported = errors.New("nucleus: required channel binding is unsupported by the current driver")
+// ErrChannelBindingUnsupported means the configuration requires SCRAM channel
+// binding but can never provide it (no TLS). Refusal precedes network I/O.
+var ErrChannelBindingUnsupported = errors.New("nucleus: required channel binding cannot be satisfied without TLS")
 
 // WithConnectTimeout bounds initial pool acquisition and feature detection.
 // The default is 30 seconds. The caller's earlier deadline still applies.
@@ -313,6 +313,7 @@ func preparePoolConfig(dsn string, supplied *pgxpool.Config, budget time.Duratio
 		}
 	}
 	if cfg.MaxConns <= 0 || cfg.MinConns < 0 || cfg.MinConns > cfg.MaxConns ||
+		cfg.MinIdleConns < 0 || cfg.MinIdleConns > cfg.MaxConns ||
 		cfg.HealthCheckPeriod <= 0 || cfg.MaxConnLifetime <= 0 || cfg.MaxConnIdleTime <= 0 ||
 		cfg.MaxConnLifetimeJitter < 0 || cfg.MaxConnLifetimeJitter > cfg.MaxConnLifetime {
 		return nil, ErrInvalidConfig
@@ -352,20 +353,27 @@ func prepareConnConfig(cc *pgx.ConnConfig, budget time.Duration) error {
 	if cc == nil || cc.ConnectTimeout < 0 {
 		return ErrInvalidConfig
 	}
-	// This driver predates MinIdleConns; reject the unsupported pool option
-	// before it can be transmitted as a server setting.
-	if _, unsupported := cc.RuntimeParams["pool_min_idle_conns"]; unsupported {
+	// A pool option set on a connection config would be transmitted as a
+	// server setting.
+	if _, misplaced := cc.RuntimeParams["pool_min_idle_conns"]; misplaced {
 		return ErrInvalidConfig
 	}
-	// pgx v5.7.2 has no SCRAM-PLUS dispatch. Do not send this libpq option
-	// as a server runtime parameter or claim TLS alone provides binding.
-	switch cc.RuntimeParams["channel_binding"] {
-	case "", "disable", "prefer":
+	// pgx enforces channel_binding (SCRAM-SHA-256-PLUS) itself. A
+	// RuntimeParams spelling moves to the driver field so it is enforced
+	// rather than sent to the server as a setting.
+	if v, ok := cc.RuntimeParams["channel_binding"]; ok {
 		delete(cc.RuntimeParams, "channel_binding")
-	case "require":
+		switch v {
+		case "":
+		case "disable", "prefer", "require":
+			cc.ChannelBinding = v
+		default:
+			return ErrInvalidConfig
+		}
+	}
+	// Binding is derived from the TLS channel; without TLS it cannot succeed.
+	if cc.ChannelBinding == "require" && cc.TLSConfig == nil {
 		return ErrChannelBindingUnsupported
-	default:
-		return ErrInvalidConfig
 	}
 	if cc.ConnectTimeout == 0 || cc.ConnectTimeout > budget {
 		cc.ConnectTimeout = budget

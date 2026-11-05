@@ -140,6 +140,18 @@ mod dml;
 pub(crate) mod enlistment;
 mod expr;
 mod helpers;
+
+/// Entry points for the cargo-fuzz crate (`fuzz/`); not a stable API.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub mod fuzz_api {
+    use crate::types::Value;
+
+    /// `INTERVAL '<raw>'` as the executor evaluates it, with no leading field.
+    pub fn parse_interval(raw: &str) -> Result<Value, String> {
+        super::helpers::parse_interval_literal(raw, None).map_err(|e| e.to_string())
+    }
+}
 mod join;
 mod logical_dump;
 mod masking_ddl;
@@ -170,6 +182,7 @@ mod types;
 mod unique_gate;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
+pub(crate) use helpers::parse_statement_timeout;
 use helpers::*;
 #[cfg(feature = "server")]
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};

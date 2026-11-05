@@ -233,6 +233,7 @@ fn create_worker_listeners(
 }
 
 /// One worker's accept loop, running inside a `current_thread` tokio runtime.
+#[allow(clippy::too_many_arguments)]
 async fn worker_accept_loop(
     listener_std: std::net::TcpListener,
     chain: DispatchChain,

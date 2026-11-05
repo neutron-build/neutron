@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 import re
-from typing import Any, Callable, cast
+import uuid
+from typing import Any, Awaitable, Callable, Iterable, Union, cast
 
 import httpx
 from starlette.requests import Request
@@ -12,6 +15,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from neutron.ai.tools import Tool, _build_parameters_schema
+
+logger = logging.getLogger("neutron.ai.mcp")
+
+Authorizer = Callable[[Request], Union[Any, Awaitable[Any]]]
+"""Resolves a request to a principal, or ``None`` to reject with 401."""
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +35,11 @@ class MCPServer:
 
     Usage::
 
-        mcp = MCPServer(name="my-tools")
+        async def authorize(request: Request) -> dict | None:
+            token = request.headers.get("authorization", "")
+            return {"name": "agent"} if token == f"Bearer {SECRET}" else None
+
+        mcp = MCPServer(name="my-tools", authorize=authorize)
 
         @mcp.tool()
         async def search(query: str) -> list[dict]:
@@ -40,11 +52,29 @@ class MCPServer:
             ...
 
         app.mount("/mcp", mcp)
+
+    ``authorize`` is required and runs on every request; it receives the
+    Starlette ``Request`` and returns a principal (stored on
+    ``request.state.principal``) or ``None`` to reject with 401. Requests
+    carrying an ``Origin`` header are refused with 403 unless the origin is
+    listed in ``allowed_origins`` (default: none, i.e. non-browser clients
+    only). Tool calls must be ``application/json``.
     """
 
-    def __init__(self, name: str = "neutron-mcp", version: str = "1.0.0") -> None:
+    def __init__(
+        self,
+        name: str = "neutron-mcp",
+        version: str = "1.0.0",
+        *,
+        authorize: Authorizer,
+        allowed_origins: Iterable[str] | None = None,
+    ) -> None:
+        if not callable(authorize):
+            raise TypeError("MCPServer requires an authorize callable")
         self.name = name
         self.version = version
+        self._authorize = authorize
+        self._allowed_origins = frozenset(allowed_origins or ())
         self._tools: dict[str, Tool] = {}
         self._resources: dict[str, _ResourceDef] = {}
         self._asgi_app: Any = None
@@ -105,8 +135,23 @@ class MCPServer:
         ]
         return Starlette(routes=routes)
 
+    async def _guard(self, request: Request) -> JSONResponse | None:
+        """Origin allowlist + authorization. Returns an error response or None."""
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in self._allowed_origins:
+            return JSONResponse({"error": "Origin not allowed"}, status_code=403)
+        principal = self._authorize(request)
+        if inspect.isawaitable(principal):
+            principal = await principal
+        if principal is None:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        request.state.principal = principal
+        return None
+
     async def _handle_root(self, request: Request) -> JSONResponse:
         """Server info / capabilities."""
+        if (denied := await self._guard(request)) is not None:
+            return denied
         return JSONResponse(
             {
                 "name": self.name,
@@ -121,6 +166,8 @@ class MCPServer:
 
     async def _handle_list_tools(self, request: Request) -> JSONResponse:
         """List available tools with their schemas."""
+        if (denied := await self._guard(request)) is not None:
+            return denied
         tools = []
         for t in self._tools.values():
             tools.append(
@@ -134,6 +181,13 @@ class MCPServer:
 
     async def _handle_call_tool(self, request: Request) -> JSONResponse:
         """Call a tool by name."""
+        if (denied := await self._guard(request)) is not None:
+            return denied
+        content_type = request.headers.get("content-type", "")
+        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            return JSONResponse(
+                {"error": "Content-Type must be application/json"}, status_code=415
+            )
         tool_name = request.path_params["tool_name"]
         tool_obj = self._tools.get(tool_name)
         if tool_obj is None:
@@ -144,16 +198,22 @@ class MCPServer:
         try:
             body = await request.json()
         except Exception:
-            body = {}
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "Body must be a JSON object"}, status_code=400
+            )
 
         try:
             result = await tool_obj(**body)
             return JSONResponse({"result": result})
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+        except Exception:
+            return _internal_error("tool", tool_name)
 
     async def _handle_list_resources(self, request: Request) -> JSONResponse:
         """List available resources."""
+        if (denied := await self._guard(request)) is not None:
+            return denied
         resources = []
         for uri_template, res in self._resources.items():
             resources.append(
@@ -167,6 +227,8 @@ class MCPServer:
 
     async def _handle_read_resource(self, request: Request) -> JSONResponse:
         """Read a resource by URI."""
+        if (denied := await self._guard(request)) is not None:
+            return denied
         resource_path = request.path_params["resource_path"]
 
         for uri_template, res in self._resources.items():
@@ -175,12 +237,21 @@ class MCPServer:
                 try:
                     result = await res.call(**params)
                     return JSONResponse({"result": result})
-                except Exception as e:
-                    return JSONResponse({"error": str(e)}, status_code=500)
+                except Exception:
+                    return _internal_error("resource", uri_template)
 
         return JSONResponse(
             {"error": f"No resource matches: {resource_path}"}, status_code=404
         )
+
+
+def _internal_error(kind: str, name: str) -> JSONResponse:
+    """Log the active exception server-side; return a generic error with an id."""
+    error_id = uuid.uuid4().hex
+    logger.exception("MCP %s %r failed (error_id=%s)", kind, name, error_id)
+    return JSONResponse(
+        {"error": "Internal error", "error_id": error_id}, status_code=500
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +285,6 @@ class _ResourceDef:
 
 
 def _is_coroutine(fn: Callable) -> bool:
-    import inspect
-
     return inspect.iscoroutinefunction(fn)
 
 
@@ -229,17 +298,20 @@ class MCPClient:
 
     Usage::
 
-        async with MCPClient("http://other-service/mcp") as client:
+        async with MCPClient(
+            "http://other-service/mcp", headers={"Authorization": f"Bearer {token}"}
+        ) as client:
             tools = await client.list_tools()
             result = await client.call_tool("search", {"query": "hello"})
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
         self.url = url.rstrip("/")
+        self._headers = dict(headers or {})
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> MCPClient:
-        self._client = httpx.AsyncClient(timeout=60.0)
+        self._client = httpx.AsyncClient(timeout=60.0, headers=self._headers)
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -290,6 +362,8 @@ class MCPClient:
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource by URI."""
+        if (denied := await self._guard(request)) is not None:
+            return denied
         client = self._ensure_client()
         resp = await client.get(f"{self.url}/resources/{uri}")
         resp.raise_for_status()

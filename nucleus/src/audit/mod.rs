@@ -365,7 +365,8 @@ fn repair_torn_tail(path: &Path) -> std::io::Result<()> {
 }
 
 /// Delete retained files past `keep`, and any left by an interrupted rotation.
-fn prune(dir: &Path, keep: usize) -> std::io::Result<()> {    let Ok(entries) = std::fs::read_dir(dir) else {
+fn prune(dir: &Path, keep: usize) -> std::io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
     };
     for entry in entries.flatten() {
@@ -629,7 +630,10 @@ mod tests {
             // Sizes cap-1 and cap are fine (control chars expand 6x, so keep
             // the raw detail well under): the boundary is exact.
             let ok_detail = "x".repeat(max as usize / 8 - 64);
-            assert!(s.record(AuditKind::RoleAltered, "b", &ok_detail, None).is_ok());
+            assert!(
+                s.record(AuditKind::RoleAltered, "b", &ok_detail, None)
+                    .is_ok()
+            );
         }
     }
 
@@ -661,7 +665,8 @@ mod tests {
             let dir = root.join(format!("cut{cut}"));
             std::fs::create_dir_all(&dir).unwrap();
             // Good terminated record + torn prefix of the reference record.
-            let mut seed = b"{\"ts_ms\":1,\"kind\":\"login_succeeded\",\"principal\":\"ok\"}\n".to_vec();
+            let mut seed =
+                b"{\"ts_ms\":1,\"kind\":\"login_succeeded\",\"principal\":\"ok\"}\n".to_vec();
             seed.extend_from_slice(&reference[..cut]);
             std::fs::write(dir.join(ACTIVE), &seed).unwrap();
 
@@ -685,7 +690,9 @@ mod tests {
                 "cut {cut}: seed record lost: {lines:?}"
             );
             assert!(
-                lines.iter().any(|l| l.contains("\"principal\":\"sentinel\"")),
+                lines
+                    .iter()
+                    .any(|l| l.contains("\"principal\":\"sentinel\"")),
                 "cut {cut}: the post-repair sentinel did not land as its own record: {lines:?}"
             );
             assert!(

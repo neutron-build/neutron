@@ -5,5 +5,20 @@
   "scripts": {
     "check": "node --check run.mjs && node --check main.mjs && node --check providers.mjs",
     "check:live": "node run.mjs"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "@prisma/client",
+      "@prisma/engines",
+      "@swc/core",
+      "better-sqlite3",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma",
+      "sharp",
+      "unrs-resolver",
+      "workerd"
+    ]
   }
 }

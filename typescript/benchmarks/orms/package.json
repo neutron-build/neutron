@@ -22,5 +22,20 @@
     "tinybench": "^2.10.1",
     "@types/better-sqlite3": "^7.6.12",
     "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "@prisma/client",
+      "@prisma/engines",
+      "@swc/core",
+      "better-sqlite3",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma",
+      "sharp",
+      "unrs-resolver",
+      "workerd"
+    ]
   }
 }
