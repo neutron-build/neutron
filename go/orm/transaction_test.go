@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Lifecycle driver fixtures test branches that cannot be induced reliably by
@@ -247,3 +248,5 @@ func TestScopeLeaseConcurrentTerminalAndChildOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func (*fixtureRows) TypeMap() *pgtype.Map { return nil }

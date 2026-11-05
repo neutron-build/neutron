@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // mockScanRows simulates Nucleus pgwire results for scanRow tests.
@@ -471,3 +472,5 @@ func TestParseTimeValue_Invalid(t *testing.T) {
 		t.Error("expected error for invalid time string")
 	}
 }
+
+func (*mockScanRows) TypeMap() *pgtype.Map { return nil }
