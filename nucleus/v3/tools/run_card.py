@@ -39,9 +39,21 @@ a closed range's end is no longer an ancestor of HEAD (ledger_rewritten), unless
 after the operator inspected the rewritten branch, moves the ledger aside and starts a new one trusting
 HEAD as is. An intact ledger is never overridden. A killed attempt's tokens count.
 
-Inside and outside the container (CONTAIN): opencode and everything it starts run in a PID namespace
-and die with it. This runner, its git checks and the Acceptance commands run outside it, so
-worker-written code that an Acceptance command runs (a test, a build script) is not contained.
+Inside and outside the container (CONTAIN): opencode and each Acceptance command run in a PID namespace
+of their own, each with a fresh TMPDIR, and everything they start dies with that namespace before this
+runner reads the branch or writes an end record. So worker-written code an Acceptance command runs (a
+test, a build script) cannot outlive its line (X-6-F1-F1-F2-F1-F1). This runner and its git checks run
+outside. A namespace contains processes, not their effects: a daemon outside can still be asked to run
+something, and a planted file can still run later, a planted `unshare` on PATH included. Those are
+X-6-F1-F1-F2-F1-F2's.
+
+What a contained command cannot do: start a real NBench row. `systemctl --user` and `systemd-run --user
+--unit ...` fail inside a PID namespace (`Failed to connect to user scope bus via local transport: No
+data available`: systemd refuses a peer whose PID it cannot see), while `systemd-run --user --wait --pipe`
+works, so NBench's `unit_start` and `unit_stop` cannot start a competitor server from a contained line,
+and they fail loudly. No waiting or ready card's Acceptance starts a real row (checked against every card
+QUEUE lists as live, X-6-F1-F1-F2-F1-F1 Work 4; every card that does is merged). A card that needs one
+must ask: there is no exemption here.
 
 v3 rules on top of v2: the last Acceptance command must be the full gate (`scripts/gate.sh`),
 whose pass requires a literal `GATE EXIT=0` line, not just exit code 0 (§7.6.4); workers may
@@ -74,7 +86,9 @@ NO_OUTPUT_S = 600  # a log still empty after this is a provider stall: restart o
 STALL_S = 30 * 60  # a log silent for this long: kill the attempt
 ATTEMPT_S = 60 * 60  # an attempt running this long: kill it
 POLL_S = 5
-# The container opencode runs in (X-6-F1-F1-F2-F1, verdict X-6-F1-F1-F2 R1). opencode
+ACCEPT_S = 60 * 60  # one Acceptance command running this long: end its container and stop the run
+# The container opencode and each Acceptance command run in (X-6-F1-F1-F2-F1, verdict
+# X-6-F1-F1-F2 R1; Acceptance: X-6-F1-F1-F2-F1-F1). opencode
 # 2.2.5 starts each shell tool command detached, in a new session, so no process
 # group holds them: a forge left in a tool shell landed after the group kill.
 # A PID namespace does: when its init dies the kernel SIGKILLs every member and
@@ -1040,7 +1054,8 @@ def parse_tokens(log_path):
 
 
 def containment_problem():
-    """Why opencode cannot be contained on this host, or None if it can.
+    """Why opencode and the Acceptance commands cannot be contained on this host, or
+    None if they can.
 
     Fails closed: main() refuses the card on any answer but None and never falls
     back to the group kill, which reaches no real tool shell. Everything kill_child
@@ -1082,11 +1097,13 @@ def container_init(pid):
 
 
 def kill_child(proc):
-    """End opencode's container, and return only when every process in it is dead.
+    """End a container, opencode's or an Acceptance command's, and return only when
+    every process in it is dead.
 
     proc is unshare (CONTAIN), the leader of its own process group, with the
-    namespace's init (opencode) in that group unless it moved itself. Every process
-    opencode starts is in the namespace, whatever session or group it moved to.
+    namespace's init (opencode, or an Acceptance command's /bin/sh) in that group
+    unless it moved itself. Every process the init starts is in the namespace,
+    whatever session or group it moved to.
     Measured in verdict X-6-F1-F1-F2: real tool shells leave the group, so the group
     kill alone never reached them. The killpg's job now is the init.
 
@@ -1151,6 +1168,59 @@ def kill_child(proc):
         select.select([fd], [], [])
         proc.init_pidfd = None
         os.close(fd)
+
+
+def spawn_contained(argv, cwd, env, **popen_args):
+    """Start argv in a new container (CONTAIN) with a fresh TMPDIR, as the leader of
+    its own process group, and return its Popen. end_container ends it.
+
+    The TMPDIR is per container because contained PIDs restart near 1, so paths keyed
+    on the process id (bench/nbench's and spikes/e1-*'s `std::process::id()` scratch
+    dirs in the temp dir) collide across containers: at equal PIDs 5 of 8 concurrent
+    contained nbench test runs failed, and 0 of 8 with a TMPDIR each (verdict
+    X-6-F1-F1-F2-F1 F3). It is under the runner's own temp dir, so outside the
+    worktree, and nothing in the container can outlive its removal.
+
+    stdin is /dev/null for a second reason beyond a closed stdin being the rule here:
+    a process group that is not the terminal's foreground group stops on a terminal
+    read (SIGTTIN), which would hold a run started from a terminal for good."""
+    tmp = tempfile.mkdtemp(prefix="nv3-container-")
+    try:
+        proc = subprocess.Popen([*CONTAIN, *argv], cwd=cwd, env=dict(env, TMPDIR=tmp), stdin=subprocess.DEVNULL, process_group=0, **popen_args)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    proc.tmpdir = tmp
+    return proc
+
+
+def end_container(proc):
+    """kill_child, then remove the container's TMPDIR. Idempotent, like kill_child: a
+    SIGTERM raising out of either leaves main()'s finally to finish the rest. A removal
+    that fails (a worker's unwritable directory) is a warning, not a failed run."""
+    kill_child(proc)
+    tmp = getattr(proc, "tmpdir", None)
+    if tmp is not None:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if os.path.exists(tmp):
+            print(f"warning: cannot remove the container's TMPDIR {tmp}", flush=True)
+        proc.tmpdir = None
+
+
+def finish_contained(proc, timeout):
+    """Wait for a spawn_contained command started with text pipes, end its container
+    and return (exit code, stdout + stderr), the shape run() returns for gate_passed
+    and failure_text. Nothing of the command is alive when this returns or raises.
+
+    unshare passes on its init's exit code and adds no output. Past the timeout this
+    raises subprocess.TimeoutExpired, as subprocess.run does, after the same end path
+    as opencode: subprocess.run's own kill would end unshare alone and not wait for
+    the init, so a member could still run while the runner reads the branch."""
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    finally:
+        end_container(proc)
+    return proc.returncode, stdout + stderr
 
 
 def _sigterm(signum, frame):
@@ -1321,7 +1391,7 @@ def main():
                     # In its own container and process group. The group does not reach
                     # opencode's children (its tool shells leave it); the container
                     # does. See CONTAIN and kill_child.
-                    child = subprocess.Popen([*CONTAIN, *cmd], cwd=wt, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, process_group=0)
+                    child = spawn_contained(cmd, wt, env, stdout=fh, stderr=subprocess.STDOUT)
                     t_start = time.time()
                     while child.poll() is None:
                         time.sleep(POLL_S)
@@ -1329,17 +1399,17 @@ def main():
                         st = log.stat()
                         silence = int(time.time() - st.st_mtime) if st.st_size else int(waited)
                         if waited > NO_OUTPUT_S and st.st_size == 0:
-                            kill_child(child)
+                            end_container(child)
                             result["killed"].append({"attempt": attempt, "reason": "no-output", "silence_s": silence})
                             print(f"[{card_id}] attempt {attempt}: no output at all after {waited / 60:.0f} min (provider stall?); restarting opencode (start {start + 1})", flush=True)
                             break
                         if st.st_size and silence > STALL_S:
-                            kill_child(child)
+                            end_container(child)
                             killed = "silence"
                             failure = f"opencode run killed: no output for {STALL_S // 60} minutes (stalled model call); continue the card"
                             break
                         if waited > ATTEMPT_S or free_gb(WT_ROOT) < args.min_free_gb / 2:
-                            kill_child(child)
+                            end_container(child)
                             killed = "timeout"
                             failure = f"opencode run killed: timed out after {ATTEMPT_S // 60} minutes or disk nearly full"
                             break
@@ -1348,7 +1418,7 @@ def main():
                         # kill_child closes this attempt the same way as a kill
                         # before anything reads the branch: its children are gone,
                         # whatever session or group they moved to.
-                        kill_child(child)
+                        end_container(child)
                         finished = True
                 if finished or killed:
                     break
@@ -1386,7 +1456,11 @@ def main():
             result["scope"] = "ok"
             failures = []
             for c in accept:
-                rc, out = run(c, wt, env=env, timeout=60 * 60)
+                # One container per command, ended before the next one starts, so
+                # nothing a line starts is alive for the next line or the end record.
+                # In `child`, so a signal during the wait still reaches the finally.
+                child = spawn_contained(["/bin/sh", "-c", c], wt, git_env(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                rc, out = finish_contained(child, ACCEPT_S)
                 if c.strip() == GATE_CMD and not gate_passed(rc, out):
                     rc, out = 1, out + "\nthe gate's last line was not GATE EXIT=0"
                 if rc == 0 and "cargo test" in c and sum(int(n) for n in re.findall(r"test result: ok\. (\d+) passed", out)) == 0:
@@ -1432,8 +1506,9 @@ def main():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         # Whether or not opencode itself is alive: this attempt's end may have been
         # interrupted. kill_child skips killpg if it already killed this child's group.
+        # child is the latest container: each earlier one was ended before it started.
         if child is not None:
-            kill_child(child)
+            end_container(child)
         _, head = run(["git", "rev-parse", "HEAD"], wt)
         head = head.strip()
         ledger_append(ledger, {"run": run_id, "end": head if OID_RE.fullmatch(head) else None, "t": time.time()})
