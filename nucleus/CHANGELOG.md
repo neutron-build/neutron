@@ -43,6 +43,14 @@ and 1.3.0 opens it again afterwards. Main's format-3 work is not included.
 - `nucleus version` reports the real release again. 1.3.0 was tagged without a
   manifest bump and reports 1.2.2.
 
+### Known issues
+
+- Not fixed here, same as 1.3.0: format 2 stores the table-directory overflow
+  payload where the page flusher stamps its checksum and LSN (NE-31). A large
+  enough catalog can stop the database opening, with `failed to open database
+  file: ... failed to fill whole buffer`. The fix needs format 3, so it is not in
+  this release. Keep a current backup if you have several hundred tables.
+
 ## [1.2.2] - 2026-10-04
 
 ### Fixed
