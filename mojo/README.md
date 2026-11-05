@@ -8,8 +8,8 @@ model loading, block quantization, transformer inference, and training utilities
 ## Status — preview, on Mojo 1.0
 
 **Mojo 1.0 shipped 2026-08-11 and the SDK was migrated to it** (2026-08-19;
-the pinned nightly toolchain no longer compiles). `mojoproject.toml` requires
-`mojo >= 1.0`, `max >= 26.5`; the last recorded validation run
+the pinned nightly toolchain no longer compiles). `mojoproject.toml` pins
+`mojo == 1.0.0`, `max >= 26.5, < 26.6`; the last recorded validation run
 (`reports/core-validation-latest.md`, 2026-08-20) is **125 pass / 0 fail on
 Mojo 1.0.0**. Treat it as a **preview**, not a production dependency:
 
@@ -95,7 +95,7 @@ FP32, Q8, Q4, and mixed-precision paths.
 
 ## Build and test
 
-This is a [pixi](https://pixi.sh)/`mojoproject.toml` workspace (`mojo >= 1.0`, `max >= 26.5`). A
+This is a [pixi](https://pixi.sh)/`mojoproject.toml` workspace (`mojo == 1.0.0`, `max >= 26.5, < 26.6`). A
 working Mojo toolchain is required to build or run anything.
 
 ```bash

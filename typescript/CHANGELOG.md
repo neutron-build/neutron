@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## 2026-11-05
+
+core 0.5.3, cli 0.5.3, create 0.1.12, agents 0.3.0, ai 0.1.3, auth 0.1.7,
+data 0.3.1, sql 0.2.1, mcp 0.1.2, nucleus 0.3.1, workflow 0.1.2, mail 0.2.0.
+
+### Fixed
+
+- `@neutron-build/agents` `SandboxExecutor.exec` forwards `ExecOptions.env` to
+  the sandbox daemon; it was dropped, so commands saw empty variables.
+- Raised the `sanitize-html` minimum to 2.18 and `yaml` to 2.8.3 for published
+  advisories.
+
 ### Security (breaking)
 
 - **`@neutron-build/agents` `LocalExecutor` builds the child env from an

@@ -95,9 +95,13 @@ theorem last_committed_delete_removes (wal : WAL) (table key : Nat) (r : WalReco
     (last : (tableMutations wal).reverse.find? (fun r => r.tableId == table && r.data.head? == some key) = some r)
     (deleted : r.recordType = .delete) : rowRecovery wal table key = none := by
   simp [rowRecovery, last, deleted]
+  rfl
 
 theorem last_committed_write_materializes (wal : WAL) (table key : Nat) (r : WalRecord)
     (last : (tableMutations wal).reverse.find? (fun r => r.tableId == table && r.data.head? == some key) = some r)
     (notDeleted : r.recordType ≠ .delete) : rowRecovery wal table key = some r.data.tail := by
-  simp [rowRecovery, last, notDeleted]
+  -- `WalRecordType` derives only `BEq`, so `simp` cannot turn `≠` into `== = false`.
+  have notDeleted' : (r.recordType == .delete) = false := by
+    cases h : r.recordType <;> first | rfl | exact absurd h notDeleted
+  simp [rowRecovery, last, notDeleted']
 end Nucleus.Spec

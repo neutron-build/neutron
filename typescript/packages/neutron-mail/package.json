@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/mail",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mail connector client for Neutron. Reads a user's existing mailbox through the neutron-mail engine, and exposes it to agents as tools.",
   "author": "Tyler",
   "license": "MIT",

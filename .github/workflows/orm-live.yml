@@ -290,7 +290,7 @@ jobs:
         env:
           NEUTRON_E2E_NUCLEUS_URL: postgresql://postgres@127.0.0.1:55432/postgres
           NEUTRON_NUCLEUS_LIVE_REQUIRED: "1"
-        run: go test -count=1 -run 'TestMCPNucleus|TestStudioX06JourneyNucleusE2E' -v ./internal/mcp ./internal/studio
+        run: go test -p 1 -count=1 -run 'TestMCPNucleus|TestStudioX06JourneyNucleusE2E' -v ./internal/mcp ./internal/studio
 
       - name: Report
         if: always()

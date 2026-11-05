@@ -36,6 +36,17 @@ jobs:
               for path in root.rglob(name): path.chmod(path.stat().st_mode | 0o111)
           with open(__import__('os').environ['GITHUB_PATH'],'a') as f: f.write(str(binaries[0].parent)+'\n')
           PY
+      # The release runs on one exact rustc and `verus --version` exits 1 when
+      # rustup lacks it. The release's own version.json names that toolchain, so
+      # bumping VERUS_VERSION cannot leave a second pin behind.
+      - name: Install the Rust toolchain the release requires
+        run: |
+          toolchain="$(python3 - "$RUNNER_TEMP/verus-tool/verus-x86-linux/version.json" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1]))['verus']['toolchain'].split()[0])
+          PY
+          )"
+          rustup toolchain install --profile minimal --no-self-update "$toolchain"
       - name: Check models and reject real semantic mutations
         run: python3 verus/scripts/canary.py
       - name: Test runner failure transports

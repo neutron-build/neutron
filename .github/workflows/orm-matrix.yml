@@ -99,6 +99,35 @@ jobs:
         with:
           go-version: "1.26"
           cache-dependency-path: cli/go.sum
+      # The recovery legs run pg_dump/pg_restore against the service. The runner's
+      # own client is older than PostgreSQL 17 and pg_dump refuses a newer server,
+      # so install the client matching each major (bounded retries as in cli.yml:
+      # a stalled apt mirror is not a CLI failure).
+      - name: Install PostgreSQL ${{ matrix.pg }} client
+        timeout-minutes: 14
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+        run: |
+          set -euo pipefail
+          retry() {
+            local what="$1"; shift
+            local limit="$1"; shift
+            for attempt in 1 2 3; do
+              if sudo timeout "$limit" "$@"; then
+                return 0
+              fi
+              echo "$what failed or stalled (attempt $attempt of 3), retrying"
+              sleep 5
+            done
+            echo "::error::$what did not succeed in 3 bounded attempts -- apt mirror stall, not a CLI failure"
+            return 1
+          }
+          retry "apt-get update" 120 apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30
+          retry "install postgresql-common" 180 apt-get install -y postgresql-common
+          retry "pgdg repository setup" 180 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          retry "install postgresql-client-$PG_MAJOR" 180 apt-get install -y "postgresql-client-$PG_MAJOR"
+          echo "NEUTRON_PG_DUMP_BINARY=/usr/lib/postgresql/$PG_MAJOR/bin/pg_dump" >> "$GITHUB_ENV"
+          echo "NEUTRON_PG_RESTORE_BINARY=/usr/lib/postgresql/$PG_MAJOR/bin/pg_restore" >> "$GITHUB_ENV"
       - name: Test
         run: go test -race -timeout 30m ./...
         working-directory: cli

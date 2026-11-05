@@ -169,17 +169,17 @@ private theorem grant_preserves_vote (s : State) (t v c t' v' c' : Nat)
 theorem step_preserves_certificates {s s' : State} (safe : certified s) (step : Step s s') :
     certified s' := by
   cases step with
-  | vote before t v c _ free =>
+  | vote t v c _ free =>
     intro t' c' elected
     have q := safe t' c' elected
     rcases q with q | q | q
-    · exact Or.inl ⟨grant_preserves_vote before t v c t' 1 c' free q.1,
-        grant_preserves_vote before t v c t' 2 c' free q.2⟩
-    · exact Or.inr (Or.inl ⟨grant_preserves_vote before t v c t' 1 c' free q.1,
-        grant_preserves_vote before t v c t' 3 c' free q.2⟩)
-    · exact Or.inr (Or.inr ⟨grant_preserves_vote before t v c t' 2 c' free q.1,
-        grant_preserves_vote before t v c t' 3 c' free q.2⟩)
-  | publish before t c certificate =>
+    · exact Or.inl ⟨grant_preserves_vote s t v c t' 1 c' free q.1,
+        grant_preserves_vote s t v c t' 2 c' free q.2⟩
+    · exact Or.inr (Or.inl ⟨grant_preserves_vote s t v c t' 1 c' free q.1,
+        grant_preserves_vote s t v c t' 3 c' free q.2⟩)
+    · exact Or.inr (Or.inr ⟨grant_preserves_vote s t v c t' 2 c' free q.1,
+        grant_preserves_vote s t v c t' 3 c' free q.2⟩)
+  | publish t c certificate =>
     intro t' c' elected
     rcases elected with eq | old
     · rcases eq with ⟨rfl, rfl⟩; exact certificate

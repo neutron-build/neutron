@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -603,7 +604,7 @@ async function makeTypeScriptConfigFixtureProject(): Promise<string> {
   // bare import resolves from the fixture rather than from the test runner.
   await fs.mkdir(path.join(root, "node_modules", "@neutron-build"), { recursive: true });
   await fs.symlink(
-    path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", ".."),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
     path.join(root, "node_modules", "@neutron-build", "core"),
     "dir"
   );

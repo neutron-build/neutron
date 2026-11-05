@@ -5,7 +5,8 @@ import re
 import sys
 
 MARKER = re.compile(r'^AXIOM AUDIT OK: ([0-9]+) theorems, none depending on an unlisted axiom$')
-THEOREM = re.compile(r'^AXIOM THEOREM: (Nucleus\.[A-Za-z0-9_.]+)$')
+# Lean names may use primes, ?, ! and unicode letters/subscripts (`find?_map_replace`).
+THEOREM = re.compile(r"^AXIOM THEOREM: (Nucleus\.[\w.'!?]+)$")
 
 def parse(output):
     # Lean logInfo includes file/line prefixes; strip only its diagnostic prefix.
