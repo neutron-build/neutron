@@ -486,6 +486,140 @@ gets no Q4 knob from this card. The X5-R40 machinery stays in the
 tree, inert at BASE and FINAL (`smo_share` 0, no draw, no op
 inserted), for whatever the owner decides.
 
+## Card X-5c-F4-F1-F1-F2's record (finding 1: the late epoch copy)
+
+Verdict X-5c-F4-F1-F1, finding 1, confirmed by a literal schedule and
+fixed: a first touch's epoch copy can still be on its way (the only
+yield between the freeze and the install is the exhausted reserve
+path's write-out of the oldest copy) while step 2 writes the page's
+normal frame — the parked mutator is the one that would have replaced
+its bytes — and resolves `Img::CopyPending` to `Img::At`; then
+`ckpt:freecopies` frees the reserve and the checkpoint completes. The
+install then lands **late**: a dirty, `is_epoch_copy` frame with
+`f.epoch = e − 1` past its own checkpoint's cleanup. The next
+checkpoint's scan accepts it (`f.is_epoch_copy || f.epoch <= k`) and
+its record path maps the LPID to epoch-`k` content while `T` says
+replay need not restore it — a silent class-C loss, no injected fault
+(the gate's trace: seed 845 r0 under the X5-R41 prototype).
+
+**The fix (step 1, one atomic step in `epoch_copy:install`):** install
+only while `map.img[lpid]` is still `Img::CopyPending`; otherwise drop
+the bytes — the image's content is already recorded (step 2's write, a
+previous-epoch eviction's `At`, or a closed window). This is S-STORE
+§5.6's copy condition ("copies only if that content is not yet at a
+slot the image map references") **re-tested after the wait**, exactly
+as P read it. Invariant `PR-LATECOPY` added to `prims.rs`'s header. A
+new named park point, `epochcopy:prewrite`, holds a copy in the
+exhausted path for the directed pins (no budget set: returns at once).
+
+**The literal schedule (step 0,
+`late_epoch_copy_must_not_enter_the_next_image`)** — twelve one-page
+trees, `R_EPOCH = 1`: the first `Mid2` hook performs P's first touch
+and fills the reserve deterministically; the mutator task's touch of B
+(the highest frame, above ten padding trees) parks in the exhausted
+path; step 2 writes P's copy (the fixpoint re-scan) and B's normal
+frame (resolving `CopyPending` → `At(slot 17)`); the `After2` hook —
+past `ckpt:freecopies` — releases the parked copy, which installs late
+(img `At`, past freecopies, dirty, `is_epoch_copy`, epoch 1); B's frame
+is evicted between the checkpoints so checkpoint 2's scan cannot
+overwrite the leaked entry; a crash after checkpoint 2's meta; the
+reopen from meta 2 read the leaked copy's flip-1 leaf (slot 24, the
+flip-1 crc) and **lost the window-1 key** — the pin failed at the
+pre-fix tip exactly as the card demands, with the path matching the
+Goal's reading (recorded by a trace before the fix). The pin also
+reopens from meta 1 (reverted): the flip-1 cut must hold one entry per
+tree, which is the half that catches an over-eager drop.
+
+**The freed-LPID pin (`freed_lpids_late_copy_never_remaps`)** — the
+same park holds a raw `store_page` (not a tree insert: an insert holds
+the epoch gate across the parked wait and the next flip cannot start —
+the first draft deadlocked the flip against the park until the budget
+self-drained) across two flips; checkpoint 1 completes, B's LPID is
+freed between the checkpoints, and window 2 opens with the map empty
+for B. The real guard drops the copy (an absent entry is not
+`CopyPending`); the reopened store's `cur` has no entry for B and the
+free set holds it. Under **M-LATECOPY-ATONLY** (the guard testing
+`Img::At` only) the copy installs onto the absent entry and
+checkpoint 2's scan records it — `img[B] = At(slot 33)`, the flip-1
+crc — the pin fails.
+
+**Late and stale counts at BASE (step 2), seeds 0..200, measured with
+the gate prototype's `LATECOPY`/`STALECOPY` counters (env-gated, on
+`git archive` exports of the pre-fix base `a4c1f869` and the post-fix
+tip; `e4-campaign run --seeds 0..200 --threads 16` under
+`ulimit -v 25165824`):**
+
+| | LATECOPY (late installs → drops) | STALECOPY (a stale copy reaching a later scan) |
+|---|---|---|
+| pre-fix (a4c1f869) | 7 | 0 |
+| post-fix (this tip) | 7 | **0** |
+
+The seven events sit on seeds **96 (×2), 104 (×1), 161 (×1), 190
+(×3)** (located by single-seed runs). Post-fix the same seven installs
+are drops — no stale copy reaches a scan over 0..200, so **the
+`ckpt2:scan` guard is not needed** and the scan condition is
+untouched. (The verdict's 0..1000 probe counted 34 late installs and 7
+stale copies pre-fix; my 0..200 slice shows 7 and 0 — consistent, the
+leak-into-scan is the rarer tail.) No seed fails before or after (the
+runner's fold: 2 vs 3 *failing rounds*, both known classes on moved
+schedules; the per-seed records pass).
+
+**Digest movement (step 4).** Over 0..200 the digests that move are
+**96** (`83795711 → 4266526636`) and **190** (`813405985 →
+4013865743`) — the drop is the only difference. Seeds 104 and 161 hit
+the path too but their late installs were observably benign pre-fix
+(same digest both sides). **No seed in X5-R37's literal list moves**:
+the whole 54-seed list re-ran green at the tip twice — once as the
+in-suite pin (`x5_r37_base_tuning_reproduces_1b0ce54e`, all 55
+assertions) and once as an independent campaign-binary pass over the
+same seeds (chunks 200..1000 plus singles through 9809, digests
+compared against the literals) — so no literal changed and F4's new
+baseline is the old one. `late_copy_count_is_zero_at_base` (step 3)
+pins the four hitting seeds' post-fix digests; the count itself is not
+observable inside this card's Limit 1 (a store counter would touch
+`StoreInner`), which the pin's doc states.
+
+**Mutation evidence** (each applied to the real code, shown failing,
+reverted clean — `git diff` empty after each):
+
+| Mutant | Failing pins |
+|---|---|
+| M-LATECOPY-INSTALL (the guard removed) | `late_epoch_copy_must_not_enter_the_next_image` (missing key), `late_copy_count_is_zero_at_base` (seed 96's digest reverts) |
+| M-LATECOPY-DROPALWAYS (every copy dropped) | `late_epoch_copy_must_not_enter_the_next_image` ("scan P after meta 1: lpid 12 unmapped" — the unresolved `CopyPending`), `step2_fixpoint_writes_late_epoch_copies` ("scan B after reopen: lpid 3 unmapped") |
+| M-LATECOPY-ATONLY (the guard tests `Img::At` only) | `freed_lpids_late_copy_never_remaps` (the freed LPID remapped) |
+
+**ESCALATE (a sibling this card's prescribed fix does not cover).**
+The exhausted path's own **record** for the oldest copy has the same
+late-landing shape: `record_image_at(key, r)` runs right after the
+park's write-out, and when the wait crossed its checkpoint's post-5
+(the map cleared), it inserts a stale `Img::At` — the oldest copy's
+flip-`k` content — into the *next* window's map. Nothing clears it
+(the flip does not clear `map.img`), the next freeze lets it override
+`cur`, and the next image maps that LPID to flip-`k` content while the
+mutations between the flips (committed, ts ≤ T) are not replayed: the
+same silent class-C loss, through the record rather than the install.
+A deterministic reproduction at this (fixed) tip — preserved at
+`~/.cache/nv3-review/x-5c-F4-F1-F1-F2/sibling_stale_record_repro.rs`
+(scratch, never committed; a self-contained `#[test]` built on the
+committed pin's world) — drives the same park across post-5, releases in
+the post-5→next-flip gap, evicts the oldest copy's LPID between the
+checkpoints (so the next scan cannot self-heal the entry by re-writing
+the frame), and reopens after the second checkpoint's meta: image 2
+maps P to `Ref { slot: 32, epoch: 1 }` — the flip-1 leaf, crc
+4182374088 — and P's scan loses the window-1 key. The committed
+`freed_lpids_late_copy_never_remaps` pin rides on the same world with
+its release inside window 2, where the record's stale insert is
+unobserved (its doc says so); a guard at the record (the same
+`CopyPending` re-test, or a window re-test) would close it, but that
+is outside this card's prescribed fix ("at `epoch_copy:install`") and
+Limit 1's letter leaves the decision to P.
+
+**What did not change:** the oracle, the model, the sim, K, R, the
+generators, every quota, `verify`'s exit rule, `ckpt2:scan`'s
+condition, and `docs/` (P decides at this card's gate whether S-STORE
+§5.6 needs its "re-test the copy condition after any wait on the
+reserve" sentence, as its own Class: spec card).
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
