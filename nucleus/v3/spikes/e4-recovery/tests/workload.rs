@@ -811,6 +811,8 @@ fn campaign_json_round_trips() {
             assert_eq!(x.fired, y.fired);
             assert_eq!(x.nested, y.nested);
             assert_eq!(x.q4_split_merge, y.q4_split_merge);
+            assert_eq!(x.q4sp, y.q4sp, "seed {} round: the Q4 split half", a.seed);
+            assert_eq!(x.q4mg, y.q4mg, "seed {} round: the Q4 merge half", a.seed);
             assert_eq!(x.q18_gc_advanced, y.q18_gc_advanced);
             assert_eq!(x.sizing_ok, y.sizing_ok);
         }

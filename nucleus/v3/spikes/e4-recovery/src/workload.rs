@@ -1069,6 +1069,15 @@ pub struct RoundRec {
     pub task_error: Option<String>,
     /// The quota flags (5.6), one per named quota.
     pub q4_split_merge: bool,
+    /// **X-5c-F4-F1-F1 step 1 (the Q4 halves):** splits inside the
+    /// crash-time checkpoint window (the store's `ckpt_splits` counter
+    /// at the `obs` snapshot — reset at each `ckpt:begin`, counting only
+    /// while a checkpoint is open; at the crash it reads the current or
+    /// last-opened window's count). A record diagnostic serialized in
+    /// `campaign.json`, never a digest input and never a quota input.
+    pub q4sp: u64,
+    /// **X-5c-F4-F1-F1 step 1:** the same for merges (`ckpt_merges`).
+    pub q4mg: u64,
     /// Q5: a ≥ 2-segment chunked txn open at the crash (no marker).
     pub q5_open: bool,
     /// Q5: a chunked txn marked, its marker above the flips so far.
@@ -2022,6 +2031,10 @@ fn round_rec(
     // window's own counters.
     rr.q4_split_merge =
         obs.crash_fired && (1..=6).contains(&obs.ckpt_step) && obs.splits >= 1 && obs.merges >= 1;
+    // X-5c-F4-F1-F1 step 1: the halves themselves, beside the combined
+    // flag (diagnostics only — see RoundRec::q4sp/q4mg).
+    rr.q4sp = obs.splits;
+    rr.q4mg = obs.merges;
     // Q5: the chunked cases. Open: a txn with chunks enqueued and no
     // marker, spanning ≥ 2 segments. Marked: a marker enqueued on a txn
     // still open (no flip has covered it — the marker sits above the
