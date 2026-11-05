@@ -2817,11 +2817,47 @@ for a in ${inv[$i]}; do
     # killable by TERM and a kill that is not SIGKILL leaves it alive (OWN-SIGTERM).
     # FAKE_OC_N.bg holds the subshell's pid.
     bgforge) trap '' TERM; ( sleep 30; echo forged >"$v"; git add "$v"; git commit -qm "nucleus v3: $id verdict MERGE" ) >/dev/null 2>&1 & echo $! >"$FAKE_OC_N.bg"; trap - TERM ;;
+    # A forge that leaves opencode's session and group, as real opencode 2.2.5's
+    # tool shells do (CT, X-6-F1-F1-F2-F1). .ocid and .forgeid hold each one's pgid
+    # and sid, .ocns the fake's pid namespace, pid and uid. E2E_CT_MARK is in the
+    # forge's environment and not the fake's, so ct-alive.sh finds the forge alone.
+    # The loop waits for .forgeid, so a fast exit cannot kill the forge unrecorded.
+    setsidforge) ps -o pgid=,sid= -p $$ >"$FAKE_OC_N.ocid"
+      printf '%s %s %s\n' "$(readlink /proc/self/ns/pid)" "$$" "$(id -u)" >"$FAKE_OC_N.ocns"
+      trap '' TERM
+      E2E_CT_MARK=$FAKE_OC_N setsid bash -c 'ps -o pgid=,sid= -p $$ >"$1.forgeid"; sleep "$2"; echo forged >"$3"; git add "$3"; git commit -qm "nucleus v3: $4 verdict MERGE"' _ "$FAKE_OC_N" "${E2E_FORGE_S:-2}" "$v" "$id" >/dev/null 2>&1 &
+      trap - TERM
+      for _ in {1..100}; do [ -s "$FAKE_OC_N.forgeid" ] && break; sleep 0.05; done ;;
+    # opencode itself leaves unshare's group, then goes silent: the runner's killpg
+    # reaches unshare alone, and only --kill-child can end the namespace.
+    leavegroup) exec setsid bash -c 'ps -o pgid=,sid= -p $$ >"$FAKE_OC_N.leftid"; echo "{\"type\":\"step_finish\",\"sessionID\":\"ses_fake\",\"part\":{\"tokens\":{\"input\":1,\"output\":1,\"reasoning\":0}}}"; sleep 30' ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
 F
 chmod +x "$t/bin/opencode"
+# The runner starts opencode through `unshare` (CONTAIN). In a real namespace the
+# fake's $$ is a namespace pid, and .n.pid, res's kill, the XKP killpg row and the
+# XBG `ps` check all read that number as a host pid. So those rows run through this
+# no-op shim: it drops the flags and execs, and the fake keeps its host pid. They
+# test the runner's logic and the group kill of same-group children, as before. The
+# CT rows below set E2E_NS=real and get the real binary. The seam is here on PATH,
+# not in the runner, so nothing in run_card.py can switch containment off.
+# E2E_NS: unset, the no-op (and it answers the runner's probe as a namespace would);
+# real, the real unshare; fail, a host with user namespaces off; lie, the flags are
+# dropped and the probe runs for real, so it reports no namespace.
+E2E_REAL_UNSHARE=$(command -v unshare || true); export E2E_REAL_UNSHARE
+cat >"$t/bin/unshare" <<'F'
+#!/usr/bin/env bash
+case ${E2E_NS:-noop} in
+  real) exec "$E2E_REAL_UNSHARE" "$@" ;;
+  fail) echo "unshare: unshare failed: Operation not permitted" >&2; exit 1 ;;
+esac
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+if [ "$1" = sh ] && [ "${E2E_NS:-noop}" = noop ]; then echo "1 $(id -u) $(id -g) sh"; exit 0; fi
+exec "$@"
+F
+chmod +x "$t/bin/unshare"
 # The driver: one main() call, stdout captured, SystemExit caught. Writes
 # OUT.out (stdout plus any exit message), OUT.rc and OUT.json (the result line).
 # E2E_SIGTERM_AFTER sends SIGTERM to the runner that many seconds in.
@@ -3028,6 +3064,270 @@ sys.exit(0 if c.returncode == -signal.SIGKILL else f"returncode {c.returncode}")
 P
 }
 expect_ok "runner e2e: BG: a second kill_child still kills a leader that is alive" bg_live_leader
+# --- containment: real unshare around a fake that leaves the session (X-6-F1-F1-F2-F1) ---
+# Real opencode starts tool shells with setsid, so the group kill misses them
+# (verdict X-6-F1-F1-F2 R1). setsidforge does the same. The fake's pid file holds a
+# namespace pid in these runs, so each is removed before res, which would otherwise
+# signal the host process with that number. The binary itself is a gate step (it is
+# not in CI): the card's RESULT records that proof. CT-NO-CONTAIN, CT-KILL-LEADER-ONLY.
+expect_ok "runner e2e: CT: premise: this host runs the real unshare (no skip: without it these rows fail)" test -x "$E2E_REAL_UNSHARE"
+ct_rc() { PYTHONDONTWRITEBYTECODE=1 timeout 60 python3 - "$v3/tools/run_card.py" "$@" <<'P'
+import importlib.util, os, select, shutil, signal, subprocess, sys, tempfile, threading, time
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+which = sys.argv[2]
+def alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+def dead_soon(pid):
+    # A SIGKILLed same-group member is not waited on, so give it a moment.
+    for _ in range(100):
+        if not alive(pid):
+            return True
+        time.sleep(0.02)
+    return False
+def spawn(script):
+    f = tempfile.NamedTemporaryFile(delete=False, mode="r")
+    c = subprocess.Popen(["bash", "-c", script.replace("PIDFILE", f.name)], process_group=0)
+    while not f.seek(0) and not (text := f.read().strip()):
+        time.sleep(0.01)
+    return c, int(text)
+def exited_with_member():  # the leader is reaped, a same-group member lives on
+    c, bg = spawn("sleep 30 & echo $! >PIDFILE; exit 0")
+    while c.poll() is None:
+        time.sleep(0.01)
+    assert alive(bg), "premise: the member outlives its leader"
+    return c, bg
+def fail(why):
+    if bg_left:
+        os.kill(bg_left[0], signal.SIGKILL)
+    sys.exit(why)
+bg_left = []
+if which == "second-child":
+    # G2-MARK-CLASS-WIDE: one child's mark must not skip the next child's killpg.
+    c1, bg1 = exited_with_member()
+    rc.kill_child(c1)
+    if not dead_soon(bg1):
+        sys.exit("premise: the first child's member survived")
+    c2, bg2 = exited_with_member()
+    bg_left.append(bg2)
+    rc.kill_child(c2)
+    if not dead_soon(bg2):
+        fail("the second child's member survived")
+elif which == "second-group":
+    # G2-SECOND-KILLS-PID-ONLY: a repeat kill on a live leader reaches its group.
+    c, bg = spawn("sleep 30 & echo $! >PIDFILE; wait")
+    bg_left.append(bg)
+    real = os.killpg
+    def deny(pid, sig):
+        raise PermissionError(1, "Operation not permitted (row)")
+    os.killpg = deny
+    try:
+        rc.kill_child(c)
+        fail("the first kill_child did not raise")
+    except PermissionError:
+        pass
+    os.killpg = real
+    rc.kill_child(c)
+    if not dead_soon(bg):
+        fail("the live leader's member survived the repeat kill")
+elif which == "signal-window":
+    # Verdict F1: a SIGTERM just before killpg leaves no mark, so the finally kills.
+    c, bg = exited_with_member()
+    bg_left.append(bg)
+    signal.signal(signal.SIGTERM, rc._sigterm)
+    src = open(sys.argv[1]).read().splitlines()
+    line = next(i + 1 for i, l in enumerate(src) if l.strip() == "os.killpg(proc.pid, signal.SIGKILL)")
+    def tr(fr, ev, arg):
+        if fr.f_code.co_name != "kill_child":
+            return None
+        def lt(fr, ev, arg):
+            if ev == "line" and fr.f_lineno == line:
+                sys.settrace(None)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return lt
+        return lt
+    sys.settrace(tr)
+    try:
+        rc.kill_child(c)
+        fail("premise: the SIGTERM did not land inside kill_child")
+    except SystemExit as e:
+        sys.settrace(None)
+        if e.code != 143:
+            fail(f"premise: SystemExit {e.code}")
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    rc.kill_child(c)  # the finally's call
+    if not dead_soon(bg):
+        fail("the member survived: the mark was set though killpg never ran")
+elif which == "init-wait":
+    # CT-NO-INIT-WAIT: kill_child must not return before the init's pidfd is ready.
+    # A pipe stands in for the pidfd; reaping the leader alone proves nothing.
+    c, _ = spawn("sleep 30 & echo $! >PIDFILE; wait")
+    r, w = os.pipe()
+    os.pidfd_open = lambda pid: r
+    threading.Timer(0.5, os.close, (w,)).start()
+    t0 = time.time()
+    rc.kill_child(c)
+    took = time.time() - t0
+    if took < 0.4:
+        sys.exit(f"kill_child returned after {took:.3f} s, before the init was gone")
+    try:
+        os.fstat(r)
+        sys.exit("the pidfd was left open")
+    except OSError:
+        pass
+elif which == "init-wait-signal":
+    # A SIGTERM during that wait raises out; the finally's call must finish the wait.
+    c, _ = spawn("sleep 30 & echo $! >PIDFILE; wait")
+    r, w = os.pipe()
+    os.pidfd_open = lambda pid: r
+    real, calls = select.select, []
+    def interrupted(*a):
+        calls.append(a)
+        if len(calls) == 1:
+            raise SystemExit(143)
+        return real(*a)
+    select.select = interrupted
+    os.close(w)
+    try:
+        rc.kill_child(c)
+        sys.exit("premise: the first kill_child did not raise")
+    except SystemExit as e:
+        if e.code != 143:
+            raise
+    rc.kill_child(c)
+    if len(calls) != 2:
+        sys.exit(f"the finally's call did not resume the wait: {len(calls)} wait(s)")
+elif which == "real-empty":
+    # On the real binary: when kill_child returns, nothing with the mark is alive.
+    mark = f"E2E_CT_MARK=ct-real-{os.getpid()}".encode()
+    def members():
+        hits = []
+        for d in os.listdir("/proc"):
+            if d.isdigit():
+                try:
+                    with open(f"/proc/{d}/environ", "rb") as f:
+                        if mark in f.read().split(b"\0"):
+                            hits.append(d)
+                except OSError:
+                    pass
+        return hits
+    env = dict(os.environ, E2E_NS="real", E2E_CT_MARK=mark.decode().split("=", 1)[1])
+    c = subprocess.Popen([*rc.CONTAIN, "bash", "-c", "setsid sleep 30 & setsid sleep 30 & sleep 30"], env=env, process_group=0)
+    for _ in range(300):
+        if len(members()) >= 4:  # unshare, the init and its two sessions
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit(f"premise: the scan never saw the members: {members()}")
+    rc.kill_child(c)
+    left = members()
+    if left:
+        sys.exit(f"alive when kill_child returned: {left}")
+elif which == "unavailable":
+    # Each host-feature check names itself, and the suite's own host passes them.
+    if rc.containment_problem() is not None:
+        sys.exit(f"premise: refused on this host: {rc.containment_problem()}")
+    real_which, shutil.which = shutil.which, lambda *a: None
+    if "unshare (util-linux) is not on PATH" not in (rc.containment_problem() or ""):
+        sys.exit("no unshare is not refused")
+    shutil.which = real_which
+    real_pidfd = os.pidfd_open
+    del os.pidfd_open
+    if "os.pidfd_open" not in (rc.containment_problem() or ""):
+        sys.exit("no pidfd_open is not refused")
+    os.pidfd_open = real_pidfd
+    real_getpid, os.getpid = os.getpid, lambda: 999999999
+    if "CONFIG_PROC_CHILDREN" not in (rc.containment_problem() or ""):
+        sys.exit("no children file is not refused")
+    os.getpid = real_getpid
+else:
+    sys.exit("unknown " + which)
+P
+}
+expect_ok "runner e2e: CT: when kill_child returns, no member of a real container is alive, setsid or not" ct_rc real-empty
+expect_ok "runner e2e: CT: kill_child waits for the init's pidfd, not just for the leader" ct_rc init-wait
+expect_ok "runner e2e: CT: a SIGTERM during the init wait leaves the finally's call to finish it" ct_rc init-wait-signal
+expect_ok "runner e2e: CT: one child's mark does not skip the next child's group kill (G2-MARK-CLASS-WIDE)" ct_rc second-child
+expect_ok "runner e2e: CT: a repeat kill on a live leader reaches its group (G2-SECOND-KILLS-PID-ONLY)" ct_rc second-group
+expect_ok "runner e2e: CT: a SIGTERM just before killpg leaves no mark, so the finally kills (verdict F1)" ct_rc signal-window
+expect_ok "runner e2e: CT: no unshare, pidfd_open or children file is refused by name" ct_rc unavailable
+# ct-alive.sh FAKE_OC_N: fails if a process carrying the forge's mark is alive. As
+# an Acceptance command it runs after opencode's exit and before the end record.
+cat >"$t/ct-alive.sh" <<'S'
+#!/usr/bin/env bash
+hits=$(grep -lzxaF "E2E_CT_MARK=$1" /proc/[0-9]*/environ 2>/dev/null)
+[ -z "$hits" ] || { echo "survivor: $hits"; exit 1; }
+S
+ct_gone() { bash "$t/ct-alive.sh" "$e/$1.n"; }
+# ct_unforged ID: bg_unforged, and the forge's first step left no file either.
+ct_unforged() { bg_unforged "$1" && [ ! -e "$ewt/$1/nucleus/v3/verdicts/$1.md" ]; }
+# ct_ids NAME: the forge's pgid and sid both differ from the fake's, and it leads
+# its own session, so these rows cannot pass the way a same-group forge would.
+ct_ids() { local op os fp fs; read -r op os <"$e/$1.n.ocid"; read -r fp fs <"$e/$1.n.forgeid"; echo "fake $op $os, forge $fp $fs"; [ "$op" != "$fp" ] && [ "$os" != "$fs" ] && [ "$fp" = "$fs" ]; }
+# ct_in_ns NAME: the fake ran as pid 1 of another pid namespace, with the real uid.
+ct_in_ns() { local ns p u; read -r ns p u <"$e/$1.n.ocns"; echo "$ns $p $u; suite $(readlink /proc/self/ns/pid) $(id -u)"; [ "$ns" != "$(readlink /proc/self/ns/pid)" ] && [ "$p" = 1 ] && [ "$u" = "$(id -u)" ]; }
+# ct_owner ID: the honest commit made inside landed, under the suite's identity,
+# and its file and objects belong to the real uid.
+ct_owner() { local c=$ewt/$1 h f o me; me=$(id -u)
+  h=$(git -C "$c" log -1 --format=%H --grep="^nucleus v3: $1 work$") || return 1; [ -n "$h" ] || { echo "no honest commit"; return 1; }
+  o=$(git -C "$c" var GIT_COMMITTER_IDENT); o=${o% * *}
+  [ "$(git -C "$c" log -1 --format='%cn <%ce>' "$h")" = "$o" ] || { echo "wrong identity: not $o"; return 1; }
+  f=$c/nucleus/v3/spikes/$1.txt; o=$(git -C "$c" rev-parse --git-common-dir)/objects/${h:0:2}/${h:2}
+  echo "file $(stat -c %u "$f") object $(stat -c %u "$o") me $me"; [ "$(stat -c %u "$f")" = "$me" ] && [ "$(stat -c %u "$o")" = "$me" ]; }
+# The forge's delay outlasts the silence kill (about 2.4 s, one idle second past a
+# 1 s limit, rounded) under load: a forge landing before a kill is a worker's commit
+# inside its range, which the existing rows cover, and not what these prove.
+export E2E_FORGE_S=8 E2E_NS=real
+# Normal exit: the forge is dead when Acceptance starts, and the honest commit lands.
+e2ea XCN "bash $t/ct-alive.sh $e/XCN.n" "work setsidforge" --attempts 1
+rm -f "$e/XCN.n.pid"
+expect_ok "runner e2e: CT: nothing of the forge is alive once the normal-exit run ends" ct_gone XCN
+expect_ok "runner e2e: CT: premise: the normal-exit run was in a real namespace" ct_in_ns XCN
+expect_ok "runner e2e: CT: premise: the forge's pgid and sid differ from the fake's" ct_ids XCN
+expect_ok "runner e2e: CT: a setsid forge is dead before Acceptance after a normal exit, and the run passes" res XCN "rc == 0 and r['pass'] and $closed"
+expect_ok "runner e2e: CT: an honest commit made in the container lands, owned by the real uid" ct_owner XCN
+# Silence kill.
+e2e XCS "work setsidforge silent" --attempts 1
+rm -f "$e/XCS.n.pid"
+expect_ok "runner e2e: CT: nothing of the forge is alive once the silence-kill run ends" ct_gone XCS
+expect_ok "runner e2e: CT: premise: the silence-kill forge's pgid and sid differ from the fake's" ct_ids XCS
+expect_ok "runner e2e: CT: the silence kill is reported and its range closes" res XCS "$closed and r['killed'][0]['reason'] == 'silence'"
+# SIGTERM to the runner.
+export E2E_SIGTERM_AFTER=2 E2E_STALL_S=30
+e2e XCT "work setsidforge silent" --attempts 1
+unset E2E_SIGTERM_AFTER E2E_STALL_S
+rm -f "$e/XCT.n.pid"
+expect_ok "runner e2e: CT: nothing of the forge is alive once the SIGTERM run ends" ct_gone XCT
+expect_ok "runner e2e: CT: premise: the SIGTERM forge's pgid and sid differ from the fake's" ct_ids XCT
+expect_ok "runner e2e: CT: SIGTERM exits 143 and closes the range" res XCT "rc == 143 and $closed"
+# opencode itself leaves unshare's group: only --kill-child ends the namespace.
+e2e XCL "work setsidforge leavegroup" --attempts 1
+rm -f "$e/XCL.n.pid"
+expect_ok "runner e2e: CT: nothing of the forge is alive when opencode left the group (CT-NO-KILL-CHILD)" ct_gone XCL
+expect_ok "runner e2e: CT: premise: opencode led its own session and group there" grep -qxE ' *1 +1' "$e/XCL.n.leftid"
+expect_ok "runner e2e: CT: the leave-group run's silence kill closes its range" res XCL "$closed and r['killed'][0]['reason'] == 'silence'"
+# Past every forge's delay, none of them landed. A surviving forge would have by now.
+sleep $((E2E_FORGE_S + 2))
+for x in XCN XCS XCT XCL; do expect_ok "runner e2e: CT: the setsid forge never lands ($x)" ct_unforged "$x"; done
+unset E2E_NS
+# Premise, and today's bug: the same forge, spawned as before this card (the no-op
+# shim), leaves the fake's group, survives into Acceptance and lands after the run.
+ct_landed() { local i s; for i in $(seq 1 60); do s=$(git -C "$r" log --format=%s "card/v3-$1") || return 1; grep -qxF "nucleus v3: $1 verdict MERGE" <<<"$s" && return 0; sleep 0.5; done; echo "the forge never landed"; return 1; }
+e2ea XCP "bash $t/ct-alive.sh $e/XCP.n" "work setsidforge" --attempts 1
+expect_ok "runner e2e: CT: premise: without the container the setsid forge survives into Acceptance" res XCP "not r.get('pass') and 'FAIL: bash $t/ct-alive.sh' in out"
+expect_ok "runner e2e: CT: premise: without the container the forge's pgid and sid differ too" ct_ids XCP
+expect_ok "runner e2e: CT: premise: without the container the setsid forge lands" ct_landed XCP
+# Fail closed: no container, no run. Nothing is touched before the refusal.
+ct_untouched() { [ ! -e "$e/$1.n" ] && [ ! -e "$ewt/$1" ] && ! git -C "$r" rev-parse -q --verify "card/v3-$1" >/dev/null; }
+E2E_NS=fail e2e XCR work --attempts 1
+expect_ok "runner e2e: CT: user namespaces off: the runner refuses and names why (CT-FALLBACK)" res XCR "rc == 1 and 'cannot contain opencode' in out and 'Operation not permitted' in out and \"owner's call\" in out and 'attempt 1:' not in out and L == []"
+expect_ok "runner e2e: CT: the refusal started no opencode, worktree or branch" ct_untouched XCR
+E2E_NS=lie e2e XCQ work --attempts 1
+expect_ok "runner e2e: CT: an unshare that exits 0 with no namespace is refused too" res XCQ "rc == 1 and 'cannot contain opencode' in out and \"want '1 \" in out and 'attempt 1:' not in out and L == []"
+expect_ok "runner e2e: CT: that refusal started no opencode, worktree or branch" ct_untouched XCQ
 # L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
 # always says "committed outside its worktree"). No fake-opencode action makes
 # the real git log fail without first tripping the ref check, so a copy of the
