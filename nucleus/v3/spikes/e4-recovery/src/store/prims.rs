@@ -27,6 +27,10 @@
 //! - PR-RESERVE (§5.6): the first `R_EPOCH` frames of the pool are the
 //!   epoch-copy reserve; normal pages never occupy them; exhaustion
 //!   writes the oldest copy out and reuses its frame.
+//! - PR-LATECOPY (§5.6, X-5c-F4-F1-F1-F2): an epoch copy installs only
+//!   while its ordering freeze (`Img::CopyPending`) still holds — §5.6's
+//!   copy condition, re-tested after the exhausted path's wait; a late
+//!   copy is dropped, never installed past its own checkpoint.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -814,6 +818,26 @@ pub fn store_page<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Re
 /// a reserve frame, or — when the `R_EPOCH` reserve is exhausted — by
 /// writing the oldest copy out to a fresh slot recorded in the image map
 /// (the EVICT-SKIP-IMAGE-MAP site) and reusing its frame.
+///
+/// **X-5c-F4-F1-F1-F2 (verdict finding 1): the install re-tests §5.6's
+/// copy condition after the wait.** §5.6 says `write_guard` copies a
+/// page's epoch-`k` bytes only while that content "is not yet at a slot
+/// the image map references" — and the copy's journey can outlast the
+/// condition: the exhausted path's write-out is the only yield between
+/// the freeze that ordered the copy (`Img::CopyPending`) and the
+/// install, so step 2 can write the page's normal frame (resolving the
+/// override to `Img::At`) and `ckpt:freecopies` can free the reserve
+/// while the copy is still on its way. A copy whose condition stopped
+/// holding has no business being installed: it would sit in the
+/// reserve, dirty, `is_epoch_copy`, with content epoch `e − 1`, past
+/// its own checkpoint's cleanup, and the next checkpoint's scan
+/// (`f.is_epoch_copy || f.epoch <= k`) would take it and map the LPID
+/// to epoch-`k` content while `T` says replay need not restore it — a
+/// silent class-C loss (the `late_epoch_copy_must_not_enter_the_next_
+/// image` pin holds the whole schedule). So the install drops the
+/// bytes unless `map.img[lpid]` is still `CopyPending` — the image's
+/// content is already recorded elsewhere (step 2's write, a
+/// previous-epoch eviction's `Img::At`, or a closed window).
 fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Result<(), Fail> {
     // An exhausted reserve writes the oldest copy out (frame order =
     // issue order) and frees its frame, then retries the install.
@@ -826,6 +850,13 @@ fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) ->
     if let Some(i) = free_idx {
         cx.with("epoch_copy:install", |c| {
             let st = c.store();
+            if st.map.img.get(&lpid) != Some(&Img::CopyPending) {
+                // The copy condition stopped holding while this copy
+                // was on its way: the bytes are not installed (the
+                // image's content is already recorded). One atomic
+                // step — nothing is written, no frame is taken.
+                return Ok(());
+            }
             let e = st.e;
             if let Some(f) = st.reserve_frames_mut().get_mut(i) {
                 f.key = lpid;
