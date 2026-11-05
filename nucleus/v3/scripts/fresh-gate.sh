@@ -49,6 +49,17 @@
 # common dir between a check and gate.sh) is out of scope, as for every
 # consumer. Nothing here repairs an object, deletes a hook or config it finds,
 # or writes into objects/: it refuses, and the operator decides.
+#
+# gate.sh runs the commit's code (its tests, its build scripts), so it runs in
+# the runner's container (CONTAIN in tools/run_card.py; X-6-F1-F1-F2-F1-F1), with
+# a TMPDIR of its own under the scratch dir: whatever it starts dies with the
+# namespace, whatever session it moved to, before this script exits. Without
+# this a forge left by a test lands on the branch after the gate was read. No
+# container means no gate: a refusal by name, never an uncontained run. What
+# this cannot stop is what the runner cannot: a daemon outside asked to run
+# something, a file planted to run later, and an `unshare` planted on PATH that
+# answers the probe (X-6-F1-F1-F2-F1-F2). A SIGKILL of this script leaves the
+# container running, as a SIGKILLed runner does; that run printed no GATE EXIT=.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=git-env.sh
@@ -88,7 +99,31 @@ echo "fresh-gate: base $base"
 # checkout on every path, and writes only to stderr, so gate.sh's GATE EXIT=
 # line (or FRESH-GATE REFUSED) stays the last stdout line.
 d=$(mktemp -d) || die "cannot create a temporary directory"
+# end_gate: if a signal ended this script while the gate ran, end the gate's
+# container before the checkout goes. Its unshare is this shell's foreground
+# child, so this reads this shell's own children file (one known process's
+# file, no scan) and unshare's for the init. --kill-child SIGKILLs the init,
+# and the kernel empties the namespace before the init can become a zombie, so
+# the wait is for the init to be gone or a zombie (it is not this shell's to
+# reap). A member stuck in uninterruptible sleep holds this wait, as it holds
+# the runner's: the checkout stays and no gate result was printed. The builtin
+# read, not cat: a command substitution would list its own subshell as a child.
+gate_running=
+end_gate() {
+  [ -n "$gate_running" ] || return 0
+  local kids=() inits=() k i s
+  read -r -a kids <"/proc/$$/task/$$/children" || true
+  for k in "${kids[@]}"; do
+    inits=()
+    { read -r -a inits <"/proc/$k/task/$k/children"; } 2>/dev/null || true
+    kill -KILL "$k" 2>/dev/null || true
+    for i in "${inits[@]}"; do
+      while { read -r s <"/proc/$i/stat"; } 2>/dev/null && [[ ${s##*) } != Z* ]]; do sleep 0.05; done
+    done
+  done
+}
 cleanup() {
+  end_gate
   if [ -e "$d/wt" ]; then
     (cd "$start" && git -c core.hooksPath=/dev/null worktree remove --force "$d/wt") >&2 || echo "fresh-gate: warning: git worktree remove failed; remove $d/wt by hand" >&2
   fi
@@ -143,6 +178,23 @@ config_checks() {
   cfg_named '^hook\.' 'config hooks run in git calls on newer git'
 }
 config_checks
+
+# The same flags as CONTAIN in tools/run_card.py (a row compares them), and the
+# same probe: everything the container relies on is checked by running it, before
+# anything is checked out. Enabling user namespaces needs root: the owner's call.
+CONTAIN=(unshare --user --map-current-user --pid --fork --kill-child --mount-proc --)
+container_check() {
+  local want got rc=0 why
+  if ! command -v unshare >/dev/null; then P+=("cannot contain the gate, so not running it: unshare (util-linux) is not on PATH"); return; fi
+  if [ ! -e "/proc/$$/task/$$/children" ]; then P+=("cannot contain the gate, so not running it: /proc/$$/task/$$/children is missing (a kernel without CONFIG_PROC_CHILDREN; this script finds the namespace's init there)"); return; fi
+  want="1 $(id -u) $(id -g) sh"
+  got=$(timeout 30 "${CONTAIN[@]}" sh -c 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm)"' </dev/null 2>"$d/contain.err") || rc=$?
+  if [ "$rc" -ne 0 ] || [ "$got" != "$want" ]; then
+    why=$(head -n 1 "$d/contain.err")
+    P+=("cannot contain the gate, so not running it: ${CONTAIN[*]} sh: exit $rc, inside it printed '$got' (want '$want'): ${why:-no stderr}. Unprivileged user namespaces are needed; enabling them needs root and is the owner's call.")
+  fi
+}
+container_check
 refuse_if_any
 
 # Step 3, the checkout: detached, hooks off.
@@ -297,14 +349,22 @@ verify_objects "$base" "$commit" || add_lines "$VERIFY_PROBLEMS"
 [ -f nucleus/v3/scripts/gate.sh ] || P+=("the commit has no nucleus/v3/scripts/gate.sh")
 refuse_if_any
 
-# Step 5: the gate, in the foreground, its output passed through. Nothing is
-# printed after it; the trap writes only to stderr. The time printed is all of
-# the checks, from the start (checkout and verify_objects included), not the
-# gate's.
+# Step 5: the gate, in the foreground and in its container, its output passed
+# through. Nothing is printed after it; the trap writes only to stderr. The time
+# printed is all of the checks, from the start (checkout and verify_objects
+# included), not the gate's. unshare returns after its init did, and the kernel
+# empties the namespace before that, so nothing of the gate is alive after this
+# line. "$d/contained" tells a container that failed to start from a gate that
+# failed: unshare's own failure is an exit 1 with no GATE EXIT= line, and the
+# contract gives that a refusal.
 ms=$((($(date +%s%N) - t0) / 1000000))
 printf 'fresh-gate: checks passed (%d files hashed in %d.%02d s)\n' "${#hp[@]}" $((ms / 1000)) $((ms % 1000 / 10))
 [ "$eol" -eq 0 ] || echo "fresh-gate: $eol file(s) matched through their eol conversion"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/nv3-target/fresh-${commit:0:12}}
+mkdir "$d/tmp"
 rc=0
-(cd nucleus/v3 && bash scripts/gate.sh) || rc=$?
+gate_running=1
+TMPDIR=$d/tmp "${CONTAIN[@]}" /bin/sh -c ': >"$1" && cd nucleus/v3 && bash scripts/gate.sh' fresh-gate "$d/contained" || rc=$?
+gate_running=
+[ -e "$d/contained" ] || die "the gate's container did not start (unshare exit $rc), so the gate did not run"
 exit "$rc"
