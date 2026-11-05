@@ -5,6 +5,44 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-04
+
+Patch release cut from `nucleus/v1.3.0`, not from main. It carries no on-disk
+format change (`DB_FORMAT_VERSION` stays 2): 1.3.1 opens a 1.3.0 data directory
+and 1.3.0 opens it again afterwards. Main's format-3 work is not included.
+
+### Fixed
+
+- **RESP buffers grow with received bytes, not header claims.** The reader runs
+  before AUTH. A ~20-byte `$536870912\r\n` header allocated 512 MiB and each
+  `*1000000\r\n` level reserved 32 MB; up-front reservation is now capped at
+  64 KiB / 1024 elements. Length, count and depth limits are unchanged.
+- **A pgwire decoder panic closes the connection cleanly.** pgwire 0.36 panics on
+  short frames, reachable before authentication, and the unwind skipped
+  per-connection cleanup. The client now gets FATAL 08P01 and a close.
+- **`$N` placeholders are bounded.** An authenticated Parse of
+  `SELECT $8000000000000000` aborted the process on allocation failure. A `$N`
+  above 65535 is now 42P02, and out-of-range numbers no longer wrap onto a valid
+  parameter.
+- **Client and config timeouts are range-checked.** `CACHE_SET` TTLs, `ACQUIRE
+  SNAPSHOT LEASE TIMEOUT` and pool settings could overflow `Instant` arithmetic.
+- **Binary COPY rejects negative field lengths** other than -1 instead of
+  panicking the connection task.
+- **uuid and zone-offset casts reject non-ASCII text** instead of panicking on a
+  byte slice.
+
+### Changed
+
+- `SET statement_timeout` now validates its value as PostgreSQL does: garbage or
+  anything above 2147483647 ms is an error and the previous value stays. It was
+  previously accepted.
+- A uuid may no longer contain a `+` sign among its hex digits.
+- Dependency patches for RustSec advisories: rustls 0.23.46, rustls-webpki
+  0.103.16, webpki-roots and webpki-root-certs 1.0.11, ctutils 0.4.8, libz-sys
+  1.1.31, zstd 0.13.4, zstd-safe 7.4.0, zstd-sys 2.1.2 (still libzstd 1.5.7).
+- `nucleus version` reports the real release again. 1.3.0 was tagged without a
+  manifest bump and reports 1.2.2.
+
 ## [1.2.2] - 2026-10-04
 
 ### Fixed
