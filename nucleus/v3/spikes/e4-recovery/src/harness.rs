@@ -3553,6 +3553,33 @@ pub fn run_round(
                     }
                 }
             }
+            // Card X-5c-F4-F1-F1-O1C (`E4_O1C_TRACE`, stderr only,
+            // default off, never a digest input): the trace of a round
+            // whose recovered frontier sits above `hi` — the three
+            // faultless class C O-1(c) rounds of X-5c-F4's file. The
+            // trace answers the card's Work 1 per replayed record: its
+            // commit ts, when its bytes were written relative to the
+            // crash (`E` ends at the crash, so an event's index names
+            // its place before it), and when the model recorded it (the
+            // model records at the enqueue's `h:model` step, so presence
+            // in `model.commits` dates the recording before the crash).
+            if std::env::var("E4_O1C_TRACE").is_ok() {
+                o1c_frontier_trace(
+                    seed,
+                    round,
+                    faults.class,
+                    &ex,
+                    &model,
+                    &wal_commits,
+                    e4_events,
+                    &wal_bindings,
+                    p0,
+                    c_prev,
+                    d_val,
+                    &d_stop,
+                    &d_rc,
+                );
+            }
             // X-5c-F3-F3a-F2 Work 3 (`E4_KEY_DIAG`, stderr only, default
             // off, never a digest input): the key-history trace of the
             // first divergent key — every page write that carried its
@@ -4328,6 +4355,337 @@ pub fn derive_written_acked(
         }
     }
     (written, acked, unparsed_written)
+}
+
+// ---- card X-5c-F4-F1-F1-O1C: the frontier-above-`hi` trace ----
+//
+// The three faultless class C O-1(c) rounds of X-5c-F4's file (1066 r0,
+// 6555 r0, 7590 r0) recover a frontier above `model.upper_bound(lo)` —
+// the only three of the 10k. The trace (`E4_O1C_TRACE`, stderr only,
+// default off, never a digest input) answers the card's Work 1 for each
+// replayed record above `hi`: its commit ts, when its bytes were
+// written relative to the crash (`E`, the workload pass's slice, ends
+// at the crash, so an event's index in `E` names its distance before
+// it), when the model recorded it (`h:model`, the step after the
+// enqueue returns — presence in `model.commits` dates the recording
+// before the crash), and why the `written` derivation's stitched walk
+// did or did not yield it (the per-inode path log).
+
+/// One `Commit`/`CommitMarker` record the stitched-write walk decodes
+/// (the `written` half's own view; diagnostic only).
+struct O1cRec {
+    ts: u64,
+    kind: u8,
+    txn: (u32, u64),
+    lsn: u64,
+    len: u64,
+    inode: usize,
+    off: u64,
+}
+
+/// [`derive_written_acked`]'s stitched-write walk, re-run for the trace:
+/// yields every `Commit`/`CommitMarker` record it decodes (not only
+/// `wal_commits`'s) beside a per-inode path log of every position it
+/// tried — decodes and jumps alike — so a record the `written` half
+/// missed can be located on the path itself. Mirrors the derivation
+/// step for step; changing the derivation without this mirror is a
+/// defect of the trace, never of the derivation.
+fn o1c_stitched_walk(events: &[DiskEvent]) -> (Vec<O1cRec>, BTreeMap<usize, Vec<String>>) {
+    let mut files: BTreeMap<usize, FileWrites> = BTreeMap::new();
+    for e in events {
+        if let DiskEvent::WriteIssued { inode, off, bytes } = e {
+            files.entry(*inode).or_default().insert(*off, bytes.clone());
+        }
+    }
+    let seg = crate::store::WAL_SEG;
+    let mut recs: Vec<O1cRec> = Vec::new();
+    let mut path: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (inode, writes) in files.iter() {
+        let log = path.entry(*inode).or_default();
+        log.push(format!(
+            "start: issued writes at {} offsets ({}..{})",
+            writes.len(),
+            writes.keys().next().copied().unwrap_or(0),
+            writes.keys().next_back().copied().unwrap_or(0),
+        ));
+        let mut off = writes.keys().copied().min().unwrap_or(0);
+        loop {
+            if off >= seg {
+                log.push(format!("off={off}: past the segment, stop"));
+                break;
+            }
+            let hdr = stitched(writes, off, 24);
+            let jump = |log: &mut Vec<String>, off: u64| -> Option<u64> {
+                let next = writes.range(off + 1..).next().map(|(k, _)| *k);
+                match next {
+                    Some(n) => {
+                        log.push(format!("off={off}: undecodable, jump to {n}"));
+                        Some(n)
+                    }
+                    None => {
+                        log.push(format!("off={off}: undecodable, no later write, stop"));
+                        None
+                    }
+                }
+            };
+            if hdr.len() < 24 || !magic_ok(&hdr) {
+                match jump(log, off) {
+                    Some(n) => {
+                        off = n;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let rd = |r: std::ops::Range<usize>| -> u64 {
+                let mut b = [0u8; 8];
+                if let Some(s) = hdr.get(r) {
+                    for (i, x) in s.iter().enumerate() {
+                        b[i] = *x;
+                    }
+                }
+                u64::from_le_bytes(b)
+            };
+            let len = rd(4..8) & 0xFFFF_FFFF;
+            let lsn = rd(16..24);
+            if len < 16 || off + len > seg || lsn % seg != off {
+                match jump(log, off) {
+                    Some(n) => {
+                        off = n;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let whole = stitched(writes, off, len as usize);
+            if (whole.len() as u64) < len {
+                match jump(log, off) {
+                    Some(n) => {
+                        off = n;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            match crate::store::wal::dec_record(&whole, lsn, lsn - off + seg) {
+                Ok(Some(rec)) => {
+                    log.push(format!(
+                        "off={off}: rec kind={} ts={} txn=({},{}) lsn={} len={} end={}",
+                        rec.kind,
+                        rec.ts,
+                        rec.txn.0,
+                        rec.txn.1,
+                        lsn,
+                        len,
+                        off + len
+                    ));
+                    if rec.kind == K_COMMIT || rec.kind == K_MARKER {
+                        recs.push(O1cRec {
+                            ts: rec.ts,
+                            kind: rec.kind,
+                            txn: rec.txn,
+                            lsn,
+                            len,
+                            inode: *inode,
+                            off,
+                        });
+                    }
+                    off += len;
+                }
+                _ => match jump(log, off) {
+                    Some(n) => {
+                        off = n;
+                        continue;
+                    }
+                    None => break,
+                },
+            }
+        }
+    }
+    (recs, path)
+}
+
+/// The frontier-above-`hi` trace (card X-5c-F4-F1-F1-O1C's Work 1).
+/// Prints only when `frontier > hi` (the shape under study: `hi` is
+/// recomputed exactly as `check_round` derives it —
+/// `model.upper_bound(model.lower_bound(c_prev))`, the class-C bounds —
+/// and `hi` is class-independent in the oracle, which overrides only
+/// `lo` in MW). Everything printed comes from `E` (the workload pass's
+/// slice, which ends at the crash), the model, `wal_commits` and the
+/// X5-R34 verdicts — never store memory.
+#[allow(clippy::too_many_arguments)]
+fn o1c_frontier_trace(
+    seed: u64,
+    round: u32,
+    class: FaultClass,
+    ex: &Extracted,
+    model: &Model,
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    e4_events: &[DiskEvent],
+    wal_bindings: &BTreeMap<String, usize>,
+    p0: u64,
+    c_prev: u64,
+    d_val: u64,
+    d_stop: &str,
+    d_rc: &BTreeSet<String>,
+) {
+    let lo = model.lower_bound(c_prev);
+    let hi = model.upper_bound(lo);
+    if ex.frontier <= hi {
+        return;
+    }
+    eprintln!(
+        "O1C trace: seed={seed} round={round} class={class:?} lo={lo} hi={hi} frontier={} T={} p0={p0} D={d_val} rc={d_rc:?}",
+        ex.frontier, ex.opened_t
+    );
+    eprintln!(
+        "O1C trace: |E|={} (E ends at the crash) D_stop=\"{d_stop}\"",
+        e4_events.len()
+    );
+    // The model's recording, per ts: present (recorded at the enqueue's
+    // `h:model` step, before the crash) with its flags.
+    let model_ts: Vec<String> = model
+        .commits
+        .range(lo..)
+        .map(|(ts, rec)| {
+            format!(
+                "ts={ts} {:?} written={} acked={} wal_commits={:?}",
+                rec.mode,
+                rec.written,
+                rec.acked,
+                wal_commits.get(ts).map(|&(s, l, n)| (s, l, n))
+            )
+        })
+        .collect();
+    eprintln!(
+        "O1C trace: model commits at or above lo={lo}: [{:?}]",
+        model_ts
+    );
+    // The stitched walk's records (the `written` half's own view).
+    let (recs, path) = o1c_stitched_walk(e4_events);
+    let above: Vec<&O1cRec> = recs.iter().filter(|r| r.ts > hi).collect();
+    let rec_strs: Vec<String> = above
+        .iter()
+        .map(|r| {
+            format!(
+                "ts={} kind={} txn=({},{}) lsn={} len={} inode={} off={} end={}",
+                r.ts,
+                r.kind,
+                r.txn.0,
+                r.txn.1,
+                r.lsn,
+                r.len,
+                r.inode,
+                r.off,
+                r.off + r.len
+            )
+        })
+        .collect();
+    eprintln!(
+        "O1C trace: stitched-walk records above hi={hi}: [{rec_strs:?}] ({} records at or below)",
+        recs.len() - above.len()
+    );
+    // The write/sync history of every inode holding an above-`hi`
+    // record, plus the name bindings (recycles included): when the bytes
+    // reached the file, relative to the crash, and which life of the
+    // file they belong to.
+    let mut inodes: BTreeSet<usize> = BTreeSet::new();
+    for r in above.iter() {
+        inodes.insert(r.inode);
+    }
+    for (ts, (_, lsn, _)) in wal_commits.iter() {
+        if *ts > hi {
+            let name = x5r34_seg_name(*lsn - (*lsn % crate::store::WAL_SEG));
+            eprintln!(
+                "O1C trace: ts={ts} segment {name} -> binding inode {:?} (durable dir bindings at the workload's end)",
+                wal_bindings.get(&name).copied()
+            );
+            if let Some(i) = wal_bindings.get(&name) {
+                inodes.insert(*i);
+            }
+        }
+    }
+    let n = e4_events.len();
+    for inode in inodes.iter() {
+        let ev: Vec<String> = e4_events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let tail = n - i;
+                match e {
+                    DiskEvent::WriteIssued {
+                        inode: f,
+                        off,
+                        bytes,
+                    } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) W+ f{f}@{off}+{}", bytes.len()))
+                    }
+                    DiskEvent::WriteReturned { inode: f, off, len } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) W= f{f}@{off}+{len}"))
+                    }
+                    DiskEvent::SyncIssued { inode: f, all } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) S+ f{f} all={all}"))
+                    }
+                    DiskEvent::SyncReturned { inode: f, all } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) S= f{f} all={all}"))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        eprintln!("O1C trace: inode {inode} write/sync events: [{ev:?}]");
+        if let Some(log) = path.get(inode) {
+            eprintln!("O1C trace: inode {inode} stitched-walk path: [{log:?}]");
+        }
+    }
+    let dir: Vec<String> = e4_events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let tail = n - i;
+            match e {
+                DiskEvent::DirOpIssued { dir: d, what } if d.contains("/wal/") => {
+                    Some(format!("E[{i}](-{tail}) {what}"))
+                }
+                DiskEvent::SyncDirReturned { dir: d } if d.contains("/wal/") => {
+                    Some(format!("E[{i}](-{tail}) sync_dir {d}"))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    eprintln!("O1C trace: /wal/ directory ops: [{dir:?}]");
+    // The derivation's own verdict per above-`lo` commit: whether the
+    // walk yielded it, the returned extent test, and X5-R34's durable
+    // verdict — the row that decides which half diverges.
+    let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
+    for e in e4_events {
+        if let DiskEvent::WriteReturned { inode, off, len } = e {
+            let w = returned_end.entry(*inode).or_default();
+            *w = (*w).max(off + len);
+        }
+    }
+    let rows: Vec<String> = wal_commits
+        .range(lo..)
+        .map(|(ts, &(sync_on, lsn, len))| {
+            let walked = recs
+                .iter()
+                .find(|r| r.ts == *ts)
+                .map(|r| (r.inode, r.off + r.len));
+            let name = x5r34_seg_name(lsn - (lsn % crate::store::WAL_SEG));
+            let durable = lsn + len <= d_val || d_rc.contains(&name);
+            let extent = |w: Option<(usize, u64)>| {
+                w.is_some_and(|(i, end)| returned_end.get(&i).copied().unwrap_or(0) >= end)
+            };
+            format!(
+                "ts={ts} sync_on={sync_on} lsn={lsn} len={len} walked={walked:?} returned_end_of_walked_inode={:?} written_rule={} acked_rule={}",
+                walked.map(|(i, _)| returned_end.get(&i).copied().unwrap_or(0)),
+                extent(walked),
+                if sync_on { durable } else { extent(walked) }
+            )
+        })
+        .collect();
+    eprintln!("O1C trace: derivation rows at or above lo={lo}: [{rows:?}]");
 }
 
 /// The record length an issued NWAL header carries at `lsn % seg`, if

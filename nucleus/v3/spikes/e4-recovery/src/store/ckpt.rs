@@ -1638,6 +1638,43 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             });
         }
     }
+    // Card X-5c-F4-F1-F1-O1C (`E4_O1C_TRACE`, stderr only, default off,
+    // never a digest input): the walk's own record list — every
+    // `Commit`/`CommitMarker` the walk accepted, with its ts, kind, lsn
+    // and txn, beside the opened meta's bounds and the valid end. This
+    // is the authoritative "replayed" side of the frontier-above-`hi`
+    // trace (the harness's `E4_O1C_TRACE` block prints the event side);
+    // the walk's records and the harness's stitched-walk records must
+    // agree on everything above `T`.
+    if std::env::var("E4_O1C_TRACE").is_ok() {
+        let recs: Vec<String> = replay
+            .iter()
+            .filter(|r| r.kind == K_COMMIT || r.kind == K_MARKER)
+            .map(|r| {
+                format!(
+                    "(ts={}, kind={}, lsn={}, len={}, txn=({},{}))",
+                    r.ts,
+                    r.kind,
+                    r.lsn,
+                    r.len(),
+                    r.txn.0,
+                    r.txn.1
+                )
+            })
+            .collect();
+        eprintln!(
+            "O1C walk: opened k={} t={} gc_w={} boot_id={} wal_start_lsn={} wal_ckpt_end={} ts_ckpt_hi={} valid_end={} records_above_T={:?}",
+            meta.ckpt_id,
+            meta.t,
+            meta.gc_w,
+            meta.boot_id,
+            meta.wal_start_lsn,
+            meta.wal_ckpt_end,
+            meta.ts_ckpt_hi,
+            valid_end,
+            recs
+        );
+    }
     // X-5c-F3-F3a step 6 (c) (`E4_TXN_DIAG`, stderr only, default off,
     // never a digest input): per recovery, each marker's recorded chunk
     // count against the chunks this walk attached to its txn. A mismatch
