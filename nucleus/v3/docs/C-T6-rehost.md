@@ -441,7 +441,7 @@ The drop-cleanup job reads committed RetiredRows at a registered snapshot `S`. F
 **What follows from the commit:**
 - **The walk.** Apply sets each tree to `dropping` (S-STORE §6.8 step 1). The bounded walk (steps 2–3) then runs as a background job, and the walk resumes at open (S-STORE §14 step 6).
 - **Atomicity.** The DropTree ops and the row delete are in one record, so a crash keeps both or neither. v2 needed I-WAL-ORDER's argument for this; one record gives it outright.
-- **Idempotence.** A DropTree of an absent or `dropping` tree only resumes the walk.
+- **Idempotence.** A DropTree of an absent or `dropping` tree only resumes the walk (in recovery, at S-STORE §14 step 6).
 
 Mutants:
 - **DROP-BEFORE-W:** the drop runs at `W ≥ S`, or at `visible_ts`;

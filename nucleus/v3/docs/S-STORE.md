@@ -247,6 +247,8 @@ Each of these holds the gate from its first page mutation to its last. The check
 - **Waiting.** Holding the gate shared across a page read is permitted; the flip waits for it.
 - **What this guarantees.** Every multi-page change is wholly in epoch `k` or wholly in epoch `k+1` (I-CKPT-AT-T).
 
+**I-LINK-ATOMIC.** Every gated operation leaves the reference graph closed. An LPID becomes mapped in the same gated operation that inserts its first reference, and unmapped in the same gated operation that removes its last. The references are a parent's child pointer, an entry's chain reference, an Overflow page's next pointer, and a directory entry's root. So every image, at every cut, satisfies I-LPID-EXACT with no special case, and §4.2's immediate reuse never hands out an LPID something still names.
+
 **`write_guard(frame)`** is the only way to mutate a page.
 - **When it copies.** It copies only if the frame's content epoch `< e`, **and** that content is not yet at a slot the image map references (the page is dirty with respect to image `k`). In that case it first copies the bytes into an **epoch-copy frame**, which belongs to the checkpointer.
 - **After the call,** the frame's content epoch is `e`.
@@ -347,20 +349,24 @@ An entry whose value exceeds `V_INLINE` stores a reference `(len u64, first LPID
 - **States:** `live` or `dropping`.
 - **DDL visibility** lives in the versioned catalog rows (C-T5), not here.
 
-**CreateTree(id)** allocates a root leaf and inserts the directory entry. It is idempotent: if the id already exists, nothing happens.
+**CreateTree(id)** allocates a root leaf and inserts the directory entry, in one gated operation (I-LINK-ATOMIC, §5.6). It is idempotent: if the id already exists, nothing happens.
 
 **DropTree(id)**
 1. Set the entry's state to `dropping`, in one directory mutation.
-2. Free the tree's pages bottom-up in bounded gated steps: free the children first, unlink them from the parent, and free overflow chains with their entries. The root is freed last.
-3. Remove the directory entry.
+2. Free the tree's pages bottom-up in bounded gated steps. Each step unlinks a child from its parent and frees it, with its entries' overflow chains, in one gated operation. A parent the step empties is freed in that same operation and unlinked from its own parent. A root's parent is its directory entry, so a step that empties the root is the last step (step 3).
+3. **The last step frees the root and removes the directory entry in one gated operation**, and frees the root's entries' overflow chains if the root is a leaf. The root's latch is released before the directory descent; the gate is held across both (§5.6: never twice).
+   - **A non-resident directory page** restarts the descent, not the operation: the thread releases its directory latches, keeps the gate, pins the page and re-descends. §5.6 permits a page read under the gate, and its release on a restart applies only before an operation's first mutation.
+   - **Inside the step,** a concurrent allocation may take the freed LPID (§4.2) while the entry still names it. No flip can land there, and the tree's one walk, the only reader of a `dropping` entry's root, has finished with it.
 
-At open, every `dropping` entry's walk resumes (the B-6 boot job; C-B1 "drop cleanup = freeing pages"). DropTree is idempotent: dropping an absent id does nothing. Because the entry is removed only after its last page is freed, a crash mid-walk never leaks pages (I-LPID-EXACT).
+At open, every `dropping` entry's walk resumes (the B-6 boot job; C-B1 "drop cleanup = freeing pages"). DropTree is idempotent: dropping an absent id does nothing. Every image therefore holds either the entry with its root mapped, or neither. A crash mid-walk leaks no page and names no freed LPID (I-LPID-EXACT, I-LINK-ATOMIC). At open, an unmapped root of a `dropping` entry is corruption like any other unmapped reference (XX001); §14 step 6 needs no other arm.
 
 **When the drop runs** (after `W` passes the DDL) is C-T0 v8's rule (v7.8 §9.2).
 
-**I-LPID-EXACT** (amcheck, quiescent): the mapped LPIDs of an image are exactly:
-- the pages reachable from the directory roots, including overflow chains (each referenced by exactly one entry);
+**I-LPID-EXACT** holds of every image, crash images included; "quiescent" (§15) describes amcheck's reading, not an exemption for crash images. The mapped LPIDs of an image are exactly:
+- the pages reachable from the directory roots, a `dropping` entry's root among them, including overflow chains (each referenced by exactly one entry);
 - the directory's own pages.
+
+Mutants (§15 I-LINK-ATOMIC): **DROP-ENTRY-SPLIT** (the root free and the entry removal in two gated operations), **DROP-UNLINK-SPLIT** (a child freed one gated step before its unlink), **CREATE-TREE-SPLIT** (the root mapped one gated step before the entry).
 
 ---
 
@@ -963,6 +969,8 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 
    A chunk whose transaction has no marker is ignored. Records with `commit_ts ≤ T` are skipped: they are in the image.
 
+   **DropTree.** A replayed `DropTree` sets `dropping` and does nothing else (nothing if the id is absent). Its walk runs at step 6. Pass 2 runs no walk. Mutant **REPLAY-DROP-WALK**: pass 2 walks, so a read-only open frees a page (§14.1; test `t_ro_open` with a replayed `DropTree`, A-7d).
+
    **Chunk supersede (I-CHUNK-SUPERSEDE).** For a chunked transaction, each op inserts or replaces the entry `key@commit_ts`, and a `Delete{revert}` deletes it if present. A replace or delete frees the replaced value's overflow chain in the same gated operation (§6.7). So the last op per key wins, whatever the image already holds for that key at that ts. An op that inserts an entry identical to the present one is a no-op. Ops of a `Commit` record keep I-ENTRY-UNIQUE's XX001 for a different value. Mutant SUPERSEDE-AS-CONFLICT: a superseding op is treated as a conflict (XX001).
 5. Truncate the WAL at the valid end.
 6. Resume the walks of every `dropping` directory entry (§6.8), as a B-6 boot job.
@@ -1028,7 +1036,7 @@ The double-crash test (A-7d) is the test that runs recovery twice. It is not a m
 - **Pool budget.** The evictable part of the pool (`F` minus the dirty frames) must meet §5.4's minimum, both during pass 2 and after it. When it would not, the open fails with 53200, having written nothing.
 - **The remedy for 53200** is either a read-only open with a larger pool budget (`F` is set per open from the N16 budget, §5.1), which still writes nothing, or a read-write open, whose boot checkpoint makes the replay durable, so that a read-only open of the files it leaves replays nothing.
 - **On a volume with no free space, the larger read-only open is the only guaranteed remedy.** A read-write open may need space for its boot checkpoint (§14 step 8), can fail there with 53100 before its meta is durable (§13), and leaves a store that recovers the same state as before.
-- **Replay is the only mutation.** No GC mutation (§10), page-local prune, LPID free, directory change or checkpoint runs.
+- **Replay is the only mutation.** No GC mutation (§10), page-local prune, LPID free, directory change or checkpoint runs. A replayed `DropTree` only sets its entry's state (§14 step 4), so the tree's pages stay mapped (mutant REPLAY-DROP-WALK).
 
 **What it skips.**
 - **Step 5:** the WAL is not truncated. The torn tail stays on disk, every walk stops at the same valid end (§12.5), and the next read-write open truncates it.
