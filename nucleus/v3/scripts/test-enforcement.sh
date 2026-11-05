@@ -3130,7 +3130,13 @@ elif which == "second-group":
     except PermissionError:
         pass
     os.killpg = real
+    # Timed: kill_child waits on the leader's child's pidfd, here the member, so a
+    # kill that missed it returns only when its sleep ends, with the member dead.
+    t0 = time.time()
     rc.kill_child(c)
+    took = time.time() - t0
+    if took > 10:
+        fail(f"the repeat kill took {took:.0f} s: the member's own end finished it, not the kill")
     if not dead_soon(bg):
         fail("the live leader's member survived the repeat kill")
 elif which == "signal-window":
