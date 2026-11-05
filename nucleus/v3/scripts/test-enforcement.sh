@@ -3387,8 +3387,14 @@ if which == "timeout-init-wait":
     # stands in for the pidfd, as the CT row's does: reaping unshare proves nothing.
     r, w = os.pipe()
     os.pidfd_open = lambda pid: r
-    threading.Timer(2.0, os.close, (w,)).start()
     c = sp("sleep 30")
+    for _ in range(3000):  # forked, so the kill finds an init to wait on, however busy the host
+        if open(f"/proc/{c.pid}/task/{c.pid}/children").read().split():
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit("premise: unshare never forked")
+    threading.Timer(2.0, os.close, (w,)).start()
     t0 = time.time()
     try:
         rc.finish_contained(c, 0.5)
@@ -3403,7 +3409,7 @@ elif which == "timeout-real":
     mark = f"acc-real-{os.getpid()}"
     c = sp("setsid sleep 30 & setsid sleep 30 & sleep 30", E2E_CT_MARK=mark)
     tmp = c.tmpdir
-    for _ in range(300):
+    for _ in range(3000):
         if len(members(mark)) >= 4:  # unshare, the init (sh or its last sleep), its two sessions
             break
         time.sleep(0.01)
@@ -3422,7 +3428,7 @@ elif which == "init-order":
     # G3-INIT-AFTER-KILL: the pidfd is looked up before the kill. Measured: a lookup
     # after it misses the init 17 times in 100, so the order is what the wait rests on.
     c = rc.spawn_contained(["sleep", "30"], os.getcwd(), env)
-    for _ in range(300):
+    for _ in range(3000):
         if open(f"/proc/{c.pid}/task/{c.pid}/children").read().split():
             break
         time.sleep(0.01)
@@ -3555,7 +3561,7 @@ expect_ok "runner e2e: ACC: premise: the SIGTERM landed during the line, with it
 expect_ok "runner e2e: ACC: nothing of the forge is alive once a SIGTERM during a line ends the run" ct_gone XAT
 expect_ok "runner e2e: ACC: a SIGTERM during a line exits 143 and closes the range" res XAT "rc == 143 and $closed"
 # Past the timeout: the end path, then the exception that today's subprocess.run raises.
-E2E_ACCEPT_S=2 e2eb XAO "$acc_forge; sleep 60" "work accforge" --attempts 1
+E2E_ACCEPT_S=5 e2eb XAO "$acc_forge; sleep 60" "work accforge" --attempts 1
 rm -f "$e/XAO.n.pid"
 expect_ok "runner e2e: ACC: premise: the timed-out line was in a real namespace, and its forge led a session" acc_ids XAO
 expect_ok "runner e2e: ACC: nothing of the forge is alive once a timeout ends the run" ct_gone XAO
@@ -3587,8 +3593,9 @@ tmps_all() { local x; cat "$e/$1.n.tmps"; [ "$(sort -u "$e/$1.n.tmps" | grep -c 
   while IFS= read -r x; do [ -n "$x" ] && [ ! -e "$x" ] && [ "$x" != "${TMPDIR:-}" ] || return 1; case $x in "$ewt"/*) return 1 ;; esac; done <"$e/$1.n.tmps"; }
 expect_ok "runner e2e: ACC: opencode and a line get different TMPDIRs, gone after the run" tmps_all XTM 2
 expect_ok "runner e2e: ACC: the TMPDIR run passes" res XTM "rc == 0 and r['pass'] and $closed"
-# A restart after no output gets a fresh one too, and the killed one is gone.
-e2e XTR "tmprec mute" --attempts 1
+# A restart after no output gets a fresh one too, and the killed one is gone. The limit
+# outlasts the fake's first write under load: a kill before tmprec records nothing.
+E2E_NO_OUTPUT_S=3 e2e XTR "tmprec mute" --attempts 1
 rm -f "$e/XTR.n.pid"
 expect_ok "runner e2e: ACC: each opencode start gets its own TMPDIR, the killed ones gone too" tmps_all XTR 3
 # An opencode forge is dead while a line runs, seen from inside the line's container.
