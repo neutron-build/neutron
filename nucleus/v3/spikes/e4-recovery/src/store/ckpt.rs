@@ -1683,7 +1683,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         match rec.kind {
             K_COMMIT if rec.ts > meta.t => {
                 for op in wal::rec_ops(rec) {
-                    apply_op(cx, &op, rec.ts, false)?;
+                    apply_op(cx, &op, rec.ts, false, true)?;
                 }
                 cx.with("recover:applied", |c| {
                     c.store().seq.applied.insert(rec.ts);
@@ -1715,7 +1715,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     && ts > meta.t
                 {
                     for op in wal::rec_ops(rec) {
-                        apply_op(cx, &op, ts, true)?;
+                        apply_op(cx, &op, ts, true, true)?;
                     }
                     cx.with("recover:applied2", |c| {
                         c.store().seq.applied.insert(ts);
@@ -1917,12 +1917,17 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
 
 /// Apply one op at `ts` (the gated insert path; §9). `chunked` marks a
 /// chunked transaction's superseding replay ops (§14: the last op per key
-/// wins — a replace, not a conflict).
+/// wins — a replace, not a conflict). `replay` marks recovery's pass 2
+/// (§14 step 4, as amended by S-1-F7): a replayed `DropTree` sets its
+/// entry's `dropping` state and does nothing else — pass 2 runs no walk;
+/// the walk is step 6's (`resume_drops`). The live apply path passes
+/// `false` and drops in full, exactly as before.
 pub fn apply_op<H: StoreHost>(
     cx: &Cx<'_, H>,
     op: &wal::WOp,
     ts: u64,
     chunked: bool,
+    replay: bool,
 ) -> Result<(), Fail> {
     match op {
         wal::WOp::CreateTree { tree } => {
@@ -1930,6 +1935,16 @@ pub fn apply_op<H: StoreHost>(
             Ok(())
         }
         wal::WOp::DropTree { tree } => {
+            if replay {
+                // §14 step 4 as amended: "A replayed `DropTree` sets
+                // `dropping` and does nothing else (nothing if the id is
+                // absent). Its walk runs at step 6. Pass 2 runs no
+                // walk." Walking here would free pages mid-replay, and
+                // the LPIDs pass 2's own later records allocate (§14.1)
+                // would take them — M-REPLAY-DROP-WALK.
+                tree::dir_drop_tree_replay(cx, *tree)?;
+                return Ok(());
+            }
             tree::dir_drop_tree(cx, *tree)?;
             Ok(())
         }

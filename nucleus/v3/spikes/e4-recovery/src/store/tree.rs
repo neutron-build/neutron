@@ -1188,25 +1188,7 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
     };
     if !entry.dropping {
         // Step 1: the entry becomes `dropping` in one directory mutation.
-        gate_shared(cx)?;
-        if let Err(e2) = tree_lock(cx, DIR_TREE) {
-            gate_release(cx);
-            return Err(e2);
-        }
-        let mut pins = PinGuard::new(cx);
-        let dir_root = cx.with("drop:dr", |c| Ok(c.store().meta.dir_root))?;
-        let e = cx.with("drop:epoch", |c| Ok(c.store().e))?;
-        let w = dir_put_locked(cx, &mut pins, dir_root, id, entry.root, true, e);
-        drop(pins);
-        tree_unlock(cx, DIR_TREE);
-        gate_release(cx);
-        w?;
-        cx.with("drop:mark", |c| {
-            if let Some(en) = c.store().dir.get_mut(&id) {
-                en.dropping = true;
-            }
-            Ok(())
-        })?;
+        dir_mark_dropping(cx, id, entry.root)?;
     }
     if cx.with("drop:mut", |c| {
         Ok(matches!(c.store().cfg.mutant, Some(Mutant::DropRootFirst)))
@@ -1312,6 +1294,47 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
     // Step 3 (M-DROP-ENTRY-SPLIT's second hold; the fixed last step
     // removed the entry inside its own hold above).
     dir_remove_entry(cx, id)?;
+    Ok(true)
+}
+
+/// DropTree's step 1 alone (§6.8): set the entry's state to `dropping`
+/// in one directory mutation — the full drop's first step and the
+/// replay path's whole `DropTree` (below) share this one definition of
+/// the mark.
+fn dir_mark_dropping<H: StoreHost>(cx: &Cx<'_, H>, id: u64, root: u64) -> Result<(), Fail> {
+    gate_shared(cx)?;
+    if let Err(e2) = tree_lock(cx, DIR_TREE) {
+        gate_release(cx);
+        return Err(e2);
+    }
+    let mut pins = PinGuard::new(cx);
+    let dir_root = cx.with("drop:dr", |c| Ok(c.store().meta.dir_root))?;
+    let e = cx.with("drop:epoch", |c| Ok(c.store().e))?;
+    let w = dir_put_locked(cx, &mut pins, dir_root, id, root, true, e);
+    drop(pins);
+    tree_unlock(cx, DIR_TREE);
+    gate_release(cx);
+    w?;
+    cx.with("drop:mark", |c| {
+        if let Some(en) = c.store().dir.get_mut(&id) {
+            en.dropping = true;
+        }
+        Ok(())
+    })
+}
+
+/// A replayed `DropTree` (§14 step 4, as amended by S-1-F7): set
+/// `dropping` and do nothing else — pass 2 runs no walk; the walk is
+/// step 6's (`resume_drops`), after replay has finished allocating.
+/// Dropping an absent id does nothing.
+pub fn dir_drop_tree_replay<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail> {
+    let entry = cx.with("drop:entry", |c| Ok(c.store().dir.get(&id).copied()))?;
+    let Some(entry) = entry else {
+        return Ok(false); // dropping an absent id does nothing
+    };
+    if !entry.dropping {
+        dir_mark_dropping(cx, id, entry.root)?;
+    }
     Ok(true)
 }
 

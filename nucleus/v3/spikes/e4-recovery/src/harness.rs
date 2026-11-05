@@ -667,7 +667,7 @@ pub fn commit_txn(
                 Ok(())
             })?;
         }
-        if let Err(e) = ckpt::apply_op(cx, &to_wop(op), ts, false) {
+        if let Err(e) = ckpt::apply_op(cx, &to_wop(op), ts, false, false) {
             client_xx001_unwind(cx, ts, e)?;
         }
         if is_drop {

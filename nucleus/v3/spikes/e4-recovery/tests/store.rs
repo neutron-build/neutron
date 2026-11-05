@@ -4620,6 +4620,7 @@ fn wal_loss_below_ckpt_end_fails_closed() {
                         },
                         2,
                         false,
+                        false,
                     )
                     .expect("apply c");
                     target = (l, l + n);
@@ -6399,4 +6400,99 @@ fn drop_entry_gone_body(seed: u64) {
     let (sched, report) = run_world(3, seed, disk, st, body);
     report.assert_clean("the drop watcher schedule");
     assert!(flag(&sched, "d_done"), "seed {seed}: both drops ran");
+}
+
+/// **X-5c-F4-F1-F1-CXX Work 3 (§14 step 4, as amended by S-1-F7): a
+/// replayed drop leaves its pages mapped until step 6.** Pass 2's
+/// `DropTree` sets `dropping` only — it runs no walk; the walk is step
+/// 6's, after replay has finished allocating. The fixture: a durable
+/// image of trees 2 and 3, then a WAL (above `T`, never applied live)
+/// holding a committed `DropTree(2)` and a commit of eight 400-byte
+/// cells into tree 3 — enough to split it during replay. Under the fix,
+/// tree 3's split allocates fresh LPIDs and step 6's walk frees tree
+/// 2's pages afterwards: the recovered map holds none of them. Under
+/// M-REPLAY-DROP-WALK (pass 2 walks), tree 2's pages are freed during
+/// replay and tree 3's split takes the lowest of them — the recovered
+/// map still holds it, and tree 3's scan sits partly on the freed page.
+#[test]
+fn drop_replay_only_marks() {
+    let seed = 1u64;
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // ---- phase A: tree 2 (a leaf root, one entry) and tree 3 (eight
+    // of the ~10 400-byte cells a leaf holds), one durable checkpoint.
+    let (disk, st, root2, root3) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 3] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let root3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        for i in 0..8u64 {
+            ins(&cx, 3, root3, &i.to_be_bytes(), 1, &[0u8; 400]);
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2, root3)
+    };
+    // ---- phase B: the WAL only — a committed DropTree above T, then a
+    // commit that splits tree 3 during replay. Nothing is applied live.
+    let mut disk_after = {
+        let sched = pass_world(1, seed + 10, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        enqueue_commit(&cx, (0, 1), 1, &[wal::WOp::DropTree { tree: 2 }]);
+        let puts: Vec<wal::WOp> = (8..16u64)
+            .map(|i| wal::WOp::Put {
+                tree: 3,
+                key: i.to_be_bytes().to_vec(),
+                value: [0u8; 400].to_vec(),
+            })
+            .collect();
+        enqueue_commit(&cx, (0, 2), 2, &puts);
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    crash_clean(&mut disk_after, seed + 50);
+    // ---- the recovery: both records replay; then step 6 walks.
+    let world = pass_world(1, seed + 20, disk_after, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, _frontier) = ckpt::recover(&cx, cfg.clone()).expect("replay recovery");
+    assert!(
+        !rec_st.dir.contains_key(&2),
+        "the replayed drop completed at step 6: tree 2's entry is gone"
+    );
+    let root2_mapped = rec_st.map.cur.contains_key(&root2)
+        || rec_st
+            .pool
+            .frames
+            .iter()
+            .any(|f| f.key == root2 && !f.is_epoch_copy);
+    assert!(
+        !root2_mapped,
+        "a replayed drop must leave its pages mapped until step 6 - tree 2's root \
+         mapped again in the recovered store means pass 2's records allocated it \
+         (M-REPLAY-DROP-WALK)"
+    );
+    cx.with("replay:install", |c| {
+        *c.store() = rec_st;
+        Ok(())
+    })
+    .expect("install");
+    let scan = tree::tree_scan(&cx, root3, 1000).expect("tree 3 scan after recovery");
+    assert_eq!(
+        scan.len(),
+        16,
+        "tree 3 holds all sixteen replayed cells across its split"
+    );
 }
