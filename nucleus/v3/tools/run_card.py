@@ -31,13 +31,17 @@ Nothing is merged here: a gate writes verdicts/<id>.md and scripts/merge-card.sh
 
 Every run appends a start and an end record to the card's trust ledger, cards/logs/<id>.ledger.jsonl,
 outside the worktree (worker_commits()); the end is written on every exit, after the opencode child
-is killed. A commit made while a worker ran never vouches for verdicts/<id>.md. A fresh run moves the
+and its whole container are dead (kill_child; X-6-F1-F1-F2-F1). A commit made while a worker ran never vouches for verdicts/<id>.md. A fresh run moves the
 old ledger aside; --keep on a worktree with no ledger whose branch has a verdict commit refuses to start
 unless --trust-existing records that the operator inspected it. Ranges are keyed on commit ids, so a
 rebase or amend between runs gives a forged commit a new id in no range: --keep refuses a branch where
 a closed range's end is no longer an ancestor of HEAD (ledger_rewritten), unless --trust-existing,
 after the operator inspected the rewritten branch, moves the ledger aside and starts a new one trusting
 HEAD as is. An intact ledger is never overridden. A killed attempt's tokens count.
+
+Inside and outside the container (CONTAIN): opencode and everything it starts run in a PID namespace
+and die with it. This runner, its git checks and the Acceptance commands run outside it, so
+worker-written code that an Acceptance command runs (a test, a build script) is not contained.
 
 v3 rules on top of v2: the last Acceptance command must be the full gate (`scripts/gate.sh`),
 whose pass requires a literal `GATE EXIT=0` line, not just exit code 0 (§7.6.4); workers may
@@ -49,6 +53,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -69,6 +74,28 @@ NO_OUTPUT_S = 600  # a log still empty after this is a provider stall: restart o
 STALL_S = 30 * 60  # a log silent for this long: kill the attempt
 ATTEMPT_S = 60 * 60  # an attempt running this long: kill it
 POLL_S = 5
+# The container opencode runs in (X-6-F1-F1-F2-F1, verdict X-6-F1-F1-F2 R1). opencode
+# 2.2.5 starts each shell tool command detached, in a new session, so no process
+# group holds them: a forge left in a tool shell landed after the group kill.
+# A PID namespace does: when its init dies the kernel SIGKILLs every member and
+# waits for them, whatever session they moved to. opencode is that init.
+# Why this and not the card's other candidates: a cgroup scope needs systemd-run,
+# which leaves this session's NoNewPrivs (the verdict rules it out), and
+# PR_SET_CHILD_SUBREAPER needs a process walk, which this runner does not do.
+# Measured under this mapping (the card's RESULT has the commands): git commits,
+# ~/.cargo and the target dir stay owned by the real uid, the network is the
+# host's (no --net), and the worker holds no capabilities (CapEff 0). opencode as
+# init ignores `kill -9 1` from inside and reaps no orphans; their zombies go with
+# the namespace.
+# --map-current-user: uid and gid stay the real ones, so git sees its own files.
+# --mount-proc: without a private /proc the worker reads the host's process table
+# and, being the same uid, can open other processes' /proc/<pid>/mem. A nested
+# user namespace cannot unmount this one either (EINVAL, measured).
+# --kill-child: unshare's death kills the init even if the init left unshare's
+# process group, so kill_child's killpg reaches the namespace either way.
+CONTAIN = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--kill-child", "--mount-proc", "--"]
+# What the namespace must look like from inside: pid 1 in a private /proc, real ids.
+CONTAIN_PROBE = 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm)"'
 # Where the per-card trust ledgers live (ledger_path()); the scenarios repoint it.
 LEDGER_DIR = CARDS / "logs"
 PROTECTED = [
@@ -1012,51 +1039,118 @@ def parse_tokens(log_path):
     return tot, session
 
 
-def kill_child(proc):
-    """Kill opencode's process group, then reap opencode.
+def containment_problem():
+    """Why opencode cannot be contained on this host, or None if it can.
 
-    This reaches only children still in opencode's group. It does not contain
-    real opencode's tool shells: opencode 2.2.5 starts each shell command
-    detached, in a new session, so those commands and anything they background
-    escape this kill, on a normal exit and on the silence, timeout and SIGTERM
-    paths alike. Measured in verdict X-6-F1-F1-F2: a forge in a tool shell landed
-    after the group kill. The later checks catch an escaped commit only if it
-    lands before the end record; one landing after it is trusted by a --keep run
-    and by merge-card.sh. Real containment is card X-6-F1-F1-F2-F1.
+    Fails closed: main() refuses the card on any answer but None and never falls
+    back to the group kill, which reaches no real tool shell. Everything kill_child
+    relies on is checked by running it, so a host with unprivileged user namespaces
+    switched off (a sysctl, AppArmor, a container's seccomp or masked /proc) is
+    named here, before the worktree is touched. Enabling them needs root and is the
+    owner's call."""
+    if shutil.which("unshare") is None:
+        return "unshare (util-linux) is not on PATH"
+    if not hasattr(os, "pidfd_open"):
+        return "this Python has no os.pidfd_open (kill_child waits on the namespace's init with it)"
+    me = os.getpid()
+    if not pathlib.Path(f"/proc/{me}/task/{me}/children").exists():
+        return f"/proc/{me}/task/{me}/children is missing (a kernel without CONFIG_PROC_CHILDREN; kill_child finds the namespace's init there)"
+    try:
+        p = subprocess.run([*CONTAIN, "sh", "-c", CONTAIN_PROBE], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"{' '.join(CONTAIN)} sh failed: {e}"
+    want = f"1 {os.geteuid()} {os.getegid()} sh"
+    if p.returncode or p.stdout.strip() != want:
+        why = (p.stderr or "").strip().splitlines() or ["no stderr"]
+        return f"{' '.join(CONTAIN)} sh: exit {p.returncode}, inside it printed {p.stdout.strip()!r} (want {want!r}): {why[0]}"
+    return None
+
+
+def container_init(pid):
+    """A pidfd for the init of the container `unshare` process `pid` started, or None.
+
+    One read of unshare's own children file, not a process walk. None means unshare
+    has not forked yet, so a SIGKILL to its group stops it from ever forking, or its
+    init is gone and with it the namespace. The children's pid cannot be reused while
+    unshare lives unreaped; once unshare reaps it the window before pidfd_open is a
+    full pid wrap within microseconds, and the cost is only a longer wait."""
+    try:
+        kids = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        return os.pidfd_open(int(kids[0])) if kids else None
+    except (OSError, ValueError):
+        return None
+
+
+def kill_child(proc):
+    """End opencode's container, and return only when every process in it is dead.
+
+    proc is unshare (CONTAIN), the leader of its own process group, with the
+    namespace's init (opencode) in that group unless it moved itself. Every process
+    opencode starts is in the namespace, whatever session or group it moved to.
+    Measured in verdict X-6-F1-F1-F2: real tool shells leave the group, so the group
+    kill alone never reached them. The killpg's job now is the init.
+
+    When this returns the namespace is empty, by kernel semantics:
+    - unshare exited by itself (opencode's normal exit): unshare only returns after
+      reaping the init, and an init's exit SIGKILLs every member and waits for them
+      (zap_pid_ns_processes) before its parent is notified;
+    - unshare was killed here: it dies alongside the init, so reaping it proves
+      nothing. The init can take many milliseconds to exit (the namespace is only
+      emptied at the end of that) and a member still runs meanwhile. A pidfd on the
+      init becomes readable after that same step, so this waits on it before
+      anything reads the branch.
+    A member stuck in uninterruptible sleep holds this wait, as it would hold
+    `wait()` on any child: the run hangs with its range open, which fails closed.
+    Residual: if something else SIGKILLs unshare, the attempt looks like a normal
+    exit, and --kill-child kills the init a moment after the runner sees it.
 
     Called after every attempt, including one where opencode exited by itself,
-    because a same-group background child keeps the group alive after opencode
-    exits and could commit during acceptance or after the end record. Safe on a
-    child that already exited: the group outlives its reaped leader while any
-    member is alive, ESRCH means it is already empty, and `wait()` on a reaped
-    child returns at once.
+    because a child sharing the leader's group (no container, or the suite's
+    no-op shim) keeps the group alive after the leader exits. Safe on a child that
+    already exited: the group outlives its reaped leader while any member is alive,
+    ESRCH means it is already empty, and `wait()` on a reaped child returns at once.
 
     Idempotent per child. Once the leader is reaped and the group has emptied,
     its pid can become an unrelated job's pgid. main()'s finally runs after the
     acceptance commands, up to 60 minutes per command, so a second killpg there
-    could SIGKILL that job. So the first call marks the Popen, before killpg,
-    and a later call skips killpg once the leader has been reaped. A leader
-    still alive pins its pid, so that call kills again rather than wait forever
-    on a child a signal kept this function from killing.
+    could SIGKILL that job. So the first call marks the Popen, once killpg has
+    returned or raised, and a later call skips killpg once the leader has been
+    reaped. A leader still alive pins its pid, so that call kills again rather than
+    wait forever on a child a signal kept this function from killing. The mark comes
+    after the killpg so that a SIGTERM landing just before it leaves the mark unset
+    and the finally's call still kills (verdict X-6-F1-F1-F2 F1).
 
-    Residual: the else branch's first call follows its poll()'s reap at once, so
-    a wrong kill there needs a full pid wrap within microseconds."""
+    Residual: the else branch's first call follows its poll()'s reap at once, so a
+    wrong kill there, or in a repeat after a SIGTERM between killpg and the mark,
+    needs a full pid wrap within microseconds."""
     if not getattr(proc, "group_killed", False) or proc.poll() is None:
-        proc.group_killed = True
+        if getattr(proc, "init_pidfd", None) is None:
+            proc.init_pidfd = container_init(proc.pid)
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass  # ESRCH: the group is already empty
-        # PermissionError is deliberately not caught. EPERM means no member of
-        # the group may be signalled: a pgid reused by another user's process,
-        # or (by kernel semantics, not run here) a group whose only remaining
-        # members run as another uid, like a backgrounded sudo. Neither is ours
-        # to ignore. The run crashes with pass unset. After a normal exit the
-        # mark makes the finally's call skip killpg, so the end record is still
-        # written. If opencode itself is alive the finally's call raises again
-        # and no end record is written: the range stays open, which counts every
-        # later commit as a worker's, so that also fails closed.
+        except PermissionError:
+            # Deliberately not swallowed. EPERM means no member of the group may
+            # be signalled: a pgid reused by another user's process, or (by kernel
+            # semantics, not run here) a group whose only remaining members run as
+            # another uid, like a backgrounded sudo. Neither is ours to ignore. The
+            # run crashes with pass unset. After a normal exit the mark makes the
+            # finally's call skip killpg, so the end record is still written. If
+            # opencode itself is alive the finally's call raises again and no end
+            # record is written: the range stays open, which counts every later
+            # commit as a worker's, so that also fails closed.
+            proc.group_killed = True
+            raise
+        proc.group_killed = True
     proc.wait()
+    # On the instance, not a local: a SIGTERM during this wait raises out of here and
+    # the finally's call must finish it.
+    fd = getattr(proc, "init_pidfd", None)
+    if fd is not None:
+        select.select([fd], [], [])
+        proc.init_pidfd = None
+        os.close(fd)
 
 
 def _sigterm(signum, frame):
@@ -1083,6 +1177,11 @@ def main():
     err = validate_card(touch, accept)
     if err:
         sys.exit(f"card {card_id}: {err} (PLAN-v3 §7.2)")
+    # Before anything touches the worktree: a run that cannot contain its worker
+    # never starts. There is no fallback to the group kill (kill_child).
+    why = containment_problem()
+    if why:
+        sys.exit(f"[{card_id}] cannot contain opencode, so not starting (nothing was changed): {why}. Unprivileged user namespaces are needed; enabling them needs root and is the owner's call.")
 
     wt = WT_ROOT / card_id
     branch = f"card/v3-{card_id}"
@@ -1219,8 +1318,10 @@ def main():
             killed = None  # "silence" or "timeout"; a no-output restart is not a kill of the attempt
             for start in range(3):
                 with open(log, "w") as fh:
-                    # Its own process group, so kill_child reaches its children too.
-                    child = subprocess.Popen(cmd, cwd=wt, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, process_group=0)
+                    # In its own container and process group. The group does not reach
+                    # opencode's children (its tool shells leave it); the container
+                    # does. See CONTAIN and kill_child.
+                    child = subprocess.Popen([*CONTAIN, *cmd], cwd=wt, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, process_group=0)
                     t_start = time.time()
                     while child.poll() is None:
                         time.sleep(POLL_S)
@@ -1243,10 +1344,10 @@ def main():
                             failure = f"opencode run killed: timed out after {ATTEMPT_S // 60} minutes or disk nearly full"
                             break
                     else:
-                        # opencode exited by itself, but a child it backgrounded
-                        # may still be running in its group: kill the group before
-                        # anything reads the branch. Real tool shells are not in
-                        # this group; see kill_child.
+                        # opencode exited by itself, and its namespace died with it.
+                        # kill_child closes this attempt the same way as a kill
+                        # before anything reads the branch: its children are gone,
+                        # whatever session or group they moved to.
                         kill_child(child)
                         finished = True
                 if finished or killed:
@@ -1329,8 +1430,8 @@ def main():
         # outlives the runner keeps committing after the end record.
         old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        # Whether or not opencode itself is alive: its group may not be empty.
-        # kill_child skips killpg if it already killed this child's group.
+        # Whether or not opencode itself is alive: this attempt's end may have been
+        # interrupted. kill_child skips killpg if it already killed this child's group.
         if child is not None:
             kill_child(child)
         _, head = run(["git", "rev-parse", "HEAD"], wt)
