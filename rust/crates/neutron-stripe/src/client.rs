@@ -507,9 +507,10 @@ mod tests {
         let acc = acceptor.clone();
         tokio::spawn(async move {
             if let Ok((sock, _)) = listener.accept().await {
-                // Even if the handshake somehow succeeded, nothing readable.
-                let _ = acc.accept(sock).await;
-                saw2.store(true, Ordering::SeqCst);
+                // Only a completed handshake could carry a request.
+                if acc.accept(sock).await.is_ok() {
+                    saw2.store(true, Ordering::SeqCst);
+                }
             }
         });
 
