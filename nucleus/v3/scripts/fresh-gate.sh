@@ -51,15 +51,26 @@
 # or writes into objects/: it refuses, and the operator decides.
 #
 # gate.sh runs the commit's code (its tests, its build scripts), so it runs in
-# the runner's container (CONTAIN in tools/run_card.py; X-6-F1-F1-F2-F1-F1), with
-# a TMPDIR of its own under the scratch dir: whatever it starts dies with the
+# the runner's container (contain_argv in tools/run_card.py; X-6-F1-F1-F2-F1-F1),
+# with a TMPDIR of its own under the scratch dir: whatever it starts dies with the
 # namespace, whatever session it moved to, before this script exits. Without
-# this a forge left by a test lands on the branch after the gate was read. No
-# container means no gate: a refusal by name, never an uncontained run. What
-# this cannot stop is what the runner cannot: a daemon outside asked to run
-# something, a file planted to run later, and an `unshare` planted on PATH that
-# answers the probe (X-6-F1-F1-F2-F1-F2). A SIGKILL of this script leaves the
-# container running, as a SIGKILLed runner does; that run printed no GATE EXIT=.
+# a container means no gate: a refusal by name, never an uncontained run. The
+# container is the runner's two-stage form with the same masks
+# (X-6-F1-F1-F2-F1-F2): $HOME read-only with the registry, cargo's git cache and
+# the target dir bound back writable, /run/user/<uid> and ~/.ssh hidden, so the
+# gate's worker code reaches neither the user manager's bus nor same-uid files
+# under $HOME. What this cannot stop is what the runner cannot: loopback TCP and
+# abstract unix sockets (shared network namespace), /tmp, and anything outside
+# $HOME — measured, and named in the runner's docstring. A SIGKILL of this script
+# leaves the container running, as a SIGKILLed runner does; that run printed no
+# GATE EXIT=.
+#
+# The binaries this script and its container run (unshare, git, mount) are
+# absolute paths from CS_PATH (`command -p getconf PATH`: where a POSIX shell
+# looks when PATH is unset), never a PATH lookup, and each is refused by name if
+# missing (X-6-F1-F1-F2-F1-F2 Work 4): a file planted in a PATH directory cannot
+# become the gate's unshare or its git. The git() function below routes every
+# `git` call in this script and in the sourced git-env.sh through that path.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=git-env.sh
@@ -79,6 +90,35 @@ die() { P+=("$*"); refuse_if_any; }
 # problem lists).
 add_lines() { local l; while IFS= read -r l; do [ -z "$l" ] || P+=("$l"); done <<<"$1"; }
 usage="usage: fresh-gate.sh [--base REF] COMMIT"
+
+# The trusted path and its binaries, before any git call runs: command -p searches
+# bash's built-in default path (not PATH), getconf PATH prints CS_PATH, and CS_PATH's
+# directories are root-owned. tb NAME: the first executable NAME directly in one.
+CS=$(command -p getconf PATH) || die "cannot read CS_PATH (command -p getconf PATH failed)"
+tb() {
+  local d
+  for d in ${CS//:/ }; do
+    if [ -x "$d/$1" ]; then printf '%s\n' "$d/$1"; return 0; fi
+  done
+  return 1
+}
+UNSHARE=$(tb unshare) || P+=("unshare (util-linux) is not in the trusted path ($CS)")
+GIT=$(tb git) || P+=("git is not in the trusted path ($CS)")
+MOUNT=$(tb mount) || P+=("mount (util-linux) is not in the trusted path ($CS)")
+UMOUNT=$(tb umount) || P+=("umount (util-linux) is not in the trusted path ($CS)")
+refuse_if_any
+# Every `git` in this script and in git-env.sh (its functions resolve the name at
+# call time, in this shell) runs the trusted binary, whatever PATH holds. The
+# env() wrapper does the same for git-env.sh's `env -u ... git index-pack` calls:
+# env(1) is a binary that resolves `git` through PATH itself, past any function,
+# so it is rerouted through the trusted path too, and every other env call
+# (different command word) passes through unchanged.
+git() { "$GIT" "$@"; }
+env() {
+  local pre=()
+  while [ "$#" -gt 0 ] && [ "$1" != git ]; do pre+=("$1"); shift; done
+  if [ "$#" -gt 0 ]; then shift; command env "${pre[@]}" "$GIT" "$@"; else command env "${pre[@]}"; fi
+}
 
 base_ref=nucleus/v3-scaffold commit_ref=
 while [ $# -gt 0 ]; do
@@ -179,19 +219,58 @@ config_checks() {
 }
 config_checks
 
-# The same flags as CONTAIN in tools/run_card.py (a row compares them), and the
-# same probe: everything the container relies on is checked by running it, before
-# anything is checked out. Enabling user namespaces needs root: the owner's call.
-CONTAIN=(unshare --user --map-current-user --pid --fork --kill-child --mount-proc --)
+# The same container form as contain_argv in tools/run_card.py (a row compares
+# them, expanded): stage 1's unshare, then the two stage shells. The setup script
+# is the runner's CONTAIN_SETUP, byte for byte, and takes its values from the
+# NV3_* variables exported below and by container_check's probe. Every binary it
+# runs is an absolute trusted path (mount and umount hold the capability over the
+# mount namespace, so a planted one on PATH must never run there), and its alt
+# mountpoint is created under the TMPDIR it is given.
+SETUP=$(cat <<'S'
+set -eu
+test -n "${HOME:-}" || exit 91
+alt=${TMPDIR:-/tmp}/nv3-alt
+test -d "$HOME" || exit 92
+test -d "$alt" || exit 93
+"$NV3_MOUNT" --bind "$HOME" "$alt"
+"$NV3_MOUNT" --bind "$HOME" "$HOME"
+"$NV3_MOUNT" -o remount,bind,ro -- "$HOME"
+for d in ${NV3_RO:-}; do
+  test -n "$d" || continue
+  test -d "$d" || continue
+  "$NV3_MOUNT" --bind "$d" "$d"
+  "$NV3_MOUNT" -o remount,bind,ro -- "$d"
+done
+for d in ${NV3_HIDE:-}; do
+  test -n "$d" || continue
+  test -d "$d" || continue
+  "$NV3_MOUNT" -t tmpfs tmpfs -- "$d"
+done
+for d in ${NV3_RW:-}; do
+  test -n "$d" || continue
+  test -d "$d" || continue
+  case "$d" in
+    "$HOME"/*) "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d" ;;
+  esac
+done
+"$NV3_UMOUNT" -- "$alt"
+exec "$NV3_UNSHARE" --user --map-user="$NV3_UID" --map-group="$NV3_GID" -- "$@"
+S
+)
+# Command substitution strips the trailing newline; the runner's constant keeps
+# it, so it is put back: a suite row compares the two setup texts byte for byte.
+SETUP="$SETUP"$'\n'
+OUTER="exec \"\$NV3_UNSHARE\" --user --map-root-user --mount --propagation slave -- /bin/sh -c '$SETUP' nv3 \"\$@\""
+CONTAIN=("$UNSHARE" --user --map-current-user --pid --fork --kill-child --mount-proc -- /bin/sh -c "$OUTER" nv3)
 container_check() {
   local want got rc=0 why
-  if ! command -v unshare >/dev/null; then P+=("cannot contain the gate, so not running it: unshare (util-linux) is not on PATH"); return; fi
   if [ ! -e "/proc/$$/task/$$/children" ]; then P+=("cannot contain the gate, so not running it: /proc/$$/task/$$/children is missing (a kernel without CONFIG_PROC_CHILDREN; this script finds the namespace's init there)"); return; fi
-  want="1 $(id -u) $(id -g) sh"
-  got=$(timeout 30 "${CONTAIN[@]}" sh -c 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm)"' </dev/null 2>"$d/contain.err") || rc=$?
+  mkdir "$d/probe" "$d/probe/nv3-alt"
+  want="1 $(id -u) $(id -g) sh CapEff=0000000000000000 runhide=0"
+  got=$(cd "$start" && NV3_HIDE="/run/user/$(id -u) $HOME/.ssh" NV3_RO="" NV3_RW="" NV3_UNSHARE="$UNSHARE" NV3_MOUNT="$MOUNT" NV3_UMOUNT="$UMOUNT" NV3_UID="$(id -u)" NV3_GID="$(id -g)" TMPDIR="$d/probe" timeout 30 "${CONTAIN[@]}" sh -c 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm) CapEff=$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/$$/status) runhide=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)"' </dev/null 2>"$d/contain.err") || rc=$?
   if [ "$rc" -ne 0 ] || [ "$got" != "$want" ]; then
     why=$(head -n 1 "$d/contain.err")
-    P+=("cannot contain the gate, so not running it: ${CONTAIN[*]} sh: exit $rc, inside it printed '$got' (want '$want'): ${why:-no stderr}. Unprivileged user namespaces are needed; enabling them needs root and is the owner's call.")
+    P+=("cannot contain the gate, so not running it: ${CONTAIN[*]:0:8} sh: exit $rc, inside it printed '$got' (want '$want'): ${why:-no stderr}. Unprivileged user namespaces are needed; enabling them needs root and is the owner's call.")
   fi
 }
 container_check
@@ -362,6 +441,16 @@ printf 'fresh-gate: checks passed (%d files hashed in %d.%02d s)\n' "${#hp[@]}" 
 [ "$eol" -eq 0 ] || echo "fresh-gate: $eol file(s) matched through their eol conversion"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/nv3-target/fresh-${commit:0:12}}
 mkdir "$d/tmp"
+# The gate container's masks (the runner's mask_env, mirrored for the gate): the
+# registry, cargo's git cache and the target dir under $HOME stay writable, the
+# runtime dir and ~/.ssh are hidden, and the checkout ($d/wt, outside $HOME)
+# needs no exception. The setup shell skips a missing directory, so the target
+# dir is created here first, as the runner creates its per-card one.
+mkdir -p -- "$CARGO_TARGET_DIR" "$d/tmp/nv3-alt"
+export NV3_HIDE="/run/user/$(id -u) $HOME/.ssh"
+export NV3_RO=""
+export NV3_RW="$CARGO_TARGET_DIR $HOME/.cargo/registry $HOME/.cargo/git"
+export NV3_UNSHARE="$UNSHARE" NV3_MOUNT="$MOUNT" NV3_UMOUNT="$UMOUNT" NV3_UID="$(id -u)" NV3_GID="$(id -g)"
 rc=0
 gate_running=1
 TMPDIR=$d/tmp "${CONTAIN[@]}" /bin/sh -c ': >"$1" && cd nucleus/v3 && bash scripts/gate.sh' fresh-gate "$d/contained" || rc=$?
