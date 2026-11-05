@@ -1013,12 +1013,49 @@ def parse_tokens(log_path):
 
 
 def kill_child(proc):
-    """Kill opencode and everything it started (its bash tool's git and cargo),
-    then reap it: a process that outlives the kill can still commit."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    """Kill opencode's process group, then reap opencode.
+
+    This reaches only children still in opencode's group. It does not contain
+    real opencode's tool shells: opencode 2.2.5 starts each shell command
+    detached, in a new session, so those commands and anything they background
+    escape this kill, on a normal exit and on the silence, timeout and SIGTERM
+    paths alike. Measured in verdict X-6-F1-F1-F2: a forge in a tool shell landed
+    after the group kill. The later checks catch an escaped commit only if it
+    lands before the end record; one landing after it is trusted by a --keep run
+    and by merge-card.sh. Real containment is card X-6-F1-F1-F2-F1.
+
+    Called after every attempt, including one where opencode exited by itself,
+    because a same-group background child keeps the group alive after opencode
+    exits and could commit during acceptance or after the end record. Safe on a
+    child that already exited: the group outlives its reaped leader while any
+    member is alive, ESRCH means it is already empty, and `wait()` on a reaped
+    child returns at once.
+
+    Idempotent per child. Once the leader is reaped and the group has emptied,
+    its pid can become an unrelated job's pgid. main()'s finally runs after the
+    acceptance commands, up to 60 minutes per command, so a second killpg there
+    could SIGKILL that job. So the first call marks the Popen, before killpg,
+    and a later call skips killpg once the leader has been reaped. A leader
+    still alive pins its pid, so that call kills again rather than wait forever
+    on a child a signal kept this function from killing.
+
+    Residual: the else branch's first call follows its poll()'s reap at once, so
+    a wrong kill there needs a full pid wrap within microseconds."""
+    if not getattr(proc, "group_killed", False) or proc.poll() is None:
+        proc.group_killed = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # ESRCH: the group is already empty
+        # PermissionError is deliberately not caught. EPERM means no member of
+        # the group may be signalled: a pgid reused by another user's process,
+        # or (by kernel semantics, not run here) a group whose only remaining
+        # members run as another uid, like a backgrounded sudo. Neither is ours
+        # to ignore. The run crashes with pass unset. After a normal exit the
+        # mark makes the finally's call skip killpg, so the end record is still
+        # written. If opencode itself is alive the finally's call raises again
+        # and no end record is written: the range stays open, which counts every
+        # later commit as a worker's, so that also fails closed.
     proc.wait()
 
 
@@ -1206,6 +1243,11 @@ def main():
                             failure = f"opencode run killed: timed out after {ATTEMPT_S // 60} minutes or disk nearly full"
                             break
                     else:
+                        # opencode exited by itself, but a child it backgrounded
+                        # may still be running in its group: kill the group before
+                        # anything reads the branch. Real tool shells are not in
+                        # this group; see kill_child.
+                        kill_child(child)
                         finished = True
                 if finished or killed:
                     break
@@ -1287,7 +1329,9 @@ def main():
         # outlives the runner keeps committing after the end record.
         old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        if child is not None and child.poll() is None:
+        # Whether or not opencode itself is alive: its group may not be empty.
+        # kill_child skips killpg if it already killed this child's group.
+        if child is not None:
             kill_child(child)
         _, head = run(["git", "rev-parse", "HEAD"], wt)
         head = head.strip()
