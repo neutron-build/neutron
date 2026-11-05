@@ -252,7 +252,7 @@ Each of these holds the gate from its first page mutation to its last. The check
 **`write_guard(frame)`** is the only way to mutate a page.
 - **When it copies.** It copies only if the frame's content epoch `< e`, **and** that content is not yet at a slot the image map references (the page is dirty with respect to image `k`). In that case it first copies the bytes into an **epoch-copy frame**, which belongs to the checkpointer.
 - **After the call,** the frame's content epoch is `e`.
-- **Reserve.** Epoch copies come from the `R_EPOCH` reserve. When the reserve is exhausted, `write_guard` dirty-evicts the oldest epoch copy (§5.2, recorded in the image map) and reuses its frame. Checkpoints therefore never need memory proportional to the dirty set.
+- **Reserve.** Epoch copies come from the `R_EPOCH` reserve. When the reserve is exhausted, `write_guard` dirty-evicts the oldest epoch copy (§5.2, recorded in the image map) and reuses its frame. `write_guard` claims the oldest copy's frame under the frame's latch, so two writers never evict the same copy, and the copy's install is under the latch of the page it preserves. Checkpoints therefore never need memory proportional to the dirty set. Mutant **EXHAUST-DOUBLE-EVICT**: two writers evict one copy, and the second clears the frame the first refilled. Test `t_epoch_reserve_two_exhausters` (A-3c): two first touches exhaust the reserve together; both copies reach the image.
 
 ### 5.7 Store memory outside the pool
 These consumers do **not** grow with the version count or with retention. Each is accounted separately to R-1 (per-consumer accounting, X-4 R2 item 2):
@@ -900,6 +900,8 @@ Mutant **CKPT-SYNC-OVER-HOLE**: step 1 ends when the latest batch's sync complet
     So `n + extra ≤ g` unless `next_lpid` exceeds `slot_count` by orders of magnitude.
   - **Convergence: the check.** The checkpointer still checks `r + extra ≤ g` after the growth. If the check fails, it grows again and repeats the check. Each further growth places at least `g − extra > 0` of the outstanding pages, so the repetition ends.
   - Growth does not change `next_lpid`, because FreeSet pages are physically addressed.
+
+Step 2's data phase ends only when no epoch-`k` content is outstanding: it waits on a latched frame (§5.6's claim and install).
 
 Pages created or mutated only after the flip are not part of the image.
 
