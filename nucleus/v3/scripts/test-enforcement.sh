@@ -3512,7 +3512,8 @@ if os.environ.get("E2E_ACCEPT_S"):
     rc.ACCEPT_S = float(os.environ["E2E_ACCEPT_S"])
 if os.environ.get("E2E_SIGTERM_ON"):
     def watch(on=pathlib.Path(os.environ["E2E_SIGTERM_ON"])):
-        while not on.exists():
+        # Not just exists(): the shell creates .forgeid before ps has written to it.
+        while not (on.exists() and on.stat().st_size):
             time.sleep(0.02)
         os.kill(os.getpid(), signal.SIGTERM)
     threading.Thread(target=watch, daemon=True).start()
