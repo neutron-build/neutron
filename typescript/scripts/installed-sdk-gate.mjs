@@ -45,7 +45,7 @@ function pack(which){
   const nucleusVersion=JSON.parse(readFileSync(path.join(REPO,'typescript/packages/neutron-nucleus/package.json'),'utf8')).version;
   assert.equal(packed.peerDependencies['@neutron-build/nucleus'],'^'+nucleusVersion);
   for(const name of Object.keys(packed.peerDependencies))assert.equal(packed.peerDependenciesMeta[name].optional,true);
-  assert.equal(packed.peerDependencies['drizzle-orm'],'^0.44.5');
+  assert.equal(packed.peerDependencies['drizzle-orm'],'^0.45.2');
   assert.equal(packed.peerDependencies.postgres,'^3.4.7');
   const ownDecl=run('tar',['-xzOf',tgz,'package/dist/db/drizzle.d.ts'],work);
   assert.ok(!ownDecl.includes('from "@libsql/client"'),'own optional SQLite driver declaration leak');
