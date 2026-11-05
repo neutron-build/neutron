@@ -117,7 +117,7 @@ try{
   const base=check('clean data optional peers absent install',()=>consumer('data-base',{'@neutron-build/data':'file:'+tarballs.data.file,'@types/node':'22.10.7'}));
   check('data root strict declarations without optional peers',()=>types(base,fixture(base,'data-root-consumer.ts')));
   check('data optional peer absence/runtime refusals',()=>runtime(base,fixture(base,'data-optional.mjs')));
-  const deps={'@neutron-build/data':'file:'+tarballs.data.file,postgres:'3.4.8','drizzle-orm':'0.44.7','@libsql/client':'0.17.0','@types/node':'22.10.7'};
+  const deps={'@neutron-build/data':'file:'+tarballs.data.file,postgres:'3.4.8','drizzle-orm':'0.45.2','@libsql/client':'0.17.0','@types/node':'22.10.7'};
   const sql=check('clean data SQL installed peer profile',()=>consumer('data-sql',deps));
   cpSync(path.join(REPO,'typescript/packages/neutron-data/types.consumer/consumer-types.ts'),path.join(sql,'consumer.ts'));
   check('data typed Drizzle application declarations',()=>types(sql,'consumer.ts',{skipLibCheck:true}));
