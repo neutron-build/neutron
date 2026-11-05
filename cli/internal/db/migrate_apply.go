@@ -2326,9 +2326,15 @@ func ExecStatementsPipelined(ctx context.Context, conn *pgconn.PgConn, stmts []s
 			res, err := p.GetResults()
 			switch r := res.(type) {
 			case *pgconn.ResultReader:
-				_, err = r.Close()
+				// A failed statement comes back as a nil *ResultReader with
+				// the error set, not as an untyped nil.
+				if r != nil {
+					_, err = r.Close()
+				}
 			case *pgconn.PipelineSync:
-				break drain
+				if err == nil {
+					break drain
+				}
 			case nil:
 				if err == nil {
 					break drain
