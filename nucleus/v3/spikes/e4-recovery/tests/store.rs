@@ -6482,6 +6482,106 @@ fn drop_last_step_pins_body(seed: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// **X-5c-F4-F1-F1-CXX rework 5 (the one hold; the REWORK verdict's
+/// finding 3, first rule): a flip that waits for "entry absent, root
+/// mapped" must never find it.** The last step removes the directory
+/// entry and frees the path inside **one** gate hold; the transient
+/// state between the entry's removal and the root's free (nothing
+/// names the root, the map still holds it) exists only while the
+/// dropper holds the gate, so a flip — which needs the gate exclusive
+/// and drains every holder first — can never cut there. A checker
+/// that asserts, at each of its steps, the flip's own opportunity
+/// (the straddle state **and** the gate free: `holders == 0`, not
+/// exclusive, no flip pending) therefore never fires. G3 (the gate
+/// released and re-taken between the entry removal and the frees —
+/// the frees in a second hold) opens exactly that window: the flip
+/// finds the straddle with the gate free, and the pin fails. Seed 5
+/// is the literal (the scan's first failures: 4, 5, 7, 8, … — 105 of
+/// 1..=200 fail under the hand-applied G3, and 0 clean).
+#[test]
+fn drop_one_hold_the_flip_never_finds_the_straddle() {
+    drop_one_hold_body(5).expect("the one hold shields the straddle");
+}
+
+fn drop_one_hold_body(seed: u64) -> Result<(), String> {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // Phase A: tree 2, a leaf root with one durably checkpointed
+    // entry — the drop's first walk step is the last step.
+    let (disk, st, root2) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        tree::dir_create_tree(&cx, 2).unwrap_or_else(|e| panic!("CreateTree 2: {e:?}"));
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2)
+    };
+    // Phase B: the dropper (t1) and the flip (t2). The flip task
+    // spins at yield granularity; each of its steps checks, in one
+    // atomic step, whether a flip that started now would cut the
+    // straddle: the entry gone (in-memory `dir`, which lags the
+    // persisted removal never — the persisted leaf is rewritten
+    // first), the root still mapped (in `map.cur` or a resident
+    // frame), and the gate free. Finding it is the violation; after
+    // the drop completes the flip runs for real (a clean cut).
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                loop {
+                    cx.yield_now("straddle:spin").map_err(fail_of)?;
+                    let hit = cx
+                        .with("straddle:chk", |c| {
+                            let st = c.store();
+                            let mapped = st.map.cur.contains_key(&root2)
+                                || st
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root2 && !f.is_epoch_copy);
+                            let entry_gone = !st.dir.contains_key(&2);
+                            let gate_free =
+                                st.gate.holders == 0 && !st.gate.exclusive && !st.gate.flip_pending;
+                            Ok(entry_gone && mapped && gate_free)
+                        })
+                        .map_err(fail_of)?;
+                    if hit {
+                        panic!(
+                            "seed {seed}: the flip found the straddle: entry absent, root {root2} mapped, gate free"
+                        );
+                    }
+                    if flag(sched, "d_done") {
+                        break;
+                    }
+                }
+                ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                set_flag(sched, "ckpt1");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the one-hold straddle schedule");
+    if !flag(&sched, "d_done") {
+        return Err(format!("seed {seed}: the drop never completed"));
+    }
+    if !flag(&sched, "ckpt1") {
+        return Err(format!("seed {seed}: the checkpoint never ran"));
+    }
+    Ok(())
+}
+
 /// **X-5c-F4-F1-F1-CXX Work 3 (§14 step 4, as amended by S-1-F7): a
 /// replayed drop leaves its pages mapped until step 6.** Pass 2's
 /// `DropTree` sets `dropping` only — it runs no walk; the walk is step
