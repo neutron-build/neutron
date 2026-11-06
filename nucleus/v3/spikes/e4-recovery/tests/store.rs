@@ -6140,6 +6140,24 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
         };
         (d, s, roots)
     };
+    // The phase-A baseline of "used but unreferenced" slots (the
+    // store's own structural pages — the map radix's, the free set's,
+    // the directory's — sit in `used_cur` outside `map.cur`): the
+    // world below must not add to it. That is exactly the orphan's
+    // signature: a slot the exhausted path's write-out allocated and
+    // then failed to release (G2) is new, and nothing else allocates
+    // without referencing in the same step.
+    let baseline_unreferenced: Vec<u64> = {
+        let mut referenced = st.slots.image_refs.clone();
+        referenced.extend(st.slots.used_durable.iter().copied());
+        referenced.extend(st.map.cur.values().map(|r| r.slot));
+        st.slots
+            .used_cur
+            .iter()
+            .filter(|s| !referenced.contains(*s))
+            .copied()
+            .collect()
+    };
     let root_p = roots[10];
     let root_l1 = roots[11];
     let root_l2 = roots[12];
@@ -6234,6 +6252,44 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
             "seed {seed}: the image left an exhausting LPID unmapped (l1={l1_map} l2={l2_map})"
         ));
     }
+    // ---- rework 6: the orphan's slot left `used_cur`. At world end
+    // (both mutators done, the checkpoint complete) the used-but-
+    // unreferenced slots are exactly phase A's baseline plus slot 5 —
+    // a stale flip-window write-out of a live page, pinned in
+    // `image_refs` while the window was open and left in `used_cur`
+    // when post-5 cleared the pins (measured, deterministic at this
+    // seed). The exhausted path's orphaned write-out must leave **no**
+    // such slot: its allocation was never referenced by anything, and
+    // under G2 (the release removed) exactly one more appears — slot
+    // 13 at this seed, the write-out of the copy the first task had
+    // already recorded — leaking until the next open.
+    let g = sched.lock();
+    let mut referenced = g.st.slots.image_refs.clone();
+    referenced.extend(g.st.slots.used_durable.iter().copied());
+    referenced.extend(g.st.map.cur.values().map(|r| r.slot));
+    let orphaned_end: Vec<u64> = g
+        .st
+        .slots
+        .used_cur
+        .iter()
+        .filter(|s| !referenced.contains(*s))
+        .copied()
+        .collect();
+    drop(g);
+    let mut want_unreferenced = baseline_unreferenced.clone();
+    want_unreferenced.push(5);
+    want_unreferenced.sort_unstable();
+    if orphaned_end != want_unreferenced {
+        let new_orphans: Vec<u64> = orphaned_end
+            .iter()
+            .filter(|s| !want_unreferenced.contains(s))
+            .copied()
+            .collect();
+        return Err(format!(
+            "seed {seed}: slots {new_orphans:?} entered used_cur referenced by nothing - the \
+             exhausted path's orphaned write-out must release its slot (Work 1, G2)"
+        ));
+    }
     // ---- the reopen: image 1 holds each exhausting page's flip cut.
     let g = sched.lock();
     let mut disk_after = g.disk.clone();
@@ -6271,7 +6327,12 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
 }
 
 /// Pin 3: a one-frame-exhausted reserve and two first touches in
-/// `write_fresh` — both copies must reach the image.
+/// `write_fresh` — both copies must reach the image, and (rework 6)
+/// the orphaned write-out's slot must have left `used_cur`: at world
+/// end the used-but-unreferenced slots are exactly the phase-A
+/// baseline plus the one stale flip-window write-out (slot 5),
+/// nothing more — G2 (the release removed) leaks the orphan's slot
+/// (13 at this seed) and fails the pin.
 #[test]
 fn exhausted_reserve_keeps_both_copies() {
     exhausted_reserve_body(1).expect("pin 3");
