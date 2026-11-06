@@ -6267,14 +6267,13 @@ fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
     let mut referenced = g.st.slots.image_refs.clone();
     referenced.extend(g.st.slots.used_durable.iter().copied());
     referenced.extend(g.st.map.cur.values().map(|r| r.slot));
-    let orphaned_end: Vec<u64> = g
-        .st
-        .slots
-        .used_cur
-        .iter()
-        .filter(|s| !referenced.contains(*s))
-        .copied()
-        .collect();
+    let orphaned_end: Vec<u64> =
+        g.st.slots
+            .used_cur
+            .iter()
+            .filter(|s| !referenced.contains(*s))
+            .copied()
+            .collect();
     drop(g);
     let mut want_unreferenced = baseline_unreferenced.clone();
     want_unreferenced.push(5);
