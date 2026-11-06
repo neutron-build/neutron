@@ -6068,15 +6068,18 @@ fn drop_cut_body_m(seed: u64, reuse: bool, m: Option<Mutant>) -> Result<(), Stri
         // must not have freed the page the split reused. The image
         // holds the flip-time cut, so the ninth and tenth cells may or
         // may not be in it — but the eight phase-A cells were durably
-        // checkpointed before the world began and must all read back.
+        // checkpointed before the world began and must all read back
+        // (rework 7: the assertion matches this comment — eight cells,
+        // not nine; the ninth is the pre-positioned insert above the
+        // flip's cut, unlogged at the image).
         let scan = tree::tree_scan(&cx2, root4, 1000).map_err(|e| {
             format!("seed {seed}: tree 4 scan after recovery: {e:?} (a reused page was freed)")
         })?;
         let n = scan.len();
-        if n < 9 {
-            return Err(format!("seed {seed}: tree 4 lost durable pages: {n} of 9"));
+        if n < 8 {
+            return Err(format!("seed {seed}: tree 4 lost durable pages: {n} of 8"));
         }
-        for i in 0..9u64 {
+        for i in 0..8u64 {
             if !scan.contains_key(i.to_be_bytes().as_slice()) {
                 return Err(format!("seed {seed}: tree 4 lost durable key {i}"));
             }
