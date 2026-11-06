@@ -1171,16 +1171,22 @@ pub fn dir_load<H: StoreHost>(
 /// `dropping`, free the tree's pages bottom-up in bounded gated steps
 /// (the root last), and — in the **last step's own gate hold** — remove
 /// the directory entry and the in-memory `dir` record **first**, then
-/// free the emptied path top-down, root first. Entry first is what
-/// keeps every image closed: an image cut between the root free and the
-/// entry removal would hold `dropping tree → root` with the root
-/// unmapped (an open refuses it) or reused by another tree (a resumed
-/// walk frees a live page) — the two straddles of the 27 A rounds
-/// (310 r0, 8010 r1; M-DROP-ENTRY-SPLIT is today's split code). The two
-/// mutexes (the tree's and the directory's) are never nested and the
-/// gate is never taken twice. DROP-ROOT-FIRST frees the root
-/// immediately instead (the mutant's leak: amcheck's LPID exactness
-/// fails).
+/// free the emptied path top-down, root first. The last step's
+/// `PinGuard` — the root and every page the step empties, noted before
+/// its first mutation — stays live across the whole hold, through the
+/// frees (§6.8 step 3): dropped at the step's edge, the root's dirty
+/// frame was a legal eviction victim during the directory descent's
+/// I/O, and `evict:finish` resurrected the freed root into `map.cur`
+/// (mapped and free, referenced by nothing — 444 r1 and 3005 r1 of the
+/// rework verdict's scan). Entry first is what keeps every image
+/// closed: an image cut between the root free and the entry removal
+/// would hold `dropping tree → root` with the root unmapped (an open
+/// refuses it) or reused by another tree (a resumed walk frees a live
+/// page) — the two straddles of the 27 A rounds (310 r0, 8010 r1;
+/// M-DROP-ENTRY-SPLIT is today's split code). The two mutexes (the
+/// tree's and the directory's) are never nested and the gate is never
+/// taken twice. DROP-ROOT-FIRST frees the root immediately instead
+/// (the mutant's leak: amcheck's LPID exactness fails).
 pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail> {
     let entry = cx.with("drop:entry", |c| Ok(c.store().dir.get(&id).copied()))?;
     let Some(entry) = entry else {
@@ -1228,9 +1234,9 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
         }
         let mut pins = PinGuard::new(cx);
         let walk = drop_walk_step(cx, &mut pins, root);
-        drop(pins);
         match walk {
             Ok(WalkOut::Stepped) => {
+                drop(pins);
                 tree_unlock(cx, id);
                 gate_release(cx);
             }
@@ -1238,6 +1244,7 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
                 if entry_split {
                     // The mutant: free now, remove the entry in its own
                     // gate hold below (bottom-up, today's order).
+                    drop(pins);
                     let mut fr = Ok(());
                     for lpid in path.iter().rev() {
                         if let Err(e2) = free_lpid(cx, *lpid) {
@@ -1250,11 +1257,23 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
                     fr?;
                     break;
                 }
-                // **The last step (§6.8 as amended): entry first, then
-                // the free, in this one gate hold.** The tree mutex is
-                // released before the directory descent and re-taken
-                // for the frees — never nested, the gate never taken
-                // twice.
+                // **The last step (§6.8 step 3, as amended by S-1-F7;
+                // rework finding 1 of verdict X-5c-F4-F1-F1-CXX): entry
+                // first, then the free, in this one gate hold — and the
+                // step's `PinGuard` stays live across the whole hold.**
+                // The walk pinned the root and every page it empties
+                // before its first mutation; releasing the pins at the
+                // step's edge left the root's dirty frame a legal
+                // eviction victim during the directory descent's I/O:
+                // the evictor latches it, `free_lpid` clears the frame
+                // and hands the LPID to the free set, and `evict:finish`
+                // re-inserts the freed root into `map.cur` — mapped and
+                // free, referenced by nothing (444 r1 and 3005 r1, the
+                // census's blind spot). Held through the frees, the
+                // frame is not evictable and the frees themselves see
+                // the frames they clear. The tree mutex is released
+                // before the directory descent and re-taken for the
+                // frees — never nested, the gate never taken twice.
                 tree_unlock(cx, id);
                 let rm = dir_remove_entry_held(cx, id).and_then(|()| {
                     cx.with("drop:rm", |c| {
@@ -1263,10 +1282,12 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
                     })
                 });
                 if let Err(e2) = rm {
+                    drop(pins);
                     gate_release(cx);
                     return Err(e2);
                 }
                 if let Err(e2) = tree_lock(cx, id) {
+                    drop(pins);
                     gate_release(cx);
                     return Err(e2);
                 }
@@ -1279,12 +1300,14 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
                         break;
                     }
                 }
+                drop(pins);
                 tree_unlock(cx, id);
                 gate_release(cx);
                 fr?;
                 return Ok(true);
             }
             Err(e2) => {
+                drop(pins);
                 tree_unlock(cx, id);
                 gate_release(cx);
                 return Err(e2);
