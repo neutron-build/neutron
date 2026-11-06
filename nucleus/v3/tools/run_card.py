@@ -50,17 +50,19 @@ outside. A namespace contains processes, not their effects, so the container als
 same-uid worker could reach outside it (X-6-F1-F1-F2-F1-F2): the runtime dir /run/user/<uid> (the user
 manager's bus: `systemd-run --user` from inside cannot reach it, measured by a connect-only probe),
 ~/.ssh and cards/logs are covered read-only or hidden, $HOME is read-only with the worktree, the
-common git dir's object and ref stores (objects/, refs/, logs/), the worktree's own gitdir,
-TARGET_DIR/<id>, ~/.cargo/registry, ~/.cargo/git, opencode's data dir and the per-run TMPDIR bound
-back writable (rework R2: a whole writable common git dir ran worker-planted config filters, a
+common git dir's object and card-ref stores (objects/, refs/heads/card/, logs/), the worktree's own
+gitdir, TARGET_DIR/<id>, ~/.cargo/registry, ~/.cargo/git, opencode's data dir and the per-run TMPDIR
+bound back writable (rework R2: a whole writable common git dir ran worker-planted config filters, a
 post-checkout hook and a repointed .git file in this runner's own git, outside every container; only
-objects, refs and logs stay writable now — a commit still lands — and the worktree's .git gitfile,
+objects, refs/heads/card and logs stay writable now — a commit still lands, and no ref outside the
+card branches' directory can be written from inside (rework R7) — and the worktree's .git gitfile,
 its gitdir's commondir and gitdir files, and opencode's bin, whose rg an uncontained opencode would
 run, are bound read-only after the writable loop). The setup shell re-enters its cwd (cd -P) after
 the masks, so the inherited cwd cannot stay on the mount underneath the read-only bind of $HOME and
 write through it with .. (rework R1: a passing Acceptance line wrote ~/.cache that way). The named
 costs of the allow-list: `git branch -D` (packed-refs.lock) and `git worktree add` from inside a
-container fail, loudly. A `Container: podman` card line opts one card out of the
+container fail, loudly, and since rework R7 so does every ref write outside refs/heads/card. A
+`Container: podman` card line opts one card out of the
 runtime-dir mask only (the owner's approval is podman-only), and the run's output says so. The
 runner's own `unshare` and `git` (and the setup shell's `mount`) are absolute paths from
 os.confstr("CS_PATH"), never PATH, so a file planted in a PATH directory cannot switch containment off
@@ -76,8 +78,15 @@ verdict X-6-F1-F1-F2-F1-F2 residuals); abstract unix sockets, which live
 in the shared network namespace (measured: names under /proc/net/unix answer or refuse on their own,
 one X socket answered); /tmp and every path not under $HOME or /run/user/<uid> (same-uid files there
 stay as they are); the system instance's sockets under /run/systemd (its bus refuses a non-root peer);
-refs and objects in the common git dir, every branch included, which the existing scope, ref and
-object checks judge afterwards (rework R2 leaves this open on purpose: a commit must land); and
+objects in the common git dir and refs under refs/heads/card — the card branches' directory,
+created runner-side when every card ref is packed, so a worker's commit still lands — which the
+existing scope, ref and object checks judge afterwards (rework R2 leaves the object store open on
+purpose: a commit must land), though other card/* branches under it stay writable, a spoil another
+card's run answers for with its pinned verdict commit ids, not a code run here; every other ref,
+the scaffold's and refs/heads/main included, is read-only inside (rework R7: a writable refs/ let a
+worker fast-forward nucleus/v3-scaffold to its own commit-tree commit, pass, and point the next
+gate's fresh-checkout extract at its script, so the allow-list names the card branches' directory,
+not refs); and
 ~/.cargo/registry, a planting route the card itself mandated (measured in a private CARGO_HOME: a
 build.rs dropped into an extracted crate runs under any cargo build outside a container; closing it
 is the owner's call). The
@@ -180,8 +189,11 @@ ACCEPT_S = 60 * 60  # one Acceptance command running this long: end its containe
 # runner through its own descriptor (the _relay thread), never by the worker.
 # The git exceptions are an allow-list (rework R2): a whole writable common git
 # dir ran worker-planted filters, hooks and a repointed .git in the runner's own
-# git, so only objects/, refs/ and logs/ plus the worktree's own gitdir are bound
-# back writable, and NV3_RO_AFTER (wt/.git, its gitdir's commondir and gitdir
+# git, so only objects/, logs/ and refs/heads/card — the card branches'
+# directory, not refs/ (rework R7: a writable refs/ let a worker fast-forward
+# the scaffold and point the next gate's extract at its own commit) — plus the
+# worktree's own gitdir are bound back writable, and NV3_RO_AFTER (wt/.git, its
+# gitdir's commondir and gitdir
 # files, opencode's bin) is bound read-only after the writable loop — a later
 # bind stacks on top, so it narrows the exceptions instead of being covered by
 # them, and `test -e` (not -d) admits the .git gitfile, a file.
@@ -412,7 +424,9 @@ OPENCODE_CONFIG = {
         # The post-hoc scope check, which diffs against the tree as it was before the
         # run, catches the file edits. The post-hoc ref check (ref_violations) catches
         # every write of a ref that carries this run's commits or is protected,
-        # whatever the spelling.
+        # whatever the spelling. The container's mask (rework R7) already refuses ref
+        # writes outside refs/heads/card from inside; ref_violations still judges the
+        # card/* branches the mask leaves writable and every write made outside one.
         "bash": {
             "*": "allow",
             **{
@@ -1200,7 +1214,11 @@ def ref_violations(wt, before, branch, pre_head):
     This closes the accidental and rationalised ref writes and the plain verbs.
     A worker with a shell can still write a ref that is neither attributable nor
     protected (a non-fast-forward of another card branch, made at a commit it did
-    not make). Any git failure is one entry naming the command, never a pass.
+    not make); since rework R7 the container's mask refuses ref writes outside
+    refs/heads/card outright, so what is left for these rules is the mask's own
+    card/* directory and every write made outside a container (concurrent
+    automation included). Any git failure is one entry naming the command, never
+    a pass.
 
     The rules read ancestry through commit objects, and a forged one can bend
     it (X-6-F1-F2-F3-F1 Finding 2). A range's excluded side is computed through
@@ -1326,6 +1344,31 @@ def git_dirs(wt):
     return _GIT_DIRS[wt]
 
 
+def ensure_card_ref_dir(wt):
+    """Create the card branches' ref directory, <common>/refs/heads/card, when it
+    is missing, and return it; None when wt names no repository (git_dirs) or
+    the directory cannot be made.
+
+    The container's writable exception names this directory, not refs/
+    (X-6-F1-F1-F2-F1-F2 rework R7), and a mask never binds a directory that does
+    not exist: the setup shell skips it, and every commit inside the container
+    would fail on the read-only bind, loudly. The directory is missing exactly
+    when every card ref is packed (`git pack-refs --all` prunes it, measured),
+    and no shipped script packs refs mid-run, so main() creates it once, before
+    the first container, for the same reason it creates TARGET_DIR/<id>. A
+    failure to create it changes nothing: the bind is skipped and the worker's
+    first commit refuses, never an unmasked run."""
+    common, _ = git_dirs(wt)
+    if common is None:
+        return None
+    ref_dir = pathlib.Path(common) / "refs" / "heads" / "card"
+    try:
+        ref_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return ref_dir
+
+
 def mask_env(env, cwd=None, keep_runtime=False):
     """env plus the NV3_* variables CONTAIN_SETUP reads: what to hide under an
     empty tmpfs, what to bind read-only, which directories to bind back writable
@@ -1338,12 +1381,17 @@ def mask_env(env, cwd=None, keep_runtime=False):
     podman` card's opt-in (Work 5); ~/.ssh stays hidden either way.
 
     The git exceptions are an allow-list (rework R2): only the common git dir's
-    objects/, refs/ and logs/ and the worktree's own gitdir are bound writable
-    (a commit still lands), while wt/.git, that gitdir's commondir and gitdir
-    files, and opencode's bin (whose rg an uncontained opencode would run) go
-    into NV3_RO_AFTER, which the setup applies after the writable loop so the
-    read-only binds stack on top of the exceptions. Missing paths are skipped
-    by the setup shell (test -e), so a checkout without them still runs."""
+    objects/, logs/ and refs/heads/card (rework R7: the card branches'
+    directory alone — a whole writable refs/ let a worker fast-forward the
+    scaffold and point the next gate's extract at its own commit) and the
+    worktree's own gitdir are bound writable (a commit still lands), while
+    wt/.git, that gitdir's commondir and gitdir files, and opencode's bin
+    (whose rg an uncontained opencode would run) go into NV3_RO_AFTER, which the
+    setup applies after the writable loop so the read-only binds stack on top of
+    the exceptions. Missing paths are skipped by the setup shell (test -e), so a
+    checkout without them still runs; refs/heads/card is created runner-side by
+    ensure_card_ref_dir (main) when every card ref is packed, for the same
+    reason."""
     hide = [pathlib.Path.home() / ".ssh"]
     if not keep_runtime:
         hide.insert(0, pathlib.Path(f"/run/user/{os.getuid()}"))
@@ -1354,7 +1402,9 @@ def mask_env(env, cwd=None, keep_runtime=False):
         rw.append(wt)
         common, gitdir = git_dirs(wt)
         if common is not None:
-            rw += [p for p in (pathlib.Path(common) / n for n in ("objects", "refs", "logs")) if p.is_dir()]
+            # refs/heads/card alone (rework R7), never refs/: every other ref,
+            # the scaffold's included, stays read-only inside the container.
+            rw += [p for p in (pathlib.Path(common) / n for n in ("objects", "refs/heads/card", "logs")) if p.is_dir()]
         if gitdir is not None and gitdir != common:
             rw.append(pathlib.Path(gitdir))
         if (wt / ".git").exists():
@@ -1696,13 +1746,30 @@ def main():
     # The container binds TARGET_DIR/<card_id> back writable, and a mask never
     # binds a directory that does not exist, so it is created here, runner-side,
     # before the first attempt (a fresh host would otherwise fail every build
-    # inside the container with EROFS on its first run).
+    # inside the container with EROFS on its first run). refs/heads/card, the
+    # one writable part of the ref store (rework R7), is created for the same
+    # reason: it is missing when every card ref is packed.
     TARGET_DIR.mkdir(parents=True, exist_ok=True)
     (TARGET_DIR / card_id).mkdir(exist_ok=True)
-    # --keep resumes unfinished work, which need not be formatted yet
-    rc, out = (0, "") if args.keep else run("cd nucleus/v3 && cargo fmt --all -- --check", wt, env=env)
-    if rc:
-        sys.exit("preflight: base is not rustfmt-clean; fix it before issuing a card\n" + out[-800:])
+    ensure_card_ref_dir(wt)
+    # --keep resumes unfinished work, which need not be formatted yet. The
+    # pre-flight runs in a container (rework R8): its checkout is the base's,
+    # and a base a worker can reach is not trusted — measured with the real
+    # cargo, a committed nucleus/v3/.cargo/config.toml with `[alias]
+    # fmt = "test --all --"` turned `cargo fmt --all -- --check` into a test
+    # run, whose build phase ran the base's build.rs in this runner's pid
+    # namespace. Contained, the same alias runs inside and the refusal below
+    # stops the run; a timeout is the same refusal, never an uncontained retry.
+    if args.keep:
+        rc, out = 0, ""
+    else:
+        pf = spawn_contained(["/bin/sh", "-c", "cd nucleus/v3 && cargo fmt --all -- --check"], wt, git_env(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            rc, out = finish_contained(pf, ACCEPT_S)
+        except subprocess.TimeoutExpired:
+            sys.exit(f"preflight: cargo fmt did not finish in {ACCEPT_S // 60} min (contained); fix the base before issuing a card")
+        if rc:
+            sys.exit("preflight: base is not rustfmt-clean; fix it before issuing a card\n" + out[-800:])
 
     wt_cards = wt / "nucleus/v3/cards"
     wt_cards.mkdir(parents=True, exist_ok=True)
