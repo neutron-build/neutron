@@ -2898,6 +2898,11 @@ A
     # the no-container premise leaves nothing behind.
     hbforge) setsid bash -c 'for _ in {1..200}; do date +%s%N >"$1.hb"; sleep 0.05; done' _ "$FAKE_OC_N" >/dev/null 2>&1 &
       for _ in {1..100}; do [ -s "$FAKE_OC_N.hb" ] && break; sleep 0.05; done ;;
+    # More output than one pipeful, ending in the marker the R5 relay row reads
+    # back from the attempt log: the slow relay (e2e-relay.py) still holds the
+    # last chunk when this child exits, so only a join before the log closes
+    # lands it. The child cannot exit before the relay drained the pipe.
+    burst) for i in $(seq 1 20000); do echo "burst $i"; done; echo RELAY-LAST-MARKER ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -3665,6 +3670,37 @@ expect_ok "runner e2e: ACC: the TMPDIR run passes" res XTM "rc == 0 and r['pass'
 E2E_NO_OUTPUT_S=3 e2e XTR "tmprec mute" --attempts 1
 rm -f "$e/XTR.n.pid"
 expect_ok "runner e2e: ACC: each opencode start gets its own TMPDIR, the killed ones gone too" tmps_all XTR 3
+# R5 (rework): the relay's join must happen while the attempt log is still open.
+# The join used to sit after the `with` that owns the log, so it closed the file
+# first and a relay still holding bytes wrote them into a closed file (ValueError,
+# swallowed, lost). The seam below (like the killpg one) swaps in a relay that
+# sleeps between its read and its write: the burst child — larger than one
+# pipeful, so it exits only once the relay drained every chunk — is gone and the
+# runner has reached the end of the `with` while the last chunk is still pending,
+# with the join the only thing that can let the file hold it.
+cat >"$t/slowrelay.py" <<'R'
+import os, time
+
+
+def patch(rc):
+    def slow_relay(child, fh):
+        while True:
+            b = os.read(child.stdout.fileno(), 65536)
+            if not b:
+                break
+            time.sleep(1.2)
+            fh.write(b)
+            fh.flush()
+
+    rc._relay = slow_relay
+R
+sed '/^rc.ATTEMPT_S, rc.POLL_S = 60, 0.1$/a import slowrelay; slowrelay.patch(rc)' "$t/e2e.py" >"$t/e2e-relay.py"
+rm -f "$e/XRL.n"
+(cd "$r" && FAKE_OC="burst work" FAKE_OC_N=$e/XRL.n E2E=$e E2E_NO_OUTPUT_S=15 E2E_STALL_S=30 PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-relay.py" "$v3/tools/run_card.py" "$e/XRL" "$(ec XRL)" --base e2e/base --attempts 1) || true
+rm -f "$e/XRL.n.pid"
+relay_last() { local f=$e/cards/logs/XRL.attempt1.jsonl; echo "attempt log lines: $(grep -c '' "$f" 2>/dev/null)"; grep -qxF RELAY-LAST-MARKER "$f"; }
+expect_ok "runner e2e: ACC: a relay holding bytes when the child exits still lands them: the attempt log holds the burst marker (R5-JOIN)" relay_last
+expect_ok "runner e2e: ACC: the burst run itself passes" res XRL "rc == 0 and r['pass'] and $closed"
 # An opencode forge is dead while a line runs, seen from inside the line's container.
 acc_hb_still='a=$(cat "$FAKE_OC_N.hb"); sleep 1; [ "$a" = "$(cat "$FAKE_OC_N.hb")" ]'
 e2ea XHB "$acc_hb_still" "work hbforge" --attempts 1
@@ -3778,6 +3814,34 @@ if which == "unmask":
     print(out)
     ok = code == 0 and "ok-BAD" not in out and "direct EPERM EPERM" in out and "nested EINVAL EINVAL" in out and "leftovers []" in out
     sys.exit(0 if ok else 1)
+if which == "cwd-escape":
+    # R1 (rework): the fake home copies the real layout — the worktree two levels
+    # below $HOME, its parent no writable exception — so a relative write one
+    # level up is the verdict's escape exactly.
+    home = os.environ["MSK_T"] + "/mskcwd"
+    env = dict(os.environ, HOME=home, E2E_NS="real")
+    wt = home + "/.cache/nv3-cards/PRB"
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-cwd.sh"], wt, env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
+    print(out)
+    sys.exit(0 if code == 0 and "BAD" not in out and out.count("REFUSED") == 2 and not pathlib.Path(home, ".cache/nv3-cards/esc").exists() else 1)
+if which == "git-allow":
+    # R2 (rework): every plant of the verdict's list is refused inside the
+    # container, and the honest commit still lands (checked against the branch
+    # outside).
+    home = os.environ["MSK_HOME"]
+    env = dict(os.environ, HOME=home, E2E_NS="real")
+    rc.TARGET_DIR = pathlib.Path(os.environ["MSK_T"]) / "target"
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-git.sh"], env["MSK_WT"], env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
+    print(out)
+    repo = pathlib.Path(home, "repo")
+    tip = subprocess.run([rc.GIT, "-C", str(repo), "log", "--format=%s", "-1", "card/v3-MSK"], capture_output=True, text=True).stdout.strip()
+    cfg = subprocess.run([rc.GIT, "-C", str(repo), "config", "--get", "filter.gp.clean"], capture_output=True, text=True)
+    gitfile = pathlib.Path(home, "wt", ".git")
+    ok = (code == 0 and "WROTE-BAD" not in out and "MOVED-BAD" not in out and out.count(":refused") == 8
+          and "commit:OK" in out and tip == "nucleus v3: MSK inside commit" and cfg.returncode == 1
+          and gitfile.is_file() and not pathlib.Path(home, "wt", ".git.bak").exists()
+          and gitfile.read_text().strip() == "gitdir: " + str(pathlib.Path(home, "repo", ".git", "worktrees", "wt")))
+    sys.exit(0 if ok else 1)
 if which == "path-strip":
     # PATH without unshare, mount, umount or git: the runner resolves all of them
     # from the trusted path, so its probe answers and a real container still starts.
@@ -3799,6 +3863,122 @@ expect_ok "runner mask: the ledger dir is read-only inside a container (LOGS-WRI
 expect_ok "runner mask: neither the payload nor a nested namespace can unmask the runtime dir: EPERM, then EINVAL, nothing revealed (MASK-UNDOABLE)" msk_rc unmask
 expect_ok "runner mask: with unshare, mount, umount and git off PATH the runner still contains (no PATH lookup)" msk_rc path-strip
 expect_ok "runner mask: a container inside a masked container still masks, and refuses to plant (nesting hides further)" msk_rc nested
+# R1 (rework): the inherited cwd. Popen(cwd=wt) sets the cwd before stage 2's
+# mounts, so without the setup's cd -P the payload's cwd stays on the mount
+# underneath the read-only bind of $HOME, and .. from it reaches every directory
+# below $HOME's mountpoint that no exception covers — in the real layout the
+# worktree's parent, ~/.cache/nv3-cards, where a passing Acceptance line wrote
+# (verdict X-6-F1-F1-F2-F1-F2 R1). The fake home copies that shape and the
+# payload writes ../esc; the /proc route names the same directory through the
+# kernel's symlink, which always re-walked the mount table.
+mkdir -p "$t/mskcwd/.cache/nv3-cards/PRB"
+cat >"$t/msk-cwd.sh" <<'M'
+#!/usr/bin/env bash
+( echo x >../esc ) 2>/dev/null && echo WROTE-BAD || echo REFUSED
+( echo z >/proc/self/cwd/../esc ) 2>/dev/null && echo PROC-BAD || echo REFUSED
+M
+expect_ok "runner mask: the payload's cwd re-enters the masked view: ../ from the worktree and /proc/self/cwd/.. are both refused (R1-CWD)" msk_rc cwd-escape
+# R2 (rework): the common git dir's exception is an allow-list. The fake git
+# home mirrors the real layout — the repository and the card's linked worktree
+# both under $HOME, the worktree's .git a gitfile into the shared common dir —
+# so its masks and exceptions are exactly what a real card gets. The premise
+# plants the verdict's filter from outside and shows the runner's own listing
+# runs it; the row then shows every plant is refused inside the container and
+# the honest commit still lands.
+mskgh=$t/mskgh
+mkdir -p "$mskgh/.local/share/opencode/bin"
+git init -q "$mskgh/repo"
+git -C "$mskgh/repo" config user.name t
+git -C "$mskgh/repo" config user.email t@t
+mkdir -p "$mskgh/repo/nucleus/v3/spikes"
+echo base >"$mskgh/repo/nucleus/v3/spikes/x.txt"
+git -C "$mskgh/repo" add -A && git -C "$mskgh/repo" commit -qm base
+git -C "$mskgh/repo" worktree add -q -b card/v3-MSK "$mskgh/wt" HEAD
+echo rg >"$mskgh/.local/share/opencode/bin/rg"
+export MSK_HOME=$mskgh MSK_COMMON=$mskgh/repo/.git MSK_GITDIR=$mskgh/repo/.git/worktrees/wt MSK_WT=$mskgh/wt MSK_MARK=$t/mskgh.mark
+cat >"$t/msk-git.sh" <<'M'
+#!/usr/bin/env bash
+echo "config:$( (printf '[filter "gp"]\n' >>"$MSK_COMMON/config") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "attributes:$( (echo '* filter=gp' >>"$MSK_COMMON/info/attributes") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "hook:$( (: >"$MSK_COMMON/hooks/post-checkout") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "dotgit:$( (printf 'gitdir: /tmp/nv3-attacker\n' >"$MSK_WT/.git") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "dotgit-mv:$( (mv "$MSK_WT/.git" "$MSK_WT/.git.bak") 2>/dev/null && echo MOVED-BAD || echo refused)"
+echo "commondir:$( (echo /tmp/nv3-attacker >"$MSK_GITDIR/commondir") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "gitdir:$( (echo /tmp/nv3-attacker >"$MSK_GITDIR/gitdir") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "bin:$( (echo '#!/bin/sh' >"$HOME/.local/share/opencode/bin/rg") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo work >>nucleus/v3/spikes/x.txt
+git add nucleus/v3/spikes/x.txt && git commit -qm "nucleus v3: MSK inside commit" && echo commit:OK || echo commit:FAIL
+M
+git -C "$mskgh/repo" config filter.gp.clean "sh -c 'echo gp-ran >>\"$MSK_MARK\"' cat"
+echo 'nucleus/v3/spikes/x.txt filter=gp' >"$mskgh/repo/.git/info/attributes"
+# A same-size edit: status skips a file whose size differs from the index, but a
+# same-size one it must hash to decide, and hashing runs the clean filter —
+# exactly the plant the verdict measured (rework R2).
+printf 'basE\n' >"$mskgh/wt/nucleus/v3/spikes/x.txt"
+rm -f "$MSK_MARK"
+mskgp() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$MSK_WT" "$MSK_MARK" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.worktree_changes(pathlib.Path(sys.argv[2]))  # the runner's own status, outside every container
+print("worktree_changes returned")
+sys.exit(0 if pathlib.Path(sys.argv[3]).exists() else 1)
+P
+}
+expect_ok "runner mask: premise: planted outside, a shared clean filter runs in the runner's own listing (the code the allow-list keeps out)" mskgp
+git -C "$mskgh/repo" config --remove-section filter.gp
+rm -f "$mskgh/repo/.git/info/attributes" "$MSK_MARK"
+git -C "$mskgh/wt" checkout -q -- nucleus/v3/spikes/x.txt
+expect_ok "runner mask: inside a container the shared config, info/attributes, hooks, the worktree's .git gitfile, its gitdir's link files and opencode's bin are refused, and a commit still lands (R2)" msk_rc git-allow
+unset MSK_HOME MSK_COMMON MSK_GITDIR MSK_WT MSK_MARK
+# R3 (rework): a committed gitlink. The worker commits a gitlink and writes a
+# full nested .git under it (the worktree is a writable exception, so R2's
+# allow-list cannot cover it); the runner's own status recurses into that
+# gitdir and runs its filter outside every container. The craft makes the
+# recursion hash f.txt: the sub's index entry carries the clean blob with
+# zeroed stat, and the file's mtime equals the index's — the racily-clean case
+# the spawned porcelain status must resolve by converting the content.
+gl=$t/gitlink
+git init -q "$gl/repo"
+git -C "$gl/repo" config user.name t
+git -C "$gl/repo" config user.email t@t
+mkdir -p "$gl/repo/nucleus/v3/spikes"
+echo base >"$gl/repo/nucleus/v3/spikes/x.txt"
+git -C "$gl/repo" add -A && git -C "$gl/repo" commit -qm base
+git init -q "$gl/repo/sub"
+git -C "$gl/repo/sub" config user.name t
+git -C "$gl/repo/sub" config user.email t@t
+printf 'hello\n' >"$gl/repo/sub/f.txt"
+printf 'f.txt filter=gp\n' >"$gl/repo/sub/.gitattributes"
+git -C "$gl/repo/sub" add -A && git -C "$gl/repo/sub" commit -qm sub-base
+printf 'hello\nEDIT\n' >"$gl/repo/sub/f.txt"
+git -C "$gl/repo/sub" update-index --cacheinfo "100644,$(git -C "$gl/repo/sub" rev-parse :f.txt),f.txt"
+touch -r "$gl/repo/sub/.git/index" "$gl/repo/sub/f.txt"
+git -C "$gl/repo/sub" config filter.gp.clean "sh -c 'echo gl-ran >>\"$t\"/gl.mark' cat"
+(cd "$gl/repo" && git add sub && git commit -qm gitlink)
+glprem() { local s; s=$(git -C "$gl/repo" status --porcelain --no-renames --ignore-submodules=none --untracked-files=all --ignored=matching); echo "status: $s"; [ -e "$t/gl.mark" ]; }
+expect_ok "runner scope: premise: the gitlink craft's status, without the refusal, recurses into sub/.git and runs the planted filter" glprem
+rm -f "$t/gl.mark"
+glr() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$gl/repo" "$t/gl.mark" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, mark = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+base = subprocess.run([rc.GIT, "-C", str(wt), "rev-parse", "HEAD~1"], capture_output=True, text=True).stdout.strip()
+gl = rc.gitlink_problems(wt)
+print("gitlink_problems:", gl)
+scope = rc.scope_violations(wt, base, ["nucleus/v3/spikes/"])
+print("scope:", scope)
+raised = False
+try:
+    rc.worktree_changes(wt)
+except subprocess.CalledProcessError as e:
+    raised = True
+    print("worktree_changes raised:", (e.stderr or "").splitlines()[:1])
+print("changed_since:", rc.changed_since(wt, base, "nucleus/v3/spikes/x.txt"))
+want = ["sub is a gitlink in the index (mode 160000; the nested .git a worker writes under it can run worktree code outside the container)"]
+sys.exit(0 if gl == want and scope == ["sub (outside Touch only)", want[0]] and raised and rc.changed_since(wt, base, "nucleus/v3/spikes/x.txt") and not mark.exists() else 1)
+P
+}
+expect_ok "runner scope: a committed gitlink is refused before any status or diff, and no listing runs the nested filter (R3)" glr
 # A planted unshare and git earlier on PATH are not executed: they record the pid
 # namespace they run in, and no record may carry this suite's.
 mkdir -p "$t/plant"
@@ -4325,6 +4505,22 @@ FG_MARK=$t/fgc5 E2E_NS=real E2E_PLANT_MARK=$t/plant.mark PATH=$t/plant:$PATH fgr
 expect_ok "fresh-gate: FGC: planted unshare and git on PATH: the gate still runs contained and passes" fgc_ran "$t/fgc5"
 expect_ok "fresh-gate: FGC: the plants never ran outside a container" plant_clean "$t/plant.mark" "$SUITE_NS"
 expect_ok "fresh-gate: FGC: (planted PATH) nothing is left" fg_clean
+# FG-NOHIDE (rework R4): the gate's container must carry the masks' values, not
+# merely agree with the runner's form (fgc_same compares forms) — emptying
+# NV3_HIDE here used to leave the runtime dir and ~/.ssh visible to the gate's
+# worker code with every row green. The stub gate is that worker code: it reads
+# the runtime dir and ~/.ssh from inside, and its stdout passes through
+# fresh-gate unchanged, so the row sees exactly what the worker saw.
+touch "$RT/nv3-suite-marker"
+expect_ok "premise: FG-NOHIDE: the marker is visible in this environment's runtime dir" test -e "$RT/nv3-suite-marker"
+git -C "$r" checkout -q -b card/v3-FGNH nucleus/v3-scaffold
+printf '#!/usr/bin/env bash\necho "runhide=$(ls -A /run/user/$(id -u) 2>/dev/null | grep -c .) ssh=$(ls -A "$HOME/.ssh" 2>/dev/null | grep -c .) marker=$(ls -A /run/user/$(id -u) 2>/dev/null | grep -cx nv3-suite-marker)"\necho "GATE EXIT=0"\nexit 0\n' >"$r/nucleus/v3/scripts/gate.sh"
+git -C "$r" add nucleus/v3/scripts/gate.sh && git -C "$r" commit -qm "nucleus v3: FGNH work" && git -C "$r" checkout -q nucleus/v3-scaffold
+fgrun card/v3-FGNH
+fgnh() { fg_show; [ "$(cat "$t/fg.rc")" = 0 ] && [ "$(tail -n 1 "$t/fg.out")" = "GATE EXIT=0" ] && grep -qxF "runhide=0 ssh=0 marker=0" "$t/fg.out"; }
+expect_ok "fresh-gate: FGC: the gate's worker code sees neither the runtime dir nor ~/.ssh (FG-NOHIDE)" fgnh
+expect_ok "fresh-gate: FGC: (FG-NOHIDE) nothing is left" fg_clean
+rm -f "$RT/nv3-suite-marker"
 # A HOME whose masks cannot be set up: the setup shell's first mount fails, the
 # probe never answers, and the whole thing is a refusal — the gate never ran.
 HOME=$t/fg-no-such-home fgrun card/v3-FGR
