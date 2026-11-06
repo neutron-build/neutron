@@ -470,32 +470,34 @@ fn szc_rename_crash_keeps_the_open_fold() {
 /// segment at or above `b` retires every boundary `≤ s`
 /// (`w11_window_note`'s `recycled_unsynced.retain`), so the window list
 /// the crash draw reads holds only still-unsynced boundaries. Literal
-/// config: BASE with `w11_share` 1000, seed 11 round 0 (X-5c-F4-F1-F1-CXX
-/// moved the literal from seed 30: the drop rework restructured the walk's
-/// steps, so seed 30's schedule now retires no boundary in time and its
-/// pick reads `w11` — the fallback shape itself is schedule-derived and was
-/// re-measured) — the round's every recycled boundary was synced over by
-/// the crash point, the window list is empty, and the pick records the
-/// fallback `w11-` (the plain uniform point stood). **G-W11-NORETIRE** (the retain line
-/// removed) fails this pin: the boundaries stay in the set, the list is
-/// non-empty, and the pick reads `w11` instead (the gate measured 9 of
-/// 200 digests moving at share 1000, picks 79 → 88).
+/// config: BASE with `w11_share` 1000, seed 30 round 0 — the round's
+/// every recycled boundary was synced over by the crash point, the
+/// window list is empty, and the pick records the fallback `w11-` (the
+/// plain uniform point stood, and it fired). **G-W11-NORETIRE** (the
+/// retain line removed) fails this pin: the boundaries stay in the
+/// set, the list is non-empty, and the pick reads `w11` instead — the
+/// measured flip at this tip (the rework's pin hold re-derived the
+/// schedule: seed 30 reads `w11-` clean and `w11` under the mutant,
+/// with seeds 37, 98, 111, 138, 156, 170 and 192 the other flippers of
+/// 0..200; the attempt-1 literal, seed 11, reads `w11-` both ways —
+/// vacuous, the rework verdict's finding 2 — and 30 was the literal
+/// before this card's drop rework moved it off).
 #[test]
 fn x5_r38_w11_needs_no_completed_sync_since() {
     let mut tun = workload::Tuning::BASE;
     tun.w11_share = 1000;
-    let rec = workload::run_seed_with(11, None, &tun);
-    assert!(rec.defect.is_none(), "seed 11: {:?}", rec.defect);
+    let rec = workload::run_seed_with(30, None, &tun);
+    assert!(rec.defect.is_none(), "seed 30: {:?}", rec.defect);
     let r0 = &rec.rounds[0];
     assert_eq!(
         r0.cwin,
         Some("w11-"),
-        "seed 11 r0: every recycled boundary has had a completed sync since its rename, \
+        "seed 30 r0: every recycled boundary has had a completed sync since its rename, \
          so the W11 window list must be empty and the pick must record the fallback"
     );
     assert!(
         r0.fired,
-        "seed 11 r0: the fallback uniform crash fired (never a NEVER-FIRED)"
+        "seed 30 r0: the fallback uniform crash fired (never a NEVER-FIRED)"
     );
 }
 

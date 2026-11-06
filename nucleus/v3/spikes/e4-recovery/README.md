@@ -606,6 +606,15 @@ seed 11 — a Limit-3 deviation recorded in the card's RESULT (the pin
 is a schedule literal of the X5-R37 class that Limit 3 did not name;
 the invariant and the assertion are unchanged).
 
+**The rework's correction to that W11 move (the REWORK verdict's
+finding 2, binding):** seed 11 was vacuous — it reads `w11-` with the
+retain line in **and** with it removed (no boundary to retire), so the
+pin held nothing. The rework's pin hold moved the schedule again and
+the literal is back at **seed 30** (measured at the rework tip, share
+1000: seed 30 reads `w11-` clean and `w11` under G-W11-NORETIRE, shown
+failing; the other flippers of 0..200 are 37, 98, 111, 138, 156, 170
+and 192, and 51 uniform-mode seeds read `w11-` clean).
+
 **A correction to -F2's record above:** its "no seed fails before or
 after" is false — at -F2's tip, 190 r1 fails and passed before (the
 verdict's finding 1). B1 was already there; the -F2 guard moved the
