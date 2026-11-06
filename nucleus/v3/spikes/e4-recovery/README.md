@@ -626,7 +626,53 @@ R36 pin and 1769's no-twin pin still hold), and
 (96, 104, 161, 190 re-measured identical). Attempt 1's "every
 drop-bearing schedule re-derived" was loose, as the verdict said: of
 the nine, four first moved at the replay change and one at B1, not
-the drop arms. The W11 fallback literal
+the drop arms.
+
+**The rework (P gate verdict REWORK 10567da6, 2026-11-06; finding 1,
+blocking).** Attempt 1's last step dropped its `PinGuard` at the walk
+step's edge, before the directory descent: unpinned, the root's dirty
+frame was a legal eviction victim during that I/O — the evictor
+latches it and yields in `write_fresh`, `free_lpid` clears the frame
+and puts the LPID in the free set, and `evict:finish` (whose
+`map.cur.insert` is unconditional) resurrects the freed root at its
+write's fresh slot. Mapped and in the free set, referenced by
+nothing; amcheck (ii) reports "mapped lpid N unreachable". Two new
+faultless class C XX001 at BASE — **444 r1** (`LAST tree 3 path
+[4, 63]`, slot 109) and **3005 r1** (`LAST tree 4 path [5, 75]`,
+slot 132) — are the **census's blind spot**: neither is in the
+51-round file nor the 54 seeds, which is why Work 5 read 0 while the
+10k carried them; S-1-F7's trial range and 50000..50200 miss them
+too. The fix (rework 1): the guard stays live across the whole one
+gate hold, through the frees; every other arm unchanged, and
+`evict:finish` untouched (Limit 1 does not name it — §6.8 is the
+rule). The gate's own trial with the pins held read C-XX 0 over
+0..10000, and one defect: 7469's twin round 1 (`Mid2@1` never fires,
+the NEVER-FIRED shape) — the re-gate reads that seed; at this tip its
+digest moved again (above) and `r21c`'s literal moved to 9469 (the
+judgment call below). The rework's new directed evidence:
+
+| Mutant (hand-applied, shown failing, reverted clean) | Failing pin |
+|---|---|
+| M-DROP-UNPIN-EARLY (the `PinGuard` dropped at the step's edge — f703c08d) | `drop_last_step_keeps_its_pages_pinned` (seed 38: "root 2 is mapped and in the free set"; 38, 85, 444, 467 of 1..=500 at f703c08d, 0 held) |
+| G3-FREE-IN-SECOND-HOLD (the gate released and re-taken between the entry removal and the frees) | `drop_one_hold_the_flip_never_finds_the_straddle` (seed 5: "the flip found the straddle: entry absent, root 2 mapped, gate free"; 105 of 1..=200 under the mutant, 0 clean) |
+| G2-ORPHAN-KEEPS-SLOT (the orphan's `used_cur` release removed) | `exhausted_reserve_keeps_both_copies` ("seed 1: slots [13] entered used_cur referenced by nothing") |
+| G-W11-NORETIRE (the `recycled_unsynced` retain removed) | `x5_r38_w11_needs_no_completed_sync_since` (seed 30 reads `w11-` clean, `w11` under the mutant) |
+
+Finding 3's two rules now have directed pins: the one-hold pin above
+(a flip that waits for "entry absent, root mapped" must never find it
+— under the fix the straddle exists only inside the hold, so the
+check can never pass), and pin 3's world-end orphan assertion (the
+used-but-unreferenced slots are exactly the phase-A baseline plus the
+one stale flip-window write-out, slot 5 at seed 1, measured and
+documented in the pin). Finding 4: pin 2's assertion is eight cells,
+matching its comment. **The r21c literal (a judgment call, recorded
+in the RESULT):** the pin hold moved 7469 onto the NEVER-FIRED shape
+— the fired-guard defect is by design a seed failure, so the ruling's
+fifth literal could not stay; it moved to 9469 under the gate's
+Limit-3 ruling class (a schedule literal of the X5-R37 kind; the
+assertions unchanged), measured: class MW, twin round 0's re-derive
+**succeeds**, real round 1 re-derives its spec (the R21 (c) re-pair
+path 7469 was pinned for), no defect, every twin paired. The W11 fallback literal
 (`x5_r38_w11_needs_no_completed_sync_since`) moved from seed 30 to
 seed 11 — a Limit-3 deviation recorded in the card's RESULT (the pin
 is a schedule literal of the X5-R37 class that Limit 3 did not name;
