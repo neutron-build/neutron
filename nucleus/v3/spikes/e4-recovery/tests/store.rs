@@ -6402,6 +6402,86 @@ fn drop_entry_gone_body(seed: u64) {
     assert!(flag(&sched, "d_done"), "seed {seed}: both drops ran");
 }
 
+/// **X-5c-F4-F1-F1-CXX rework 2 (the REWORK verdict's finding 1:
+/// §6.8 step 3 — the last step holds its pins through the one hold).**
+/// The walk's `PinGuard` covers the root and every page the step
+/// empties, noted before its first mutation; dropped at the step's
+/// edge (M-DROP-UNPIN-EARLY, f703c08d's code), the root's dirty frame
+/// was a legal eviction victim during the directory descent's I/O: the
+/// evictor latches it and yields in `write_fresh`, `free_lpid` clears
+/// the frame and puts the LPID in the free set, and `evict:finish` —
+/// which runs `map.cur.insert(key, r)` unconditionally — resurrects
+/// the freed root at its write's fresh slot: mapped and in the free
+/// set, referenced by nothing (444 r1 and 3005 r1 at BASE, faultless
+/// class C XX001 the census never saw). With the guard live across the
+/// hold the frame is not evictable (`evict:pick` demands `pins == 0`),
+/// so the store can never end a drop with the root both mapped and
+/// free. A dropper over a dirty leaf root races an evictor looping
+/// `evict_one(&cx, false)`; seed 38 is the literal (of 1..=500 the
+/// gate measured 38, 85, 444 and 467 failing at f703c08d, 0 with the
+/// pins held).
+#[test]
+fn drop_last_step_keeps_its_pages_pinned() {
+    drop_last_step_pins_body(38).expect("the last step keeps its pages pinned");
+}
+
+fn drop_last_step_pins_body(seed: u64) -> Result<(), String> {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // Phase A: trees 2–5, tree 2 durably checkpointed and then dirtied
+    // — a leaf root whose frame is dirty when the drop begins.
+    let (disk, st, root2) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 3, 4, 5] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        cx_checkpoint(&sched, |_| Ok(()));
+        ins(&cx, 2, root2, &2u64.to_be_bytes(), 2, &val(2, 2));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2)
+    };
+    // Phase B: the dropper (t1) and an evictor (t2) looping outside
+    // any gated operation, so it takes the gate shared per attempt —
+    // exactly the background evictor of §5.2.
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                while !flag(sched, "d_done") {
+                    let _ = prims::evict_one(&cx, false).map_err(fail_of)?;
+                    cx.yield_now("gate:evict").map_err(fail_of)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the gate evict schedule");
+    let g = sched.lock();
+    let mapped = g.st.map.cur.contains_key(&root2);
+    let free = g.st.slots.free_lpids.contains(&root2);
+    if mapped && free {
+        return Err(format!(
+            "seed {seed}: root {root2} is mapped and in the free set — the last step \
+             freed a page whose frame an evictor had already latched (evict:finish \
+             resurrected it)"
+        ));
+    }
+    Ok(())
+}
+
 /// **X-5c-F4-F1-F1-CXX Work 3 (§14 step 4, as amended by S-1-F7): a
 /// replayed drop leaves its pages mapped until step 6.** Pass 2's
 /// `DropTree` sets `dropping` only — it runs no walk; the walk is step
