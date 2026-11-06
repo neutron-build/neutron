@@ -110,6 +110,15 @@ fn smoke_16_seeds() {
 /// (gate-measured over the whole 10k; only seed 2376 r2's non-digest
 /// `szc` changed)).
 /// M-BASEDRIFT (one BASE constant changed) fails this pin.
+///
+/// **This card's movement, attributed (the REWORK verdict's finding 6,
+/// re-measured at the rework tip):** Work 1 (B1) moved 190;
+/// Work 2 (A) moved 66, 907, 1769, 6149, 7469, 7528; Work 3 (replay)
+/// moved 112, 198, 303; the rework's pin hold (rework step 1) moved
+/// 112 (`2438489582 -> 3003462667`), 1769 (`1311732889 ->
+/// 2372375821`, back to 1b0ce54e's own value) and 7469
+/// (`3658720859 -> 1670717970`) — each value below is this tip's own
+/// measurement, the literals re-derived once (rework step 4).
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
     const WANT: &[(u64, u64)] = &[
@@ -135,7 +144,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (60, 2199024193),
         (66, 3628190779),
         (67, 1488955537),
-        (112, 2438489582),
+        (112, 3003462667),
         (118, 4034749261),
         (198, 95622311),
         (221, 2732451886),
@@ -152,7 +161,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (987, 2492798953),
         (1267, 1225086008),
         (1749, 1584051239),
-        (1769, 1311732889),
+        (1769, 2372375821),
         (1787, 1119157608),
         (1887, 3622450829),
         (2376, 3116539881),
@@ -163,7 +172,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (5549, 308297210),
         (5808, 2754578359),
         (6149, 123186068),
-        (7469, 3658720859),
+        (7469, 1670717970),
         (7528, 122281874),
         (8728, 3345856243),
         (9809, 1177349546),

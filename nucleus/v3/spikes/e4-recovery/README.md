@@ -600,7 +600,33 @@ restructured the walk's steps, so every drop-bearing schedule
 re-derived; each value is this card's own measurement).
 `late_copy_count_is_zero_at_base` moved at one seed: 190
 `4013865743 -> 679383372` — the -F2 verdict's probe value under Work 1
-alone, now with all three fixes in. The W11 fallback literal
+alone, now with all three fixes in.
+
+**The rework's re-measured attribution (rework step 4; the REWORK
+verdict's finding 6, whose per-step table this now matches).** Each
+move of 1b0ce54e's baseline has exactly one first owner, and the
+rework's pin hold (step 1) is a fourth:
+
+| First moves at | Seeds |
+|---|---|
+| Work 1 (B1) | 190 |
+| Work 2 (A) | 66, 907, 1769, 6149, 7469, 7528 |
+| Work 3 (replay) | 112, 198, 303 |
+| Rework step 1 (the pin hold) | 112, 1769, 7469 |
+
+The rework's three are second moves: 112 `2438489582 -> 3003462667`,
+1769 `1311732889 -> 2372375821` (back to 1b0ce54e's own value — the
+pin hold moved the schedule off the drop-arm change and onto the base
+draw), 7469 `3658720859 -> 1670717970` (the seed the verdict's trial
+flagged: its twin round 1's re-derived spec `Mid2@1` never fires —
+the NEVER-FIRED shape on a moved schedule; the re-gate reads it).
+Pass/fail does not change on any of the three (all rounds pass; 112's
+R36 pin and 1769's no-twin pin still hold), and
+`late_copy_count_is_zero_at_base`'s four digests did not move again
+(96, 104, 161, 190 re-measured identical). Attempt 1's "every
+drop-bearing schedule re-derived" was loose, as the verdict said: of
+the nine, four first moved at the replay change and one at B1, not
+the drop arms. The W11 fallback literal
 (`x5_r38_w11_needs_no_completed_sync_since`) moved from seed 30 to
 seed 11 — a Limit-3 deviation recorded in the card's RESULT (the pin
 is a schedule literal of the X5-R37 class that Limit 3 did not name;
