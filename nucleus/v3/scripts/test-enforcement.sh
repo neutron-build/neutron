@@ -109,11 +109,24 @@ git -C "$r" remote add origin "$t/origin.git"
 git -C "$r" push -q origin nucleus/v3-scaffold
 
 # A fake cargo so the copied gate.sh runs without building anything.
-# FAKE_FAIL names the cargo subcommand to fail.
+# FAKE_FAIL names the cargo subcommand to fail. The fmt branch emulates, for
+# the rework R8 row below, what the real cargo was measured to do on this host
+# (the verdict's measurement and this rework's scenario): a checkout's own
+# .cargo/config.toml whose [alias] names fmt replaces the external subcommand,
+# so `cargo fmt --all -- --check` runs the alias, not rustfmt. The fake records
+# the pid namespace that runs it to $FMT_NS_MARK (set only by that row and its
+# premise) and fails, as the real one does with trailing arguments an alias
+# does not take. Only `cargo fmt` in a checkout that carries the config names
+# the alias, so every other row's cargo stays the plain fake.
 mkdir -p "$t/bin"
 cat >"$t/bin/cargo" <<'F'
 #!/usr/bin/env bash
 [ "${1:-}" = "${FAKE_FAIL:-none}" ] && { echo "fake cargo $1 failed" >&2; exit 1; }
+if [ "${1:-}" = fmt ] && [ -f .cargo/config.toml ] && grep -qE '^[[:space:]]*fmt[[:space:]]*=' .cargo/config.toml; then
+  echo "warning: user-defined alias \`fmt\` is shadowing an external subcommand" >&2
+  [ -n "${FMT_NS_MARK:-}" ] && readlink /proc/self/ns/pid >"$FMT_NS_MARK"
+  exit 1
+fi
 exit 0
 F
 chmod +x "$t/bin/cargo"
@@ -3124,10 +3137,13 @@ expect_ok "runner e2e: BG: a normal exit calls killpg once, with SIGKILL, on ope
 expect_ok "runner e2e: BG: the one-killpg run passes and closes its range" res XKP "rc == 0 and r['pass'] and dead() and $closed"
 # XPE: killpg raises PermissionError after a normal exit. It stays uncaught and
 # fails the run, and the mark lets the finally write the end record (verdict R3).
+# --keep since rework R8: the pre-flight's container now ends first and would
+# take the raising killpg before any run starts (fail closed, nothing to close);
+# with --keep the first killpg is opencode's again, the path this row names.
 sed '/^spec = importlib.util.spec_from_file_location/a os.killpg = lambda pid, sig: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted (row)"))' "$t/e2e.py" >"$t/e2e-pe.py"
 expect_ok "runner e2e: BG: premise: the driver copy makes killpg raise" grep -qF 'Operation not permitted (row)' "$t/e2e-pe.py"
 rm -f "$e/XPE.n"
-(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XPE.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-pe.py" "$v3/tools/run_card.py" "$e/XPE" "$(ec XPE)" --base e2e/base --attempts 1) || true
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XPE.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-pe.py" "$v3/tools/run_card.py" "$e/XPE" "$(ec XPE)" --base e2e/base --attempts 1 --keep) || true
 expect_ok "runner e2e: BG: a raising killpg after a normal exit crashes the run and still leaves an end record" res XPE "rc == 1 and not r.get('pass') and 'PermissionError' in out and $closed"
 # A marked child whose leader is still alive is killed again, not waited on
 # forever: the first killpg raises, the second call must still kill. timeout
@@ -3851,6 +3867,32 @@ if which == "path-strip":
     code, out = rc.finish_contained(rc.spawn_contained(["sh", "-c", "readlink /proc/self/ns/pid"], os.getcwd(), dict(os.environ, E2E_NS="real"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 60)
     print(out, "suite", os.readlink("/proc/self/ns/pid"))
     sys.exit(0 if code == 0 and out.strip() and out.strip() != os.readlink("/proc/self/ns/pid") else 1)
+if which == "refs-card":
+    # R7 (rework2): the verdict's scaffold move, and a side ref outside card/,
+    # are refused inside the container; the honest commit still lands, and the
+    # scaffold did not move (checked against the repository outside).
+    home = os.environ["MSK_HOME"]
+    env = dict(os.environ, HOME=home, E2E_NS="real")
+    repo = pathlib.Path(home, "repo")
+    sc = subprocess.run([rc.GIT, "-C", str(repo), "rev-parse", "nucleus/v3-scaffold"], capture_output=True, text=True).stdout.strip()
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-refs.sh"], env["MSK_WT"], env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
+    print(out)
+    tip = subprocess.run([rc.GIT, "-C", str(repo), "log", "--format=%s", "-1", "card/v3-MSK"], capture_output=True, text=True).stdout.strip()
+    sc2 = subprocess.run([rc.GIT, "-C", str(repo), "rev-parse", "nucleus/v3-scaffold"], capture_output=True, text=True).stdout.strip()
+    sys.exit(0 if code == 0 and out.count(":refused") == 3 and "MOVED-BAD" not in out and "WROTE-BAD" not in out
+             and "commit:OK" in out and tip == "nucleus v3: MSK refs commit" and sc2 == sc else 1)
+if which == "packed-refs":
+    # The packed case (R7): the runner creates refs/heads/card before the first
+    # container (ensure_card_ref_dir, as main() does), so a repository whose
+    # every ref is packed still takes the worker's commit inside.
+    home = os.environ["MSK_HOME"]
+    env = dict(os.environ, HOME=home, E2E_NS="real")
+    made = rc.ensure_card_ref_dir(pathlib.Path(env["MSK_WT"]))
+    code, out = rc.finish_contained(rc.spawn_contained(["bash", os.environ["MSK_T"] + "/msk-pack.sh"], env["MSK_WT"], env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), 120)
+    print(out)
+    repo = pathlib.Path(home, "repo")
+    tip = subprocess.run([rc.GIT, "-C", str(repo), "log", "--format=%s", "-1", "card/v3-MSK"], capture_output=True, text=True).stdout.strip()
+    sys.exit(0 if made is not None and code == 0 and "commit:OK" in out and "commit:FAIL" not in out and tip == "nucleus v3: MSK packed commit" else 1)
 sys.exit("unknown " + which)
 P
 }
@@ -3893,6 +3935,8 @@ git -C "$mskgh/repo" config user.email t@t
 mkdir -p "$mskgh/repo/nucleus/v3/spikes"
 echo base >"$mskgh/repo/nucleus/v3/spikes/x.txt"
 git -C "$mskgh/repo" add -A && git -C "$mskgh/repo" commit -qm base
+# The scaffold branch the R7 row tries to move, as the verdict's attack did.
+git -C "$mskgh/repo" branch nucleus/v3-scaffold
 git -C "$mskgh/repo" worktree add -q -b card/v3-MSK "$mskgh/wt" HEAD
 echo rg >"$mskgh/.local/share/opencode/bin/rg"
 export MSK_HOME=$mskgh MSK_COMMON=$mskgh/repo/.git MSK_GITDIR=$mskgh/repo/.git/worktrees/wt MSK_WT=$mskgh/wt MSK_MARK=$t/mskgh.mark
@@ -3929,6 +3973,49 @@ git -C "$mskgh/repo" config --remove-section filter.gp
 rm -f "$mskgh/repo/.git/info/attributes" "$MSK_MARK"
 git -C "$mskgh/wt" checkout -q -- nucleus/v3/spikes/x.txt
 expect_ok "runner mask: inside a container the shared config, info/attributes, hooks, the worktree's .git gitfile, its gitdir's link files and opencode's bin are refused, and a commit still lands (R2)" msk_rc git-allow
+# R7 (rework2): the ref exception is refs/heads/card, the card branches'
+# directory, not refs/ — a whole writable refs/ let a contained worker
+# fast-forward nucleus/v3-scaffold to its own commit-tree commit, pass, and
+# point the next gate's fresh-checkout extract at its script (verdict
+# X-6-F1-F1-F2-F1-F2 R7, measured with real opencode). The premise makes the
+# same move from outside, as the attack did; the row then shows the move
+# refused inside, a side ref outside card/ refused, the honest commit still
+# landing, and the scaffold unmoved.
+mskrprem() {
+  local o before after
+  before=$(git -C "$mskgh/repo" rev-parse nucleus/v3-scaffold)
+  o=$(git -C "$mskgh/repo" commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold -m "probe move")
+  git -C "$mskgh/repo" update-ref refs/heads/nucleus/v3-scaffold "$o"
+  after=$(git -C "$mskgh/repo" rev-parse nucleus/v3-scaffold)
+  git -C "$mskgh/repo" update-ref refs/heads/nucleus/v3-scaffold "$before"
+  echo "moved outside: $before -> $after (restored: $(git -C "$mskgh/repo" rev-parse nucleus/v3-scaffold))"
+  [ "$before" != "$after" ] && [ "$(git -C "$mskgh/repo" rev-parse nucleus/v3-scaffold)" = "$before" ]
+}
+expect_ok "runner mask: premise: outside a container the scaffold move succeeds (what the allow-list cut)" mskrprem
+cat >"$t/msk-refs.sh" <<'M'
+#!/usr/bin/env bash
+o=$(git commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold -m "probe move")
+echo "move:$(git update-ref refs/heads/nucleus/v3-scaffold "$o" 2>/dev/null && echo MOVED-BAD || echo refused)"
+echo "rawfile:$( (echo "$o" >"$MSK_COMMON/refs/heads/nucleus/v3-scaffold") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo "side:$( (echo "$o" >"$MSK_COMMON/refs/heads/side-probe") 2>/dev/null && echo WROTE-BAD || echo refused)"
+echo work2 >>nucleus/v3/spikes/x.txt
+git add nucleus/v3/spikes/x.txt && git commit -qm "nucleus v3: MSK refs commit" && echo commit:OK || echo commit:FAIL
+M
+expect_ok "runner mask: inside a container the scaffold move, a raw ref-file write and a side ref outside card/ are refused, and a commit still lands (R7)" msk_rc refs-card
+# The packed case: refs/heads/card is missing once every card ref is packed
+# (`git pack-refs --all` prunes it, measured), and a mask never binds a missing
+# directory — so the runner creates it before the first container, as it
+# creates TARGET_DIR/<id>. The premise packs the fake repository and shows the
+# directory gone; the row calls the same creation main() makes and shows the
+# honest commit still landing inside.
+git -C "$mskgh/repo" pack-refs --all
+expect_ok "runner mask: premise: after pack-refs --all the card ref directory is gone" bash -c '! test -d "$1/refs/heads/card"' _ "$MSK_COMMON"
+cat >"$t/msk-pack.sh" <<'M'
+#!/usr/bin/env bash
+echo packed >>nucleus/v3/spikes/x.txt
+git add nucleus/v3/spikes/x.txt && git commit -qm "nucleus v3: MSK packed commit" && echo commit:OK || echo commit:FAIL
+M
+expect_ok "runner mask: a packed ref store still takes the worker's commit: the runner creates refs/heads/card first (R7)" msk_rc packed-refs
 unset MSK_HOME MSK_COMMON MSK_GITDIR MSK_WT MSK_MARK
 # R3 (rework): a committed gitlink. The worker commits a gitlink and writes a
 # full nested .git under it (the worktree is a writable exception, so R2's
@@ -4040,9 +4127,10 @@ acc_sg='E2E_CT_MARK=$FAKE_OC_N.sg bash -c "sleep 30" >/dev/null 2>&1 & echo $! >
 e2ea XAE "$acc_sg"$'`\n- `'"bash $t/ct-alive.sh $e/XAE.n.sg" work --attempts 1
 expect_ok "runner e2e: ACC: premise: the first line recorded its same-group child" grep -qxE '[0-9]+' "$e/XAE.n.sg"
 expect_ok "runner e2e: ACC: a line's same-group child is dead before the next line starts (ACC-NO-END)" res XAE "rc == 0 and r['pass'] and $closed"
-# The one-killpg row above counts opencode's group. Each line adds its own, once.
-kp_each() { local n; cat "$e/XKP.kp"; n=$(grep -c '' "$e/XKP.kp"); [ "$n" = 3 ] && [ "$(cut -d ' ' -f 1 "$e/XKP.kp" | sort -u | grep -c '')" = 3 ] && ! grep -qv ' 9$' "$e/XKP.kp"; }
-expect_ok "runner e2e: ACC: opencode and each line get one SIGKILL killpg, no group twice" kp_each
+# The one-killpg row above counts opencode's group. Each line adds its own, once;
+# since rework R8 the rustfmt pre-flight's container adds one more before them.
+kp_each() { local n; cat "$e/XKP.kp"; n=$(grep -c '' "$e/XKP.kp"); [ "$n" = 4 ] && [ "$(cut -d ' ' -f 1 "$e/XKP.kp" | sort -u | grep -c '')" = 4 ] && ! grep -qv ' 9$' "$e/XKP.kp"; }
+expect_ok "runner e2e: ACC: the pre-flight, opencode and each line get one SIGKILL killpg, no group twice" kp_each
 # L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
 # always says "committed outside its worktree"). No fake-opencode action makes
 # the real git log fail without first tripping the ref check, so a copy of the
@@ -4276,6 +4364,38 @@ git -C "$r" branch -f main nucleus/v3-scaffold
 e2e XR3 "work foreign" --attempts 1
 expect_ok "runner e2e: RF3: concurrent legitimate ref moves during a run pass" \
   res XR3 "rc == 0 and r['pass'] and r['scope'] == 'ok' and 'refs changed' not in out"
+# PF (rework2 R8): the rustfmt pre-flight runs in a container. The base branch
+# carries nucleus/v3/.cargo/config.toml naming an fmt alias, which the real
+# cargo was measured to honour over the external subcommand (this rework's
+# scenario: an alias `fmt = "test --all --"` made the pre-flight build and run
+# the base's build.rs in the host pid namespace); the fake cargo above emulates
+# exactly that, recording the pid namespace it runs in. The premise runs the
+# pre-flight's own command outside a container and shows this suite's
+# namespace; the row then shows the same run through main() records a
+# container's, and refuses the base before any attempt starts.
+git -C "$r" checkout -q -b e2e/fmt e2e/base
+mkdir -p "$r/nucleus/v3/.cargo"
+printf '[alias]\nfmt = "nsprobe"\n' >"$r/nucleus/v3/.cargo/config.toml"
+git -C "$r" add nucleus/v3/.cargo/config.toml && git -C "$r" commit -qm "e2e: fmt alias base"
+git -C "$r" checkout -q e2e/base
+pfx=$t/pfx
+git -C "$r" worktree add -q --detach "$pfx" e2e/fmt
+pfprem() {
+  local rc=0
+  (cd "$pfx/nucleus/v3" && FMT_NS_MARK=$t/pf.ns cargo fmt --all -- --check) >/dev/null 2>&1 || rc=$?
+  echo "uncontained fmt exit $rc ns $(cat "$t/pf.ns")"
+  [ "$rc" -ne 0 ] && [ "$(cat "$t/pf.ns")" = "$(readlink /proc/self/ns/pid)" ]
+}
+expect_ok "runner e2e: PF: premise: outside a container the aliased fmt runs here, in this namespace" pfprem
+rm -f "$t/pf.ns"
+rm -f "$e/XPF.n"
+printf '# CARD XPF: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/fmt        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `true`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' >"$e/cards/XPF.local.md"
+(cd "$r" && FMT_NS_MARK=$t/pf.ns E2E_NS=real FAKE_OC=work FAKE_OC_N=$e/XPF.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/XPF" "$e/cards/XPF.local.md" --base e2e/fmt --attempts 1) || true
+expect_ok "runner e2e: PF: the aliased pre-flight ran inside a container, not this namespace (PREFLIGHT-OUTSIDE)" \
+  bash -c '[ -s "$1" ] && [ "$(cat "$1")" != "$2" ]' _ "$t/pf.ns" "$(readlink /proc/self/ns/pid)"
+expect_ok "runner e2e: PF: the run refuses the aliased base at the pre-flight, before any attempt" \
+  res XPF "rc == 1 and 'preflight: base is not rustfmt-clean' in out and 'attempt 1:' not in out and L == []"
+git -C "$r" worktree remove --force "$pfx"
 # S: a replace ref in the repository stops main() before attempt 1 (X-6-F1-F2).
 # Both commits are unreachable, so nothing else in $r is rewritten meanwhile.
 xs=$(git -C "$r" commit-tree "e2e/base^{tree}" -m "nucleus v3: XS replaced")
