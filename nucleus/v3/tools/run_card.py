@@ -6,7 +6,10 @@ Usage: nucleus/v3/tools/run_card.py nucleus/v3/cards/<id>.local.md [--base <bran
 
 Flow: worktree on branch card/v3-<id> from --base -> copy card + worker prompt in (they are local-only)
 -> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, curl, wget, brew, git push/reset/checkout/stash, git fetch/pull/tag/reflog/fast-import, history rewrites, git-state edits, git global options and their GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_CONFIG* environment forms) -> scope guard (only the
-card's "Touch only" globs) -> acceptance commands -> up to N attempts with failure output fed back ->
+card's "Touch only" globs; a committed gitlink, mode 160000, is refused before the first status or
+diff of every check, which would otherwise run a filter in the nested .git a worker writes under it,
+outside the container — X-6-F1-F1-F2-F1-F2 rework R3) -> acceptance commands -> up to N attempts with
+failure output fed back ->
 RUNLOG row. Every attempt first checks free disk. Every git call runs with replace refs, grafts,
 fsmonitor, the commit-graph and the untracked cache off (GIT_ENV), and a repository carrying them (a
 commit-graph that fails verification, a command-line -c turning a cache back on), a shallow one, one
@@ -47,24 +50,39 @@ outside. A namespace contains processes, not their effects, so the container als
 same-uid worker could reach outside it (X-6-F1-F1-F2-F1-F2): the runtime dir /run/user/<uid> (the user
 manager's bus: `systemd-run --user` from inside cannot reach it, measured by a connect-only probe),
 ~/.ssh and cards/logs are covered read-only or hidden, $HOME is read-only with the worktree, the
-repository's common git dir, TARGET_DIR/<id>, ~/.cargo/registry, ~/.cargo/git, opencode's data dir and
-the per-run TMPDIR bound back writable. A `Container: podman` card line opts one card out of the
+common git dir's object and ref stores (objects/, refs/, logs/), the worktree's own gitdir,
+TARGET_DIR/<id>, ~/.cargo/registry, ~/.cargo/git, opencode's data dir and the per-run TMPDIR bound
+back writable (rework R2: a whole writable common git dir ran worker-planted config filters, a
+post-checkout hook and a repointed .git file in this runner's own git, outside every container; only
+objects, refs and logs stay writable now — a commit still lands — and the worktree's .git gitfile,
+its gitdir's commondir and gitdir files, and opencode's bin, whose rg an uncontained opencode would
+run, are bound read-only after the writable loop). The setup shell re-enters its cwd (cd -P) after
+the masks, so the inherited cwd cannot stay on the mount underneath the read-only bind of $HOME and
+write through it with .. (rework R1: a passing Acceptance line wrote ~/.cache that way). The named
+costs of the allow-list: `git branch -D` (packed-refs.lock) and `git worktree add` from inside a
+container fail, loudly. A `Container: podman` card line opts one card out of the
 runtime-dir mask only (the owner's approval is podman-only), and the run's output says so. The
 runner's own `unshare` and `git` (and the setup shell's `mount`) are absolute paths from
 os.confstr("CS_PATH"), never PATH, so a file planted in a PATH directory cannot switch containment off
 or become the runner's git; each is refused by name if missing, never fallen back from.
 
-What stays reachable from inside, measured, not assumed (X-6-F1-F1-F2-F1-F2 Work 6; the card's RESULT
-has the commands): loopback TCP (the worker needs the network for its provider, and a network
-namespace is a separate design) — 127.0.0.1:22 and :3773 answered a connect-only probe from inside a
-masked container (:36667 refused; a mask cannot close any of them); abstract unix sockets, which live
+What stays reachable or writable from inside, measured, not assumed (X-6-F1-F1-F2-F1-F2 Work 6 and
+its rework; the card's RESULT has the commands): loopback TCP (the worker needs the network for its
+provider, and a network namespace is a separate design) — 127.0.0.1:22, :3773 (T3), :33161
+(cloudflared) and :41429 answered a connect-only probe from inside a masked container, and T3 Code's
+unauthenticated `opencode serve` on 127.0.0.1:42653 accepts connections while it runs: a request
+could run a shell outside, and no mount closes it (the owner sets its password or accepts this;
+verdict X-6-F1-F1-F2-F1-F2 residuals); abstract unix sockets, which live
 in the shared network namespace (measured: names under /proc/net/unix answer or refuse on their own,
 one X socket answered); /tmp and every path not under $HOME or /run/user/<uid> (same-uid files there
 stay as they are); the system instance's sockets under /run/systemd (its bus refuses a non-root peer);
-and the writable exceptions themselves, ref and object writes in the common git dir included, which
-the existing scope, ref and object checks judge. The runtime dir and ~/.ssh are hidden by an empty
-tmpfs: the mountpoint itself stays writable, its contents — the bus, the sway and ssh sockets, the
-keys — are unreachable.
+refs and objects in the common git dir, every branch included, which the existing scope, ref and
+object checks judge afterwards (rework R2 leaves this open on purpose: a commit must land); and
+~/.cargo/registry, a planting route the card itself mandated (measured in a private CARGO_HOME: a
+build.rs dropped into an extracted crate runs under any cargo build outside a container; closing it
+is the owner's call). The
+runtime dir and ~/.ssh are hidden by an empty tmpfs: the mountpoint itself stays writable, its
+contents — the bus, the sway and ssh sockets, the keys — are unreachable.
 
 What a contained command cannot do: start a real NBench row. `systemctl --user` and `systemd-run --user
 --unit ...` fail inside a PID namespace (`Failed to connect to user scope bus via local transport: No
@@ -160,6 +178,21 @@ ACCEPT_S = 60 * 60  # one Acceptance command running this long: end its containe
 # tmpfs; cards/logs (the ledger) is bound read-only on its own, so the mask holds
 # even where CARDS is repointed outside $HOME. The attempt log is written by the
 # runner through its own descriptor (the _relay thread), never by the worker.
+# The git exceptions are an allow-list (rework R2): a whole writable common git
+# dir ran worker-planted filters, hooks and a repointed .git in the runner's own
+# git, so only objects/, refs/ and logs/ plus the worktree's own gitdir are bound
+# back writable, and NV3_RO_AFTER (wt/.git, its gitdir's commondir and gitdir
+# files, opencode's bin) is bound read-only after the writable loop — a later
+# bind stacks on top, so it narrows the exceptions instead of being covered by
+# them, and `test -e` (not -d) admits the .git gitfile, a file.
+# The cwd re-entry (rework R1): Popen(cwd=wt) sets the cwd before stage 2's
+# mounts, so without the cd below the payload's cwd stays on the mount
+# underneath the read-only bind, and .. from it reaches every directory below
+# $HOME's mountpoint no exception covers (the real worktree's .. is
+# ~/.cache/nv3-cards, measured: a passing Acceptance line wrote there). cd -P
+# re-resolves $PWD through the masked view after every mask is in place, moving
+# the cwd onto the mounts (an absolute path, /proc/*/cwd included, always
+# re-walked the mount table and was already safe; the relative route was not).
 # A container started inside an already-masked container cannot take that private
 # view (a locked read-only mount refuses the bind), so it masks everything the
 # outer one left writable and skips the exceptions it can no longer grant:
@@ -240,6 +273,13 @@ for d in ${NV3_RW:-}; do
     "$HOME"/*) if [ "$altok" = 1 ]; then "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d"; fi ;;
   esac
 done
+for d in ${NV3_RO_AFTER:-}; do
+  test -n "$d" || continue
+  test -e "$d" || continue
+  "$NV3_MOUNT" --bind "$d" "$d"
+  "$NV3_MOUNT" -o remount,bind,ro -- "$d"
+done
+cd -P -- "$PWD"
 if [ "$altok" = 1 ]; then "$NV3_UMOUNT" -- "$alt"; fi
 exec "$NV3_UNSHARE" --user --map-user="$NV3_UID" --map-group="$NV3_GID" -- "$@"
 """
@@ -540,6 +580,26 @@ def git_paths(args, wt):
     return [f for f in p.stdout.split("\0") if f]
 
 
+def gitlink_problems(wt):
+    """One line per mode 160000 (gitlink) entry in wt's index. A committed
+    gitlink makes the runner's own status and diff recurse into a nested .git
+    that a worker wrote inside the worktree — the worktree is a writable
+    exception, so rework R2's allow-list cannot cover it — and that gitdir's
+    config and attributes can run a filter outside every container (measured on
+    a scratch repo, verdict X-6-F1-F1-F2-F1-F2 R3). So every check that is about
+    to status or diff wt refuses the gitlink first; ls-files --stage reads only
+    the index, so it runs no filter. A failed listing is one line, never []."""
+    try:
+        ents = git_paths(["ls-files", "--stage", "-z", "--full-name", "--", ":/"], wt)
+    except subprocess.CalledProcessError as e:
+        return [f"git ls-files --stage failed (exit {e.returncode}): {((e.stderr or '').strip().splitlines() or ['no stderr'])[0]} (cannot check for gitlinks)"]
+    out = []
+    for e in ents:
+        if e[:6] == "160000":
+            out.append(f'{e.split(chr(9), 1)[1]} is a gitlink in the index (mode 160000; the nested .git a worker writes under it can run worktree code outside the container)')
+    return out
+
+
 def worktree_changes(wt):
     """Every uncommitted change in wt as (XY, path) status entries, untracked
     files included whatever hides them (X-6-F1-F2-F2-F1). --untracked-files=all
@@ -553,7 +613,13 @@ def worktree_changes(wt):
     its own directory; "at or above" keeps a core.excludesFile naming a tracked
     .gitignore from hiding paths elsewhere. Tracked .gitignores are matched as
     exact names, never as pathspecs. A failed status, ls-files or check-ignore
-    raises CalledProcessError, as git_paths does: never a partial set."""
+    raises CalledProcessError, as git_paths does: never a partial set. A gitlink
+    in the index raises before the status runs (gitlink_problems, rework R3):
+    the status would recurse into the gitlink's nested .git and could run its
+    filter outside the container."""
+    gl = gitlink_problems(wt)
+    if gl:
+        raise subprocess.CalledProcessError(1, [GIT, "ls-files", "--stage"], "", "\n".join(gl))
     ents = git_paths(["status", "--porcelain", "--no-renames", "--ignore-submodules=none", "--untracked-files=all", "--ignored=matching"], wt)
     # Porcelain -z entries are "XY <path>"; --no-renames means no "orig path" entries.
     out = [(e[:2], e[3:]) for e in ents if e[:2] != "!!"]
@@ -684,7 +750,11 @@ def changed_since(wt, rev, f):
     """True unless f in the worktree is exactly as in rev's tree (committed,
     staged, unstaged or untracked). Diffs rev itself, not a merge-base, so an
     amend or rebase that drops rev's commits cannot hide the change; any git
-    error counts as changed."""
+    error counts as changed. A gitlink in the index counts as changed too
+    (gitlink_problems, rework R3): the diff could recurse into the gitlink's
+    nested .git, so it must not run."""
+    if gitlink_problems(wt):
+        return True
     rc, diff = run([GIT, "diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", rev, "--", f], wt)
     rc2, untracked = run([GIT, "ls-files", "--others", "--", f], wt)
     return bool(rc or rc2 or diff.strip() or untracked.strip())
@@ -1032,7 +1102,23 @@ def scope_violations(wt, base, touch, card_id=None, pre_head=None, ledger=None):
     it at pre_head (HEAD before this run's first attempt) and the ledger shows
     no worker made the commit that wrote it (gate_committed).
     Git state that hides changes is a violation too (git_state_problems), so
-    every scope check names it; the checks below still run under GIT_ENV."""
+    every scope check names it; the checks below still run under GIT_ENV.
+    A gitlink in the index is refused before the first status or diff below
+    (gitlink_problems, rework R3): running them would execute a filter in the
+    gitlink's nested .git, outside the container. The refusal carries the same
+    protected / outside-Touch-only classification the listing it preempts would
+    have given the gitlink's path, so it is never a weaker report."""
+    gl = gitlink_problems(wt)
+    if gl:
+        out = []
+        for line in gl:
+            path = line.partition(" is a gitlink")[0]
+            if any(path.startswith(p) for p in PROTECTED):
+                out.append(path + " (protected)")
+            elif not in_scope(path, touch):
+                out.append(path + " (outside Touch only)")
+            out.append(line)
+        return out
     bad = [f"{p} (git state hides changes)" for p in git_state_problems(wt)]
     try:
         files = changed_files(wt, base)
@@ -1217,42 +1303,64 @@ def parse_tokens(log_path):
     return tot, session
 
 
-_GIT_COMMON = {}
+_GIT_DIRS = {}
 
 
-def git_common_dir(wt):
-    """The absolute path of wt's git common dir (the object and ref store every
-    worktree of that repository shares), or None when git cannot name it. One
-    trusted-path git call per directory per process, cached: the container's
-    writable-exception list needs it on every spawn. None means no exception is
-    made for it, so a worker in that directory cannot commit — it fails closed,
-    loudly."""
+def git_dirs(wt):
+    """The absolute paths of wt's git common dir (the object and ref store every
+    worktree of that repository shares) and of wt's own git dir, as a (common,
+    gitdir) pair; a side is None when git cannot name it. One trusted-path git
+    call per directory per process, cached: the container's writable-exception
+    list needs it on every spawn. A None common dir means no exception is made
+    for the repository, so a worker in that directory cannot commit — it fails
+    closed, loudly. gitdir is the linked worktree's own directory (HEAD and the
+    index live there); for a primary checkout it equals the common dir, and then
+    nothing extra is granted (X-6-F1-F1-F2-F1-F2 rework R2): its HEAD and index
+    sit under the read-only bind, so a commit inside the container fails loudly
+    rather than the whole shared dir being handed back writable."""
     wt = str(pathlib.Path(wt).resolve())
-    if wt not in _GIT_COMMON:
-        p = subprocess.run([GIT, "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=wt, env=git_env(), capture_output=True, text=True)
-        _GIT_COMMON[wt] = p.stdout.strip() if p.returncode == 0 and p.stdout.strip().startswith("/") else None
-    return _GIT_COMMON[wt]
+    if wt not in _GIT_DIRS:
+        p = subprocess.run([GIT, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir"], cwd=wt, env=git_env(), capture_output=True, text=True)
+        out = (p.stdout.splitlines() + ["", ""])[:2] if p.returncode == 0 else ["", ""]
+        _GIT_DIRS[wt] = tuple(s if s.startswith("/") else None for s in out)
+    return _GIT_DIRS[wt]
 
 
 def mask_env(env, cwd=None, keep_runtime=False):
     """env plus the NV3_* variables CONTAIN_SETUP reads: what to hide under an
     empty tmpfs, what to bind read-only, which directories to bind back writable
-    from the private read-write view of $HOME it takes first, and the binary and
-    ids its stages use. The values are this runner's own paths (module constants
-    and cwd), never worker input, so a payload cannot reshape its own mask by
-    editing them later: the setup shell ran before it started, and it has no
-    capability to mount. keep_runtime drops the /run/user/<uid> mask only — a
-    `Container: podman` card's opt-in (Work 5); ~/.ssh stays hidden either way."""
+    from the private read-write view of $HOME it takes first, which paths to
+    bind read-only after that writable loop, and the binary and ids its stages
+    use. The values are this runner's own paths (module constants and cwd),
+    never worker input, so a payload cannot reshape its own mask by editing them
+    later: the setup shell ran before it started, and it has no capability to
+    mount. keep_runtime drops the /run/user/<uid> mask only — a `Container:
+    podman` card's opt-in (Work 5); ~/.ssh stays hidden either way.
+
+    The git exceptions are an allow-list (rework R2): only the common git dir's
+    objects/, refs/ and logs/ and the worktree's own gitdir are bound writable
+    (a commit still lands), while wt/.git, that gitdir's commondir and gitdir
+    files, and opencode's bin (whose rg an uncontained opencode would run) go
+    into NV3_RO_AFTER, which the setup applies after the writable loop so the
+    read-only binds stack on top of the exceptions. Missing paths are skipped
+    by the setup shell (test -e), so a checkout without them still runs."""
     hide = [pathlib.Path.home() / ".ssh"]
     if not keep_runtime:
         hide.insert(0, pathlib.Path(f"/run/user/{os.getuid()}"))
     rw = [p for p in (CARGO_REGISTRY, CARGO_GIT, CARGO_DENY_DB, OPENCODE_DATA) if p.is_dir()]
+    ro_after = [OPENCODE_DATA / "bin"] if (OPENCODE_DATA / "bin").is_dir() else []
     if cwd is not None:
         wt = pathlib.Path(cwd).resolve()
         rw.append(wt)
-        common = git_common_dir(wt)
+        common, gitdir = git_dirs(wt)
         if common is not None:
-            rw.append(pathlib.Path(common))
+            rw += [p for p in (pathlib.Path(common) / n for n in ("objects", "refs", "logs")) if p.is_dir()]
+        if gitdir is not None and gitdir != common:
+            rw.append(pathlib.Path(gitdir))
+        if (wt / ".git").exists():
+            ro_after.append(wt / ".git")
+        if gitdir is not None:
+            ro_after += [pathlib.Path(gitdir) / n for n in ("commondir", "gitdir")]
         # The worktree's name is the card id (WT_ROOT / card_id), so the shared
         # target dir's per-card subdirectory is the exception, not the whole dir.
         target = TARGET_DIR / wt.name
@@ -1262,6 +1370,7 @@ def mask_env(env, cwd=None, keep_runtime=False):
     e["NV3_HIDE"] = " ".join(str(p) for p in hide)
     e["NV3_RO"] = str(LEDGER_DIR) if LEDGER_DIR.is_dir() else ""
     e["NV3_RW"] = " ".join(dict.fromkeys(str(p) for p in rw))
+    e["NV3_RO_AFTER"] = " ".join(dict.fromkeys(str(p) for p in ro_after))
     e["NV3_UNSHARE"] = str(UNSHARE)
     e["NV3_MOUNT"] = str(MOUNT)
     e["NV3_UMOUNT"] = str(UMOUNT)
@@ -1540,8 +1649,10 @@ def main():
             ledger_move_aside(ledger, card_id)
     # Before anything else reads or runs in the worktree, --trust-existing's
     # inspection included: a run on a repository whose git state hides changes
-    # never starts (scope_violations would refuse every attempt anyway).
-    state = git_state_problems(wt)
+    # never starts (scope_violations would refuse every attempt anyway). A
+    # gitlink is named first (rework R3): no status or diff of the worktree may
+    # run before it is gone.
+    state = gitlink_problems(wt) + git_state_problems(wt)
     if state:
         sys.exit(f"[{card_id}] git state hides changes; not starting (nothing was cleared):\n" + "\n".join(state))
 
@@ -1701,10 +1812,15 @@ def main():
                         # whatever session or group they moved to.
                         end_container(child)
                         finished = True
-                # The relay's flushes precede its EOF, so once the container is
-                # dead and this join returns, the log file holds every byte.
-                if pump is not None:
-                    pump.join(30)
+                    # The relay's flushes precede its EOF, so once the container is
+                    # dead and this join returns, the log file holds every byte.
+                    # Joined inside the `with` (rework R5): the join must happen
+                    # while the file is still open, or a relay holding bytes writes
+                    # them into a closed file (ValueError, swallowed, lost). No
+                    # deadlock: the join is bounded, and a relay that died on ENOSPC
+                    # leaves the stall or disk kill to end the run.
+                    if pump is not None:
+                        pump.join(30)
                 if finished or killed:
                     break
             if '"provider.quota"' in log.read_text(errors="replace"):

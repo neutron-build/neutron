@@ -59,7 +59,9 @@
 # (X-6-F1-F1-F2-F1-F2): $HOME read-only with the registry, cargo's git cache and
 # the target dir bound back writable, /run/user/<uid> and ~/.ssh hidden, so the
 # gate's worker code reaches neither the user manager's bus nor same-uid files
-# under $HOME. What this cannot stop is what the runner cannot: loopback TCP and
+# under $HOME; the checkout's .git gitfile, its gitdir's link files and opencode's
+# bin are bound read-only after the writable loop, and the setup's cd -P re-enters
+# the masked view, as in the runner (rework R2, R1). What this cannot stop is what the runner cannot: loopback TCP and
 # abstract unix sockets (shared network namespace), /tmp, and anything outside
 # $HOME — measured, and named in the runner's docstring. A SIGKILL of this script
 # leaves the container running, as a SIGKILLed runner does; that run printed no
@@ -225,7 +227,11 @@ config_checks
 # NV3_* variables exported below and by container_check's probe. Every binary it
 # runs is an absolute trusted path (mount and umount hold the capability over the
 # mount namespace, so a planted one on PATH must never run there), and its alt
-# mountpoint is created under the TMPDIR it is given.
+# mountpoint is created under the TMPDIR it is given. NV3_RO_AFTER (the rework
+# R2 read-only binds that stack after the writable loop) and the closing cd -P
+# (rework R1: the inherited cwd must not stay on the mount underneath the masks)
+# are part of that shared text; this script's own values for them are exported
+# with the gate's masks below.
 SETUP=$(cat <<'S'
 set -eu
 test -n "${HOME:-}" || exit 91
@@ -258,6 +264,13 @@ for d in ${NV3_RW:-}; do
     "$HOME"/*) if [ "$altok" = 1 ]; then "$NV3_MOUNT" --bind "$alt/${d#"$HOME"/}" "$d"; fi ;;
   esac
 done
+for d in ${NV3_RO_AFTER:-}; do
+  test -n "$d" || continue
+  test -e "$d" || continue
+  "$NV3_MOUNT" --bind "$d" "$d"
+  "$NV3_MOUNT" -o remount,bind,ro -- "$d"
+done
+cd -P -- "$PWD"
 if [ "$altok" = 1 ]; then "$NV3_UMOUNT" -- "$alt"; fi
 exec "$NV3_UNSHARE" --user --map-user="$NV3_UID" --map-group="$NV3_GID" -- "$@"
 S
@@ -272,7 +285,7 @@ container_check() {
   if [ ! -e "/proc/$$/task/$$/children" ]; then P+=("cannot contain the gate, so not running it: /proc/$$/task/$$/children is missing (a kernel without CONFIG_PROC_CHILDREN; this script finds the namespace's init there)"); return; fi
   mkdir "$d/probe" "$d/probe/nv3-alt"
   want="1 $(id -u) $(id -g) sh CapEff=0000000000000000 runhide=0"
-  got=$(cd "$start" && NV3_HIDE="/run/user/$(id -u) $HOME/.ssh" NV3_RO="" NV3_RW="" NV3_UNSHARE="$UNSHARE" NV3_MOUNT="$MOUNT" NV3_UMOUNT="$UMOUNT" NV3_UID="$(id -u)" NV3_GID="$(id -g)" TMPDIR="$d/probe" timeout 30 "${CONTAIN[@]}" sh -c 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm) CapEff=$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/$$/status) runhide=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)"' </dev/null 2>"$d/contain.err") || rc=$?
+  got=$(cd "$start" && NV3_HIDE="/run/user/$(id -u) $HOME/.ssh" NV3_RO="" NV3_RW="" NV3_RO_AFTER="" NV3_UNSHARE="$UNSHARE" NV3_MOUNT="$MOUNT" NV3_UMOUNT="$UMOUNT" NV3_UID="$(id -u)" NV3_GID="$(id -g)" TMPDIR="$d/probe" timeout 30 "${CONTAIN[@]}" sh -c 'echo "$$ $(id -u) $(id -g) $(cat /proc/1/comm) CapEff=$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/$$/status) runhide=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)"' </dev/null 2>"$d/contain.err") || rc=$?
   if [ "$rc" -ne 0 ] || [ "$got" != "$want" ]; then
     why=$(head -n 1 "$d/contain.err")
     P+=("cannot contain the gate, so not running it: ${CONTAIN[*]:0:8} sh: exit $rc, inside it printed '$got' (want '$want'): ${why:-no stderr}. Unprivileged user namespaces are needed; enabling them needs root and is the owner's call.")
@@ -450,11 +463,18 @@ mkdir "$d/tmp"
 # registry, cargo's git cache and the target dir under $HOME stay writable, the
 # runtime dir and ~/.ssh are hidden, and the checkout ($d/wt, outside $HOME)
 # needs no exception. The setup shell skips a missing directory, so the target
-# dir is created here first, as the runner creates its per-card one.
+# dir is created here first, as the runner creates its per-card one. NV3_RO_AFTER
+# mirrors the runner's rework R2 list: the checkout's .git gitfile and its
+# gitdir's commondir and gitdir files (a repointed one would redirect this
+# script's own worktree-remove trap and anything else that reads the checkout),
+# and opencode's bin (its rg is what an uncontained opencode would run); the
+# setup shell skips each entry that does not exist.
+fggitdir=$(git rev-parse --path-format=absolute --git-dir)
 mkdir -p -- "$CARGO_TARGET_DIR" "$d/tmp/nv3-alt"
 export NV3_HIDE="/run/user/$(id -u) $HOME/.ssh"
 export NV3_RO=""
 export NV3_RW="$CARGO_TARGET_DIR $HOME/.cargo/registry $HOME/.cargo/git $HOME/.cargo/advisory-dbs"
+export NV3_RO_AFTER="$d/wt/.git $fggitdir/commondir $fggitdir/gitdir $HOME/.local/share/opencode/bin"
 export NV3_UNSHARE="$UNSHARE" NV3_MOUNT="$MOUNT" NV3_UMOUNT="$UMOUNT" NV3_UID="$(id -u)" NV3_GID="$(id -g)"
 rc=0
 gate_running=1
