@@ -1786,6 +1786,62 @@ and their content are unchanged by the relocation).
 **New failures under X5-R51 (e): 0.** The "Otherwise" branch of F2's
 step 4 therefore runs, as this card's steps 2–6.
 
+**Step 2 — the literals re-derived (X5-R49) (commit 54b7c105).** The
+seven red pins at the Base tip, each literal re-derived once with its
+cause (X5-R49's freed-home release moves the allocation scan's yields
+and the slot numbering from a workload's first free onward; no pin's
+body or predicate changed):
+
+| pin | old → new | how the move shows (one line) |
+|---|---|---|
+| `x5_r37_base_tuning_reproduces_1b0ce54e` | 13 digests (3, 47, 112, 198, 303, 967, 987, 1749, 2376, 2927, 5549, 7469, 7528; e.g. 47 `2526989435→1878234829`) | the yield shift moves each seed's drawn crash points; the 41 others are byte-identical (step 1's 54-seed run) |
+| `late_copy_count_is_zero_at_base` | 96 `4266526636→1886292663`, 190 `679383372→3730452910` (104/161 identical) | the exhausted-reserve interleavings that park these seeds' first-touch copies land at other yield points; the drop itself is unchanged |
+| `szc_rename_crash_keeps_the_open_fold` | 2376 r2 crash `uniform@y:17768→uniform@y:15359` | the drawn uniform point moved with the yields; at the new point the crash is still at the rename's yield with the open checkpoint's fold (`szc` true, `fired`, measured) |
+| `r48_repaired_twin_fires_at_the_joint_spec` | 7469 r1 `Mid2@4→Mid2@3` | checkpoint 1's slot numbering shifted, so the per-index AND of the two complete mask lists re-derives `Mid2@3`; both sides still fire there (no defect, all paired) |
+| `o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2` | `lo=40 hi=41 frontier=41 T=38 c=41 → lo=38 hi=38 frontier=38 T=35 c=38` | the round's frontier moved onto its window bound, collapsing the window (owner ts 38 > T 35, `le_T=false`: the `le_T`-from-frontier mutant is still caught here) |
+| `x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2` | `lo=30 hi=33 frontier=32 T=29 c=32 → lo=34 hi=35 frontier=34 T=31 c=34` | the window slid up to what the twin's line was at the Base; `c=34 < hi=35` still catches FRONTIER-AS-HI and ts 34 > T 31 the `le_T` mutant; at this tip r2 prints one window only |
+| `g8_checkpoint_poison_ends_the_workload` | seeds `[747, 967] → [747, 47]` (P's re-selection rule; not a literal) | 967 r1 no longer exists — X5-R49 moved checkpoint 1's `map_root` 11→10, so the same `Mid6@0` draw fails 967's open in r0 and the seed stops; 47 is the lowest 0..1000 seed ≠ 747 whose BASE r1 passes every pin assertion at the tip (qualifying: 47, 67, 387, 527, 567, 747, 767, 788, 987); 747 unmoved and green |
+
+`cargo test -q --release -p e4-recovery` green after the edits — 261
+tests, 0 failed — and **F3's share-1000 pins are green at the tip**
+(not red), so step 4 re-selects none of them. fmt and clippy clean.
+
+**Anomaly (the 1749 window collapse).** With `lo = hi = frontier =
+c = 38` the 1749 r2 line no longer separates the `c = lo`/`c = hi`
+clamp mutants on its own, and 5549's `lo = frontier` does not separate
+`c = lo` either (5549 still catches `c = hi`: `c=34 ≠ hi=35`, and
+both pins still catch the `le_T`-from-frontier mutant). Those two
+mutants are F3-F3a-F2-F1 gate rows, not part of this card's 14-row
+binding table (`mut.py`'s set), so nothing this card must show is
+weakened; recorded so P can re-point that gate's clamp rows if it
+re-runs them.
+
+**Step 3 — pin 4, `x5_r49_window_freed_unimaged_home_held_by_image_refs`
+(verdict finding 4's follow-up -F2, folded here; this commit).**
+Test-only, `tests/store.rs`. The shape, exactly as the verdict
+specified: the leaf's home `s` is written by an eviction in epoch k
+**before the flip** (checkpoint k's `Before0` hook), so no image ever
+adopted it (`used_cur` alone); the page is **touched clean inside
+checkpoint k's window** at `After0` (a `fetch_page` plus a
+`store_page` of the same bytes — the first-touch freeze records
+`Img::At(s)` and pins `s` in `image_refs`, with the premises asserted
+inside the window, where they hold); and the page is **freed inside
+the same window** at `After1`. Assertions, body in the pin's spirit of
+pins 1–3: `slot_free(s)` false at the free itself, at every `Mid2`
+after it, at k's `After5` (durable now) and through k's `Mid6`; true
+first at checkpoint k+1's `Mid6` (pending at its `After5`).
+
+- At the tip: **passes** (seed 5; slot 3; the store test target 50/50
+  green).
+- **O-FREE-DROP-IMGREFS applied to the real code** (the release in
+  `free_lpid` also does `image_refs.remove(&r.slot)`): the pin fails
+  at exactly the at-the-free check — `slot 3 must not be free at the
+  free itself … left: Some(true) right: Some(false)` — while pins 1–3
+  still pass under it (pin 2's slot is masked by `used_durable`, the
+  verdict's finding). Reverted completely: `git diff` on
+  `src/store/prims.rs` empty after the revert; the named tests green
+  at the reverted tip.
+
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)

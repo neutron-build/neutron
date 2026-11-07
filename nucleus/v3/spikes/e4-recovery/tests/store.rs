@@ -22,7 +22,9 @@ use e4_recovery::sim::{
 };
 use e4_recovery::store::ckpt::{self, CkptHook};
 use e4_recovery::store::wal;
-use e4_recovery::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims, tree};
+use e4_recovery::store::{
+    Cx, Fail, HasStore, Img, Mutant, StoreCfg, StoreInner, amcheck, prims, tree,
+};
 
 /// The test world: scheduling, disk and store slices plus a small shared
 /// flag board (and a numeric board, X-5c-F3-F3b step 1's After4 record)
@@ -6566,6 +6568,167 @@ fn x5_r49_unimaged_home_frees_at_once() {
     assert!(
         slot_free_at(&sched, s),
         "seed {seed}: an unimaged home must be free at once (§4.4's last paragraph, X5-R49 (a))"
+    );
+}
+
+/// **X5-R49 pin 4:
+/// `x5_r49_window_freed_unimaged_home_held_by_image_refs`** (verdict
+/// X-5c-F4-F1-F1-F3-F2 finding 4's follow-up -F2, folded into this
+/// card's step 3). Pin 2's window-freed home is *also* in
+/// `used_durable` (image k−1 adopted it), which masks the verdict's
+/// mutant O-FREE-DROP-IMGREFS: even with the `image_refs` pin dropped
+/// at the free, the durable set still refuses the slot. This pin
+/// removes the mask. The page's home `s` was written by an **eviction
+/// in epoch k before the flip** (checkpoint k's `Before0`), so no
+/// image ever adopted it — `s` is in `used_cur` alone; the page is
+/// then **touched clean inside checkpoint k's window** (a fetch plus a
+/// `store_page` of the same bytes at `After0`), whose first-touch
+/// freeze records `Img::At(s)` and pins `s` in `image_refs`; and the
+/// page is **freed inside the same window** (`After1`). From the free
+/// through checkpoint k's `Mid6` the slot's only remaining reference
+/// is that `image_refs` pin (post-5 carries it into the new durable
+/// set), so `slot_free(s)` must be false there and true first at
+/// checkpoint k+1's `Mid6`. O-FREE-DROP-IMGREFS (the release also
+/// removes the freed home from `image_refs`) leaves `s` referenced by
+/// nothing at the free — allocatable while image k still references
+/// it, before meta k is synced — and fails the at-the-free check.
+#[test]
+fn x5_r49_window_freed_unimaged_home_held_by_image_refs() {
+    let seed = 5u64;
+    let (sched, lpid, s_old) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Dirty the page in epoch k (outside the checkpoint), as pin 3 does.
+    ins(&cx, 2, lpid, &2u64.to_be_bytes(), 2, &val(2, 2));
+    // Checkpoint k=2. Before0 — before the flip — evict the dirty page:
+    // the write-out gives it a fresh home `s` no image adopted.
+    let mut evicted = None;
+    let mut pinned = false;
+    let mut not_durable = false;
+    let mut img_at_s = false;
+    let mut free_point = None;
+    let mut mid2_free = false;
+    let mut after5_k = None;
+    let mut mid6_k = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::Before0 {
+            for _ in 0..64 {
+                if !prims::evict_one(&cx, true).expect("evict") {
+                    break;
+                }
+                let h = home_slot(&sched, lpid);
+                if h.is_some_and(|h| h != s_old) {
+                    evicted = h;
+                    break;
+                }
+            }
+        }
+        if hook == CkptHook::After0
+            && let Some(s) = evicted
+        {
+            // The clean touch inside the window: load the page clean and
+            // write it back; the first-touch freeze records Img::At(s)
+            // and pins `s` in `image_refs`. The premises are read here,
+            // inside the window (post-5 clears both sets).
+            let (bytes, _) = prims::fetch_page(&cx, lpid, true).expect("clean fetch");
+            prims::store_page(&cx, lpid, bytes).expect("clean touch");
+            let g = sched.lock();
+            pinned = g.st.slots.image_refs.contains(&s);
+            not_durable = !g.st.slots.used_durable.contains(&s);
+            img_at_s = matches!(g.st.map.img.get(&lpid), Some(Img::At(r)) if r.slot == s);
+        }
+        if hook == CkptHook::After1
+            && let Some(s) = evicted
+        {
+            prims::free_lpid(&cx, lpid).expect("free inside the window");
+            free_point = Some(slot_free_at(&sched, s));
+        }
+        if hook == CkptHook::Mid2
+            && let Some(s) = evicted
+            && free_point.is_some()
+        {
+            mid2_free |= slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::After5
+            && let Some(s) = evicted
+            && free_point.is_some()
+        {
+            after5_k = Some(slot_free_at(&sched, s));
+        }
+        if hook == CkptHook::Mid6
+            && let Some(s) = evicted
+            && free_point.is_some()
+        {
+            mid6_k = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    let s = evicted.unwrap_or_else(|| {
+        let h = home_slot(&sched, lpid).expect("the page keeps a home");
+        panic!("seed {seed}: the eviction never moved the home (still {h})");
+    });
+    assert!(
+        pinned,
+        "seed {seed}: the clean touch must have pinned {s} in image_refs (the premise)"
+    );
+    assert!(
+        not_durable,
+        "seed {seed}: the eviction home {s} must never have entered an image (the premise)"
+    );
+    assert!(
+        img_at_s,
+        "seed {seed}: the image being built must hold the page at its eviction home {s} (Img::At)"
+    );
+    {
+        let g = sched.lock();
+        assert!(
+            !g.st.slots.used_cur.contains(&s),
+            "seed {seed}: the free must have released {s} from used_cur (X5-R49 (a))"
+        );
+    }
+    assert_eq!(
+        free_point,
+        Some(false),
+        "seed {seed}: slot {s} must not be free at the free itself — image k references it \
+         (image_refs); this is the check O-FREE-DROP-IMGREFS breaks"
+    );
+    assert!(
+        !mid2_free,
+        "seed {seed}: slot {s} must stay not-free at every Mid2 after the free (image_refs)"
+    );
+    assert_eq!(
+        after5_k,
+        Some(false),
+        "seed {seed}: slot {s} must be durable (not free) at checkpoint k's After5"
+    );
+    assert!(
+        !mid6_k,
+        "seed {seed}: slot {s} must not be free through checkpoint k's Mid6 — image k \
+         references it (it entered the new durable set at post-5)"
+    );
+    // Checkpoint k+1=3: the image leaves the LPID unmapped, so `s`
+    // drops to `pending_free` at post-5 and step 6 releases it.
+    let mut after5_k1 = false;
+    let mut mid6_k1 = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After5 {
+            after5_k1 = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6_k1 = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !after5_k1,
+        "seed {seed}: slot {s} must be pending at checkpoint k+1's After5"
+    );
+    assert!(
+        mid6_k1,
+        "seed {seed}: slot {s} must be free at checkpoint k+1's Mid6 — the image_refs \
+         pin was the only reference from the free to here"
     );
 }
 
