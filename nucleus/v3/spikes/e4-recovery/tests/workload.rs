@@ -1798,3 +1798,230 @@ fn g8_checkpoint_poison_ends_the_workload() {
         assert!(rec.defect.is_none(), "seed {seed}: no harness defect");
     }
 }
+
+// ---- X5-R41/X5-R42/X5-R43 (card X-5c-F4-F1-F1-F3 steps 3, 6, 7) ----
+// The literal settings below are probe-found (single seeds at the share
+// 1000 tuning `Tuning::BASE` + `r41_share` 1000, the first probe share;
+// no setting met the step-5 rule, so nothing was handed off — the pins
+// pin the machinery, not a chosen setting) and are labelled probe-found,
+// never evidence for a quota claim.
+
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 3): the draw-count pin.**
+/// [`workload::r41_pick`] returns `None` — the `S_R41` stream is never
+/// constructed, no stream state consumed (the card's Limit 3) — for
+/// every round under `Tuning::BASE` (`r41_share` 0), and draws (returns
+/// `Some`) the moment the share is non-zero. The BASE-digest half of
+/// the pin is `x5_r37_base_tuning_reproduces_1b0ce54e` (above): a draw
+/// made at share 0 whose result reached `S_GEN`'s order would move a
+/// BASE digest (M-R41-DRAW reverts this).
+#[test]
+fn x5_r41_not_drawn_at_base() {
+    for seed in 0..64u64 {
+        for round in 0..3u32 {
+            assert_eq!(
+                workload::r41_pick(seed, round, &workload::Tuning::BASE),
+                None,
+                "seed {seed} round {round}: r41_share 0 must draw nothing (M-R41-DRAW reverts this)"
+            );
+        }
+    }
+    // A non-zero share draws (returns Some) for every eligible round,
+    // and both outcomes appear at an intermediate share.
+    let mut share1 = workload::Tuning::BASE;
+    share1.r41_share = 100;
+    let (mut somes, mut trues) = (0usize, 0usize);
+    for seed in 0..500u64 {
+        if let Some(pick) = workload::r41_pick(seed, 0, &share1) {
+            somes += 1;
+            trues += usize::from(pick);
+        }
+    }
+    assert_eq!(somes, 500, "a non-zero share draws for every round");
+    assert!(
+        trues > 0 && trues < 500,
+        "share 100 permille must both hit and miss over 500 seeds"
+    );
+    let mut share1000 = workload::Tuning::BASE;
+    share1000.r41_share = 1000;
+    for seed in 0..8u64 {
+        assert_eq!(
+            workload::r41_pick(seed, 0, &share1000),
+            Some(true),
+            "share 1000 permille selects every round"
+        );
+    }
+}
+
+/// **X5-R41 (step 3): the card's named pin — an aligned round with both
+/// Q4 halves and a reuse in the crash's own held window.** The literal
+/// config is the first probe setting (`r41_share` 1000, everything else
+/// BASE) and seed **21 round 0** (crash `After0@1`): the record's
+/// `q4_split_merge` is **true** with `q4sp == 4` and `q4mg == 8` exact
+/// (verdict finding 3: `≥ 1` on both halves let G-Q4MG-FROM-SPLITS
+/// pass; 4 ≠ 8 pins the halves apart) and `q4reuse >= 1`. The seed's
+/// digest is pinned with it (a seed pin's identity is (generator,
+/// seed), X5-R37). **M-R41-NOHOLD** (the hold returns at once — the
+/// crash at `After0` beats the block, the window's counters stay 0),
+/// **M-R41-WRONGWINDOW** (the hold and gate key on checkpoint 0, not
+/// `idx` — this seed's `idx` is 1, so the block runs in checkpoint 0's
+/// window and the crash at checkpoint 1's `After0` reads a fresh
+/// window), **M-R41-NOPREP** (the block's Deletes removed — the sweep
+/// has nothing to elide, `q4mg` falls to 0) and
+/// **M-R41-AFTERCRASHARM** (the hold placed after the crash arm — this
+/// seed's crash hook is `After0`, so the crash fires before the hold)
+/// each move the digest and leave the exact values wrong.
+#[test]
+fn x5_r41_aligned_round_has_q4_and_reuse() {
+    let mut tun = workload::Tuning::BASE;
+    tun.r41_share = 1000;
+    let rec = workload::run_seed_with(21, None, &tun);
+    assert!(rec.defect.is_none(), "seed 21: {:?}", rec.defect);
+    assert_eq!(rec.digest, 1771266996, "seed 21's schedule moved");
+    let r0 = rec.rounds.first().expect("seed 21 runs round 0");
+    assert_eq!(r0.crash, "After0@1", "round 0's crash point moved");
+    assert!(
+        r0.fired,
+        "round 0's crash must fire (a silent round is a harness defect)"
+    );
+    assert!(
+        r0.q4_split_merge,
+        "the aligned round must carry q4_split_merge true"
+    );
+    assert_eq!(r0.q4sp, 4, "q4sp exact (G-Q4MG-FROM-SPLITS reverts this)");
+    assert_eq!(r0.q4mg, 8, "q4mg exact (G-Q4MG-FROM-SPLITS reverts this)");
+    assert!(
+        r0.q4reuse >= 1,
+        "the held window reused an LPID freed since the flip: q4reuse={}",
+        r0.q4reuse
+    );
+    assert!(r0.pass, "the aligned round passes: {:?}", r0.o3_fail);
+}
+
+/// **X5-R41/R43 (steps 2/3/7): the completed-window arm.** Seed **142
+/// round 1** at `r41_share` 1000 (crash `After5@1`): the armed
+/// checkpoint's window ran to its step 5 — `imgsp == 15`, `imgmg == 12`
+/// and `imgreuse == 9` exact (the window ledger's last row, the counts
+/// of the checkpoint whose meta the round's recovery opened), the round
+/// passes, and its `q4i_raw` holds. Under **M-REUSE-DROPS-IMG**
+/// (`Mutant::ReuseDropsImg`, the seeded Joint fault) the same round
+/// fails the oracle — the fault's drop of `map.img[l]` loses the reused
+/// page from the image — so the pin runs both arms: applying the mutant
+/// unconditionally breaks the clean arm and fails this pin.
+#[test]
+fn x5_r41_completed_window_arm() {
+    use e4_recovery::store::Mutant;
+    let mut tun = workload::Tuning::BASE;
+    tun.r41_share = 1000;
+    let rec = workload::run_seed_with(142, None, &tun);
+    assert!(rec.defect.is_none(), "seed 142: {:?}", rec.defect);
+    assert_eq!(rec.digest, 1664460399, "seed 142's schedule moved");
+    let r1 = rec.rounds.get(1).expect("seed 142 runs round 1");
+    assert_eq!(r1.crash, "After5@1", "round 1's crash point moved");
+    assert!(r1.fired, "round 1's crash must fire");
+    assert_eq!(r1.imgsp, 15, "imgsp exact");
+    assert_eq!(r1.imgmg, 12, "imgmg exact");
+    assert_eq!(
+        r1.imgreuse, 9,
+        "imgreuse exact (M-REUSE-DROPS-IMG reverts this)"
+    );
+    assert!(r1.q4i_raw, "the opened image is this window's meta");
+    assert!(
+        r1.pass,
+        "the completed-window round passes: {:?}",
+        r1.o3_fail
+    );
+    // The Joint fault's arm: the same seed under the mutant fails the
+    // oracle on this round — asserted through the X5-R43 rule itself
+    // (a round failing O-1/O-2/O-3 in the mutant's arm that passed in
+    // the clean arm; an MP detection round may still pass the fold,
+    // the rule reads the oracle texts).
+    let mrec = workload::run_seed_with(142, Some(Mutant::ReuseDropsImg), &tun);
+    let nf = e4_recovery::campaign::seeded_new_failures(
+        std::slice::from_ref(&rec),
+        std::slice::from_ref(&mrec),
+    );
+    assert!(
+        nf.contains(&(142, 1)),
+        "M-REUSE-DROPS-IMG must fail the oracle on 142 r1: o1={:?} o2={:?} o3={:?}",
+        mrec.rounds[1].o1_fail,
+        mrec.rounds[1].o2_fail,
+        mrec.rounds[1].o3_fail
+    );
+}
+
+/// **X5-R42 (step 6): `q4i_raw` keys on the opened image, never on the
+/// last step-5 checkpoint.** The pure half pins the lookup's
+/// discriminating case (a ledger whose last row holds a reuse and whose
+/// opened id's row does not — a meta rollback's shape); the literal
+/// half pins seed **148 round 0** at `r41_share` 1000 (class MP, crash
+/// `After5@1`): its last completed window held `imgreuse == 5` reuses
+/// while its final recovery opened an image whose own window has no
+/// ledger row, so `q4i_raw` (and `q4i`) must be **false**.
+/// **M-Q4I-LASTCKPT** (`q4i_raw` reads the last step-5 checkpoint)
+/// reads `imgreuse ≥ 1` as true and fails both halves.
+#[test]
+fn x5_r42_q4i_keys_on_the_opened_image() {
+    use std::collections::BTreeMap;
+    use workload::{Tuning, q4i_raw_of};
+    // The discriminating ledger: ids 0..=3, the last row (id 3) holds a
+    // reuse, the opened image is id 1 whose row does not.
+    let mut w: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+    w.insert(0, (0, 0, 0));
+    w.insert(1, (2, 2, 0));
+    w.insert(2, (9, 9, 9));
+    w.insert(3, (15, 12, 9));
+    assert!(
+        !q4i_raw_of(&w, Some(1)),
+        "the opened image's own window (no reuse) decides, not the last row"
+    );
+    assert!(
+        q4i_raw_of(&w, Some(2)),
+        "an opened image whose own window held a reuse counts"
+    );
+    assert!(
+        !q4i_raw_of(&w, None),
+        "a refused or failed open never counts"
+    );
+    assert!(
+        !q4i_raw_of(&w, Some(9)),
+        "the harness checkpoint's id has no row (never recorded)"
+    );
+    // The literal seed: imgreuse 5, q4i_raw false.
+    let mut tun = Tuning::BASE;
+    tun.r41_share = 1000;
+    let rec = workload::run_seed_with(148, None, &tun);
+    assert!(rec.defect.is_none(), "seed 148: {:?}", rec.defect);
+    assert_eq!(rec.digest, 139439729, "seed 148's schedule moved");
+    let r0 = rec.rounds.first().expect("seed 148 runs round 0");
+    assert_eq!(r0.crash, "After5@1");
+    assert_eq!(r0.imgreuse, 5, "the last completed window held 5 reuses");
+    assert!(
+        !r0.q4i_raw,
+        "the opened image's own window decides: q4i_raw must be false here \
+         (M-Q4I-LASTCKPT reverts this)"
+    );
+    assert!(!r0.q4i, "q4i follows q4i_raw");
+}
+
+/// **X5-R42 (step 6): a refused round is not `q4i`.** The fold is
+/// `q4i_raw ∧ fired ∧ end.is_some()` (Q18's end): the exclusions match
+/// SIZING's — nested recovery crashes, the harness checkpoint, and
+/// rounds whose final recovery yields no state. **M-Q4I-REFUSED**
+/// (the `end.is_some()` term dropped) fails the refused case.
+#[test]
+fn x5_r42_refused_round_is_not_q4i() {
+    use workload::q4i_of;
+    assert!(
+        q4i_of(true, true, true),
+        "the full conjunction holds: an opened image's reuse in a crash round"
+    );
+    assert!(
+        !q4i_of(true, true, false),
+        "a refused or failed open (no end state) is excluded (M-Q4I-REFUSED reverts this)"
+    );
+    assert!(!q4i_of(false, true, true), "no reuse in the opened window");
+    assert!(
+        !q4i_of(true, false, true),
+        "a round whose own crash never fired is excluded"
+    );
+}
