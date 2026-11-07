@@ -993,6 +993,24 @@ stderrs live beside the runner's logs at
 `$HOME/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-O1C.*` (copied there
 by this card's commands: `t<seed>.{a,b}.{err,json}`).
 
+## Card X-5c-F4-F1-F1-O1C-F1's record (X5-R47: `written` by replay in issue order)
+
+## X5-R47 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the
+step-0 discipline, as X5-R6–R46 before it). It amends X5-R34's
+"Unchanged: `written`" and supersedes the O1C record's diagnosis
+above: the fix it prescribes replaces the `written` half and the F1
+report of `derive_written_acked`.
+
+**X5-R47 (amends X5-R34's "Unchanged: `written`").** A commit `(ts, lsn, len)` of `wal_commits` is **written** iff, at some event of `E`, immediately after a `WriteIssued` is applied in `E`'s order to a per-inode byte image, some inode's image holds at `[lsn mod WAL_SEG, lsn mod WAL_SEG + len)` a record that `dec_record` accepts with its own `lsn` and with `rec.ts == ts` and kind `Commit` or `CommitMarker`.
+- **Monotone.** Once written, always written: a later life overwriting the bytes does not unwrite the commit. The test is never made against the final image alone.
+- **No resolver by key.** No per-offset map and no greatest-key cover take part. Later bytes replace earlier bytes because they were issued later.
+- **Issued is returned.** `SimDisk::write_at` emits `WriteIssued` and `WriteReturned` in one step, so no crash separates them. The old `returned_end` test is removed. Add a debug-free guard: a `WriteIssued` in `E` without its immediately following `WriteReturned` fails the round through `task_error`.
+- **F1.** A commit is reported in `unparsed_written` iff it is not written and, at some such point, an image holds at `lsn mod WAL_SEG` 24 header bytes with correct magic, its own embedded `lsn`, and `lsn mod WAL_SEG + len_in_header > WAL_SEG`.
+- **SyncOff's acked** stays "iff written". SyncOn's acked half is untouched.
+- **Rejected forms.** A final-image walk, an interval-superseded view, and resolving `stitched`'s cover by issue order over the whole history all drop earlier-life records (measured: 1,028 of 19,118 rounds).
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
