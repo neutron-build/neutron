@@ -55,7 +55,12 @@ gitdir, TARGET_DIR/<id>, ~/.cargo/registry, ~/.cargo/git, opencode's data dir an
 bound back writable (rework R2: a whole writable common git dir ran worker-planted config filters, a
 post-checkout hook and a repointed .git file in this runner's own git, outside every container; only
 objects, refs/heads/card and logs stay writable now — a commit still lands, and no ref outside the
-card branches' directory can be written from inside (rework R7) — and the worktree's .git gitfile,
+card branches' directory can be written from inside (rework R7) — but a file in the writable paths can
+still be a symbolic ref: inside git it goes nowhere a plain ref could not, while outside git writes
+through it, so any symref under refs/heads, and any worktree HEAD that is not the card branch, is
+refused before every outside git call of this runner that could follow one — worktree add -B at the
+start included, and again after every attempt and at the final check, which fails the run (rework
+R9) — and the worktree's .git gitfile,
 its gitdir's commondir and gitdir files, and opencode's bin, whose rg an uncontained opencode would
 run, are bound read-only after the writable loop). The setup shell re-enters its cwd (cd -P) after
 the masks, so the inherited cwd cannot stay on the mount underneath the read-only bind of $HOME and
@@ -86,7 +91,12 @@ card's run answers for with its pinned verdict commit ids, not a code run here; 
 the scaffold's and refs/heads/main included, is read-only inside (rework R7: a writable refs/ let a
 worker fast-forward nucleus/v3-scaffold to its own commit-tree commit, pass, and point the next
 gate's fresh-checkout extract at its script, so the allow-list names the card branches' directory,
-not refs); and
+not refs/), and a symbolic ref planted in the writable card/ directory, or in the worktree's own
+HEAD, reaches no protected ref through this runner either: symref_problems and head_symref_problem
+refuse both before any outside git call that could follow one — at the start, before worktree add
+-B, which the verdict measured writing the scaffold through such a plant; after every attempt; at
+the final check, which fails the run; and before the end record's read of HEAD (rework R9; the
+gate's own commit still needs its own check, which is the orchestrator's to add, per the verdict); and
 ~/.cargo/registry, a planting route the card itself mandated (measured in a private CARGO_HOME: a
 build.rs dropped into an extracted crate runs under any cargo build outside a container; closing it
 is the owner's call). The
@@ -1177,6 +1187,60 @@ def stray_commits(card_id, branch, since):
     return [l for l in p.stdout.splitlines() if card_id in l]
 
 
+def symref_problems(wt):
+    """One line per symbolic ref under refs/heads ([] when there are none):
+    a symref there is nothing this repository's automation makes — branches
+    are plain refs, loose or packed — but a file a contained worker can write,
+    because refs/heads/card is the mask's writable ref exception (rework R7).
+    This runner's own git runs outside every container and writes through one:
+    the measured attack (verdict X-6-F1-F1-F2-F1-F2 R9) planted `ref:
+    refs/heads/nucleus/v3-scaffold` in refs/heads/card/v3-<a later card>, that
+    run passed, and the operator's next `run_card <later card> --base
+    card/v3-<stack>` moved the scaffold with the runner's own `worktree add
+    -B` before the run's ref snapshot was taken. So main() refuses before that
+    call, the startup gate and every refs_moved check refuse again (a plant
+    that appears mid-run never reaches the next outside git call that could
+    follow it), and a failed listing is one line, never a silent []."""
+    cmd = [GIT, "for-each-ref", "--format=%(refname)%00%(symref)", "refs/heads"]
+    p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
+        return [f"{' '.join(cmd)} failed (exit {p.returncode}): {why} (cannot check for symbolic refs under refs/heads)"]
+    out = []
+    for l in p.stdout.splitlines():
+        name, _, sym = l.partition("\0")
+        if name and sym:
+            out.append(f"symbolic ref {name} -> {sym} (a write made through it by outside git would land on {sym}; verdict X-6-F1-F1-F2-F1-F2 R9)")
+    return out
+
+
+def head_symref_problem(wt, branch):
+    """[] when the worktree's HEAD is a symbolic ref to exactly
+    refs/heads/<branch>, else one line naming what it is instead. The
+    worktree's own gitdir is a writable exception (a commit must land), so a
+    contained worker can repoint HEAD itself; every outside git read in the
+    worktree then follows it (rev-parse HEAD, diff base...HEAD — symbolic-ref
+    dereferences the whole chain, so HEAD -> refs/heads/card/v3-<id> ->
+    elsewhere is caught as well), and an outside write through it lands on the
+    ref it names: the verdict's run C (X-6-F1-F1-F2-F1-F2 R9) wrote `ref:
+    refs/heads/nucleus/v3-scaffold` into <gitdir>/HEAD, the run passed, and
+    the gate's later commit in that worktree moved the scaffold. This runner
+    refuses one before its own git follows HEAD — the startup gate, every
+    refs_moved check, and the end record's read — and the gate's own commit
+    needs its own check, which is the orchestrator's to add (outside Touch
+    only, per the verdict). A detached HEAD, or a git that cannot answer, is
+    refused the same way: the branch is never assumed."""
+    want = f"refs/heads/{branch}"
+    p = subprocess.run([GIT, "symbolic-ref", "HEAD"], cwd=wt, env=git_env(), capture_output=True, text=True)
+    if p.returncode == 0:
+        got = p.stdout.strip()
+        if got == want:
+            return []
+        return [f"HEAD is a symbolic ref to {got or '(nothing)'}, not {want} (a write made through it by outside git would land on {got or 'nothing'}; verdict X-6-F1-F1-F2-F1-F2 R9)"]
+    why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
+    return [f"git symbolic-ref HEAD failed (exit {p.returncode}): {why} (cannot confirm the worktree's HEAD is {want}; verdict X-6-F1-F1-F2-F1-F2 R9)"]
+
+
 def ref_snapshot(wt):
     """{refname: oid} for every ref, read in the card worktree (which shares the
     ref store with ROOT). A failed git raises, as git_paths does: an empty
@@ -1682,6 +1746,17 @@ def main():
     if bus:
         print(f"[{card_id}] Container: podman: the runtime dir /run/user/{os.getuid()} stays mounted for this card (the user manager's bus is reachable; podman-only approval)", flush=True)
 
+    # R9 (verdict X-6-F1-F1-F2-F1-F2): refs/heads/card is writable inside the
+    # container, and a file there can be a symbolic ref. The worktree add -B
+    # below writes refs/heads/<branch> through one onto its target — the
+    # measured attack moved nucleus/v3-scaffold exactly that way, on the next
+    # card's run, before that run's ref snapshot — so any symref under
+    # refs/heads is refused here, before any worktree git runs at all and
+    # before anything is changed. Nothing is cleaned: the operator decides.
+    sym = symref_problems(ROOT)
+    if sym:
+        sys.exit(f"[{card_id}] a symbolic ref under refs/heads; not starting (worktree add -B would write through it onto its target; verdict X-6-F1-F1-F2-F1-F2 R9; nothing was changed):\n" + "\n".join(sym))
+
     wt = WT_ROOT / card_id
     branch = f"card/v3-{card_id}"
     ledger = ledger_path(card_id)
@@ -1697,6 +1772,17 @@ def main():
         # A recreated branch starts a new ledger; the old one is kept for the record.
         if ledger.exists():
             ledger_move_aside(ledger, card_id)
+    # R9: with the worktree in place, both plants are refused before anything
+    # below reads it (--trust-existing's inspection included): a symref under
+    # refs/heads, and a worktree HEAD that is not the card branch. The scan
+    # above cleared the ref store; this catches what a kept worktree carries
+    # (its gitdir is writable inside the container) and anything that landed
+    # between the two checks. Every later outside git call of the run — the
+    # ledger and trust reads, pre_head, the diffs and rev-lists — sits behind
+    # this gate, and refs_moved re-checks after every attempt.
+    sym = symref_problems(wt) + head_symref_problem(wt, branch)
+    if sym:
+        sys.exit(f"[{card_id}] a symbolic ref under refs/heads, or a worktree HEAD that is not {branch}; not starting (this runner's own git would follow it onto another ref; verdict X-6-F1-F1-F2-F1-F2 R9; nothing was cleared):\n" + "\n".join(sym))
     # Before anything else reads or runs in the worktree, --trust-existing's
     # inspection included: a run on a repository whose git state hides changes
     # never starts (scope_violations would refuse every attempt anyway). A
@@ -1802,7 +1888,15 @@ def main():
         # Prints the operator's restore commands but never runs them: a concurrent
         # legitimate update could be clobbered, and the operator decides.
         nonlocal refs_reported
-        bad = ref_violations(wt, refs_before, branch, pre_head)
+        # R9: the two plants are refused before ref_violations runs, because
+        # its own outside git would follow them — rev-list refs/heads/<branch>
+        # reads a branch symref, and every read of HEAD follows a planted one.
+        # When they fire, the ancestry reads are skipped: the run fails without
+        # this runner's git ever resolving the plant. symref_problems also
+        # names a branch another run's worktree add -B would have written
+        # through; head_symref_problem is what fails a mid-run HEAD plant.
+        sym = symref_problems(wt) + head_symref_problem(wt, branch)
+        bad = sym if sym else ref_violations(wt, refs_before, branch, pre_head)
         if bad and bad != refs_reported:
             lines = [f"[{card_id}] {header}:"]
             for i, v in enumerate(bad):
@@ -1955,9 +2049,12 @@ def main():
         result["seconds"] = int(time.time() - t0)
 
         # The row reports the final tree, however the loop ended: a killed or
-        # exhausted last attempt used to leave "scope n/a".
-        bad = scope_violations(wt, args.base, touch, card_id, pre_head, ledger)
+        # exhausted last attempt used to leave "scope n/a". R9: the plants are
+        # refused first, because the scope diff below reads HEAD (git diff
+        # base...HEAD), so it runs behind the check, never through a plant
+        # that would bend its report; the row's scope value is unchanged.
         refs_bad, refs_final = refs_moved("final ref check: refs changed outside the card branch"), True
+        bad = scope_violations(wt, args.base, touch, card_id, pre_head, ledger)
         result["scope"] = "OUTSIDE" if refs_bad or stray_commits(card_id, branch, t0) else "FAIL" if bad else "ok"
         if bad:
             print(f"[{card_id}] final scope FAIL: " + "; ".join(bad), flush=True)
@@ -1980,8 +2077,17 @@ def main():
         # child is the latest container: each earlier one was ended before it started.
         if child is not None:
             end_container(child)
-        _, head = run([GIT, "rev-parse", "HEAD"], wt)
-        head = head.strip()
+        # R9: the end record reads HEAD, and an outside read of a planted HEAD
+        # follows the plant — it resolves to another branch's tip, which would
+        # close this run's range at a commit that is not the branch's. Refused,
+        # the range stays open: worker_commits then counts every commit in
+        # base..HEAD as this run's worker's, which fails closed.
+        head = ""
+        if head_symref_problem(wt, branch):
+            print(f"[{card_id}] the worktree's HEAD is not {branch}; leaving the ledger range open (verdict X-6-F1-F1-F2-F1-F2 R9)", flush=True)
+        else:
+            _, head = run([GIT, "rev-parse", "HEAD"], wt)
+            head = head.strip()
         ledger_append(ledger, {"run": run_id, "end": head if OID_RE.fullmatch(head) else None, "t": time.time()})
         if not refs_final:  # an exit that skipped the final check (quota, disk, exception, signal)
             refs_moved("refs changed outside the card branch (at exit)")
