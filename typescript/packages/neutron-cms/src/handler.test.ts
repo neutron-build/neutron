@@ -319,7 +319,7 @@ test("the stylesheet's address changes with its content, so an old cached copy i
 
 test("the editor's back link never returns to the editor", async () => {
   const cookie = await logIn();
-  const open = async (site: ReturnType<typeof defineCms>) => (await site.GET({ request: new Request(`${SITE}/n-admin/edit`, { headers: { cookie } }), params: { path: "edit" } })).text();
+  const open = async (site: { GET: (args: { request: Request; params?: Record<string, string> }) => Promise<Response> }) => (await site.GET({ request: new Request(`${SITE}/n-admin/edit`, { headers: { cookie } }), params: { path: "edit" } })).text();
   assert.match(await open(cms), /class="back" href="\/n-admin"/);
   const lists = { a: { fields: { b: "text" } }, c: { label: "Gallery", fields: { d: "text" } } } as const;
   assert.match(await open(defineCms({ posts: false, onPage: ["a"], lists })), /class="back" href="\/n-admin\/lists\/c"/);
