@@ -1,17 +1,19 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1 (E4 Q4 reachability: the split and merge
-halves measured, the re-gate's findings 1/2/4 closed, X5-R40 the SMO
-alignment, three settings probed) — complete, and the card's decision
-rule is NOT MET by all three settings: Q4 is 0 of ~310 rounds at every
-setting (ESCALATE, the record below).** `Tuning::FINAL ==
-Tuning::BASE` at this tip (this card does no retune); every seed pin
-runs `Tuning::BASE` (1b0ce54e's generator, bit for bit,
-pinned by `x5_r37_base_tuning_reproduces_1b0ce54e` over all 54 seeds
-any test passes to a seed runner — 41, 303 and 2376 joined with the
-rework's and step 0a's pins); no BASE digest moved. The stages before
-it (X-5c-F4-F1, X-5c-F4, X-5c-F3-F3b and back to X-5c) are complete
-and merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R40.
+Status: **stage X-5c-F4-F1-F1-F3 (X5-R41 the window-targeted SMO
+alignment, X5-R42 the Q4-I row, X5-R43 the seeded faults) — complete,
+and the card's decision rule is NOT MET by all three shares (Q4 × 50
+reads 1,400 / 1,150 / 900 against the 1,500 bar at 1000 / 800 / 600;
+ESCALATE, the record below); the seeded Joint fault is CAUGHT at
+share 1000 and the Slot fault is UNCAUGHT at every setting measured
+(a second ESCALATE).** `Tuning::FINAL == Tuning::BASE` at this tip
+(no setting was handed off); every seed pin runs `Tuning::BASE`
+(1b0ce54e's generator, bit for bit, pinned by
+`x5_r37_base_tuning_reproduces_1b0ce54e` over all 54 seeds any test
+passes to a seed runner); no BASE digest moved. The stages before it
+(X-5c-F4-F1-F1 and its follow-ups, X-5c-F4-F1, X-5c-F4, X-5c-F3-F3b
+and back to X-5c) are complete and merged. Opus judges E4 on the
+RESULT with P's rulings X5-R1–R43.
 **Card X-5c-F4-F1-F1-O1C-F1 (X5-R47) has since replaced the `written`
 half and the F1 report of `derive_written_acked` with the replay in
 issue order — the three faultless class C O-1(c) rounds (1066, 6555,
@@ -1267,6 +1269,199 @@ in its doc (X5-R48's own row).
 passage said "of the nine, four first moved at the replay change";
 its own table shows ten movers — three first at the replay change,
 one at B1 — and the passage now says so (the verdict's finding 4).
+
+## Card X-5c-F4-F1-F1-F3's record (X5-R41 the window-targeted SMO
+## alignment, X5-R42 the Q4-I row, X5-R43 the seeded faults)
+
+**Limit 5 (first commit, b7651f73) — X5-R40 removed.** `smo_share`,
+`S_SMO`, `ScriptOp::AwaitCkptOpen`, `AWAIT_CKPT_OPEN_TURNS`, its four
+pins and the seed 886 pin: it never handed off a setting and has no
+reader. Its 0..200 result stays in `verdicts/X-5c-F4-F1-F1.md`.
+
+**Step 1 — X5-R41 (commit f69e94b5).** A round is selected when all
+hold: a targeted crash (`seed / 10` even), no drop this round, and a
+draw from the new `S_R41` stream below `r41_share` permille — nothing
+is drawn at share 0, and every content draw comes from the second new
+stream `S_R41C`, so an unselected round consumes nothing (BASE's
+scripts are bit-for-bit the generator's; the 54-seed BASE pin still
+passes). The block, at the front of the GC task after the barrier:
+two sync-on commits of 20 Puts each at the value ceiling (a dense run
+of 40 keys in tree `tm`), two sync-on commits of Deletes of those
+keys, `R41Wait`, `Gc { tree: tm }`, one sync-on commit of 20 Puts at
+the ceiling (a dense run in a tree other than `tm`), `R41Done`; a
+`R41Arm { idx: knobs.target_ckpt }` goes before the barrier. The hold
+lives in the checkpointer's hook closure: at `After0` of the armed
+checkpoint, before the crash arm, it sets the window flag and
+spin-yields until `R41Done`, `workload_done`, a task error, or the
+fixed 20,000-turn budget (`R41_TURNS`; no wall clock). `R41Wait`
+spin-yields on the flag, `workload_done`, `tasks_left <= 1`, or the
+same budget. Why this is not contrived: a real checkpoint over a
+large dirty set stays open far longer than one tree sweep; the spike's
+window is short only because its dirty set is small.
+
+**Step 2 (commit 58e99890) — the record fields, never digest inputs.**
+`q4reuse` (the store's new `ckpt_reuse` observable: `alloc_lpid`
+handing out an LPID freed since this flip, reset per window beside
+`ckpt_splits`/`ckpt_merges`), `imgsp`/`imgmg`/`imgreuse` (the same
+counts for the window of the last checkpoint whose step 5 returned,
+from the harness's per-checkpoint ledger), `q4i_raw` (the window of
+the checkpoint whose meta the round's **final recovery opened**, by
+that meta's `ckpt_id` through a per-seed ledger kept for the whole
+seed — a meta rollback reads the older image's window, never the last
+step-5 checkpoint's, and the harness checkpoint's id is dropped after
+each round so its meta finds no row) and `q4i` (`q4i_raw` ∧ the
+round's crash fired ∧ Q18's `end.is_some()`, in `q4i_of`). The JSON
+round-trips all six. The store also gains exactly the two X5-R43
+`Mutant` variants, inert when `cfg.mutant` is `None`, at the gate's
+`patch.py` sites. **The reuse window is the whole flip window (the
+flip through step 5), the field definition of step 2 — the Q4-I row's
+"reused before its step 2 froze the table" is the coverage intent it
+serves; a reuse after the freeze but before step 5 counts.**
+
+**Step 4/5 — the three shares over 0..200, each with only that knob,
+then reverted; probe, not evidence.** Same session, 16 threads,
+`ulimit -v 25165824`, outputs outside the worktree. CPU is user+sys of
+the run command; wall beside it.
+
+| probe, not evidence | BASE | R41 1000 | R41 800 | R41 600 |
+|---|---|---|---|---|
+| rounds | 304 | 308 | 307 | 304 |
+| Q4 | 0 | 28 | 23 | 18 |
+| Q4 × 50 | 0 | **1,400** | 1,150 | 900 |
+| Q5a (row 200) | 3 | 4 | 2 | 2 |
+| Q7 (row 200) | 6 | 6 | 7 | 7 |
+| Q18 (row 1,000) | 19 | 94 | 84 | 63 |
+| q4i_raw / q4i | 4 / 4 | 30 / 30 | 27 / 27 | 18 / 18 |
+| **Q4-I × 50** | 200 | **1,500** | 1,350 | 900 |
+| imgboth (imgsp ∧ imgmg rounds) | 1 | 35 | 31 | 21 |
+| imgru (imgreuse ≥ 1 rounds) | 4 | 35 | 32 | 22 |
+| CPU s (wall s) | 163 (13.3) | 331 (36.8) | 299 (35.3) | 251 (34.0) |
+| CPU vs BASE | — | +103% | +83% | +54% |
+| failing rounds | 8 r0, 178 r1 | 178 r1 | 178 r1 | 8 r0, 178 r1 |
+
+The failing rounds are the known pair (both MP O-3 (e) (ii) amcheck
+findings, F4's MP-A class); the alignment makes 8 r0 pass at 1000/800
+and leaves 178 r1 untouched. No new failure class appeared under any
+share (no class C O-1 without XX001, no C-XX, no deadlock, no livelock
+— `DEADLOCK=0 PANIC=0 DEFECT_SEEDS=0` everywhere).
+
+**The decision rule, verbatim (fixed before any probe).** *Met: Q4 ×
+50 ≥ 1,500, with no Q5a, Q7 or Q18 below the lower of its row and
+BASE's own count × 50 on the same seeds, and CPU ≤ +60% of BASE. Also,
+because the owner chose option A: the image arm with reuse × 50 ≥
+1,500. Hand off the setting for F4's REFRESH. Not met by all three:
+ESCALATE with the numbers. Q4 is never lowered or redefined by a card,
+a gate or an orchestrator.*
+
+Applied (the floors: Q5a min(200, 3×50=150)=150; Q7 min(200, 6×50=300,
+row 200)=200; Q18 min(1000, 19×50=950)=950; "the image arm with reuse"
+read as `q4i`, the row's own quantity — `q4i_raw` and `imgreuse` are
+reported beside it):
+
+- **1000: NOT MET.** Q4 ×50 = 1,400 < 1,500; CPU +103% > +60%; the
+  image arm ×50 = 1,500 ≥ 1,500 (exactly); Q5a 200 ≥ 150, Q7 300 ≥
+  200, Q18 4,700 ≥ 950.
+- **800: NOT MET.** Q4 1,150; CPU +83%; image arm 1,350; floors held.
+- **600: NOT MET.** Q4 900; CPU +54% (met); image arm 900; floors held.
+
+**NOT MET by all three → no setting is handed off; ESCALATE with the
+numbers** (Q4 at the best share reads 1,400 per 10k against the
+1,500 bar; the prototype's 1,760-per-10k reading predates this card's
+own `!knobs.drop_tree` selection clause, which removes a third of the
+selected rounds). Q4's definition and threshold are untouched.
+
+**Step 6 — X5-R42 (commit dc11158d).** `verify`'s exit rule gains the
+Q4-I row (≥ 1,000 `q4i` rounds over the whole 10k, printed beside the
+5.6 table and counted in its miss total) and its reproduction check
+(a per-round `q4i` mismatch between the file and the re-run counts the
+seed as non-reproducing; `q4i` stays out of the digest so X5-R37's
+BASE literals cannot move). At this tip FINAL == BASE, so the row
+reads short there; no Acceptance line runs `verify`.
+
+**Step 7 — X5-R43 (commits f921a2a2 and the correction c3d1b4b5).**
+The `seeded-faults` subcommand runs the range three times at the
+campaign's tuning (clean, Joint `M-REUSE-DROPS-IMG`, Slot
+`M-FREE-HOME-ALLOC`). A **new failing round** fails O-1, O-2 or O-3 in
+the mutant's arm and **passes the oracle** in the clean arm
+(no O-1/O-2/O-3 text — the pin's own wording, "a literal seed the
+oracle fails on with the mutant and passes on without it"; the first
+draft subtracted the clean arm's *fold* pass instead, which counted 46
+MP detection rounds whose failure texts are identical between the
+arms — a fault that changed nothing — and is corrected in c3d1b4b5).
+Deadlock, panic and monitor-only hits never count. Caught is ≥ 5 new
+failing rounds with ≥ 1 arm-predicate hit (`q4i_raw` for Joint,
+`q4_split_merge` for Slot); the exit is non-zero if either fault is
+not caught. Measured over 0..200, 16 threads:
+
+| arm (probe, not evidence) | at BASE (share 0) | at share 1000 |
+|---|---|---|
+| Joint new failing rounds | 1 (`63r1`) | **19** (all at After4–After6/Mid6) |
+| Joint with `q4i_raw` | 1 | **6** |
+| Joint verdict | NOT CAUGHT (< 5) | **CAUGHT** |
+| Slot new failing rounds | 0 | **0** |
+| Slot with `q4_split_merge` | 0 | 0 |
+| Slot verdict | NOT CAUGHT | **NOT CAUGHT** |
+
+The Joint catches at share 1000, by crash position: After4@0 ×1,
+After4@1 ×2, After5@1 ×3, After5@2 ×1, After6@0 ×1, After6@1 ×2,
+After6@2 ×3, Mid6@0 ×2, Mid6@1 ×4 — exactly the gate's "all at
+After4–After6" shape, and the gate's own "0 failing among Q4-window
+reuse rounds" held too: **no Q4 round (a steps-0–3 crash) catches the
+Joint fault**; its 6 arm-predicate hits are `q4i_raw` rounds (the
+completed-window arm), consistent with the verdict's finding that
+Q4's crash position cannot see the joint case. The Slot fault reads
+**zero new failing rounds at every setting measured** (BASE and share
+1000): its damage lands only in rounds that already carry oracle
+texts (MP media detections) or pass — with no catch, the Caught rule
+fails and with it the card's own bar, "**A fault not caught at the
+chosen share is an ESCALATE, with no hand-off.**"
+
+**M-FREE-HOME-ALLOC is UNCAUGHT** (no catcher exists over the card's
+probe range; the named pin `x5_r43_free_home_alloc_is_caught` cannot
+be written and is not — reported, never hidden). All other named
+mutants were applied to the real code, shown failing their named
+test, and reverted clean (`git diff` empty of the mutant each time):
+
+| mutant | catching test (each shown failing, then reverted clean) |
+|---|---|
+| M-R41-NOHOLD (hold returns at once) | `x5_r41_aligned_round_has_q4_and_reuse` (digest 47420405 ≠ 1771266996) |
+| M-R41-WRONGWINDOW (hold/gate key on checkpoint 0) | the same pin (digest 4213423696; the pin's seed has `idx` 1) |
+| M-R41-NOPREP (the block's Deletes removed) | the same pin (digest 2823454535; `q4mg` falls) |
+| M-R41-DRAW (`S_R41` drawn at share 0, fed into `S_GEN`) | `x5_r37_base_tuning_reproduces_1b0ce54e` (seed 0's BASE digest moved) |
+| M-R41-AFTERCRASHARM (hold after the crash arm) | the same pin (digest 47420405; the pin's seed's hook is `After0`) |
+| G-Q4MG-FROM-SPLITS (`q4mg` from `obs.splits`) | the exact-value pin (`q4mg` 4 ≠ 8) |
+| M-REUSE-DROPS-IMG | `x5_r41_completed_window_arm` (seed 142's digest 2081828015 ≠ 1664460399 and the clean round fails the oracle) |
+| M-FREE-HOME-ALLOC | **UNCAUGHT** — no catcher exists over 0..200 at BASE or share 1000 |
+| M-Q4I-LASTCKPT (`q4i_raw` reads the last step-5 checkpoint) | `x5_r42_q4i_keys_on_the_opened_image` |
+| M-Q4I-REFUSED (`q4i` drops `end.is_some()`) | `x5_r42_refused_round_is_not_q4i` |
+| M-Q4I-NOFLOOR (the row's minimum to 0) | `x5_r42_row_at_999_and_1000` |
+| M-Q4I-NOREPRO (the re-run comparison removed) | `x5_r42_flipped_q4i_fails_reproduction` |
+| M-SEEDED-NOBASELINE (no clean-arm subtraction) | `x5_r43_known_failures_are_not_new` |
+| M-SEEDED-NOARMRULE (the arm predicates dropped) | `x5_r43_caught_needs_the_arm_predicate` |
+
+**Pins (step 3, commit c1e879f5).** `x5_r41_not_drawn_at_base`
+(`r41_pick` draws nothing at share 0; the BASE-digest half is the
+54-seed pin), `x5_r41_aligned_round_has_q4_and_reuse` (seed 21 r0 at
+`r41_share` 1000: crash `After0@1`, `q4sp` **4** and `q4mg` **8**
+exact — verdict finding 3: exact values, 4 ≠ 8 — `q4reuse` ≥ 1,
+digest 1771266996), `x5_r41_completed_window_arm` (seed 142 r1:
+`After5@1`, `imgsp`/`imgmg`/`imgreuse` **15/12/9** exact, `q4i_raw`,
+clean oracle-clean, and the Joint fault's arm fails the oracle on the
+same round), `x5_r42_q4i_keys_on_the_opened_image` (the ledger lookup's
+discriminating case, and seed 148 r0: `imgreuse` **5** with `q4i_raw`
+**false**), `x5_r42_refused_round_is_not_q4i`, and the campaign-side
+pins of steps 6/7. The literals are probe-found at the first probe
+share (1000) — no setting met the rule, so nothing was handed off;
+the pins pin the machinery, not a chosen setting, and are labelled
+probe-found, never evidence for a quota claim.
+
+**What F4 inherits.** No `r41_share` is handed off (the rule is NOT
+MET by all three; the ESCALATE carries the table above). The
+machinery is in place and inert at share 0; X5-R42's row and its
+reproduction check are in `verify`; the `seeded-faults` subcommand is
+F4's to run on FINAL in its Acceptance (REFRESH 9), where the Joint
+fault must be caught and the Slot fault's fate is the owner's to
+decide (this card's ESCALATE).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
