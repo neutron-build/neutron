@@ -4408,8 +4408,10 @@ pub fn derive_written_acked(
 /// its place, so an event stream that could otherwise let the replay
 /// read bytes the workload never saw returned fails the round loudly
 /// through `task_error` instead of mis-deriving `written`. Returns the
-/// first violation's description, if any.
-fn r47_issue_return_paired(events: &[DiskEvent]) -> Option<String> {
+/// first violation's description, if any. Pub for its directed pin
+/// (`r47_pairing_guard_names_an_unpaired_write`), as the X5-R34
+/// guards are.
+pub fn r47_issue_return_paired(events: &[DiskEvent]) -> Option<String> {
     for (i, e) in events.iter().enumerate() {
         if let DiskEvent::WriteIssued { inode, off, bytes } = e {
             let paired = matches!(

@@ -1649,6 +1649,306 @@ fn name1_of() -> String {
     e4_recovery::harness::x5r34_seg_name(65536)
 }
 
+// ---- X5-R47 (card X-5c-F4-F1-F1-O1C-F1): the replay's self-tests ----
+
+/// **X5-R47, 1066 r0's literal shape:** a recycled file's earlier-life
+/// write `[206, 10897)` (issued first, its own old-life record at 206)
+/// sits at a map key between the new life's write key 0 and the new
+/// record at 2453 — under the pre-X5-R47 `stitched` resolver the
+/// greatest key ≤ 2453 picked the **old** write's bytes and the new
+/// record never entered `ts_pos`, capping `hi` one commit below the
+/// recovered frontier (verdict X-5c-F4-F1-F1-O1C). Under the replay,
+/// the later-issued bytes replace the earlier ones and **both** new
+/// records — at 0 and at 2453 — are written. **M-R47-KEY-COVER** (the
+/// old greatest-key resolver restored) fails this pin: ts 21 stays
+/// unwritten behind the old write.
+#[test]
+fn r47_new_life_record_behind_old_write() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 2usize;
+    let seg_a = 196608u64; // 3 * WAL_SEG: the recycled segment's first LSN
+    // The old life's write [206, 10897): its own record at 206, then
+    // zeros (an earlier segment-0 body that never held the new life).
+    let mut old = x5r34::rec(5, 206, 2000);
+    old.resize(10897 - 206, 0);
+    // The new life's single batch [0, 5046): ts 20's record at 0 and
+    // ts 21's at 2453 — 1066's exact positions and lengths.
+    let mut new = x5r34::rec(20, seg_a, 2453);
+    new.extend_from_slice(&x5r34::rec(21, seg_a + 2453, 2593));
+    assert_eq!(old.len(), 10897 - 206);
+    assert_eq!(new.len(), 5046);
+    let mut ev = x5r34::Ev::new();
+    ev.write(inode, 206, &old).write(inode, 0, &new);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(20u64, (false, seg_a, 2453));
+    commits.insert(21u64, (false, seg_a + 2453, 2593));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, seg_a, &bindings);
+    assert_eq!(
+        written,
+        vec![20u64, 21],
+        "the new life's records at 0 and 2453 are both written — the\
+         \nold life's earlier write cannot shadow them (X5-R47: no\
+         \nresolver by key)"
+    );
+    assert_eq!(
+        acked,
+        vec![20u64, 21],
+        "SyncOff's acked stays iff written (both commits are SyncOff)"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "both records parse at their own lsns — no F1"
+    );
+}
+
+/// **X5-R47's monotone clause:** a record whose bytes a later life
+/// overwrites stays written — once written, always written; the test
+/// is never made against the final image alone. **M-R47-FINAL-IMAGE**
+/// (testing the final image only) fails this pin: the final image
+/// holds only the overwriting garbage, and the commit would unwrap.
+#[test]
+fn r47_earlier_life_record_stays_written() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 3usize;
+    let rec = x5r34::rec(9, 1000, 500);
+    let mut ev = x5r34::Ev::new();
+    // The earlier life's record at [1000, 1500), then the recycle's new
+    // life overwriting [900, 1600) wholesale with its own bytes.
+    ev.write(inode, 1000, &rec)
+        .write(inode, 900, &vec![0xCDu8; 700]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(9u64, (false, 1000, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![9u64],
+        "the record was held by the image after its own write — the\
+         \nlater life's overwrite does not unwrite it (monotone)"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "the garbage at the position has no magic — no F1"
+    );
+}
+
+/// **X5-R47's negative space:** a commit with no bytes issued at all,
+/// and one whose record's last byte is never issued (a torn tail, a
+/// normal crash outcome), stay unwritten and unreported. **M-R47-ALL-
+/// WRITTEN** (every commit written) fails this pin.
+#[test]
+fn r47_never_issued_stays_unwritten() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 4usize;
+    let mut ev = x5r34::Ev::new();
+    // ts 30's record, whole (the positive control); ts 31 has no bytes
+    // issued anywhere; ts 32's record misses exactly its last byte.
+    ev.write(inode, 30000, &x5r34::rec(30, 30000, 400));
+    let torn = x5r34::rec(32, 60000, 500);
+    ev.write(inode, 60000, &torn[..torn.len() - 1]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(30u64, (false, 30000, 400));
+    commits.insert(31u64, (false, 50000, 300));
+    commits.insert(32u64, (false, 60000, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![30u64],
+        "only the whole record marks its commit written: ts 31 was\
+         \nnever issued and ts 32's last byte never was"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "a never-written record and a torn tail are not F1: ts 32's\
+         \nheader fits its segment (no len past the end)"
+    );
+}
+
+/// **X5-R47's identity clause:** the image must hold a record that
+/// `dec_record` accepts **with its own `lsn`** and with `rec.ts == ts`
+/// — a valid record at the position with another lsn (a recycled
+/// segment's stale content, §12.5's position rule), and one with the
+/// same lsn but another ts (another commit's record), both leave the
+/// commit unwritten. **M-R47-NO-TS** (dropping `rec.ts == ts`) fails
+/// this pin through the same-lsn case.
+#[test]
+fn r47_wrong_record_at_position_stays_unwritten() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 6usize;
+    let mut ev = x5r34::Ev::new();
+    // ts 40 at 50000: the positive control (a correct record).
+    // ts 41's lsn lands at 30000, where a *stale* record with its own
+    // lsn 30000 lives; ts 42's lsn lands at 40000, where a record with
+    // the same lsn carries another commit's ts.
+    ev.write(inode, 30000, &x5r34::rec(91, 30000, 500))
+        .write(inode, 40000, &x5r34::rec(92, 40000, 500))
+        .write(inode, 50000, &x5r34::rec(40, 50000, 400));
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(40u64, (false, 50000, 400));
+    commits.insert(41u64, (false, 65536 + 30000, 500));
+    commits.insert(42u64, (false, 40000, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![40u64],
+        "only the record with its own lsn and this commit's ts counts:\
+         \nts 41 found a stale-lsn record and ts 42 another commit's"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "both foreign records fit their segments — no F1"
+    );
+}
+
+/// **X5-R47's F1 by the same replay:** a commit whose record header
+/// sits at the segment-relative position with its own lsn and a length
+/// past the segment end — written, never parseable — is reported even
+/// when an old-life write's key covers the header's position (the
+/// masking shape: the new batch starts below the header, the old write
+/// was issued at a key between the two). **M-R47-NO-F1** (no report)
+/// fails this pin.
+#[test]
+fn r47_f1_on_recycled_file() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 5usize;
+    // The over-cap record: header at 65000 saying len 1000 — 65000 +
+    // 1000 runs past WAL_SEG. Only its first 24 bytes are ever issued,
+    // as the tail of a batch that starts at 64800.
+    let over = x5r34::rec(51, 65000, 1000);
+    let mut batch = vec![0x11u8; 200];
+    batch.extend_from_slice(&over[..24]);
+    assert_eq!(batch.len(), 224);
+    let mut ev = x5r34::Ev::new();
+    // The old life's write [64900, 65200) — its key 64900 sits between
+    // the batch's key 64800 and the header at 65000, and covers 65000.
+    ev.write(inode, 64900, &vec![0xEEu8; 300])
+        .write(inode, 64800, &batch);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(51u64, (false, 65000, 1000));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert!(
+        written.is_empty(),
+        "a header whose len runs past the segment is never a whole\
+         \nrecord — the commit is not written"
+    );
+    assert_eq!(
+        unparsed,
+        vec![51u64],
+        "the replay saw the header with its own lsn behind the old\
+         \nlife's write — F1 reports it (the loud half)"
+    );
+}
+
+/// **X5-R47's pairing guard** (the `returned_end` extent test's
+/// replacement): `SimDisk::write_at` emits `WriteIssued` and its
+/// `WriteReturned` in one step, so a paired stream passes quietly and
+/// any `WriteIssued` without its immediately following own return —
+/// absent, or with a different length — is named for the round's
+/// `task_error`.
+#[test]
+fn r47_pairing_guard_names_an_unpaired_write() {
+    use e4_recovery::sim::DiskEvent;
+    let paired = {
+        let mut ev = x5r34::Ev::new();
+        ev.write(7, 0, &x5r34::rec(3, 0, 500));
+        ev
+    };
+    assert!(
+        e4_recovery::harness::r47_issue_return_paired(&paired.events).is_none(),
+        "a stream of paired writes passes the guard"
+    );
+    // No return at all: the next event is a sync.
+    let missing = vec![
+        DiskEvent::WriteIssued {
+            inode: 7,
+            off: 40,
+            bytes: vec![1u8; 60],
+        },
+        DiskEvent::SyncIssued {
+            inode: 7,
+            all: false,
+        },
+    ];
+    let why = e4_recovery::harness::r47_issue_return_paired(&missing)
+        .expect("an unpaired WriteIssued is named");
+    assert!(
+        why.contains("E[0]") && why.contains("len 60"),
+        "the guard names the event index and length: {why}"
+    );
+    // A return with a different length is not its own.
+    let wrong_len = vec![
+        DiskEvent::WriteIssued {
+            inode: 7,
+            off: 40,
+            bytes: vec![1u8; 60],
+        },
+        DiskEvent::WriteReturned {
+            inode: 7,
+            off: 40,
+            len: 59,
+        },
+    ];
+    assert!(
+        e4_recovery::harness::r47_issue_return_paired(&wrong_len).is_some(),
+        "a WriteReturned with a different length does not pair"
+    );
+}
+
+/// **X5-R47 on the three rounds** (verdict X-5c-F4-F1-F1-O1C's, at
+/// this tip): 1066, 6555 and 7590 r0 — the faultless class C rounds
+/// whose recovered frontier sat one commit above the stitched walk's
+/// `hi` — now pass with `hi` raised to the replayed last WAL-written
+/// commit, exactly the F2-tip values the card quotes (CXX moved none
+/// of them; the pre-change values at this tip were (20, 20, —, 21)
+/// fail, (22, 23, —, 24) fail, (19, 20, —, 21) fail). 6555's rounds 1
+/// and 2 continue passing, as the verdict's re-judgement measured.
+#[test]
+fn r47_three_rounds() {
+    let want: &[(u64, u64, u64, u64, u64)] = &[
+        // (seed, lo, hi, c, frontier)
+        (1066, 20, 21, 21, 21),
+        (6555, 22, 24, 24, 24),
+        (7590, 19, 21, 21, 21),
+    ];
+    for (seed, lo, hi, c, frontier) in want {
+        let rec =
+            e4_recovery::workload::run_seed_with(*seed, None, &e4_recovery::workload::Tuning::BASE);
+        let rr = rec
+            .rounds
+            .first()
+            .expect("the seed must reach round 0 (the pin's subject)");
+        assert!(rr.pass, "seed {seed} r0 must pass under X5-R47");
+        assert_eq!(
+            (rr.lo, rr.hi, rr.c, rr.frontier),
+            (*lo, *hi, Some(*c), *frontier),
+            "seed {seed} r0: (lo, hi, c, frontier)"
+        );
+        if *seed == 6555 {
+            for (ri, r) in rec.rounds.iter().enumerate().skip(1) {
+                assert!(r.pass, "seed 6555 r{ri} continues passing: {r:?}");
+            }
+        }
+    }
+}
+
 /// **X-5c-F3-F3a-F3, the folded follow-up (S, test-only; F3-F3b's step
 /// 0′): X5-R35 (a)'s slicing rule held on a real seed, not only by the
 /// (g) 6 event fixture.** The seed driver runs seed 403 through round 1:
