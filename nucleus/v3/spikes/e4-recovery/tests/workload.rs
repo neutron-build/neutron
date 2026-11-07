@@ -1429,6 +1429,54 @@ fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
     }
 }
 
+/// **X5-R48 pin (card X-5c-F4-F1-F1-CXX-F1; literal config = seed 7469,
+/// verdict X-5c-F4-F1-F1-CXX's finding 1).** Round 1 of the MW seed
+/// 7469: the twin fires at the drawn `Mid2@0`, the real round's first
+/// attempt does not (its complete masks read `[3f7, 3ff, 3f7, 3ff,
+/// ...]`), so the real round re-derives `Mid2@1` — and the R21 (c)
+/// re-pair runs the twin at that spec on a chain that diverged from
+/// the real one: the twin's own complete masks read `[3ff, 3f7, 3ff,
+/// 3f7, ...]`, its checkpoint 1 never reaches `Mid2`, the crash never
+/// fires and the fired-guard fails the seed — at CXX's tip the one
+/// defect seed of 0..10000. X5-R48's joint spec (the per-index AND of
+/// the two complete mask lists, `[3f7, 3f7, 3f7, 3f7, 3ff, 3ff, 3ff,
+/// 3ff]`) re-derives `Mid2@4`, and the twin and the real round both
+/// re-run there and fire: no defect, every round paired, round 1's
+/// crash of record `Mid2@4` and fired. Under M-R48-REAL-MASKS-ONLY
+/// (the second re-derive consulting the real round's masks alone) the
+/// joint draw returns `Mid2@1` again, the re-paired twin never fires,
+/// and the fired-guard defect returns — this pin fails.
+#[test]
+fn r48_repaired_twin_fires_at_the_joint_spec() {
+    let rec = workload::run_seed_with(7469, None, &workload::Tuning::BASE);
+    assert!(
+        rec.defect.is_none(),
+        "seed 7469: the re-paired twin's fired-guard defect is back: {:?}",
+        rec.defect
+    );
+    assert_eq!(
+        rec.twin_paired.len(),
+        rec.rounds.len(),
+        "seed 7469: the pairing flag must cover every executed round"
+    );
+    assert!(
+        rec.twin_paired.iter().all(|p| *p),
+        "seed 7469: a round ran with a twin at a different crash spec (Work 2.5 break)"
+    );
+    assert!(
+        rec.rounds.len() >= 2,
+        "seed 7469: the literal shape needs its second round"
+    );
+    assert_eq!(
+        rec.rounds[1].crash, "Mid2@4",
+        "seed 7469: round 1 must run the joint spec (X5-R48)"
+    );
+    assert!(
+        rec.rounds[1].fired,
+        "seed 7469: round 1's joint-spec crash must fire"
+    );
+}
+
 /// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
 /// loud defect, never a hang.** The draft's `reachable_hook_spec`
 /// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with
