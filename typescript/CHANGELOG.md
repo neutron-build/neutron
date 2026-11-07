@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## 2026-11-07
+
+core 0.5.4, cli 0.5.4.
+
+### Security
+
+- A second spelling of a path (`/%61dmin`, `//admin`, `/admin%2F`) could reach a
+  route without passing global middleware that names it, because middleware
+  matches on the URL and the router on the decoded path. The server now redirects
+  every request to one spelling (308) before anything reads the path, and the
+  router treats an encoded `/` as part of a segment, never as a separator. Applies
+  to `createServer` and the docker adapter. See GHSA-4h4w-hf8m-4mj4.
+
+### Changed
+
+- `maxRequestBodyBytes` now defaults to 10 MiB, in `createServer` and the docker
+  adapter (`NEUTRON_MAX_BODY_BYTES`), so a route that reads its body before
+  authenticating cannot be made to hold arbitrary memory. Apps taking larger
+  uploads directly must raise it; 0 turns it off.
+
 ## 2026-11-05
 
 core 0.5.3, cli 0.5.3, create 0.1.12, agents 0.3.0, ai 0.1.3, auth 0.1.7,

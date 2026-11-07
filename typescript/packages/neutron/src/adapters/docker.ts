@@ -168,9 +168,31 @@ const MIME_TYPES = {
   ".txt": "text/plain; charset=utf-8",
 };
 
+// The server's default (ServerOptions.maxRequestBodyBytes). 0 turns it off.
+const MAX_BODY_BYTES = process.env.NEUTRON_MAX_BODY_BYTES === undefined ? 10 * 1024 * 1024 : Number(process.env.NEUTRON_MAX_BODY_BYTES);
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", \`http://\${req.headers.host || "localhost"}\`);
+    // The server's own rule (core/route-path.ts): one spelling of every path,
+    // so middleware matching on the URL and the router cannot disagree.
+    const canonical = url.pathname
+      .replace(/\\/{2,}/g, "/")
+      .replace(/%([0-9a-fA-F]{2})/g, (escape, hex) => {
+        const char = String.fromCharCode(parseInt(hex, 16));
+        return /[A-Za-z0-9\\-._~]/.test(char) ? char : escape.toUpperCase();
+      });
+    if (canonical !== url.pathname) {
+      res.statusCode = 308;
+      res.setHeader("Location", canonical + url.search);
+      res.end();
+      return;
+    }
+    if (MAX_BODY_BYTES > 0 && Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
+      res.statusCode = 413;
+      res.end("Request body too large");
+      return;
+    }
     const pathname = decodeURIComponent(url.pathname);
 
     // A prebuilt HTML file answers only where no app route claims the path
@@ -308,6 +330,16 @@ function streamFile(req, res, filePath, pathname) {
   });
 }
 
+// A body with no Content-Length, or a false one: the read fails past the cap.
+async function* capBody(stream) {
+  let read = 0;
+  for await (const chunk of stream) {
+    read += chunk.length;
+    if (MAX_BODY_BYTES > 0 && read > MAX_BODY_BYTES) throw new Error("Request body too large");
+    yield chunk;
+  }
+}
+
 function toWebRequest(req) {
   const url = new URL(req.url || "/", \`http://\${req.headers.host || "localhost"}\`);
   const headers = new Headers();
@@ -327,7 +359,7 @@ function toWebRequest(req) {
   return new Request(url.toString(), {
     method,
     headers,
-    body: hasBody ? req : undefined,
+    body: hasBody ? capBody(req) : undefined,
     duplex: hasBody ? "half" : undefined,
   });
 }

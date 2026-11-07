@@ -109,25 +109,48 @@ export function comparePathSpecificity(a: string, b: string): number {
   return 0;
 }
 
+const UNRESERVED = /[A-Za-z0-9\-._~]/;
+
+/**
+ * The one spelling of a request path, per RFC 3986 6.2.2: repeated slashes
+ * collapse, escapes of unreserved characters decode, other escapes get
+ * uppercase hex. The server redirects any other spelling here before anything
+ * reads the path, so middleware matching on the URL and the router can never
+ * disagree about which route a request is for: `/%61dmin`, `/admin` and
+ * `//admin` are one route. An encoded "/" stays encoded, see normalizePathname.
+ */
+export function canonicalRequestPath(pathname: string): string {
+  return pathname
+    .replace(/\/{2,}/g, "/")
+    .replace(/%([0-9a-fA-F]{2})/g, (escape, hex: string) => {
+      const char = String.fromCharCode(parseInt(hex, 16));
+      return UNRESERVED.test(char) ? char : escape.toUpperCase();
+    });
+}
+
+/**
+ * The path the router matches: segments split on the "/" in the URL, then each
+ * is decoded. A decoded "/" stays inside its segment as `%2F`, so `/admin%2F`
+ * is one segment that no static route `/admin` matches, instead of `/admin/`.
+ */
 export function normalizePathname(pathname: string): string | null {
-  let decoded: string;
+  let segments: string[];
   try {
-    decoded = decodeURIComponent(pathname || "/");
+    segments = (pathname || "/").split("/").map((segment) => decodeURIComponent(segment));
   } catch {
     return null;
   }
 
-  // Traversal is a whole segment equal to "..", not a substring: `/a..b`
-  // and `/v1.2..3` are legal paths, `/a/../b` is not.
+  // Judged on the fully decoded path, so an encoded separator hides nothing.
+  // Traversal is a whole segment equal to "..", not a substring: `/a..b` and
+  // `/v1.2..3` are legal paths, `/a/../b` is not.
+  const decoded = segments.join("/");
   if (!decoded.startsWith("/") || decoded.includes("\\") || decoded.includes("\0") || decoded.split("/").includes("..")) {
     return null;
   }
 
-  if (decoded.length > 1 && decoded.endsWith("/")) {
-    return decoded.slice(0, -1);
-  }
-
-  return decoded;
+  const routed = segments.map((segment) => segment.replaceAll("/", "%2F")).join("/");
+  return routed.length > 1 && routed.endsWith("/") ? routed.slice(0, -1) : routed;
 }
 
 export interface NotFoundMatch {
