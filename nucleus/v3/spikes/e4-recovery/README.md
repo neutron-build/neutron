@@ -1842,6 +1842,52 @@ first at checkpoint k+1's `Mid6` (pending at its `After5`).
   `src/store/prims.rs` empty after the revert; the named tests green
   at the reverted tip.
 
+**Step 4 — share 1000 over 0..200 (this commit).** A scratch export
+of the whole workspace outside the worktree (this sandbox's
+`~/.cache/nv3-review` is read-only, so the export lives under
+`/tmp/nv3-container-jc_2ajyd/opencode/X-5c-F4-F1-F1-F3-F2-F1/src/`,
+target dir beside it), with the probe knob the only edit
+(`r41_share: 0 → 1000` in both `Tuning::BASE` and `Tuning::FINAL`;
+the gate's own a1 used its `E4G_R41=1000` scratch form — same run).
+The committed crate is untouched (the knob reverted, `git diff`
+clean). One 200-seed run at 16 threads under `ulimit -v 25165824`:
+`MONITOR=0`, `DEADLOCK=0`, `PANIC=0`, `DEFECT_SEEDS=0`, failing
+rounds 1 (the known `8r0`).
+
+- **vs `m/a1.json`, per (seed, round) and per twin under X5-R51
+  (a)–(e):** 62 digests moved; no fold regression, no bullet-3 hit, no
+  class change, and **no twin round changed a text**. The reference
+  comparator form (paths/range pointed at these files) agrees with my
+  per-round table:
+
+  ```
+  DIGESTS_MOVED 62 FAILING_ROUNDS 1 MONITOR 0
+  MOVED_GAINED 1 [(47, 1)]
+  MOVED_MP_PENDING [(47, 1)]
+  MOVED_LOST 2 [(47, 0), (179, 0)]
+  HEALED 0 []
+  NEW_FAILING 0 [] BAD_SEEDS []
+  ```
+
+- **Moved-gained (1), with its (b)5 evidence:** 47 r1, MP, `poison`,
+  `O-1(a) at c=19: published {} != model {2, 3, 4, 5}` — single-seed
+  diag run at share 1000 (`E4_MPE_DIAG=1 E4_X33_DIAG=1`, its own line
+  `E4 SEEDS=1 … MONITOR=0`): amcheck (i) 5 findings, `tainted {9, 11,
+  36, 47, 85}`, slots `[9, 47, 85, 36, 11]` all in tainted — the same
+  explained shape as at BASE 0..1000.
+- **Moved-lost (2):** 47 r0 MP `After1@1`, Base text `O-1(a) at
+  c=17: published {} != model {2, 3, 4}` (the detection moved to the
+  new r1); 179 r0 MW `uniform@y:9755→132`, Base text `O-1(a) at c=6`
+  with `x33x`/`cover_err` true at the Base — the WAL-cover-loss shape,
+  exactly the verdict's finding 1.
+- **Healed: none.** **New failures: 0.**
+- **F3's share-1000 pins: none re-selected.** All of them
+  (`x5_r41_aligned_round_has_q4_and_reuse`,
+  `x5_r41_completed_window_arm`, the `x5_r42_*` and `x5_r43_*` rows)
+  meet their own predicates at their own seeds at this tip — the full
+  suite is green with them in it (262 passed, 0 failed, this step's
+  re-run).
+
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
