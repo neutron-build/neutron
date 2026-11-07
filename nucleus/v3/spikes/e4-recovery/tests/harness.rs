@@ -2168,6 +2168,15 @@ fn x33_damage_maps_through_the_bound_name() {
 /// process-global env var; the stderr side stays behind
 /// `E4_O1_AT_FRONTIER`, default off, and never moves the digest (the
 /// diff runs on a throwaway clone of the recovered world).
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the window collapsed —
+/// every r2 line now prints `lo=38 hi=38 frontier=38 T=35 c=38`
+/// (owner ts 38 > T 35, `le_T=false`, so the `le_T`-from-frontier
+/// mutant is still caught here), because the freed-home release moves
+/// the round's frontier onto its window bound; the clamp literals
+/// moved with it and, with `lo = hi = frontier`, this round no longer
+/// separates `c = lo`/`c = hi` on its own (5549's `c=34 < hi=35` still
+/// catches `c = hi`; see the anomaly note in the card's README record).
 #[test]
 fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
     e4_recovery::harness::o1f_capture_arm();
@@ -2184,17 +2193,17 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
         .find(|l| {
             l.contains("round=2")
                 && l.contains("tree=4")
-                && l.contains("lo=40")
-                && l.contains("hi=41")
-                && l.contains("frontier=41")
-                && l.contains("T=38")
-                && l.contains("c=41")
+                && l.contains("lo=38")
+                && l.contains("hi=38")
+                && l.contains("frontier=38")
+                && l.contains("T=35")
+                && l.contains("c=38")
         })
         .cloned();
     let Some(line) = hit else {
         panic!(
-            "1749 r2: the frontier candidate's line must name lo 40 / hi 41\
-             \n/ frontier 41 / T 38 at c=41 — got {lines:?}"
+            "1749 r2: the frontier candidate's line must name lo 38 / hi 38\
+             \n/ frontier 38 / T 35 at c=38 — got {lines:?}"
         );
     };
     check_le_t_agrees_with_owner_and_t(&line);
@@ -2211,6 +2220,16 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
 /// so `le_T` is false and a `le_T`-from-frontier computation (32 ≤ 32)
 /// breaks the agreement. The twin round's line (frontier 34, `T` 31)
 /// must not satisfy the literal.
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the window moved to
+/// `lo=34 hi=35 frontier=34 T=31 c=34` with the newest owner ts 34
+/// above `T` 31 — the freed-home release shifts the replay frontier,
+/// and the round's window slid up by what the twin's used to be. The
+/// clamp still does real work on the hi side (`c=34 < hi=35`, so
+/// FRONTIER-AS-HI prints 35 and fails the `c=34` match), the
+/// `le_T`-from-frontier mutant is still caught (34 > 31), and at this
+/// tip round 2 prints exactly one window (three tree lines), so no
+/// twin line can satisfy the literal either.
 #[test]
 fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
     e4_recovery::harness::o1f_capture_arm();
@@ -2226,31 +2245,31 @@ fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
         .iter()
         .filter(|l| {
             l.contains("round=2")
-                && l.contains("lo=30")
-                && l.contains("hi=33")
-                && l.contains("frontier=32")
-                && l.contains("T=29")
-                && l.contains("c=32")
+                && l.contains("lo=34")
+                && l.contains("hi=35")
+                && l.contains("frontier=34")
+                && l.contains("T=31")
+                && l.contains("c=34")
         })
         .cloned()
         .collect();
     assert!(
         !hits.is_empty(),
-        "5549 r2: the real MW round's line must sit at c=32 with frontier 32\
-         \n< hi 33 and T=29 — got {lines:?}"
+        "5549 r2: the real MW round's line must sit at c=34 with frontier 34\
+         \n< hi 35 and T=31 — got {lines:?}"
     );
     // The frontier is strictly inside the candidate window here: the
-    // clamp did real work (FRONTIER-AS-HI prints c=33).
+    // clamp did real work (FRONTIER-AS-HI prints c=35).
     assert!(
-        hits.iter().all(|l| l.contains("c=32 ")),
+        hits.iter().all(|l| l.contains("c=34 ")),
         "every matched line names the clamped candidate: {hits:?}"
     );
-    // The newest owner (32) is above T (29): le_T is false, and the
+    // The newest owner (34) is above T (31): le_T is false, and the
     // agreement check below is what a frontier-computed le_T breaks.
     assert!(
         hits.iter()
-            .any(|l| l.contains("owner_ts=32") && l.contains("le_T=false")),
-        "5549 r2's newest owner (ts 32, above T 29, at the frontier) must\
+            .any(|l| l.contains("owner_ts=34") && l.contains("le_T=false")),
+        "5549 r2's newest owner (ts 34, above T 31, at the frontier) must\
          \nprint le_T=false — got {hits:?}"
     );
     for line in hits.iter() {

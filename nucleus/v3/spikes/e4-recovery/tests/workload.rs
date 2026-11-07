@@ -127,13 +127,25 @@ fn smoke_16_seeds() {
 /// tip moved nothing else, and the contiguous 0..200 moved no digest
 /// and changed no record (the failing rounds stay the known 8/178
 /// pair, `DEFECT_SEEDS=0`).
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** 13 of the 54 moved
+/// with X5-R49 — 3 `923362676 -> 4196035152`, 47 `2526989435 ->
+/// 1878234829`, 112 `3003462667 -> 841173046`, 198 `95622311 ->
+/// 3654049329`, 303 `4147169426 -> 144621379`, 967 `2847369120 ->
+/// 3916549382`, 987 `2492798953 -> 1449471436`, 1749 `1584051239 ->
+/// 3785784973`, 2376 `3116539881 -> 926921172`, 2927 `1901399424 ->
+/// 1916772534`, 5549 `308297210 -> 3614535945`, 7469 `1393729414 ->
+/// 1742707490`, 7528 `122281874 -> 3346573892` (F2 measured them; the
+/// gate's verdict confirms; this card re-measured singly, same 13) —
+/// the freed-home release changes the allocation scan's yield pattern
+/// from a workload's first free onward, so the drawn crash points and
+/// slot numbers land elsewhere. The other 41 are byte-identical.
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
     const WANT: &[(u64, u64)] = &[
         (0, 49696441),
         (1, 1198539130),
         (2, 927823387),
-        (3, 923362676),
+        (3, 4196035152),
         (4, 1441374082),
         (5, 980071820),
         (6, 2097771150),
@@ -147,17 +159,17 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (14, 2027633753),
         (15, 3135194667),
         (41, 2325274127),
-        (47, 2526989435),
+        (47, 1878234829),
         (48, 605204002),
         (60, 2199024193),
         (66, 3628190779),
         (67, 1488955537),
-        (112, 3003462667),
+        (112, 841173046),
         (118, 4034749261),
-        (198, 95622311),
+        (198, 3654049329),
         (221, 2732451886),
         (268, 317704428),
-        (303, 4147169426),
+        (303, 144621379),
         (308, 522943877),
         (387, 2151920803),
         (403, 2657356820),
@@ -165,23 +177,23 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (660, 3256450980),
         (747, 4071845386),
         (907, 1749572610),
-        (967, 2847369120),
-        (987, 2492798953),
+        (967, 3916549382),
+        (987, 1449471436),
         (1267, 1225086008),
-        (1749, 1584051239),
+        (1749, 3785784973),
         (1769, 2372375821),
         (1787, 1119157608),
         (1887, 3622450829),
-        (2376, 3116539881),
+        (2376, 926921172),
         (2669, 357787865),
-        (2927, 1901399424),
+        (2927, 1916772534),
         (4049, 2182387428),
         (4309, 3466635396),
-        (5549, 308297210),
+        (5549, 3614535945),
         (5808, 2754578359),
         (6149, 123186068),
-        (7469, 1393729414),
-        (7528, 122281874),
+        (7469, 1742707490),
+        (7528, 3346573892),
         (8728, 3345856243),
         (9809, 1177349546),
     ];
@@ -251,16 +263,23 @@ fn x5_r37_final_equals_base_at_this_tip() {
 /// pin; the directed pin
 /// (`late_epoch_copy_must_not_enter_the_next_image`, `tests/store.rs`)
 /// holds the schedule itself.
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** 96 and 190 moved again
+/// (`4266526636 -> 1886292663` and `679383372 -> 3730452910`) — the
+/// freed-home release shifts the allocation scan's yields, so the
+/// exhausted-reserve interleavings that park these seeds' first-touch
+/// copies land at other points; the drop (what the pin holds) is
+/// unchanged and 104/161 are byte-identical.
 #[test]
 fn late_copy_count_is_zero_at_base() {
     // (seed, post-fix digest); 104 and 161 hit the path too but their
     // late installs were observably benign pre-fix — the digest is the
     // same either side, and pinning it keeps them under the pin.
     const WANT: &[(u64, u64)] = &[
-        (96, 4266526636),
+        (96, 1886292663),
         (104, 3776021738),
         (161, 3908247512),
-        (190, 679383372),
+        (190, 3730452910),
     ];
     for (seed, want) in WANT {
         let rec = workload::run_seed_with(*seed, None, &workload::Tuning::BASE);
@@ -451,7 +470,13 @@ fn x5_r38_w11_crash_reads_stale_at_start() {
 /// `Tuning::BASE` — the crash `uniform@y:17768` lands at the rename's
 /// yield with a checkpoint open whose begin step folded 235 ≥ 4·F = 184
 /// dirtied LPIDs, so the record's `szc` can only be true through the
-/// fold surviving the unwind into the snapshot. **M-RENAME-SWALLOW**
+/// fold surviving the unwind into the snapshot.
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the uniform crash
+/// moved `uniform@y:17768 -> uniform@y:15359` — the freed-home release
+/// shifts the scan yields, so the drawn uniform point lands elsewhere;
+/// at the new point the round still crashes at the rename's yield with
+/// the open checkpoint's fold (`szc` true, measured at this tip), so
+/// the pinned shape is unchanged. **M-RENAME-SWALLOW**
 /// (the `is_ok()` form restored) fails this pin (`szc` false, the
 /// gate's measurement: 15 of 15,386 rounds had the observable move
 /// after the fire); **M-RENAME-ANYERR** (a plain `?` on the rename —
@@ -468,7 +493,7 @@ fn szc_rename_crash_keeps_the_open_fold() {
         .get(2)
         .unwrap_or_else(|| panic!("seed 2376: three rounds"));
     assert_eq!(
-        r2.crash, "uniform@y:17768",
+        r2.crash, "uniform@y:15359",
         "seed 2376 r2: the pinned uniform crash at the recycle rename's yield"
     );
     assert!(r2.fired, "seed 2376 r2: the crash fired");
@@ -1454,6 +1479,13 @@ fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
 /// (the second re-derive consulting the real round's masks alone) the
 /// joint draw returns `Mid2@1` again, the re-paired twin never fires,
 /// and the fired-guard defect returns — this pin fails.
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the joint spec's draw
+/// moved `Mid2@4 -> Mid2@3` — checkpoint 1's slot numbering shifted
+/// when freed homes became allocatable, so the per-index AND of the two
+/// complete mask lists re-derives `Mid2@3`; the twin and the real
+/// round both still fire there (measured at this tip: 2 rounds, no
+/// defect, round 1 `Mid2@3` fired and passing).
 #[test]
 fn r48_repaired_twin_fires_at_the_joint_spec() {
     let rec = workload::run_seed_with(7469, None, &workload::Tuning::BASE);
@@ -1476,7 +1508,7 @@ fn r48_repaired_twin_fires_at_the_joint_spec() {
         "seed 7469: the literal shape needs its second round"
     );
     assert_eq!(
-        rec.rounds[1].crash, "Mid2@4",
+        rec.rounds[1].crash, "Mid2@3",
         "seed 7469: round 1 must run the joint spec (X5-R48)"
     );
     assert!(
@@ -1764,9 +1796,21 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
 /// `terr=true` and the round fails. A second revert arm (M-CKPOISONb:
 /// the mid-checkpoint `Fail::Poisoned` case removed) fails the same
 /// assertions whenever the mark lands mid-checkpoint.
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2; P's re-selection rule,
+/// fixed with X5-R51):** 967 r1 no longer exists — X5-R49 moved
+/// checkpoint 1's `map_root` from 11 to 10 when a freed slot was
+/// reused, so the same `Mid6@0` draw now fails the open in round 0 and
+/// the seed stops at one round. The replacement is **47**, the lowest
+/// seed in 0..1000 other than 747 whose BASE round 1 passes every
+/// assertion of this pin at the tip with the body unchanged (scanned
+/// over the tip's 0..1000 run: the qualifying seeds are 47, 67, 387,
+/// 527, 567, 747, 767, 788, 987); 47's r0 now ends in an R6 detection
+/// round and its r1 carries the `poison` crash, passing. 747 is not
+/// re-selected and still passes.
 #[test]
 fn g8_checkpoint_poison_ends_the_workload() {
-    for seed in [747u64, 967] {
+    for seed in [747u64, 47] {
         let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let r1 = &rec.rounds[1];
         assert!(
