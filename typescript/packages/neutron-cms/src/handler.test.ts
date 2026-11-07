@@ -434,6 +434,10 @@ test("the preview resolves the site's own image paths", async () => {
   const cookie = await logIn();
   const response = await call("/n-admin/preview", { method: "POST", cookie, body: form({ title: "T", body: "![](/img/a.jpg)" }) });
   const html = await response.text();
-  assert.match(html, /<base href="https:\/\/site\.test\/">/);
-  assert.match(html, /src="\/img\/a\.jpg"/);
+  assert.match(html, /src="https:\/\/site\.test\/img\/a\.jpg"/);
+  assert.doesNotMatch(html, /<base/);
+  const sized = await (await call("/n-admin/preview", { method: "POST", cookie, body: form({ title: "T", body: "![](/media/a-2000x1000.webp)\n\n[x](/about/) [y](https://other.test/z)" }) })).text();
+  assert.match(sized, /srcset="https:\/\/site\.test\/media\/a-2000x1000-t\.webp 800w, https:\/\/site\.test\/media\/a-2000x1000\.webp 2000w"/);
+  assert.match(sized, /href="https:\/\/site\.test\/about\/"/);
+  assert.match(sized, /href="https:\/\/other\.test\/z"/);
 });
