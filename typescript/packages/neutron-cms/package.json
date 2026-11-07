@@ -1,0 +1,66 @@
+{
+  "name": "@neutron-build/cms",
+  "version": "0.1.0",
+  "description": "A small CMS for Neutron sites: posts, photo galleries, events and any list, edited at /n-admin. No database server and no JavaScript for visitors.",
+  "author": "Tyler",
+  "license": "MIT",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "typescript/packages/neutron-cms"
+  },
+  "keywords": [
+    "neutron",
+    "cms",
+    "sqlite",
+    "blog",
+    "gallery"
+  ],
+  "type": "module",
+  "bin": {
+    "neutron-cms": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./photo": {
+      "types": "./dist/photo.d.ts",
+      "import": "./dist/photo.js"
+    },
+    "./store": {
+      "types": "./dist/store.d.ts",
+      "import": "./dist/store.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "scripts": {
+    "build": "node scripts/embed.mjs && tsc",
+    "lint": "node scripts/embed.mjs && tsc --noEmit --pretty false",
+    "test": "pnpm run build && node --test --no-warnings dist/*.test.js"
+  },
+  "dependencies": {
+    "marked": "15.0.12",
+    "preact-render-to-string": "^6.5.0"
+  },
+  "peerDependencies": {
+    "preact": "^10.25.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "preact": "^10.25.4",
+    "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "sideEffects": false
+}

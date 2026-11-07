@@ -550,6 +550,25 @@ importers:
         specifier: ^5.7.2
         version: 5.9.3
 
+  packages/neutron-cms:
+    dependencies:
+      marked:
+        specifier: 15.0.12
+        version: 15.0.12
+      preact-render-to-string:
+        specifier: ^6.5.0
+        version: 6.6.5(preact@10.25.4)
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.7
+        version: 22.19.11
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
   packages/neutron-data:
     dependencies:
       '@aws-sdk/client-s3':
