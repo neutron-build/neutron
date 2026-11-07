@@ -52,6 +52,19 @@ const S_HOOK: u64 = 11;
 /// `w11_share + w12_share > 0`, never drawn (and never constructed)
 /// when both shares are 0, so BASE consumes no stream state on it.
 const S_CWIN: u64 = 12;
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+/// before this card's probes): the alignment selection stream.** One
+/// draw per round when `r41_share > 0` **and** the round is eligible (a
+/// targeted crash, no drop this round), never drawn (and never
+/// constructed) when the share is 0, so BASE consumes no stream state
+/// on it and every BASE round's script is bit-for-bit the pre-X5-R41
+/// generator's. Independent of `S_GEN` and of `S_R41C`.
+const S_R41: u64 = 14;
+/// **X5-R41:** the selected block's content stream — the merge tree
+/// `tm`, the split tree `ts`, and the two dense runs' bases. Drawn only
+/// inside a selected round, so an unselected round consumes nothing on
+/// it (the card's Limit 3).
+const S_R41C: u64 = 15;
 
 /// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
 /// frozen tuning.** Every generator constant the X-5c-F4 retune may
@@ -159,6 +172,18 @@ pub struct Tuning {
     /// list (a `wal_recycle` rename returned, its `sync_dir` not yet
     /// complete). 0 in BASE.
     pub w12_share: u32,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+    /// before this card's probes): the window-targeted alignment share**
+    /// (permille). In a round selected by the `S_R41` stream with this
+    /// probability — a targeted-crash round with no drop — the GC task
+    /// runs the alignment block of step 1 inside the target checkpoint's
+    /// own window (the checkpointer holds it open at `After0`), so the
+    /// block's splits, merges and LPID reuses land in that window's own
+    /// counters (Q4's halves, and the reuse Q4-I keys on). 0 in BASE and
+    /// this card's FINAL: no draw is made and no op is inserted — probe
+    /// settings are set in `Tuning::FINAL` only for a probe run and
+    /// reverted (never committed); X-5c-F4's REFRESH owns the hand-off.
+    pub r41_share: u64,
 }
 
 impl Tuning {
@@ -197,6 +222,7 @@ impl Tuning {
         burst_gc_loops: 0,
         w11_share: 0,
         w12_share: 0,
+        r41_share: 0,
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
@@ -237,6 +263,7 @@ impl Tuning {
         burst_gc_loops: 0,
         w11_share: 0,
         w12_share: 0,
+        r41_share: 0,
     };
 }
 
@@ -643,11 +670,117 @@ pub fn build_round(
             w: None,
         });
     }
-    // Assemble: the barrier, the base sweeps, the burst's sweeps.
+    // **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+    // before this card's probes): the window-targeted SMO alignment.**
+    // A round is selected when all hold: a targeted crash (`seed / 10`
+    // even — the crash hooks of checkpoint index 0–2 are the reachable
+    // early windows), no drop this round (`!knobs.drop_tree` — the
+    // block's dense runs and sweep must not race the DDL task's drop
+    // walk), and a draw from the round's own `S_R41` stream below
+    // `r41_share` permille. Nothing is drawn at share 0 (BASE and this
+    // card's FINAL); every content draw of the block comes from the
+    // second new stream `S_R41C`, so an unselected round consumes no
+    // stream state and its script is bit-for-bit the generator's.
+    //
+    // The block (at the front of the GC task, after the barrier):
+    // - two sync-on commits of 20 Puts each at the value ceiling, a
+    //   dense run of 40 keys in tree `tm` — the run overfills whatever
+    //   leaf holds it, so splits land wherever it runs;
+    // - two sync-on commits of Deletes of those keys — the deletes
+    //   leave tombstones whose elision empties the run's leaves;
+    // - `R41Wait` (spins until the checkpointer's hold opens the
+    //   window — see the op's arm);
+    // - `Gc { tree: tm }` — the sweep elides the tombstones and merges
+    //   the emptied leaves, freeing their LPIDs **inside the window**
+    //   (X5-R40's design took its merge material from the chunked
+    //   txn's own keys, which stay above `w` until that txn's marker
+    //   applies — the block's deletes are in their own commits, so
+    //   their ts is below the sweep's watermark the moment they
+    //   apply);
+    // - one sync-on commit of 20 Puts at the ceiling, a dense run in a
+    //   tree other than `tm` when one exists — the run's splits
+    //   allocate LPIDs, and `alloc_lpid` reuses the freed ones in the
+    //   same window (the reuse Q4-I keys on);
+    // - `R41Done`, which releases the checkpointer's hold.
+    // A `R41Arm { idx: knobs.target_ckpt }` goes before the barrier:
+    // the checkpointer holds the window of exactly that checkpoint
+    // index — the crash's own.
+    let r41 = (seed / 10).is_multiple_of(2)
+        && !knobs.drop_tree
+        && r41_pick(seed, round, tun) == Some(true);
+    let r41_block: Vec<ScriptOp> = if r41 {
+        let mut g = Rng::new(derive(seed * 100 + round as u64, S_R41C));
+        let span = write_max - 1; // |2..=write_max|
+        let tm = 2 + g.below(span);
+        let ts = if span >= 2 {
+            2 + (tm - 2 + 1 + g.below(span - 1)) % span
+        } else {
+            tm
+        };
+        let ks = knobs.keyspace;
+        let n = 40u64.min(ks);
+        let base = g.below(ks - n + 1);
+        let hi = tun.value_hi as usize;
+        let mut block: Vec<ScriptOp> = Vec::new();
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Put {
+                        tree: tm,
+                        key: to_be64(k),
+                        value: vec![0x5A; hi],
+                    })
+                    .collect(),
+            });
+        }
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Delete {
+                        tree: tm,
+                        key: to_be64(k),
+                    })
+                    .collect(),
+            });
+        }
+        block.push(ScriptOp::R41Wait);
+        block.push(ScriptOp::Gc { tree: tm, w: None });
+        let rl = 20u64.min(ks);
+        let b2 = g.below(ks - rl + 1);
+        block.push(ScriptOp::Commit {
+            sync_on: true,
+            ops: (b2..b2 + rl)
+                .map(|k| Op::Put {
+                    tree: ts,
+                    key: to_be64(k),
+                    value: vec![0xA5; hi],
+                })
+                .collect(),
+        });
+        block.push(ScriptOp::R41Done);
+        block
+    } else {
+        Vec::new()
+    };
+    // Assemble: the barrier, then (in a selected round) the alignment
+    // block, then the base sweeps and the burst's; the arm goes at the
+    // very front, before the barrier, and **only in a selected round** —
+    // an unselected round's GC task is bit-for-bit the generator's.
     let mut gc_ops: Vec<ScriptOp> = Vec::new();
     barrier(&mut gc_ops);
+    gc_ops.extend(r41_block);
     gc_ops.extend(base_sweep_ops);
     gc_ops.extend(burst_sweep_ops);
+    if r41 {
+        gc_ops.insert(
+            0,
+            ScriptOp::R41Arm {
+                idx: knobs.target_ckpt,
+            },
+        );
+    }
     // ---- the DDL/bulk task ----
     let mut ddl_ops: Vec<ScriptOp> = Vec::new();
     barrier(&mut ddl_ops);
@@ -896,6 +1029,26 @@ pub fn window_crash_point(
     } else {
         (uniform_yield_point(seed, round, counted), None)
     }
+}
+
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1): the alignment selection.**
+/// One draw from the round's own `S_R41` stream, true with probability
+/// `r41_share` permille. Returns `None` — **no draw made** — when
+/// `r41_share == 0` (BASE and this card's FINAL): the stream is never
+/// constructed, so no stream state is consumed (the card's Limit 3) and
+/// the round's script is bit-for-bit the pre-X5-R41 generator's. The
+/// `None`/`Some` split is the draw-count contract the
+/// `x5_r41_not_drawn_at_base` pin asserts (drawing at `r41_share == 0`
+/// would return `Some(false)`, observable here and nowhere else — the
+/// stream is independent, so no digest can see it); the caller draws
+/// only for eligible rounds (a targeted crash, no drop), so a uniform
+/// or drop round consumes nothing even at a non-zero share.
+pub fn r41_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
+    if tun.r41_share == 0 {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_R41));
+    Some(r.below(1000) < tun.r41_share)
 }
 
 /// A round whose crash spec never fired is a **harness defect** (5.5

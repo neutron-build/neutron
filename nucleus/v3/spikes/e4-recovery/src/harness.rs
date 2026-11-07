@@ -43,6 +43,17 @@ const S_CRASH: u64 = 4;
 const S_MEDIA: u64 = 5;
 const S_SAMPLE: u64 = 6;
 
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1):** the spin-turn budget of
+/// the checkpointer's window hold and of [`ScriptOp::R41Wait`]'s exit —
+/// a fixed backstop, in deterministic sim-order turns and never wall
+/// clock. The hold normally ends within tens or hundreds of turns (the
+/// alignment block's commits and sweep run to `R41Done` while the
+/// checkpointer spins); the budget only trips when the block can no
+/// longer finish (a failed task — which the hold's own exit set covers —
+/// or a window that never opens for the waiter), and it is far below
+/// `YIELD_BUDGET` so a tripped spin can never masquerade as a livelock.
+const R41_TURNS: u64 = 20_000;
+
 /// One scripted operation of a task (card Work 13, "Workload").
 #[derive(Debug, Clone)]
 pub enum ScriptOp {
@@ -80,6 +91,30 @@ pub enum ScriptOp {
     },
     /// Request a checkpoint and wait for it to complete.
     Checkpoint,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+    /// before this card's probes):** arm the checkpointer's window hold
+    /// for checkpoint completion index `idx` — the round's
+    /// `knobs.target_ckpt`, the crash's own checkpoint. Goes at the very
+    /// front of the GC task (before the setup barrier); inert in a round
+    /// that never reaches checkpoint `idx`, and in every unselected
+    /// round (the op is inserted only in a selected round, so no BASE
+    /// schedule moves).
+    R41Arm {
+        /// The checkpoint completion index whose window is held.
+        idx: u64,
+    },
+    /// **X5-R41:** wait until the armed checkpoint's window is held
+    /// open (the checkpointer set the window flag at its `After0`), or
+    /// the workload can no longer open one (the workload done, this the
+    /// last unfinished script task, or the [`R41_TURNS`] budget). A
+    /// spin-yield loop, like the checkpointer's own poll pattern: no
+    /// wait key is woken when the flag is set, so a parked waiter could
+    /// only ever observe the window after the hold released it.
+    R41Wait,
+    /// **X5-R41:** the alignment block is complete — releases the
+    /// checkpointer's hold (sticky for the rest of the round, so a
+    /// window that opens late never waits on a block that already ran).
+    R41Done,
     /// Set a named park point's budget (the D5 split parking).
     Park {
         /// The park point.
@@ -251,6 +286,17 @@ pub struct HarnessState {
     /// Card Work 5.6's Q18 observable: a GC sweep ran with a watermark
     /// above the previous `gc_w` while a checkpoint window was open.
     pub gc_adv_in_window: bool,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1):** the armed checkpoint
+    /// index (set by [`ScriptOp::R41Arm`]; the hold triggers at the
+    /// `After0` of exactly this completion index).
+    pub r41_idx: Option<u64>,
+    /// **X5-R41:** the window flag — set when the checkpointer's hold
+    /// begins at the armed checkpoint's `After0` (read by
+    /// [`ScriptOp::R41Wait`]).
+    pub r41_win: bool,
+    /// **X5-R41:** the alignment block completed (set by
+    /// [`ScriptOp::R41Done`]; releases the hold, sticky for the round).
+    pub r41_done: bool,
     /// The last checkpoint hook the checkpointer passed (0 = none): a
     /// small position code for the Q4 window (1 = Before0 … 6 = After3;
     /// 7+ are later hooks). Maintained by the checkpointer's hook
@@ -1047,6 +1093,44 @@ pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
             })?;
             wait_ckpt(cx)
         }
+        ScriptOp::R41Arm { idx } => cx.with("h:r41arm", |c| {
+            c.h().r41_idx = Some(*idx);
+            Ok(())
+        }),
+        ScriptOp::R41Done => cx.with("h:r41done", |c| {
+            c.h().r41_done = true;
+            Ok(())
+        }),
+        ScriptOp::R41Wait => {
+            // X5-R41: spin-yield (the checkpointer's own poll pattern)
+            // until the armed checkpoint's window is held open or the
+            // workload can no longer open one. The exit set is wider
+            // than "the window flag" for the same circularity the old
+            // X5-R40 gate hit: `workload_done` is set when the last
+            // script task finishes, and this task waiting for a window
+            // that only a *future commit* could open would hold that
+            // last slot forever — so the op also exits when it is the
+            // last unfinished script task (`tasks_left <= 1`: no
+            // further commit can arrive, so no commits-triggered window
+            // can open) and after the fixed [`R41_TURNS`] budget. In
+            // every exit-but-flag case the following block ops simply
+            // run ungated — the round proceeds exactly as it would
+            // without the alignment, never a hang. A crash unwinds
+            // through `yield_now`'s `Err(Crashed)` as every scripted op
+            // does.
+            let mut turns = 0u64;
+            loop {
+                let (win, done, left) = cx.with("h:r41wait", |c| {
+                    let h = c.h();
+                    Ok((h.r41_win, h.workload_done, h.tasks_left))
+                })?;
+                if win || done || left <= 1 || turns >= R41_TURNS {
+                    return Ok(());
+                }
+                turns += 1;
+                cx.yield_now("h:r41wait")?;
+            }
+        }
         ScriptOp::Park { name, budget } => cx.with("h:park", |c| {
             c.store().parks.insert(name, *budget);
             Ok(())
@@ -1482,6 +1566,41 @@ fn checkpointer_body(
                     }
                     Ok(())
                 });
+                // **X5-R41 (card X-5c-F4-F1-F1-F3 step 1): the hold.**
+                // At `After0` of the armed checkpoint — after the flip
+                // released the epoch gate, before any later step — set
+                // the window flag, then spin-yield until the alignment
+                // block ends (`R41Done`), the workload is done, a task
+                // error unwinds the round, or the fixed [`R41_TURNS`]
+                // budget. Holding the window open is what makes the
+                // block's SMOs and reuses land in the crash's own
+                // window: without it the crash hook (which may fire at
+                // this very hook) beats the block — X5-R40's third
+                // design miss. This is not contrived: a real checkpoint
+                // over a large dirty set stays open far longer than one
+                // tree sweep; the spike's window is short only because
+                // its dirty set is small.
+                if hook == CkptHook::After0 {
+                    let armed = cx.with("h:r41armed", |c| Ok(c.h().r41_idx == Some(ck_idx)))?;
+                    if armed {
+                        cx.with("h:r41winflag", |c| {
+                            c.h().r41_win = true;
+                            Ok(())
+                        })?;
+                        let mut turns = 0u64;
+                        loop {
+                            let (done, wd, err) = cx.with("h:r41hold", |c| {
+                                let h = c.h();
+                                Ok((h.r41_done, h.workload_done, h.task_error.is_some()))
+                            })?;
+                            if done || wd || err || turns >= R41_TURNS {
+                                break;
+                            }
+                            turns += 1;
+                            cx.yield_now("h:r41hold")?;
+                        }
+                    }
+                }
                 if Some(hook) == fire_at {
                     arm_crash(cx.w);
                     return Err(Fail::Sim(SimFail::Crashed));
