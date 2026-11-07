@@ -3,19 +3,22 @@ import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+export type Kind = "post" | "page";
+
 export interface Post {
   id: number;
   slug: string | null;
   title: string;
   description: string;
   label: string;
+  kind: Kind;
   body: string;
   published_at: string | null;
   updated_at: string;
 }
 
 export type Item = Record<string, string>;
-export type PostFields = Pick<Post, "title" | "description" | "body" | "slug" | "published_at"> & { label?: string };
+export type PostFields = Pick<Post, "title" | "description" | "body" | "slug" | "published_at"> & { label?: string; kind?: Kind };
 export type SaveResult =
   | { ok: true; post: Post }
   | { ok: false; error: "stale" | "slug-taken" | "slug-reserved" | "missing" };
@@ -61,6 +64,7 @@ const MIGRATIONS = [
      INSERT INTO posts_old (post_id, title, body, saved_at) VALUES (old.id, old.title, old.body, old.updated_at);
    END;`,
   `ALTER TABLE posts ADD COLUMN label TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'post'`,
 ];
 
 const store = globalThis as typeof globalThis & { __cmsDb?: DatabaseSync };
@@ -131,22 +135,22 @@ const now = () => new Date().toISOString();
 export const isLive = (post: Pick<Post, "published_at">, at = now()) =>
   post.published_at !== null && post.published_at <= at;
 
-export const allPosts = () =>
-  db().prepare("SELECT * FROM posts ORDER BY published_at IS NOT NULL, published_at DESC, updated_at DESC").all() as unknown as Post[];
+export const allPosts = (kind: Kind = "post") =>
+  db().prepare("SELECT * FROM posts WHERE kind = ? ORDER BY published_at IS NOT NULL, published_at DESC, updated_at DESC").all(kind) as unknown as Post[];
 
-export const livePosts = () =>
-  db().prepare("SELECT * FROM posts WHERE published_at <= ? ORDER BY published_at DESC").all(now()) as unknown as Post[];
+export const livePosts = (kind: Kind = "post") =>
+  db().prepare("SELECT * FROM posts WHERE kind = ? AND published_at <= ? ORDER BY published_at DESC").all(kind, now()) as unknown as Post[];
 
 export const getPost = (id: number) =>
   db().prepare("SELECT * FROM posts WHERE id = ?").get(id) as Post | undefined;
 
-export const livePostBySlug = (slug: string) =>
-  db().prepare("SELECT * FROM posts WHERE slug = ? AND published_at <= ?").get(slug, now()) as Post | undefined;
+export const livePostBySlug = (slug: string, kind: Kind = "post") =>
+  db().prepare("SELECT * FROM posts WHERE slug = ? AND kind = ? AND published_at <= ?").get(slug, kind, now()) as Post | undefined;
 
 export function createPost(fields: Partial<PostFields> & { updated_at?: string } = {}): number {
   const result = db()
-    .prepare("INSERT INTO posts (slug, title, description, label, body, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .run(fields.slug ?? null, fields.title ?? "", fields.description ?? "", fields.label ?? "", fields.body ?? "", fields.published_at ?? null, fields.updated_at ?? now());
+    .prepare("INSERT INTO posts (slug, title, description, label, body, published_at, updated_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(fields.slug ?? null, fields.title ?? "", fields.description ?? "", fields.label ?? "", fields.body ?? "", fields.published_at ?? null, fields.updated_at ?? now(), fields.kind ?? "post");
   return Number(result.lastInsertRowid);
 }
 

@@ -24,6 +24,10 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
     posts: (): Post[] => livePosts(),
     /** One published post, or undefined. */
     post: (slug: string): Post | undefined => livePostBySlug(slug),
+    /** Published pages, newest first. */
+    pages: (): Post[] => livePosts("page"),
+    /** One published page, or undefined. */
+    page: (slug: string): Post | undefined => livePostBySlug(slug, "page"),
     /** A list's items, in their saved order. */
     list: (key: keyof Lists & string): Item[] => listItems(key),
     /** A dated list's items through today, with undated ones kept. */

@@ -61,6 +61,7 @@ export default function Page({ data }) {
 |---|---|
 | `cms.posts()` | Published posts, newest first |
 | `cms.post(slug)` | One published post |
+| `cms.pages()`, `cms.page(slug)` | Published pages, with `pages: true` |
 | `cms.list(key)` | A list's items, in saved order |
 | `cms.upcoming(key)` | A dated list through today |
 | `cms.text(key)` | One text field |
@@ -120,6 +121,7 @@ Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type
 |---|---|---|
 | `path` | `/n-admin` | Where the route files are |
 | `posts` | `true` | Set `false` on a site with no blog |
+| `pages` | `false` | Standalone pages, edited like posts and kept out of the blog |
 | `postUrl` | `/<slug>` | Where a post lives, for the admin's links |
 | `reservedSlugs` | none | URLs a post may not take, usually your other pages |
 | `previewCss` | none | Your post styles as a string, so previews match the site |

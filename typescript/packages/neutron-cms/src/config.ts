@@ -21,6 +21,8 @@ export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record
   path?: string;
   /** Set false on a site with no blog. */
   posts?: boolean;
+  /** Standalone pages, such as an about page, edited like posts but kept out of the blog. */
+  pages?: boolean;
   /** Where a post lives on the site, for the admin's links. Default `/<slug>`. */
   postUrl?: (slug: string) => string;
   /** URLs a post may not take because a page already answers them. */
@@ -46,6 +48,7 @@ export interface ResolvedList {
 export interface ResolvedConfig {
   path: string;
   posts: boolean;
+  pages: boolean;
   postUrl: (slug: string) => string;
   reservedSlugs: string[];
   previewCss: string;
@@ -90,6 +93,7 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
   return {
     path,
     posts: config.posts ?? true,
+    pages: config.pages ?? false,
     postUrl: config.postUrl ?? ((slug) => `/${slug}`),
     reservedSlugs: [...new Set([...(firstSegment ? [firstSegment] : []), ...(config.reservedSlugs ?? [])])],
     previewCss: config.previewCss ?? "",

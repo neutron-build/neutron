@@ -33,6 +33,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
       <header class="top">
         <a class="name" href={admin}>Neutron CMS</a>
         {config.posts ? <a href={admin} aria-current={current("posts")}>Posts</a> : null}
+        {config.pages ? <a href={`${admin}/pages`} aria-current={current("pages")}>Pages</a> : null}
         {config.onPage.length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
         {Object.entries(config.lists).filter(([key]) => !config.onPage.includes(key)).map(([key, list]) => (
           <a key={key} href={`${admin}/lists/${key}`} aria-current={current(key)}>{list.label}</a>
@@ -85,19 +86,20 @@ export interface PostRow {
   status: Status;
 }
 
-export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[] }) {
+export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kind?: "post" | "page" }) {
   const admin = props.config.path;
+  const pages = props.kind === "page";
   return (
-    <Shell config={props.config} active="posts">
+    <Shell config={props.config} active={pages ? "pages" : "posts"}>
       <main class="page">
         <div class="page-head">
-          <h1>Posts</h1>
-          <form method="post" action={admin}>
-            <button class="button primary" type="submit">New post</button>
+          <h1>{pages ? "Pages" : "Posts"}</h1>
+          <form method="post" action={pages ? `${admin}/pages` : admin}>
+            <button class="button primary" type="submit">{pages ? "New page" : "New post"}</button>
           </form>
         </div>
         {props.posts.length === 0 ? (
-          <p class="muted">No posts yet.</p>
+          <p class="muted">{pages ? "No pages yet." : "No posts yet."}</p>
         ) : (
           <table class="posts">
             <tbody>
@@ -132,7 +134,7 @@ export function EditorPage(props: {
   return (
     <>
       <header class="top editor-top">
-        <a class="back" href={admin} aria-label="Back to posts">{"\u2190"}<span class="on-wide">&nbsp;Posts</span></a>
+        <a class="back" href={post.kind === "page" ? `${admin}/pages` : admin} aria-label={post.kind === "page" ? "Back to pages" : "Back to posts"}>{"\u2190"}<span class="on-wide">&nbsp;{post.kind === "page" ? "Pages" : "Posts"}</span></a>
         <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
         <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
         <span class="spacer" />

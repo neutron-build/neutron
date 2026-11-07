@@ -12,6 +12,7 @@ const PASSWORD = "a-long-enough-test-password";
 let directory: string;
 
 const cms = defineCms({
+  pages: true,
   reservedSlugs: ["about"],
   texts: { tagline: "text" },
   onPage: ["links", "text"],
@@ -400,4 +401,31 @@ test("an empty configured data folder is never filled with a new database", asyn
     closeDb();
     process.env.CMS_DATA_DIR = saved;
   }
+});
+
+test("pages are kept apart from the blog and share its editor", async () => {
+  const cookie = await logIn();
+  const created = await call("/n-admin/pages", { method: "POST", cookie });
+  const path = created.headers.get("location")!;
+  assert.match(path, /^\/n-admin\/posts\/\d+$/);
+  const editor = await (await call(path, { cookie })).text();
+  assert.match(editor, /href="\/n-admin\/pages"/);
+  const revision = editor.match(/name="revision" value="([^"]+)"/)![1];
+  assert.equal((await call(path, { method: "POST", cookie, body: form({ intent: "publish", title: "About me", body: "Hi", slug: "about-me", revision }) })).status, 303);
+  assert.equal(cms.page("about-me")?.title, "About me");
+  assert.equal(cms.post("about-me"), undefined);
+  assert.deepEqual(cms.posts().map((post) => post.slug), []);
+  assert.deepEqual(cms.pages().map((page) => page.slug), ["about-me"]);
+  const list = await (await call("/n-admin/pages", { cookie })).text();
+  assert.match(list, />About me</);
+  assert.match(list, />New page</);
+  assert.doesNotMatch(await (await call("/n-admin", { cookie })).text(), />About me</);
+  assert.match(list, />Pages<\/a>/);
+});
+
+test("a site without pages has no Pages section", async () => {
+  const noPages = defineCms({});
+  const cookie = await logIn();
+  const response = await noPages.GET({ request: new Request(`${SITE}/n-admin/pages`, { headers: { cookie } }), params: { path: "pages" } });
+  assert.equal(response.status, 404);
 });

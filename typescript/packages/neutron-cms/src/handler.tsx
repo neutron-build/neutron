@@ -104,15 +104,15 @@ export function createHandler(config: ResolvedConfig) {
   const notFound = () => page("Not found", <NotFoundPage config={config} />, 404);
   const isScript = (request: Request) => request.headers.has("x-cms");
 
-  function postsPage() {
+  function postsPage(kind: "post" | "page" = "post") {
     const at = new Date().toISOString();
-    const posts = allPosts().map((post) => ({
+    const posts = allPosts(kind).map((post) => ({
       id: post.id,
       title: post.title,
       date: post.published_at ?? post.updated_at,
       status: statusOf(post, at),
     }));
-    return page("Posts", <PostsPage config={config} posts={posts} />);
+    return page(kind === "page" ? "Pages" : "Posts", <PostsPage config={config} posts={posts} kind={kind} />);
   }
 
   function home(request: Request) {
@@ -179,7 +179,7 @@ export function createHandler(config: ResolvedConfig) {
 
   async function editor(request: Request, id: number) {
     const post = getPost(id);
-    if (!post) return notFound();
+    if (!post || (post.kind === "page" ? !config.pages : !config.posts)) return notFound();
     const saved = new URL(request.url).searchParams.has("saved");
     if (request.method !== "POST") return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={saved} />);
 
@@ -190,7 +190,7 @@ export function createHandler(config: ResolvedConfig) {
 
     if (intent === "delete") {
       deletePost(id);
-      return redirect(admin);
+      return redirect(post.kind === "page" ? `${admin}/pages` : admin);
     }
 
     const date = parseDate(read("date") || read("date_local"));
@@ -318,7 +318,8 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
     if (first === "upload" && !second && post) return upload(request);
     if (first === "preview" && !second && post) return preview(request);
-    if (first === "posts" && config.posts && second && /^\d+$/.test(second) && rest.length === 0) return editor(request, Number(second));
+    if (first === "pages" && config.pages && !second) return post ? redirect(`${admin}/posts/${createPost({ kind: "page" })}`) : postsPage("page");
+    if (first === "posts" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0) return editor(request, Number(second));
     if (first === "lists" && second && rest.length === 0) return list(request, second);
     return notFound();
   }
