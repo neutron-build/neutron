@@ -1463,6 +1463,32 @@ F4's to run on FINAL in its Acceptance (REFRESH 9), where the Joint
 fault must be caught and the Slot fault's fate is the owner's to
 decide (this card's ESCALATE).
 
+## Card X-5c-F4-F1-F1-F3-F2's record (X5-R49: step 6 frees a freed
+## LPID's home slot)
+
+## X5-R49 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the
+step-0 discipline, as X5-R6–R48 before it). The premise ruling first,
+then the ruling itself.
+
+**P ruling on the premise: yes, this is a prototype deviation from S-STORE §6.5 item 3 and §13 step 6, not a spec question.**
+- §6.5 item 3's merge "frees `R`'s LPID (§4.2)". §4.4 lets a slot be written once nothing references it among the durable image, the image being built and the current map.
+- After `free_lpid`, the current map no longer maps the LPID, so the third reference is gone. §13 step 6 then moves the slot from pending to free once meta `k` is synced and image `k` does not reference it.
+- The spike keeps the slot in `used_cur`, the set that stands for that third reference, forever. It is a leak, not a loss: I-FREE-SAFE holds and nothing is overwritten. But the clean store never reuses a freed page's slot within a session, so I-FREE-SAFE's reuse path is never exercised, and a fault in it cannot be seen. That is why the Slot mutant can only show up through -F1's extra `used_cur` line.
+- The spec text is unambiguous, so no spec change is needed.
+
+**X5-R49 (a prototype deviation fixed; S-STORE §4.4, §6.5 item 3, §13 step 6).**
+- **(a) Release at the free.** `free_lpid` removes the freed LPID's current home from `used_cur` in the same atomic step that removes `map.cur[lpid]`, **unconditionally**. It reads the home before the map drops it.
+  - **Why unconditional, not `unpin_home`.** `free_lpid` runs `freeze_first_touch` first, so during a flip window the image being built already holds its own reference: an `Img::At` whose slot is in `image_refs`, or an epoch copy at another slot. (`Img::Same` is never constructed.) The durable image's reference is in `used_durable`.
+  - `unpin_home` returns early on an `image_refs` slot. That would keep a window-freed home in `used_cur` after post-5 clears the pins: the same leak, only rarer. The gate's scratch (`E4G_SLOT=fixstore`) used `unpin_home` and left exactly those slots pinned.
+- **(b) Step 6 is the release point.** `alloc_slot` also refuses a slot in `pending_free`. `ckpt:step6` clears `pending_free`, as it does today. So a slot that image `k−1` references and image `k` does not becomes allocatable at step 6, not at post-5. One pure predicate, `slot_free(&SlotState, slot)`, is `alloc_slot`'s only test.
+- **(c) FREE-EARLY keeps its meaning.** Its apply makes its early frees allocatable at the flip, so it does not route them through `pending_free`, which (b) now protects. D14 still sees M-NOINPLACE.
+- **(d) Nothing else changes:** not `unpin_home`, not post-5, not the step-6 closure, not the open's slot-set rebuild, and not `Mutant::FreeHomeAlloc`'s site (that site is -F1's).
+
+**Step 0 — the ruling carried.** The text above, verbatim, before any
+code of this card.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
