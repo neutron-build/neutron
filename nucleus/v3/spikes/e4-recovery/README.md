@@ -12,6 +12,10 @@ any test passes to a seed runner — 41, 303 and 2376 joined with the
 rework's and step 0a's pins); no BASE digest moved. The stages before
 it (X-5c-F4-F1, X-5c-F4, X-5c-F3-F3b and back to X-5c) are complete
 and merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R40.
+**Card X-5c-F4-F1-F1-O1C-F1 (X5-R47) has since replaced the `written`
+half and the F1 report of `derive_written_acked` with the replay in
+issue order — the three faultless class C O-1(c) rounds (1066, 6555,
+7590 r0) now pass; the record is below.**
 
 ## P ruling nv3-X-5c-F4-esc-1, verbatim (2026-11-04; binding)
 
@@ -1010,6 +1014,124 @@ report of `derive_written_acked`.
 - **F1.** A commit is reported in `unparsed_written` iff it is not written and, at some such point, an image holds at `lsn mod WAL_SEG` 24 header bytes with correct magic, its own embedded `lsn`, and `lsn mod WAL_SEG + len_in_header > WAL_SEG`.
 - **SyncOff's acked** stays "iff written". SyncOn's acked half is untouched.
 - **Rejected forms.** A final-image walk, an interval-superseded view, and resolving `stitched`'s cover by issue order over the whole history all drop earlier-life records (measured: 1,028 of 19,118 rounds).
+
+**Step 0 — the diagnosis brought in.** `git cherry-pick c13299c0
+82062a02`, card X-5c-F4-F1-F1-O1C's two commits (not its verdict),
+clean on this base.
+
+**Steps 2–3 — the implementation (commit a3b64979).**
+`derive_written_acked`'s `written` half and F1 report are now one
+pass over `E`: each `WriteIssued` is applied in `E`'s order to its
+inode's byte image (`r47_apply_write`), and immediately after the
+application the just-written image is tested — `r47_image_holds` for
+`written` (the record at `[lsn mod WAL_SEG, +len)` decoding with its
+own lsn, `rec.ts == ts`, kind `Commit`/`CommitMarker`, inside its
+segment), `r47_header_runs_past_segment` for F1 (the 24 header bytes,
+correct magic, its own embedded lsn, `len_in_header` past the segment
+end). Each write is tested only against commits whose record overlaps
+it (the union window `[pos, pos + max(len, 24))`; the geometry
+hoisted out of the loop), and both verdict sets are monotone — a
+point that qualified at some event of `E` is never re-tested and
+never unqualified. **Issued is returned:** the `returned_end` extent
+test is removed and `r47_issue_return_paired` (always on,
+debug-free) takes its place in `run_round`'s `task_error` cascade —
+a `WriteIssued` whose immediately following event is not its own
+`WriteReturned` (same inode, offset, length) fails the round. The
+SyncOn acked half, `D`, `Rc`, the oracle, the model, the sim, K, R,
+the generators, the quotas and the store are untouched. The
+diagnostics: `o1c_stitched_walk` and its per-inode path log are
+deleted (they mirrored a reader that no longer exists), as are
+`issued_header_len`, `stitched` and the `FileWrites` alias (no
+remaining readers); `ack_record_present` replays the same way and its
+doc now names the derivation itself, never a mirror; the false "the
+walk sees exactly the latest life" doc is gone; `o1c_frontier_trace`
+keeps its frontier-above-`hi` shape but computes its derivation rows
+by **calling `derive_written_acked` directly** (the trace can no
+longer drift from the derivation), and its inode histories come from
+the durable bindings of above-`hi` commits.
+
+**Step 4 — the pins (commit d8f9f7a0).** Seven, hand-built events
+unless stated, beside the x5r34 self-tests in `tests/harness.rs`:
+
+- `r47_new_life_record_behind_old_write` — 1066's literal shape (old
+  write `[206, 10897)`, new write `[0, 5046)` holding records at 0
+  and 2453): both written, both acked (SyncOff), no F1.
+- `r47_earlier_life_record_stays_written` — a record overwritten
+  wholesale by a later life stays written (monotone).
+- `r47_never_issued_stays_unwritten` — no bytes issued, and a last
+  byte never issued (a torn tail), stay unwritten and unreported;
+  a whole record is the positive control.
+- `r47_wrong_record_at_position_stays_unwritten` — a valid record at
+  the position with another lsn (the §12.5 stale rule) and one with
+  the same lsn but another ts; a correct record is the control.
+- `r47_f1_on_recycled_file` — a past-segment header behind an
+  old-life write (the new batch's key below the header, the old
+  write's key between the two) is reported and never written.
+- `r47_pairing_guard_names_an_unpaired_write` — a paired stream
+  passes `r47_issue_return_paired`; a missing return and a
+  different-length return are both named (the guard is pub for the
+  pin, as the X5-R34 guards are — a pin beyond the card's named six,
+  judgment call: the guard is new judged code and deserves its own).
+- `r47_three_rounds` — seeds 1066, 6555, 7590 under
+  `Tuning::BASE`: r0 passes with `(lo, hi, c, frontier)` =
+  (20, 21, 21, 21), (22, 24, 24, 24), (19, 21, 21, 21) — **the
+  F2-tip values the card quotes, unmoved by CXX** (this tip's
+  pre-change values were (20, 20, —, 21) fail, (22, 23, —, 24) fail,
+  (19, 20, —, 21) fail); 6555's rounds 1–2 continue passing.
+
+**Step 5 — the mutants** (each applied to the real code, shown
+failing its pin, reverted completely — `git diff` clean after every
+revert):
+
+| Mutant | Failing pin (measured) |
+|---|---|
+| M-R47-KEY-COVER (the old greatest-key resolver: per-offset map, each byte by the greatest key ≤ the cursor, tested once over the history) | `r47_new_life_record_behind_old_write` — `left: [20] right: [20, 21]`: ts 21's record masked by the old write's key 206 |
+| M-R47-FINAL-IMAGE (each commit tested against the final images only) | `r47_earlier_life_record_stays_written` — `left: [] right: [9]`: the overwritten record unwritten |
+| M-R47-ALL-WRITTEN (every commit written) | `r47_never_issued_stays_unwritten` — `left: [30, 31, 32] right: [30]` |
+| M-R47-NO-TS (`rec.ts == ts` dropped) | `r47_wrong_record_at_position_stays_unwritten` — `left: [40, 42] right: [40]`: the same-lsn record with another ts counts (the stale-lsn case stays unwritten through `dec_record`'s own lsn check) |
+| M-R47-NO-F1 (the header-past-end set never recorded) | `r47_f1_on_recycled_file` — `left: [] right: [51]` |
+
+**Step 6 — digest movement** (single seeds, one process each, under
+`ulimit -v 25165824`, output outside the worktree; pre = this tip
+without the change — the cherry-picked diagnosis commits, post = the
+X5-R47 commits):
+
+| Seed | pre digest | post digest | verdict |
+|---|---|---|---|
+| 1066 r0 | 1383263257 | 423674518 | **fail → pass** (O-1(c) cleared; (lo, hi, c, frontier) (20, 20, —, 21) → (20, 21, 21, 21)) |
+| 6555 r0 | 3687676066 | 3744559595 | **fail → pass** ((22, 23, —, 24) → (22, 24, 24, 24); r1, r2 keep passing) |
+| 7590 r0 | 3340396508 | 3293778794 | **fail → pass** ((19, 20, —, 21) → (19, 21, 21, 21)) |
+| 8852 r0 | 564931007 | 564931007 | **no move** (see below) |
+
+The X5-R37 literal list (54 seeds, run singly before and after):
+**zero digests moved** — the pin `x5_r37_base_tuning_reproduces_1b0ce54e`
+holds byte for byte at this tip. The contiguous `run --seeds 0..200
+--threads 16`: **zero digest moves, zero verdict changes** (the
+failing rounds stay exactly the known 8/178 pair, `DEFECT_SEEDS=0`),
+so no literal was re-derived — no pinned seed's digest moved, and
+X5-R47 explains every movement there was.
+
+**8852, reported as measured (a judgment call).** The card expects
+8852's "only change `hi` 32 to 33" (the O1C gate's F2-tip
+measurement: a SyncOn record issued 2 events before the crash, not
+durable, `D` below its end, the frontier staying put). At **this**
+tip 8852 r0 runs a different schedule — CXX moved the seed's rounds
+(the O1C verdict itself warned "CXX and X5-R41 change the rounds") —
+and reads `(lo, hi, c, frontier)` = (8, 8, 8, 8), passing, with **no
+replay/walk divergence at all**: its digest is byte-identical before
+and after (564931007). No verdict changed in either direction on
+8852, so the card's stop clause ("any other verdict change") is not
+reached; the expected movement simply does not exist at this tip. No
+other seed in any run changed verdict.
+
+**The 0..200 cost, probe, not evidence** (`run --seeds 0..200
+--threads 16`, same host; pre = the tip's binary built before the
+change, post = after it): pre wall **12.6 s**, CPU 127.4 s user +
+29.5 s sys (≈ 157 s); post wall 18.5–38.5 s across three runs (the
+host carries other load; the quiet-host run is 18.5 s), CPU 181–192 s
+user + 41–45 s sys (≈ 226–233 s). The replay costs about +45% CPU on
+the campaign's WAL-heavy rounds — the price of the ruling's per-write
+record tests; no `E4 ABORT`, no livelock, no deadlock.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
