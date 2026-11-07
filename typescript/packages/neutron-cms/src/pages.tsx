@@ -23,7 +23,7 @@ export function Document(props: { config: ResolvedConfig; title: string; childre
   );
 }
 
-function Shell(props: { config: ResolvedConfig; active?: string; children: ComponentChildren }) {
+function Shell(props: { config: ResolvedConfig; active?: string; extraScript?: string; children: ComponentChildren }) {
   const { config, active } = props;
   const admin = config.path;
   const current = (name: string) => (active === name ? "page" : undefined);
@@ -32,10 +32,11 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
       <header class="top">
         <a class="name" href={admin}>n-admin</a>
         {config.posts ? <a href={admin} aria-current={current("posts")}>Posts</a> : null}
-        {Object.entries(config.lists).map(([key, list]) => (
+        {config.onPage.length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
+        {Object.entries(config.lists).filter(([key]) => !config.onPage.includes(key)).map(([key, list]) => (
           <a key={key} href={`${admin}/lists/${key}`} aria-current={current(key)}>{list.label}</a>
         ))}
-        {Object.keys(config.texts).length ? <a href={`${admin}/lists/${TEXT}`} aria-current={current(TEXT)}>Text</a> : null}
+        {Object.keys(config.texts).length && !config.onPage.includes(TEXT) ? <a href={`${admin}/lists/${TEXT}`} aria-current={current(TEXT)}>Text</a> : null}
         <span class="spacer" />
         <a href="/" target="_blank" rel="noreferrer">View site</a>
         <form method="post" action={`${admin}/logout`}>
@@ -44,6 +45,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
       </header>
       {props.children}
       <script defer src={`${admin}/admin.js`} />
+      {props.extraScript ? <script defer src={`${admin}/${props.extraScript}`} /> : null}
     </>
   );
 }
@@ -281,6 +283,20 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
           </div>
         </form>
       </main>
+    </Shell>
+  );
+}
+
+export function EditPage(props: { config: ResolvedConfig }) {
+  return (
+    <Shell config={props.config} active="edit" extraScript="edit.js">
+      <div class="edit-bar">
+        <button class="button primary" type="button" data-edit-save disabled>Save</button>
+        <button class="button" type="button" data-edit-discard disabled>Discard</button>
+        <span class="muted" data-edit-state role="status" />
+      </div>
+      <iframe class="edit-frame" title="Your site" src="/" data-edit-frame />
+      <div class="edit-tools" data-edit-tools hidden />
     </Shell>
   );
 }

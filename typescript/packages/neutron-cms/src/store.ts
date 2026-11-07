@@ -209,6 +209,23 @@ export function replaceItems(list: string, items: Item[], revision?: string): { 
   });
 }
 
+/** Saves one page's edits together. If any list changed elsewhere, nothing is written. */
+export function saveEdits(texts: Record<string, string>, lists: Record<string, { revision: string; items: Item[] }>): { ok: true } | { ok: false; stale: string } {
+  return transaction(() => {
+    for (const [key, list] of Object.entries(lists)) {
+      if (list.revision !== listRevision(key)) return { ok: false, stale: key };
+    }
+    const upsert = db().prepare("INSERT INTO texts (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
+    for (const [key, value] of Object.entries(texts)) upsert.run(key, value);
+    const insert = db().prepare("INSERT INTO items (list, position, data) VALUES (?, ?, ?)");
+    for (const [key, list] of Object.entries(lists)) {
+      db().prepare("DELETE FROM items WHERE list = ?").run(key);
+      list.items.forEach((item, position) => insert.run(key, position, JSON.stringify(item)));
+    }
+    return { ok: true };
+  });
+}
+
 /** Dated items in order, undated ones last. */
 export const sortByDate = (items: Item[], field: string) =>
   [...items].sort((a, b) => (a[field] || "9999").localeCompare(b[field] || "9999"));

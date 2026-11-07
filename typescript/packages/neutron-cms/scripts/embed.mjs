@@ -4,5 +4,5 @@ import { readFileSync, writeFileSync } from "node:fs";
 const read = (name) => JSON.stringify(readFileSync(new URL(`../src/${name}`, import.meta.url), "utf8"));
 writeFileSync(
   new URL("../src/assets.generated.ts", import.meta.url),
-  `export const ADMIN_CSS = ${read("admin.css")};\nexport const ADMIN_JS = ${read("admin.client.js")};\n`,
+  `export const ADMIN_CSS = ${read("admin.css")};\nexport const ADMIN_JS = ${read("admin.client.js")};\nexport const EDIT_JS = ${read("edit.client.js")};\n`,
 );

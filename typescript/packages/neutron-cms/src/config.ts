@@ -31,6 +31,8 @@ export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record
   timeZone?: string;
   lists?: Lists;
   texts?: Record<string, FieldType | Field>;
+  /** Lists edited by clicking them on the page, so they leave the menu. Use "text" for the text fields. */
+  onPage?: string[];
 }
 
 export type ResolvedField = Required<Pick<Field, "label" | "type">> & { required: boolean };
@@ -50,6 +52,7 @@ export interface ResolvedConfig {
   timeZone: string;
   lists: Record<string, ResolvedList>;
   texts: Record<string, ResolvedField>;
+  onPage: string[];
 }
 
 /** The address of the page that edits text fields, so a list cannot use it. */
@@ -79,6 +82,10 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
       return [key, { label: list.label ?? title(key), fields, sortBy: list.sortBy }];
     }),
   );
+  const onPage = config.onPage ?? [];
+  for (const key of onPage) {
+    if (key !== TEXT && !Object.hasOwn(lists, key)) throw new Error(`neutron-cms: onPage names "${key}", which is not a list`);
+  }
   const firstSegment = path.split("/").filter(Boolean)[0];
   return {
     path,
@@ -89,6 +96,7 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
     timeZone: config.timeZone ?? "UTC",
     lists,
     texts: resolveFields(config.texts ?? {}),
+    onPage,
   };
 }
 

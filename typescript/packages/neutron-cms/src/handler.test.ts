@@ -14,6 +14,7 @@ let directory: string;
 const cms = defineCms({
   reservedSlugs: ["about"],
   texts: { tagline: "text" },
+  onPage: ["links", "text"],
   lists: {
     gallery: { fields: { image: { type: "image", required: true }, caption: "text" } },
     events: { sortBy: "date", fields: { title: { type: "text", required: true }, date: { type: "date", required: true }, url: "url" } },
@@ -72,7 +73,7 @@ after(() => {
 });
 
 test("every admin address is gated; only login, styles and images are public", async () => {
-  for (const path of ["/n-admin", "/n-admin/lists/gallery", "/n-admin/lists/text", "/n-admin/posts/1", "/n-admin/admin.js", "/n-admin/login/x", "/n-admin/media/a/b", "/n-admin/nope"]) {
+  for (const path of ["/n-admin/edit", "/n-admin/edit/data", "/n-admin/edit.js", "/n-admin", "/n-admin/lists/gallery", "/n-admin/lists/text", "/n-admin/posts/1", "/n-admin/admin.js", "/n-admin/login/x", "/n-admin/media/a/b", "/n-admin/nope"]) {
     const response = await call(path);
     assert.equal(response.status, 303, path);
     assert.equal(response.headers.get("location"), "/n-admin/login", path);
@@ -120,7 +121,8 @@ test("admin pages forbid caching, framing and indexing", async () => {
 
 test("the menu follows the config", async () => {
   const html = await (await call("/n-admin", { cookie: await logIn() })).text();
-  for (const label of ["Posts", "Gallery", "Events", "Links", "Text"]) assert.match(html, new RegExp(`>${label}</a>`));
+  for (const label of ["Posts", "Edit site", "Gallery", "Events"]) assert.match(html, new RegExp(`>${label}</a>`));
+  for (const label of ["Links", "Text"]) assert.doesNotMatch(html, new RegExp(`>${label}</a>`));
 });
 
 test("a post goes from draft to live, and reserved or taken URLs are refused", async () => {
@@ -247,4 +249,60 @@ test("ready is true on an empty database, so a new site can deploy, and false wh
     process.env.CMS_DATA_DIR = CMS_DATA_DIR;
     process.env.NODE_ENV = NODE_ENV;
   }
+});
+
+const edit = (cookie: string, body: unknown) =>
+  call("/n-admin/edit/save", { method: "POST", cookie, headers: { "x-cms": "1" }, body: typeof body === "string" ? body : JSON.stringify(body) });
+
+test("the editor page, script and data are there once signed in", async () => {
+  const cookie = await logIn();
+  const page = await (await call("/n-admin/edit", { cookie })).text();
+  assert.match(page, /data-edit-frame/);
+  assert.match(page, /src="\/n-admin\/edit\.js"/);
+  assert.match(await (await call("/n-admin/edit.js", { cookie })).text(), /data-edit-save/);
+  const data = await (await call("/n-admin/edit/data", { cookie })).json();
+  assert.equal(data.lists.links.fields.url.type, "url");
+  assert.equal(data.textFields.tagline.type, "text");
+  assert.equal((await call("/n-admin/edit/save", { method: "POST", headers: { "x-cms": "1" }, body: "{}" })).status, 401);
+  assert.equal((await call("/n-admin/edit/save", { method: "POST", cookie, origin: "https://evil.test", body: "{}" })).status, 403);
+});
+
+test("a page's edits save together, keeping only declared fields", async () => {
+  const cookie = await logIn();
+  const { lists } = await (await call("/n-admin/edit/data", { cookie })).json();
+  const response = await edit(cookie, {
+    texts: { tagline: " Hi " },
+    lists: { links: { revision: lists.links.revision, items: [{ label: " One ", url: "https://a.test", injected: "x", label2: 5 }] } },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(cms.text("tagline"), "Hi");
+  assert.deepEqual(cms.list("links"), [{ label: "One", url: "https://a.test" }]);
+});
+
+test("a stale or invalid edit writes nothing at all", async () => {
+  const cookie = await logIn();
+  const { lists } = await (await call("/n-admin/edit/data", { cookie })).json();
+  assert.equal((await edit(cookie, { texts: { tagline: "first" }, lists: { links: { revision: lists.links.revision, items: [{ label: "a", url: "https://a.test" }] } } })).status, 200);
+
+  const stale = await edit(cookie, { texts: { tagline: "second" }, lists: { links: { revision: lists.links.revision, items: [{ label: "b", url: "https://b.test" }] } } });
+  assert.equal(stale.status, 409);
+  assert.equal(cms.text("tagline"), "first");
+  assert.equal(cms.list("links")[0].label, "a");
+
+  const fresh = (await (await call("/n-admin/edit/data", { cookie })).json()).lists.links.revision;
+  assert.equal((await edit(cookie, { texts: { tagline: "third" }, lists: { links: { revision: fresh, items: [{ label: "", url: "" }] } } })).status, 422);
+  assert.equal(cms.text("tagline"), "first");
+
+  assert.equal((await edit(cookie, { texts: { nope: "x" } })).status, 422);
+  assert.equal((await edit(cookie, { lists: { nope: { items: [] } } })).status, 422);
+  assert.equal((await edit(cookie, { lists: { constructor: { items: [] } } })).status, 422);
+  assert.equal((await edit(cookie, "not json")).status, 400);
+});
+
+test("onPage must name real lists, and a site with no posts opens the editor", async () => {
+  assert.throws(() => defineCms({ onPage: ["nope"] }), /not a list/);
+  const onlyPage = defineCms({ posts: false, onPage: ["a"], lists: { a: { fields: { b: "text" } } } });
+  const cookie = await logIn();
+  const response = await onlyPage.GET({ request: new Request(`${SITE}/n-admin`, { headers: { cookie } }) });
+  assert.equal(response.headers.get("location"), "/n-admin/edit");
 });

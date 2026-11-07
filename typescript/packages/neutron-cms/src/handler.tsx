@@ -1,6 +1,6 @@
 import type { VNode } from "preact";
 import { render } from "preact-render-to-string";
-import { ADMIN_CSS, ADMIN_JS } from "./assets.generated.js";
+import { ADMIN_CSS, ADMIN_JS, EDIT_JS } from "./assets.generated.js";
 import {
   clearAttempts, clientAddress, createSession, endSession, hasSession, passwordHash, readLimited, sessionCookie,
   takeAttempt, verifyPassword,
@@ -9,9 +9,9 @@ import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
-import { Document, EditorPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
+import { Document, EditorPage, EditPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deletePost, getPost, isLive, listItems, listRevision, replaceItems, savePost, setTexts,
+  allPosts, allTexts, createPost, deletePost, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
   sortByDate, type Item, type Post,
 } from "./store.js";
 
@@ -118,6 +118,7 @@ export function createHandler(config: ResolvedConfig) {
       if (request.method === "POST") return redirect(`${admin}/posts/${createPost()}`);
       return postsPage();
     }
+    if (config.onPage.length) return redirect(`${admin}/edit`);
     const first = Object.keys(config.lists)[0] ?? (Object.keys(config.texts).length ? TEXT : null);
     return first ? redirect(`${admin}/lists/${first}`) : page("Nothing to edit", <NotFoundPage config={config} />);
   }
@@ -245,6 +246,57 @@ export function createHandler(config: ResolvedConfig) {
     return saved();
   }
 
+  /** Everything the editor needs. Only signed-in requests reach it. */
+  function editData() {
+    return Response.json({
+      textFields: config.texts,
+      lists: Object.fromEntries(Object.entries(config.lists).map(([key, list]) => [key, {
+        label: list.label,
+        fields: list.fields,
+        sortBy: list.sortBy,
+        items: listItems(key),
+        revision: listRevision(key),
+      }])),
+    });
+  }
+
+  async function editSave(request: Request) {
+    const refuse = (error: string, status = 422) => Response.json({ error }, { status });
+    let body: { texts?: unknown; lists?: unknown };
+    try {
+      body = await request.json();
+    } catch {
+      return refuse("That save could not be read.", 400);
+    }
+    const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+    const texts: Record<string, string> = {};
+    for (const [name, value] of Object.entries(isRecord(body.texts) ? body.texts : {})) {
+      if (!Object.hasOwn(config.texts, name) || typeof value !== "string") return refuse(`${name} is not a text field.`);
+      texts[name] = value.trim();
+    }
+
+    const lists: Record<string, { revision: string; items: Item[] }> = {};
+    for (const [key, value] of Object.entries(isRecord(body.lists) ? body.lists : {})) {
+      const definition = Object.hasOwn(config.lists, key) ? config.lists[key] : undefined;
+      if (!definition || !isRecord(value) || !Array.isArray(value.items)) return refuse(`${key} is not a list.`);
+      // Only declared fields are kept, whatever the request carried.
+      const items = value.items.map((item: unknown) =>
+        Object.fromEntries(Object.keys(definition.fields).map((name) => {
+          const field = isRecord(item) ? item[name] : "";
+          return [name, typeof field === "string" ? field.trim() : ""];
+        })),
+      );
+      const problem = problemWith(definition, items);
+      if (problem) return refuse(`${definition.label}: ${problem}`);
+      lists[key] = { revision: String(value.revision ?? ""), items: definition.sortBy ? sortByDate(items, definition.sortBy) : items };
+    }
+
+    const result = saveEdits(texts, lists);
+    if (!result.ok) return refuse(`${config.lists[result.stale].label} changed elsewhere. Reload, then make your edit again.`, 409);
+    return Response.json({ ok: true });
+  }
+
   async function route(request: Request, segments: string[]): Promise<Response> {
     const [first, second, ...rest] = segments;
     const post = request.method === "POST";
@@ -255,6 +307,10 @@ export function createHandler(config: ResolvedConfig) {
       return redirect(`${admin}/login`, sessionCookie(null, admin));
     }
     if (first === "admin.js" && !second) return new Response(ADMIN_JS, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
+    if (first === "edit.js" && !second) return new Response(EDIT_JS, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
+    if (first === "edit" && !second && !post && config.onPage.length) return page("Edit site", <EditPage config={config} />);
+    if (first === "edit" && second === "data" && rest.length === 0 && !post) return editData();
+    if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
     if (first === "upload" && !second && post) return upload(request);
     if (first === "preview" && !second && post) return preview(request);
     if (first === "posts" && config.posts && second && /^\d+$/.test(second) && rest.length === 0) return editor(request, Number(second));

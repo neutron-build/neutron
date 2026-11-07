@@ -2,7 +2,7 @@
 
 A small CMS for Neutron sites: posts, photo galleries, events and any other list, edited at `/n-admin`.
 
-It stores everything in one SQLite file and one folder, needs no database server, and sends visitors no JavaScript. Layout stays in your code. There is no page builder.
+It stores everything in one SQLite file and one folder, needs no database server, and sends visitors no JavaScript. Content can be edited by clicking it on the page. Layout stays in your code, so there is no page builder.
 
 Requires Node 22.16 or newer. Run the site with `neutron-ts start`, because the `docker` preset drops the route type this uses (Neutron 0.5.3).
 
@@ -70,6 +70,42 @@ Post bodies are Markdown. `renderMarkdown`, `summarize` and `firstImage` are exp
 
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 
+## Click to edit
+
+Mark what's on the page, list it in `onPage`, and a new **Edit site** page opens your real site with those parts editable. Those lists leave the menu. Words are typed in place, images are clicked, and anything the page doesn't show, such as a link's address, appears in a small toolbar along with Add, Remove and move.
+
+```ts
+defineCms({
+  texts: { tagline: "text" },
+  lists: { team: { fields: { name: "text", photo: "image", site: "url" } } },
+  onPage: ["team", "text"],
+});
+```
+
+```tsx
+<p data-cms-text="tagline">{tagline}</p>
+<ul>
+  {team.map((person, index) => (
+    <li data-cms-item={`team.${index}`}>
+      <a href={person.site}><Photo data-cms="photo" src={person.photo} alt={person.name} /></a>
+      <h3 data-cms="name">{person.name}</h3>
+    </li>
+  ))}
+</ul>
+```
+
+- `data-cms-text` marks a text field, `data-cms-item` marks one list item by its index in `cms.list()`, and `data-cms` marks a field inside that item.
+- A marked element should hold only that field's text.
+- The editor loads your site in a frame, and Neutron forbids framing by default. Allow your own site to frame itself in `neutron.config.ts`, and use `frame-ancestors 'self'` if you set a Content-Security-Policy:
+
+  ```ts
+  routes: { headers: [{ source: "/:path*", headers: { "X-Frame-Options": "SAMEORIGIN" } }] }
+  ```
+
+- Visitors get the same page as ever. The attributes do nothing, and the editing script only runs in the admin.
+- Use `hydrate: false` on these pages, so a client render can't overwrite an edit in progress.
+- It changes content, not layout. A filtered list, such as one from `cms.upcoming`, can edit its fields here but not add or move items, so edit those on their list page.
+
 ## Fields and lists
 
 Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type, or `{ type, label, required }` when it needs more. Labels default to the key.
@@ -88,6 +124,7 @@ Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type
 | `reservedSlugs` | none | URLs a post may not take, usually your other pages |
 | `previewCss` | none | Your post styles as a string, so previews match the site |
 | `timeZone` | `UTC` | When a date has passed |
+| `onPage` | none | Lists edited by clicking them on the page. Use `"text"` for the text fields |
 
 ## Environment
 
