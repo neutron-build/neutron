@@ -803,7 +803,13 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
                 .copied()
                 .collect();
             let old = std::mem::take(&mut st.slots.used_durable);
-            st.slots.pending_free = old.difference(&live).copied().collect();
+            // **X5-R49 (c) (card X-5c-F4-F1-F1-F3-F2): the early frees
+            // leave `used_durable` into no set at all.** `pending_free`
+            // is step 6's set, and `slot_free` refuses it (X5-R49 (b)),
+            // so routing them there would hide the mutant behind the
+            // refusal — its frees must be allocatable **at the flip**,
+            // while meta k−1 still references them, which is the
+            // I-FREE-SAFE violation D14's M-NOINPLACE catches.
             st.slots.used_durable = old.intersection(&live).copied().collect();
             Ok(())
         })?;

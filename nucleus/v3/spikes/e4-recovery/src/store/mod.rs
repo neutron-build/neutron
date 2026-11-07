@@ -353,11 +353,19 @@ pub struct FrozenImage {
     pub slot_count: u64,
 }
 
-/// Slot bookkeeping (§4.4–§4.5).
+/// Slot bookkeeping (§4.4–§4.5). The four sets are the allocator's
+/// whole decision — [`crate::store::prims::slot_free`] is its only
+/// test — and their discipline is X5-R49 (card
+/// X-5c-F4-F1-F1-F3-F2): a freed LPID's home leaves `used_cur` at the
+/// free itself (§4.4's last paragraph when no image holds it), a slot
+/// image k−1 references and image k does not moves to `pending_free`
+/// at post-5 and is released only at step 6 (§13 step 6).
 #[derive(Debug, Default, Clone)]
 pub struct SlotState {
     /// Current homes (the current map's pages, plus the current image's
-    /// map/free-set pages).
+    /// map/free-set pages). A freed LPID's home leaves this set in
+    /// `free_lpid`'s own atomic step (X5-R49 (a)), so the set never
+    /// outlives the map entry it stood for.
     pub used_cur: BTreeSet<u64>,
     /// The durable image's referenced slots (all of them: data, map and
     /// free-set pages).
@@ -365,7 +373,11 @@ pub struct SlotState {
     /// Slots frozen into `At` overrides of the image being built (from
     /// freeze to step 5): protected from reuse while image k needs them.
     pub image_refs: BTreeSet<u64>,
-    /// Slots freed at step 6 (between the frees and the recycle).
+    /// Slots referenced by image k−1 and not by image k, moved here at
+    /// post-5; `alloc_slot` refuses them, and §13 step 6's clearance
+    /// (between the frees and the WAL recycle) is their release point —
+    /// a slot becomes allocatable at step 6, not at post-5 (I-FREE-SAFE,
+    /// X5-R49 (b)).
     pub pending_free: BTreeSet<u64>,
     /// The file length in slots.
     pub slot_count: u64,

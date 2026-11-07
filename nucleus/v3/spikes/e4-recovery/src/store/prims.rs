@@ -489,7 +489,25 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
             st.slots.used_durable.remove(&r.slot);
             st.slots.image_refs.remove(&r.slot);
         }
-        st.map.cur.remove(&lpid);
+        // **X5-R49 (a) (card X-5c-F4-F1-F1-F3-F2; S-STORE §4.2, §4.4,
+        // §6.5 item 3): the freed LPID's current home leaves `used_cur`
+        // in the same atomic step that removes the map entry,
+        // unconditionally** — the home is read before the map drops it.
+        // Unconditional, not `unpin_home`: `free_lpid` ran
+        // `freeze_first_touch` above, so during a flip window the image
+        // being built already holds its own reference (an `Img::At`
+        // whose slot is in `image_refs`, or an epoch copy at another
+        // slot) and the durable image's is in `used_durable` — neither
+        // needs `used_cur`'s third reference, and `unpin_home`'s early
+        // return on an `image_refs` slot would keep a window-freed home
+        // pinned past post-5 (the same leak, only rarer). Outside a
+        // window no image can still gain the slot, so §4.4's last
+        // paragraph makes it reusable at once; inside one it stays
+        // refused until the image that references it is superseded and
+        // §13 step 6 runs (X5-R49 (b)).
+        if let Some(r) = st.map.cur.remove(&lpid) {
+            st.slots.used_cur.remove(&r.slot);
+        }
         // S-STORE §4.2/§4.3 (card X-5c-F3, class C-XX): a freed LPID
         // goes to the free set — `next_lpid` never shrinks. The
         // draft's `next_lpid -= 1` on freeing the highest LPID let the
@@ -516,15 +534,20 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
 
 /// **X5-R49 (b) (card X-5c-F4-F1-F1-F3-F2 step 1): `alloc_slot`'s only
 /// test, as one pure predicate.** A slot is allocatable iff referenced
-/// by none of §4.4's three references: the current map (`used_cur`),
+/// by none of §4.4's three references — the current map (`used_cur`),
 /// the durable image (`used_durable`) and the image being built
-/// (`image_refs`, plus the `used_cur` homes it shares). Pure over
-/// [`SlotState`], so a test can read the allocator's decision at any
-/// instant without allocating (X5-R49's pins).
+/// (`image_refs`, plus the `used_cur` homes it shares) — **and not in
+/// `pending_free`** (§13 step 6): a slot image k−1 references and image
+/// k does not moves to `pending_free` at post-5 and is released only
+/// when step 6 clears the set, so a free between the two is never
+/// handed out before the freeing meta is synced (I-FREE-SAFE).
+/// Pure over [`SlotState`], so a test can read the allocator's decision
+/// at any instant without allocating (X5-R49's pins).
 pub fn slot_free(slots: &SlotState, slot: u64) -> bool {
     !slots.used_cur.contains(&slot)
         && !slots.used_durable.contains(&slot)
         && !slots.image_refs.contains(&slot)
+        && !slots.pending_free.contains(&slot)
 }
 
 /// Allocate the lowest free slot (§4.5), growing the file by
