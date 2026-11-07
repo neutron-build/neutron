@@ -15,7 +15,11 @@ and merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R40.
 **Card X-5c-F4-F1-F1-O1C-F1 (X5-R47) has since replaced the `written`
 half and the F1 report of `derive_written_acked` with the replay in
 issue order — the three faultless class C O-1(c) rounds (1066, 6555,
-7590 r0) now pass; the record is below.**
+7590 r0) now pass; the record is below.** **Card
+X-5c-F4-F1-F1-CXX-F1 (X5-R48) has since repaired X5-R21 (c)'s
+re-pair for the twin that never fires (the joint spec): 7469, the
+one defect seed of CXX's 10k window, now passes with all three
+rounds; the record is below.**
 
 ## P ruling nv3-X-5c-F4-esc-1, verbatim (2026-11-04; binding)
 
@@ -629,8 +633,10 @@ R36 pin and 1769's no-twin pin still hold), and
 `late_copy_count_is_zero_at_base`'s four digests did not move again
 (96, 104, 161, 190 re-measured identical). Attempt 1's "every
 drop-bearing schedule re-derived" was loose, as the verdict said: of
-the nine, four first moved at the replay change and one at B1, not
-the drop arms.
+the ten, three first moved at the replay change and one at B1, not
+the drop arms — as the table above itself shows (the "nine/four"
+count was the verdict's finding 4; corrected by card
+X-5c-F4-F1-F1-CXX-F1's step 7).
 
 **The rework (P gate verdict REWORK 10567da6, 2026-11-06; finding 1,
 blocking).** Attempt 1's last step dropped its `PinGuard` at the walk
@@ -1178,6 +1184,89 @@ diagnosis is verdict X-5c-F4-F1-F1-CXX's finding 1 (seed 7469).
 - **Re-run.** The twin re-runs at the joint spec from its own start. The real round then runs at that same spec. `twin_final_spec` and `real_final_spec` both name it, and `crash_desc` describes it.
 - **Refusal.** A refused re-derive (union 0, or an empty list) leaves the unfired twin and its fired-guard defect standing. A joint-spec twin that still does not fire also trips the guard. There is no third attempt.
 - **Unchanged.** Every round whose re-paired twin fires, the twin's first-attempt re-derive, the uniform wrap and the class C retry. No other arm draws anything.
+
+**Step 0 — the ruling carried (commit 1c600515).** The text above,
+verbatim, before any code of this card.
+
+**Step 1 — the pin, failing at this tip (commit 42801a1f).**
+`r48_repaired_twin_fires_at_the_joint_spec` (seed 7469 under
+`Tuning::BASE`): no defect, `twin_paired` true on every round, round
+1's crash `Mid2@4` and fired. At this tip it failed on
+`Some("twin round 1: the crash spec never fired (Mid2@1)")` — 7469
+was CXX's one defect seed of 0..10000 (the pre-change single-seed
+run: `DEFECT_SEEDS=1`, the seed stopping after round 1, digest
+1670717970).
+
+**Step 2 — X5-R48 implemented (commit 45ab6b49).** The R21 (c)
+re-pair block of `run_seed_with` (`src/workload.rs`), the only code
+this card touches: when the re-paired twin does not fire at the real
+round's re-derived spec, the per-index AND of the twin's complete
+masks and the real round's first-attempt complete masks (over the
+shorter length) goes to one `reachable_hook_spec` draw — the same
+drawn `(hook, ckpt_index)`, the same `(seed, round)` — and on `Ok`
+the twin re-runs at that joint spec from its own start (kept beside
+`tch_pair` as `tch_retry` is), `spec2`/`script2`/`crash_desc` name
+it, the real round then runs at it, and `twin_final_spec` and
+`real_final_spec` both name it. On `Err` nothing changes: the unfired
+attempt's fired-guard defect stands (the Refusal clause); a
+joint-spec twin that still does not fire trips the guard the same
+way; there is no third attempt. Every other arm — a firing re-pair,
+the twin's first-attempt re-derive, the uniform wrap, the class C
+retry — is untouched, and no other arm draws anything. Measured on
+7469 (an instrumented scratch copy, single seed): the re-pair's own
+masks `[3ff, 3f7, 3ff, 3f7, 3ff, 3ff, 3ff, 3ff]` AND the real first
+attempt's `[3f7, 3ff, 3f7, 3ff, 3ff, 3ff, 3ff, 3ff]` = `[3f7, 3f7,
+3f7, 3f7, 3ff, 3ff, 3ff, 3ff]`, and the draw moves `Mid2@0 ->
+Mid2@4` (`Mid2` is `CKPT_HOOKS[3]`, bit 3 — the one bit `0x3f7`
+lacks; the joint first carries it at index 4, and the drawn index 0
+does not), twin and real both fire, three rounds all pass, no defect,
+digest **1393729414** — the gate trial's exact value
+(`trial-joint-repair.diff`, a diagnostic; this code was written
+against the ruling, not copied from it).
+
+**Step 3 — the mutant.** **M-R48-REAL-MASKS-ONLY** (the second
+re-derive consults the real round's masks alone): the draw returns
+`Mid2@1` again, the re-paired twin re-runs there and never fires, and
+the pin fails on `Some("twin round 1: the crash spec never fired
+(Mid2@1)")`. Applied to the real code, shown, reverted completely
+(`git diff` empty, the pin green again at the reverted tip).
+
+**Step 4 — `r21c` (commit 70e87d9a).** 7469 is back in the list
+beside 9469, and the pin's doc is corrected per the verdict's finding
+2: at CXX's tip only 9469 reaches the re-pair path with a firing
+twin; 2669 re-derives in the twin's first attempt; 4049, 4309 and
+9809 re-derive nothing.
+
+**Step 5 — the last-step pin's second seed (commit 39ddccdd).**
+`drop_last_step_keeps_its_pages_pinned` runs its unchanged body at
+seeds 38 and 467. **G6-UNPIN-BEFORE-FREES** (the guard dropped after
+the directory descent, before the tree mutex is re-taken, applied by
+hand to `dir_drop_tree`'s last step): the pin **passes at 38** and
+**fails at 467** — `seed 467: root 2 is mapped and in the free set —
+the last step freed a page whose frame an evictor had already
+latched (evict:finish resurrected it)`. Reverted clean (`git diff`
+empty, the pin green at both seeds). The CXX verdict's
+"UNCAUGHT at the literal seed 38" row is closed by the 467 literal,
+exactly as its finding 3 prescribed.
+
+**Step 6 — the digests (commit ba4aac1f).** Single seeds and the one
+contiguous 0..200, under `ulimit -v 25165824`, output outside the
+worktree; pre = CXX's tip (= this card's base, whose literals the
+X5-R37 pin holds byte for byte), post = this tip:
+
+| Run | Movement |
+|---|---|
+| 7469 singly | `1670717970 -> 1393729414`; `DEFECT_SEEDS 1 -> 0`; 2 rounds -> 3, all passing; r1's crash `Mid2@1 -> Mid2@4`, fired; the twin rounds all pass |
+| the X5-R37 list (54 seeds), singly | 7469 alone; the other 53 byte-identical |
+| contiguous 0..200, 16 threads | zero digest moves, zero record changes; the failing rounds stay the known 8/178 pair; `DEFECT_SEEDS=0` |
+
+7469's literal is re-derived in the pin and the movement attributed
+in its doc (X5-R48's own row).
+
+**Step 7 — this record, and the correction above.** CXX's movement
+passage said "of the nine, four first moved at the replay change";
+its own table shows ten movers — three first at the replay change,
+one at B1 — and the passage now says so (the verdict's finding 4).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
