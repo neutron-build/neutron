@@ -1888,6 +1888,60 @@ rounds 1 (the known `8r0`).
   suite is green with them in it (262 passed, 0 failed, this step's
   re-run).
 
+**Step 5 — the mutants re-run (this commit).** F3's 14 rows with
+`mut.py`'s exact edits, and F2's six plus its two `O-*` rows and this
+card's `O-FREE-DROP-IMGREFS`, each applied to a scratch export of this
+tip outside the worktree (the only edit per run; restored after — the
+export's sources verified byte-identical to the worktree tip at the
+end), built at a scratch target dir, `cargo test -q --release
+-p e4-recovery --no-fail-fast` filtered to each row's named test:
+
+| mutant | rc | catching test(s) shown failing | vs the record |
+|---|---|---|---|
+| M-R41-NOHOLD | 101 | `x5_r41_aligned_round_has_q4_and_reuse` | as at F3 |
+| M-R41-WRONGWINDOW | 101 | the same pin | as at F3 |
+| M-R41-NOPREP | 101 | the same pin | as at F3 |
+| M-R41-DRAW | 101 | `x5_r37_base_tuning_reproduces_1b0ce54e` (against the re-derived literals) | as at F3 |
+| M-R41-AFTERCRASHARM | 101 | `x5_r41_aligned_round_has_q4_and_reuse` | as at F3 |
+| G-Q4MG-FROM-SPLITS | 101 | the same pin | as at F3 |
+| M-REUSE-DROPS-IMG | 101 | `x5_r41_completed_window_arm` | as at F3 |
+| M-FREE-HOME-ALLOC | 101 | **16 tests**, incl. `x5_r49_freed_home_frees_at_step6`, `x5_r49_window_freed_home_frees_at_next_step6`, pin 4, `x5_r37_…`, `late_copy_…`, `r48_…`, `szc_…`, `x5_r42_q4i_…`, `d14`-adjacent digest pins | **no longer UNCAUGHT** — see below |
+| M-Q4I-LASTCKPT | 101 | `x5_r42_q4i_keys_on_the_opened_image` | as at F3 |
+| M-Q4I-REFUSED | 101 | `x5_r42_refused_round_is_not_q4i` | as at F3 |
+| M-Q4I-NOFLOOR | 101 | `campaign::x5_r42_row_at_999_and_1000` | as at F3 |
+| M-Q4I-NOREPRO | 101 | `campaign::x5_r42_flipped_q4i_fails_reproduction` | as at F3 |
+| M-SEEDED-NOBASELINE | 101 | `campaign::x5_r43_known_failures_are_not_new` | as at F3 |
+| M-SEEDED-NOARMRULE | 101 | `campaign::x5_r43_caught_needs_the_arm_predicate` | as at F3 |
+| M-FREE-LEAK | 101 | all four `x5_r49_*` pins (1's Mid6, 3's at-once, 2's k+1, 4's k+1) | as at F2 (pins 1 and 3 named there; 2 and 4 also fail) |
+| M-FREE-UNPIN-ONLY | 101 | `x5_r49_window_freed_home_frees_at_next_step6` **and pin 4** (pins 1, 3 pass) | as at F2; pin 4 adds a second catcher for the same leak |
+| M-STEP6-AT-POST5 | 101 | `x5_r49_freed_home_frees_at_step6` (After5), pins 2 and 4 | as at F2 (more catchers) |
+| M-FREE-RELEASE-DURABLE | 101 | `x5_r49_freed_home_frees_at_step6` (before the flip) | as at F2 |
+| G-FE-PENDING | 101 | `d14_monitors` (FREE-EARLY, `monitors=[]` — M-NOINPLACE inert behind (b)) | as at F2 |
+| G2 (the orphaned write-out's release removed, `epoch_copy:record`) | 101 | `exhausted_reserve_keeps_both_copies` | as at F2 (site re-identified at this tip: the orphan's `used_cur.remove` in the `!same` arm) |
+| O-STEP6-NOCLEAR | 101 | pins 1 and 2 (Mid6) and pin 4 | as at F2 (more catchers) |
+| O-SLOTFREE-NO-DURABLE | 101 | pin 1 (before the flip), pins 2 and 4 | as at F2 (more catchers) |
+| **O-FREE-DROP-IMGREFS** | 101 | **`x5_r49_window_freed_unimaged_home_held_by_image_refs`** (pin 4 alone; pins 1–3 pass — pin 2 masked by `used_durable`) | **caught** (UNCAUGHT at F2; step 3's pin closes the gap) |
+
+**M-FREE-HOME-ALLOC is no longer UNCAUGHT at this tip.** The card and
+F3's README expect it UNCAUGHT (F3-F1's job). At F2's Base it was
+inert because the freed home stayed in `used_cur` for the session (the
+leak X5-R49 fixed), so dropping `used_durable`/`image_refs` at the
+free still left the slot refused. With X5-R49 (a) in place the same
+edit makes every freed home allocatable at once while its durable
+image references it — 16 tests fail, the three `x5_r49_*` pins among
+them. The direction is favourable (a mutant that gained catchers, none
+lost); nothing was weakened and F3-F1's fix is still pending. Recorded
+as a deviation from the card's expected row, not hidden.
+
+**M-R51-NOEXPLAIN** (the checker mutant, scratch-only, applied to this
+worker's step-1 checker logic, never the crate): with (b)5 dropped it
+classifies as MOVED exactly the rounds the full checker stops on —
+shown on synthetic diag lines: an MP finding on an untainted slot
+(`slot: Some(9)` in `tainted {10}`), an empty findings list, and an MW
+`damaged=[]` line all read "MOVED (explained)" under the mutant and
+"NEW FAILURE → STOP" under the full checker (`mr51.py` in the scratch
+dir, exit 0 on the divergence).
+
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
