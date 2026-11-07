@@ -8,7 +8,7 @@ export type Status = keyof typeof STATUS_LABEL;
 
 const DATE = new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 
-export function Document(props: { config: ResolvedConfig; title: string; children: ComponentChildren }) {
+export function Document(props: { config: ResolvedConfig; title: string; cssVersion: string; children: ComponentChildren }) {
   return (
     <html lang="en">
       <head>
@@ -17,7 +17,7 @@ export function Document(props: { config: ResolvedConfig; title: string; childre
         <meta name="robots" content="noindex" />
         <title>{`${props.title} - n-admin`}</title>
         <link rel="icon" href="data:," />
-        <link rel="stylesheet" href={`${props.config.path}/admin.css`} />
+        <link rel="stylesheet" href={`${props.config.path}/admin.css?v=${props.cssVersion}`} />
       </head>
       <body>{props.children}</body>
     </html>

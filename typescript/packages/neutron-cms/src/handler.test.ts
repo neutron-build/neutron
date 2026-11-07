@@ -232,7 +232,7 @@ test("the admin can live at another path", async () => {
   const moved = defineCms({ path: "/edit/" });
   const cookie = await logIn();
   const page = await (await moved.GET({ request: new Request(`${SITE}/edit`, { headers: { cookie } }) })).text();
-  assert.match(page, /href="\/edit\/admin\.css"/);
+  assert.match(page, /href="\/edit\/admin\.css\?v=[a-f0-9]{12}"/);
   assert.match(page, /src="\/edit\/admin\.js"/);
   assert.match(await moved.GET({ request: new Request(`${SITE}/edit`) }).then((r) => r.headers.get("location")!), /^\/edit\/login$/);
 });
@@ -305,4 +305,14 @@ test("onPage must name real lists, and a site with no posts opens the editor", a
   const cookie = await logIn();
   const response = await onlyPage.GET({ request: new Request(`${SITE}/n-admin`, { headers: { cookie } }) });
   assert.equal(response.headers.get("location"), "/n-admin/edit");
+});
+
+test("the stylesheet's address changes with its content, so an old cached copy is never used", async () => {
+  const page = await (await call("/n-admin/login")).text();
+  const address = page.match(/href="(\/n-admin\/admin\.css\?v=[a-f0-9]{12})"/)![1];
+  const current = await call(address);
+  assert.match(current.headers.get("cache-control")!, /immutable/);
+  assert.match(await current.text(), /\.edit-frame/);
+  assert.equal((await call("/n-admin/admin.css")).headers.get("cache-control"), "no-store");
+  assert.equal((await call("/n-admin/admin.css?v=old")).headers.get("cache-control"), "no-store");
 });

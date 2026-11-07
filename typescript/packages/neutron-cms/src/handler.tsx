@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { VNode } from "preact";
 import { render } from "preact-render-to-string";
 import { ADMIN_CSS, ADMIN_JS, EDIT_JS } from "./assets.generated.js";
@@ -35,6 +36,9 @@ const SAVE_ERRORS: Record<string, string> = {
   "slug-reserved": "That URL belongs to another page on the site.",
   missing: "This post no longer exists.",
 };
+
+/** In the stylesheet's address, so an update can never meet an old copy in a browser's cache. */
+const CSS_VERSION = createHash("sha256").update(ADMIN_CSS).digest("hex").slice(0, 12);
 
 const redirect = (location: string, cookie?: string) =>
   new Response(null, { status: 303, headers: { Location: location, ...(cookie ? { "Set-Cookie": cookie } : {}) } });
@@ -94,7 +98,7 @@ export function createHandler(config: ResolvedConfig) {
   const admin = config.path;
 
   const page = (title: string, body: VNode, status = 200) =>
-    new Response(`<!doctype html>${render(<Document config={config} title={title}>{body}</Document>)}`, {
+    new Response(`<!doctype html>${render(<Document config={config} title={title} cssVersion={CSS_VERSION}>{body}</Document>)}`, {
       status,
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
@@ -325,7 +329,10 @@ export function createHandler(config: ResolvedConfig) {
     // The only things a visitor may fetch.
     if (!unsafe && segments[0] === "media" && segments.length === 2) return serveImage(segments[1]);
     if (!unsafe && segments[0] === "admin.css" && segments.length === 1) {
-      return new Response(ADMIN_CSS, { headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
+      const current = new URL(request.url).searchParams.get("v") === CSS_VERSION;
+      return new Response(ADMIN_CSS, {
+        headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": current ? "public, max-age=31536000, immutable" : "no-store" },
+      });
     }
 
     if (unsafe && !isSameOrigin(request)) return new Response("Forbidden", { status: 403 });
