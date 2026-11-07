@@ -1,19 +1,27 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3 (X5-R41 the window-targeted SMO
-alignment, X5-R42 the Q4-I row, X5-R43 the seeded faults) — complete,
-and the card's decision rule is NOT MET by all three shares (Q4 × 50
-reads 1,400 / 1,150 / 900 against the 1,500 bar at 1000 / 800 / 600;
-ESCALATE, the record below); the seeded Joint fault is CAUGHT at
-share 1000 and the Slot fault is UNCAUGHT at every setting measured
-(a second ESCALATE).** `Tuning::FINAL == Tuning::BASE` at this tip
-(no setting was handed off); every seed pin runs `Tuning::BASE`
-(1b0ce54e's generator, bit for bit, pinned by
-`x5_r37_base_tuning_reproduces_1b0ce54e` over all 54 seeds any test
-passes to a seed runner); no BASE digest moved. The stages before it
+Status: **stage X-5c-F4-F1-F1-F3-F2 (X5-R49, the freed home's release)
+— stopped at step 4's gate: the fix is implemented and pinned (three
+new pins, six mutants caught, D14 and rework 6 unchanged), the Base
+references reproduce exactly, but the movement comparison over BASE
+0..1000 reads **7 new O-1(a) detected-loss texts on MP/MW rounds that
+had none at the Base** (all pass=true, none a fold regression, no new
+deadlock/panic/monitor/defect; one Base failing round healed) — the
+card's "any new failure: stop … Do not try a fix" rule fired; the
+literal re-derivation, F3's mutant re-runs and the diagnostic did not
+run, and seven digest-literal pins keep stale literals (red) at this
+tip. The record and the rounds are below. ESCALATE.** Before it:
+stage X-5c-F4-F1-F1-F3 (X5-R41/X5-R42/X5-R43) complete — its decision
+rule NOT MET by all three shares, the Joint fault CAUGHT at share 1000
+and the Slot fault UNCAUGHT at every setting measured (both ESCALATEs,
+the record below; the Slot fault's cause — this card's store deviation
+— is what X5-R49 fixes). `Tuning::FINAL == Tuning::BASE` at this tip
+(no setting was handed off); the X5-R37 pin holds the **old** literals
+at this tip (13 of its 54 seeds moved with the fix; the measured new
+digests are recorded below, unapplied). The stages before it
 (X-5c-F4-F1-F1 and its follow-ups, X-5c-F4-F1, X-5c-F4, X-5c-F3-F3b
 and back to X-5c) are complete and merged. Opus judges E4 on the
-RESULT with P's rulings X5-R1–R43.
+RESULT with P's rulings X5-R1–R49.
 **Card X-5c-F4-F1-F1-O1C-F1 (X5-R47) has since replaced the `written`
 half and the F1 report of `derive_written_acked` with the replay in
 issue order — the three faultless class C O-1(c) rounds (1066, 6555,
@@ -1538,6 +1546,84 @@ tip):
 | M-FREE-RELEASE-DURABLE (the release also removes `used_durable`) | `x5_r49_freed_home_frees_at_step6` (its before-the-flip check: image 1 still references the slot) |
 | G-FE-PENDING (FREE-EARLY's apply routes its frees through `pending_free`) | D14's FREE-EARLY assertion (`monitors=[]` — M-NOINPLACE never fires, the mutant is inert behind (b)) |
 | G2 (rework 6's own: the orphaned write-out's release removed) | `exhausted_reserve_keeps_both_copies` at its unmoved literal (`slots [13] entered used_cur referenced by nothing`) |
+
+**Step 4 — movement measured, then the STOP (this commit).** Base =
+`1180d761` (this card's Base), built from a `git archive` export at a
+target dir outside the worktree; tip = this branch. Every run under
+`ulimit -v 25165824`, 16 threads, output outside the worktree.
+
+- **The Base reproduces `m/b1.json` exactly**: BASE 0..200 at the Base
+  binary is byte-identical (sha256 `3480c86b…c3c6`, `E4 FOLD
+  FAILING_SEEDS=2 FAILING_ROUNDS=2`), so the reference files stand.
+- **X5-R37's 54 seeds, singly**: 41 byte-identical, **13 moved** —
+  measured new digests (recorded here, **not applied** — see the stop):
+  3 `923362676→4196035152`, 47 `2526989435→1878234829`, 112
+  `3003462667→841173046`, 198 `95622311→3654049329`, 303
+  `4147169426→144621379`, 967 `2847369120→3916549382`, 987
+  `2492798953→1449471436`, 1749 `1584051239→3785784973`, 2376
+  `3116539881→926921172`, 2927 `1901399424→1916772534`, 5549
+  `308297210→3614535945`, 7469 `1393729414→1742707490`, 7528
+  `122281874→3346573892`.
+- **BASE 0..1000** (five 200-seed blocks at the tip vs `m/b1k.json`):
+  243 digests moved; failing rounds Base 5 (`8r0, 178r1, 457r0, 537r0,
+  688r0`, all the known MP class) → tip 4 (`8r0, 178r1, 537r0, 688r0`);
+  twin failing rounds both sides `609r1, 849r1`; `DEFECT_SEEDS=0`,
+  `DEADLOCK=0`, `PANIC=0` everywhere. **BASE 0..200** (tip block 1 vs
+  `m/b1.json`): 51 moved, failing rounds 2 vs 2 — the known `8r0` /
+  `178r1` pair on both sides.
+- **New failures (the card's bullets, applied per (seed, round) and per
+  twin) — not zero, so the card's stop rule fires.** All of them are
+  bullet-2 (a round with no O-1/O-2/O-3 text at the Base that has one
+  here); no fold regression (no round that passed the fold at the Base
+  fails it here), and no new DEADLOCK, PANIC, MONITOR, DEFECT or baton
+  hit anywhere:
+
+  | seed, round | class | Base | tip |
+  |---|---|---|---|
+  | 47 r1 (round count 1→2) | MP | (no round 1; the seed's r0 carried the detection) | `pass=true`, `o1='O-1(a) at c=19: published {} != model {2, 3, 4, 5}'`, `crash=poison`; r0 is now text-free |
+  | 339 r0 | MW | `pass=true`, no text, `crash=uniform@y:9569` | `pass=true`, `o1='O-1(a) at c=5: published {} != model {2, 3, 4}'`, `crash=uniform@y:6802` |
+  | 547 r0 | MP | `pass=true`, no text, `crash=After5@2` | `pass=true`, `o1='O-1(a) at c=26: published {} != model {2}'`, `crash=After5@2` |
+  | 779 r0 | MW | `pass=true`, no text, `crash=uniform@y:369` | `pass=true`, `o1='O-1(a) at c=7: published {} != model {2}'`, `crash=uniform@y:5896` |
+  | 797 r0 | MP | `pass=true`, no text, `crash=uniform@y:9889` | `pass=true`, `o1='O-1(a) at c=21: published {} != model {2, 3}'`, `crash=uniform@y:11872` |
+  | 799 r0 | MW | `pass=true`, no text, `crash=uniform@y:13386` | `pass=true`, `o1='O-1(a) at c=5: published {} != model {2}'`, `crash=uniform@y:9670` |
+  | 967 r0 (round count 2→1) | MP | `pass=true`, no text, `crash=Mid6@0` | `pass=true`, `o1='O-1(a) at c=7: published {} != model {2, 3}'`, `crash=Mid6@0` |
+
+  Reading (the rounds' own shapes, not a fix attempt): every new text
+  is an **O-1(a) detected-and-explained loss** — X5-R6's MP/MW rule:
+  a loss the round's media faults explain passes with the text
+  recorded (`o1_detected_loss`). The fix moves the store's yield
+  pattern (allocations differ from the free onward), so the drawn
+  uniform crash points landed elsewhere (`9569→6802`, `369→5896`,
+  `9889→11872`, `13386→9670`) and the media-fault ∩ recovery
+  intersections changed in both directions: 47 and 967 each moved an
+  existing detection one round (47's from r0 to a new r1, 967's from
+  r1 into r0); 339/547/779/797/799 each gained one on a round that had
+  none; and 457 r0's Base failure — an **unexplained** `O-3(a)` served
+  corruption beside its `O-1(a)` — became explained at the tip
+  (`crash=uniform@y:14318→6537`, `pass=false→true`), which is why the
+  tip has one fewer failing round. Seeds 47 and 967 are reported under
+  the strict reading (an added round carrying a text has vacuously
+  "no text at the Base"); 339/547/779/797/799 (and 967 r0) meet the
+  bullet as written, so the stop is mandatory under any reading.
+
+**The stop, and what did not run.** Per Work 4: no fix was attempted.
+The step's remaining items are machinery of the "Otherwise" branch and
+did not run: the `r41_share` 1000 over 0..200 comparison against
+`m/a1.json`; the literal re-derivation commits (the 13 measured new
+digests above are recorded, not applied — the pins keep the old
+literals and are red at this tip: `x5_r37_base_tuning_reproduces_1b0ce54e`,
+`o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2` (its new
+line: r2 tree 4 `lo=38 hi=38 frontier=38 T=35 c=38`),
+`x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2` (its new line:
+r2 `lo=34 hi=35 frontier=34 T=31 c=34`, owner ts 34 > T 31, the clamp
+still not the identity), `r48_repaired_twin_fires_at_the_joint_spec`,
+`late_copy_count_is_zero_at_base`, `szc_rename_crash_keeps_the_open_fold`,
+`g8_checkpoint_poison_ends_the_workload`); F3's 14 named mutants against
+re-derived pins; and the frees / freed-homes-released-at-step-6 /
+handed-out-again diagnostic over BASE 0..200 (the gate read 0 and 0 at
+the Base). Steps 5's re-derivations are therefore also not done; this
+record is the card's end state.
+
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
