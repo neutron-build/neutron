@@ -860,7 +860,15 @@ pub fn seeded_new_failures(clean: &[SeedRec], faulty: &[SeedRec]) -> Vec<(u64, u
         }
         for (i, (cr, fr)) in c.rounds.iter().zip(f.rounds.iter()).enumerate() {
             let fails_oracle = fr.o1_fail.is_some() || fr.o2_fail.is_some() || fr.o3_fail.is_some();
-            if fails_oracle && !fr.deadlock && !fr.panic && cr.pass {
+            // "Passes in the clean arm" is the oracle, not the fold: a
+            // clean round that already carries an O-1/O-2/O-3 text (an
+            // MP detection round, say) is a known failure, and a fault
+            // that changes nothing about it must not count as caught —
+            // the pin's own wording ("the oracle fails on with the
+            // mutant and passes on without it") is the rule.
+            let passes_oracle =
+                cr.o1_fail.is_none() && cr.o2_fail.is_none() && cr.o3_fail.is_none();
+            if fails_oracle && !fr.deadlock && !fr.panic && passes_oracle {
                 out.push((f.seed, i));
             }
         }
