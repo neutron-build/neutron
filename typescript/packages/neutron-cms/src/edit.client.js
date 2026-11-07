@@ -37,7 +37,7 @@ function show() {
   saveButton.disabled = pending > 0 || !dirty;
   discardButton.disabled = !dirty;
   state.classList.toggle("bad", bad);
-  state.textContent = notice || (pending ? `Uploading, ${pending} left` : dirty ? "Unsaved changes" : HINT);
+  state.textContent = notice || (pending ? `Uploading, ${pending} left` : dirty ? "Unsaved changes" : selected ? "" : HINT);
 }
 
 function say(message, isBad = false) {
@@ -148,6 +148,7 @@ function select(itemEl) {
   selected = itemEl;
   selected?.setAttribute("data-cms-selected", "");
   drawTools();
+  show();
 }
 
 function button(text, label, action, disabled = false) {

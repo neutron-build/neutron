@@ -24,7 +24,7 @@ export function Document(props: { config: ResolvedConfig; title: string; cssVers
   );
 }
 
-function Shell(props: { config: ResolvedConfig; active?: string; extraScript?: string; children: ComponentChildren }) {
+function Shell(props: { config: ResolvedConfig; active?: string; children: ComponentChildren }) {
   const { config, active } = props;
   const admin = config.path;
   const current = (name: string) => (active === name ? "page" : undefined);
@@ -46,7 +46,6 @@ function Shell(props: { config: ResolvedConfig; active?: string; extraScript?: s
       </header>
       {props.children}
       <script defer src={`${admin}/admin.js`} />
-      {props.extraScript ? <script defer src={`${admin}/${props.extraScript}`} /> : null}
     </>
   );
 }
@@ -290,15 +289,25 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
 }
 
 export function EditPage(props: { config: ResolvedConfig }) {
+  const { config } = props;
+  const admin = config.path;
+  // A site with no blog opens on this page, so going back to its home would land here again.
+  const otherList = Object.entries(config.lists).find(([key]) => !config.onPage.includes(key));
+  const back = config.posts ? { href: admin, label: "Posts" } : otherList ? { href: `${admin}/lists/${otherList[0]}`, label: otherList[1].label } : null;
   return (
-    <Shell config={props.config} active="edit" extraScript="edit.js">
-      <div class="edit-bar">
-        <button class="button primary" type="button" data-edit-save disabled>Save</button>
-        <button class="button" type="button" data-edit-discard disabled>Discard</button>
-        <span class="muted" data-edit-state role="status" />
+    <>
+      <header class="top editor-top edit-top">
+        {back ? <a class="back" href={back.href} aria-label={`Back to ${back.label}`}>{"\u2190"}<span class="on-wide">&nbsp;{back.label}</span></a> : null}
+        <span class="state" data-edit-state role="status" />
+        <span class="spacer" />
         <div class="edit-tools" data-edit-tools hidden />
-      </div>
+        <a class="button quiet on-wide" href="/" target="_blank" rel="noreferrer">View site</a>
+        <button class="button" type="button" data-edit-discard disabled>Discard</button>
+        <button class="button primary" type="button" data-edit-save disabled>Save</button>
+      </header>
       <iframe class="edit-frame" title="Your site" src="/" data-edit-frame />
-    </Shell>
+      <script defer src={`${admin}/admin.js`} />
+      <script defer src={`${admin}/edit.js`} />
+    </>
   );
 }

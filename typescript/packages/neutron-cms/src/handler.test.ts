@@ -316,3 +316,12 @@ test("the stylesheet's address changes with its content, so an old cached copy i
   assert.equal((await call("/n-admin/admin.css")).headers.get("cache-control"), "no-store");
   assert.equal((await call("/n-admin/admin.css?v=old")).headers.get("cache-control"), "no-store");
 });
+
+test("the editor's back link never returns to the editor", async () => {
+  const cookie = await logIn();
+  const open = async (site: ReturnType<typeof defineCms>) => (await site.GET({ request: new Request(`${SITE}/n-admin/edit`, { headers: { cookie } }), params: { path: "edit" } })).text();
+  assert.match(await open(cms), /class="back" href="\/n-admin"/);
+  const lists = { a: { fields: { b: "text" } }, c: { label: "Gallery", fields: { d: "text" } } } as const;
+  assert.match(await open(defineCms({ posts: false, onPage: ["a"], lists })), /class="back" href="\/n-admin\/lists\/c"/);
+  assert.doesNotMatch(await open(defineCms({ posts: false, onPage: ["a", "c"], lists })), /class="back"/);
+});
