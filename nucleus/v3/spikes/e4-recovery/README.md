@@ -1942,6 +1942,99 @@ shown on synthetic diag lines: an MP finding on an untainted slot
 "NEW FAILURE → STOP" under the full checker (`mr51.py` in the scratch
 dir, exit 0 on the divergence).
 
+**Step 6 — the frees diagnostic, and this card's end state (this
+commit).** Over BASE 0..200 at the tip, in a scratch export whose only
+edits are three `GEV` `eprintln!` counters and a diag-only
+`SlotState::freed_homes` set (never committed; the worktree untouched,
+`git status` clean; the instrumented run's `E4` line and all 200
+digests byte-identical to the plain tip run, so the counters changed
+nothing):
+
+- `GEV FREE` — `free_lpid` home releases: **2209**
+- `GEV STEP6` — freed homes that became free at a §13 step 6:
+  **2091**
+- `GEV REUSE` — allocations that handed a freed home out again in the
+  same session: **4212**
+
+The gate read 0 and 0 for the last two at the Base (the leak X5-R49
+fixes). All three are non-zero here, so X5-R49 does real work on the
+campaign — no ESCALATE. (The reuse count exceeds the free count
+because a slot can be freed and re-handed more than once in a session;
+the counters are raw event counts, reported as measured.)
+
+**Correction of F2's step-4 record (verdict finding 2).** F2's README
+table called the seven gained texts "X5-R6 detected-and-explained
+losses" with `o1dl`/`r6` framing; the verdict corrects this: they are
+**failed-recovery rounds** (`published {}`, no `r6` detection, `o1dl`
+0) that pass with the O-1(a) text recorded, 547 r0 and 967 r0 were the
+X5-R6 rounds **at the Base**, and the record omitted the reverse
+direction entirely (the five moved-lost rounds this card's step 1
+lists). F2's measured numbers themselves were right; this card's step
+1 supersedes its reading.
+
+## RESULT
+
+card: X-5c-F4-F1-F1-F3-F2-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1   commit: (this commit; the chain d43236cc → 6023ccbc → 54b7c105 → b53f9ed3 → da4808a4 → ba255388 → here)
+
+acceptance (this attempt runs `cargo test` and `scripts/gate.sh` last;
+the 10k baseline lines are the runner's per X5-R31 — this sandbox's
+`~/.cache/nv3-review` is a read-only mount, so their `--out` paths
+cannot be written here):
+- `cd nucleus/v3 && cargo test -q --release -p e4-recovery` — 262
+  passed, 0 failed (261 before pin 4; every target green).
+- `cd nucleus/v3 && bash scripts/gate.sh` — see the run log below; the
+  two known reds the card's Notes name (`runner e2e: K`, and
+  `ack_prefix_two_batches_in_flight` under load) are pre-existing, not
+  this card's.
+- The 10k baseline, the runner's once, at this tip; the comparator
+  with X5-R51 (f) as written, `MOVED_MP_PENDING` then checked by the
+  gate under (b)5.
+
+mutants: F3's 14 — 13 caught as recorded; **M-FREE-HOME-ALLOC caught**
+(16 tests; was expected UNCAUGHT — X5-R49 (a) unmasked it; favourable,
+recorded, F3-F1 still pending). F2's six: M-FREE-LEAK (all four
+`x5_r49_*` pins), M-FREE-UNPIN-ONLY (pin 2 + pin 4), M-STEP6-AT-POST5
+(pin 1 + 2 + 4), M-FREE-RELEASE-DURABLE (pin 1), G-FE-PENDING
+(`d14_monitors`), G2 (`exhausted_reserve_keeps_both_copies`; site
+re-identified). O-STEP6-NOCLEAR (pins 1, 2, 4),
+O-SLOTFREE-NO-DURABLE (pins 1, 2, 4), **O-FREE-DROP-IMGREFS caught by
+pin 4 alone** (UNCAUGHT at F2). M-R51-NOEXPLAIN: shown on synthetic
+diag lines. Every mutant applied and reverted clean; the export
+verified byte-identical to the tip afterwards.
+
+numbers: BASE 0..1000 vs `m/b1k.json`: 243 digests moved, moved-gained
+7 / moved-lost 5 / healed 1 / new failures 0 (the comparator's exact
+reading). Share 1000 over 0..200 vs `m/a1.json`: 62 moved, gained 1 /
+lost 2 / healed 0 / new 0. 54 seeds: 13 moved, exactly F2's set.
+Diagnostic over BASE 0..200: frees 2209, step-6 releases 2091,
+in-session reuses 4212 (all non-zero; the Base read 0 and 0).
+
+judgment calls: (1) the card's scratch dir `~/.cache/nv3-review/
+X-5c-F4-F1-F1-F3-F2-F1/` is a read-only mount in this sandbox, so all
+scratch (exports, targets, run output, scripts) lives under
+`/tmp/nv3-container-jc_2ajyd/opencode/X-5c-F4-F1-F1-F3-F2-F1/` — the
+runs themselves are unchanged. (2) The share-1000 probe used a
+`Tuning` patch (`r41_share: 1000` in both consts) instead of the
+gate's `E4G_R41` env form — the same run. (3) G2's edit site was
+re-identified at this tip (the orphan's `used_cur.remove` in
+`epoch_copy:record`'s `!same` arm): the first attempt at the row
+(evict:finish's idempotent re-insert) was inert and discarded, and the
+correct site catches as at F2. (4) `szc`'s doc comment keeps F4's
+"folded 235 ≥ 4·F = 184" measurement with a note that the crash
+literal moved and the `szc` assertion holds at the new point.
+
+ESCALATE: none.
+
+anomalies: (1) the 1749 r2 frontier window collapsed to
+`lo=hi=frontier=c=38`, so the two O1F pins no longer separate `c=lo`
+(5549 still catches `c=hi`; both still catch the `le_T`-from-frontier
+mutant) — those are F3-F3a-F2-F1 gate rows, not this card's 14;
+recorded for P. (2) M-FREE-HOME-ALLOC is no longer UNCAUGHT at this
+tip (see mutants). (3) `git commit` prints a benign
+`packed-refs.lock: Read-only file system` warning (the shared main
+repo's refs are read-only here); each commit lands on the branch
+correctly — `git log` and `git status` verified after every step.
+
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
