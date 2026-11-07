@@ -1489,6 +1489,57 @@ then the ruling itself.
 **Step 0 — the ruling carried.** The text above, verbatim, before any
 code of this card.
 
+**Step 1 — `slot_free`, then the pins failing (commit cfd9fa69).**
+`slot_free(&SlotState, slot)` is now `alloc_slot`'s only test, as one
+pure predicate over the slot sets (a pure refactor: the 54-seed BASE
+pin `x5_r37_base_tuning_reproduces_1b0ce54e` still passes, bit for
+bit). The three pins were added and shown failing at the Base:
+`x5_r49_freed_home_frees_at_step6` (its Mid6 check: slot 6 not free),
+`x5_r49_window_freed_home_frees_at_next_step6` (its k+1 Mid6 check),
+`x5_r49_unimaged_home_frees_at_once` (its free-at-once check).
+
+**Step 2 — X5-R49 implemented (commit 2e274d09).** (a) `free_lpid`
+releases the freed home from `used_cur` unconditionally, in the same
+atomic step that drops `map.cur[lpid]`, reading the home before the
+drop (`Mutant::FreeHomeAlloc`'s site above it untouched); (b)
+`slot_free` refuses `pending_free`, so post-5 keeps a superseded slot
+pending and §13 step 6's clearance (unchanged) is the release point;
+(c) FREE-EARLY's apply frees into no set — `pending_free` is step 6's,
+and routing there would hide the mutant behind (b)'s refusal. The
+`SlotState` doc comments state the four sets' discipline. The three
+pins pass; D14's FREE-EARLY still fires M-NOINPLACE; rework 6's
+literal did **not** move and its pin is green. Seven digest-literal
+pins fail at this commit pending step 4's re-derivation (the X5-R37
+table, 1749 r2 and 5549 r2's O-1f lines, 7469, the late-copy seeds,
+`szc`). **The eviction in flight across a free:** its `evict:finish`
+re-inserts `map.cur[key] = r` — the free is undone in the map, the
+documented "evict:finish resurrected it" shape, demonstrated by
+`drop_last_step_keeps_its_pages_pinned` at seed 467 (CXX-F1 step 5) —
+and `used_cur.insert(r.slot)`: the new slot stays in `used_cur`
+**referenced by the resurrected entry** (inside a window,
+`record_image_at` also pins it in `image_refs`, and post-5 carries it
+into the durable set), so it is *not* rework 6's unreferenced class;
+nothing to fix here, and (a) correctly released the *old* home at the
+free (a later re-free of the resurrected LPID releases the new one).
+Through the store's own paths the interleave cannot precede a free: a
+pack or drop walk fetches the page first, and a fetch parks on an
+`evicting` frame, so the free observes the finished eviction.
+
+**Step 3 — the mutant table (this commit).** Each mutant applied to
+the real code, shown failing its named test, reverted completely
+(`git diff` empty after each; all named tests green at the reverted
+tip):
+
+| mutant | catching test (shown failing) |
+|---|---|
+| M-FREE-LEAK (no release at the free — the Base's code) | `x5_r49_freed_home_frees_at_step6` (Mid6 check) and `x5_r49_unimaged_home_frees_at_once` (at-once check); pin 2's k+1 check also fails |
+| M-FREE-UNPIN-ONLY (the release through `unpin_home`, the gate's scratch form) | `x5_r49_window_freed_home_frees_at_next_step6` (k+1's Mid6 check) — pins 1 and 3 pass, exactly the ruling's "the same leak, only rarer" |
+| M-STEP6-AT-POST5 (`slot_free` ignores `pending_free`) | `x5_r49_freed_home_frees_at_step6` (its After5 check: "must be pending at After5") |
+| M-FREE-RELEASE-DURABLE (the release also removes `used_durable`) | `x5_r49_freed_home_frees_at_step6` (its before-the-flip check: image 1 still references the slot) |
+| G-FE-PENDING (FREE-EARLY's apply routes its frees through `pending_free`) | D14's FREE-EARLY assertion (`monitors=[]` — M-NOINPLACE never fires, the mutant is inert behind (b)) |
+| G2 (rework 6's own: the orphaned write-out's release removed) | `exhausted_reserve_keeps_both_copies` at its unmoved literal (`slots [13] entered used_cur referenced by nothing`) |
+
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
