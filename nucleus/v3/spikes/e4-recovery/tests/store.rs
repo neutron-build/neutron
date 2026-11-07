@@ -6340,6 +6340,235 @@ fn exhausted_reserve_keeps_both_copies() {
     exhausted_reserve_body(1).expect("pin 3");
 }
 
+// ---- X5-R49 (card X-5c-F4-F1-F1-F3-F2, step 1): a freed LPID's home
+// slot is released (S-STORE §4.4's last paragraph, §6.5 item 3 and
+// §13 step 6; the pins read `prims::slot_free` — the allocator's one
+// test — directly off the world, so each instant is observed without
+// allocating). ----
+
+/// The current home slot of `lpid`, off the world (test helper).
+fn home_slot(sched: &Sched<TestWorld>, lpid: u64) -> Option<u64> {
+    let g = sched.lock();
+    g.st.map.cur.get(&lpid).map(|r| r.slot)
+}
+
+/// `slot_free(s)` off the world (test helper).
+fn slot_free_at(sched: &Sched<TestWorld>, s: u64) -> bool {
+    let g = sched.lock();
+    prims::slot_free(&g.st.slots, s)
+}
+
+/// A one-page tree (id 2) checkpointed once: its root leaf's home is
+/// adopted by image 1 and durable. Returns the world and the leaf's
+/// post-checkpoint home slot `s` (image 1 — the next checkpoint's
+/// image k−1 — references it).
+fn r49_setup_durable_home(seed: u64, cfg: StoreCfg) -> (Sched<TestWorld>, u64, u64) {
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    let sched = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    tree::dir_create_tree(&cx, 2).expect("CreateTree");
+    let root = tree::dir_root_of(&cx, 2).expect("root");
+    ins(&cx, 2, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+    cx_checkpoint(&sched, |_| Ok(()));
+    let lpid = tree::dir_root_of(&cx, 2).expect("root after ckpt");
+    let s = home_slot(&sched, lpid).expect("the leaf keeps a home");
+    {
+        let g = sched.lock();
+        assert!(
+            g.st.slots.used_durable.contains(&s),
+            "seed {seed}: image 1 must reference the leaf's home {s} (the pin's premise)"
+        );
+    }
+    (sched, lpid, s)
+}
+
+/// **X5-R49 pin 1: `x5_r49_freed_home_frees_at_step6`.** A page whose
+/// home `s` image k−1 references, freed **outside** a window in epoch
+/// k (§6.5 item 3's merge shape, S-STORE §4.2/§4.4): `slot_free(s)` is
+/// false before checkpoint k's flip (the durable image's reference),
+/// false at its `After5` (the slot is `pending_free`, released only at
+/// step 6 — §13 step 6, X5-R49 (b)), true at its `Mid6`, and the next
+/// allocation that scans `s` gets it. M-FREE-LEAK (the Base's code: no
+/// release at the free) fails the `Mid6` and allocation checks;
+/// M-STEP6-AT-POST5 fails the `After5` check; M-FREE-RELEASE-DURABLE
+/// fails the before-the-flip check.
+#[test]
+fn x5_r49_freed_home_frees_at_step6() {
+    let seed = 1u64;
+    let (sched, lpid, s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // The free, outside any window (no checkpoint is running).
+    prims::free_lpid(&cx, lpid).expect("free outside the window");
+    assert!(
+        !slot_free_at(&sched, s),
+        "seed {seed}: slot {s} must not be free before the flip (image 1 references it)"
+    );
+    // Checkpoint k=2: the image leaves the LPID unmapped, so `s` drops
+    // from the durable set at post-5 into `pending_free` (After5), and
+    // step 6 (Mid6) is the release point.
+    let mut after5 = false;
+    let mut mid6 = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After5 {
+            after5 = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6 = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !after5,
+        "seed {seed}: slot {s} must be pending (not free) at After5 — step 6, not post-5, \
+         releases it (X5-R49 (b))"
+    );
+    assert!(
+        mid6,
+        "seed {seed}: slot {s} must be free at Mid6 — the freed home left `used_cur` at the \
+         free and the durable set at post-5 (X5-R49 (a)/(b))"
+    );
+    // The next allocation that scans `s` takes it (lowest-free-first,
+    // §4.5): every free slot below `s` is handed out first, then `s`
+    // itself — never a skip past it.
+    let mut got_s = false;
+    for _ in 0..=s {
+        let a = prims::alloc_slot(&cx).expect("alloc");
+        if a == s {
+            got_s = true;
+            break;
+        }
+        if a > s {
+            break;
+        }
+    }
+    assert!(
+        got_s,
+        "seed {seed}: the allocation that scans {s} must take it (it is free and the lowest)"
+    );
+}
+
+/// **X5-R49 pin 2: `x5_r49_window_freed_home_frees_at_next_step6`.** A
+/// clean page freed **inside** checkpoint k's window: the first-touch
+/// freeze records `Img::At(s)`, so the image being built (image k)
+/// references `s` and keeps it out of `pending_free` at k's own step 6
+/// — the slot stays not-free through checkpoint k's `Mid6` (it is in
+/// the new durable set), and becomes free at checkpoint k+1's `Mid6`
+/// (post-5 of k+1 moves it to `pending_free`; step 6 releases it).
+/// M-FREE-UNPIN-ONLY (the release through `unpin_home`, the gate's
+/// scratch form) returns early on the `image_refs` pin and leaves `s`
+/// in `used_cur` past k+1's step 6, failing the last check.
+#[test]
+fn x5_r49_window_freed_home_frees_at_next_step6() {
+    let seed = 2u64;
+    let (sched, lpid, s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Checkpoint k=2: the free lands at After0 — inside the flip
+    // window, on a clean frame (checkpoint 1 wrote it out), so the
+    // freeze records Img::At(s) and pins `s` in image_refs.
+    let mut in_window = false;
+    let mut mid6_k = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After0 {
+            prims::free_lpid(&cx, lpid).expect("free inside the window");
+            in_window = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6_k = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !in_window,
+        "seed {seed}: the window free's Img::At({s}) pins the slot (image 2 references it)"
+    );
+    assert!(
+        !mid6_k,
+        "seed {seed}: slot {s} must not be free through checkpoint k's Mid6 — image k \
+         references it (it is in the new durable set)"
+    );
+    // Checkpoint k+1=3: the image leaves the LPID unmapped; `s` drops
+    // to `pending_free` at post-5 and is released at step 6.
+    let mut after5_k1 = false;
+    let mut mid6_k1 = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After5 {
+            after5_k1 = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6_k1 = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !after5_k1,
+        "seed {seed}: slot {s} must be pending at checkpoint k+1's After5"
+    );
+    assert!(
+        mid6_k1,
+        "seed {seed}: slot {s} must be free at checkpoint k+1's Mid6 — the unconditional \
+         release (X5-R49 (a)) left no `used_cur` pin behind"
+    );
+}
+
+/// **X5-R49 pin 3: `x5_r49_unimaged_home_frees_at_once`.** A page whose
+/// home was written by an eviction in this epoch and never adopted by
+/// an image (§4.4's last paragraph): the home is in `used_cur` alone,
+/// so a free outside a window makes it allocatable **at once** — no
+/// pending transition, because neither image references it.
+/// M-FREE-LEAK (no release at the free) fails this pin outright.
+#[test]
+fn x5_r49_unimaged_home_frees_at_once() {
+    let seed = 3u64;
+    let (sched, lpid, _s_old) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Dirty the page again (epoch 2) and evict it: the write-out moves
+    // the home to a fresh slot no image ever adopted.
+    ins(&cx, 2, lpid, &2u64.to_be_bytes(), 2, &val(2, 2));
+    let mut s_new = None;
+    for _ in 0..64 {
+        if !prims::evict_one(&cx, true).expect("evict") {
+            break;
+        }
+        let h = home_slot(&sched, lpid);
+        if h.is_some_and(|h| h != _s_old) {
+            s_new = h;
+            break;
+        }
+    }
+    let s = s_new.unwrap_or_else(|| {
+        let h = home_slot(&sched, lpid).expect("the page keeps a home");
+        panic!("seed {seed}: the eviction never moved the home (still {h})");
+    });
+    {
+        let g = sched.lock();
+        assert!(
+            !g.st.slots.used_durable.contains(&s),
+            "seed {seed}: the eviction's home {s} must not be in an image (the pin's premise)"
+        );
+    }
+    assert!(
+        !slot_free_at(&sched, s),
+        "seed {seed}: the eviction home {s} is the current home (not free before the free)"
+    );
+    prims::free_lpid(&cx, lpid).expect("free outside the window");
+    assert!(
+        slot_free_at(&sched, s),
+        "seed {seed}: an unimaged home must be free at once (§4.4's last paragraph, X5-R49 (a))"
+    );
+}
+
 /// **X-5c-F4-F1-F1-CXX Work 2: `drop_entry_gone_before_root_free`.**
 /// I-LINK-ATOMIC's cut side (§6.8 as amended by S-1-F7): a directory
 /// entry must never name an unmapped root — not even between two

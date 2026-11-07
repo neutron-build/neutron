@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::page::{self, Ref};
-use super::{Cx, Fail, Frame, FrozenImage, Img, Mutant, StoreHost, StoreInner};
+use super::{Cx, Fail, Frame, FrozenImage, Img, Mutant, SlotState, StoreHost, StoreInner};
 use crate::sim::{E4Env, Sched, SimFail, TaskId, WaitKey};
 
 /// Record a world-acquisition failure observed where it cannot be
@@ -514,12 +514,24 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
     Ok(())
 }
 
+/// **X5-R49 (b) (card X-5c-F4-F1-F1-F3-F2 step 1): `alloc_slot`'s only
+/// test, as one pure predicate.** A slot is allocatable iff referenced
+/// by none of §4.4's three references: the current map (`used_cur`),
+/// the durable image (`used_durable`) and the image being built
+/// (`image_refs`, plus the `used_cur` homes it shares). Pure over
+/// [`SlotState`], so a test can read the allocator's decision at any
+/// instant without allocating (X5-R49's pins).
+pub fn slot_free(slots: &SlotState, slot: u64) -> bool {
+    !slots.used_cur.contains(&slot)
+        && !slots.used_durable.contains(&slot)
+        && !slots.image_refs.contains(&slot)
+}
+
 /// Allocate the lowest free slot (§4.5), growing the file by
 /// `max(16, slot_count/16)` when none is free (the card's test-scale
-/// override of §4.5's `max(1 MiB, n/16)`). A slot is allocatable only if
-/// referenced by none of: the current map (`used_cur`), the durable image
-/// (`used_durable`), the image being built (`image_refs` + `used_cur`,
-/// §4.4's three references). The slot is marked used on allocation.
+/// override of §4.5's `max(1 MiB, n/16)`). A slot is allocatable only
+/// per [`slot_free`] (§4.4's three references). The slot is marked used
+/// on allocation.
 pub fn alloc_slot<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
     let mut s = 3u64;
     loop {
@@ -536,10 +548,7 @@ pub fn alloc_slot<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
             if s >= st.slots.slot_count {
                 return Ok(Scan::Grow);
             }
-            if !st.slots.used_cur.contains(&s)
-                && !st.slots.used_durable.contains(&s)
-                && !st.slots.image_refs.contains(&s)
-            {
+            if slot_free(&st.slots, s) {
                 st.slots.used_cur.insert(s);
                 return Ok(Scan::Allocated(s));
             }
