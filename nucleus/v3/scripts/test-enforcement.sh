@@ -2916,6 +2916,18 @@ A
     # last chunk when this child exits, so only a join before the log closes
     # lands it. The child cannot exit before the relay drained the pipe.
     burst) for i in $(seq 1 20000); do echo "burst $i"; done; echo RELAY-LAST-MARKER ;;
+    # R9 (rework3): the verdict's run A — a symbolic ref under refs/heads/card
+    # (the mask's writable ref directory, rework R7) naming a later card's
+    # branch, plus a stacked base pointed at a worker commit. Raw file writes,
+    # exactly as a contained worker makes them: git symbolic-ref is denied by
+    # the bash map, a plain file is not.
+    symplant) common=$(git rev-parse --path-format=absolute --git-common-dir)
+      mkdir -p "$common/refs/heads/card"
+      printf 'ref: refs/heads/nucleus/v3-scaffold\n' >"$common/refs/heads/card/v3-XN4"
+      git branch card/v3-XNSTACK "$(git commit-tree "HEAD^{tree}" -p HEAD -m "nucleus v3: XN stack tip")" ;;
+    # R9 (rework3): the verdict's run C — the worktree's own HEAD (its gitdir
+    # is a writable exception) repointed at the scaffold.
+    headplant) printf 'ref: refs/heads/nucleus/v3-scaffold\n' >"$(git rev-parse --path-format=absolute --git-dir)/HEAD" ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -4396,6 +4408,114 @@ expect_ok "runner e2e: PF: the aliased pre-flight ran inside a container, not th
 expect_ok "runner e2e: PF: the run refuses the aliased base at the pre-flight, before any attempt" \
   res XPF "rc == 1 and 'preflight: base is not rustfmt-clean' in out and 'attempt 1:' not in out and L == []"
 git -C "$r" worktree remove --force "$pfx"
+# R9 (rework3): a symbolic ref under refs/heads, or a worktree HEAD that is not
+# the card branch, turns this runner's own git — which runs outside every
+# container — into the writer. The verdict's run A planted `ref:
+# refs/heads/nucleus/v3-scaffold` in refs/heads/card/v3-<a later card> and
+# pointed a stacked base at a worker commit; the operator's next run then ran
+# `worktree add -B card/v3-<later> <wt> <stacked base>`, which wrote through
+# the symref and moved the scaffold before that run's ref snapshot. Run C
+# planted the same symref in the worktree's own HEAD, and the gate's step-7
+# commit in that worktree moved the scaffold (the gate's own check is the
+# orchestrator's to add, outside Touch only). The runner's part of the fix:
+# refuse before worktree add -B, refuse at the startup gate and at every
+# refs_moved check, never read or write through either plant — and still take
+# an honest stacked card, since stacked runs are in live use and a false
+# refusal would be its own failure.
+r9sc=$(git -C "$r" rev-parse nucleus/v3-scaffold)
+r9tip=$(git -C "$r" commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold -m "nucleus v3: XN stack tip")
+r9prem() {
+  git -C "$r" branch card/v3-XNSTACK "$r9tip"
+  mkdir -p "$r/.git/refs/heads/card"
+  printf 'ref: refs/heads/nucleus/v3-scaffold\n' >"$r/.git/refs/heads/card/v3-XN2"
+  git -C "$r" worktree add -q -B card/v3-XN2 "$t/xn2wt" card/v3-XNSTACK   # the operator's run B, its first git op
+  local after
+  after=$(git -C "$r" rev-parse nucleus/v3-scaffold)
+  git -C "$r" worktree remove --force "$t/xn2wt" >/dev/null 2>&1
+  git -C "$r" update-ref --no-deref -d refs/heads/card/v3-XN2
+  git -C "$r" update-ref -d refs/heads/card/v3-XNSTACK
+  git -C "$r" update-ref refs/heads/nucleus/v3-scaffold "$r9sc"
+  echo "worktree add -B through the symref moved the scaffold to $after (the stacked tip $r9tip); restored $(git -C "$r" rev-parse nucleus/v3-scaffold)"
+  [ "$after" = "$r9tip" ] && [ "$(git -C "$r" rev-parse nucleus/v3-scaffold)" = "$r9sc" ] && [ ! -e "$r/.git/refs/heads/card/v3-XN2" ]
+}
+expect_ok "runner e2e: R9 premise: worktree add -B through a planted symref moves the scaffold (the verdict's run B)" r9prem
+# The fix, at the runner's start: the plant refuses the next run before
+# worktree add -B, so no outside git of it follows the symref at all.
+mkdir -p "$r/.git/refs/heads/card"
+printf 'ref: refs/heads/nucleus/v3-scaffold\n' >"$r/.git/refs/heads/card/v3-XN2"
+git -C "$r" branch card/v3-XNSTACK "$r9tip"
+printf '# CARD XN2: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: card/v3-XNSTACK        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `true`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' >"$e/cards/XN2.local.md"
+rm -f "$e/XN2.n"
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XN2.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/XN2" "$e/cards/XN2.local.md" --base card/v3-XNSTACK --attempts 1) || true
+r9sc_at='subprocess.run(["git", "-C", repo, "rev-parse", "nucleus/v3-scaffold"], capture_output=True, text=True).stdout.strip()'
+expect_ok "runner e2e: R9: the symref plant refuses the run before worktree add -B, and the scaffold stays put" \
+  res XN2 "rc == 1 and not r.get('pass') and 'symbolic ref refs/heads/card/v3-XN2 -> refs/heads/nucleus/v3-scaffold' in out and 'not starting' in out and 'attempt 1:' not in out and L == [] and not os.path.exists('$e/wt/XN2') and $r9sc_at == '$r9sc'"
+git -C "$r" update-ref --no-deref -d refs/heads/card/v3-XN2
+git -C "$r" update-ref -d refs/heads/card/v3-XNSTACK
+# The plant made mid-run: the run that wrote it fails its own checks (the
+# per-attempt refs_moved names the symref and stops), the honest commit still
+# lands, and the scaffold stays.
+e2e XN3 "work symplant" --attempts 1
+xn3tip=$(git -C "$r" rev-parse card/v3-XN3)
+expect_ok "runner e2e: R9: a symref planted during the run fails it at the ref check, the honest commit lands, the scaffold stays" \
+  res XN3 "rc == 1 and r['scope'] == 'OUTSIDE' and not r['pass'] and 'symbolic ref refs/heads/card/v3-XN4 -> refs/heads/nucleus/v3-scaffold' in out and '[XN3] refs changed outside the card branch; stopping' in out and H == '$xn3tip' and $r9sc_at == '$r9sc'"
+git -C "$r" update-ref --no-deref -d refs/heads/card/v3-XN4
+git -C "$r" update-ref -d refs/heads/card/v3-XNSTACK
+# The verdict's run C: the plant in the worktree's own HEAD. The run fails at
+# the same checks (HEAD is judged there too), no outside read of HEAD follows
+# the plant at exit (the ledger range stays open, which fails closed), the
+# honest commit lands and the scaffold stays.
+e2e XNH "work headplant" --attempts 1
+xnhtip=$(git -C "$r" rev-parse card/v3-XNH)
+expect_ok "runner e2e: R9: a HEAD repointed at the scaffold fails the run, leaves the ledger range open, and moves nothing" \
+  res XNH "rc == 1 and r['scope'] == 'OUTSIDE' and not r['pass'] and 'HEAD is a symbolic ref to refs/heads/nucleus/v3-scaffold, not refs/heads/card/v3-XNH' in out and L[-1].get('end') is None and L[-2]['run'] == L[-1]['run'] and H == '$xnhtip' and $r9sc_at == '$r9sc'"
+# The planted HEAD stays in that worktree (the runner refuses and cleans
+# nothing), and a symref HEAD counts as a checkout of its target, so it would
+# pin nucleus/v3-scaffold and block the fresh-gate section's own checkout of
+# it below. Point it back at the card branch, as the operator's cleanup would.
+git -C "$ewt/XNH" symbolic-ref HEAD refs/heads/card/v3-XNH
+# The control: the honest shape — plain refs, HEAD on the card branch, and a
+# card stacked on another card's branch — passes both checks without a word.
+e2e XN5 work --attempts 1
+expect_ok "runner e2e: R9 control: an honest card passes (premise for the stacked one)" res XN5 "rc == 0 and r['pass'] and $closed"
+printf '# CARD XN6: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: card/v3-XN5        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `true`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' >"$e/cards/XN6.local.md"
+rm -f "$e/XN6.n"
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XN6.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/XN6" "$e/cards/XN6.local.md" --base card/v3-XN5 --attempts 1) || true
+xn6tip=$(git -C "$r" rev-parse card/v3-XN6)
+expect_ok "runner e2e: R9 control: an honest stacked card (base card/v3-XN5) passes, commits, and neither check fires" \
+  res XN6 "rc == 0 and r['pass'] and r['scope'] == 'ok' and H == '$xn6tip' and 'symbolic ref' not in out and 'HEAD is a symbolic ref' not in out"
+# MAIN-NO-ENSURE (rework3; the verdict's uncaught mutant): main() creates
+# refs/heads/card before the first container (ensure_card_ref_dir). The packed
+# mask row above calls the function itself, so nothing showed main() calling
+# it. This row drives the real main() twice against a repository under a fake
+# $HOME the container masks, where the directory's existence is main()'s doing
+# alone: run 1 fresh passes (worktree add -B writes the branch loose, so the
+# directory exists either way), then pack-refs --all — as gc does; the premise
+# shows the directory pruned — then run 2 with --keep: no loose ref is written
+# before the worker commits inside the real container, so only main()'s call
+# makes the mask bind refs/heads/card back writable and the honest commit land.
+xne=$t/xne
+mkdir -p "$xne/home/repo/nucleus/v3/tools" "$xne/home/repo/nucleus/v3/scripts" "$xne/home/repo/nucleus/v3/spikes" "$xne/cards/logs"
+printf 'worker prompt\n' >"$xne/cards/WORKER-PROMPT.local.md"
+git -c init.defaultBranch=main init -q "$xne/home/repo"
+git -C "$xne/home/repo" config user.name t
+git -C "$xne/home/repo" config user.email t@t
+cp "$v3/tools/run_card.py" "$xne/home/repo/nucleus/v3/tools/run_card.py"
+printf '#!/usr/bin/env bash\necho GATE EXIT=0\n' >"$xne/home/repo/nucleus/v3/scripts/gate.sh"
+echo base >"$xne/home/repo/nucleus/v3/spikes/x.txt"
+printf '**/*.local.*\nopencode.json\n' >"$xne/home/repo/.gitignore"
+git -C "$xne/home/repo" add -A && git -C "$xne/home/repo" commit -qm base
+git -C "$xne/home/repo" branch nucleus/v3-scaffold
+printf '# CARD XNE: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: nucleus/v3-scaffold        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `true`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' >"$xne/cards/XNE.local.md"
+xnerun() { (cd "$xne/home/repo" && HOME="$xne/home" E2E_NS=real FAKE_OC=work FAKE_OC_N=$xne/n.n E2E=$xne PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$xne/home/repo/nucleus/v3/tools/run_card.py" "$xne/$1" "$xne/cards/XNE.local.md" --base nucleus/v3-scaffold --attempts 1 "${@:2}") || true; }
+xnerun XNE1
+expect_ok "runner e2e: R9 packed: run 1 (fresh) passes inside the real container and lands the honest commit" \
+  bash -c "[ \"\$(cat '$xne/XNE1.rc')\" = 0 ] && grep -q '\"pass\": true' '$xne/XNE1.json' && [ \"\$(git -C '$xne/home/repo' log --format=%s -1 card/v3-XNE)\" = 'nucleus v3: XNE work' ]"
+git -C "$xne/home/repo" pack-refs --all
+expect_ok "runner e2e: R9 packed: premise: after pack-refs --all the card ref directory is gone again" bash -c '! test -d "$xne/home/repo/.git/refs/heads/card"'
+xnerun XNE2 --keep
+expect_ok "runner e2e: R9 packed: a --keep resume on the packed store still commits inside: main() creates refs/heads/card (MAIN-NO-ENSURE)" \
+  bash -c "[ \"\$(cat '$xne/XNE2.rc')\" = 0 ] && grep -q '\"pass\": true' '$xne/XNE2.json' && [ -d '$xne/home/repo/.git/refs/heads/card' ] && [ \"\$(git -C '$xne/home/repo' rev-list --count nucleus/v3-scaffold..card/v3-XNE)\" = 2 ]"
 # S: a replace ref in the repository stops main() before attempt 1 (X-6-F1-F2).
 # Both commits are unreachable, so nothing else in $r is rewritten meanwhile.
 xs=$(git -C "$r" commit-tree "e2e/base^{tree}" -m "nucleus v3: XS replaced")
