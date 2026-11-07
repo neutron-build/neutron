@@ -48,6 +48,7 @@ pub fn main(args: &[String]) -> i32 {
         "run" => cmd_run(&args[1..]),
         "verify" => cmd_verify(&args[1..]),
         "mutants" => cmd_mutants(&args[1..]),
+        "seeded-faults" => cmd_seeded_faults(&args[1..]),
         "--help" | "-h" | "help" => {
             usage();
             0
@@ -65,7 +66,8 @@ fn usage() {
         "usage: e4-campaign run --seeds A..B --threads N --out results/campaign.json\n\
          \x20      e4-campaign verify --results results/campaign.json [--threads N]\n\
          \x20      e4-campaign mutants --seeds A..B --out results/mutants.json\n\
-         \x20      e4-campaign mutants --check results/mutants.json\n"
+         \x20      e4-campaign mutants --check results/mutants.json\n\
+         \x20      e4-campaign seeded-faults --seeds A..B --threads N --out results/seeded.json"
     );
 }
 
@@ -840,6 +842,212 @@ fn cmd_verify(args: &[String]) -> i32 {
         println!("VERIFY FAILED seeds={n} (all three checks reported above; exit {exit})");
     }
     exit
+}
+
+// ---- seeded-faults (X5-R43, card X-5c-F4-F1-F1-F3 step 7) ----
+
+/// **X5-R43:** the new failing rounds of a seeded fault's arm — every
+/// `(seed, round)` that fails O-1, O-2 or O-3 in the mutant's arm and
+/// passes in the clean arm. Deadlock, panic and monitor-only hits do
+/// not count (the O-1 text a livelock arm carries is excluded with the
+/// round's own deadlock flag). **M-SEEDED-NOBASELINE** drops the clean
+/// arm's subtraction.
+pub fn seeded_new_failures(clean: &[SeedRec], faulty: &[SeedRec]) -> Vec<(u64, usize)> {
+    let mut out = Vec::new();
+    for (c, f) in clean.iter().zip(faulty.iter()) {
+        if c.seed != f.seed {
+            continue;
+        }
+        for (i, (cr, fr)) in c.rounds.iter().zip(f.rounds.iter()).enumerate() {
+            let fails_oracle = fr.o1_fail.is_some() || fr.o2_fail.is_some() || fr.o3_fail.is_some();
+            if fails_oracle && !fr.deadlock && !fr.panic && cr.pass {
+                out.push((f.seed, i));
+            }
+        }
+    }
+    out
+}
+
+/// **X5-R43:** one arm's table — the new failing rounds, their breakdown
+/// by crash position, by Q4's own split-and-merge predicate and by
+/// `q4i_raw`, and the Caught verdict: **≥ 5 new failing rounds, ≥ 1 of
+/// them with the arm's predicate** (`q4i_raw` for the Joint fault,
+/// `q4_split_merge` for the Slot fault). **M-SEEDED-NOARMRULE** drops
+/// the arm predicate.
+#[derive(Debug, Clone)]
+pub struct SeededTable {
+    /// The arm's name (printed and serialized).
+    pub arm: &'static str,
+    /// The mutant behind the arm.
+    pub mutant: &'static str,
+    /// The new failing `(seed, round)` pairs, in sweep order.
+    pub new_failing: Vec<(u64, usize)>,
+    /// The new failing rounds' crash descriptions, in the same order.
+    pub crashes: Vec<String>,
+    /// How many of them carry Q4's own split-and-merge predicate.
+    pub with_q4sm: u64,
+    /// How many of them carry `q4i_raw`.
+    pub with_q4ir: u64,
+    /// The Caught verdict (≥ 5 new failing rounds and ≥ 1 arm-predicate
+    /// hit).
+    pub caught: bool,
+}
+
+/// Compute one arm's table. `joint` selects the arm predicate:
+/// `q4i_raw` for the Joint fault, `q4_split_merge` for the Slot fault.
+pub fn seeded_faults_table(
+    arm: &'static str,
+    mutant: &'static str,
+    clean: &[SeedRec],
+    faulty: &[SeedRec],
+    joint: bool,
+) -> SeededTable {
+    let new_failing = seeded_new_failures(clean, faulty);
+    let mut crashes = Vec::new();
+    let mut with_q4sm = 0u64;
+    let mut with_q4ir = 0u64;
+    for &(seed, round) in &new_failing {
+        if let Some(fr) = faulty
+            .iter()
+            .find(|r| r.seed == seed)
+            .and_then(|r| r.rounds.get(round))
+        {
+            crashes.push(fr.crash.clone());
+            if fr.q4_split_merge {
+                with_q4sm += 1;
+            }
+            if fr.q4i_raw {
+                with_q4ir += 1;
+            }
+        }
+    }
+    let caught = new_failing.len() as u64 >= 5 && (if joint { with_q4ir } else { with_q4sm } >= 1);
+    SeededTable {
+        arm,
+        mutant,
+        new_failing,
+        crashes,
+        with_q4sm,
+        with_q4ir,
+        caught,
+    }
+}
+
+/// The subcommand's exit: non-zero if either fault is not caught.
+pub fn seeded_exit(joint: &SeededTable, slot: &SeededTable) -> i32 {
+    if joint.caught && slot.caught { 0 } else { 2 }
+}
+
+/// `e4-campaign seeded-faults --seeds A..B --threads N --out F`: run the
+/// range three times at the campaign's tuning (`Tuning::FINAL` — the
+/// share being probed is compiled in and reverted after the probe),
+/// clean and under each seeded fault, then print both tables and write
+/// them to `F`. Exits non-zero if either fault is not caught.
+fn cmd_seeded_faults(args: &[String]) -> i32 {
+    let Some(out) = parse_out(args) else {
+        eprintln!("e4-campaign seeded-faults: --out is required");
+        return 2;
+    };
+    let (lo, hi) = parse_seeds(args, 0);
+    if lo >= hi {
+        eprintln!("e4-campaign seeded-faults: --seeds A..B is required (half-open)");
+        return 2;
+    }
+    let threads = parse_threads(args);
+    let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
+    let dispatch = std::sync::Arc::new(Dispatch::new(seed_count(lo, hi) * 3));
+    let _wd = start_watchdog(
+        std::sync::Arc::clone(&watch),
+        std::sync::Arc::clone(&dispatch),
+        None,
+    );
+    let sweep = |m: Option<Mutant>| -> Vec<SeedRec> {
+        dispatch.taken.store(0, Ordering::SeqCst);
+        dispatch.done.store(0, Ordering::SeqCst);
+        let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_range_into(&shared, lo, hi, m, threads, Some((&watch, &dispatch)));
+        let mut recs = shared.lock().map(|s| s.clone()).unwrap_or_default();
+        recs.sort_unstable_by_key(|r| r.seed);
+        recs
+    };
+    let clean = sweep(None);
+    let joint_recs = sweep(Some(Mutant::ReuseDropsImg));
+    let slot_recs = sweep(Some(Mutant::FreeHomeAlloc));
+    let _retire = WatchRetire(std::sync::Arc::clone(&watch));
+    let joint = seeded_faults_table(
+        "Joint",
+        "M-REUSE-DROPS-IMG (Mutant::ReuseDropsImg)",
+        &clean,
+        &joint_recs,
+        true,
+    );
+    let slot = seeded_faults_table(
+        "Slot",
+        "M-FREE-HOME-ALLOC (Mutant::FreeHomeAlloc)",
+        &clean,
+        &slot_recs,
+        false,
+    );
+    for t in [&joint, &slot] {
+        let mut by_crash: BTreeMap<&str, u64> = BTreeMap::new();
+        for c in t.crashes.iter() {
+            *by_crash.entry(c.as_str()).or_insert(0) += 1;
+        }
+        println!(
+            "SEEDED {:<6} {:<38} new-failing {:>3} (>=5) q4_split_merge {:>3} q4i_raw {:>3} (>=1 arm predicate) {}",
+            t.arm,
+            t.mutant,
+            t.new_failing.len(),
+            t.with_q4sm,
+            t.with_q4ir,
+            if t.caught { "CAUGHT" } else { "NOT CAUGHT" }
+        );
+        let breakdown = if by_crash.is_empty() {
+            "-".to_owned()
+        } else {
+            by_crash
+                .iter()
+                .map(|(k, v)| format!("{k} x{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("SEEDED {:<6} by crash position: {breakdown}", t.arm);
+        let pairs = t
+            .new_failing
+            .iter()
+            .map(|(s, r)| format!("{s}r{r}"))
+            .collect::<Vec<_>>();
+        println!("SEEDED {:<6} rounds: {}", t.arm, pairs.join(" "));
+    }
+    let json = format!(
+        "{{\"e4\":1,\"seeded\":[{}]}}",
+        [&joint, &slot]
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"arm\":{},\"mutant\":{},\"new_failing\":[{}],\"crashes\":{:?},\"with_q4sm\":{},\"with_q4ir\":{},\"caught\":{}}}",
+                    esc(t.arm),
+                    esc(t.mutant),
+                    t.new_failing
+                        .iter()
+                        .map(|(s, r)| format!("{{\"seed\":{s},\"round\":{r}}}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    t.crashes,
+                    t.with_q4sm,
+                    t.with_q4ir,
+                    t.caught
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if let Err(e) = std::fs::write(&out, json) {
+        eprintln!("e4-campaign seeded-faults: cannot write {out}: {e}");
+        return 2;
+    }
+    seeded_exit(&joint, &slot)
 }
 
 // ---- mutants ----
@@ -2397,4 +2605,133 @@ fn x5_r42_flipped_q4i_fails_reproduction() {
     let short = (rec(true), SeedRec::default());
     let (bad, _) = verify_digest_report(&[short.0], &[short.1]);
     assert_eq!(bad, 1, "a missing round is a non-reproduction");
+}
+
+/// **X5-R43 (card X-5c-F4-F1-F1-F3 step 7): a round failing in both
+/// arms is not new.** A known failure (the clean round already
+/// fails the fold) that the mutant's arm also fails never counts as
+/// a new failing round. **M-SEEDED-NOBASELINE** (the mutant's
+/// failing rounds counted without subtracting the clean arm's)
+/// fails this pin.
+#[test]
+fn x5_r43_known_failures_are_not_new() {
+    let round = |pass: bool, o1: bool| workload::RoundRec {
+        pass,
+        o1_fail: o1.then(|| "O-1(b): scan mismatch".to_owned()),
+        ..workload::RoundRec::default()
+    };
+    let clean = SeedRec {
+        seed: 3,
+        rounds: vec![round(false, true), round(true, false), round(true, false)],
+        ..SeedRec::default()
+    };
+    let faulty = SeedRec {
+        seed: 3,
+        // Round 0 fails in both arms (a known failure); round 1 fails
+        // only in the mutant's arm (new); round 2 is a deadlock hit.
+        rounds: vec![
+            round(false, true),
+            round(false, true),
+            workload::RoundRec {
+                pass: false,
+                deadlock: true,
+                o1_fail: Some("recovery livelock".to_owned()),
+                ..workload::RoundRec::default()
+            },
+        ],
+        ..SeedRec::default()
+    };
+    let nf = seeded_new_failures(std::slice::from_ref(&clean), &[faulty]);
+    assert_eq!(
+        nf,
+        vec![(3, 1)],
+        "only the round that passed the clean arm is new, and a deadlock round never counts \
+         (M-SEEDED-NOBASELINE reverts the first half)"
+    );
+}
+
+/// **X5-R43 (step 7): Caught needs the arm predicate.** Five new
+/// failing rounds with none carrying the arm's predicate
+/// (`q4i_raw` for Joint, `q4_split_merge` for Slot) is **not**
+/// caught; one predicate hit among them is.
+/// **M-SEEDED-NOARMRULE** (the arm predicates dropped) fails this
+/// pin.
+#[test]
+fn x5_r43_caught_needs_the_arm_predicate() {
+    let arm = |q4sm: bool, q4ir: bool| SeedRec {
+        seed: 1,
+        rounds: (0..5)
+            .map(|i| workload::RoundRec {
+                pass: false,
+                o1_fail: Some(format!("O-1 at {i}")),
+                q4_split_merge: q4sm,
+                q4i_raw: q4ir,
+                ..workload::RoundRec::default()
+            })
+            .collect(),
+        ..SeedRec::default()
+    };
+    let clean = SeedRec {
+        seed: 1,
+        rounds: vec![
+            workload::RoundRec {
+                pass: true,
+                ..workload::RoundRec::default()
+            };
+            5
+        ],
+        ..SeedRec::default()
+    };
+    // Five new failures, no predicate hits: not caught on either
+    // arm (M-SEEDED-NOARMRULE reverts this).
+    let no_hit = arm(false, false);
+    let jt = seeded_faults_table(
+        "Joint",
+        "m",
+        std::slice::from_ref(&clean),
+        std::slice::from_ref(&no_hit),
+        true,
+    );
+    assert!(!jt.caught, "Joint needs >=1 new failing round with q4i_raw");
+    let st = seeded_faults_table(
+        "Slot",
+        "m",
+        std::slice::from_ref(&clean),
+        std::slice::from_ref(&no_hit),
+        false,
+    );
+    assert!(
+        !st.caught,
+        "Slot needs >=1 new failing round with q4_split_merge"
+    );
+    // With the predicate hit present, both are caught.
+    let jt_hit = arm(false, true);
+    let jt = seeded_faults_table("Joint", "m", std::slice::from_ref(&clean), &[jt_hit], true);
+    assert!(jt.caught, "Joint caught with a q4i_raw hit beside the five");
+    assert_eq!(jt.with_q4ir, 5);
+    let st_hit = arm(true, false);
+    let st = seeded_faults_table("Slot", "m", std::slice::from_ref(&clean), &[st_hit], false);
+    assert!(st.caught, "Slot caught with a q4_split_merge hit");
+    // And four new failures with a predicate hit is still not
+    // caught: the >=5 floor is its own term.
+    let four = SeedRec {
+        seed: 2,
+        rounds: arm(true, true).rounds.into_iter().take(4).collect(),
+        ..SeedRec::default()
+    };
+    let clean4 = SeedRec {
+        seed: 2,
+        rounds: vec![
+            workload::RoundRec {
+                pass: true,
+                ..workload::RoundRec::default()
+            };
+            4
+        ],
+        ..SeedRec::default()
+    };
+    let st4 = seeded_faults_table("Slot", "m", &[clean4], &[four], false);
+    assert!(!st4.caught, "four new failing rounds miss the >=5 floor");
+    assert_eq!(seeded_exit(&jt, &st), 0, "both caught exits zero");
+    assert_ne!(seeded_exit(&jt, &st4), 0, "an uncaught arm exits non-zero");
 }

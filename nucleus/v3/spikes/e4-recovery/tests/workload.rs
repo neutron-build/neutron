@@ -2027,3 +2027,34 @@ fn x5_r42_refused_round_is_not_q4i() {
         "a round whose own crash never fired is excluded"
     );
 }
+
+/// **X5-R43 (step 7): the seeded Slot fault is caught on a literal
+/// seed.** Seed **17 round 0** under `Tuning::BASE` (a uniform-mode
+/// round — unselected at any share, so the pin is share-free): the
+/// clean arm passes, and under `Mutant::FreeHomeAlloc`
+/// (M-FREE-HOME-ALLOC, I-FREE-SAFE's shape) the oracle fails the same
+/// round. Applying the mutant unconditionally breaks the clean arm and
+/// fails this pin.
+#[test]
+fn x5_r43_free_home_alloc_is_caught() {
+    use e4_recovery::store::Mutant;
+    let tun = workload::Tuning::BASE;
+    let clean = workload::run_seed_with(17, None, &tun);
+    assert!(clean.defect.is_none(), "seed 17: {:?}", clean.defect);
+    let c0 = clean.rounds.first().expect("seed 17 runs round 0");
+    assert!(c0.pass, "the clean arm passes: {:?}", c0.o3_fail);
+    let mrec = workload::run_seed_with(17, Some(Mutant::FreeHomeAlloc), &tun);
+    let m0 = mrec.rounds.first().expect("the mutant arm runs round 0");
+    assert!(
+        m0.o1_fail.is_some() || m0.o2_fail.is_some() || m0.o3_fail.is_some(),
+        "M-FREE-HOME-ALLOC must fail the oracle on 17 r0 (the X5-R43 new-failing rule \
+         reads exactly these texts): o1={:?} o2={:?} o3={:?}",
+        m0.o1_fail,
+        m0.o2_fail,
+        m0.o3_fail
+    );
+    assert!(
+        !m0.deadlock && !m0.panic,
+        "the catch is an oracle failure, never a hang"
+    );
+}
