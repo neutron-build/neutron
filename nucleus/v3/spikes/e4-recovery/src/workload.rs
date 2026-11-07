@@ -1883,11 +1883,12 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                             break 'derive;
                         }
                     };
-                    let spec2 = CrashSpec::Hook {
+                    let real_masks = out.obs.ckpt_hooks_hit.clone();
+                    let mut spec2 = CrashSpec::Hook {
                         ckpt_index: idx2,
                         hook: hook2,
                     };
-                    let script2 = Script {
+                    let mut script2 = Script {
                         crash: Some(spec2.clone()),
                         ..script
                     };
@@ -1909,6 +1910,16 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                     let mut supply2 = None;
                     let mut twin_points2 = Vec::new();
                     if let Some(tch) = tch_pair.take() {
+                        // **X5-R48:** the twin's own start for the joint
+                        // re-run below (the first re-pair attempt
+                        // consumes `tch`'s parts, as the first attempt
+                        // consumed the chain's).
+                        let tch_joint = Chain {
+                            disk: tch.disk.clone(),
+                            st: tch.st.clone(),
+                            model: harness::clone_model(&tch.model),
+                            cut: tch.cut,
+                        };
                         let tscript = Script {
                             nested: Vec::new(),
                             ..script2.clone()
@@ -1924,7 +1935,7 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                             probe_pass: false,
                         };
                         let mut treads = Vec::new();
-                        let tout = harness::run_round(
+                        let mut tout = harness::run_round(
                             seed,
                             round,
                             &tscript,
@@ -1937,6 +1948,71 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                             Some(&mut treads),
                             None,
                         );
+                        // **X5-R48 (amends X5-R21 (c)): the joint
+                        // re-derive.** The re-paired twin ran at a spec
+                        // derived only from the REAL round's masks, and
+                        // the chains can diverge, so its crash may never
+                        // fire — the fired-guard would then fail the
+                        // seed for a crash point no checkpoint of the
+                        // twin's chain reaches (7469: the R21 (c)
+                        // re-pair was the one arm with no re-derive).
+                        // Both unfired attempts — the real round's
+                        // first, the re-paired twin — ran to completion,
+                        // so both mask lists are complete: their
+                        // per-index AND over the shorter length names
+                        // the hooks BOTH chains reach, and one
+                        // [`reachable_hook_spec`] draw on it (the same
+                        // drawn `(hook, ckpt_index)`, the same `(seed,
+                        // round)`) re-pairs the round at a spec both can
+                        // fire. The twin re-runs at that spec from its
+                        // own start; the real round then runs at the
+                        // same one (`script2`/`spec2` name it below).
+                        // A refused re-derive (union 0, or an empty
+                        // list) draws nothing and changes nothing: the
+                        // unfired attempt's fired-guard defect stands,
+                        // exactly as before — and a twin that still does
+                        // not fire at the joint spec trips the guard the
+                        // same way. There is no third attempt.
+                        if !tout.obs.crash_fired {
+                            let joint: Vec<u16> = tout
+                                .obs
+                                .ckpt_hooks_hit
+                                .iter()
+                                .zip(real_masks.iter())
+                                .map(|(a, b)| a & b)
+                                .collect();
+                            if let Ok((i3, h3)) =
+                                reachable_hook_spec(&joint, hook, ckpt_index, seed, round)
+                            {
+                                spec2 = CrashSpec::Hook {
+                                    ckpt_index: i3,
+                                    hook: h3,
+                                };
+                                script2 = Script {
+                                    crash: Some(spec2.clone()),
+                                    ..script2.clone()
+                                };
+                                crash_desc = format!("{h3:?}@{i3}");
+                                let t3 = Script {
+                                    nested: Vec::new(),
+                                    ..script2.clone()
+                                };
+                                treads.clear();
+                                tout = harness::run_round(
+                                    seed,
+                                    round,
+                                    &t3,
+                                    &tf_pair,
+                                    cfg.clone(),
+                                    tch_joint.disk,
+                                    tch_joint.st,
+                                    &tch_joint.model,
+                                    tch_joint.cut,
+                                    Some(&mut treads),
+                                    None,
+                                );
+                            }
+                        }
                         if let Some(d) = crash_fired_defect(&tout, &crash_desc)
                             && rec.defect.is_none()
                         {
