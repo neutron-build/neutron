@@ -99,7 +99,9 @@ function startEditor(form) {
   };
 
   // Words a reader sees: image addresses, link targets and Markdown marks don't count.
+  const design = "design" in form.dataset;
   const words = () => {
+    if (design) return "";
     const text = body.value
       .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
       .replace(/\]\([^)]*\)/g, " ")
@@ -143,7 +145,7 @@ function startEditor(form) {
       } else {
         revision.value = result.revision;
         if (!dirty) store.clear();
-        show(`Saved, ${words()}`);
+        show(design ? "Saved" : `Saved, ${words()}`);
       }
     } catch {
       dirty = true;
@@ -161,7 +163,7 @@ function startEditor(form) {
   function changed() {
     dirty = true;
     store.write();
-    show(isDraft ? words() : `Unsaved changes, ${words()}`);
+    show(isDraft ? words() : design ? "Unsaved changes" : `Unsaved changes, ${words()}`);
     schedule();
   }
 
@@ -355,7 +357,7 @@ function startEditor(form) {
     if (images.length) addImages(images);
   });
 
-  $("[data-add-image]").addEventListener("click", async () => {
+  $("[data-add-image]")?.addEventListener("click", async () => {
     addImages(await pickImages());
   });
 
@@ -383,7 +385,7 @@ function startEditor(form) {
 
   // Preview: the server's renderer, in a sandbox.
 
-  $("[data-toggle-preview]").addEventListener("click", async (event) => {
+  $("[data-toggle-preview]")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     const opening = frame.hidden;
     if (opening) {

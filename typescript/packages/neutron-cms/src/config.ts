@@ -14,6 +14,8 @@ export interface ListDefinition {
   fields: Record<string, FieldType | Field>;
   /** A date field to keep the list in order by, instead of arranging it by hand. */
   sortBy?: string;
+  /** Keep its own page in the admin menu even when it is also edited on the site, as a menu that hides behind a button is. */
+  ownPage?: boolean;
 }
 
 export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record<string, ListDefinition>> {
@@ -23,6 +25,14 @@ export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record
   posts?: boolean;
   /** Standalone pages, such as an about page, edited like posts but kept out of the blog. */
   pages?: boolean;
+  /**
+   * Pages with their own design, by key and title, such as `{ portfolio: "Portfolio" }`. Each is listed
+   * under Pages, published and unpublished like any page, and its words and pictures are edited on the
+   * page itself. Your route draws it when `cms.page(slug, request)` returns a page whose `layout` is the key.
+   */
+  designs?: Record<string, string>;
+  /** Where a page lives on the site. Defaults to `postUrl`. */
+  pageUrl?: (slug: string) => string;
   /** Where a post lives on the site, for the admin's links. Default `/<slug>`. */
   postUrl?: (slug: string) => string;
   /** URLs a post may not take because a page already answers them. */
@@ -43,13 +53,16 @@ export interface ResolvedList {
   label: string;
   fields: Record<string, ResolvedField>;
   sortBy?: string;
+  ownPage: boolean;
 }
 
 export interface ResolvedConfig {
   path: string;
   posts: boolean;
   pages: boolean;
+  designs: Record<string, string>;
   postUrl: (slug: string) => string;
+  pageUrl: (slug: string) => string;
   reservedSlugs: string[];
   previewCss: string;
   timeZone: string;
@@ -82,9 +95,14 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
       if (list.sortBy && fields[list.sortBy]?.type !== "date") {
         throw new Error(`neutron-cms: list "${key}" sorts by "${list.sortBy}", which is not a date field`);
       }
-      return [key, { label: list.label ?? title(key), fields, sortBy: list.sortBy }];
+      return [key, { label: list.label ?? title(key), fields, sortBy: list.sortBy, ownPage: list.ownPage ?? false }];
     }),
   );
+  const postUrl = config.postUrl ?? ((slug: string) => `/${slug}`);
+  const designs = config.designs ?? {};
+  for (const key of Object.keys(designs)) {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(key)) throw new Error(`neutron-cms: design "${key}" must be lowercase letters, digits and dashes`);
+  }
   const onPage = config.onPage ?? [];
   for (const key of onPage) {
     if (key !== TEXT && !Object.hasOwn(lists, key)) throw new Error(`neutron-cms: onPage names "${key}", which is not a list`);
@@ -93,8 +111,10 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
   return {
     path,
     posts: config.posts ?? true,
-    pages: config.pages ?? false,
-    postUrl: config.postUrl ?? ((slug) => `/${slug}`),
+    pages: config.pages ?? Object.keys(designs).length > 0,
+    postUrl,
+    pageUrl: config.pageUrl ?? postUrl,
+    designs,
     reservedSlugs: [...new Set([...(firstSegment ? [firstSegment] : []), ...(config.reservedSlugs ?? [])])],
     previewCss: config.previewCss ?? "",
     timeZone: config.timeZone ?? "UTC",

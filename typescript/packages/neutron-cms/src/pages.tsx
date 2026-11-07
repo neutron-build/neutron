@@ -36,7 +36,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
         {config.posts ? <a href={admin} aria-current={current("posts")}>Posts</a> : null}
         {config.pages ? <a href={`${admin}/pages`} aria-current={current("pages")}>Pages</a> : null}
         {config.onPage.length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
-        {Object.entries(config.lists).filter(([key]) => !config.onPage.includes(key)).map(([key, list]) => (
+        {Object.entries(config.lists).filter(([key, list]) => list.ownPage || !config.onPage.includes(key)).map(([key, list]) => (
           <a key={key} href={`${admin}/lists/${key}`} aria-current={current(key)}>{list.label}</a>
         ))}
         {Object.keys(config.texts).length && !config.onPage.includes(TEXT) ? <a href={`${admin}/lists/${TEXT}`} aria-current={current(TEXT)}>Text</a> : null}
@@ -92,7 +92,7 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
   const pages = props.kind === "page";
   return (
     <Shell config={props.config} active={pages ? "pages" : "posts"}>
-      <main class="page">
+      <main class="page narrow">
         <div class="page-head">
           <h1>{pages ? "Pages" : "Posts"}</h1>
           <form method="post" action={pages ? `${admin}/pages` : admin}>
@@ -132,6 +132,8 @@ export function EditorPage(props: {
   const live = status === "live";
   const admin = config.path;
   const FORM = "post-form";
+  const design = post.kind === "page" && Object.hasOwn(config.designs, post.layout);
+  const url = post.kind === "page" ? config.pageUrl : config.postUrl;
   return (
     <>
       <header class="top editor-top">
@@ -139,9 +141,9 @@ export function EditorPage(props: {
         <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
         <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
         <span class="spacer" />
-        <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>
+        {design ? null : <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>}
         <button class="button quiet" type="button" data-toggle-meta aria-expanded={error ? "true" : "false"} aria-controls="post-settings">Settings</button>
-        <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>
+        {design ? null : <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>}
         {status === "draft" ? (
           <button class="button primary" type="submit" form={FORM} name="intent" value="publish" data-publish>Publish</button>
         ) : (
@@ -149,7 +151,7 @@ export function EditorPage(props: {
         )}
       </header>
 
-      <form class="editor" id={FORM} method="post" noValidate data-editor={post.id} data-status={status} data-meta-open={error ? "" : undefined}>
+      <form class="editor" id={FORM} method="post" noValidate data-editor={post.id} data-design={design ? "" : undefined} data-status={status} data-meta-open={error ? "" : undefined}>
         <input type="hidden" name="revision" value={post.updated_at} />
         <input type="hidden" name="date" value={post.published_at ?? ""} />
         {error ? <p class="notice error" role="alert">{error}</p> : null}
@@ -161,8 +163,18 @@ export function EditorPage(props: {
 
         <main class="writing">
           <textarea class="title" name="title" rows={1} placeholder="Add title" aria-label="Title" autofocus={!post.title}>{values.title}</textarea>
-          <p class="markdown-note" data-markdown-note hidden />
-          <textarea class="body" name="body" placeholder="Start writing in Markdown. Images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
+          {design ? (
+            <div class="design-note">
+              <p>This page has its own design. Its words and pictures are edited on the page itself, and nothing shows to visitors until you publish.</p>
+              <a class="button primary" href={`${admin}/edit?page=${post.id}`}>Edit on the page</a>
+              <textarea name="body" hidden aria-hidden="true" />
+            </div>
+          ) : (
+            <>
+              <p class="markdown-note" data-markdown-note hidden />
+              <textarea class="body" name="body" placeholder="Start writing in Markdown. Images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
+            </>
+          )}
         </main>
         {/* Same origin so the site's images load past its Cross-Origin-Resource-Policy; scripts stay off. */}
         <iframe class="preview" title="Preview" sandbox="allow-same-origin" data-preview hidden />
@@ -186,9 +198,9 @@ export function EditorPage(props: {
             <span>Short label</span>
             <input class="input" name="label" value={values.label} placeholder="Defaults to the title" />
           </label>
-          <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>
+          {design ? null : <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>}
           <footer>
-            {live && post.slug ? <a href={config.postUrl(post.slug)} target="_blank" rel="noreferrer">View post</a> : null}
+            {live && post.slug ? <a href={url(post.slug)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
             {status === "draft" ? null : (
               <button class="link" type="submit" name="intent" value="unpublish" data-confirm={live ? "Take this post offline?" : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
             )}
@@ -256,7 +268,7 @@ export function ListPage(props: {
   const photos = isPhotoList(list);
   return (
     <Shell config={config} active={listKey}>
-      <main class="page">
+      <main class={photos ? "page" : "page narrow"}>
         <div class="page-head"><h1>{list.label}</h1></div>
         <form class="list-form" method="post" data-list>
           <input type="hidden" name="revision" value={revision} />
@@ -285,7 +297,7 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
   const { config, texts, saved } = props;
   return (
     <Shell config={config} active={TEXT}>
-      <main class="page">
+      <main class="page narrow">
         <div class="page-head"><h1>Text</h1></div>
         <form class="text-form" method="post">
           {Object.entries(config.texts).map(([name, field]) => (
@@ -304,12 +316,12 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
   );
 }
 
-export function EditPage(props: { config: ResolvedConfig }) {
+export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string } }) {
   const { config } = props;
   const admin = config.path;
   // A site with no blog opens on this page, so going back to its home would land here again.
   const otherList = Object.entries(config.lists).find(([key]) => !config.onPage.includes(key));
-  const back = config.posts ? { href: admin, label: "Posts" } : otherList ? { href: `${admin}/lists/${otherList[0]}`, label: otherList[1].label } : null;
+  const back = props.back ? props.back : config.posts ? { href: admin, label: "Posts" } : otherList ? { href: `${admin}/lists/${otherList[0]}`, label: otherList[1].label } : null;
   return (
     <>
       <header class="top editor-top edit-top">
@@ -317,11 +329,11 @@ export function EditPage(props: { config: ResolvedConfig }) {
         <span class="state" data-edit-state role="status" />
         <span class="spacer" />
         <div class="edit-tools" data-edit-tools hidden />
-        <a class="button quiet on-wide" href="/" target="_blank" rel="noreferrer">View site</a>
+        {props.src ? null : <a class="button quiet on-wide" href="/" target="_blank" rel="noreferrer">View site</a>}
         <button class="button" type="button" data-edit-discard disabled>Discard</button>
         <button class="button primary" type="button" data-edit-save disabled>Save</button>
       </header>
-      <iframe class="edit-frame" title="Your site" src="/" data-edit-frame />
+      <iframe class="edit-frame" title="Your site" src={props.src ?? "/"} data-edit-frame />
       <script defer src={assetUrl(admin, "admin.js")} />
       <script defer src={assetUrl(admin, "edit.js")} />
     </>

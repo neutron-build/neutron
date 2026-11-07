@@ -2,7 +2,7 @@ import type { VNode } from "preact";
 import { render } from "preact-render-to-string";
 import { isAsset, serveAsset } from "./assets.js";
 import {
-  clearAttempts, clientAddress, createSession, endSession, hasSession, passwordHash, readLimited, sessionCookie,
+  clearAttempts, clientAddress, createSession, endSession, hasSession, passwordHash, previewToken, readLimited, sessionCookie,
   takeAttempt, verifyPassword, withPasswordCheck,
 } from "./auth.js";
 import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
@@ -11,7 +11,7 @@ import { renderMarkdown } from "./markdown.js";
 import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
 import { Document, EditorPage, EditPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deletePost, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
+  allPosts, allTexts, createPost, deletePost, ensureDesigns, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
   sortByDate, type Item, type Post,
 } from "./store.js";
 
@@ -102,6 +102,7 @@ export function createHandler(config: ResolvedConfig) {
   const isScript = (request: Request) => request.headers.has("x-cms");
 
   function postsPage(kind: "post" | "page" = "post") {
+    if (kind === "page") ensureDesigns(config.designs);
     const at = new Date().toISOString();
     const posts = allPosts(kind).map((post) => ({
       id: post.id,
@@ -179,11 +180,25 @@ export function createHandler(config: ResolvedConfig) {
     );
   }
 
+  const isDesign = (post: Post) => post.kind === "page" && Object.hasOwn(config.designs, post.layout);
+
+  /** The site, or with `?page=` one designed page, drafts included, framed for editing. */
+  function editSite(request: Request) {
+    const id = Number(new URL(request.url).searchParams.get("page"));
+    const designed = id ? getPost(id) : undefined;
+    if (designed && isDesign(designed) && designed.slug) {
+      const src = `${config.pageUrl(designed.slug)}?cms-preview=${encodeURIComponent(previewToken(designed.slug))}`;
+      return page(`Edit ${designed.title || "page"}`, <EditPage config={config} src={src} back={{ href: `${admin}/posts/${designed.id}`, label: designed.title || "Page" }} />);
+    }
+    return page("Edit site", <EditPage config={config} />);
+  }
+
   async function editor(request: Request, id: number) {
     const post = getPost(id);
     if (!post || (post.kind === "page" ? !config.pages : !config.posts)) return notFound();
     const saved = new URL(request.url).searchParams.has("saved");
     if (request.method !== "POST") return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={saved} />);
+    // A designed page keeps its body, which its design doesn't show, whatever the form sends.
 
     const form = await request.formData();
     const read = (name: string) => String(form.get(name) ?? "");
@@ -205,7 +220,7 @@ export function createHandler(config: ResolvedConfig) {
       title: read("title").trim(),
       description: read("description").trim(),
       label: read("label").trim(),
-      body: read("body"),
+      body: isDesign(post) ? post.body : read("body"),
       slug: read("slug"),
       published_at,
     };
@@ -314,7 +329,7 @@ export function createHandler(config: ResolvedConfig) {
       return redirect(`${admin}/login`, sessionCookie(null, admin));
     }
     if (isAsset(first) && !second) return serveAsset(first, request);
-    if (first === "edit" && !second && !post && config.onPage.length) return page("Edit site", <EditPage config={config} />);
+    if (first === "edit" && !second && !post && config.onPage.length) return editSite(request);
     if (first === "edit" && second === "data" && rest.length === 0 && !post) return editData();
     if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
     if (first === "upload" && !second && post) return upload(request);

@@ -12,6 +12,8 @@ export interface Post {
   description: string;
   label: string;
   kind: Kind;
+  /** A design's key when the page has its own design, otherwise empty. */
+  layout: string;
   body: string;
   published_at: string | null;
   updated_at: string;
@@ -65,6 +67,7 @@ const MIGRATIONS = [
    END;`,
   `ALTER TABLE posts ADD COLUMN label TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'post'`,
+  `ALTER TABLE posts ADD COLUMN layout TEXT NOT NULL DEFAULT ''`,
 ];
 
 const store = globalThis as typeof globalThis & { __cmsDb?: DatabaseSync };
@@ -146,6 +149,28 @@ export const getPost = (id: number) =>
 
 export const livePostBySlug = (slug: string, kind: Kind = "post") =>
   db().prepare("SELECT * FROM posts WHERE slug = ? AND kind = ? AND published_at <= ?").get(slug, kind, now()) as Post | undefined;
+
+/** A page or post at this address, published or not. */
+export const postBySlug = (slug: string, kind: Kind = "post") =>
+  db().prepare("SELECT * FROM posts WHERE slug = ? AND kind = ?").get(slug, kind) as Post | undefined;
+
+/**
+ * Every design has a page: a draft is made for one that has none. A page already at the design's
+ * address, such as one imported from an older site, becomes the design's page and keeps its state.
+ */
+export function ensureDesigns(designs: Record<string, string>): void {
+  const keys = Object.keys(designs);
+  if (!keys.length) return;
+  const byLayout = db().prepare("SELECT id FROM posts WHERE kind = 'page' AND layout = ?");
+  transaction(() => {
+    for (const key of keys) {
+      if (byLayout.get(key)) continue;
+      const atAddress = postBySlug(key, "page") ?? (db().prepare("SELECT * FROM posts WHERE slug = ?").get(key) as Post | undefined);
+      if (atAddress?.kind === "page") db().prepare("UPDATE posts SET layout = ? WHERE id = ?").run(key, atAddress.id);
+      else db().prepare("INSERT INTO posts (slug, title, kind, layout, updated_at) VALUES (?, ?, 'page', ?, ?)").run(atAddress ? null : key, designs[key], key, now());
+    }
+  });
+}
 
 export function createPost(fields: Partial<PostFields> & { updated_at?: string } = {}): number {
   const result = db()

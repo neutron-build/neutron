@@ -454,3 +454,53 @@ test("admin scripts are versioned, cached only when current, and kept behind the
   assert.equal((await call(src)).status, 303);
   assert.match(editor, /data-toggle-markdown/);
 });
+
+test("a designed page is a draft until published, and its draft shows only through Edit site", async () => {
+  const designed = defineCms({ designs: { portfolio: "Portfolio" }, onPage: ["text"], texts: { tagline: "text" } });
+  const cookie = await logIn();
+  const call2 = (path: string, init: RequestInit = {}) => {
+    const url = new URL(path, SITE);
+    const unsafe = init.method && init.method !== "GET";
+    const headers = new Headers({ cookie, ...(unsafe ? { origin: SITE } : {}) });
+    return (unsafe ? designed.POST : designed.GET)({ request: new Request(url, { ...init, headers }), params: { path: url.pathname.replace(/^\/n-admin\/?/, "") } });
+  };
+  const list = await (await call2("/n-admin/pages")).text();
+  assert.match(list, />Portfolio</);
+  assert.match(list, />draft</);
+  const id = list.match(/href="\/n-admin\/posts\/(\d+)">Portfolio</)![1];
+  const editor = await (await call2(`/n-admin/posts/${id}`)).text();
+  assert.match(editor, /Edit on the page/);
+  assert.doesNotMatch(editor, /data-toggle-preview/);
+
+  assert.equal(designed.page("portfolio"), undefined);
+  assert.equal(designed.page("portfolio", new Request(`${SITE}/portfolio/`)), undefined);
+  assert.equal(designed.page("portfolio", new Request(`${SITE}/portfolio/?cms-preview=1.forged`)), undefined);
+  const edit = await (await call2(`/n-admin/edit?page=${id}`)).text();
+  const src = edit.match(/data-edit-frame[^>]*|src="([^"]+)"[^>]*data-edit-frame/)![0].match(/src="([^"]+)"/)![1].replace(/&amp;/g, "&");
+  assert.match(src, /^\/portfolio\?cms-preview=/);
+  assert.equal(designed.page("portfolio", new Request(SITE + src))?.layout, "portfolio");
+  assert.equal(designed.page("other", new Request(SITE + src.replace("/portfolio", "/other"))), undefined);
+
+  const revision = editor.match(/name="revision" value="([^"]+)"/)![1];
+  assert.equal((await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "publish", title: "Portfolio", body: "ignored", slug: "portfolio", revision }) })).status, 303);
+  assert.equal(designed.page("portfolio")?.layout, "portfolio");
+  assert.equal(designed.page("portfolio")?.body, "");
+  assert.deepEqual(designed.pages().map((page) => page.slug), ["portfolio"]);
+});
+
+test("a page imported at a design's address becomes that design's page", () => {
+  const id = createPost({ kind: "page", slug: "gallery", title: "Gallery", body: "old text" });
+  const designed = defineCms({ designs: { gallery: "Gallery" } });
+  assert.equal(designed.pages().length, 0);
+  const row = db().prepare("SELECT id, layout, body FROM posts WHERE slug = 'gallery'").get() as { id: number; layout: string; body: string };
+  assert.deepEqual({ ...row }, { id, layout: "gallery", body: "old text" });
+  assert.equal((db().prepare("SELECT COUNT(*) AS n FROM posts WHERE layout = 'gallery'").get() as { n: number }).n, 1);
+});
+
+test("a list edited on the site can keep its own admin page", async () => {
+  const menu = defineCms({ onPage: ["menu"], lists: { menu: { label: "Menu links", ownPage: true, fields: { label: "text", url: "url" } } } });
+  const cookie = await logIn();
+  const page = await (await menu.GET({ request: new Request(`${SITE}/n-admin/lists/menu`, { headers: { cookie } }), params: { path: "lists/menu" } })).text();
+  assert.match(page, />Menu links<\/a>/);
+  assert.match(page, /<span>Label<\/span>/);
+});

@@ -17,6 +17,7 @@ const { nodes, marks } = schema;
 
 function start(body) {
   const form = body.form;
+  if ("design" in form.dataset) return;
   const title = form.querySelector("[name=title]");
   const state = document.querySelector("[data-state]");
   const note = document.querySelector("[data-markdown-note]");

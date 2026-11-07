@@ -133,6 +133,7 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 /* Pages */
 
 .page { max-width: calc(var(--width) + 48px); margin: 0 auto; padding: 24px 24px 48px; }
+.page.narrow { max-width: 808px; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 36px; margin-bottom: 16px; }
 .page-head h1 { color: var(--strong); font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
 
@@ -188,6 +189,7 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 
 /* Visual editor: the text reads like the page it becomes. */
 
+.design-note { display: grid; justify-items: start; gap: 16px; margin-top: 8px; padding: 24px; background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; color: var(--muted); font-size: 15px; line-height: 1.6; }
 .markdown-note { margin: 0 0 16px; padding: 8px 12px; background: var(--surface); border-radius: 6px; color: var(--muted); font-size: 13px; }
 
 .prose { min-height: 50vh; outline: 0; color: var(--ink); font: 18px/1.75 var(--sans); overflow-wrap: break-word; white-space: pre-wrap; word-wrap: break-word; font-variant-ligatures: none; -webkit-font-variant-ligatures: none; }
@@ -362,7 +364,11 @@ a.button { color: inherit; text-decoration: none; }
   .on-wide { display: none; }
   .on-phone { display: inline; }
   .meta { width: 100vw; border-left: 0; }
-  .posts .status { display: none; }
+  .posts tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .posts td { border-top: 0; }
+  .posts tr { border-top: 1px solid var(--rule); }
+  .posts .status { grid-row: 2; padding: 0 0 10px; }
+  .posts .status:empty { display: none; }
   .item { grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 12px 0; }
   .item-tools { min-height: 24px; }
 }

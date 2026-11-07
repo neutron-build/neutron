@@ -1,4 +1,4 @@
-import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { db } from "./store.js";
 
@@ -67,6 +67,25 @@ export function hasSession(request: Request): boolean {
   const find = db().prepare("SELECT 1 FROM sessions WHERE token_hash = ? AND password_tag = ? AND expires_at > ?");
   const now = new Date().toISOString();
   return tokens.some((token) => Boolean(find.get(sha256(token), sha256(hash), now)));
+}
+
+// Drafts of designed pages open in the Edit site frame, on the site's own address, where the
+// session cookie (scoped to the admin) never reaches. A short-lived signed key in the address does.
+const PREVIEW_KEY = randomBytes(32);
+const PREVIEW_HOURS = 12;
+const previewMac = (slug: string, expires: string) => createHmac("sha256", PREVIEW_KEY).update(`${slug}\n${expires}`).digest("base64url");
+
+export function previewToken(slug: string): string {
+  const expires = String(Date.now() + PREVIEW_HOURS * 3_600_000);
+  return `${expires}.${previewMac(slug, expires)}`;
+}
+
+export function isPreview(slug: string, token: string | null): boolean {
+  const [expires, mac] = (token ?? "").split(".");
+  if (!expires || !mac || !(Number(expires) > Date.now())) return false;
+  const expected = Buffer.from(previewMac(slug, expires));
+  const given = Buffer.from(mac);
+  return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
 export function endSession(request: Request): void {

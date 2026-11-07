@@ -241,9 +241,9 @@ test("events sort by date and stay up through their own day", () => {
 
 test("a list of mostly pictures is a photo list", () => {
   const field = (type: "text" | "image" = "text") => ({ label: "L", type, required: false });
-  assert.equal(isPhotoList({ label: "G", fields: { image: field("image"), caption: field() } }), true);
-  assert.equal(isPhotoList({ label: "P", fields: { image: field("image"), label: field(), url: field() } }), false);
-  assert.equal(isPhotoList({ label: "L", fields: { label: field(), url: field() } }), false);
+  assert.equal(isPhotoList({ label: "G", ownPage: false, fields: { image: field("image"), caption: field() } }), true);
+  assert.equal(isPhotoList({ label: "P", ownPage: false, fields: { image: field("image"), label: field(), url: field() } }), false);
+  assert.equal(isPhotoList({ label: "L", ownPage: false, fields: { label: field(), url: field() } }), false);
 });
 
 test("post images carry their size and offer the thumbnail", () => {
