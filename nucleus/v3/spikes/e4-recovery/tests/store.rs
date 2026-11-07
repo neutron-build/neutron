@@ -6482,10 +6482,17 @@ fn drop_entry_gone_body(seed: u64) {
 /// free. A dropper over a dirty leaf root races an evictor looping
 /// `evict_one(&cx, false)`; seed 38 is the literal (of 1..=500 the
 /// gate measured 38, 85, 444 and 467 failing at f703c08d, 0 with the
-/// pins held).
+/// pins held). **X-5c-F4-F1-F1-CXX-F1 (that verdict's finding 3, this
+/// card's step 5): seed 467 joins 38.** The narrower G6 form — the
+/// guard released after the directory descent, before the tree mutex
+/// is re-taken (the frees themselves run unpinned) — passes at 38 and
+/// fails at 7, 467, 488, 542, 589, 595, 693, 817 of 1..=1000 (the
+/// gate's measurement); 467 is its literal here, and it fails under
+/// the f703c08d code too. The body is unchanged.
 #[test]
 fn drop_last_step_keeps_its_pages_pinned() {
     drop_last_step_pins_body(38).expect("the last step keeps its pages pinned");
+    drop_last_step_pins_body(467).expect("the last step keeps its pages pinned");
 }
 
 fn drop_last_step_pins_body(seed: u64) -> Result<(), String> {
