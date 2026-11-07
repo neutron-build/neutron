@@ -61,6 +61,7 @@ const revisionOf = (html: string) => html.match(/name="revision" value="([^"]+)"
 before(async () => {
   directory = mkdtempSync(join(tmpdir(), "cms-handler-"));
   process.env.CMS_DATA_DIR = directory;
+  db({ create: true });
   process.env.SITE_URL = SITE;
   process.env.CMS_PASSWORD_HASH = await hashPassword(PASSWORD);
 });
@@ -324,4 +325,79 @@ test("the editor's back link never returns to the editor", async () => {
   const lists = { a: { fields: { b: "text" } }, c: { label: "Gallery", fields: { d: "text" } } } as const;
   assert.match(await open(defineCms({ posts: false, onPage: ["a"], lists })), /class="back" href="\/n-admin\/lists\/c"/);
   assert.doesNotMatch(await open(defineCms({ posts: false, onPage: ["a", "c"], lists })), /class="back"/);
+});
+
+test("a planted second session cookie can't sign the owner out", async () => {
+  const cookie = await logIn();
+  assert.equal((await call("/n-admin", { cookie: `n_session=planted; ${cookie}` })).status, 200);
+  assert.equal((await call("/n-admin", { cookie: `${cookie}; n_session=planted` })).status, 200);
+});
+
+test("the throttle believes forwarded addresses only from a local proxy, and groups IPv6 by /64", async () => {
+  const { clientAddress } = await import("./auth.js");
+  const peers = new WeakMap<Request, { remoteAddress: string }>();
+  (globalThis as Record<symbol, unknown>)[Symbol.for("@neutron-build/core/transport-peer")] ??= peers;
+  const registry = (globalThis as Record<symbol, WeakMap<Request, { remoteAddress: string }>>)[Symbol.for("@neutron-build/core/transport-peer")];
+  const at = (peer: string, forwarded?: string) => {
+    const request = new Request(SITE, { headers: forwarded ? { "x-forwarded-for": forwarded } : {} });
+    registry.set(request, { remoteAddress: peer });
+    return clientAddress(request);
+  };
+  assert.equal(at("203.0.113.9", "1.2.3.4"), "203.0.113.9");
+  assert.equal(at("172.18.0.2", "198.51.100.7"), "198.51.100.7");
+  assert.equal(at("::ffff:127.0.0.1", "198.51.100.8"), "198.51.100.8");
+  assert.equal(at("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+  assert.equal(at("2001:db8:1:2:bbbb::9"), "2001:db8:1:2::/64");
+});
+
+test("a full throttle drops its oldest entry, not everyone's", async () => {
+  const { takeAttempt } = await import("./auth.js");
+  const at = 1_000_000;
+  for (let index = 0; index < 6; index++) takeAttempt("locked-out", at);
+  assert.equal(takeAttempt("locked-out", at), false);
+  for (let index = 0; index < 10_000; index++) takeAttempt(`flood-${index}`, at);
+  assert.equal(takeAttempt("flood-9999", at), true);
+});
+
+test("images stream with their length", async () => {
+  const cookie = await logIn();
+  const { url } = await (await send(cookie, png(42))).json();
+  const served = await call(url);
+  assert.equal(served.headers.get("content-length"), "9");
+  assert.equal((await served.arrayBuffer()).byteLength, 9);
+});
+
+test("without SITE_URL only a localhost origin is accepted, and https sites get Secure cookies", async () => {
+  const { sessionCookie } = await import("./auth.js");
+  const saved = process.env.SITE_URL;
+  try {
+    process.env.SITE_URL = "https://site.test";
+    assert.match(sessionCookie("t"), /; Secure$/);
+    delete process.env.SITE_URL;
+    const cookie = await (async () => {
+      process.env.SITE_URL = SITE;
+      const value = await logIn();
+      delete process.env.SITE_URL;
+      return value;
+    })();
+    const write = (host: string) => cms.POST({ request: new Request(`http://${host}/n-admin`, { method: "POST", headers: { cookie, origin: `http://${host}` } }) });
+    assert.equal((await write("evil.test")).status, 403);
+    assert.equal((await write("localhost:3000")).status, 303);
+  } finally {
+    process.env.SITE_URL = saved;
+  }
+});
+
+test("an empty configured data folder is never filled with a new database", async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  void DatabaseSync;
+  closeDb();
+  const saved = process.env.CMS_DATA_DIR;
+  process.env.CMS_DATA_DIR = join(directory, "unmounted");
+  try {
+    assert.equal(cms.ready(), false);
+  } finally {
+    closeDb();
+    process.env.CMS_DATA_DIR = saved;
+  }
 });

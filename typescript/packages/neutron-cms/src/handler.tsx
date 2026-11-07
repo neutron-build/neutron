@@ -4,7 +4,7 @@ import { render } from "preact-render-to-string";
 import { ADMIN_CSS, ADMIN_JS, EDIT_JS } from "./assets.generated.js";
 import {
   clearAttempts, clientAddress, createSession, endSession, hasSession, passwordHash, readLimited, sessionCookie,
-  takeAttempt, verifyPassword,
+  takeAttempt, verifyPassword, withPasswordCheck,
 } from "./auth.js";
 import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
@@ -75,11 +75,9 @@ function problemWith(list: ResolvedList, items: Item[]): string | null {
 function isSameOrigin(request: Request): boolean {
   const origin = request.headers.get("origin");
   if (!origin) return false;
-  const expected = process.env.SITE_URL
-    ? new URL(process.env.SITE_URL).origin
-    : process.env.NODE_ENV === "production"
-      ? null
-      : new URL(request.url).origin;
+  const own = new URL(request.url);
+  const local = own.hostname === "localhost" || own.hostname === "127.0.0.1" || own.hostname === "[::1]";
+  const expected = process.env.SITE_URL ? new URL(process.env.SITE_URL).origin : process.env.NODE_ENV !== "production" && local ? own.origin : null;
   return origin === expected;
 }
 
@@ -141,7 +139,10 @@ export function createHandler(config: ResolvedConfig) {
 
     const raw = await readLimited(request, 4096);
     const password = raw === null ? null : new URLSearchParams(raw).get("password");
-    if (!password || !(await verifyPassword(password, hash))) return refuse("Wrong password.");
+    if (!password) return refuse("Wrong password.");
+    const verified = await withPasswordCheck(() => verifyPassword(password, hash));
+    if (verified === "busy") return refuse("The server is busy. Try again in a moment.", 503);
+    if (!verified) return refuse("Wrong password.");
 
     clearAttempts(client);
     return redirect(admin, sessionCookie(createSession(hash), admin));

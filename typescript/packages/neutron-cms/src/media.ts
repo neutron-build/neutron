@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { Readable } from "node:stream";
 import { join } from "node:path";
 import { dataDir } from "./store.js";
 import { THUMB_WIDTH } from "./images.js";
@@ -70,9 +72,12 @@ export function saveImage(bytes: Uint8Array, resized?: Resized): string | null {
 export async function serveImage(name: string): Promise<Response> {
   if (!NAME.test(name)) return new Response("Not found", { status: 404 });
   try {
-    const bytes = await readFile(join(dataDir(), "media", name));
-    return new Response(bytes, {
+    const path = join(dataDir(), "media", name);
+    const { size } = await stat(path);
+    const body = Readable.toWeb(createReadStream(path)) as unknown as ReadableStream<Uint8Array>;
+    return new Response(body, {
       headers: {
+        "Content-Length": String(size),
         "Content-Type": TYPES[name.split(".")[1] as Extension],
         "Cache-Control": "public, max-age=31536000, immutable",
         "Cross-Origin-Resource-Policy": "cross-origin",

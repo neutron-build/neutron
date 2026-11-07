@@ -24,6 +24,7 @@ const fields = (over = {}) => ({ title: "Hello", description: "", body: "Text", 
 before(() => {
   directory = mkdtempSync(join(tmpdir(), "cms-"));
   process.env.CMS_DATA_DIR = directory;
+  db({ create: true });
 });
 beforeEach(() => {
   for (const table of ["posts", "items", "texts", "sessions", "posts_old"]) db().exec(`DELETE FROM ${table}`);
@@ -165,7 +166,7 @@ test("throttle allows five tries per client, then recovers", () => {
 test("client address is the proxy's last hop", () => {
   const request = new Request("http://x/", { headers: { "x-forwarded-for": "6.6.6.6, 1.2.3.4" } });
   assert.equal(clientAddress(request), "1.2.3.4");
-  assert.equal(clientAddress(new Request("http://x/")), "local");
+  assert.equal(clientAddress(new Request("http://x/")), "unknown");
 });
 
 test("readLimited stops at the limit", async () => {

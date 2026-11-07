@@ -78,7 +78,8 @@ export const dbPath = () => join(dataDir(), "site.db");
 export function db(options: { create?: boolean } = {}): DatabaseSync {
   if (store.__cmsDb) return store.__cmsDb;
   const path = dbPath();
-  const mayCreate = options.create || process.env.NODE_ENV !== "production";
+  // A configured folder is normally a mounted volume, and an empty one usually means it wasn't mounted.
+  const mayCreate = options.create || (process.env.NODE_ENV !== "production" && !process.env.CMS_DATA_DIR);
   if (!existsSync(path)) {
     if (!mayCreate) throw new Error(`No database at ${path}. Is the volume mounted?`);
     mkdirSync(dataDir(), { recursive: true });

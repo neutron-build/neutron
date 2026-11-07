@@ -50,32 +50,32 @@ export function createSession(hash: string): string {
   return token;
 }
 
-function cookieValue(request: Request): string | null {
+function cookieValues(request: Request): string[] {
+  const values: string[] = [];
   for (const part of (request.headers.get("cookie") ?? "").split(";")) {
     const [name, value] = part.trim().split("=");
-    if (name === COOKIE && value) return value;
+    if (name === COOKIE && value) values.push(value);
   }
-  return null;
+  return values.slice(0, 8);
 }
 
+/** A browser can send several cookies of this name; any one that is valid counts. */
 export function hasSession(request: Request): boolean {
   const hash = passwordHash();
-  const token = cookieValue(request);
-  if (!hash || !token) return false;
-  return Boolean(
-    db()
-      .prepare("SELECT 1 FROM sessions WHERE token_hash = ? AND password_tag = ? AND expires_at > ?")
-      .get(sha256(token), sha256(hash), new Date().toISOString()),
-  );
+  const tokens = cookieValues(request);
+  if (!hash || tokens.length === 0) return false;
+  const find = db().prepare("SELECT 1 FROM sessions WHERE token_hash = ? AND password_tag = ? AND expires_at > ?");
+  const now = new Date().toISOString();
+  return tokens.some((token) => Boolean(find.get(sha256(token), sha256(hash), now)));
 }
 
 export function endSession(request: Request): void {
-  const token = cookieValue(request);
-  if (token) db().prepare("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
+  const remove = db().prepare("DELETE FROM sessions WHERE token_hash = ?");
+  for (const token of cookieValues(request)) remove.run(sha256(token));
 }
 
 export function sessionCookie(token: string | null, path = "/n-admin"): string {
-  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  const secure = process.env.NODE_ENV === "production" || process.env.SITE_URL?.startsWith("https:") ? "; Secure" : "";
   const age = token ? SESSION_DAYS * 86_400 : 0;
   return `${COOKIE}=${token ?? ""}; Path=${path}; HttpOnly; SameSite=Strict; Max-Age=${age}${secure}`;
 }
@@ -85,17 +85,41 @@ export function sessionCookie(token: string | null, path = "/n-admin"): string {
 
 const WINDOW_MS = 15 * 60_000;
 const MAX_ATTEMPTS = 5;
+const MAX_CLIENTS = 10_000;
 const attempts = new Map<string, { count: number; resetAt: number }>();
 
-/** Caddy replaces any client-sent X-Forwarded-For, so its last hop is the real peer. */
+// Neutron records each request's socket address here (core's server/peer.ts). Looked up per request,
+// because this module can load before Neutron creates the registry; read without importing core.
+const PEERS = Symbol.for("@neutron-build/core/transport-peer");
+const peerOf = (request: Request) =>
+  (globalThis as unknown as Record<symbol, WeakMap<Request, { remoteAddress: string }> | undefined>)[PEERS]?.get(request)?.remoteAddress;
+
+const isLocalAddress = (address: string) =>
+  /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|fc|fd|::ffff:(127|10|192\.168|172\.(1[6-9]|2\d|3[01]))\.)/i.test(address);
+
+/** IPv6 hosts get a /64 each, so a single network can't mint new addresses to dodge the count. */
+function bucket(address: string): string {
+  const plain = address.replace(/^::ffff:/i, "");
+  if (!plain.includes(":")) return plain;
+  return plain.split(":").slice(0, 4).join(":") + "::/64";
+}
+
+/**
+ * The connection's own address. A forwarded address is believed only when the connection comes
+ * from a proxy on this machine or network, such as Caddy, which replaces what the client sent.
+ */
 export function clientAddress(request: Request): string {
-  return request.headers.get("x-forwarded-for")?.split(",").at(-1)?.trim() || "local";
+  const forwarded = request.headers.get("x-forwarded-for")?.split(",").at(-1)?.trim();
+  const peer = peerOf(request);
+  if (peer && !isLocalAddress(peer)) return bucket(peer);
+  return bucket(forwarded || peer || "unknown");
 }
 
 export function takeAttempt(client: string, at = Date.now()): boolean {
-  if (attempts.size > 10_000) {
+  if (!attempts.has(client) && attempts.size >= MAX_CLIENTS) {
     for (const [key, entry] of attempts) if (entry.resetAt <= at) attempts.delete(key);
-    if (attempts.size > 10_000) attempts.clear();
+    // Still full: drop the oldest entry, never everything, so a flood can't unlock everyone at once.
+    if (attempts.size >= MAX_CLIENTS) attempts.delete(attempts.keys().next().value!);
   }
   const entry = attempts.get(client);
   if (!entry || entry.resetAt <= at) {
@@ -104,6 +128,27 @@ export function takeAttempt(client: string, at = Date.now()): boolean {
   }
   entry.count += 1;
   return entry.count <= MAX_ATTEMPTS;
+}
+
+// At most two password checks run at once, and a short queue waits behind them. Each check is about
+// 70 ms of CPU, so this bounds what any number of login attempts can cost the server.
+const MAX_CHECKS = 2;
+const MAX_WAITING = 16;
+let running = 0;
+const waiting: (() => void)[] = [];
+
+export async function withPasswordCheck<T>(work: () => Promise<T>): Promise<T | "busy"> {
+  if (running >= MAX_CHECKS) {
+    if (waiting.length >= MAX_WAITING) return "busy";
+    await new Promise<void>((resolve) => waiting.push(resolve));
+  }
+  running += 1;
+  try {
+    return await work();
+  } finally {
+    running -= 1;
+    waiting.shift()?.();
+  }
 }
 
 export const clearAttempts = (client: string) => {

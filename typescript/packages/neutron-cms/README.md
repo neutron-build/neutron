@@ -147,6 +147,9 @@ Serve `cms.ready()` from a health route to stop a deploy that has lost its data.
 
 ## Limits
 
+The admin trusts your public site. Any script running on the site's own address, including an analytics or embed script, runs with the owner's login when the owner visits. That is normal for a CMS on the same domain, WordPress included. For real separation, serve the admin from its own subdomain.
+
+
 - One account with one password.
 - Uploads are limited to 2000px on the long side, and the original is not kept.
 - Photos removed from a list stay in `media/`.
