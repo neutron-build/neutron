@@ -1133,6 +1133,34 @@ user + 41–45 s sys (≈ 226–233 s). The replay costs about +45% CPU on
 the campaign's WAL-heavy rounds — the price of the ruling's per-write
 record tests; no `E4 ABORT`, no livelock, no deadlock.
 
+**The gate's enforcement step in this container (a judgment call,
+recorded with its evidence).** `bash scripts/gate.sh` failed at
+`STEP enforcement-tests EXIT=1` three times, deterministically, on
+one test only: "runner e2e: K: SIGTERM kills opencode and closes the
+ledger range". Root cause, measured on a preserved scratch run:
+**every real assertion of K held** — the driver exited rc 143, the
+ledger range closed at the branch tip, and the fake opencode's pid
+was dead (`kill(pid, 0) → ESRCH`) — but `dead()` also probes
+`killpg(pgid, 0)`, which succeeded because the killed `sleep 30`
+(orphaned when its parent died in the same group kill) stayed a
+**zombie**: `ps` shows `[sleep] <defunct>` at exactly the run's pgid,
+and the container carries 706 unreaped zombies, because **this
+container's PID 1 is the card session's own `opencode` process**,
+which never `wait()`s — no adopted orphan is ever collected, and a
+zombie keeps its process group visible to `killpg`. The test is
+self-contained (a throwaway repo under `mktemp -d`, copying only
+`scripts/*.sh`, `CORE_PATHS` and `tools/run_card.py` — nothing this
+card touched), and the same suite passed for the CXX and O1C gates on
+hosts whose init reaps. The card's Touch-only list forbids editing
+`scripts/` or `tools/`, so the fix here is **environmental**: the
+Acceptance gate runs under a stdlib subreaper wrapper
+(`PR_SET_CHILD_SUBREAPER` + a tight `waitpid(-1, WNOHANG)` loop,
+preserved at `/tmp/…/reaper.py`, never in the repo) that adopts and
+reaps orphaned descendants — the service a normal init provides. It
+changes no gate step, no file and no test; `bash
+scripts/test-enforcement.sh` under it prints `test-enforcement: all
+passed` (exit 0), and the wrapper is not needed for any other step.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
