@@ -1,16 +1,23 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3-F2 (X5-R49, the freed home's release)
-— stopped at step 4's gate: the fix is implemented and pinned (three
-new pins, six mutants caught, D14 and rework 6 unchanged), the Base
-references reproduce exactly, but the movement comparison over BASE
-0..1000 reads **7 new O-1(a) detected-loss texts on MP/MW rounds that
-had none at the Base** (all pass=true, none a fold regression, no new
-deadlock/panic/monitor/defect; one Base failing round healed) — the
-card's "any new failure: stop … Do not try a fix" rule fired; the
-literal re-derivation, F3's mutant re-runs and the diagnostic did not
-run, and seven digest-literal pins keep stale literals (red) at this
-tip. The record and the rounds are below. ESCALATE.** Before it:
+Status: **stage X-5c-F4-F1-F1-F3-F2-F1 — this card continues F2
+(X5-R49) from its tip `1524e284` under the gate verdict's P ruling
+X5-R51, the step-4 movement exemption (fixed verbatim below, with the
+g8 re-selection rule, before any code or literal of this card).**
+F2 stopped because its own step-4 rule fired on seven rounds; the
+gate's finding (verdict `X-5c-F4-F1-F1-F3-F2.md`) is that those are
+schedule movement, not a loss X5-R49 introduced — X5-R49's code at
+`b5c9a840` is correct as written and stays untouched. This card
+re-reads the movement under X5-R51, runs F2's step-4 "Otherwise"
+branch (the literals, the share-1000 comparison, F3's mutants, the
+diagnostic), adds the verdict's -F2 pin for the uncaught
+O-FREE-DROP-IMGREFS window (-F2 folded in here, no separate card), and
+re-selects `g8`'s second seed by a fixed rule. Before it: stage
+X-5c-F4-F1-F1-F3-F2 (X5-R49) implemented and pinned (three new pins,
+six mutants caught, D14 and rework 6 unchanged), stopped at step 4's
+gate — the record and the rounds are below, with this card's
+correction of its reading per verdict finding 2. ESCALATE resolved by
+P ruling X5-R51.** Before it:
 stage X-5c-F4-F1-F1-F3 (X5-R41/X5-R42/X5-R43) complete — its decision
 rule NOT MET by all three shares, the Joint fault CAUGHT at share 1000
 and the Slot fault UNCAUGHT at every setting measured (both ESCALATEs,
@@ -1623,6 +1630,77 @@ re-derived pins; and the frees / freed-homes-released-at-step-6 /
 handed-out-again diagnostic over BASE 0..200 (the gate read 0 and 0 at
 the Base). Steps 5's re-derivations are therefore also not done; this
 record is the card's end state.
+
+## Card X-5c-F4-F1-F1-F3-F2-F1's record (X5-R51 the movement
+## exemption, the literals re-derived, the image_refs pin, the 10k)
+
+## X5-R51 (P ruling, verbatim, fixed before this card's code and before any literal; any change is an ESCALATE)
+
+Copied verbatim from the card before any code, run or literal of this
+card (the step-0 discipline, as X5-R6–R50 before it). **Numbering.**
+The verdict proposes calling this rule X5-R50. But X5-R50 is already
+taken: card X-5c-F4-F1-F1-F3-F1 uses it for its prior-window generator
+block. The highest X5-R number in use in the README, the cards and the
+verdicts is R50, so **this rule is X5-R51**. The numbers do not follow
+landing order: X5-R51 lands before F3-F1's X5-R50, and that is
+intended.
+
+**X5-R51 (the step-4 movement exemption; a P rule on this card's comparisons only; X5-R49 unchanged).**
+- **(a) Scope.**
+  - X5-R51 amends only bullet 2 of F2's step-4 "new failure" list: "a round with no O-1, O-2 or O-3 text at the Base that has one here".
+  - It applies to `rounds` entries, never to `twin` entries. It compares the same seed at the Base and at the tip under the same `Tuning`.
+  - A round that exists at the tip but not at the Base counts as text-free at the Base.
+  - Bullet 1 (a fold regression) and bullet 3 (a DEADLOCK, PANIC, MONITOR, DEFECT or baton hit the Base lacks) are unchanged.
+  - The rule that a changed text in a round that already carried one is reported, not counted, is unchanged.
+- **(b) Moved, not new.** A bullet-2 round, seed `s` round `i`, is **moved** only when every check below holds. Each check is read from the named output and nothing else:
+  1. **Class.** The seed's `class` in the run JSON is `MP` or `MW`.
+  2. **Pass.** The round's `pass` is `true`.
+  3. **The text.** `o2` and `o3` are null, and `o1` begins with `O-1(a)`.
+  4. **No monitor hit.** The run's `E4 SEEDS=… MONITOR=` count is 0. For a single-seed run, that run's own line counts. A non-zero count exempts nothing in that run.
+  5. **Fully explained.** Run seed `s` alone at the tip with `E4_MPE_DIAG=1 E4_X33_DIAG=1`.
+     - **MP:** take the `amcheck_i findings … tainted …` line inside the `=== seed s round i class Mp ===` block. It must hold:
+       - at least one finding;
+       - a non-empty `tainted` set;
+       - every finding's `slot` is `Some(n)` with `n` in `tainted`.
+
+       A `None` slot, a slot outside `tainted`, an empty finding list or a missing block means the round is **not** explained.
+     - **MW:** the round's JSON `x33x` and `cover_err` are both `true`, and the `X33 diag: seed=s round=i ERR arm: damaged=[…]` line has a non-empty `damaged` list.
+- **(c) Lost.** The reverse direction is a Base round with a text whose tip round is text-free and `pass`, or missing.
+  - It is **moved-lost** when the Base round meets checks 1–3, plus the MW part of check 5 (the JSON fields only).
+  - Any other such round is **healed**.
+  - A Base round with `pass=false` whose tip round has `pass=true` and still carries a text is also **healed**. This is 457r0's shape.
+- **(d) Reporting.** Moved-gained, moved-lost and healed rounds are listed in full, never netted and never counted as new failures or as gains.
+  - **Moved-gained** rows give: seed, round, class, the Base and tip crash, the tip text, and for MP the findings and `tainted`, or for MW `damaged`.
+  - **Moved-lost** and **healed** rows give: seed, round, class, the Base and tip crash, and the Base text.
+- **(e) Outside the rule.** A bullet-2 round that fails any check in (b) is a **new failure**. So is any bullet-1 or bullet-3 hit.
+  - STOP: write the rounds into the README, commit, and ESCALATE. **Do not try a fix.**
+  - This applies at every comparison in this card: the 54 seeds, BASE 0..1000, and share 1000 over 0..200.
+- **(f) The 10k comparator.** The JSON does not carry findings or `tainted`. So the comparator in Acceptance applies checks 1–4, plus the MW part of check 5. It lists every MP round that passes those checks as `MOVED_MP_PENDING`.
+  - **The gate**, not a worker, runs each `MOVED_MP_PENDING` seed alone under (b)5 (seeds < 10000 only). A round that fails that check is a new failure: ESCALATE.
+  - The comparator's exit code is 0 only if nothing outside the rule is found. That is necessary, not sufficient.
+- **(g) Not an oracle change.**
+  - `pass`, the texts, the fold, `verify`, every quota and X5-R1–R50 are unchanged.
+  - X5-R51 decides only what this card's comparisons stop on. It carries to no other card unless P re-issues it.
+
+## g8's re-selection (P rule, fixed with X5-R51)
+
+`g8_checkpoint_poison_ends_the_workload` runs on seeds `[747, 967]`,
+round 1 of each. At the tip, 967 has only one round, so its second
+seed must be re-selected. This is not a literal edit.
+- **Rule.** The replacement for 967 is the **lowest seed in 0..1000,
+  other than 747, whose BASE round 1 passes every assertion of the
+  pin** at the tip, with the pin body unchanged: `crash == "poison"`,
+  `fired`, no `task_error`, no deadlock or livelock, `pass`, and no
+  defect.
+- The verdict expects seed 47. Record old → new, and give the reason:
+  967 r1 no longer exists because X5-R49 moved checkpoint 1's
+  `map_root` from 11 to 10.
+- 747 is not re-selected. **If 747 r1 no longer passes the pin, STOP
+  and ESCALATE.**
+
+**Step 0 — the rulings carried.** The text above, verbatim, before any
+code, run or literal of this card. F2's attempt-2 uncommitted edits
+were never imported (this worktree started clean at the Base).
 
 
 
