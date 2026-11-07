@@ -181,26 +181,24 @@ function startEditor(form) {
     changed();
   });
 
-  // The sidebar stays how it was left.
+  // Settings slide over the page and leave when you go back to writing.
 
   const metaToggle = $("[data-toggle-meta]");
-  const META_KEY = "n-admin:meta-closed";
-  function setMeta(closed) {
-    form.toggleAttribute("data-meta-closed", closed);
-    metaToggle.setAttribute("aria-pressed", String(!closed));
+  const meta = $(".meta");
+  function setMeta(open) {
+    form.toggleAttribute("data-meta-open", open);
+    metaToggle.setAttribute("aria-expanded", String(open));
   }
-  try {
-    if (innerWidth > 1000) setMeta(localStorage.getItem(META_KEY) === "1");
-  } catch {}
-  metaToggle.addEventListener("click", () => {
-    const closed = !form.hasAttribute("data-meta-closed");
-    setMeta(closed);
-    try {
-      localStorage.setItem(META_KEY, closed ? "1" : "0");
-    } catch {}
-    fitAll();
+  metaToggle.addEventListener("click", () => setMeta(!form.hasAttribute("data-meta-open")));
+  document.addEventListener("click", (event) => {
+    if (form.hasAttribute("data-meta-open") && !meta.contains(event.target) && !metaToggle.contains(event.target)) setMeta(false);
   });
-  $$("[name=description], [name=slug]").forEach((field) => field.addEventListener("input", changed));
+  addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && form.hasAttribute("data-meta-open")) {
+      setMeta(false);
+      metaToggle.focus();
+    }
+  });
 
   if (slug && !slug.disabled) {
     const fromTitle = (text) => text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);

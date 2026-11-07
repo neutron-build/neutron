@@ -15,7 +15,7 @@ export function Document(props: { config: ResolvedConfig; title: string; cssVers
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="robots" content="noindex" />
-        <title>{`${props.title} - n-admin`}</title>
+        <title>{`${props.title} - Neutron CMS`}</title>
         <link rel="icon" href="data:," />
         <link rel="stylesheet" href={`${props.config.path}/admin.css?v=${props.cssVersion}`} />
       </head>
@@ -31,7 +31,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; extraScript?: s
   return (
     <>
       <header class="top">
-        <a class="name" href={admin}>n-admin</a>
+        <a class="name" href={admin}>Neutron CMS</a>
         {config.posts ? <a href={admin} aria-current={current("posts")}>Posts</a> : null}
         {config.onPage.length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
         {Object.entries(config.lists).filter(([key]) => !config.onPage.includes(key)).map(([key, list]) => (
@@ -133,11 +133,12 @@ export function EditorPage(props: {
   return (
     <>
       <header class="top editor-top">
-        <a class="back" href={admin}>{"\u2190"} Posts</a>
+        <a class="back" href={admin} aria-label="Back to posts">{"\u2190"}<span class="on-wide">&nbsp;Posts</span></a>
+        <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
         <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
         <span class="spacer" />
-        <button class="button quiet" type="button" data-add-image>Add image</button>
-        <button class="button quiet" type="button" data-toggle-meta aria-pressed="true">Settings</button>
+        <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>
+        <button class="button quiet" type="button" data-toggle-meta aria-expanded={error ? "true" : "false"} aria-controls="post-settings">Settings</button>
         <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>
         {status === "draft" ? (
           <button class="button primary" type="submit" form={FORM} name="intent" value="publish" data-publish>Publish</button>
@@ -146,7 +147,7 @@ export function EditorPage(props: {
         )}
       </header>
 
-      <form class="editor" id={FORM} method="post" data-editor={post.id} data-status={status}>
+      <form class="editor" id={FORM} method="post" data-editor={post.id} data-status={status} data-meta-open={error ? "" : undefined}>
         <input type="hidden" name="revision" value={post.updated_at} />
         <input type="hidden" name="date" value={post.published_at ?? ""} />
         {error ? <p class="notice error" role="alert">{error}</p> : null}
@@ -162,8 +163,7 @@ export function EditorPage(props: {
         </main>
         <iframe class="preview" title="Preview" sandbox="" data-preview hidden />
 
-        <aside class="meta" aria-label="Post settings">
-          <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
+        <aside class="meta" id="post-settings" aria-label="Post settings">
           <label class="field">
             <span>URL</span>
             <input class="input" name="slug" value={values.slug ?? ""} disabled={live} placeholder="from-the-title" spellcheck={false} autocapitalize="off" />
