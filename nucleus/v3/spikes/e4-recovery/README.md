@@ -1702,6 +1702,90 @@ seed must be re-selected. This is not a literal edit.
 code, run or literal of this card. F2's attempt-2 uncommitted edits
 were never imported (this worktree started clean at the Base).
 
+**Step 1 — the movement under X5-R51 (this commit).** The tip built at
+the runner's `CARGO_TARGET_DIR` (outside the worktree); the Base was
+**not** rebuilt (F2 and the gate both reproduced `m/b1.json` byte for
+byte, so `m/b1k.json` stands). Every run under `ulimit -v 25165824`,
+output outside the worktree (this sandbox's `~/.cache/nv3-review` is a
+read-only mount, so the card's scratch dir lives at
+`/tmp/nv3-container-jc_2ajyd/opencode/X-5c-F4-F1-F1-F3-F2-F1/`; the runs
+and their content are unchanged by the relocation).
+
+- **X5-R37's 54 seeds, singly** (`--threads 1`, one run each): exactly
+  the 13 F2 measured moved — 3 `923362676→4196035152`, 47
+  `2526989435→1878234829`, 112 `3003462667→841173046`, 198
+  `95622311→3654049329`, 303 `4147169426→144621379`, 967
+  `2847369120→3916549382`, 987 `2492798953→1449471436`, 1749
+  `1584051239→3785784973`, 2376 `3116539881→926921172`, 2927
+  `1901399424→1916772534`, 5549 `308297210→3614535945`, 7469
+  `1393729414→1742707490`, 7528 `122281874→3346573892` — and the other
+  41 are byte-identical. `MONITOR=0` in all 54 runs. No other
+  difference, so no STOP here.
+- **BASE 0..1000** as five 200-seed runs at 16 threads, compared with
+  `m/b1k.json` per (seed, round) and per twin: **243 digests moved**;
+  `MONITOR=0`, `DEADLOCK=0`, `PANIC=0`, `DEFECT_SEEDS=0` in every
+  block; failing rounds Base 5 (`8r0 178r1 457r0 537r0 688r0`) → tip 4
+  (`8r0 178r1 537r0 688r0`); twin failing rounds `609r1 849r1` on both
+  sides, and **no twin round changed a text at all**. No fold
+  regression (no round that passed the fold at the Base fails here), no
+  class changed, no bullet-3 hit. The Acceptance comparator, its paths,
+  its `MONITOR` source and its `range` pointed at these files, is the
+  reference reading:
+
+  ```
+  DIGESTS_MOVED 243 FAILING_ROUNDS 4 MONITOR 0
+  MOVED_GAINED 7 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0)]
+  MOVED_MP_PENDING [(47, 1), (547, 0), (797, 0), (967, 0)]
+  MOVED_LOST 5 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1)]
+  HEALED 1 [(457, 0)]
+  NEW_FAILING 0 [] BAD_SEEDS []
+  ```
+
+  (exit 0) — the gate's expected reading. My own per-round table,
+  both directions, follows.
+
+- **Moved-gained (7), each with its (b)5 evidence** — one single-seed
+  run per seed with `E4_MPE_DIAG=1 E4_X33_DIAG=1` (each run's own
+  `E4 SEEDS=1 … MONITOR=0` line, so (b)4 holds run by run):
+
+  | seed, round | class | Base crash | tip crash | tip text (O-1(a)) | (b)5 evidence |
+  |---|---|---|---|---|---|
+  | 47 r1 | MP | (round 1 did not exist at the Base; r0 carried the text) | `poison` | `at c=19: published {} != model {2, 3, 4, 5}` | amcheck (i): 5 findings, `tainted {9, 11, 36, 47, 85}`, slots `[9, 47, 85, 36, 11]` all in tainted |
+  | 339 r0 | MW | `uniform@y:9569` | `uniform@y:6802` | `at c=5: published {} != model {2, 3, 4}` | `x33x=true cover_err=true`; `X33 diag: seed=339 round=0 ERR arm: damaged=[(145943, 171812), (74181, 126189)]` (WAL inodes; no page slot) |
+  | 547 r0 | MP | `After5@2` | `After5@2` | `at c=26: published {} != model {2}` | amcheck (i): 2 findings, `tainted {66, 167}`, slots `[66, 167]` |
+  | 779 r0 | MW | `uniform@y:369` | `uniform@y:5896` | `at c=7: published {} != model {2}` | `x33x=true cover_err=true`; `damaged=[(1504, 2226), (50688, 51410), (2226, 2299), (5120, 5193)]` |
+  | 797 r0 | MP | `uniform@y:9889` | `uniform@y:11872` | `at c=21: published {} != model {2, 3}` | amcheck (i): 2 findings, `tainted {13, 40}`, slots `[13, 40]` |
+  | 799 r0 | MW | `uniform@y:13386` | `uniform@y:9670` | `at c=5: published {} != model {2}` | `x33x=true cover_err=true`; `damaged=[(48768, 65536)]` |
+  | 967 r0 | MP | `Mid6@0` | `Mid6@0` | `at c=7: published {} != model {2, 3}` | amcheck (i): 1 finding, `tainted {10}`, slot `[10]` — checkpoint 1's `map_root` itself, moved 11→10 by X5-R49's slot reuse |
+
+- **Moved-lost (5)** — Base rounds with a text whose tip round is
+  text-free and `pass`, or missing; each meets (c)'s checks 1–3 plus
+  the MW part of check 5 on the Base round's own JSON (`pass=true`,
+  O-1(a) only; MW rows carry `x33x=true cover_err=true` at the Base):
+
+  | seed, round | class | Base crash | tip crash | Base text (O-1(a)) |
+  |---|---|---|---|---|
+  | 47 r0 | MP | `After1@1` | `After1@1` | `at c=17: published {} != model {2, 3, 4}` (the detection moved to the new r1) |
+  | 179 r0 | MW | `uniform@y:9755` | `uniform@y:132` | `at c=6: published {} != model {2}`, `x33x`/`cover_err` true at the Base |
+  | 397 r0 | MP | `uniform@y:12142` | `uniform@y:10240` | `at c=4: published {} != model {2, 3}` |
+  | 579 r0 | MW | `uniform@y:14505` | `uniform@y:12430` | `at c=18: published {} != model {2}`, `x33x`/`cover_err` true at the Base |
+  | 967 r1 | MP | `poison` | (round 1 no longer exists; the seed now stops at r0) | `at c=8: published {} != model {2, 3, 4}` |
+
+- **Healed (1):** `457 r0` MP — Base `uniform@y:14318` `pass=false`
+  with `O-1(a) at c=30` **and** an unexplained `O-3(a)` beside it; tip
+  `uniform@y:6537` `pass=true` with `O-1(a) at c=6`. The (c) pass-flip
+  shape: the crash draw moved, the known served-corruption draw is no
+  longer reached. The class itself remains (`8r0 537r0 688r0`).
+
+- **Changed texts in rounds that already carried one (reported, not
+  counted, 9):** 97 r0 `c=7→c=19`, 117 r0 `c=17→c=7`, 199 r1
+  `c=26→c=12`, 457 r0 `c=30→c=6` (the healed row above), 527 r1
+  `c=23→c=22`, 617 r0 `c=20→c=27`, 678 r0 `c=10→c=33`, 798 r0
+  `c=5→c=18`, 857 r0 `c=7→c=12` — all `O-1(a)` on both sides.
+
+**New failures under X5-R51 (e): 0.** The "Otherwise" branch of F2's
+step 4 therefore runs, as this card's steps 2–6.
+
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
