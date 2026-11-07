@@ -16,6 +16,7 @@ export function Document(props: { config: ResolvedConfig; title: string; childre
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="robots" content="noindex" />
         <title>{`${props.title} - n-admin`}</title>
+        <link rel="icon" href="data:," />
         <link rel="stylesheet" href={`${props.config.path}/admin.css`} />
       </head>
       <body>{props.children}</body>
@@ -211,12 +212,11 @@ function Input(props: { name: string; field: ResolvedField; value?: string }) {
 
 function Row(props: { list: ResolvedList; item?: Item }) {
   const entries = Object.entries(props.list.fields);
-  const pair = entries.length === 2;
   const grid = isPhotoList(props.list);
   const sorted = Boolean(props.list.sortBy);
   return (
-    <div class={pair ? "item" : "item stacked"}>
-      <div class={pair ? "item-fields pair" : "item-fields"}>
+    <div class={entries.length > 2 ? "item stacked" : "item"}>
+      <div class="item-fields">
         {entries.map(([key, field]) => <Input key={key} name={`f.${key}`} field={field} value={props.item?.[key]} />)}
       </div>
       <div class="item-tools">
@@ -294,9 +294,9 @@ export function EditPage(props: { config: ResolvedConfig }) {
         <button class="button primary" type="button" data-edit-save disabled>Save</button>
         <button class="button" type="button" data-edit-discard disabled>Discard</button>
         <span class="muted" data-edit-state role="status" />
+        <div class="edit-tools" data-edit-tools hidden />
       </div>
       <iframe class="edit-frame" title="Your site" src="/" data-edit-frame />
-      <div class="edit-tools" data-edit-tools hidden />
     </Shell>
   );
 }

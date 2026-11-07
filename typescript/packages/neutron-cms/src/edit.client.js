@@ -7,7 +7,19 @@ const state = $("[data-edit-state]");
 const saveButton = $("[data-edit-save]");
 const discardButton = $("[data-edit-discard]");
 
-const ACCENT = "#2f80ed";
+const HINT = "Click any text or image to change it";
+
+// Lives only in the frame, in memory: a constructed sheet touches neither the site's CSS nor its layout.
+const PAGE_STYLES = `
+  [data-cms-field]:hover { outline: 2px solid rgb(47 128 237 / .6); outline-offset: 2px; }
+  [data-cms-field]:focus { outline: 2px solid #2f80ed; outline-offset: 2px; }
+  [data-cms-selected] { outline: 1px dashed #2f80ed; outline-offset: 6px; }
+  [contenteditable] { cursor: text; }
+  [contenteditable]:empty { display: inline-block; min-width: 4em; }
+  [contenteditable]:empty::before { content: attr(data-cms-placeholder); opacity: .5; }
+  img[data-cms-field] { cursor: pointer; }
+  img[data-cms-field]:not([src]) { min-width: 80px; min-height: 80px; background: rgb(128 128 128 / .3); }
+`;
 
 let data = null;
 let page = null;
@@ -15,6 +27,8 @@ let selected = null;
 let dirty = false;
 let pending = 0;
 let notice = "";
+let bad = false;
+let justSaved = false;
 let touchedTexts = {};
 let touchedLists = new Set();
 const itemOf = new WeakMap();
@@ -22,77 +36,77 @@ const itemOf = new WeakMap();
 function show() {
   saveButton.disabled = pending > 0 || !dirty;
   discardButton.disabled = !dirty;
-  state.classList.toggle("bad", notice.startsWith("!"));
-  state.textContent = notice.replace(/^!/, "") || (pending ? `Uploading, ${pending} left` : dirty ? "Unsaved changes" : "Click anything outlined to edit it");
+  state.classList.toggle("bad", bad);
+  state.textContent = notice || (pending ? `Uploading, ${pending} left` : dirty ? "Unsaved changes" : HINT);
+}
+
+function say(message, isBad = false) {
+  notice = message;
+  bad = isBad;
+  show();
 }
 
 function changed() {
   dirty = true;
   notice = "";
+  bad = false;
   show();
 }
 
-const parseItem = (el) => {
+function parseItem(el) {
   const value = el.getAttribute("data-cms-item");
   const at = value.lastIndexOf(".");
   return { key: value.slice(0, at), index: Number(value.slice(at + 1)) };
-};
-
-function outline(el, color) {
-  el.style.outline = color ? `2px solid ${color}` : "";
-  el.style.outlineOffset = color ? "2px" : "";
 }
 
-function hoverable(el) {
-  el.addEventListener("mouseenter", () => { if (el !== page.activeElement) outline(el, `${ACCENT}99`); });
-  el.addEventListener("mouseleave", () => { if (el !== page.activeElement && el !== selected) outline(el, ""); });
+async function replaceImage(file, onDone, el) {
+  const preview = el ? URL.createObjectURL(file) : null;
+  const previous = el?.getAttribute("src");
+  if (el) {
+    el.removeAttribute("srcset");
+    el.removeAttribute("sizes");
+    el.src = preview;
+  }
+  pending += 1;
+  changed();
+  try {
+    const { url, thumb } = await uploadImage(file);
+    if (el) el.src = thumb;
+    onDone(url);
+    pending -= 1;
+    show();
+  } catch (error) {
+    if (el && previous) el.src = previous;
+    pending -= 1;
+    say(`${file.name}: ${error.message}`, true);
+  }
+  if (preview) URL.revokeObjectURL(preview);
 }
 
 /** A field on the page: words are typed in place, an image is clicked. */
 function bindField(el, field, write) {
+  el.setAttribute("data-cms-field", "");
   if (field.type === "image") {
-    el.dataset.cmsPick = "";
-    el.style.cursor = "pointer";
+    el.title = `Click to replace this ${field.label.toLowerCase()}`;
     el.addEventListener("click", async (event) => {
       event.preventDefault();
       const [file] = await pickImages();
-      if (!file) return;
-      const preview = URL.createObjectURL(file);
-      el.removeAttribute("srcset");
-      el.removeAttribute("sizes");
-      el.src = preview;
-      pending += 1;
-      changed();
-      try {
-        const { url, thumb } = await uploadImage(file);
-        el.src = thumb;
-        write(url);
-      } catch (error) {
-        notice = `!${file.name}: ${error.message}`;
-      }
-      URL.revokeObjectURL(preview);
-      pending -= 1;
-      show();
+      if (file) replaceImage(file, write, el);
     });
-  } else {
-    el.setAttribute("contenteditable", "plaintext-only");
-    el.spellcheck = true;
-    el.style.minWidth = "1em";
-    el.style.minHeight = "1em";
-    el.style.cursor = "text";
-    el.addEventListener("input", () => {
-      write(el.innerText.trim());
-      changed();
-      place();
-    });
-    el.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") el.blur();
-      if (event.key === "Enter" && field.type !== "textarea") event.preventDefault();
-    });
-    el.addEventListener("focus", () => outline(el, ACCENT));
-    el.addEventListener("blur", () => outline(el, ""));
+    return;
   }
-  hoverable(el);
+  el.setAttribute("contenteditable", "plaintext-only");
+  el.setAttribute("data-cms-placeholder", field.label);
+  el.spellcheck = false;
+  el.addEventListener("input", () => {
+    // The browser leaves a stray line break in an emptied field, which would hide the placeholder.
+    if (!el.textContent.trim()) el.textContent = "";
+    write(el.innerText.trim());
+    changed();
+  });
+  el.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && field.type !== "textarea") event.preventDefault();
+  });
 }
 
 const isInline = (field) => field.type === "text" || field.type === "textarea" || field.type === "image";
@@ -130,19 +144,10 @@ function decideArrangeable(key) {
 
 function select(itemEl) {
   if (selected === itemEl) return;
-  if (selected) outline(selected, "");
+  selected?.removeAttribute("data-cms-selected");
   selected = itemEl;
-  if (selected) outline(selected, ACCENT);
+  selected?.setAttribute("data-cms-selected", "");
   drawTools();
-}
-
-function place() {
-  if (!selected || !selected.isConnected) return;
-  const box = selected.getBoundingClientRect();
-  const height = tools.offsetHeight;
-  const top = box.top - height - 8;
-  tools.style.top = `${frame.offsetTop + Math.max(4, top < 0 ? box.bottom + 8 : top)}px`;
-  tools.style.left = `${frame.offsetLeft + Math.max(4, Math.min(box.left, frame.clientWidth - tools.offsetWidth - 4))}px`;
 }
 
 function button(text, label, action, disabled = false) {
@@ -152,6 +157,53 @@ function button(text, label, action, disabled = false) {
   return el;
 }
 
+function arrangeTools(key, list) {
+  const touch = () => {
+    touchedLists.add(key);
+    changed();
+    drawTools();
+  };
+  const siblings = rendered(key);
+  const at = siblings.indexOf(selected);
+  const next = siblings[at + 1] ?? siblings[at - 1];
+  const sideways = next && Math.abs(next.getBoundingClientRect().top - selected.getBoundingClientRect().top) < 8;
+
+  return [
+    button(sideways ? "←" : "↑", "Move earlier", () => {
+      siblings[at - 1].before(selected);
+      touch();
+    }, at === 0),
+    button(sideways ? "→" : "↓", "Move later", () => {
+      siblings[at + 1].after(selected);
+      touch();
+    }, at === siblings.length - 1),
+    button("Add", "Add another", () => {
+      const clone = selected.cloneNode(true);
+      for (const el of [clone, ...clone.querySelectorAll("*")]) {
+        for (const name of ["contenteditable", "data-cms-field", "data-cms-selected", "data-cms-placeholder", "title"]) el.removeAttribute(name);
+      }
+      for (const el of boundFields(clone)) {
+        if (el.tagName === "IMG") for (const name of ["src", "srcset", "sizes", "width", "height"]) el.removeAttribute(name);
+        else el.textContent = "";
+      }
+      selected.after(clone);
+      bindItem(clone, key, {});
+      select(clone);
+      touchedLists.add(key);
+      changed();
+      boundFields(clone).find((el) => el.isContentEditable)?.focus();
+    }),
+    button("Remove", "Remove this", () => {
+      if (rendered(key).length === 1) return say(`This is the last one, so it stays. The ${list.label} list page can empty it.`, true);
+      const going = selected;
+      select(null);
+      going.remove();
+      touchedLists.add(key);
+      changed();
+    }),
+  ];
+}
+
 function drawTools() {
   tools.textContent = "";
   tools.hidden = !selected;
@@ -159,8 +211,7 @@ function drawTools() {
   const { key, item } = itemOf.get(selected);
   const list = data.lists[key];
 
-  const title = Object.assign(document.createElement("strong"), { textContent: list.label });
-  tools.append(title);
+  tools.append(Object.assign(document.createElement("strong"), { textContent: list.label }));
 
   // Whatever the page doesn't show, such as a link's address, is edited here.
   const shown = new Set(boundFields(selected).map((el) => el.getAttribute("data-cms")));
@@ -169,17 +220,12 @@ function drawTools() {
     if (field.type === "image") {
       tools.append(button(`Change ${field.label.toLowerCase()}`, field.label, async () => {
         const [file] = await pickImages();
-        if (!file) return;
-        pending += 1;
-        changed();
-        try {
-          item[name] = (await uploadImage(file)).url;
-          touchedLists.add(key);
-        } catch (error) {
-          notice = `!${file.name}: ${error.message}`;
+        if (file) {
+          replaceImage(file, (url) => {
+            item[name] = url;
+            touchedLists.add(key);
+          });
         }
-        pending -= 1;
-        show();
       }));
       continue;
     }
@@ -187,74 +233,30 @@ function drawTools() {
       className: "input",
       type: field.type === "date" ? "date" : "text",
       value: item[name] ?? "",
-      placeholder: field.label,
     });
     input.setAttribute("aria-label", field.label);
+    input.spellcheck = false;
     input.addEventListener("input", () => {
       item[name] = input.value.trim();
       touchedLists.add(key);
       changed();
     });
-    tools.append(input);
+    const label = Object.assign(document.createElement("label"), { className: "edit-field" });
+    label.append(field.label, input);
+    tools.append(label);
   }
 
-  if (list.arrangeable) {
-    const touch = () => {
-      touchedLists.add(key);
-      changed();
-      place();
-    };
-    tools.append(button("←", "Move earlier", () => {
-      const before = selected.previousElementSibling;
-      if (before && itemOf.has(before)) before.before(selected);
-      touch();
-    }));
-    tools.append(button("→", "Move later", () => {
-      const after = selected.nextElementSibling;
-      if (after && itemOf.has(after)) after.after(selected);
-      touch();
-    }));
-    tools.append(button("Add", "Add another", () => {
-      const clone = selected.cloneNode(true);
-      for (const el of [clone, ...clone.querySelectorAll("*")]) {
-        el.removeAttribute("contenteditable");
-        el.removeAttribute("style");
-      }
-      for (const el of boundFields(clone)) {
-        if (el.tagName === "IMG") {
-          el.removeAttribute("srcset");
-          el.removeAttribute("sizes");
-          el.removeAttribute("src");
-          el.style.minHeight = "4em";
-        } else {
-          el.textContent = "";
-        }
-      }
-      selected.after(clone);
-      bindItem(clone, key, {});
-      select(clone);
-      touch();
-      const first = boundFields(clone).find((el) => el.isContentEditable);
-      first?.focus();
-    }));
-    tools.append(button("Remove", "Remove this", () => {
-      if (rendered(key).length === 1) {
-        notice = `!This is the last one. Use the ${list.label} list page to empty it.`;
-        return show();
-      }
-      const going = selected;
-      select(null);
-      going.remove();
-      touch();
-    }));
-  }
-  place();
+  if (list.arrangeable) tools.append(...arrangeTools(key, list));
 }
 
 function bindPage() {
   page = frame.contentDocument;
   selected = null;
   drawTools();
+
+  const sheet = new frame.contentWindow.CSSStyleSheet();
+  sheet.replaceSync(PAGE_STYLES);
+  page.adoptedStyleSheets = [...page.adoptedStyleSheets, sheet];
 
   for (const el of page.querySelectorAll("[data-cms-text]")) {
     const name = el.getAttribute("data-cms-text");
@@ -276,51 +278,26 @@ function bindPage() {
     const target = event.target;
     const itemEl = target.closest("[data-cms-item]");
     select(itemEl && itemOf.has(itemEl) ? itemEl : null);
+    if (notice && !bad) say("");
 
     const link = target.closest("a[href]");
     if (!link) return;
     const internal = new URL(link.href).origin === location.origin;
-    if (itemEl || target.closest("[data-cms-text]") || !internal) {
+    if (itemEl || target.closest("[data-cms-text]")) {
       event.preventDefault();
-      if (!itemEl && !internal) {
-        notice = "Links to other sites are off while editing.";
-        show();
-      }
+    } else if (!internal) {
+      event.preventDefault();
+      say("Links to other sites are off while editing.");
     } else if (dirty && !confirm("Leave this page? Your unsaved changes will be lost.")) {
       event.preventDefault();
     }
   }, true);
   page.addEventListener("submit", (event) => event.preventDefault(), true);
-  page.addEventListener("scroll", place, true);
-  frame.contentWindow.addEventListener("resize", place);
+  page.addEventListener("keydown", shortcuts);
 }
 
-async function load() {
-  const response = await fetch(`${ADMIN}/edit/data`, { headers: { "x-cms": "1" } });
-  if (response.status === 401) {
-    location.href = `${ADMIN}/login`;
-    return;
-  }
-  data = await response.json();
-  dirty = false;
-  touchedTexts = {};
-  touchedLists = new Set();
-  notice = "";
-  show();
-}
-
-frame.addEventListener("load", async () => {
-  await load();
-  try {
-    if (!frame.contentDocument?.body) throw new Error("blocked");
-    bindPage();
-  } catch {
-    notice = `!This site doesn't allow being framed. Set X-Frame-Options to SAMEORIGIN and frame-ancestors to 'self'.`;
-    show();
-  }
-});
-
-saveButton.addEventListener("click", async () => {
+async function save() {
+  if (saveButton.disabled) return;
   page.activeElement?.blur?.();
   const lists = {};
   for (const key of touchedLists) {
@@ -330,23 +307,53 @@ saveButton.addEventListener("click", async () => {
       items: list.arrangeable ? rendered(key).map((el) => itemOf.get(el).item) : list.items,
     };
   }
-  notice = "Saving…";
-  show();
+  say("Saving…");
+  saveButton.disabled = true;
   try {
     const response = await cms("edit/save", JSON.stringify({ texts: touchedTexts, lists }));
     const result = await response.json().catch(() => ({}));
-    if (response.status === 401) notice = `!Signed out. Log in again in another tab, then save. Nothing was lost.`;
-    else if (!response.ok) notice = `!${result.error ?? "Could not save"}`;
-    else {
-      dirty = false;
-      frame.contentWindow.location.reload();
-      return;
-    }
+    if (response.status === 401) return say("Signed out. Log in again in another tab, then save. Nothing was lost.", true);
+    if (!response.ok) return say(result.error ?? "Could not save", true);
+    dirty = false;
+    justSaved = true;
+    frame.contentWindow.location.reload();
   } catch {
-    notice = "!Offline. Nothing was lost. Try saving again.";
+    say("Offline. Nothing was lost. Try saving again.", true);
   }
-  show();
+}
+
+function shortcuts(event) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    save();
+  }
+  if (event.key === "Escape") {
+    page?.activeElement?.blur?.();
+    select(null);
+  }
+}
+
+frame.addEventListener("load", async () => {
+  const response = await fetch(`${ADMIN}/edit/data`, { headers: { "x-cms": "1" } });
+  if (response.status === 401) {
+    location.href = `${ADMIN}/login`;
+    return;
+  }
+  data = await response.json();
+  dirty = false;
+  touchedTexts = {};
+  touchedLists = new Set();
+  try {
+    if (!frame.contentDocument?.body) throw new Error("blocked");
+    bindPage();
+    say(justSaved ? "Saved" : "");
+  } catch {
+    say("This site doesn't allow being framed. Set X-Frame-Options to SAMEORIGIN and frame-ancestors to 'self'.", true);
+  }
+  justSaved = false;
 });
+
+saveButton.addEventListener("click", save);
 
 discardButton.addEventListener("click", () => {
   if (!confirm("Discard your changes?")) return;
@@ -354,7 +361,7 @@ discardButton.addEventListener("click", () => {
   frame.contentWindow.location.reload();
 });
 
+addEventListener("keydown", shortcuts);
 addEventListener("beforeunload", (event) => {
   if (dirty || pending) event.preventDefault();
 });
-addEventListener("resize", place);

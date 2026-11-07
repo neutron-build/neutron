@@ -58,7 +58,7 @@ export interface ResolvedConfig {
 /** The address of the page that edits text fields, so a list cannot use it. */
 export const TEXT = "text";
 
-const title = (key: string) => key[0].toUpperCase() + key.slice(1);
+const title = (key: string) => (key === "url" ? "URL" : key[0].toUpperCase() + key.slice(1));
 
 function resolveField(key: string, field: FieldType | Field): ResolvedField {
   const full = typeof field === "string" ? { type: field } : field;
