@@ -244,3 +244,12 @@ test("a list of mostly pictures is a photo list", () => {
   assert.equal(isPhotoList({ label: "P", fields: { image: field("image"), label: field(), url: field() } }), false);
   assert.equal(isPhotoList({ label: "L", fields: { label: field(), url: field() } }), false);
 });
+
+test("post images carry their size and offer the thumbnail", () => {
+  const sized = renderMarkdown("![A](/media/a-2000x1000.webp)");
+  assert.match(sized, /src="\/media\/a-2000x1000-t\.webp"/);
+  assert.match(sized, /srcset="\/media\/a-2000x1000-t\.webp 800w, \/media\/a-2000x1000\.webp 2000w"/);
+  assert.match(sized, /width="2000" height="1000"/);
+  assert.match(renderMarkdown("![B](/media/b-600x400.webp)"), /src="\/media\/b-600x400\.webp" alt="B" width="600" height="400"/);
+  assert.match(renderMarkdown("![C](/img/old.jpg)"), /^<p><img src="\/img\/old\.jpg" alt="C" loading="lazy"/);
+});

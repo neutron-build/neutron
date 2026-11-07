@@ -1,5 +1,5 @@
 import { Marked } from "marked";
-import { imageSize } from "./images.js";
+import { photoAttributes } from "./images.js";
 
 const attribute = (value: string) => value.replace(/&(?!\w+;|#\d+;)/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 
@@ -9,9 +9,12 @@ const marked = new Marked({
   renderer: {
     image({ href, title, text }) {
       const titled = title ? ` title="${attribute(title)}"` : "";
-      const size = imageSize(href);
-      const sized = size ? ` width="${size.width}" height="${size.height}"` : "";
-      return `<img src="${attribute(href)}" alt="${attribute(text)}"${titled}${sized} loading="lazy" decoding="async">`;
+      // A size lets the browser reserve the space and leave images below the fold until they're near.
+      // A thumbnail, when there is one, saves most screens the full image.
+      const { src, width, height, srcset, sizes } = photoAttributes(href, "(min-width: 800px) 768px, 100vw");
+      const sized = width ? ` width="${width}" height="${height}"` : "";
+      const responsive = srcset ? ` srcset="${attribute(srcset)}" sizes="${sizes}"` : "";
+      return `<img src="${attribute(src)}"${responsive} alt="${attribute(text)}"${titled}${sized} loading="lazy" decoding="async">`;
     },
   },
 });
