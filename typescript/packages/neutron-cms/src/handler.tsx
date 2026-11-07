@@ -171,7 +171,7 @@ export function createHandler(config: ResolvedConfig) {
     const title = escapeHtml(String(form.get("title") ?? ""));
     const body = renderMarkdown(String(form.get("body") ?? ""));
     return new Response(
-      `<!doctype html><meta charset="utf-8"><style>html{box-sizing:border-box}*{box-sizing:inherit}body{margin:0;font-family:sans-serif}img{max-width:100%;height:auto}main{width:min(768px,100%);margin:0 auto;padding:64px 24px 96px}${config.previewCss}</style><main><h1>${title}</h1><div class="prose">${body}</div></main>`,
+      `<!doctype html><meta charset="utf-8"><style>html{box-sizing:border-box}*{box-sizing:inherit}body{margin:0;font-family:sans-serif}img{max-width:100%;height:auto}main{width:min(768px,100%);margin:0 auto;padding:40px 24px 96px}h1:first-child{margin:0 0 16px;font-size:40px;line-height:1.2}${config.previewCss}</style><main><h1>${title}</h1><div class="prose">${body}</div></main>`,
       { headers: { "Content-Type": "text/html; charset=utf-8" } },
     );
   }
