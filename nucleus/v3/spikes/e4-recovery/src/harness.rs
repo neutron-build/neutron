@@ -43,17 +43,6 @@ const S_CRASH: u64 = 4;
 const S_MEDIA: u64 = 5;
 const S_SAMPLE: u64 = 6;
 
-/// **X5-R40 (card X-5c-F4-F1-F1 step 2):** the spin-turn budget of
-/// [`ScriptOp::AwaitCkptOpen`]'s backstop exit. A checkpoint window
-/// opens within tens of the spinner's turns in every healthy round
-/// (commits keep crossing the checkpointer's `every` threshold); the
-/// budget only trips when no window can open again, where the old
-/// contract livelocked against the yield budget (the probe at
-/// `smo_share` 1000, seeds 4/20). Fixed, deterministic sim-order turns —
-/// never wall clock — and far below `YIELD_BUDGET` so a tripped spin can
-/// never masquerade as a livelock.
-const AWAIT_CKPT_OPEN_TURNS: u64 = 1024;
-
 /// One scripted operation of a task (card Work 13, "Workload").
 #[derive(Debug, Clone)]
 pub enum ScriptOp {
@@ -91,20 +80,6 @@ pub enum ScriptOp {
     },
     /// Request a checkpoint and wait for it to complete.
     Checkpoint,
-    /// **X5-R40 (card X-5c-F4-F1-F1 step 2; a 5.2 amendment,
-    /// pre-registered before this card's probes):** wait until a
-    /// checkpoint window is open (`ckpt_open`) or the workload can no
-    /// longer open one (the workload done, this the last unfinished
-    /// script task, or the spin budget [`AWAIT_CKPT_OPEN_TURNS`] —
-    /// see the op arm for the circularity that widens the card's
-    /// "or the workload is done"). The SMO alignment op: the ops that
-    /// follow it in its task start only inside a checkpoint window, so
-    /// their splits and merges land in the window's own counters (Q4's
-    /// halves). Implemented as the checkpointer's own poll pattern (a
-    /// spin-yield loop, never a park: no wait key is woken at
-    /// `ckpt:begin`, so a parked waiter could only ever observe the
-    /// window after it closed).
-    AwaitCkptOpen,
     /// Set a named park point's budget (the D5 split parking).
     Park {
         /// The park point.
@@ -1071,45 +1046,6 @@ pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
                 Ok(())
             })?;
             wait_ckpt(cx)
-        }
-        ScriptOp::AwaitCkptOpen => {
-            // X5-R40: spin-yield (the checkpointer's own `h:ck` poll
-            // pattern — see the variant's doc for why no park exists)
-            // until a checkpoint window opens or the workload is done.
-            // A crash unwinds through `yield_now`'s `Err(Crashed)` as
-            // every scripted op does.
-            //
-            // The exit set is wider than "window open or workload done"
-            // because `workload_done` has a circular case: it is set
-            // when the last script task finishes, and a spinner waiting
-            // for a window that only a *future commit* could open (the
-            // checkpointer's `every` threshold already exhausted) holds
-            // that last slot forever — the probe at `smo_share` 1000
-            // livelocked exactly there (seeds 4/20, site `h:ckpt`). So
-            // the op also exits when it is the last unfinished script
-            // task (`tasks_left <= 1`: no further commit can arrive, so
-            // no commits-triggered window can open), and after a fixed
-            // spin-turn budget (`AWAIT_CKPT_OPEN_TURNS`, deterministic
-            // sim-order turns, never wall clock) as the backstop for a
-            // quieter task that never commits. In every exit-but-window
-            // case the following ops simply run ungated — the round
-            // proceeds exactly as it would without the alignment, never
-            // a hang.
-            let mut turns = 0u64;
-            loop {
-                let (open, done, left) = cx.with("h:ackopen", |c| {
-                    let (done, left) = {
-                        let h = c.h();
-                        (h.workload_done, h.tasks_left)
-                    };
-                    Ok((c.store().ckpt_open, done, left))
-                })?;
-                if open || done || left <= 1 || turns >= AWAIT_CKPT_OPEN_TURNS {
-                    return Ok(());
-                }
-                turns += 1;
-                cx.yield_now("h:ackopen")?;
-            }
         }
         ScriptOp::Park { name, budget } => cx.with("h:park", |c| {
             c.store().parks.insert(name, *budget);

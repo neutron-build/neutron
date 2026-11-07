@@ -52,14 +52,6 @@ const S_HOOK: u64 = 11;
 /// `w11_share + w12_share > 0`, never drawn (and never constructed)
 /// when both shares are 0, so BASE consumes no stream state on it.
 const S_CWIN: u64 = 12;
-/// **X5-R40 (card X-5c-F4-F1-F1 step 2):** the SMO selection stream —
-/// one draw per round when `smo_share > 0` ([`smo_pick`]), never drawn
-/// (and never constructed) when it is 0, so BASE consumes no stream
-/// state on it. Independent of `S_GEN`: the SMO block's *script-content*
-/// draws (the split-seeding run's position) come from the round's `S_GEN`
-/// stream, inside the selected branch only, so an unselected round's
-/// script is bit-for-bit the pre-X5-R40 generator's.
-const S_SMO: u64 = 13;
 
 /// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
 /// frozen tuning.** Every generator constant the X-5c-F4 retune may
@@ -167,15 +159,6 @@ pub struct Tuning {
     /// list (a `wal_recycle` rename returned, its `sync_dir` not yet
     /// complete). 0 in BASE.
     pub w12_share: u32,
-    /// **X5-R40 (card X-5c-F4-F1-F1 step 2; a 5.2 amendment,
-    /// pre-registered before this card's probes): the SMO share**
-    /// (permille). In a round selected by the `S_SMO` stream with this
-    /// probability, the burst tree's extra GC sweeps and one
-    /// split-seeding commit start only after a checkpoint window is open
-    /// ([`ScriptOp::AwaitCkptOpen`]) — Q4's two halves aligned into one
-    /// window. 0 in BASE and this card's FINAL: no draw is made and no
-    /// op is inserted (the schedule changes only in selected rounds).
-    pub smo_share: u64,
 }
 
 impl Tuning {
@@ -214,7 +197,6 @@ impl Tuning {
         burst_gc_loops: 0,
         w11_share: 0,
         w12_share: 0,
-        smo_share: 0,
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
@@ -255,7 +237,6 @@ impl Tuning {
         burst_gc_loops: 0,
         w11_share: 0,
         w12_share: 0,
-        smo_share: 0,
     };
 }
 
@@ -584,79 +565,6 @@ pub fn build_round(
     } else {
         (0, Vec::new())
     };
-    // **X5-R40 (card X-5c-F4-F1-F1 step 2; a 5.2 amendment,
-    // pre-registered before this card's probes): the SMO alignment.**
-    // In a round selected by `S_SMO` with probability `smo_share`
-    // permille, the burst tree's extra GC sweeps and the split-seeding
-    // commit — Puts into a nearly full key run of a tree (≤ 20 ops: a
-    // dense run of consecutive fresh keys at the value ceiling, which
-    // overfills whatever leaf holds it and so splits it wherever it
-    // runs) — start only after a checkpoint window is open, through
-    // `ScriptOp::AwaitCkptOpen`. Both sit at the FRONT of the GC task
-    // (the earliest scripted position), so the gate releases into the
-    // round's FIRST window — where the targeted crash hooks (index 0–2)
-    // live: gating behind the chunked txn instead released after it,
-    // where the checkpointer's `every` threshold is exhausted (the
-    // livelock of probe `s1000a`, seeds 4/20) and every targeted crash
-    // has long fired; and the deletes' elision needs `w` past their ts,
-    // which the chunked txn's single atomic apply holds back until its
-    // marker syncs (probe `s1000b`: the sweeps read `w` = 0–2 with the
-    // deletes durable but unapplied, 0 in-window merges in 43 rounds).
-    // The merge half therefore comes from the holes a PREVIOUS round's
-    // burst left in the recovered tree (a later round's boot frontier
-    // is already past their ts, so the first sweep elides and absorbs
-    // them); the split-seeding run goes to a tree OTHER than the burst
-    // tree so it cannot refill the holes the sweeps merge. Every draw
-    // lives inside this block, so an unselected round (and every BASE
-    // round, where `smo_pick` draws nothing) consumes no stream state
-    // and its script is bit-for-bit the pre-X5-R40 generator's: the op
-    // changes the schedule only in selected rounds. Targeted rounds
-    // keep their hook and uniform rounds keep their draw — the crash
-    // spec is untouched.
-    let smo = smo_pick(seed, round, tun).unwrap_or(false);
-    let smo_seed_ops: Vec<ScriptOp> = if smo {
-        // A tree other than the burst tree when one exists: the
-        // round's writable span is `2..=write_max` (the drop target,
-        // `trees + 1`, is already excluded from `write_max` in a drop
-        // round — seed 62's livelock was the first draft picking it:
-        // the split commit's apply waited forever for a tree the DDL
-        // task had dropped). With no burst (`burst_frac == 0`,
-        // `burst_tree == 0`) every tree in the span qualifies.
-        let span = write_max - 1; // |2..=write_max|
-        let skip = u64::from((2..=write_max).contains(&burst_tree));
-        let stree = match span.checked_sub(skip) {
-            Some(0) | None => burst_tree, // the span is just the burst tree
-            Some(cand) => {
-                let t = 2 + rng.below(cand);
-                if t >= burst_tree && (2..=write_max).contains(&burst_tree) {
-                    t + 1
-                } else {
-                    t
-                }
-            }
-        };
-        // The dense run: ≤ 20 consecutive fresh keys below the
-        // keyspace, at the value ceiling — ~9 fill a leaf, so the run
-        // splits its leaf wherever it lands.
-        let run_len = 20u64.min(knobs.keyspace);
-        let base = rng.below(knobs.keyspace - run_len + 1);
-        let seed_puts: Vec<Op> = (base..base + run_len)
-            .map(|k| Op::Put {
-                tree: stree,
-                key: to_be64(k),
-                value: vec![0xA5; tun.value_hi as usize],
-            })
-            .collect();
-        vec![
-            ScriptOp::AwaitCkptOpen,
-            ScriptOp::Commit {
-                sync_on: true,
-                ops: seed_puts,
-            },
-        ]
-    } else {
-        Vec::new()
-    };
     committers[chunked_task - 1].push(ScriptOp::Chunked {
         sync_on: rng.below(10) >= knobs.syncoff_tenths,
         ops: chunked_ops,
@@ -719,10 +627,7 @@ pub fn build_round(
         barrier(ops);
     }
     // ---- the GC sweeper task: sweeps concurrent with checkpoints ----
-    // The draws run in F4's fixed order (base sweeps, then the burst's);
-    // X5-R40 changes only where the ops LAND in selected rounds (the
-    // gated block at the task's front) — the S_GEN stream is consumed
-    // identically either way.
+    // The draws run in F4's fixed order (base sweeps, then the burst's).
     let mut base_sweep_ops: Vec<ScriptOp> = Vec::new();
     for _ in 0..tun.gc_sweeps_lo + rng.below(tun.gc_sweeps_span) {
         let tree = 2 + rng.below(write_max - 1);
@@ -738,31 +643,11 @@ pub fn build_round(
             w: None,
         });
     }
-    // Assemble: the barrier, then X5-R40's gated block, then the base
-    // sweeps, and the burst's sweeps at the tail exactly where F4's
-    // knobs put them whenever the round is not selected. In a selected
-    // round the gated block is: the gate, the first half of the burst's
-    // sweeps, the split-seeding commit, the second half — the sweeps
-    // span several early windows by their own length (each is a whole
-    // tree walk), and the commit sits mid-sequence so its split lands
-    // in one of the same later early windows the sweeps' merges reach
-    // (the first draft ran the commit before all the sweeps and its
-    // split landed only in the first window, while the crash's
-    // checkpoint — index 0–2 — saw the merges alone: probe `s1000d`,
-    // seeds 42/44, one half each).
+    // Assemble: the barrier, the base sweeps, the burst's sweeps.
     let mut gc_ops: Vec<ScriptOp> = Vec::new();
     barrier(&mut gc_ops);
-    if smo {
-        let half = burst_sweep_ops.len() / 2;
-        gc_ops.push(ScriptOp::AwaitCkptOpen);
-        gc_ops.extend(burst_sweep_ops.iter().take(half).cloned());
-        gc_ops.extend(smo_seed_ops.iter().skip(1).cloned());
-        gc_ops.extend(burst_sweep_ops.iter().skip(half).cloned());
-        gc_ops.extend(base_sweep_ops);
-    } else {
-        gc_ops.extend(base_sweep_ops);
-        gc_ops.extend(burst_sweep_ops);
-    }
+    gc_ops.extend(base_sweep_ops);
+    gc_ops.extend(burst_sweep_ops);
     // ---- the DDL/bulk task ----
     let mut ddl_ops: Vec<ScriptOp> = Vec::new();
     barrier(&mut ddl_ops);
@@ -1011,24 +896,6 @@ pub fn window_crash_point(
     } else {
         (uniform_yield_point(seed, round, counted), None)
     }
-}
-
-/// **X5-R40 (card X-5c-F4-F1-F1 step 2): the SMO selection.** One draw
-/// from the round's own `S_SMO` stream, true with probability
-/// `smo_share` permille. Returns `None` — **no draw made** — when
-/// `smo_share == 0` (BASE and this card's FINAL): the stream is never
-/// constructed, so no stream state is consumed (the card's Limit 4) and
-/// the round's script is bit-for-bit the pre-X5-R40 generator's. The
-/// `None`/`Some` split is the draw-count contract the M-SMO-DRAW pin
-/// asserts (drawing at `smo_share == 0` would return `Some(false)`,
-/// which is observable here and nowhere else — the stream is
-/// independent, so no digest can see it).
-pub fn smo_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
-    if tun.smo_share == 0 {
-        return None;
-    }
-    let mut r = Rng::new(derive(seed * 100 + round as u64, S_SMO));
-    Some(r.below(1000) < tun.smo_share)
 }
 
 /// A round whose crash spec never fired is a **harness defect** (5.5
