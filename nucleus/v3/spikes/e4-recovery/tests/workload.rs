@@ -1936,16 +1936,18 @@ fn x5_r41_completed_window_arm() {
     // the clean arm; an MP detection round may still pass the fold,
     // the rule reads the oracle texts).
     let mrec = workload::run_seed_with(142, Some(Mutant::ReuseDropsImg), &tun);
-    let nf = e4_recovery::campaign::seeded_new_failures(
-        std::slice::from_ref(&rec),
-        std::slice::from_ref(&mrec),
+    let m1 = mrec.rounds.get(1).expect("the mutant arm runs round 1");
+    assert!(
+        m1.o1_fail.is_some() || m1.o2_fail.is_some() || m1.o3_fail.is_some(),
+        "M-REUSE-DROPS-IMG must fail the oracle on 142 r1 (the X5-R43 new-failing rule \
+         reads exactly these texts): o1={:?} o2={:?} o3={:?}",
+        m1.o1_fail,
+        m1.o2_fail,
+        m1.o3_fail
     );
     assert!(
-        nf.contains(&(142, 1)),
-        "M-REUSE-DROPS-IMG must fail the oracle on 142 r1: o1={:?} o2={:?} o3={:?}",
-        mrec.rounds[1].o1_fail,
-        mrec.rounds[1].o2_fail,
-        mrec.rounds[1].o3_fail
+        !m1.deadlock && !m1.panic,
+        "the catch is an oracle failure, never a hang"
     );
 }
 

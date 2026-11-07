@@ -65,7 +65,7 @@ fn usage() {
         "usage: e4-campaign run --seeds A..B --threads N --out results/campaign.json\n\
          \x20      e4-campaign verify --results results/campaign.json [--threads N]\n\
          \x20      e4-campaign mutants --seeds A..B --out results/mutants.json\n\
-         \x20      e4-campaign mutants --check results/mutants.json"
+         \x20      e4-campaign mutants --check results/mutants.json\n"
     );
 }
 
@@ -595,14 +595,47 @@ pub fn verify_seed_set_ok(recs: &[SeedRec]) -> bool {
 /// X5-R15 (b): the digest comparison, pure — the count and the list of
 /// non-reproducing seeds (the report prints the list; the re-run itself
 /// is the command's job).
+///
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6):** a seed also counts as
+/// non-reproducing when any of its rounds' `q4i` differs between the
+/// file and the re-run — `q4i` stays out of the digest (X5-R37's BASE
+/// literals must not move), so the file-versus-re-run comparison is its
+/// only guard (M-Q4I-NOREPRO removes it).
 pub fn verify_digest_report(recs: &[SeedRec], rerun: &[SeedRec]) -> (u64, Vec<u64>) {
     let mut bad_list = Vec::new();
     for (a, b) in recs.iter().zip(rerun.iter()) {
-        if a.seed != b.seed || a.digest != b.digest {
+        let q4i_differs = a.rounds.len() != b.rounds.len()
+            || a.rounds
+                .iter()
+                .zip(b.rounds.iter())
+                .any(|(x, y)| x.q4i != y.q4i);
+        if a.seed != b.seed || a.digest != b.digest || q4i_differs {
             bad_list.push(a.seed);
         }
     }
     (bad_list.len() as u64, bad_list)
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row's floor** —
+/// owner decision of 2026-11-05 (option A; PLAN §10 item 11): ≥ 1,000
+/// crash rounds whose final recovery opens an image whose own window
+/// held an LPID freed after that image's flip and reused before its
+/// table froze. The row counts `q4i` over the campaign's whole 10k.
+pub const Q4I_REQUIRED: u64 = 1_000;
+
+/// **X5-R42:** the Q4-I achieved count over the records — the rounds
+/// whose `q4i` holds.
+pub fn q4i_count(recs: &[SeedRec]) -> u64 {
+    recs.iter()
+        .flat_map(|r| r.rounds.iter())
+        .filter(|x| x.q4i)
+        .count() as u64
+}
+
+/// **X5-R42:** the row's verdict at `achieved` (M-Q4I-NOFLOOR takes the
+/// minimum to 0).
+pub fn q4i_row_ok(achieved: u64) -> bool {
+    achieved >= Q4I_REQUIRED
 }
 
 /// X5-R15 (b): the exit decision, pure and **at the end** — every check
@@ -742,6 +775,25 @@ fn cmd_verify(args: &[String]) -> i32 {
             row.what,
             row.achieved,
             row.required,
+            if ok { "MET" } else { "MISSED" }
+        );
+        if !ok {
+            missed += 1;
+        }
+    }
+    // **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row** — the
+    // owner's option A, judged like every quota row (a miss fails the
+    // exit; `--no-quotas` keeps its exemption). Printed after the 5.6
+    // table; its achieved count is the file's own (the re-run's q4i
+    // already guarded reproduction above).
+    {
+        let achieved = q4i_count(&recs);
+        let ok = q4i_row_ok(achieved);
+        println!(
+            "QUOTA Q4-I {:<62} achieved {:>6} required {:>6} {}",
+            "crash rounds whose opened image's window held a reuse",
+            achieved,
+            Q4I_REQUIRED,
             if ok { "MET" } else { "MISSED" }
         );
         if !ok {
@@ -2250,8 +2302,7 @@ mod tests {
         );
     }
 
-    /// X5-R13 (d)'s pins: `0..10000` is 10,000 seeds; `5..5` is empty,
-    /// which is an error at the command level; the sweep default is the
+    /// X5-R13 (d)'s pins: `0..10000` is 10,000 seeds; `5..5` is empty,    /// which is an error at the command level; the sweep default is the
     /// card's `0..500`; and the dispatch loop's bounds are half-open
     /// (`run_range(0, 3)` runs exactly seeds 0, 1, 2).
     #[test]
@@ -2284,4 +2335,66 @@ mod tests {
             "run_range(0, 3) runs exactly three seeds"
         );
     }
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row's floor.**
+/// ≥ 1,000 crash rounds (owner decision of 2026-11-05, option A);
+/// at 999 the row misses, at 1,000 it meets. **M-Q4I-NOFLOOR** (the
+/// minimum goes to 0) reads 999 as met and fails this pin.
+#[test]
+fn x5_r42_row_at_999_and_1000() {
+    assert_eq!(Q4I_REQUIRED, 1_000, "the owner's floor is 1,000");
+    assert!(
+        !q4i_row_ok(999),
+        "999 achieved is a miss (M-Q4I-NOFLOOR reverts this)"
+    );
+    assert!(q4i_row_ok(1_000), "1,000 achieved meets the row");
+    assert!(!q4i_row_ok(0), "an empty campaign misses the row");
+    // The count reads the rounds' q4i flags, nothing else.
+    let recs = vec![SeedRec {
+        seed: 1,
+        rounds: vec![
+            workload::RoundRec {
+                q4i: true,
+                ..workload::RoundRec::default()
+            },
+            workload::RoundRec::default(),
+        ],
+        ..SeedRec::default()
+    }];
+    assert_eq!(q4i_count(&recs), 1);
+}
+
+/// **X5-R42 (step 6): a flipped `q4i` fails reproduction.** Two
+/// records with identical digests whose rounds differ only in
+/// `q4i`: the seed counts as non-reproducing (the field stays out
+/// of the digest, so the file-versus-re-run comparison is its only
+/// guard). **M-Q4I-NOREPRO** (the comparison removed) fails this
+/// pin.
+#[test]
+fn x5_r42_flipped_q4i_fails_reproduction() {
+    let rec = |q4i: bool| SeedRec {
+        seed: 7,
+        digest: 12345,
+        rounds: vec![workload::RoundRec {
+            q4i,
+            ..workload::RoundRec::default()
+        }],
+        ..SeedRec::default()
+    };
+    let same = (rec(true), rec(true));
+    let (bad, _) = verify_digest_report(&[same.0], &[same.1]);
+    assert_eq!(bad, 0, "identical records reproduce");
+    let flipped = (rec(true), rec(false));
+    let (bad, list) = verify_digest_report(&[flipped.0], &[flipped.1]);
+    assert_eq!(
+        bad, 1,
+        "a flipped q4i must count the seed as non-reproducing (M-Q4I-NOREPRO reverts this)"
+    );
+    assert_eq!(list, vec![7]);
+    // A differing round count is a non-reproduction on the same
+    // rule (the zip cannot compare what is not there).
+    let short = (rec(true), SeedRec::default());
+    let (bad, _) = verify_digest_report(&[short.0], &[short.1]);
+    assert_eq!(bad, 1, "a missing round is a non-reproduction");
 }
