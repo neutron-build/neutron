@@ -62,6 +62,9 @@ function pickImages(multiple = false) {
 
 const imageFiles = (list) => [...list].filter((file) => file.type.startsWith("image/"));
 
+// The visual editor uploads through the same pipeline.
+window.cmsUpload = uploadImage;
+
 const editor = $("[data-editor]");
 if (editor) startEditor(editor);
 
@@ -95,8 +98,15 @@ function startEditor(form) {
     },
   };
 
+  // Words a reader sees: image addresses, link targets and Markdown marks don't count.
   const words = () => {
-    const count = body.value.trim() ? body.value.trim().split(/\s+/).length : 0;
+    const text = body.value
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+      .replace(/\]\([^)]*\)/g, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/[#*_>`~[\]|-]+/g, " ")
+      .trim();
+    const count = text ? text.split(/\s+/).length : 0;
     return `${count.toLocaleString()} ${count === 1 ? "word" : "words"}`;
   };
 
@@ -170,6 +180,7 @@ function startEditor(form) {
   };
   fitAll();
   addEventListener("resize", fitAll);
+  body.addEventListener("cms:resize", () => fit(body));
   document.fonts?.ready.then(fitAll);
 
   title.addEventListener("input", () => {
@@ -223,13 +234,24 @@ function startEditor(form) {
     publish.textContent = future ? "Schedule" : "Publish";
   }
 
+  const markEmpty = () => local.classList.toggle("empty", !local.value);
+  markEmpty();
   local.addEventListener("input", () => {
+    markEmpty();
     syncPublishLabel();
     changed();
   });
   syncPublishLabel();
 
-  form.addEventListener("submit", () => {
+  // Safari silently refuses to send a form with a half-typed date, so say what's wrong instead.
+  form.addEventListener("submit", (event) => {
+    if (local.validity.badInput && event.submitter?.value !== "delete") {
+      event.preventDefault();
+      setMeta(true);
+      local.focus();
+      show("Finish the publish date, or clear it.", true);
+      return;
+    }
     clearTimeout(timer);
     syncDate();
     dirty = false;
@@ -255,6 +277,7 @@ function startEditor(form) {
     $("[data-restore-yes]", banner).addEventListener("click", () => {
       title.value = copy.title;
       body.value = copy.body;
+      body.dispatchEvent(new Event("cms:replaced"));
       fitAll();
       banner.hidden = true;
       changed();
@@ -283,6 +306,10 @@ function startEditor(form) {
   }
 
   async function addImages(files) {
+    if (body.dataset.visual) {
+      body.dispatchEvent(new CustomEvent("cms:images", { detail: files }));
+      return;
+    }
     for (const file of files) {
       const marker = `![Uploading ${file.name || "image"}…]()`;
       const lead = body.selectionStart > 0 && body.value[body.selectionStart - 1] !== "\n" ? "\n\n" : "";
@@ -321,6 +348,7 @@ function startEditor(form) {
   });
   writing.addEventListener("dragleave", () => writing.classList.remove("dropping"));
   writing.addEventListener("drop", (event) => {
+    if (event.defaultPrevented) return writing.classList.remove("dropping");
     event.preventDefault();
     writing.classList.remove("dropping");
     const images = imageFiles(event.dataTransfer.files);
@@ -392,8 +420,25 @@ $$("[data-list]").forEach((form) => {
   let queue = Promise.resolve();
   let dragged = null;
 
+  const discard = $("[data-discard]", form);
+  discard.addEventListener("click", () => {
+    if (!confirm("Discard your changes to this list?")) return;
+    dirty = false;
+    pending = 0;
+    location.reload();
+  });
+
+  addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      if (!pending) form.requestSubmit();
+    }
+  });
+
   function show() {
     save.disabled = pending > 0;
+    discard.hidden = !dirty;
+    form.classList.toggle("dirty", dirty);
     state.classList.toggle("bad", Boolean(problem));
     state.textContent = problem || (pending ? `Uploading, ${pending} left` : dirty ? "Unsaved changes" : state.textContent);
   }

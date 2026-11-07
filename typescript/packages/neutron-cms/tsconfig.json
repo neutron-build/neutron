@@ -29,6 +29,8 @@
     "node_modules",
     "dist",
     "src/admin.client.js",
-    "src/edit.client.js"
+    "src/edit.client.js",
+    "src/editor.client.js",
+    "src/editor/*.js"
   ]
 }

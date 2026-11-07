@@ -67,7 +67,7 @@ export default function Page({ data }) {
 | `cms.text(key)` | One text field |
 | `cms.ready()` | False if the database is missing |
 
-Post bodies are Markdown. `renderMarkdown`, `summarize` and `firstImage` are exported for showing them. Your site chooses the post URLs, so post pages, feeds and sitemaps are ordinary routes.
+Post bodies are Markdown, written in a visual editor: headings, lists, links and images show as they will look, a toolbar appears over selected text, typed Markdown such as `## ` or `**bold**` turns into formatting, and clicking an image asks for its description. The editor reads with the same parser the site renders with and refuses any round trip that would change the page, so HTML and anything else it can't draw stays as an editable source block; a post it can't show exactly opens as Markdown. Settings has a switch to write in Markdown instead. `renderMarkdown`, `summarize` and `firstImage` are exported for showing them. Your site chooses the post URLs, so post pages, feeds and sitemaps are ordinary routes.
 
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 

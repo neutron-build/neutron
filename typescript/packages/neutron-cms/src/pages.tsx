@@ -1,4 +1,5 @@
 import type { ComponentChildren } from "preact";
+import { assetUrl } from "./assets.js";
 import { isPhotoList, TEXT, type ResolvedConfig, type ResolvedField, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import type { Item, Post } from "./store.js";
@@ -8,7 +9,7 @@ export type Status = keyof typeof STATUS_LABEL;
 
 const DATE = new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 
-export function Document(props: { config: ResolvedConfig; title: string; cssVersion: string; children: ComponentChildren }) {
+export function Document(props: { config: ResolvedConfig; title: string; children: ComponentChildren }) {
   return (
     <html lang="en">
       <head>
@@ -17,7 +18,7 @@ export function Document(props: { config: ResolvedConfig; title: string; cssVers
         <meta name="robots" content="noindex" />
         <title>{`${props.title} - Neutron CMS`}</title>
         <link rel="icon" href="data:," />
-        <link rel="stylesheet" href={`${props.config.path}/admin.css?v=${props.cssVersion}`} />
+        <link rel="stylesheet" href={assetUrl(props.config.path, "admin.css")} />
       </head>
       <body>{props.children}</body>
     </html>
@@ -46,7 +47,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
         </form>
       </header>
       {props.children}
-      <script defer src={`${admin}/admin.js`} />
+      <script defer src={assetUrl(admin, "admin.js")} />
     </>
   );
 }
@@ -148,7 +149,7 @@ export function EditorPage(props: {
         )}
       </header>
 
-      <form class="editor" id={FORM} method="post" data-editor={post.id} data-status={status} data-meta-open={error ? "" : undefined}>
+      <form class="editor" id={FORM} method="post" noValidate data-editor={post.id} data-status={status} data-meta-open={error ? "" : undefined}>
         <input type="hidden" name="revision" value={post.updated_at} />
         <input type="hidden" name="date" value={post.published_at ?? ""} />
         {error ? <p class="notice error" role="alert">{error}</p> : null}
@@ -160,7 +161,8 @@ export function EditorPage(props: {
 
         <main class="writing">
           <textarea class="title" name="title" rows={1} placeholder="Add title" aria-label="Title" autofocus={!post.title}>{values.title}</textarea>
-          <textarea class="body" name="body" placeholder="Start writing. Markdown works, and images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
+          <p class="markdown-note" data-markdown-note hidden />
+          <textarea class="body" name="body" placeholder="Start writing in Markdown. Images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
         </main>
         {/* Same origin so the site's images load past its Cross-Origin-Resource-Policy; scripts stay off. */}
         <iframe class="preview" title="Preview" sandbox="allow-same-origin" data-preview hidden />
@@ -184,6 +186,7 @@ export function EditorPage(props: {
             <span>Short label</span>
             <input class="input" name="label" value={values.label} placeholder="Defaults to the title" />
           </label>
+          <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>
           <footer>
             {live && post.slug ? <a href={config.postUrl(post.slug)} target="_blank" rel="noreferrer">View post</a> : null}
             {status === "draft" ? null : (
@@ -193,7 +196,8 @@ export function EditorPage(props: {
           </footer>
         </aside>
       </form>
-      <script defer src={`${admin}/admin.js`} />
+      <script defer src={assetUrl(admin, "admin.js")} />
+      <script defer src={assetUrl(admin, "editor.js")} />
     </>
   );
 }
@@ -221,7 +225,14 @@ function Row(props: { list: ResolvedList; item?: Item }) {
   return (
     <div class={entries.length > 2 ? "item stacked" : "item"}>
       <div class="item-fields">
-        {entries.map(([key, field]) => <Input key={key} name={`f.${key}`} field={field} value={props.item?.[key]} />)}
+        {entries.map(([key, field]) => grid
+          ? <Input key={key} name={`f.${key}`} field={field} value={props.item?.[key]} />
+          : (
+            <label class="field" key={key}>
+              <span>{field.label}</span>
+              <Input name={`f.${key}`} field={field} value={props.item?.[key]} />
+            </label>
+          ))}
       </div>
       <div class="item-tools">
         {sorted ? null : <button class="link" type="button" data-row="up" aria-label="Move earlier">{grid ? "←" : "↑"}</button>}
@@ -261,6 +272,8 @@ export function ListPage(props: {
               ? <button class="button" type="button" data-row="add-photos">Add photos</button>
               : <button class="button" type="button" data-row="add">Add</button>}
             <span class="muted" data-state role="status">{saved ? "Saved" : photos ? "Or drop photos on this page" : ""}</span>
+            <span class="spacer" />
+            <button class="link" type="button" data-discard hidden>Discard changes</button>
           </div>
         </form>
       </main>
@@ -309,8 +322,8 @@ export function EditPage(props: { config: ResolvedConfig }) {
         <button class="button primary" type="button" data-edit-save disabled>Save</button>
       </header>
       <iframe class="edit-frame" title="Your site" src="/" data-edit-frame />
-      <script defer src={`${admin}/admin.js`} />
-      <script defer src={`${admin}/edit.js`} />
+      <script defer src={assetUrl(admin, "admin.js")} />
+      <script defer src={assetUrl(admin, "edit.js")} />
     </>
   );
 }

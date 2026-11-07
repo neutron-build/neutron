@@ -53,7 +53,20 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
+    "esbuild": "^0.28.2",
     "preact": "^10.25.4",
+    "prosemirror-commands": "^1.7.2",
+    "prosemirror-dropcursor": "^1.8.4",
+    "prosemirror-gapcursor": "^1.4.1",
+    "prosemirror-history": "^1.5.1",
+    "prosemirror-inputrules": "^1.5.1",
+    "prosemirror-keymap": "^1.2.3",
+    "prosemirror-markdown": "^1.13.9",
+    "prosemirror-model": "^1.25.12",
+    "prosemirror-schema-list": "^1.6.0",
+    "prosemirror-state": "^1.4.4",
+    "prosemirror-transform": "^1.12.5",
+    "prosemirror-view": "^1.42.9",
     "typescript": "^5.7.2"
   },
   "publishConfig": {

@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
 import type { VNode } from "preact";
 import { render } from "preact-render-to-string";
-import { ADMIN_CSS, ADMIN_JS, EDIT_JS } from "./assets.generated.js";
+import { isAsset, serveAsset } from "./assets.js";
 import {
   clearAttempts, clientAddress, createSession, endSession, hasSession, passwordHash, readLimited, sessionCookie,
   takeAttempt, verifyPassword, withPasswordCheck,
@@ -37,8 +36,6 @@ const SAVE_ERRORS: Record<string, string> = {
   missing: "This post no longer exists.",
 };
 
-/** In the stylesheet's address, so an update can never meet an old copy in a browser's cache. */
-const CSS_VERSION = createHash("sha256").update(ADMIN_CSS).digest("hex").slice(0, 12);
 
 const redirect = (location: string, cookie?: string) =>
   new Response(null, { status: 303, headers: { Location: location, ...(cookie ? { "Set-Cookie": cookie } : {}) } });
@@ -96,7 +93,7 @@ export function createHandler(config: ResolvedConfig) {
   const admin = config.path;
 
   const page = (title: string, body: VNode, status = 200) =>
-    new Response(`<!doctype html>${render(<Document config={config} title={title} cssVersion={CSS_VERSION}>{body}</Document>)}`, {
+    new Response(`<!doctype html>${render(<Document config={config} title={title}>{body}</Document>)}`, {
       status,
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
@@ -316,8 +313,7 @@ export function createHandler(config: ResolvedConfig) {
       endSession(request);
       return redirect(`${admin}/login`, sessionCookie(null, admin));
     }
-    if (first === "admin.js" && !second) return new Response(ADMIN_JS, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
-    if (first === "edit.js" && !second) return new Response(EDIT_JS, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
+    if (isAsset(first) && !second) return serveAsset(first, request);
     if (first === "edit" && !second && !post && config.onPage.length) return page("Edit site", <EditPage config={config} />);
     if (first === "edit" && second === "data" && rest.length === 0 && !post) return editData();
     if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
@@ -335,12 +331,7 @@ export function createHandler(config: ResolvedConfig) {
 
     // The only things a visitor may fetch.
     if (!unsafe && segments[0] === "media" && segments.length === 2) return serveImage(segments[1]);
-    if (!unsafe && segments[0] === "admin.css" && segments.length === 1) {
-      const current = new URL(request.url).searchParams.get("v") === CSS_VERSION;
-      return new Response(ADMIN_CSS, {
-        headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": current ? "public, max-age=31536000, immutable" : "no-store" },
-      });
-    }
+    if (!unsafe && segments[0] === "admin.css" && segments.length === 1) return serveAsset("admin.css", request);
 
     if (unsafe && !isSameOrigin(request)) return new Response("Forbidden", { status: 403 });
 
@@ -353,7 +344,8 @@ export function createHandler(config: ResolvedConfig) {
 
     const response = await route(request, segments);
     const headers = new Headers(response.headers);
-    headers.set("Cache-Control", "no-store");
+    // Versioned scripts say how long they keep; everything else behind the login is never stored.
+    if (!isAsset(segments[0]) || segments.length !== 1) headers.set("Cache-Control", "no-store");
     headers.set("Content-Security-Policy", CSP);
     headers.set("X-Robots-Tag", "noindex");
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers });

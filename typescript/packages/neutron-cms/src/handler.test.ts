@@ -235,7 +235,7 @@ test("the admin can live at another path", async () => {
   const cookie = await logIn();
   const page = await (await moved.GET({ request: new Request(`${SITE}/edit`, { headers: { cookie } }) })).text();
   assert.match(page, /href="\/edit\/admin\.css\?v=[a-f0-9]{12}"/);
-  assert.match(page, /src="\/edit\/admin\.js"/);
+  assert.match(page, /src="\/edit\/admin\.js\?v=[a-f0-9]{12}"/);
   assert.match(await moved.GET({ request: new Request(`${SITE}/edit`) }).then((r) => r.headers.get("location")!), /^\/edit\/login$/);
 });
 
@@ -260,7 +260,7 @@ test("the editor page, script and data are there once signed in", async () => {
   const cookie = await logIn();
   const page = await (await call("/n-admin/edit", { cookie })).text();
   assert.match(page, /data-edit-frame/);
-  assert.match(page, /src="\/n-admin\/edit\.js"/);
+  assert.match(page, /src="\/n-admin\/edit\.js\?v=[a-f0-9]{12}"/);
   assert.match(await (await call("/n-admin/edit.js", { cookie })).text(), /data-edit-save/);
   const data = await (await call("/n-admin/edit/data", { cookie })).json();
   assert.equal(data.lists.links.fields.url.type, "url");
@@ -440,4 +440,17 @@ test("the preview resolves the site's own image paths", async () => {
   assert.match(sized, /srcset="https:\/\/site\.test\/media\/a-2000x1000-t\.webp 800w, https:\/\/site\.test\/media\/a-2000x1000\.webp 2000w"/);
   assert.match(sized, /href="https:\/\/site\.test\/about\/"/);
   assert.match(sized, /href="https:\/\/other\.test\/z"/);
+});
+
+test("admin scripts are versioned, cached only when current, and kept behind the login", async () => {
+  const cookie = await logIn();
+  const created = await call("/n-admin", { method: "POST", cookie });
+  const editor = await (await call(created.headers.get("location")!, { cookie })).text();
+  const src = editor.match(/src="(\/n-admin\/editor\.js\?v=[a-f0-9]{12})"/)![1];
+  const current = await call(src, { cookie });
+  assert.equal(current.headers.get("cache-control"), "private, max-age=31536000, immutable");
+  assert.match(await current.text(), /cmsUpload/);
+  assert.equal((await call("/n-admin/editor.js?v=old", { cookie })).headers.get("cache-control"), "no-store");
+  assert.equal((await call(src)).status, 303);
+  assert.match(editor, /data-toggle-markdown/);
 });
