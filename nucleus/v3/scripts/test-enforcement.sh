@@ -4452,6 +4452,31 @@ expect_ok "runner e2e: R9: the symref plant refuses the run before worktree add 
   res XN2 "rc == 1 and not r.get('pass') and 'symbolic ref refs/heads/card/v3-XN2 -> refs/heads/nucleus/v3-scaffold' in out and 'not starting' in out and 'attempt 1:' not in out and L == [] and not os.path.exists('$e/wt/XN2') and $r9sc_at == '$r9sc'"
 git -C "$r" update-ref --no-deref -d refs/heads/card/v3-XN2
 git -C "$r" update-ref -d refs/heads/card/v3-XNSTACK
+# R10 (final): the same plant as a filesystem symlink. for-each-ref never
+# lists a symlink named as a ref (its directory walk stats the entry and
+# fails), so the R9 scan was blind to this form — git still resolves one by
+# readlink and follows it on read and write, and the gate measured (r10) the
+# operator's next stacked `worktree add -B` moving the scaffold through a
+# link planted in refs/heads/card before that run's own startup gate fired.
+# The same checks now walk refs/heads on disk (and lstat the worktree's
+# HEAD), so the link is refused at the same place the symref file is:
+# before worktree add -B, nothing cleared, scaffold untouched.
+mkdir -p "$r/.git/refs/heads/card"
+ln -s refs/heads/nucleus/v3-scaffold "$r/.git/refs/heads/card/v3-XN7"
+git -C "$r" branch card/v3-XNSTACK "$r9tip"
+printf '# CARD XN7: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: card/v3-XNSTACK        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `true`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' >"$e/cards/XN7.local.md"
+rm -f "$e/XN7.n"
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XN7.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/XN7" "$e/cards/XN7.local.md" --base card/v3-XNSTACK --attempts 1) || true
+expect_ok "runner e2e: R10: a symlink under refs/heads refuses the run before worktree add -B, and the scaffold stays put" \
+  res XN7 "rc == 1 and not r.get('pass') and 'symlink refs/heads/card/v3-XN7 -> refs/heads/nucleus/v3-scaffold' in out and 'not starting' in out and 'attempt 1:' not in out and L == [] and not os.path.exists('$e/wt/XN7') and $r9sc_at == '$r9sc'"
+# The refused plant is cleaned by hand, as the operator's would be (the link
+# survives the write-through it was refused for, so it goes first), and the
+# scaffold restore is for the mutant run of this row, where worktree add -B
+# did go through before the startup gate: the honest run changes nothing.
+rm -f "$r/.git/refs/heads/card/v3-XN7"
+git -C "$r" update-ref refs/heads/nucleus/v3-scaffold "$r9sc"
+git -C "$r" update-ref -d refs/heads/card/v3-XNSTACK
+git -C "$r" worktree remove --force "$e/wt/XN7" >/dev/null 2>&1 || true
 # The plant made mid-run: the run that wrote it fails its own checks (the
 # per-attempt refs_moved names the symref and stops), the honest commit still
 # lands, and the scaffold stays.

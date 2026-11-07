@@ -57,7 +57,9 @@ post-checkout hook and a repointed .git file in this runner's own git, outside e
 objects, refs/heads/card and logs stay writable now — a commit still lands, and no ref outside the
 card branches' directory can be written from inside (rework R7) — but a file in the writable paths can
 still be a symbolic ref: inside git it goes nowhere a plain ref could not, while outside git writes
-through it, so any symref under refs/heads, and any worktree HEAD that is not the card branch, is
+through it, so any symref under refs/heads — a symlink named as a ref included, which for-each-ref
+never lists but git resolves and follows the same way (rework R10) — and any worktree HEAD that is
+not the card branch, or is itself a symlink, is
 refused before every outside git call of this runner that could follow one — worktree add -B at the
 start included, and again after every attempt and at the final check, which fails the run (rework
 R9) — and the worktree's .git gitfile,
@@ -92,7 +94,9 @@ the scaffold's and refs/heads/main included, is read-only inside (rework R7: a w
 worker fast-forward nucleus/v3-scaffold to its own commit-tree commit, pass, and point the next
 gate's fresh-checkout extract at its script, so the allow-list names the card branches' directory,
 not refs/), and a symbolic ref planted in the writable card/ directory, or in the worktree's own
-HEAD, reaches no protected ref through this runner either: symref_problems and head_symref_problem
+HEAD — the symlink form included: for-each-ref never lists one, but git follows it on read and
+write, so the ref store is also walked on disk and a symlink of the worktree's HEAD file itself is
+refused too (rework R10) — reaches no protected ref through this runner either: symref_problems and head_symref_problem
 refuse both before any outside git call that could follow one — at the start, before worktree add
 -B, which the verdict measured writing the scaffold through such a plant; after every attempt; at
 the final check, which fails the run; and before the end record's read of HEAD (rework R9; the
@@ -1200,7 +1204,13 @@ def symref_problems(wt):
     -B` before the run's ref snapshot was taken. So main() refuses before that
     call, the startup gate and every refs_moved check refuse again (a plant
     that appears mid-run never reaches the next outside git call that could
-    follow it), and a failed listing is one line, never a silent []."""
+    follow it), and a failed listing is one line, never a silent [].
+    R10 adds the symlink form: this listing never reports a filesystem
+    symlink named as a ref (the ref walk stats the entry and fails), while
+    git resolves one by readlink and follows it on read and write — the
+    measured `worktree add -B` moved the scaffold through a link planted in
+    refs/heads/card — so the same checks also walk refs/heads on disk and
+    refuse any symlink under it, the directory itself included."""
     cmd = [GIT, "for-each-ref", "--format=%(refname)%00%(symref)", "refs/heads"]
     p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
     if p.returncode != 0:
@@ -1211,6 +1221,26 @@ def symref_problems(wt):
         name, _, sym = l.partition("\0")
         if name and sym:
             out.append(f"symbolic ref {name} -> {sym} (a write made through it by outside git would land on {sym}; verdict X-6-F1-F1-F2-F1-F2 R9)")
+    # R10: the listing above is blind to the symlink form, so the ref store is
+    # also walked on disk. A git that cannot name its own common dir, or a walk
+    # that cannot read it, is one line, never a silent pass; a refs/heads that
+    # is not there at all is every ref packed, with nothing under it to walk.
+    cmd = [GIT, "rev-parse", "--path-format=absolute", "--git-common-dir"]
+    p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True)
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
+        return [f"{' '.join(cmd)} failed (exit {p.returncode}): {why} (cannot walk refs/heads for symlinks)"]
+    heads = os.path.join(p.stdout.strip(), "refs", "heads")
+    if os.path.islink(heads):
+        out.append(f"symlink refs/heads -> {os.readlink(heads)} (for-each-ref does not list it; every loose branch ref would be read and written through it; verdict X-6-F1-F1-F2-F1-F2 R10)")
+    elif os.path.lexists(heads):
+        errs = []
+        for dirpath, dirnames, filenames in os.walk(heads, onerror=errs.append):
+            for n in sorted(dirnames + filenames):
+                path = os.path.join(dirpath, n)
+                if os.path.islink(path):
+                    out.append(f"symlink refs/heads/{os.path.relpath(path, heads)} -> {os.readlink(path)} (for-each-ref does not list it; a write made through it by outside git would land on its target; verdict X-6-F1-F1-F2-F1-F2 R10)")
+        out.extend(f"cannot walk refs/heads for symlinks ({e})" for e in errs)
     return out
 
 
@@ -1229,7 +1259,25 @@ def head_symref_problem(wt, branch):
     refs_moved check, and the end record's read — and the gate's own commit
     needs its own check, which is the orchestrator's to add (outside Touch
     only, per the verdict). A detached HEAD, or a git that cannot answer, is
-    refused the same way: the branch is never assumed."""
+    refused the same way: the branch is never assumed.
+    R10 adds the symlink form: the HEAD file itself can be a symlink (the
+    gitdir is writable inside), and one whose readlink text names exactly
+    the card branch is the shape the symbolic-ref check alone would accept —
+    every read and write of the file goes through the link, so one is
+    refused before symbolic-ref reads through it."""
+    # R10: the HEAD file itself can be a symlink, and one whose readlink text
+    # names exactly the card branch is the shape the symbolic-ref check below
+    # would accept — every read and write of the file goes through the link.
+    # (--git-dir is pure path arithmetic; --git-path HEAD is not: it resolves
+    # HEAD as a ref and returns the target's path, past the symlink to judge.)
+    cmd = [GIT, "rev-parse", "--path-format=absolute", "--git-dir"]
+    p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True)
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
+        return [f"{' '.join(cmd)} failed (exit {p.returncode}): {why} (cannot check the worktree's HEAD for a symlink)"]
+    head_path = os.path.join(p.stdout.strip(), "HEAD")
+    if os.path.islink(head_path):
+        return [f"the worktree's HEAD is a symlink -> {os.readlink(head_path)} (every outside read and write of HEAD would go through it onto its target; verdict X-6-F1-F1-F2-F1-F2 R10)"]
     want = f"refs/heads/{branch}"
     p = subprocess.run([GIT, "symbolic-ref", "HEAD"], cwd=wt, env=git_env(), capture_output=True, text=True)
     if p.returncode == 0:
