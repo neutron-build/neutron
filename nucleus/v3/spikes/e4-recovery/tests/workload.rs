@@ -119,6 +119,14 @@ fn smoke_16_seeds() {
 /// 2372375821`, back to 1b0ce54e's own value) and 7469
 /// (`3658720859 -> 1670717970`) — each value below is this tip's own
 /// measurement, the literals re-derived once (rework step 4).
+///
+/// **X-5c-F4-F1-F1-CXX-F1 (X5-R48, step 6):** the joint re-pair moved
+/// 7469 alone (`1670717970 -> 1393729414`, the gate trial's value —
+/// the re-paired twin now fires at the joint spec `Mid2@4` and the
+/// seed gains its round 2 back). The 54 seeds re-run singly at this
+/// tip moved nothing else, and the contiguous 0..200 moved no digest
+/// and changed no record (the failing rounds stay the known 8/178
+/// pair, `DEFECT_SEEDS=0`).
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
     const WANT: &[(u64, u64)] = &[
@@ -172,7 +180,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (5549, 308297210),
         (5808, 2754578359),
         (6149, 123186068),
-        (7469, 1670717970),
+        (7469, 1393729414),
         (7528, 122281874),
         (8728, 3345856243),
         (9809, 1177349546),
