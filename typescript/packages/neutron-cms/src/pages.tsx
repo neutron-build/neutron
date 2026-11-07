@@ -54,7 +54,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; extraScript?: s
 export function NotFoundPage(props: { config: ResolvedConfig }) {
   return (
     <Shell config={props.config}>
-      <main class="page"><p>Not found.</p></main>
+      <main class="page"><p class="muted">Not found.</p></main>
     </Shell>
   );
 }
@@ -94,7 +94,7 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[] }) {
         <div class="page-head">
           <h1>Posts</h1>
           <form method="post" action={admin}>
-            <button class="button" type="submit">New post</button>
+            <button class="button primary" type="submit">New post</button>
           </form>
         </div>
         {props.posts.length === 0 ? (
@@ -128,9 +128,25 @@ export function EditorPage(props: {
   const { config, post, status, saved, error } = props;
   const values = { ...post, ...props.fields };
   const live = status === "live";
+  const admin = config.path;
+  const FORM = "post-form";
   return (
-    <Shell config={config} active="posts">
-      <form class="editor" method="post" data-editor={post.id} data-status={status}>
+    <>
+      <header class="top editor-top">
+        <a class="back" href={admin}>{"\u2190"} Posts</a>
+        <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
+        <span class="spacer" />
+        <button class="button quiet" type="button" data-add-image>Add image</button>
+        <button class="button quiet" type="button" data-toggle-meta aria-pressed="true">Settings</button>
+        <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>
+        {status === "draft" ? (
+          <button class="button primary" type="submit" form={FORM} name="intent" value="publish" data-publish>Publish</button>
+        ) : (
+          <button class="button primary" type="submit" form={FORM} name="intent" value="save" data-save>Update</button>
+        )}
+      </header>
+
+      <form class="editor" id={FORM} method="post" data-editor={post.id} data-status={status}>
         <input type="hidden" name="revision" value={post.updated_at} />
         <input type="hidden" name="date" value={post.published_at ?? ""} />
         {error ? <p class="notice error" role="alert">{error}</p> : null}
@@ -141,32 +157,22 @@ export function EditorPage(props: {
         </div>
 
         <main class="writing">
-          <textarea class="title" name="title" rows={1} placeholder="Title" aria-label="Title" autofocus={!post.title}>{values.title}</textarea>
-          <textarea class="body" name="body" aria-label="Body">{values.body}</textarea>
+          <textarea class="title" name="title" rows={1} placeholder="Add title" aria-label="Title" autofocus={!post.title}>{values.title}</textarea>
+          <textarea class="body" name="body" placeholder="Start writing. Markdown works, and images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
         </main>
         <iframe class="preview" title="Preview" sandbox="" data-preview hidden />
 
-        <div class="actions">
-          <div>
-            <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
-            <div class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</div>
-          </div>
-          <div class="row-of">
-            {status === "draft" ? (
-              <button class="button primary" type="submit" name="intent" value="publish" data-publish>Publish</button>
-            ) : (
-              <button class="button primary" type="submit" name="intent" value="save" data-save>Update</button>
-            )}
-            <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>
-            <button class="button" type="button" data-add-image>Add image</button>
-          </div>
-        </div>
-
-        <div class="meta">
+        <aside class="meta" aria-label="Post settings">
+          <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
           <label class="field">
             <span>URL</span>
             <input class="input" name="slug" value={values.slug ?? ""} disabled={live} placeholder="from-the-title" spellcheck={false} autocapitalize="off" />
             {live ? <small>Fixed while live, so links keep working. Unpublish to change it.</small> : null}
+          </label>
+          <label class="field">
+            <span>{status === "draft" ? "Publish on" : "Published on"}</span>
+            <input class="input" type="datetime-local" name="date_local" value={post.published_at?.slice(0, 16) ?? ""} />
+            {status === "draft" ? <small>Empty publishes now. A future date schedules it.</small> : null}
           </label>
           <label class="field">
             <span>Description</span>
@@ -176,11 +182,6 @@ export function EditorPage(props: {
             <span>Short label</span>
             <input class="input" name="label" value={values.label} placeholder="Defaults to the title" />
           </label>
-          <label class="field">
-            <span>{status === "draft" ? "Publish on" : "Published on"}</span>
-            <input class="input" type="datetime-local" name="date_local" value={post.published_at?.slice(0, 16) ?? ""} />
-            {status === "draft" ? <small>Empty publishes now. A future date schedules it.</small> : null}
-          </label>
           <footer>
             {live && post.slug ? <a href={config.postUrl(post.slug)} target="_blank" rel="noreferrer">View post</a> : null}
             {status === "draft" ? null : (
@@ -188,9 +189,10 @@ export function EditorPage(props: {
             )}
             <button class="link" type="submit" name="intent" value="delete" data-confirm="Delete this post?" formnovalidate>Delete</button>
           </footer>
-        </div>
+        </aside>
       </form>
-    </Shell>
+      <script defer src={`${admin}/admin.js`} />
+    </>
   );
 }
 

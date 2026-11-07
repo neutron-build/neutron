@@ -155,8 +155,51 @@ function startEditor(form) {
     schedule();
   }
 
-  title.addEventListener("input", changed);
-  body.addEventListener("input", changed);
+  // Where the browser can't size a textarea to its text, do it here, or long text would be cut off.
+  const fits = CSS.supports("field-sizing", "content");
+  function fit(area) {
+    if (fits) return;
+    const scroll = scrollY;
+    area.style.height = "auto";
+    area.style.height = `${area.scrollHeight}px`;
+    scrollTo(0, scroll);
+  }
+  const fitAll = () => {
+    fit(title);
+    fit(body);
+  };
+  fitAll();
+  addEventListener("resize", fitAll);
+  document.fonts?.ready.then(fitAll);
+
+  title.addEventListener("input", () => {
+    fit(title);
+    changed();
+  });
+  body.addEventListener("input", () => {
+    fit(body);
+    changed();
+  });
+
+  // The sidebar stays how it was left.
+
+  const metaToggle = $("[data-toggle-meta]");
+  const META_KEY = "n-admin:meta-closed";
+  function setMeta(closed) {
+    form.toggleAttribute("data-meta-closed", closed);
+    metaToggle.setAttribute("aria-pressed", String(!closed));
+  }
+  try {
+    if (innerWidth > 1000) setMeta(localStorage.getItem(META_KEY) === "1");
+  } catch {}
+  metaToggle.addEventListener("click", () => {
+    const closed = !form.hasAttribute("data-meta-closed");
+    setMeta(closed);
+    try {
+      localStorage.setItem(META_KEY, closed ? "1" : "0");
+    } catch {}
+    fitAll();
+  });
   $$("[name=description], [name=slug]").forEach((field) => field.addEventListener("input", changed));
 
   if (slug && !slug.disabled) {
@@ -214,6 +257,7 @@ function startEditor(form) {
     $("[data-restore-yes]", banner).addEventListener("click", () => {
       title.value = copy.title;
       body.value = copy.body;
+      fitAll();
       banner.hidden = true;
       changed();
     });
@@ -248,6 +292,7 @@ function startEditor(form) {
       try {
         const { url } = await uploadImage(file);
         body.value = body.value.replace(marker, `![](${url})`);
+        fit(body);
         changed();
       } catch (error) {
         body.value = body.value.replace(`${marker}\n\n`, "");
@@ -327,6 +372,7 @@ function startEditor(form) {
     writing.hidden = opening;
     button.textContent = opening ? "Edit" : "Preview";
     button.setAttribute("aria-pressed", String(opening));
+    if (!opening) fitAll();
   });
 
   show(words());
