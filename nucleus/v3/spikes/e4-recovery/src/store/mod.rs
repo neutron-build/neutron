@@ -139,6 +139,26 @@ pub enum Mutant {
     /// is `open`'s call to [`page::select_meta`]; amcheck, the monitors
     /// and the harness walks keep the check unconditionally.
     MetaWrongSlot,
+    /// **X5-R43 (card X-5c-F4-F1-F1-F3 step 7; the verdict's seeded
+    /// Joint fault, owner decision of 2026-11-05 — `M-REUSE-DROPS-IMG`):
+    /// `alloc_lpid`'s reuse removes `map.img[l]`.** A window reuse hands
+    /// out an LPID the image being built still maps; the fault drops
+    /// that image entry, so the finished image leaves the page unmapped
+    /// (the freed LPID's `cur` is gone) and the page's content is lost
+    /// from image k — the one true SMO-against-SMO interaction §4.2's
+    /// immediate reuse admits. Inert when `cfg.mutant` is `None`; the
+    /// single site is `alloc_lpid`'s reuse branch.
+    ReuseDropsImg,
+    /// **X5-R43 (the verdict's seeded Slot fault, I-FREE-SAFE's shape —
+    /// `M-FREE-HOME-ALLOC`): `free_lpid` removes the freed LPID's
+    /// durable home from `used_durable` and `image_refs`.** The slot
+    /// then looks unreferenced by the durable image, so a later
+    /// `unpin_home` (an eviction or step-2 adopt) releases it from
+    /// `used_cur` and `alloc_slot` hands it out while meta k−1 still
+    /// references it — a crash before meta k is durable opens image
+    /// k−1 over the wrong bytes. Inert when `cfg.mutant` is `None`; the
+    /// single site is `free_lpid`'s home-release.
+    FreeHomeAlloc,
 }
 
 /// Store configuration (card 3.3–3.4 with the Work 12 amendment, 4.1).
@@ -457,6 +477,14 @@ pub struct StoreInner {
     pub ckpt_splits: u64,
     /// Merges inside the open checkpoint window (Q4).
     pub ckpt_merges: u64,
+    /// **X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 step 2; a store
+    /// observable, never a behaviour input): `alloc_lpid` reuses inside
+    /// the open checkpoint window that handed out an LPID freed since
+    /// this flip** — a reuse during the flip window of an LPID the image
+    /// being built still maps (`map.img` holds it), reset at each
+    /// `ckpt:begin` exactly like `ckpt_splits`/`ckpt_merges`. The Q4
+    /// reuse half (`q4reuse`) and Q4-I's arm read it.
+    pub ckpt_reuse: u64,
     /// R_EPOCH exhaustion count (Q10).
     pub epoch_exhausted: u64,
     /// The free-set serialisation grew the file (Q17).
@@ -607,6 +635,7 @@ impl StoreInner {
             ckpt_open: false,
             ckpt_splits: 0,
             ckpt_merges: 0,
+            ckpt_reuse: 0,
             epoch_exhausted: 0,
             freeset_grew: false,
             stale_seg_reads: 0,

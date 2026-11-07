@@ -1418,7 +1418,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"q4sp\":{},\"q4mg\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"q4sp\":{},\"q4mg\":{},\"q4ru\":{},\"imgsp\":{},\"imgmg\":{},\"imgru\":{},\"q4ir\":{},\"q4i\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1471,6 +1471,12 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 u8::from(x.szc),
                 x.q4sp,
                 x.q4mg,
+                x.q4reuse,
+                x.imgsp,
+                x.imgmg,
+                x.imgreuse,
+                u8::from(x.q4i_raw),
+                u8::from(x.q4i),
                 u8::from(x.q4_split_merge),
                 u8::from(x.q5_open),
                 u8::from(x.q5_marked),
@@ -1929,6 +1935,33 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "q4mg" => {
                 // The same for merges.
                 x.q4mg = j.int()?;
+            }
+            "q4ru" => {
+                // X5-R41 (X-5c-F4-F1-F1-F3 step 2): the reuse half in
+                // the crash's window. Absent in older files (default 0).
+                x.q4reuse = j.int()?;
+            }
+            "imgsp" => {
+                // X5-R41/R42: the completed-window arm (the last
+                // checkpoint whose step 5 returned).
+                x.imgsp = j.int()?;
+            }
+            "imgmg" => {
+                x.imgmg = j.int()?;
+            }
+            "imgru" => {
+                x.imgreuse = j.int()?;
+            }
+            "q4ir" => {
+                // X5-R42: the opened image's own window held a reuse.
+                x.q4i_raw = j.int()? != 0;
+            }
+            "q4i" => {
+                // X5-R42: the Q4-I row's per-round predicate. Compared
+                // per round between the file and the re-run by `verify`
+                // (a mismatch counts the seed as non-reproducing),
+                // never a digest input.
+                x.q4i = j.int()? != 0;
             }
             "cwin" => {
                 // X5-R38: the window pick of record ("u" = the plain

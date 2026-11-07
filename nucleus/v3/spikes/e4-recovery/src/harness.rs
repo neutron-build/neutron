@@ -297,6 +297,16 @@ pub struct HarnessState {
     /// **X5-R41:** the alignment block completed (set by
     /// [`ScriptOp::R41Done`]; releases the hold, sticky for the round).
     pub r41_done: bool,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-checkpoint
+    /// window ledger** — one `(ckpt_id, splits, merges, reuses)` row per
+    /// checkpoint whose step 5 returned, appended at the checkpointer's
+    /// `After5` hook (the counters still hold that window's counts; the
+    /// next `ckpt:begin` resets them). The driver carries the rows for
+    /// the whole seed keyed by `ckpt_id`, so a round's final recovery
+    /// reads the opened image's **own** window however far the round
+    /// rolled back. The harness checkpoint's window is never here (it
+    /// runs through a no-op hook closure, in its own world).
+    pub ckpt_windows: Vec<(u64, u64, u64, u64)>,
     /// The last checkpoint hook the checkpointer passed (0 = none): a
     /// small position code for the Q4 window (1 = Before0 … 6 = After3;
     /// 7+ are later hooks). Maintained by the checkpointer's hook
@@ -1566,6 +1576,25 @@ fn checkpointer_body(
                     }
                     Ok(())
                 });
+                // **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the window
+                // ledger row.** Step 5 just resolved — `st.k` is this
+                // checkpoint's id and the counters still hold its
+                // window's counts (the next `ckpt:begin` resets them,
+                // `ckpt:post5` having cleared the flip window so
+                // nothing further accrues). Recorded for the driver's
+                // per-seed ledger; `imgsp`/`imgmg`/`imgreuse` (the
+                // record's fields) are the last row at the crash-time
+                // snapshot.
+                if hook == CkptHook::After5 {
+                    let _ = cx.with("h:r41win5", |c| {
+                        let (k, sp, mg, ru) = {
+                            let st = c.store();
+                            (st.k, st.ckpt_splits, st.ckpt_merges, st.ckpt_reuse)
+                        };
+                        c.h().ckpt_windows.push((k, sp, mg, ru));
+                        Ok(())
+                    });
+                }
                 // **X5-R41 (card X-5c-F4-F1-F1-F3 step 1): the hold.**
                 // At `After0` of the armed checkpoint — after the flip
                 // released the epoch gate, before any later step — set
@@ -1765,6 +1794,18 @@ pub struct RoundOutcome {
     pub crashed_disk: SimDisk,
     /// The recovered store's state (for the next round).
     pub end_store: Option<StoreInner>,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the `ckpt_id` of the
+    /// meta the round's final recovery opened** (`None` on every `Err`
+    /// arm — no image was opened). The driver's `q4i_raw` lookup keys on
+    /// it, never on "the last checkpoint": a meta rollback reads the
+    /// older image's own window.
+    pub opened_ckpt_id: Option<u64>,
+    /// **X5-R42:** the `ckpt_id` the round's harness checkpoint wrote
+    /// (`Some` only when that checkpoint completed; the opened id + 1).
+    /// The driver removes it from the per-seed ledger — that meta is the
+    /// harness checkpoint's, whose window is not recorded ("the harness
+    /// checkpoint's windows are not recorded").
+    pub harness_ckpt_id: Option<u64>,
     /// The truncation cut for the model (`c`).
     pub cut: u64,
     /// Whether the round was judged class C / MP / MW (for the record).
@@ -1920,6 +1961,8 @@ impl Default for RoundOutcome {
             end_disk: SimDisk::new(),
             crashed_disk: SimDisk::new(),
             end_store: None,
+            opened_ckpt_id: None,
+            harness_ckpt_id: None,
             cut: 0,
             class: FaultClass::C,
             deadlock: false,
@@ -2097,6 +2140,16 @@ pub struct WorkloadObs {
     pub splits: u64,
     /// Merges inside the open checkpoint window (Q4).
     pub merges: u64,
+    /// **X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 step 2): window reuses**
+    /// (`alloc_lpid` handing out an LPID freed since this flip), the
+    /// reuse companion of `splits`/`merges` (the store's `ckpt_reuse`).
+    pub reuses: u64,
+    /// **X5-R42:** the window ledger as of the crash — one
+    /// `(ckpt_id, splits, merges, reuses)` row per checkpoint of this
+    /// workload pass whose step 5 returned before the tasks ended. The
+    /// record's `imgsp`/`imgmg`/`imgreuse` are the last row; the driver
+    /// merges the rows into its per-seed ledger for `q4i_raw`.
+    pub ckpt_windows: Vec<(u64, u64, u64, u64)>,
     /// R_EPOCH exhaustion count (Q10).
     pub epoch_exhausted: u64,
     /// The free-set serialisation grew the file (Q17).
@@ -2473,6 +2526,8 @@ pub fn run_round(
             crash_fired: g.sched.crashed,
             splits: st.ckpt_splits,
             merges: st.ckpt_merges,
+            reuses: st.ckpt_reuse,
+            ckpt_windows: g.h.ckpt_windows.clone(),
             epoch_exhausted: st.epoch_exhausted,
             freeset_grew: st.freeset_grew,
             stale_seg_reads: st.stale_seg_reads,
@@ -3311,6 +3366,9 @@ pub fn run_round(
             let (opened_meta, _opened_xx) = read_opened_meta(&end_disk);
             let opened_t = opened_meta.as_ref().map(|m| m.t).unwrap_or(0);
             let gc_w = opened_meta.as_ref().map(|m| m.gc_w).unwrap_or(0);
+            // X5-R42 (step 2): the opened meta's own ckpt_id — the
+            // `q4i_raw` lookup key.
+            outcome.opened_ckpt_id = opened_meta.as_ref().map(|m| m.ckpt_id);
             // **X5-R36 (e): the round's `reuse_on_dropping`** — the
             // opened image's directory (durable bytes) beside the
             // model's `CreateTree` replay window `(T, frontier]`. The
@@ -3760,6 +3818,14 @@ pub fn run_round(
                 let g = world.lock();
                 (g.disk.clone(), g.st.clone())
             };
+            // X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the harness
+            // checkpoint's own id — `Some` only when it completed (its
+            // post5 advanced `st.k` to it), so the driver can drop that
+            // id's ledger row (the harness checkpoint's windows are not
+            // recorded).
+            if ck.is_ok() {
+                outcome.harness_ckpt_id = Some(end_store.k);
+            }
             // X5-R29 (a): the subtree-fallout reading's evidence, on
             // this round's end disk (stderr only, never a digest
             // input).

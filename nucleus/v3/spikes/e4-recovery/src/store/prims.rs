@@ -373,6 +373,23 @@ pub fn alloc_lpid<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
         let st = c.store();
         if let Some(l) = st.slots.free_lpids.iter().next().copied() {
             st.slots.free_lpids.remove(&l);
+            // **X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 steps 2/7): a
+            // window reuse of an LPID freed since this flip.** During a
+            // flip window, `map.img` holds every LPID first-touched
+            // since the flip began — a free-set entry that is in it was
+            // freed inside this window, so handing it out reuses an
+            // LPID the image being built still maps. Counted as a store
+            // observable (`ckpt_reuse`, reset per window like
+            // `ckpt_splits`); never a behaviour input. M-REUSE-DROPS-IMG
+            // (X5-R43's Joint fault) drops the image entry here.
+            if st.flip_window && st.map.img.contains_key(&l) {
+                if st.ckpt_open {
+                    st.ckpt_reuse += 1;
+                }
+                if matches!(st.cfg.mutant, Some(Mutant::ReuseDropsImg)) {
+                    st.map.img.remove(&l);
+                }
+            }
             // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr only,
             // never a digest input): a free-set reuse whose lpid the
             // current map still references (P's lead (i): an allocation
@@ -459,6 +476,18 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
                 f.pins = 0;
                 f.evicting = false;
             }
+        }
+        // **X5-R43 (card X-5c-F4-F1-F1-F3 step 7; M-FREE-HOME-ALLOC,
+        // I-FREE-SAFE's shape): the freed LPID's durable home leaves
+        // `used_durable` and `image_refs`**, so a later `unpin_home`
+        // releases it from `used_cur` and `alloc_slot` can hand it out
+        // while meta k−1 still references it. Inert when `cfg.mutant`
+        // is `None`. The home is read **before** the map drops the LPID.
+        if matches!(st.cfg.mutant, Some(Mutant::FreeHomeAlloc))
+            && let Some(r) = st.map.cur.get(&lpid).copied()
+        {
+            st.slots.used_durable.remove(&r.slot);
+            st.slots.image_refs.remove(&r.slot);
         }
         st.map.cur.remove(&lpid);
         // S-STORE §4.2/§4.3 (card X-5c-F3, class C-XX): a freed LPID

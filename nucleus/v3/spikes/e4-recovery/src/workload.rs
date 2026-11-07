@@ -1051,8 +1051,28 @@ pub fn r41_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
     Some(r.below(1000) < tun.r41_share)
 }
 
-/// A round whose crash spec never fired is a **harness defect** (5.5
-/// step 2: every round crashes). A silent no-crash round would leave
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): `q4i_raw`** — did the
+/// window of the checkpoint whose meta the final recovery opened hold a
+/// reuse? Pure in the per-seed ledger (`ckpt_id → (splits, merges,
+/// reuses)`, last write wins: the row for an id is always the most
+/// recent checkpoint with that id, which is exactly the checkpoint whose
+/// meta bytes sit in that id's slot) and the opened meta's `ckpt_id`.
+/// `None` (a refused or failed open — no opened meta) or a missing row
+/// (the harness checkpoint's id, never recorded) is false.
+pub fn q4i_raw_of(windows: &BTreeMap<u64, (u64, u64, u64)>, opened_ckpt_id: Option<u64>) -> bool {
+    opened_ckpt_id.is_some_and(|k| windows.get(&k).is_some_and(|w| w.2 >= 1))
+}
+
+/// **X5-R42: `q4i`** — the Q4-I row's per-round predicate:
+/// `q4i_raw` ∧ the round's own crash fired ∧ Q18's `end.is_some()`
+/// (excluded like SIZING: nested recovery crashes — only the final
+/// recovery's opened meta is read — the harness checkpoint, and refused
+/// or failed opens).
+pub fn q4i_of(q4i_raw: bool, fired: bool, end_some: bool) -> bool {
+    q4i_raw && fired && end_some
+}
+
+/// A round whose crash spec never fired is a **harness defect** (5.5/// step 2: every round crashes). A silent no-crash round would leave
 /// every downstream field — faults, recovery, the oracle inputs —
 /// meaningless while still being judged, so the driver records this and
 /// fails the seed. The `TaskYield` draw could not miss (its address
@@ -1237,6 +1257,38 @@ pub struct RoundRec {
     pub q4sp: u64,
     /// **X-5c-F4-F1-F1 step 1:** the same for merges (`ckpt_merges`).
     pub q4mg: u64,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 2): window reuses in the
+    /// crash's window** — `alloc_lpid` handed out an LPID freed since
+    /// this flip (the store's `ckpt_reuse` at the crash snapshot, reset
+    /// per window like `q4sp`/`q4mg`). A record diagnostic serialized in
+    /// `campaign.json`, never a digest input and never a quota input.
+    pub q4reuse: u64,
+    /// **X5-R41/R42 (step 2): the splits of the window of the last
+    /// checkpoint whose step 5 returned** (the last ledger row at the
+    /// crash snapshot; 0 when none returned). Diagnostics, never digest
+    /// inputs.
+    pub imgsp: u64,
+    /// **X5-R41/R42:** the same window's merges.
+    pub imgmg: u64,
+    /// **X5-R41/R42:** the same window's reuses.
+    pub imgreuse: u64,
+    /// **X5-R42 (step 2): the opened image's own window held a reuse** —
+    /// the window of the checkpoint whose meta this round's **final
+    /// recovery opened** (by that meta's `ckpt_id`, from the per-seed
+    /// ledger: a meta rollback reads the older image's window, never the
+    /// last step-5 checkpoint's; the harness checkpoint's windows are
+    /// not recorded, so its id has no row). Excluded like SIZING:
+    /// nested recovery crashes (only the final recovery's opened meta is
+    /// read), the harness checkpoint, and refused or failed opens (no
+    /// opened meta). A record diagnostic, never a digest input.
+    pub q4i_raw: bool,
+    /// **X5-R42:** `q4i_raw` ∧ the round's own crash fired ∧ Q18's
+    /// `end.is_some()` — the Q4-I row's per-round predicate (X5-R42's
+    /// row counts it over the campaign's whole 10k). Never a digest
+    /// input: it stays out of the digest so X5-R37's BASE literals
+    /// cannot move, and `verify` compares it per round between the file
+    /// and the re-run instead.
+    pub q4i: bool,
     /// Q5: a ≥ 2-segment chunked txn open at the crash (no marker).
     pub q5_open: bool,
     /// Q5: a chunked txn marked, its marker above the flips so far.
@@ -1510,6 +1562,14 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
     // starting frontier, its append end) is appended after the round.
     let mut x33_lives: Vec<harness::X33Life> = Vec::new();
     let mut x33_prev_frontier = 0u64;
+    // **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-seed checkpoint
+    // window ledger** — every checkpoint's window counts for the whole
+    // seed, keyed by `ckpt_id` (last write wins). A round's `q4i_raw`
+    // looks up the opened meta's own id in it; the round's harness
+    // checkpoint's id is removed after the round (its windows are not
+    // recorded, and without the removal a stale row from an older
+    // checkpoint of the same id could answer for its meta).
+    let mut ckpt_windows: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
     for round in 0..round_counts {
         let Some(ch) = chain.take() else {
             break;
@@ -2144,6 +2204,19 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // X5-R38: the window pick of record (a digest input only when
         // set — see `RoundRec::cwin`).
         rr.cwin = cwin_pick;
+        // **X5-R42 (step 2): the image arm.** Merge this (final)
+        // attempt's ledger rows into the per-seed ledger, key `q4i_raw`
+        // on the opened meta's own id, fold `q4i`, then drop the harness
+        // checkpoint's id — a later round's recovery can open its meta,
+        // and its window is not recorded.
+        for &(k, sp, mg, ru) in &out.obs.ckpt_windows {
+            ckpt_windows.insert(k, (sp, mg, ru));
+        }
+        rr.q4i_raw = q4i_raw_of(&ckpt_windows, out.opened_ckpt_id);
+        rr.q4i = q4i_of(rr.q4i_raw, rr.fired, out.end_store.is_some());
+        if let Some(hk) = out.harness_ckpt_id {
+            ckpt_windows.remove(&hk);
+        }
         rec.deadlock |= rr.deadlock;
         rec.panic |= rr.panic;
         rec.baton |= rr.baton;
@@ -2270,6 +2343,16 @@ fn round_rec(
     // flag (diagnostics only — see RoundRec::q4sp/q4mg).
     rr.q4sp = obs.splits;
     rr.q4mg = obs.merges;
+    // X5-R41/R42 (card X-5c-F4-F1-F1-F3 step 2): the reuse half in the
+    // crash's window, and the completed-window arm — the counts of the
+    // last checkpoint whose step 5 returned (the last ledger row at the
+    // crash snapshot).
+    rr.q4reuse = obs.reuses;
+    if let Some(&(_, sp, mg, ru)) = obs.ckpt_windows.last() {
+        rr.imgsp = sp;
+        rr.imgmg = mg;
+        rr.imgreuse = ru;
+    }
     // Q5: the chunked cases. Open: a txn with chunks enqueued and no
     // marker, spanning ≥ 2 segments. Marked: a marker enqueued on a txn
     // still open (no flip has covered it — the marker sits above the
