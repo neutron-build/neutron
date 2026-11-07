@@ -429,3 +429,11 @@ test("a site without pages has no Pages section", async () => {
   const response = await noPages.GET({ request: new Request(`${SITE}/n-admin/pages`, { headers: { cookie } }), params: { path: "pages" } });
   assert.equal(response.status, 404);
 });
+
+test("the preview resolves the site's own image paths", async () => {
+  const cookie = await logIn();
+  const response = await call("/n-admin/preview", { method: "POST", cookie, body: form({ title: "T", body: "![](/img/a.jpg)" }) });
+  const html = await response.text();
+  assert.match(html, /<base href="https:\/\/site\.test\/">/);
+  assert.match(html, /src="\/img\/a\.jpg"/);
+});

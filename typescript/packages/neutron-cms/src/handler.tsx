@@ -171,8 +171,10 @@ export function createHandler(config: ResolvedConfig) {
     const form = await request.formData();
     const title = escapeHtml(String(form.get("title") ?? ""));
     const body = renderMarkdown(String(form.get("body") ?? ""));
+    // The preview frame has no address of its own, so the site's paths need one to resolve against.
+    const site = escapeHtml(`${process.env.SITE_URL ? new URL(process.env.SITE_URL).origin : new URL(request.url).origin}/`);
     return new Response(
-      `<!doctype html><meta charset="utf-8"><style>html{box-sizing:border-box}*{box-sizing:inherit}body{margin:0;font-family:sans-serif}img{max-width:100%;height:auto}main{width:min(768px,100%);margin:0 auto;padding:40px 24px 96px}h1:first-child{margin:0 0 16px;font-size:40px;line-height:1.2}${config.previewCss}</style><main><h1>${title}</h1><div class="prose">${body}</div></main>`,
+      `<!doctype html><meta charset="utf-8"><base href="${site}"><style>html{box-sizing:border-box}*{box-sizing:inherit}body{margin:0;font-family:sans-serif}img{max-width:100%;height:auto}main{width:min(768px,100%);margin:0 auto;padding:40px 24px 96px}h1:first-child{margin:0 0 16px;font-size:40px;line-height:1.2}${config.previewCss}</style><main><h1>${title}</h1><div class="prose">${body}</div></main>`,
       { headers: { "Content-Type": "text/html; charset=utf-8" } },
     );
   }
