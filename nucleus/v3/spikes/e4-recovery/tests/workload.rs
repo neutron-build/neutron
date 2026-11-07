@@ -1381,36 +1381,36 @@ fn r20_mpe_r_reads_the_issued_write_history() {
 }
 
 /// **X5-R21 (c) pin (P ruling nv3-X-5c-F1-esc-1; literal config = the
-/// ruling's seeds 2669/4049/4309/9809 plus 9469 — targeted MW seeds
-/// where the twin and real chains diverge and a round re-derives its
-/// spec).** The draft's real-round retry re-derived the spec and
-/// re-ran alone, keeping the twin's supply and nested points from the
-/// twin's run at the OLD spec — a Work 2.5 pairing break (the twin is
-/// the same script, crash and F-CRASH resolutions). Now the twin
-/// re-runs at the re-derived spec, from its own start, before the
-/// real round uses its supply and nested points; the twin record,
-/// supply, nested points and chain continuation come from the re-run.
+/// ruling's seeds 2669/4049/4309/9809 plus 9469 and 7469 — targeted MW
+/// seeds that walk the retry and re-pair arms' edges).** The draft's
+/// real-round retry re-derived the spec and re-ran alone, keeping the
+/// twin's supply and nested points from the twin's run at the OLD
+/// spec — a Work 2.5 pairing break (the twin is the same script,
+/// crash and F-CRASH resolutions). Now the twin re-runs at the
+/// re-derived spec, from its own start, before the real round uses
+/// its supply and nested points; the twin record, supply, nested
+/// points and chain continuation come from the re-run.
 /// `twin_paired` (diagnostic only, never a digest input) asserts the
 /// pairing on every round. On the reverted pairing re-run the flag
 /// reads false on the re-derived round.
 ///
-/// **Literal move (X-5c-F4-F1-F1-CXX rework, a judgment call recorded
-/// in the card's RESULT):** the ruling's fifth seed was 7469. The
-/// rework's pin hold (rework step 1) moved its schedule so its twin
-/// round 1's re-derived spec `Mid2@1` never fires — the NEVER-FIRED
-/// defect, exactly what the REWORK verdict's own trial measured on
-/// the pin-held scratch ("the re-gate runs the window and reads
-/// 7469"); its real round 1 still runs the retry. The schedule
-/// literal moved under the gate's Limit-3 ruling class (a literal of
-/// the X5-R37 kind whose schedule the store change re-derived), the
-/// assertions unchanged. 9469 is the replacement, measured at this
-/// tip: class MW, twin round 0's NEVER-FIRED re-derive **succeeds**
-/// (the re-derived spec fires), real round 1 re-derives its spec (the
-/// R21 (c) re-pair path 7469 was pinned for), no defect, every twin
-/// paired.
+/// **Literal history (verdict X-5c-F4-F1-F1-CXX's finding 2,
+/// corrected here per that card's step 4):** the ruling's fifth seed
+/// was 7469; CXX's rework moved its schedule so its re-paired twin
+/// never fired at the re-derived spec (the NEVER-FIRED defect), and
+/// 9469 replaced it. Measured at CXX's tip, only **9469** reaches the
+/// re-pair path with a firing twin; **2669** re-derives in the twin's
+/// FIRST attempt (the twin's own NEVER-FIRED re-derive, which also
+/// moves the real round's spec), and **4049, 4309 and 9809** derive
+/// nothing (their drawn specs fire on both chains) — the earlier doc
+/// overstated them as re-pair seeds. X5-R48 repairs the re-pair arm,
+/// and 7469 is back: it reaches the re-pair path with a twin that
+/// does NOT fire at the re-derived spec, the joint spec re-pairs both
+/// (`r48_repaired_twin_fires_at_the_joint_spec` pins the literal),
+/// no defect, every twin paired.
 #[test]
 fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
-    for seed in [2669u64, 4049, 4309, 9469, 9809] {
+    for seed in [2669u64, 4049, 4309, 7469, 9469, 9809] {
         let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.defect.is_none(),
