@@ -1161,6 +1161,24 @@ changes no gate step, no file and no test; `bash
 scripts/test-enforcement.sh` under it prints `test-enforcement: all
 passed` (exit 0), and the wrapper is not needed for any other step.
 
+## Card X-5c-F4-F1-F1-CXX-F1's record (X5-R48: the re-paired twin that
+## never fires)
+
+## X5-R48 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the
+step-0 discipline, as X5-R6–R47 before it). It amends X5-R21 (c)'s
+re-pair (P ruling nv3-X-5c-F1-esc-1, above): when the re-paired
+twin's crash does not fire at the real round's re-derived spec, the
+re-pair itself re-derives, from both complete mask lists. The
+diagnosis is verdict X-5c-F4-F1-F1-CXX's finding 1 (seed 7469).
+
+**X5-R48 (amends X5-R21 (c)).** When the re-paired twin's crash does not fire at the real round's re-derived spec, both unfired attempts ran to completion, so both mask lists are complete.
+- **Joint spec.** Take the per-index AND of the twin's masks and the real round's first-attempt masks, over the shorter length. Call `reachable_hook_spec` on it with the same drawn `(hook, ckpt_index)` and the same `(seed, round)`.
+- **Re-run.** The twin re-runs at the joint spec from its own start. The real round then runs at that same spec. `twin_final_spec` and `real_final_spec` both name it, and `crash_desc` describes it.
+- **Refusal.** A refused re-derive (union 0, or an empty list) leaves the unfired twin and its fired-guard defect standing. A joint-spec twin that still does not fire also trips the guard. There is no third attempt.
+- **Unchanged.** Every round whose re-paired twin fires, the twin's first-attempt re-derive, the uniform wrap and the class C retry. No other arm draws anything.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
