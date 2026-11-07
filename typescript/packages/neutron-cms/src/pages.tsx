@@ -162,7 +162,8 @@ export function EditorPage(props: {
           <textarea class="title" name="title" rows={1} placeholder="Add title" aria-label="Title" autofocus={!post.title}>{values.title}</textarea>
           <textarea class="body" name="body" placeholder="Start writing. Markdown works, and images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
         </main>
-        <iframe class="preview" title="Preview" sandbox="" data-preview hidden />
+        {/* Same origin so the site's images load past its Cross-Origin-Resource-Policy; scripts stay off. */}
+        <iframe class="preview" title="Preview" sandbox="allow-same-origin" data-preview hidden />
 
         <aside class="meta" id="post-settings" aria-label="Post settings">
           <label class="field">
