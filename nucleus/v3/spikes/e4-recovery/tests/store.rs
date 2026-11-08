@@ -2756,7 +2756,13 @@ fn ack_prefix_two_batches_in_flight() {
             // entering its wait (which its own observation shows cannot
             // be satisfied — `mid_wait_open`); A is held at
             // writer:prewrite (effectively indefinitely; see above).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            // The poll backs off 1 ms between checks: each `flag` takes
+            // the world lock, and a tight loop starves the tasks it is
+            // waiting for under host load (X-5c-F4-F1-F1-F2 verdict,
+            // finding 2: 12-44 s wall on a loaded host against this
+            // deadline). The deadline is 300 s for the same reason; a
+            // hung world still fails, it just fails slowly.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             let mut timed_out = false;
             loop {
                 if flag(&sched, "b_wrote") {
@@ -2769,6 +2775,7 @@ fn ack_prefix_two_batches_in_flight() {
                     timed_out = true;
                     break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             if timed_out {
                 if let Some(h) = h0.take() {
@@ -2821,7 +2828,10 @@ fn ack_prefix_two_batches_in_flight() {
                 // The clean arm: release A; both waits must return and
                 // durable must cover batch 2's end.
                 sched.lock().st.parks.insert("writer:prewrite", 0);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // Same backoff and deadline scale as the first poll
+                // (above): no world-lock contention with the tasks whose
+                // acks this waits for, and headroom for a loaded host.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
                 loop {
                     if flag(&sched, "a_acked") && flag(&sched, "b_acked") {
                         break;
@@ -2833,6 +2843,7 @@ fn ack_prefix_two_batches_in_flight() {
                         flag(&sched, "a_acked"),
                         flag(&sched, "b_acked")
                     );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 let g = sched.lock();
                 assert!(
