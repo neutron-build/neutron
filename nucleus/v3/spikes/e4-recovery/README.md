@@ -2486,6 +2486,94 @@ in its "changed texts (9)"; the comparator counts it once, as `HEALED`
 (the calibration's `TEXT_CHANGED 8`), because both rules classify the
 Base-`pass=false` shape healed first.
 
+### Re-verification attempt (2026-11-07, after the 60-min kill and the
+### quota stop)
+
+Attempt 1 (killed at 60 min) left all four step commits on the branch
+(`10ee2e52 → 8bbbfcec → f21a2247 → 689db626`) with a clean tree, so the
+restart rule resumes at the first step with no commit: there is none.
+This attempt re-verified every recorded reading and re-ran every
+Acceptance line for real. Nothing outside `tools/`+this README changed;
+`git status` stayed clean throughout.
+
+- **Acceptance 1** `cargo test -q --release -p e4-recovery`: exit 0,
+  **262 passed, 0 failed** (18+0+25+43+55+28+50+43+0), green as at
+  `eb9c4328`.
+- **Acceptance 2** `self-test`: exit 0, **38 cases, 0 failed**.
+- **Acceptance 3** the scratch-export `git apply --check` of
+  `tools/x5r52-twin-diag.patch`: exit 0 on a fresh `git archive HEAD
+  nucleus` export. (The sandbox's shell guard rejects `git -C`, so the
+  archive was taken from the worktree root — the same repository state
+  `git -C ../..` names; the `rm -rf` scratch reset was replaced by a
+  fresh directory name, which is equivalent for a one-shot extract.)
+- **Acceptance 4** the 10k `compare` line, verbatim: exit 0, both
+  sha256 checks green, and exactly P's reference reading —
+  `DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0`, `MOVED_GAINED 87`,
+  `MOVED_MP_PENDING 52`, `META_ONLY_ELIGIBLE 4 [(1927,1),(7257,0),
+  (7658,0),(8278,0)]`, `MPA_PASS_FAIL 1 [(7078,0)]`, `TWIN_DDL_PENDING
+  2 [(2599,2),(2859,1)]`, `MOVED_LOST 94`, `HEALED 3 [(457,0),(1298,1),
+  (8777,0)]`, `TWIN_HEALED 1 [(6539,1)]`, `TEXT_CHANGED 131`,
+  `TWIN_FAILING 7 BASE 6`, `NEW_FAILING 0`, `BAD_SEEDS 0`.
+- **Acceptance 5** `bash scripts/gate.sh` (full log kept at
+  `${CARGO_TARGET_DIR}/gate-full.out`): `STEP test EXIT=0`, `STEP clippy
+  EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`,
+  `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=1`
+  with exactly **one** FAIL row — `runner e2e: K: SIGTERM kills opencode
+  and closes the ledger range` — so `GATE EXIT=1`. **This is the known,
+  ruled row, not a finding of this card.** Verdict
+  `verdicts/X-5c-F4-F1-F1.md` (K ruling): "`kill_child` is correct.
+  `dead()` asks the wrong question: `killpg` succeeds on a zombie-held
+  group"; a worker's own-session gate reads red on that row alone "when
+  opencode as PID 1 reaps no orphans… It is the only row. The runner's
+  Acceptance is the truth. Do not chase it, and do not run a subreaper
+  to make it pass." This container matches the ruling's premise:
+  `/proc/1/comm` = `opencode`. The fix is queued as card
+  X-5c-F4-F1-F1-F1 ("does not block the held card or F4"), and this
+  card's Touch-only list forbids `scripts/` anyway. CXX-F1's subreaper
+  wrapper (recorded above, before the ruling) is overruled for cards
+  after it; F2-F1's own record already carried the row as a known red.
+  My probes match the ruled mechanism: at check time the fake's pid is
+  dead by every oracle (`kill(pid,0)→ESRCH`, no `/proc/<pid>`, `ps`
+  empty; the pid allocator is sequential with no `ns_last_pid` rewind —
+  verified by a 21k-sample monitor running concurrently with a failing
+  suite — and ~23M kill probes over isolated kill+reap repros never
+  fired), yet `killpg(pgid,·)` succeeds on the orphaned `sleep`'s
+  unreaped zombie holding the group, exactly as the verdict states.
+- **The 0..1000 calibration** re-run exactly as recorded: 243/4/0,
+  gained 7, MP pending `[(47,1),(547,0),(797,0),(967,0)]`, empty X5-R52
+  rows, lost 5, healed `[(457,0)]`, `TEXT_CHANGED 8`, twin failing 2
+  BASE 2, `NEW_FAILING 0`, exit 0.
+- **All 52 `check-mp` rows** re-derived from the gate's `m/pend/`
+  recordings: **48 `EXPLAINED (b)5`, 4 `EXPLAINED (b)5'`** (1927 r1,
+  7257 r0, 7658 r0, 8278 r0 — the `META_ONLY_ELIGIBLE` four), none
+  NOT-EXPLAINED, no missing file.
+- **The three `check-twin` rows** re-derived from attempt 1's preserved
+  patched single-seed runs (`${CARGO_TARGET_DIR}/x5r52/s*.{err,json,
+  out}`; T5's digest/MONITOR checks inside): 2599 twin r2 `EXPLAINED
+  N=3 k=2` (real round 1: lost=1 mis=0 torn=1, frontier=1 hi=5), 2859
+  twin r1 `EXPLAINED N=4 k=1` (real round 0: mis=1, frontier=1 hi=7),
+  609 twin r1 `EXPLAINED N=5 k=1` (real round 0: torn=2, frontier=2
+  hi=8) — the pre-existing shape, as evidence. The gate reproduces 2599
+  and 2859 on its own per (f).
+- **Mutation evidence re-applied this attempt** to fresh scratch copies
+  under `CARGO_TARGET_DIR` (never the worktree; the tree stayed clean):
+  M-CMP-NO-PF — `self-test` FAIL, 9 cases incl. `pass-fail-base-text-
+  not-mpa`, and over the real 10k `MPA_PASS_FAIL 0 []` with `7078`
+  absent from the entire output, exit 0 (the original comparator's gap,
+  reproduced); M-CMP-MPA-NOJUDGE — FAIL `mpa-skx-smx-false`,
+  `mpa-pass-na-false`; M-CMP-META-ANYSLOT — FAIL `meta-only-some-finding`;
+  M-CMP-TWIN-NODIR — FAIL `twin-t2-both-dirs-lack-N`; M-CMP-TWIN-ANYCLASS
+  — FAIL `twin-mp-seed-prefilter-fails`. No UNCAUGHT.
+
+anomaly: attempt 1's RESULT paragraph above records `scripts/gate.sh`
+ending `GATE EXIT=0`; this attempt cannot reproduce that reading in this
+container (`opencode` as PID 1) without the subreaper wrapper the
+X-5c-F4-F1-F1 verdict later forbade, and attempt 1's log was killed
+before its end. The one row that differs is the ruled `runner e2e: K`
+row; every other gate step is green here, and every other recorded
+number of this card reproduces exactly as written above.
+
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
