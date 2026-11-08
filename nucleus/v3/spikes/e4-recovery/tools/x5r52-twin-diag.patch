@@ -1,0 +1,80 @@
+diff --git a/spikes/e4-recovery/src/harness.rs b/spikes/e4-recovery/src/harness.rs
+--- a/spikes/e4-recovery/src/harness.rs
++++ b/spikes/e4-recovery/src/harness.rs
+@@ -2449,6 +2449,11 @@
+     mut twin: Option<&mut Vec<(usize, u64, u64)>>,
+     x33: Option<&X33In<'_>>,
+ ) -> RoundOutcome {
++    // X5-R52 (card X-5c-F4-F1-F1-F3-F2-F1-F1): diag-only run marker so
++    // every GATEDIAG listing below is attributable to one run_round
++    // invocation (probe, twin or real). eprintln only: never a digest
++    // input.
++    eprintln!("X5R52 run seed={seed} round={round} class={:?}", faults.class);
+     // ---- the workload pass ----
+     // **X5-R35 (a):** the event count the incoming disk carries is the
+     // boundary of X5-R34's `E` — everything the capture holds below it
+@@ -3087,6 +3092,7 @@
+                 continue;
+             }
+             Err(e) => {
++                eprintln!("GATEDIAG recovery Err seed={seed} round={round} class={:?} nested={nested_fired} e={e:?}", faults.class);
+                 // **X-5c-F3-F3b step 2 (c):** the round field is a typed
+                 // match on I-WAL-COVER's refusal, never a text match.
+                 cover_err_outcome = matches!(e, Fail::WalLoss { .. });
+diff --git a/spikes/e4-recovery/src/workload.rs b/spikes/e4-recovery/src/workload.rs
+--- a/spikes/e4-recovery/src/workload.rs
++++ b/spikes/e4-recovery/src/workload.rs
+@@ -1693,6 +1693,18 @@
+                 cut: ch.cut,
+             });
+         }
++        // X5-R52 (c)(i) T2/T4 (card X-5c-F4-F1-F1-F3-F2-F1-F1): the two
++        // chains' directory keys at round start, after the broken-chain
++        // re-seed and before the twin runs. Class C has no twin chain,
++        // so the line prints for MP/MW only. eprintln only: never a
++        // digest input.
++        if let Some(twin_at_start) = twin_chain.as_ref() {
++            eprintln!(
++                "X5R52 round-start seed={seed} round={round} real_dir={:?} twin_dir={:?}",
++                ch.st.dir.keys().copied().collect::<Vec<u64>>(),
++                twin_at_start.st.dir.keys().copied().collect::<Vec<u64>>()
++            );
++        }
+         // The targeted draw of a class C round retries on its own
+         // (no twin exists); keep the round's start for the re-run. The
+         // MP/MW real round needs its own retry too (the twin and real
+diff --git a/spikes/e4-recovery/src/store/ckpt.rs b/spikes/e4-recovery/src/store/ckpt.rs
+--- a/spikes/e4-recovery/src/store/ckpt.rs
++++ b/spikes/e4-recovery/src/store/ckpt.rs
+@@ -1725,11 +1725,21 @@
+         Ok(())
+     })?;
+     let mut frontier = meta.t;
++    {
++        let dk: Vec<u64> = cx.with("gd", |c| Ok(c.store().dir.keys().copied().collect::<Vec<u64>>()))?;
++        eprintln!("GATEDIAG replay start meta.t={} ckpt_id={} dir_root={} wal_start={} dir_keys={:?} nrec={}", meta.t, meta.ckpt_id, meta.dir_root, meta.wal_start_lsn, dk, replay.len());
++        for rec in replay.iter() {
++            let ops = wal::rec_ops(rec);
++            let ddl: Vec<String> = ops.iter().filter_map(|o| match o { wal::WOp::CreateTree{tree}=>Some(format!("C{tree}")), wal::WOp::DropTree{tree}=>Some(format!("D{tree}")), _=>None }).collect();
++            let trees: std::collections::BTreeSet<u64> = ops.iter().map(|o| match o { wal::WOp::CreateTree{tree}|wal::WOp::DropTree{tree}|wal::WOp::Put{tree,..}|wal::WOp::Delete{tree,..} => *tree }).collect();
++            eprintln!("GATEDIAG   rec lsn={} kind={} ts={} txn={:?} ddl={:?} trees={:?}", rec.lsn, rec.kind, rec.ts, rec.txn, ddl, trees);
++        }
++    }
+     for rec in replay.iter() {
+         match rec.kind {
+             K_COMMIT if rec.ts > meta.t => {
+                 for op in wal::rec_ops(rec) {
+-                    apply_op(cx, &op, rec.ts, false, true)?;
++                    if let Err(e) = apply_op(cx, &op, rec.ts, false, true) { eprintln!("GATEDIAG replay apply FAIL lsn={} ts={} e={e:?}", rec.lsn, rec.ts); return Err(e); }
+                 }
+                 cx.with("recover:applied", |c| {
+                     c.store().seq.applied.insert(rec.ts);
+@@ -1761,7 +1771,7 @@
+                     && ts > meta.t
+                 {
+                     for op in wal::rec_ops(rec) {
+-                        apply_op(cx, &op, ts, true, true)?;
++                        if let Err(e) = apply_op(cx, &op, ts, true, true) { eprintln!("GATEDIAG replay chunk apply FAIL lsn={} ts={ts} e={e:?}", rec.lsn); return Err(e); }
+                     }
+                     cx.with("recover:applied2", |c| {
+                         c.store().seq.applied.insert(ts);
