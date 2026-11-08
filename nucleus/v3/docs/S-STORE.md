@@ -963,7 +963,7 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 ## 14. Recovery
 
 1. Read page 0 and both meta slots. The newest valid meta `k` wins (§2.2). A meta whose magic and CRC are valid but whose `T > ts_ckpt_hi` or `wal_start_lsn > wal_ckpt_end` is corrupt: the open fails with XX001, with no fallback (§2.2). Mutant **META-RANGE-SKIP**: this open-time check is removed (test `t_cover_ts_cross_check`, §15 I-WAL-COVER).
-2. Load the map root and the free set of image `k`. Every slot not referenced by image `k` is free, including the slots eviction wrote after meta `k`.
+2. Load the map root and the free set of image `k`. Every slot not referenced by image `k` is free, including the slots eviction wrote after meta `k`. Then build the root table from image `k`'s directory (§6.8), before replay.
 3. **Pass 1:** walk the WAL from `wal_start_lsn` to the valid end (§12.5), collecting the set of `(txn, commit_ts)` of every `CommitMarker` with `commit_ts > T`. It checks each record for a splice as well (§12.5, I-WAL-CHAIN), and ends at the first one.
 
 3a. **Coverage check (I-WAL-COVER).** Pass 1 also records the largest `commit_ts` of the `Commit` and `CommitMarker` records it reads. The WAL **covers** image `k` iff:
@@ -999,7 +999,7 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 
    A chunk whose transaction has no marker is ignored. Records with `commit_ts ≤ T` are skipped: they are in the image.
 
-   **DropTree.** A replayed `DropTree` sets `dropping` and does nothing else (nothing if the id is absent). Its walk runs at step 6. Pass 2 runs no walk. Mutant **REPLAY-DROP-WALK**: pass 2 walks, so a read-only open frees a page (§14.1; test `t_ro_open` with a replayed `DropTree`, A-7d).
+   **DropTree.** A replayed `DropTree` sets `dropping` and does nothing else (nothing if the id is absent). Its walk runs at step 6. Pass 2 runs no walk. Mutant **REPLAY-DROP-WALK**: pass 2 walks, so a read-only open frees a page (§14.1; test `t_ro_open` with a replayed `DropTree`, A-7d). Its state change includes the root-table entry's, and a replayed `CreateTree` installs its entry, as in normal operation (§6.8).
 
    **Chunk supersede (I-CHUNK-SUPERSEDE).** For a chunked transaction, each op inserts or replaces the entry `key@commit_ts`, and a `Delete{revert}` deletes it if present. A replace or delete frees the replaced value's overflow chain in the same gated operation (§6.7). So the last op per key wins, whatever the image already holds for that key at that ts. An op that inserts an entry identical to the present one is a no-op. Ops of a `Commit` record keep I-ENTRY-UNIQUE's XX001 for a different value. Mutant SUPERSEDE-AS-CONFLICT: a superseding op is treated as a conflict (XX001).
 5. Truncate the WAL at the valid end.
@@ -1035,7 +1035,7 @@ The double-crash test (A-7d) is the test that runs recovery twice. It is not a m
 
 **No writer.** While a read-only open is open, no read-write open of the file runs: it takes N11's file lock (through `Env`) in a mode that excludes a read-write open, and it fails rather than wait when a writer holds the lock. **The lock creates and writes no file**, in either mode: it is an advisory lock on the page file itself (opened read-only by a read-only open), or, on OPFS, the access-handle mode (`read-only` against a writer's exclusive `readwrite`). A lock file would be a write, and on a full volume its creation fails (mutant **RO-LOCK-FILE**). <!-- For A-1: an O_RDONLY fd cannot take a POSIX fcntl write lock, so the read-only open needs a shared (read) lock mode; PLAN-v3 §3.2's Env has only lock_exclusive (follow-up proposed in verdicts/S-2-F2.md). --> Why exclude a writer: a writer recycles WAL segments and reuses slots after every checkpoint (§13 step 6), so the reader's image and WAL span would change under it. Whether several read-only opens may share the file is the lock mode's choice; nothing here depends on it, because none of them writes.
 
-**What it replays.** Steps 1–4, including the open-time meta check (step 1) and the coverage check (step 3a): the same winning meta (§2.2), the same image, the same valid end (§12.5), or the splice cut (§14 step 3a), the same two passes, and the same ops, with I-CHUNK-SUPERSEDE.
+**What it replays.** Steps 1–4, including the open-time meta check (step 1) and the coverage check (step 3a): the same winning meta (§2.2), the same image, the same valid end (§12.5), or the splice cut (§14 step 3a), the same two passes, and the same ops, with I-CHUNK-SUPERSEDE. It builds the root table as §14 step 2 does, and its replayed directory changes maintain it.
 - So its state equals the state a read-write open of the same files has after step 4, before its boot checkpoint.
 - The apply frontier is fixed as after step 4 (the largest replayed `commit_ts`, or `T`), and `W` starts at the meta's `gc_w` (C-T0 v8 §3.7 steps 2–3). Neither advances, because nothing commits.
 - Skipping pass 2 would serve image `k` alone and silently lose every acked commit above `T` (mutant **RO-NO-REPLAY**).
