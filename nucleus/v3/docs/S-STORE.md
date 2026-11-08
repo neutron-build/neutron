@@ -1234,10 +1234,10 @@ This file wins over the plan (precedence above). The plan should be updated thro
   - **Trigger:** a field report on a target that drops synced writes, a splice XX001 reported from the field, or server mode's synchronous-replication card.
 
 **Known cost of root names (cards S-1-F7, S-1-F7-F2):**
-- **T5: no root caches.** §6.8's root names bar any cache of a tree's root LPID, so every operation descends the directory first.
-  - **The cost.** Measured on E0's B+tree in memory (verdict S-1-F7, n5000, loaded machine, rough): about +240 ns per point get single-threaded (16–21% of a bare get). With one pool per tree, 1.46× at 4 threads to 2.08× at 16; it is hidden today by E0's page-table mutex.
-  - **Why the bar is wider than safety needs.** C-T6 §7.5 keeps a tree from being dropped while a registered snapshot can see it, so a foreground operation could safely keep a root LPID for its statement. Only background jobs (sweeps, abort cleanup) need the rule.
-  - **Trigger.** Directory latching above 5% of point-op CPU, or below PLAN-v3 §3.12's buffer-pool scaling bar at 16+ threads, opens a spec edit allowing a root name for the life of a registered snapshot, for foreground operations only. Until then the rule stands.
+- **T5: no root name kept across operations.** §6.8's root names let no thread keep a tree's root LPID across operations: every operation names its root through the root table and validates it under the root's latch.
+  - **The cost.** One root-table read and one re-read per operation, in place of draft 7.5's two-latch directory descent (about +240 ns per point get, and 1.46× at 4 threads to 2.08× at 16, on E0's tree, verdict S-1-F7). No ordinary operation latches the directory, so that global cache line leaves the hot path, provided a root-name read stores to no memory common to all trees (§6.8 "The root table"). Each operation still takes its tree's root latch, a read-modify-write on a cache line per tree, so a workload on one hot table keeps E0's scaling cliff; the remedy is the E0/E7 optimistic-latch trigger (PLAN-v3 §3.12), not this rule.
+  - **Measurement.** A-5, with E0, measures the table path: the point-op CPU spent naming roots, and multi-tree scaling at 4 to 16 threads. ROOT-TABLE-SHARED-WRITE (a root-name read takes a read guard or a reference count on memory common to all trees) shows there, not in a functional test.
+  - **Later.** C-T6 §7.5 keeps a tree from being dropped while a registered snapshot can see it, so a foreground operation could keep a root name for its registered snapshot. That is a later spec edit, opened if A-5's measurement puts the table path above 5% of point-op CPU; background jobs keep the current rule.
 
 ---
 
