@@ -9,7 +9,7 @@ import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
-import { Document, EditorPage, EditPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
+import { Document, EditorPage, EditPage, type DesignedPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
 import {
   allPosts, allTexts, createPost, deletePost, ensureDesigns, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
   sortByDate, type Item, type Post,
@@ -183,24 +183,31 @@ export function createHandler(config: ResolvedConfig) {
   const designOf = (post: Post) => (post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined);
   const isDesign = (post: Post) => designOf(post) !== undefined;
 
-  /** The site, or with `?page=` one designed page, drafts included, framed for editing. */
+  /** The site, framed for editing. `?page=` was the old way to open a designed page; it now opens as itself. */
   function editSite(request: Request) {
     const id = Number(new URL(request.url).searchParams.get("page"));
-    const designed = id ? getPost(id) : undefined;
-    const design = designed && designOf(designed);
-    if (designed && design && (design.url || designed.slug)) {
-      const address = design.url ?? config.pageUrl(designed.slug!);
-      const src = isLive(designed) ? address : `${address}?cms-preview=${encodeURIComponent(previewToken(design.url ? designed.layout : designed.slug!))}`;
-      return page(`Edit ${designed.title || "page"}`, <EditPage config={config} src={src} back={{ href: `${admin}/posts/${designed.id}`, label: designed.title || "Page" }} />);
-    }
+    if (id) return redirect(`${admin}/posts/${id}`);
     return page("Edit site", <EditPage config={config} />);
+  }
+
+  /** A designed page opens as itself, drafts included, ready to click and edit, and is published from the same bar. */
+  function designedPage(post: Post) {
+    const design = designOf(post)!;
+    const address = design.url ?? (post.slug ? config.pageUrl(post.slug) : null);
+    if (!address) return notFound();
+    const src = isLive(post) ? address : `${address}?cms-preview=${encodeURIComponent(previewToken(design.url ? post.layout : post.slug!))}`;
+    const state: DesignedPage = { id: post.id, status: statusOf(post), revision: post.updated_at, permanent: design.permanent };
+    return page(post.title || "Page", <EditPage config={config} src={src} back={{ href: `${admin}/pages`, label: "Pages" }} page={state} />);
   }
 
   async function editor(request: Request, id: number) {
     const post = getPost(id);
     if (!post || (post.kind === "page" ? !config.pages : !config.posts)) return notFound();
     const saved = new URL(request.url).searchParams.has("saved");
-    if (request.method !== "POST") return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={saved} />);
+    if (request.method !== "POST") {
+      if (isDesign(post)) return designedPage(post);
+      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={saved} />);
+    }
     // A designed page keeps its body, which its design doesn't show, whatever the form sends.
 
     const form = await request.formData();
@@ -221,20 +228,17 @@ export function createHandler(config: ResolvedConfig) {
       intent === "unpublish" ? null :
       post.published_at === null ? null : (date ?? post.published_at);
 
-    const fields = {
-      title: read("title").trim(),
-      description: read("description").trim(),
-      label: read("label").trim(),
-      body: isDesign(post) ? post.body : read("body"),
-      slug: design?.url ? (post.slug ?? "") : read("slug"),
-      published_at,
-    };
+    // A designed page is only published or unpublished from its bar; everything else stays as it is.
+    const fields = design
+      ? { title: post.title, description: post.description, label: post.label, body: post.body, slug: post.slug ?? "", published_at }
+      : { title: read("title").trim(), description: read("description").trim(), label: read("label").trim(), body: read("body"), slug: read("slug"), published_at };
 
     // A design owns its address, even one the site reserves for its own routes.
     const result = savePost(id, fields, read("revision"), design ? [] : config.reservedSlugs);
     if (!result.ok) {
       const message = SAVE_ERRORS[result.error];
       if (script) return Response.json({ ok: false, error: result.error, message }, { status: 409 });
+      if (design) return redirect(`${admin}/posts/${id}`);
       return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={false} error={message} fields={fields} />);
     }
     if (script) return Response.json({ ok: true, revision: result.post.updated_at, slug: result.post.slug });

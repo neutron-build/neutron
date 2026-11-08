@@ -469,13 +469,15 @@ test("a designed page is a draft until published, and its draft shows only throu
   assert.match(list, />draft</);
   const id = list.match(/href="\/n-admin\/posts\/(\d+)">Portfolio</)![1];
   const editor = await (await call2(`/n-admin/posts/${id}`)).text();
-  assert.match(editor, /Edit on the page/);
+  assert.match(editor, /data-edit-frame/, "a designed page opens as itself");
+  assert.match(editor, /value="publish"/);
   assert.doesNotMatch(editor, /data-toggle-preview/);
 
   assert.equal(designed.page("portfolio"), undefined);
   assert.equal(designed.page("portfolio", new Request(`${SITE}/portfolio/`)), undefined);
   assert.equal(designed.page("portfolio", new Request(`${SITE}/portfolio/?cms-preview=1.forged`)), undefined);
-  const edit = await (await call2(`/n-admin/edit?page=${id}`)).text();
+  assert.equal((await call2(`/n-admin/edit?page=${id}`)).headers.get("location"), `/n-admin/posts/${id}`);
+  const edit = editor;
   const src = edit.match(/data-edit-frame[^>]*|src="([^"]+)"[^>]*data-edit-frame/)![0].match(/src="([^"]+)"/)![1].replace(/&amp;/g, "&");
   assert.match(src, /^\/portfolio\?cms-preview=/);
   assert.equal(designed.page("portfolio", new Request(SITE + src))?.layout, "portfolio");
@@ -527,8 +529,8 @@ test("a homepage design is always published, answers only at its own address, an
   const editor = await (await call2(`/n-admin/posts/${id}`)).text();
   assert.doesNotMatch(editor, /value="unpublish"/);
   assert.doesNotMatch(editor, /value="delete"/);
-  const revision = editor.match(/name="revision" value="([^"]+)"/)![1];
-  await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "unpublish", title: "Home", revision }) });
+  const revision = "any"; // the homepage has no publish controls at all
+  await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "unpublish", revision }) });
   await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "delete" }) });
   assert.equal(site.design("home")?.title, "Home");
 
@@ -536,9 +538,11 @@ test("a homepage design is always published, answers only at its own address, an
   const gpgEditor = await (await call2(`/n-admin/posts/${gpg}`)).text();
   assert.match(gpgEditor, /value="unpublish"/);
   const gpgRevision = gpgEditor.match(/name="revision" value="([^"]+)"/)![1];
-  await call2(`/n-admin/posts/${gpg}`, { method: "POST", body: new URLSearchParams({ intent: "unpublish", title: "GPG", revision: gpgRevision }) });
+  await call2(`/n-admin/posts/${gpg}`, { method: "POST", body: new URLSearchParams({ intent: "unpublish", revision: gpgRevision }) });
   assert.equal(site.design("gpg"), undefined, "a reserved address doesn't stop a design being unpublished");
-  const edit = await (await call2(`/n-admin/edit?page=${gpg}`)).text();
+  assert.equal(site.design("gpg") === undefined && (await site.GET({ request: new Request(`${SITE}/n-admin/pages`, { headers: { cookie } }), params: { path: "pages" } })).status, 200);
+  const edit = await (await call2(`/n-admin/posts/${gpg}`)).text();
+  assert.match(edit, /value="publish"/);
   const src = edit.match(/src="([^"]+)"[^>]*data-edit-frame/)![1].replace(/&amp;/g, "&");
   assert.match(src, /^\/gpg\/\?cms-preview=/);
   assert.equal(site.design("gpg", new Request(SITE + src))?.title, "GPG");

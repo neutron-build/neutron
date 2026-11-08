@@ -35,7 +35,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
         <a class="name" href={admin}>Neutron CMS</a>
         {config.posts ? <a href={admin} aria-current={current("posts")}>Posts</a> : null}
         {config.pages ? <a href={`${admin}/pages`} aria-current={current("pages")}>Pages</a> : null}
-        {config.onPage.length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
+        {config.onPage.length && !Object.keys(config.designs).length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
         {Object.entries(config.lists).filter(([key, list]) => list.ownPage || !config.onPage.includes(key)).map(([key, list]) => (
           <a key={key} href={`${admin}/lists/${key}`} aria-current={current(key)}>{list.label}</a>
         ))}
@@ -167,18 +167,8 @@ export function EditorPage(props: {
 
         <main class="writing">
           <textarea class="title" name="title" rows={1} placeholder="Add title" aria-label="Title" autofocus={!post.title}>{values.title}</textarea>
-          {design ? (
-            <div class="design-note">
-              <p>This page has its own design. Its words and pictures are edited on the page itself, and nothing shows to visitors until you publish.</p>
-              <a class="button primary" href={`${admin}/edit?page=${post.id}`}>Edit on the page</a>
-              <textarea name="body" hidden aria-hidden="true" />
-            </div>
-          ) : (
-            <>
-              <p class="markdown-note" data-markdown-note hidden />
-              <textarea class="body" name="body" placeholder="Start writing in Markdown. Images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
-            </>
-          )}
+          <p class="markdown-note" data-markdown-note hidden />
+          <textarea class="body" name="body" placeholder="Start writing in Markdown. Images can be pasted or dropped here." aria-label="Body">{values.body}</textarea>
         </main>
         {/* Same origin so the site's images load past its Cross-Origin-Resource-Policy; scripts stay off. */}
         <iframe class="preview" title="Preview" sandbox="allow-same-origin" data-preview hidden />
@@ -328,7 +318,15 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
   );
 }
 
-export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string } }) {
+/** A designed page's state, when Edit site is showing one: it's published from the same bar. */
+export interface DesignedPage {
+  id: number;
+  status: Status;
+  revision: string;
+  permanent: boolean;
+}
+
+export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string }; page?: DesignedPage }) {
   const { config } = props;
   const admin = config.path;
   // A site with no blog opens on this page, so going back to its home would land here again.
@@ -338,12 +336,23 @@ export function EditPage(props: { config: ResolvedConfig; src?: string; back?: {
     <>
       <header class="top editor-top edit-top">
         {back ? <a class="back" href={back.href} aria-label={`Back to ${back.label}`}>{"\u2190"}<span class="on-wide">&nbsp;{back.label}</span></a> : null}
+        {props.page ? <span class={`status ${props.page.status}`}>{STATUS_LABEL[props.page.status]}</span> : null}
         <span class="state" data-edit-state role="status" />
         <span class="spacer" />
         <div class="edit-tools" data-edit-tools hidden />
         {props.src ? null : <a class="button quiet on-wide" href="/" target="_blank" rel="noreferrer">View site</a>}
         <button class="button" type="button" data-edit-discard disabled>Discard</button>
         <button class="button primary" type="button" data-edit-save disabled>Save</button>
+        {props.page && !(props.page.permanent && props.page.status === "live") ? (
+          <form class="publish-form" method="post" action={`${admin}/posts/${props.page.id}`}>
+            <input type="hidden" name="revision" value={props.page.revision} />
+            {props.page.status === "draft" ? (
+              <button class="button" type="submit" name="intent" value="publish" data-publish>Publish</button>
+            ) : (
+              <button class="button quiet" type="submit" name="intent" value="unpublish" data-confirm="Take this page offline? You can publish it again any time.">{props.page.status === "live" ? "Unpublish" : "Unschedule"}</button>
+            )}
+          </form>
+        ) : null}
       </header>
       <iframe class="edit-frame" title="Your site" src={props.src ?? "/"} data-edit-frame />
       <script defer src={assetUrl(admin, "admin.js")} />

@@ -190,7 +190,6 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 
 /* Visual editor: the text reads like the page it becomes. */
 
-.design-note { display: grid; justify-items: start; gap: 16px; margin-top: 8px; padding: 24px; background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; color: var(--muted); font-size: 15px; line-height: 1.6; }
 .markdown-note { margin: 0 0 16px; padding: 8px 12px; background: var(--surface); border-radius: 6px; color: var(--muted); font-size: 13px; }
 
 .prose { min-height: 50vh; outline: 0; color: var(--ink); font: 18px/1.75 var(--sans); overflow-wrap: break-word; white-space: pre-wrap; word-wrap: break-word; font-variant-ligatures: none; -webkit-font-variant-ligatures: none; }
@@ -328,6 +327,7 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 
 body:has(.edit-frame) { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
 body:has(.edit-frame) .top { position: static; flex: none; }
+.publish-form { display: flex; margin-left: 4px; padding-left: 12px; border-left: 1px solid var(--rule); }
 .edit-frame { flex: 1; width: 100%; min-height: 0; border: 0; background: var(--bg); }
 .edit-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-right: 8px; padding-right: 16px; border-right: 1px solid var(--rule); font-size: 13px; }
 .edit-tools strong { margin-right: 4px; color: var(--strong); font-weight: 600; }
