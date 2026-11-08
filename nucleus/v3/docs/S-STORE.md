@@ -200,7 +200,7 @@ A slot that only the current map referenced (an earlier eviction home of a page 
 
 ### 5.1 Structure
 - **Pool.** A fixed array of `F` frames, set at open from the N16 budget (card R-1). It **never grows**.
-- **Frame.** Holds the page bytes, a `RwLock` latch, a dirty flag, a pin count and the content epoch.
+- **Frame.** Holds the page bytes, a task-fair latch (§5.3), a dirty flag, a pin count and the content epoch.
 - **Page table.** A hash map from page id to frame (`spikes/e0-btree/src/pool.rs`).
 - **No `unsafe`** (N9).
 
@@ -219,9 +219,16 @@ Optimistic latches and pointer swizzling come only when an E0 or E7 trigger fire
 A dirty page may therefore be evicted **at any time**, independently of checkpoints. This is what lets write-heavy loads and long-reader version retention exceed RAM (PLAN-v3 §3.3).
 
 ### 5.3 Latch rules
-- Latches are acquired **top-down**, and among siblings **left to right** (I-LATCH, §6.2). Nothing ever latches sideways or upward, so latching cannot deadlock.
+- **Order.** Latches are acquired in one order: directory pages, which only an operation that changes the directory latches (§6.8 "Root names"); then the pages of one tree, top-down, and among siblings left to right (I-LATCH, §6.2); then map pages, in radix order (a MapInner before its children, siblings by ascending LPID range). Nothing ever latches sideways or upward: a thread blocks only on a latch ranked after every latch it holds, map pages ranking after every tree page. Among map pages two rules make that hold: a claim of an epoch copy takes no map latch, since only step 2 writes the image map (§5.6 "Reserve", §13 step 2); and a map page's write releases that page's latch before it latches the parent (§4.1).
+- **Latch scope.** A thread holds frame latches only inside one storage call, and only on one tree's pages. Before the call returns, and before it starts an access to any other tree, it releases every frame latch and every pin it holds. Two exceptions add no wait edge: a `try_latch` acquirer (an eviction victim and its page-local prune, §5.2 and §10.3; an epoch-copy claim, §5.6), which never blocks on a tree latch and under a victim's latch takes only map latches; and a stale root name's first latch (§6.8 "Root names", step (2)), which may land on another tree's page while the thread holds no other latch. Directory pages count as no tree's here: a directory change latches its directory path and then at most one tree's pages, as the order says. No gated operation latches pages of two trees: apply, settle, convert, the GC sweep and index maintenance each work on one tree per gated operation (N2), and a cross-tree check such as an index scan's per-entry verification (C-T6 §8) is a separate call.
+- **Fair latches.** A frame latch is task-fair: a waiting exclusive request blocks new shared grants; a waiter is overtaken by at most a bounded number of later requests, or for a bounded time; and `try_latch` never succeeds over a queued exclusive waiter. Strict FIFO handoff is not required, since it convoys on a write-hot root. `std::sync::RwLock` promises no policy and does not qualify. `parking_lot`'s RwLock blocks new readers behind a writer but unlocks unfairly by default, so A-3b checks the bypass bound against the latch type and version it pins.
+- **No recursive latch.** No thread latches a page it already holds, in either mode. A task-fair latch deadlocks on a recursive shared acquisition behind a queued writer; the latch scope makes one impossible, since no access starts under a latch.
 - **No I/O while holding an exclusive latch on an inner node.** An operation that needs a non-resident page releases its latches, pins the page (loading it), and restarts from the root, re-validating what it saw (PLAN-v3 §3.3). Pins guarantee residency, not identity, so validation re-reads the parent under its latch.
+- **A reader's hold includes no page read.** A reader that needs a non-resident page releases its latches, pins the page and re-descends, as an inner exclusive holder does (above), so a reader's latch hold is CPU-bounded and a gated writer queued on it waits for no I/O. A writer's hold of its leaf may still include a read: on a leaf root, a chain build or free at `ROW_LIMIT` reads MapLeafs in place under the root's exclusive latch (§6.7), which A-5 measures.
 - A frame's latch is never held across a wait on another transaction.
+- **No latch escapes a call.** No store API returns a borrow into a frame, no latch guard outlives the call that took it, and a storage call never yields (an `await`, or an N10 cooperative step boundary) while it holds a latch. `!Send` guards do not enforce this on a single-threaded executor, so `t_latch_scope`'s tracker checks it at every yield point.
+- **Why latching cannot deadlock.** Every holder waits only down the order. A latch-free thread holds nothing, or only the gate while it waits on a latch, and a latch holder never waits on the gate (§5.6), so it is on no cycle. A cursor is parked between calls and holds nothing (§6.6), so no thread reads under a cursor's latches. No thread holds latches of two trees except under the two exceptions above, and neither adds a wait edge. A gated writer latches within one tree, top-down, after the gate. A pin-only holder has no latch edge. A directory change holds the directory path and then at most one tree's pages; the directory ranks first and no ordinary operation latches it, so it waits only on that tree's brief holders. A `try_latch` acquirer never waits on a tree latch, and under a victim's latch it takes only map latches, which rank last. The checkpointer's step 2 waits on a latched frame holding no latch, map latches included (§13); it takes a current MapLeaf's latch only after a written frame's latch, and in the map phase it holds one latch at a time. Among map pages a thread blocks only toward a later radix rank: a claim takes no map latch, since only step 2 writes the image map (§5.6 "Reserve"), so two `write_guard`s that exhaust the reserve while holding MapLeafs never wait on each other's MapLeaf; and a map page's write releases the page's latch before it latches the parent (§4.1). At the pool floor, a thread that holds a latch never waits for an unpin: with no evictable frame it releases its latches and restarts (§5.2), and a reader pins with no latch held (above). A thread that waits for an unpin therefore holds no latch, and its wait is finite only because §5.4 counts every pin any thread can hold, a gate-waiter's restart pins included; that term is card S-1-F7-F2-F2-F2's, so this argument depends on it, and that card lands before A-3b. With one order, no recursive acquisition and no latch held across a call, fair blocking latches add no cycle.
+- **The fairness bound.** A waiter of either mode is granted once the holders present at its arrival have released, plus the bounded bypass, and each hold is bounded by one call's work on one tree, which includes no transaction wait: a batch fill, bounded by A-4e's per-call bound (§6.6); a descent step, CPU-bounded for a reader (above); a writer's critical section, which on a leaf root includes a chain build or free bounded by the maximum value size (§6.7, measured by A-5); and a frame acquisition's victim write. This covers writers and readers alike, every holder shape and writers among themselves, and nothing is exempt. A gated writer blocked on a root delays a pending flip by at most one such hold, as §5.6 already permits for a page read.
 
 ### 5.4 Pins and the minimum pool size
 **Minimum size.** `F ≥ threads × (max tree height + 2) + R_EPOCH + R_MAP`:
@@ -229,7 +236,7 @@ A dirty page may therefore be evicted **at any time**, independently of checkpoi
 - `R_EPOCH` is the epoch-copy reserve (§5.6);
 - `R_MAP` covers the MapLeaf pins of §4.1, bounded by `⌈dirty frames / 510⌉`.
 
-**Below the minimum,** the open is refused with 53200. A thread that cannot pin a frame because every frame is pinned waits for an unpin. The minimum makes that wait finite.
+**Below the minimum,** the open is refused with 53200. A thread that cannot pin a frame because every frame is pinned waits for an unpin. The minimum makes that wait finite. A parked cursor holds no latch and no pin (§6.6), so each thread counts one operation's path and open cursors add nothing to `F`. The wait is finite only if this formula counts every pin a thread can hold while it waits on the gate (§5.3 "Why latching cannot deadlock").
 
 ### 5.5 What lives in the pool
 The pool is the **only** place tree content, overflow content and MapLeaf content live in memory. Versions retained for long readers are tree entries (§7), so under memory pressure they occupy **disk, not RAM**: they are evicted like any other page. This makes X-4's ruling R2 Assumption 1 true by construction: (b) adds no unspillable N16 consumer for long readers (PLAN-v3 §4, "Ruling R2").
@@ -265,6 +272,7 @@ These consumers do **not** grow with the version count or with retention. Each i
 |---|---|
 | page table | O(F) |
 | the root table (§6.8) | O(trees): one entry per directory entry |
+| cursor batch buffers (§6.6) | A-4e's per-call bound per open cursor; R-1 accounts them per session and sets a cap or a spill policy |
 | MapInner pages | ≈ 1/510 of the MapLeaf count |
 | the two free-set bitmaps | 1 bit per slot plus 1 bit per LPID |
 | the pending-free lists (§13 step 6) | ≤ the pages written in one checkpoint interval |
@@ -288,7 +296,7 @@ Reference: `spikes/e0-btree/src/tree.rs` for search, insert, split, latch coupli
 ### 6.2 Latching (I-LATCH)
 - **Writers** use latch coupling (crabbing) with exclusive latches: they release every ancestor once the latched child is *safe*, meaning it has room for one more maximum-size cell (E0's T-COUPLING). Only an operation that changes the directory latches a directory page (§6.8 "Root names"), and it couples down the directory in the same way.
 - **Readers** use shared latches, top-down. They hold the parent while they latch the child.
-- **Order.** Latches are taken in (depth ascending, then left to right among siblings).
+- **Order.** Within one tree, latches are taken in (depth ascending, then left to right among siblings); directory pages come before any tree page and map pages after, in §5.3's order.
 
 The consequence that §4.2 and §6.6 rely on: no thread can reach a page except through a latched parent or a re-descent from the root, so an LPID unlinked under its parent's exclusive latch is unreachable afterwards.
 
