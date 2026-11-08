@@ -10,14 +10,13 @@ import { liftListItem, sinkListItem, splitListItem, wrapInList } from "prosemirr
 import { dropCursor } from "prosemirror-dropcursor";
 import { gapCursor } from "prosemirror-gapcursor";
 import { Marked } from "marked";
-import { schema } from "./editor/schema.js";
+import { isSafeUrl, schema } from "./editor/schema.js";
 import { fromMarkdown, toMarkdown } from "./editor/markdown.js";
 
 const { nodes, marks } = schema;
 
 function start(body) {
   const form = body.form;
-  if ("design" in form.dataset) return;
   const title = form.querySelector("[name=title]");
   const state = document.querySelector("[data-state]");
   const note = document.querySelector("[data-markdown-note]");
@@ -28,7 +27,12 @@ function start(body) {
   const marked = new Marked({ gfm: true, breaks: true });
   const decoder = document.createElement("textarea");
   const decode = (text) => (text.includes("&") ? ((decoder.innerHTML = text), decoder.value) : text);
-  const rendered = (markdown) => marked.parse(markdown).replace(/>\s+</g, "><").trim();
+  // Compared as the browser reads it, so &mdash; and an em dash count as the same text.
+  const normal = document.createElement("template");
+  const rendered = (markdown) => {
+    normal.innerHTML = marked.parse(markdown);
+    return normal.innerHTML.replace(/>\s+</g, "><").trim();
+  };
   function read(markdown) {
     try {
       const doc = fromMarkdown(markdown, (source) => marked.lexer(source), decode);
@@ -49,7 +53,15 @@ function start(body) {
     return EditorState.create({ doc, plugins: plugins(panel) });
   }
 
+  // Images whose upload finished, by the temporary address they were shown under, so an undo and
+  // redo across the upload brings back the saved image, not a dead preview.
+  const uploaded = new Map();
+  let uploading = 0;
+  const countUploads = () => (body.dataset.uploading = String(uploading));
+
   function writeBack(doc) {
+    // The Markdown field is the one being edited now; the hidden visual copy mustn't overwrite it.
+    if (!body.dataset.visual) return;
     body.value = toMarkdown(doc);
     body.dispatchEvent(new Event("input", { bubbles: true }));
   }
@@ -66,7 +78,18 @@ function start(body) {
         dispatchTransaction(tr) {
           const next = view.state.apply(tr);
           view.updateState(next);
-          if (tr.docChanged) writeBack(next.doc);
+          if (tr.docChanged) {
+            const stale = [];
+            next.doc.descendants((node, pos) => {
+              if (node.type === nodes.image && uploaded.has(node.attrs.src)) stale.push(pos);
+            });
+            if (stale.length) {
+              const fix = view.state.tr.setMeta("addToHistory", false);
+              for (const pos of stale) fix.setNodeMarkup(pos, null, { ...next.doc.nodeAt(pos).attrs, src: uploaded.get(next.doc.nodeAt(pos).attrs.src) });
+              return view.dispatch(fix);
+            }
+            writeBack(next.doc);
+          }
           panel.update(view);
         },
         handlePaste: (v, event) => pasted(v, event),
@@ -97,6 +120,10 @@ function start(body) {
   const UNREADABLE = "This text uses Markdown the visual editor can't show without changing it, so it stays as Markdown.";
 
   toggle.addEventListener("click", () => {
+    if (uploading) {
+      fail("Wait for the images to finish uploading.");
+      return;
+    }
     if (body.hidden) {
       showMarkdown();
       try { localStorage.setItem(PREFER, "1"); } catch {}
@@ -151,13 +178,23 @@ function start(body) {
         tr = tr.insert(after, nodes.paragraph.create(null, image));
       }
       v.dispatch(tr.scrollIntoView());
+      uploading += 1;
+      countUploads();
       window.cmsUpload(file).then(
-        ({ url }) => replaceImage(v, local, (attrs) => ({ ...attrs, src: url })),
+        ({ url }) => {
+          uploaded.set(local, url);
+          replaceImage(v, local, (attrs) => ({ ...attrs, src: url }));
+        },
         (error) => {
           replaceImage(v, local, null);
           fail(error.message);
         },
-      ).finally(() => URL.revokeObjectURL(local));
+      ).finally(() => {
+        uploading -= 1;
+        countUploads();
+        // Written out once more, so the saved text has the image even if it arrived while hidden.
+        if (view) writeBack(view.state.doc);
+      });
     }
   }
 
@@ -182,7 +219,7 @@ function start(body) {
     }
     const text = event.clipboardData?.getData("text/plain").trim() ?? "";
     const { from, to, empty } = v.state.selection;
-    if (!empty && /^(https?:\/\/|mailto:)\S+$/.test(text)) {
+    if (!empty && /^(https?:\/\/|mailto:)\S+$/.test(text) && isSafeUrl(text)) {
       v.dispatch(v.state.tr.addMark(from, to, marks.link.create({ href: text })));
       return true;
     }
@@ -260,6 +297,8 @@ function plugins(panel) {
       "Mod-Alt-2": heading(2),
       "Mod-Alt-3": heading(3),
       "Shift-Enter": chainCommands(exitCode, (state, dispatch) => {
+        // A line break inside a heading would split it on the site.
+        if (state.selection.$from.parent.type === nodes.heading) return false;
         dispatch?.(state.tr.replaceSelectionWith(nodes.hard_break.create()).scrollIntoView());
         return true;
       }),
@@ -441,9 +480,16 @@ class Panel {
     const range = state.selection.empty && existing ? existing : { from: state.selection.from, to: state.selection.to };
     const input = Object.assign(document.createElement("input"), { className: "float-input", type: "text", value: existing?.href ?? "", placeholder: "Paste or type a link", spellcheck: false });
     input.setAttribute("aria-label", "Link address");
+    input.addEventListener("input", () => input.setCustomValidity(""));
     const apply = () => {
-      let href = input.value.trim();
+      // Spaces would end a Markdown link early, so they're encoded.
+      let href = input.value.trim().replace(/\s/g, "%20");
       if (href && !/^([a-z][\w+.-]*:|\/|#|\?)/i.test(href)) href = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(href) ? `mailto:${href}` : `https://${href}`;
+      if (href && !isSafeUrl(href)) {
+        input.setCustomValidity("Use a web address, an email address or a path on this site.");
+        input.reportValidity();
+        return;
+      }
       const tr = view.state.tr.removeMark(range.from, range.to, marks.link);
       if (href) tr.addMark(range.from, range.to, marks.link.create({ href }));
       this.mode = null;
@@ -470,7 +516,8 @@ class Panel {
   showImage(sel) {
     const pos = sel.from;
     const node = sel.node;
-    const input = Object.assign(document.createElement("input"), { className: "float-input", type: "text", value: node.attrs.alt, placeholder: "Describe this image for people who can't see it", spellcheck: true });
+    const input = Object.assign(document.createElement("input"), { className: "float-input", type: "text", value: node.attrs.alt, placeholder: "Describe this image", spellcheck: true });
+    input.title = "For people who can't see it, and for search engines";
     input.setAttribute("aria-label", "Image description");
     const save = () => {
       const current = this.view.state.doc.nodeAt(pos);
@@ -536,12 +583,22 @@ class Panel {
 
 const SIZED = /-(\d+)x(\d+)\.(webp|jpe?g|png|avif)$/i;
 
+// A click on an image means "this image": its description takes the typing, which would otherwise
+// replace the image. Arrowing onto it leaves the cursor in the text. The focus moves once the click
+// is over, or the editor would take it back when the button comes up.
+const focusDescription = () => {
+  const field = () => document.querySelector(".float-panel:not([hidden]) .float-input");
+  if (field()) field().focus();
+  else setTimeout(() => field()?.focus());
+};
+
 class ImageView {
   constructor(node, view, getPos) {
     this.dom = document.createElement("span");
     this.dom.className = "image";
     this.img = document.createElement("img");
     this.img.draggable = false;
+    this.img.addEventListener("click", focusDescription);
     this.dom.append(this.img);
     this.badge = Object.assign(document.createElement("span"), { className: "alt-badge", textContent: "Add description" });
     this.badge.addEventListener("mousedown", (event) => {

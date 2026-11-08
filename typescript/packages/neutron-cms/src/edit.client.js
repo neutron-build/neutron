@@ -14,6 +14,7 @@ const PAGE_STYLES = `
   [data-cms-field]:hover { outline: 2px solid rgb(47 128 237 / .6); outline-offset: 2px; }
   [data-cms-field]:focus { outline: 2px solid #2f80ed; outline-offset: 2px; }
   [data-cms-selected] { outline: 1px dashed #2f80ed; outline-offset: 6px; }
+  img[data-cms-field]:not([src]) { display: block; min-width: 120px; min-height: 90px; background: rgb(47 128 237 / .08); outline: 2px dashed rgb(47 128 237 / .6); cursor: pointer; }
   [contenteditable] { cursor: text; }
   [contenteditable]:empty { display: inline-block; min-width: 4em; }
   [contenteditable]:empty::before { content: attr(data-cms-placeholder); opacity: .5; }
@@ -184,7 +185,8 @@ function arrangeTools(key, list) {
         for (const name of ["contenteditable", "data-cms-field", "data-cms-selected", "data-cms-placeholder", "title"]) el.removeAttribute(name);
       }
       for (const el of boundFields(clone)) {
-        if (el.tagName === "IMG") for (const name of ["src", "srcset", "sizes", "width", "height"]) el.removeAttribute(name);
+        // An empty image, not a copy of the last one's description or a broken-image icon.
+        if (el.tagName === "IMG") for (const name of ["src", "srcset", "sizes", "width", "height", "alt"]) el.removeAttribute(name);
         else el.textContent = "";
       }
       selected.after(clone);
@@ -297,8 +299,8 @@ function bindPage() {
   page.addEventListener("keydown", shortcuts);
 }
 
-async function save() {
-  if (saveButton.disabled) return;
+async function save(after) {
+  if (saveButton.disabled) return after?.();
   page.activeElement?.blur?.();
   const lists = {};
   for (const key of touchedLists) {
@@ -317,7 +319,8 @@ async function save() {
     if (!response.ok) return say(result.error ?? "Could not save", true);
     dirty = false;
     justSaved = true;
-    frame.contentWindow.location.reload();
+    if (after) return after();
+    openPage(true);
   } catch {
     say("Offline. Nothing was lost. Try saving again.", true);
   }
@@ -334,33 +337,78 @@ function shortcuts(event) {
   }
 }
 
-frame.addEventListener("load", async () => {
-  const response = await fetch(`${ADMIN}/edit/data`, { headers: { "x-cms": "1" } });
+// The content is read before the page that shows it, never after: a change landing in between then
+// makes the save stale and refused, instead of lining edits up against items the page doesn't show.
+let fresh = null;
+
+async function readData() {
+  let response;
+  try {
+    response = await fetch(`${ADMIN}/edit/data`, { headers: { "x-cms": "1" } });
+  } catch {
+    // Offline, or the page is being left; Safari reports the second as a failure too.
+    say("Couldn't reach the site. Check the connection, then reload.", true);
+    return null;
+  }
   if (response.status === 401) {
     location.href = `${ADMIN}/login`;
-    return;
+    return null;
   }
-  data = await response.json();
+  return response.json();
+}
+
+async function openPage(reload) {
+  fresh = await readData();
+  if (!fresh) return;
+  if (reload) frame.contentWindow.location.reload();
+  else frame.src = frame.dataset.src;
+}
+
+frame.addEventListener("load", async () => {
+  if (!frame.getAttribute("src")) return;
+  // A link followed inside the frame arrives without fresh content, so read it now.
+  data = fresh ?? (await readData());
+  fresh = null;
+  if (!data) return;
   dirty = false;
   touchedTexts = {};
   touchedLists = new Set();
   try {
     if (!frame.contentDocument?.body) throw new Error("blocked");
     bindPage();
-    say(justSaved ? "Saved" : "");
+    // A page whose content comes from elsewhere, such as a README, has nothing to edit here.
+    const editable = page.querySelector("[data-cms-field], [data-cms-item]");
+    saveButton.hidden = discardButton.hidden = !editable;
+    say(justSaved ? "Saved" : editable ? "" : "Nothing on this page is edited here.");
   } catch {
     say("This site doesn't allow being framed. Set X-Frame-Options to SAMEORIGIN and frame-ancestors to 'self'.", true);
   }
   justSaved = false;
 });
 
-saveButton.addEventListener("click", save);
+saveButton.addEventListener("click", () => save());
 
 discardButton.addEventListener("click", () => {
   if (!confirm("Discard your changes?")) return;
   dirty = false;
-  frame.contentWindow.location.reload();
+  openPage(true);
 });
+
+// Publishing a page saves its unsaved edits first, so what goes live is what's on screen.
+const publishForm = document.querySelector(".publish-form");
+publishForm?.addEventListener("submit", (event) => {
+  if (!dirty && !pending) return;
+  event.preventDefault();
+  if (pending) return say("Wait for the images to finish uploading.", true);
+  const submitter = event.submitter;
+  save(() => {
+    // The saved edits aren't changes any more, so leaving for the published page doesn't warn.
+    dirty = false;
+    publishForm.requestSubmit(submitter);
+  });
+});
+
+openPage(false);
 
 addEventListener("keydown", shortcuts);
 addEventListener("beforeunload", (event) => {

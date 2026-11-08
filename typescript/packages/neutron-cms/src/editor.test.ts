@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Marked } from "marked";
+import { renderMarkdown } from "./markdown.js";
 // The visual editor's Markdown, from source: it is bundled for the browser, not compiled with the package.
 import { fromMarkdown, toMarkdown } from "../src/editor/markdown.js";
 
@@ -32,4 +33,26 @@ test("typed angle brackets stay text, never HTML", () => {
   const { schema } = fromMarkdown("", lexer, decode).type;
   const doc = schema.node("doc", null, [schema.node("paragraph", null, [schema.text("<script>alert(1)</script>")])]);
   assert.doesNotMatch(rendered(toMarkdown(doc)), /<script>/);
+});
+
+test("typed text that looks like structure stays text", () => {
+  const { schema } = fromMarkdown("", lexer, decode).type;
+  const para = (...content: Parameters<typeof schema.node>[2][]) => schema.node("paragraph", null, content.flat() as never);
+  const cases = [
+    para(schema.text("1) not a list")),
+    para(schema.text("    not code")),
+    para(schema.text("first"), schema.node("hard_break"), schema.text("# not a heading")),
+    para(schema.text("first"), schema.node("hard_break"), schema.text("2) not a list")),
+  ];
+  for (const paragraph of cases) {
+    const html = rendered(toMarkdown(schema.node("doc", null, [paragraph])));
+    assert.match(html, /^<p>/, html);
+    assert.doesNotMatch(html, /<(ol|ul|pre|h1)>/, html);
+  }
+});
+
+test("links that could run code lose the link, not the words", () => {
+  const md = "[click](javascript:alert(1)) and [ok](https://example.com) and ![x](javascript:1)";
+  assert.match(renderMarkdown(md), /^<p>click and <a href="https:\/\/example\.com">ok<\/a> and x<\/p>/);
+  assert.match(renderMarkdown("<b>hi</b>", { html: false }), /&lt;b&gt;hi&lt;\/b&gt;/);
 });

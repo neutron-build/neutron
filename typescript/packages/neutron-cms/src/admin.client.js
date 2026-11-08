@@ -83,25 +83,32 @@ function startEditor(form) {
   const isDraft = form.dataset.status === "draft";
 
   let dirty = false;
-  let saving = false;
+  let saving = null; // the autosave in flight, if any
   let timer;
+  let uploading = 0;
+  // Images still uploading, here or in the visual editor. Saving now would keep a placeholder or drop the image.
+  const uploads = () => uploading + Number(body.dataset.uploading || 0);
 
+  // The browser copy notes the revision it was written over, and is only removed once that exact text
+  // is saved here: another tab saving its own text must not throw this one's away.
   const store = {
     read() {
       try { return JSON.parse(localStorage.getItem(storageKey)); } catch { return null; }
     },
     write() {
-      try { localStorage.setItem(storageKey, JSON.stringify({ title: title.value, body: body.value })); } catch {}
+      try { localStorage.setItem(storageKey, JSON.stringify({ title: title.value, body: body.value, revision: revision.value })); } catch {}
     },
     clear() {
       try { localStorage.removeItem(storageKey); } catch {}
     },
+    clearIf(saved) {
+      const copy = store.read();
+      if (copy && copy.title === saved.title && copy.body === saved.body) store.clear();
+    },
   };
 
   // Words a reader sees: image addresses, link targets and Markdown marks don't count.
-  const design = "design" in form.dataset;
   const words = () => {
-    if (design) return "";
     const text = body.value
       .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
       .replace(/\]\([^)]*\)/g, " ")
@@ -122,13 +129,22 @@ function startEditor(form) {
     state.append(Object.assign(document.createElement("a"), { href: `${ADMIN}/login`, target: "_blank", textContent: "Log in" }));
   }
 
-  async function autosave() {
-    if (!dirty || saving) return;
-    saving = true;
+  function autosave() {
+    if (!dirty || saving) return saving;
+    if (uploads()) return schedule();
+    saving = run().finally(() => {
+      saving = null;
+      if (dirty && !state.classList.contains("bad")) schedule();
+    });
+    return saving;
+  }
+
+  async function run() {
     dirty = false;
     syncDate();
     const data = new FormData(form);
     data.set("intent", "save");
+    const sent = { title: title.value, body: body.value };
     show("Saving…");
     try {
       const response = await cms(`posts/${form.dataset.editor}`, data);
@@ -144,15 +160,13 @@ function startEditor(form) {
         show(result.message ?? "Could not save", true);
       } else {
         revision.value = result.revision;
-        if (!dirty) store.clear();
-        show(design ? "Saved" : `Saved, ${words()}`);
+        if (!dirty) store.clearIf(sent);
+        show(`Saved, ${words()}`);
       }
     } catch {
       dirty = true;
       show("Offline. Your text is safe in this browser.", true);
     }
-    saving = false;
-    if (dirty && !state.classList.contains("bad")) schedule();
   }
 
   function schedule() {
@@ -163,14 +177,14 @@ function startEditor(form) {
   function changed() {
     dirty = true;
     store.write();
-    show(isDraft ? words() : design ? "Unsaved changes" : `Unsaved changes, ${words()}`);
+    show(isDraft ? words() : `Unsaved changes, ${words()}`);
     schedule();
   }
 
   // Where the browser can't size a textarea to its text, do it here, or long text would be cut off.
   const fits = CSS.supports("field-sizing", "content");
   function fit(area) {
-    if (fits) return;
+    if (fits || area.hidden) return;
     const scroll = scrollY;
     area.style.height = "auto";
     area.style.height = `${area.scrollHeight}px`;
@@ -247,11 +261,24 @@ function startEditor(form) {
 
   // Safari silently refuses to send a form with a half-typed date, so say what's wrong instead.
   form.addEventListener("submit", (event) => {
-    if (local.validity.badInput && event.submitter?.value !== "delete") {
+    const intent = event.submitter?.value;
+    if (local.validity.badInput && intent !== "delete") {
       event.preventDefault();
       setMeta(true);
       local.focus();
       show("Finish the publish date, or clear it.", true);
+      return;
+    }
+    if (uploads() && intent !== "delete") {
+      event.preventDefault();
+      show("Wait for the images to finish uploading.", true);
+      return;
+    }
+    // An autosave on its way would change the revision under this request: let it land, then send.
+    if (saving) {
+      event.preventDefault();
+      const submitter = event.submitter;
+      saving.then(() => form.requestSubmit(submitter));
       return;
     }
     clearTimeout(timer);
@@ -272,10 +299,19 @@ function startEditor(form) {
     history.replaceState(null, "", url);
   }
 
+  // A refused save shows the submitted text, which isn't saved anywhere yet.
+  if ($("[role=alert]", form)) {
+    dirty = true;
+    store.write();
+  }
+
   const copy = store.read();
   if (copy && (copy.title !== title.value || copy.body !== body.value)) {
     const banner = $("[data-restore]");
     banner.hidden = false;
+    if (copy.revision && copy.revision !== revision.value) {
+      banner.firstChild.textContent = "This browser has unsaved text for this post, written before its last change elsewhere. Restoring replaces that newer version. ";
+    }
     $("[data-restore-yes]", banner).addEventListener("click", () => {
       title.value = copy.title;
       body.value = copy.body;
@@ -307,25 +343,33 @@ function startEditor(form) {
     if (start === end) body.setSelectionRange(start + before.length, start + before.length);
   }
 
+  let markers = 0;
   async function addImages(files) {
     if (body.dataset.visual) {
       body.dispatchEvent(new CustomEvent("cms:images", { detail: files }));
       return;
     }
     for (const file of files) {
-      const marker = `![Uploading ${file.name || "image"}…]()`;
+      const marker = `![Uploading ${file.name || "image"} ${++markers}…]()`;
       const lead = body.selectionStart > 0 && body.value[body.selectionStart - 1] !== "\n" ? "\n\n" : "";
       insert(`${lead}${marker}\n\n`);
+      uploading += 1;
+      // Replaced where it stands, so the cursor and the rest of the text stay put.
+      const swap = (text, withBreak = false) => {
+        const target = withBreak ? `${marker}\n\n` : marker;
+        const at = body.value.indexOf(target);
+        if (at >= 0) body.setRangeText(text, at, at + target.length, "preserve");
+      };
       try {
         const { url } = await uploadImage(file);
-        body.value = body.value.replace(marker, `![](${url})`);
-        fit(body);
-        changed();
+        swap(`![](${url})`);
       } catch (error) {
-        body.value = body.value.replace(`${marker}\n\n`, "");
-        changed();
+        swap("", true);
         show(error.message, true);
       }
+      uploading -= 1;
+      fit(body);
+      changed();
     }
   }
 
@@ -357,7 +401,7 @@ function startEditor(form) {
     if (images.length) addImages(images);
   });
 
-  $("[data-add-image]")?.addEventListener("click", async () => {
+  $("[data-add-image]").addEventListener("click", async () => {
     addImages(await pickImages());
   });
 
@@ -385,7 +429,7 @@ function startEditor(form) {
 
   // Preview: the server's renderer, in a sandbox.
 
-  $("[data-toggle-preview]")?.addEventListener("click", async (event) => {
+  $("[data-toggle-preview]").addEventListener("click", async (event) => {
     const button = event.currentTarget;
     const opening = frame.hidden;
     if (opening) {
@@ -474,8 +518,11 @@ $$("[data-list]").forEach((form) => {
         $("button", field).textContent = "Replace";
       } catch (error) {
         problem = `${file.name}: ${error.message}`;
+        // Only a row made for this photo goes; a row with words already typed keeps them.
+        const row = field.closest(".item");
         if (input.value) image.src = previous;
-        else field.closest(".item").remove();
+        else if (row.dataset.forPhoto) row.remove();
+        else image.removeAttribute("src");
       }
       URL.revokeObjectURL(preview);
       pending -= 1;
@@ -483,7 +530,11 @@ $$("[data-list]").forEach((form) => {
     });
   }
 
-  const addPhotos = (files) => files.forEach((file) => upload($(".image-field", addRow()), file));
+  const addPhotos = (files) => files.forEach((file) => {
+    const row = addRow();
+    row.dataset.forPhoto = "1";
+    upload($(".image-field", row), file);
+  });
 
   form.addEventListener("input", changed);
 

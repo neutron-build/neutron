@@ -158,24 +158,42 @@ export const postBySlug = (slug: string, kind: Kind = "post") =>
   db().prepare("SELECT * FROM posts WHERE slug = ? AND kind = ?").get(slug, kind) as Post | undefined;
 
 /**
- * Every design has a page: a draft is made for one that has none. A page already at the design's
- * address, such as one imported from an older site, becomes the design's page and keeps its state.
+ * Every design has a page: a draft is made for one that has none (published, for one that starts so).
+ * A page already at the design's address, such as one imported from an older site, becomes the
+ * design's page and keeps its state. A permanent design's page is always published. Writes only
+ * when something is missing, so reads stay reads.
  */
 export function ensureDesigns(given: Record<string, string | { title: string; published?: boolean; permanent?: boolean }>): void {
   const designs = Object.fromEntries(Object.entries(given).map(([key, value]) => [key, typeof value === "string" ? { title: value } : value])) as Record<string, { title: string; published?: boolean; permanent?: boolean }>;
-  const keys = Object.keys(designs);
-  if (!keys.length) return;
-  const byLayout = db().prepare("SELECT id FROM posts WHERE kind = 'page' AND layout = ?");
+  const byLayout = db().prepare("SELECT * FROM posts WHERE kind = 'page' AND layout = ?");
+  const needs = Object.entries(designs).filter(([key, design]) => {
+    const page = byLayout.get(key) as unknown as Post | undefined;
+    return !page || (design.permanent && !isLive(page));
+  });
+  if (!needs.length) return;
   transaction(() => {
-    for (const key of keys) {
-      if (designs[key].permanent) db().prepare("UPDATE posts SET published_at = ? WHERE kind = 'page' AND layout = ? AND (published_at IS NULL OR published_at > ?)").run(now(), key, now());
-      if (byLayout.get(key)) continue;
-      const atAddress = postBySlug(key, "page") ?? (db().prepare("SELECT * FROM posts WHERE slug = ?").get(key) as Post | undefined);
-      const live = designs[key].published || designs[key].permanent ? now() : null;
-      if (atAddress?.kind === "page") db().prepare("UPDATE posts SET layout = ? WHERE id = ?").run(key, atAddress.id);
-      else db().prepare("INSERT INTO posts (slug, title, kind, layout, published_at, updated_at) VALUES (?, ?, 'page', ?, ?, ?)").run(atAddress ? null : key, designs[key].title, key, live, now());
+    for (const [key, design] of needs) {
+      let page = byLayout.get(key) as unknown as Post | undefined;
+      if (!page) {
+        const atAddress = db().prepare("SELECT * FROM posts WHERE slug = ?").get(key) as Post | undefined;
+        if (atAddress?.kind === "page") {
+          db().prepare("UPDATE posts SET layout = ? WHERE id = ?").run(key, atAddress.id);
+        } else {
+          // A post at this address keeps it; the design's page has none until the post moves.
+          const live = design.published || design.permanent ? now() : null;
+          db().prepare("INSERT INTO posts (slug, title, kind, layout, published_at, updated_at) VALUES (?, ?, 'page', ?, ?, ?)").run(atAddress ? null : key, design.title, key, live, now());
+        }
+        page = byLayout.get(key) as unknown as Post;
+      }
+      if (design.permanent && !isLive(page)) db().prepare("UPDATE posts SET published_at = ? WHERE id = ?").run(now(), page.id);
     }
   });
+}
+
+/** "New post" makes a draft at once; one left empty for an hour was never wanted. */
+export function removeAbandonedDrafts(): void {
+  const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
+  db().prepare("DELETE FROM posts WHERE published_at IS NULL AND layout = '' AND title = '' AND body = '' AND description = '' AND updated_at < ?").run(hourAgo);
 }
 
 export function createPost(fields: Partial<PostFields> & { updated_at?: string } = {}): number {
@@ -200,22 +218,34 @@ export function slugify(title: string): string {
  * Saves only when `revision` still matches, so a stale tab cannot overwrite newer text.
  * A live post keeps its slug, because changing it would break every link to it.
  */
+/** Now, or a moment later than `previous`: a revision must change on every save, even two in the same millisecond. */
+function after(previous: string): string {
+  const stamp = now();
+  return stamp > previous ? stamp : new Date(Date.parse(previous) + 1).toISOString();
+}
+
 export function savePost(id: number, fields: PostFields, revision: string, reservedSlugs: string[] = []): SaveResult {
   return transaction<SaveResult>(() => {
     const current = getPost(id);
     if (!current) return { ok: false, error: "missing" };
     if (current.updated_at !== revision) return { ok: false, error: "stale" };
 
+    const taken = (candidate: string) =>
+      reservedSlugs.includes(candidate) || Boolean(db().prepare("SELECT 1 FROM posts WHERE slug = ? AND id <> ?").get(candidate, id));
     let slug = isLive(current) ? current.slug : slugify(fields.slug ?? "") || null;
-    if (!slug && fields.published_at) slug = slugify(fields.title) || `post-${id}`;
-    if (slug && reservedSlugs.includes(slug)) return { ok: false, error: "slug-reserved" };
-    if (slug && db().prepare("SELECT 1 FROM posts WHERE slug = ? AND id <> ?").get(slug, id)) {
-      return { ok: false, error: "slug-taken" };
+    if (!slug && fields.published_at) {
+      // An address made from the title steps aside, as WordPress does: "notes", then "notes-2".
+      const base = slugify(fields.title) || `post-${id}`;
+      slug = base;
+      for (let n = 2; taken(slug); n++) slug = `${base}-${n}`;
     }
+    // One chosen by hand is never changed behind the owner's back.
+    if (slug && reservedSlugs.includes(slug)) return { ok: false, error: "slug-reserved" };
+    if (slug && taken(slug)) return { ok: false, error: "slug-taken" };
 
     db()
       .prepare("UPDATE posts SET slug = ?, title = ?, description = ?, label = ?, body = ?, published_at = ?, updated_at = ? WHERE id = ?")
-      .run(slug, fields.title, fields.description, fields.label ?? current.label, fields.body.replace(/\r\n?/g, "\n"), fields.published_at, now(), id);
+      .run(slug, fields.title, fields.description, fields.label ?? current.label, fields.body.replace(/\r\n?/g, "\n"), fields.published_at, after(current.updated_at), id);
     return { ok: true, post: getPost(id)! };
   });
 }

@@ -8,10 +8,11 @@ import {
 import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
+import { isSafeUrl } from "./safe-url.js";
 import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
 import { Document, EditorPage, EditPage, type DesignedPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deletePost, ensureDesigns, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
+  allPosts, allTexts, createPost, deletePost, ensureDesigns, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
   sortByDate, type Item, type Post,
 } from "./store.js";
 
@@ -56,14 +57,32 @@ function parseDate(value: string): string | null {
 }
 
 /** The first thing wrong with these rows, in words the editor can act on. */
+/** A link typed the way people type them, "fylun.ai" or "me@site.com", made into one that works. */
+function completeUrl(value: string): string {
+  if (/^[^\s@/:]+@[^\s@/]+\.[a-z]{2,}$/i.test(value)) return `mailto:${value}`;
+  if (/^(www\.)?[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}([/?#]\S*)?$/i.test(value)) return `https://${value}`;
+  return value;
+}
+
+const isLinkTarget = (value: string) => /^(https?:\/\/[^\s/]+\S*|mailto:\S+|tel:\S+|[/#?]\S*)$/i.test(value) && isSafeUrl(value);
+
+/** Completes typed links in place, then names the first row that can't be saved, and why. */
 function problemWith(list: ResolvedList, items: Item[]): string | null {
   const fields = Object.entries(list.fields);
-  const required = fields.filter(([, field]) => field.required);
-  if (items.some((item) => required.some(([key]) => !item[key]))) {
-    return `Every row needs ${required.map(([, field]) => field.label.toLowerCase()).join(" and ")}.`;
+  for (const item of items) {
+    for (const [key, field] of fields) if (field.type === "url" && item[key]) item[key] = completeUrl(item[key]);
   }
-  for (const [key, field] of fields) {
-    if (field.type === "date" && items.some((item) => item[key] && !isDate(item[key]))) return `${field.label} must be a real date.`;
+  for (const [index, item] of items.entries()) {
+    const row = items.length > 1 ? `Row ${index + 1}: ` : "";
+    const missing = fields.filter(([key, field]) => field.required && !item[key]).map(([, field]) => field.label);
+    if (missing.length) return `${row}add ${missing.join(" and ")}.`;
+    for (const [key, field] of fields) {
+      const value = item[key];
+      if (!value) continue;
+      if (field.type === "date" && !isDate(value)) return `${row}${field.label} must be a real date.`;
+      if (field.type === "url" && !isLinkTarget(value)) return `${row}"${value}" isn't a link. Use a web address such as https://example.com, or a path such as /about/.`;
+      if (field.type === "image" && !isSafeUrl(value)) return `${row}${field.label} isn't an image address.`;
+    }
   }
   return null;
 }
@@ -103,8 +122,11 @@ export function createHandler(config: ResolvedConfig) {
 
   function postsPage(kind: "post" | "page" = "post") {
     if (kind === "page") ensureDesigns(config.designs);
+    removeAbandonedDrafts();
     const at = new Date().toISOString();
-    const posts = allPosts(kind).map((post) => ({
+    // Pages that are always there, such as the homepage, lead the list.
+    const first = (post: Post) => (kind === "page" && designOf(post)?.permanent ? 0 : 1);
+    const posts = allPosts(kind).sort((a, b) => first(a) - first(b)).map((post) => ({
       id: post.id,
       title: post.title,
       date: post.published_at ?? post.updated_at,
@@ -123,27 +145,35 @@ export function createHandler(config: ResolvedConfig) {
     return first ? redirect(`${admin}/lists/${first}`) : page("Nothing to edit", <NotFoundPage config={config} />);
   }
 
+  /** Where to go after logging in: only somewhere inside the admin, never another site. */
+  const backTo = (next: string | null) =>
+    next && next.startsWith(`${admin}/`) && !next.startsWith(`${admin}/login`) && !/[\\\s]|\/\//.test(next) ? next : null;
+
   async function login(request: Request) {
     const hash = passwordHash();
     if (request.method !== "POST") {
-      if (hasSession(request)) return redirect(admin);
-      return page("Log in", <LoginPage config={config} configured={Boolean(hash)} />);
+      const next = backTo(new URL(request.url).searchParams.get("next"));
+      if (hasSession(request)) return redirect(next ?? admin);
+      return page("Log in", <LoginPage config={config} configured={Boolean(hash)} next={next} />);
     }
-    const refuse = (error: string, status = 200) => page("Log in", <LoginPage config={config} configured={Boolean(hash)} error={error} />, status);
+    let next: string | null = null;
+    const refuse = (error: string, status = 200) => page("Log in", <LoginPage config={config} configured={Boolean(hash)} error={error} next={next} />, status);
     if (!hash) return refuse("No password is set.");
 
     const client = clientAddress(request);
     if (!takeAttempt(client)) return refuse("Too many attempts. Try again in 15 minutes.");
 
     const raw = await readLimited(request, 4096);
-    const password = raw === null ? null : new URLSearchParams(raw).get("password");
+    const fields = new URLSearchParams(raw ?? "");
+    next = backTo(fields.get("next"));
+    const password = raw === null ? null : fields.get("password");
     if (!password) return refuse("Wrong password.");
     const verified = await withPasswordCheck(() => verifyPassword(password, hash));
     if (verified === "busy") return refuse("The server is busy. Try again in a moment.", 503);
     if (!verified) return refuse("Wrong password.");
 
     clearAttempts(client);
-    return redirect(admin, sessionCookie(createSession(hash), admin));
+    return redirect(next ?? admin, sessionCookie(createSession(hash), admin));
   }
 
   async function upload(request: Request) {
@@ -194,8 +224,13 @@ export function createHandler(config: ResolvedConfig) {
   function designedPage(post: Post) {
     const design = designOf(post)!;
     const address = design.url ?? (post.slug ? config.pageUrl(post.slug) : null);
-    if (!address) return notFound();
-    const src = isLive(post) ? address : `${address}?cms-preview=${encodeURIComponent(previewToken(design.url ? post.layout : post.slug!))}`;
+    if (!address) {
+      const taken = allPosts("post").find((other) => other.slug === post.layout);
+      return page(post.title || "Page", (
+        <EditPage config={config} back={{ href: `${admin}/pages`, label: "Pages" }} notice={`This page belongs at /${post.layout}/, but the post "${taken?.title || "Untitled"}" is using that address. Change that post's URL in its Settings, then come back.`} />
+      ));
+    }
+    const src = isLive(post) ? address : `${address}?cms-preview=${encodeURIComponent((design.url ? previewToken("design", post.layout) : previewToken("page", post.slug!)))}`;
     const state: DesignedPage = { id: post.id, status: statusOf(post), revision: post.updated_at, permanent: design.permanent };
     return page(post.title || "Page", <EditPage config={config} src={src} back={{ href: `${admin}/pages`, label: "Pages" }} page={state} />);
   }
@@ -208,7 +243,6 @@ export function createHandler(config: ResolvedConfig) {
       if (isDesign(post)) return designedPage(post);
       return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={saved} />);
     }
-    // A designed page keeps its body, which its design doesn't show, whatever the form sends.
 
     const form = await request.formData();
     const read = (name: string) => String(form.get(name) ?? "");
@@ -224,6 +258,7 @@ export function createHandler(config: ResolvedConfig) {
 
     const date = parseDate(read("date") || read("date_local"));
     const published_at =
+      design?.permanent ? (isLive(post) ? post.published_at : new Date().toISOString()) :
       intent === "publish" ? (date ?? new Date().toISOString()) :
       intent === "unpublish" ? null :
       post.published_at === null ? null : (date ?? post.published_at);
@@ -233,13 +268,18 @@ export function createHandler(config: ResolvedConfig) {
       ? { title: post.title, description: post.description, label: post.label, body: post.body, slug: post.slug ?? "", published_at }
       : { title: read("title").trim(), description: read("description").trim(), label: read("label").trim(), body: read("body"), slug: read("slug"), published_at };
 
+    if (intent === "publish" && !design && !fields.title) {
+      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={false} error="Add a title before publishing." fields={fields} revision={read("revision")} />);
+    }
+
     // A design owns its address, even one the site reserves for its own routes.
     const result = savePost(id, fields, read("revision"), design ? [] : config.reservedSlugs);
     if (!result.ok) {
       const message = SAVE_ERRORS[result.error];
       if (script) return Response.json({ ok: false, error: result.error, message }, { status: 409 });
       if (design) return redirect(`${admin}/posts/${id}`);
-      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={false} error={message} fields={fields} />);
+      // Keep the revision this form was opened at: the current one would let a second press overwrite the newer text.
+      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={false} error={message} fields={fields} revision={read("revision")} />);
     }
     if (script) return Response.json({ ok: true, revision: result.post.updated_at, slug: result.post.slug });
     return redirect(`${admin}/posts/${id}?saved=1`);
@@ -259,8 +299,9 @@ export function createHandler(config: ResolvedConfig) {
 
     const definition = Object.hasOwn(config.lists, key) ? config.lists[key] : undefined;
     if (!definition) return notFound();
-    const show = (items: Item[], error?: string) =>
-      page(definition.label, <ListPage config={config} listKey={key} items={items} revision={listRevision(key)} saved={showsSaved && !error} error={error} />);
+    // A refused save keeps the revision it was made from, so pressing Save again can't overwrite a newer list.
+    const show = (items: Item[], error?: string, revision = listRevision(key)) =>
+      page(definition.label, <ListPage config={config} listKey={key} items={items} revision={revision} saved={showsSaved && !error} error={error} />);
     if (request.method !== "POST") return show(listItems(key));
 
     const form = await request.formData();
@@ -271,10 +312,11 @@ export function createHandler(config: ResolvedConfig) {
     const items = definition.sortBy ? sortByDate(filled, definition.sortBy) : filled;
 
     // A refused save shows what was submitted, so no work is lost.
+    const submitted = String(form.get("revision") ?? "");
     const problem = problemWith(definition, items);
-    if (problem) return show(items, problem);
-    if (items.length === 0 && form.get("confirm_empty") !== "1") return show(items, `${definition.label} was not cleared. Confirm to remove everything.`);
-    if (!replaceItems(key, items, String(form.get("revision") ?? "")).ok) return show(items, `${definition.label} changed elsewhere. Copy anything you need, then reload.`);
+    if (problem) return show(items, problem, submitted);
+    if (items.length === 0 && form.get("confirm_empty") !== "1") return show(items, `${definition.label} was not cleared. Confirm to remove everything.`, submitted);
+    if (!replaceItems(key, items, submitted).ok) return show(items, `${definition.label} changed elsewhere. Copy anything you need, then reload.`, submitted);
     return saved();
   }
 
@@ -364,7 +406,10 @@ export function createHandler(config: ResolvedConfig) {
     const isLogin = segments.length === 1 && segments[0] === "login";
     if (!isLogin && !hasSession(request)) {
       if (isScript(request)) return Response.json({ error: "signed-out" }, { status: 401 });
-      return redirect(`${admin}/login`);
+      // Back to the same page after logging in.
+      const here = new URL(request.url);
+      const next = request.method === "GET" && segments.length ? `?next=${encodeURIComponent(here.pathname + here.search)}` : "";
+      return redirect(`${admin}/login${next}`);
     }
 
     const response = await route(request, segments);

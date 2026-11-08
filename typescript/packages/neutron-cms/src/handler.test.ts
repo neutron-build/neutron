@@ -78,7 +78,7 @@ test("every admin address is gated; only login, styles and images are public", a
   for (const path of ["/n-admin/edit", "/n-admin/edit/data", "/n-admin/edit.js", "/n-admin", "/n-admin/lists/gallery", "/n-admin/lists/text", "/n-admin/posts/1", "/n-admin/admin.js", "/n-admin/login/x", "/n-admin/media/a/b", "/n-admin/nope"]) {
     const response = await call(path);
     assert.equal(response.status, 303, path);
-    assert.equal(response.headers.get("location"), "/n-admin/login", path);
+    assert.match(response.headers.get("location")!, /^\/n-admin\/login(\?next=%2Fn-admin[^/]*)?$/, path);
   }
   assert.equal((await call("/n-admin/login")).status, 200);
   assert.equal((await call("/n-admin/admin.css")).status, 200);
@@ -156,7 +156,7 @@ test("a list saves in order and a refused save keeps what was typed", async () =
   const revision = revisionOf(page);
   const save = (rows: Record<string, string[]>, extra = {}) => call("/n-admin/lists/links", { method: "POST", cookie, body: form({ revision, ...rows, ...extra }) });
 
-  assert.match(await (await save({ "f.label": ["keep me"], "f.url": [""] })).text(), /Every row needs label and url[\s\S]*value="keep me"/);
+  assert.match(await (await save({ "f.label": ["keep me"], "f.url": [""] })).text(), /add URL\.[\s\S]*value="keep me"/);
   assert.match(await (await save({})).text(), /was not cleared/);
   assert.equal((await save({ "f.label": ["b", "a"], "f.url": ["https://b.test", "https://a.test"] })).status, 303);
   assert.deepEqual(cms.list("links").map((item) => item.label), ["b", "a"]);
@@ -546,4 +546,59 @@ test("a homepage design is always published, answers only at its own address, an
   const src = edit.match(/src="([^"]+)"[^>]*data-edit-frame/)![1].replace(/&amp;/g, "&");
   assert.match(src, /^\/gpg\/\?cms-preview=/);
   assert.equal(site.design("gpg", new Request(SITE + src))?.title, "GPG");
+});
+
+test("a refused save can't be pressed again to overwrite the newer text", async () => {
+  const cookie = await logIn();
+  const path = (await call("/n-admin", { method: "POST", cookie })).headers.get("location")!;
+  const opened = (await (await call(path, { cookie })).text()).match(/name="revision" value="([^"]+)"/)![1];
+  // Another tab saves first.
+  assert.equal((await call(path, { method: "POST", cookie, body: form({ intent: "save", title: "B", body: "newer", revision: opened }) })).status, 303);
+  // This tab's save is refused, and the page it gets back must still carry the old revision.
+  const refused = await (await call(path, { method: "POST", cookie, body: form({ intent: "save", title: "A", body: "older", revision: opened }) })).text();
+  assert.match(refused, /changed elsewhere|Changed elsewhere|no longer/i);
+  const again = refused.match(/name="revision" value="([^"]+)"/)![1];
+  assert.equal(again, opened);
+  await call(path, { method: "POST", cookie, body: form({ intent: "save", title: "A", body: "older", revision: again }) });
+  const id = Number(path.split("/").pop());
+  assert.equal((db().prepare("SELECT body FROM posts WHERE id = ?").get(id) as { body: string }).body, "newer");
+});
+
+test("typed links are completed, and a bad one names its row", async () => {
+  const cookie = await logIn();
+  const page = await (await call("/n-admin/lists/links", { cookie })).text();
+  const revision = page.match(/name="revision" value="([^"]*)"/)![1];
+  const save = (labels: string[], urls: string[]) => {
+    const body = new URLSearchParams({ revision });
+    labels.forEach((label, i) => { body.append("f.label", label); body.append("f.url", urls[i]); });
+    return call("/n-admin/lists/links", { method: "POST", cookie, body });
+  };
+  assert.match(await (await save(["a", "b"], ["https://a.test", "fylun dot ai"])).text(), /Row 2: &quot;fylun dot ai&quot; isn't a link/);
+  assert.match(await (await save(["a"], ["javascript:alert(1)"])).text(), /isn.{1,6}t a link/);
+  assert.equal((await save(["a", "b", "c"], ["fylun.ai", "me@site.com", "/about/"])).status, 303);
+  assert.deepEqual(cms.list("links").map((item) => item.url), ["https://fylun.ai", "mailto:me@site.com", "/about/"]);
+});
+
+test("after a lapsed session, logging in returns to the page you were on, and only inside the admin", async () => {
+  const away = await call("/n-admin/posts/1");
+  assert.equal(away.headers.get("location"), "/n-admin/login?next=%2Fn-admin%2Fposts%2F1");
+  assert.match(await (await call("/n-admin/login?next=%2Fn-admin%2Fposts%2F1")).text(), /name="next" value="\/n-admin\/posts\/1"/);
+  assert.doesNotMatch(await (await call("/n-admin/login?next=https%3A%2F%2Fevil.test")).text(), /name="next"/);
+  assert.doesNotMatch(await (await call("/n-admin/login?next=%2F%2Fevil.test")).text(), /name="next"/);
+});
+
+test("a title-made address steps aside for one in use; publishing needs a title", async () => {
+  const cookie = await logIn();
+  const open = async () => {
+    const path = (await call("/n-admin", { method: "POST", cookie })).headers.get("location")!;
+    const revision = (await (await call(path, { cookie })).text()).match(/name="revision" value="([^"]+)"/)![1];
+    return { path, revision };
+  };
+  const first = await open();
+  await call(first.path, { method: "POST", cookie, body: form({ intent: "publish", title: "Notes", body: "x", revision: first.revision }) });
+  const second = await open();
+  assert.equal((await call(second.path, { method: "POST", cookie, body: form({ intent: "publish", title: "Notes", body: "y", revision: second.revision }) })).status, 303);
+  assert.ok(cms.post("notes-2"));
+  const third = await open();
+  assert.match(await (await call(third.path, { method: "POST", cookie, body: form({ intent: "publish", title: "", body: "z", revision: third.revision }) })).text(), /Add a title before publishing/);
 });

@@ -41,7 +41,7 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
      */
     page: (slug: string, request?: Request): Post | undefined => {
       withDesigns();
-      const found = livePostBySlug(slug, "page") ?? (request && isPreview(slug, new URL(request.url).searchParams.get("cms-preview")) ? postBySlug(slug, "page") : undefined);
+      const found = livePostBySlug(slug, "page") ?? (request && isPreview("page", slug, new URL(request.url).searchParams.get("cms-preview")) ? postBySlug(slug, "page") : undefined);
       // A design with its own address answers only there.
       return found && config.designs[found.layout]?.url && Object.hasOwn(config.designs, found.layout) ? undefined : found;
     },
@@ -54,7 +54,7 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
       const found = designPage(key);
       if (!found) return undefined;
       if (isLive(found)) return found;
-      return request && isPreview(key, new URL(request.url).searchParams.get("cms-preview")) ? found : undefined;
+      return request && isPreview("design", key, new URL(request.url).searchParams.get("cms-preview")) ? found : undefined;
     },
     /** A list's items, in their saved order. */
     list: (key: keyof Lists & string): Item[] => listItems(key),
@@ -62,6 +62,8 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
     upcoming: (key: keyof Lists & string): Item[] => upcoming(listItems(key), dateField(key), today(config.timeZone)),
     /** A text field's value, or an empty string. */
     text: (key: string): string => allTexts()[key] ?? "",
+    /** Every text field at once, for a page that shows many. */
+    texts: (): Record<string, string> => allTexts(),
     /** False when the database is missing, as it is on a lost volume. Use it as a deploy health check. */
     ready(): boolean {
       try {

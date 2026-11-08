@@ -26,5 +26,6 @@ const editor = await build({
 const assets = { ADMIN_CSS: read("admin.css"), ADMIN_JS: read("admin.client.js"), EDIT_JS: read("edit.client.js"), EDITOR_JS: editor.outputFiles[0].text };
 writeFileSync(
   new URL("../src/assets.generated.ts", import.meta.url),
-  Object.entries(assets).map(([name, text]) => `export const ${name} = ${JSON.stringify(text)};\n`).join(""),
+  // Typed as string, or the declaration file would carry each bundle again as a literal type.
+  Object.entries(assets).map(([name, text]) => `export const ${name}: string = ${JSON.stringify(text)};\n`).join(""),
 );

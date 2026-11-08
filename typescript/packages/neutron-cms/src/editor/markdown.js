@@ -1,7 +1,7 @@
 // Markdown in and out of the visual editor. It reads with the same parser the site renders with,
 // so what the editor shows is what visitors see. Whatever it can't show stays as a raw block,
 // written back exactly as it came in.
-import { MarkdownSerializer, defaultMarkdownSerializer as base } from "prosemirror-markdown";
+import { MarkdownSerializer, MarkdownSerializerState, defaultMarkdownSerializer as base } from "prosemirror-markdown";
 import { schema } from "./schema.js";
 
 class Unsupported extends Error {}
@@ -116,6 +116,14 @@ const serializer = new MarkdownSerializer(
     bullet_list(state, node) {
       state.renderList(node, "  ", () => "- ");
     },
+    // After a line break the text starts a line, where "# ", "- " or "1. " would start a heading or a list.
+    text(state, node, parent, index) {
+      if (state.inAutolink || index === 0 || parent.child(index - 1).type.name !== "hard_break") return state.text(node.text, !state.inAutolink);
+      const text = node.text.replace(/^[ \t]+/, "");
+      const start = text.match(/^(#{1,6}(?=\s|$)|[-+*>](?=\s)|\d+(?=[.)]\s))/)?.[0] ?? "";
+      if (start) state.text(/^\d/.test(start) ? `${start}\\` : `\\${start}`, false);
+      state.text(text.slice(start.length), true);
+    },
   },
   {
     em: { open: "*", close: "*", mixable: true, expelEnclosingWhitespace: true },
@@ -127,5 +135,14 @@ const serializer = new MarkdownSerializer(
   // Typed "<" is text, not the start of HTML.
   { escapeExtraCharacters: /[<]/g },
 );
+
+// Line starts that marked reads as structure but the stock escaping lets through: "1) " starts a list,
+// and leading spaces or a tab can start a code block. Leading spaces never show in a page anyway.
+const esc = MarkdownSerializerState.prototype.esc;
+MarkdownSerializerState.prototype.esc = function (text, startOfLine = false) {
+  let out = esc.call(this, text, startOfLine);
+  if (startOfLine) out = out.replace(/^[ \t]+/, "").replace(/^(\d+)\)/, "$1\\)");
+  return out;
+};
 
 export const toMarkdown = (doc) => serializer.serialize(doc, { tightLists: true });

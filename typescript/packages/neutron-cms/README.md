@@ -61,13 +61,14 @@ export default function Page({ data }) {
 |---|---|
 | `cms.posts()` | Published posts, newest first |
 | `cms.post(slug)` | One published post |
-| `cms.pages()`, `cms.page(slug)` | Published pages, with `pages: true` |
+| `cms.pages()`, `cms.page(slug, request?)` | Published pages; with the request, a designed draft opened from the admin too |
+| `cms.design(key, request?)` | The page of a design with a fixed address, such as a homepage; undefined while unpublished, so answer 404 |
 | `cms.list(key)` | A list's items, in saved order |
 | `cms.upcoming(key)` | A dated list through today |
-| `cms.text(key)` | One text field |
+| `cms.text(key)`, `cms.texts()` | One text field, or all of them at once |
 | `cms.ready()` | False if the database is missing |
 
-Post bodies are Markdown, written in a visual editor: headings, lists, links and images show as they will look, a toolbar appears over selected text, typed Markdown such as `## ` or `**bold**` turns into formatting, and clicking an image asks for its description. The editor reads with the same parser the site renders with and refuses any round trip that would change the page, so HTML and anything else it can't draw stays as an editable source block; a post it can't show exactly opens as Markdown. Settings has a switch to write in Markdown instead. `renderMarkdown`, `summarize` and `firstImage` are exported for showing them. Your site chooses the post URLs, so post pages, feeds and sitemaps are ordinary routes.
+Post bodies are Markdown, written in a visual editor: headings, lists, links and images show as they will look, a toolbar appears over selected text, typed Markdown such as `## ` or `**bold**` turns into formatting, and clicking an image asks for its description. The editor reads with the same parser the site renders with and refuses any round trip that would change the page, so HTML and anything else it can't draw stays as an editable source block; a post it can't show exactly opens as Markdown. Settings has a switch to write in Markdown instead. `renderMarkdown`, `summarize` and `firstImage` are exported for showing them; links and images that could run code (`javascript:` and the like) lose their link, and `renderMarkdown(text, { html: false })` shows raw HTML as text, for Markdown you don't control. Your site chooses the post URLs, so post pages, feeds and sitemaps are ordinary routes.
 
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 
@@ -122,6 +123,7 @@ Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type
 | `path` | `/n-admin` | Where the route files are |
 | `posts` | `true` | Set `false` on a site with no blog |
 | `pages` | `false` | Standalone pages, edited like posts and kept out of the blog |
+| `designs` | `{}` | Pages with their own design, by key: a title, or `{ title, url?, published?, permanent? }`. Each is listed under Pages and opens framed for click-to-edit, with Publish in the same bar. `url` fixes its address (a homepage at `/`); `permanent` keeps it always published |
 | `postUrl` | `/<slug>` | Where a post lives, for the admin's links |
 | `reservedSlugs` | none | URLs a post may not take, usually your other pages |
 | `previewCss` | none | Your post styles as a string, so previews match the site |

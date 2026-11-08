@@ -1,6 +1,13 @@
 // What the visual editor can hold. Anything Markdown can say that isn't here is kept as a raw block.
 import { Schema } from "prosemirror-model";
 
+/** Same rule as safe-url.ts on the server: web, mail and phone links and paths on this site, nothing that runs code. */
+export function isSafeUrl(href) {
+  const plain = String(href).replace(/[\u0000-\u0020\u007f]/g, "");
+  const scheme = plain.match(/^([a-z][a-z0-9+.-]*):/i)?.[1].toLowerCase();
+  return !scheme || scheme === "http" || scheme === "https" || scheme === "mailto" || scheme === "tel";
+}
+
 export const schema = new Schema({
   nodes: {
     doc: { content: "block+" },
@@ -53,7 +60,8 @@ export const schema = new Schema({
       inline: true,
       group: "inline",
       draggable: true,
-      parseDOM: [{ tag: "img[src]", getAttrs: (dom) => ({ src: dom.getAttribute("src"), alt: dom.getAttribute("alt") || "", title: dom.getAttribute("title") }) }],
+      // Pasted images must be addresses, not data: or blob: copies that would bloat the text.
+      parseDOM: [{ tag: "img[src]", getAttrs: (dom) => (/^(https?:|\/(?!\/))/i.test(dom.getAttribute("src")) ? { src: dom.getAttribute("src"), alt: dom.getAttribute("alt") || "", title: dom.getAttribute("title") } : false) }],
       toDOM: (node) => ["img", { src: node.attrs.src, alt: node.attrs.alt, title: node.attrs.title }],
     },
     hard_break: { inline: true, group: "inline", selectable: false, parseDOM: [{ tag: "br" }], toDOM: () => ["br"] },
@@ -62,7 +70,7 @@ export const schema = new Schema({
     link: {
       attrs: { href: {}, title: { default: null } },
       inclusive: false,
-      parseDOM: [{ tag: "a[href]", getAttrs: (dom) => ({ href: dom.getAttribute("href"), title: dom.getAttribute("title") }) }],
+      parseDOM: [{ tag: "a[href]", getAttrs: (dom) => (isSafeUrl(dom.getAttribute("href")) ? { href: dom.getAttribute("href"), title: dom.getAttribute("title") } : false) }],
       toDOM: (mark) => ["a", { href: mark.attrs.href, title: mark.attrs.title, rel: "noreferrer" }, 0],
     },
     em: {

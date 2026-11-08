@@ -7,7 +7,9 @@ import type { Item, Post } from "./store.js";
 export const STATUS_LABEL = { draft: "Draft", live: "Live", scheduled: "Scheduled" } as const;
 export type Status = keyof typeof STATUS_LABEL;
 
-const DATE = new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+// Dates in the list are the site's dates, in its time zone, as the public pages show them.
+const listDate = (config: ResolvedConfig, iso: string) =>
+  new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: config.timeZone }).format(new Date(iso));
 
 export function Document(props: { config: ResolvedConfig; title: string; children: ComponentChildren }) {
   return (
@@ -60,12 +62,14 @@ export function NotFoundPage(props: { config: ResolvedConfig }) {
   );
 }
 
-export function LoginPage(props: { config: ResolvedConfig; configured: boolean; error?: string }) {
+export function LoginPage(props: { config: ResolvedConfig; configured: boolean; error?: string; next?: string | null }) {
   return (
     <main class="login">
       <h1>Log in</h1>
+      {props.next && !props.error ? <p class="muted">Your session ended. Log in to pick up where you were. Unsaved text is kept in this browser.</p> : null}
       {props.configured ? (
         <form method="post" action={`${props.config.path}/login`}>
+          {props.next ? <input type="hidden" name="next" value={props.next} /> : null}
           <label class="field">
             <span>Password</span>
             <input class="input" type="password" name="password" autocomplete="current-password" required autofocus />
@@ -108,7 +112,7 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
                 <tr key={post.id}>
                   <td><a href={`${admin}/posts/${post.id}`}>{post.title || "Untitled"}</a></td>
                   <td class={`status ${post.status}`}>{post.status}</td>
-                  <td class="date"><time dateTime={post.date}>{DATE.format(new Date(post.date))}</time></td>
+                  <td class="date"><time dateTime={post.date}>{listDate(props.config, post.date)}</time></td>
                 </tr>
               ))}
             </tbody>
@@ -126,14 +130,14 @@ export function EditorPage(props: {
   saved: boolean;
   error?: string;
   fields?: Partial<Post>;
+  /** The revision the form was opened at, after a refused save. */
+  revision?: string;
 }) {
   const { config, post, status, saved, error } = props;
   const values = { ...post, ...props.fields };
   const live = status === "live";
   const admin = config.path;
   const FORM = "post-form";
-  const design = post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined;
-  const fixed = design?.url;
   const url = post.kind === "page" ? config.pageUrl : config.postUrl;
   return (
     <>
@@ -142,10 +146,10 @@ export function EditorPage(props: {
         <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
         <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
         <span class="spacer" />
-        {design ? null : <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>}
+        <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>
         <button class="button quiet" type="button" data-toggle-meta aria-expanded={error ? "true" : "false"} aria-controls="post-settings">Settings</button>
-        {design ? null : <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>}
-        {status !== "draft" && !design?.permanent ? (
+        <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>
+        {status !== "draft" ? (
           <button class="button quiet on-wide" type="submit" form={FORM} name="intent" value="unpublish" data-confirm={live ? `Take this ${post.kind} offline? You can publish it again any time.` : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
         ) : null}
         {status === "draft" ? (
@@ -155,10 +159,10 @@ export function EditorPage(props: {
         )}
       </header>
 
-      <form class="editor" id={FORM} method="post" noValidate data-editor={post.id} data-design={design ? "" : undefined} data-status={status} data-meta-open={error ? "" : undefined}>
-        <input type="hidden" name="revision" value={post.updated_at} />
+      <form class="editor" id={FORM} method="post" noValidate data-editor={post.id} data-status={status} data-meta-open={error ? "" : undefined}>
+        <input type="hidden" name="revision" value={props.revision ?? post.updated_at} />
         <input type="hidden" name="date" value={post.published_at ?? ""} />
-        {error ? <p class="notice error" role="alert">{error}</p> : null}
+
         <div class="notice" data-restore hidden>
           This browser has unsaved text for this post.
           <button class="button" type="button" data-restore-yes>Restore</button>
@@ -174,23 +178,17 @@ export function EditorPage(props: {
         <iframe class="preview" title="Preview" sandbox="allow-same-origin" data-preview hidden />
 
         <aside class="meta" id="post-settings" aria-label="Post settings">
-          {fixed ? (
-            <div class="field">
-              <span>Address</span>
-              <a href={fixed} target="_blank" rel="noreferrer">{fixed}</a>
-              <small>{design?.permanent ? "This page is always published." : "Set by the site's design."}</small>
-            </div>
-          ) : (
-            <label class="field">
-              <span>URL</span>
-              <input class="input" name="slug" value={values.slug ?? ""} disabled={live} placeholder="from-the-title" spellcheck={false} autocapitalize="off" />
-              {live ? <small>Fixed while live, so links keep working. Unpublish to change it.</small> : null}
-            </label>
-          )}
+          {/* Here, not above the text: the settings open on an error, and on a phone they cover the page. */}
+          {error ? <p class="error" role="alert">{error}</p> : null}
+          <label class="field">
+            <span>URL</span>
+            <input class="input" name="slug" value={values.slug ?? ""} disabled={live} placeholder="from-the-title" spellcheck={false} autocapitalize="off" />
+            {live ? <small>Fixed while live, so links keep working. Unpublish to change it.</small> : null}
+          </label>
           <label class="field">
             <span>{status === "draft" ? "Publish on" : "Published on"}</span>
             <input class="input" type="datetime-local" name="date_local" value={post.published_at?.slice(0, 16) ?? ""} />
-            {status === "draft" ? <small>Empty publishes now. A future date schedules it.</small> : null}
+            <small>{status === "draft" ? "Empty publishes now. A future date schedules it. " : ""}In this browser's time zone.</small>
           </label>
           <label class="field">
             <span>Description</span>
@@ -200,13 +198,13 @@ export function EditorPage(props: {
             <span>Short label</span>
             <input class="input" name="label" value={values.label} placeholder="Defaults to the title" />
           </label>
-          {design ? null : <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>}
+          <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>
           <footer>
-            {live && (fixed || post.slug) ? <a href={fixed ?? url(post.slug!)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
-            {status !== "draft" && !design?.permanent ? (
+            {live && post.slug ? <a href={url(post.slug)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
+            {status !== "draft" ? (
               <button class="link on-phone" type="submit" name="intent" value="unpublish" data-confirm={live ? `Take this ${post.kind} offline? You can publish it again any time.` : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
             ) : null}
-            {design ? null : <button class="link" type="submit" name="intent" value="delete" data-confirm={`Delete this ${post.kind}?`} formnovalidate>Delete</button>}
+            <button class="link" type="submit" name="intent" value="delete" data-confirm={`Delete this ${post.kind}?`} formnovalidate>Delete</button>
           </footer>
         </aside>
       </form>
@@ -326,7 +324,7 @@ export interface DesignedPage {
   permanent: boolean;
 }
 
-export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string }; page?: DesignedPage }) {
+export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string }; page?: DesignedPage; notice?: string }) {
   const { config } = props;
   const admin = config.path;
   // A site with no blog opens on this page, so going back to its home would land here again.
@@ -354,9 +352,9 @@ export function EditPage(props: { config: ResolvedConfig; src?: string; back?: {
           </form>
         ) : null}
       </header>
-      <iframe class="edit-frame" title="Your site" src={props.src ?? "/"} data-edit-frame />
+      {props.notice ? <main class="page narrow"><p class="notice error" role="alert">{props.notice}</p></main> : <iframe class="edit-frame" title="Your site" data-src={props.src ?? "/"} data-edit-frame />}
       <script defer src={assetUrl(admin, "admin.js")} />
-      <script defer src={assetUrl(admin, "edit.js")} />
+      {props.notice ? null : <script defer src={assetUrl(admin, "edit.js")} />}
     </>
   );
 }

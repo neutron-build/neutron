@@ -71,19 +71,22 @@ export function hasSession(request: Request): boolean {
 
 // Drafts of designed pages open in the Edit site frame, on the site's own address, where the
 // session cookie (scoped to the admin) never reaches. A short-lived signed key in the address does.
-const PREVIEW_KEY = randomBytes(32);
-const PREVIEW_HOURS = 12;
-const previewMac = (slug: string, expires: string) => createHmac("sha256", PREVIEW_KEY).update(`${slug}\n${expires}`).digest("base64url");
+// Signed with the password hash: it survives a deploy and every instance agrees, and changing the
+// password ends every key at once.
+export type PreviewScope = "page" | "design";
+const PREVIEW_HOURS = 2;
+const previewMac = (scope: PreviewScope, name: string, expires: string) =>
+  createHmac("sha256", sha256(`neutron-cms preview\n${passwordHash()}`)).update(`${scope}\n${name}\n${expires}`).digest("base64url");
 
-export function previewToken(slug: string): string {
+export function previewToken(scope: PreviewScope, name: string): string {
   const expires = String(Date.now() + PREVIEW_HOURS * 3_600_000);
-  return `${expires}.${previewMac(slug, expires)}`;
+  return `${expires}.${previewMac(scope, name, expires)}`;
 }
 
-export function isPreview(slug: string, token: string | null): boolean {
+export function isPreview(scope: PreviewScope, name: string, token: string | null): boolean {
   const [expires, mac] = (token ?? "").split(".");
-  if (!expires || !mac || !(Number(expires) > Date.now())) return false;
-  const expected = Buffer.from(previewMac(slug, expires));
+  if (!passwordHash() || !expires || !mac || !(Number(expires) > Date.now())) return false;
+  const expected = Buffer.from(previewMac(scope, name, expires));
   const given = Buffer.from(mac);
   return given.length === expected.length && timingSafeEqual(given, expected);
 }
