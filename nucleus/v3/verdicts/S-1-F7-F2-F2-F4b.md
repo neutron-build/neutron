@@ -4,122 +4,71 @@ Card-gate: P
 Verdict: REWORK
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: nv3-gate-S-1-F7-F2-F2-F4b (T3 review sub-agent, Claude Code session 3e3ee303-bb75-43ec-8799-fc492cd7cae4; it wrote neither card amendment, ruling, review, nor any S-1-F7-F2-F2-F4b commit)
+Gate-session: nv3-regate-S-1-F7-F2-F2-F4b (T3 review sub-agent, Claude Code session 2d11159a-bb6a-42b8-9655-fe9d42b569b8; it wrote neither the card, its amendments, the rulings, the reviews, the REWORK verdict c1f42387, nor any S-1-F7-F2-F2-F4b commit)
 Date: 2026-11-07
 Gate-exit: GATE EXIT=0
-Commit: f9b815db66a5fd1f0c040bce0f31e23c8d1846e9
-Mutants: spec mutants checked on paper against the §15 text (all 27 new, plus CURSOR-STALE-LPID): caught as the card's Mutation-evidence table says; gate text mutants on a fresh clone at f9b815db: GM1 drop "with the list's records for its entries applied" -> UNCAUGHT; GM2 drop "The built page is written to a fresh slot, and that slot is recorded in its parent's buffer, up to the root." -> UNCAUGHT; GM3 drop "A map page whose epoch-k content it has taken counts as written for image k" -> UNCAUGHT; GM4 drop "or that the list's records name" -> UNCAUGHT; GM5 drop the fairness bound's "a frame acquisition's victim write" -> UNCAUGHT; GM6 drop §5.4's gate-waiter pin sentence -> UNCAUGHT; GM7 §4.1 latches the parent before releasing the page -> G48; GM8 drop "std::sync::RwLock ... does not qualify" -> UNCAUGHT; GM9 let a reader read under a shared latch -> G10; GM10 drop the found-flag from the parked position -> G21
+Commit: 7be2bf1593924aa7e7afc9815277113d70b11788
+Mutants: gate text mutants on a fresh clone at 7be2bf15 (scaffold ref at acc81c77), all 59 G run per mutant: GM1 -> G58; GM2 -> G58; GM3 -> G58, G59; GM4 -> G58; GM5 -> G14; GM6 -> G15; GM7 -> G48; GM8 -> G7; GM9 -> G10; GM10 -> G21; B71 -> G14; B72 -> G14; B77 (both forms) -> G13; B78 (each of the three holders) -> G27; B79 -> G59; own: X1 swap R4c's order (unlatch, then release to the reserve) -> G59; X2 drop "(at most one per thread)" -> G14; X3 drop "which includes no transaction wait" -> UNCAUGHT; X4 drop "a descent step, CPU-bounded for a reader (above); " -> UNCAUGHT; X5 replace "This covers ... nothing is exempt." with "Readers are exempt." -> G14; X6 drop the flip clause's "plus the bounded bypass" -> G14; X7 "Every wait for an unpin, that one included," -> "A wait for an unpin" -> G13; X8 evictor latch "taken blocking" -> G27; X9 drop "the holders present at its arrival and" -> G14
 Followups: none
 
 ## Gate run
 
-- **Script.** The scaffold's `fresh-gate.sh` and `git-env.sh` were extracted through the `--no-local` shallow clone (GATE-PROMPT step 1), with no `EXTRACT FAILED` line. Scaffold id acc81c776183bd9853f7a69e2cec4262d300d89f. The script ran from `~/Workspace/neutron-v3` with `CARGO_TARGET_DIR=~/.cache/nv3-target/gate-S-1-F7-F2-F2-F4b`, on commit f9b815db66a5fd1f0c040bce0f31e23c8d1846e9.
-- **Lines.** One run, in the foreground harness as a background task, waited for. `fresh-gate: commit f9b815db66a5fd1f0c040bce0f31e23c8d1846e9`, `fresh-gate: base acc81c776183bd9853f7a69e2cec4262d300d89f`, `fresh-gate: checks passed (4778 files hashed in 2.05 s)`, `fresh-gate: 2 file(s) matched through their eol conversion`; steps STEP test EXIT=0; STEP clippy EXIT=0; STEP fmt EXIT=0; STEP deny EXIT=0; STEP core-paths-selftest EXIT=0; STEP enforcement-tests EXIT=0; literal last line `GATE EXIT=0`. stderr empty, no refusal. `$fg` removed afterwards.
-- **Scope.** `git diff nucleus/v3-scaffold...f9b815db --stat` lists only `nucleus/v3/docs/S-STORE.md` (+54/−20), in 7 commits on acc81c77, which is within Touch only. Hunk by hunk the diff stays inside Limits 1–17:
-  - §6.8 "Root names" changes only in step (2)'s span plus the one inserted sentence (diffed character by character against the scaffold);
-  - §5.6 changes only in "Reserve";
-  - I-CKPT-AT-T's (a)–(c) are untouched;
-  - G36's byte identities hold.
-- **Acceptance.** G1–G57 were run on a fresh `--no-local` clone checked out at f9b815db (not the worker's worktree), with `nucleus/v3-scaffold` at acc81c77: all 57 pass. On the scaffold, every G fails except G36 and G38, which are identity checks and negative checks.
+- **Script.** The scaffold's `fresh-gate.sh` and `git-env.sh` were extracted through the `--no-local` shallow clone (GATE-PROMPT step 1), with no `EXTRACT FAILED` line. Scaffold id acc81c776183bd9853f7a69e2cec4262d300d89f. The script ran from `~/Workspace/neutron-v3` with `CARGO_TARGET_DIR=~/.cache/nv3-target/gate-S-1-F7-F2-F2-F4b`, on commit 7be2bf1593924aa7e7afc9815277113d70b11788.
+- **Lines.** One run, as a background task of the foreground harness, waited for. `fresh-gate: commit 7be2bf1593924aa7e7afc9815277113d70b11788`, `fresh-gate: base acc81c776183bd9853f7a69e2cec4262d300d89f`, `fresh-gate: checks passed (4779 files hashed in 3.12 s)`, `fresh-gate: 2 file(s) matched through their eol conversion`; STEP test EXIT=0; STEP clippy EXIT=0; STEP fmt EXIT=0; STEP deny EXIT=0; STEP wasm32 EXIT=0; STEP core-paths-selftest EXIT=0; STEP enforcement-tests EXIT=0; literal last line `GATE EXIT=0`. stderr empty, no refusal. `$fg` removed afterwards.
+- **Scope.** `git diff acc81c77...7be2bf15 --stat` lists `nucleus/v3/docs/S-STORE.md` and the earlier REWORK verdict `nucleus/v3/verdicts/S-1-F7-F2-F2-F4b.md` (the gate's own file). The rework's six commits change only S-STORE §5.3 (two bullets), §6.8 "Root names" (the one inserted sentence), §13 step 2's map-phase bullet (one inserted sentence) and the changelog. All of it is within Touch only and Limits 2, 7 and 16, as the amendment says.
+- **Acceptance.** All 59 greps (G1–G59) were run on a fresh `--no-local` clone checked out at 7be2bf15, with `nucleus/v3-scaffold` at acc81c77: every one passes. On the scaffold, every G fails except G36 and G38.
 
-## Do the amendments carry the rulings and reviews?
+## Is the amendment faithful to R1–R4?
 
-- **Lock-order review.**
-  - C1 → Work 12 and 18 (the parked position and the per-call bound, which covers point reads and probes).
-  - C2's exception → Work 2.
-  - C4 → Work 3.
-  - C5 → Work 5 and 8.
-  - C6.1–C6.4 → Work 7, 16, 9 and 6.
-  - C7 → Work 14.
-  - C8 → Work 13.
-  - C3 is -F4a's.
-  
-  Each is present, in the review's terms, apart from the fairness-bound term in R1.
-- **Map-order ruling.**
-  - (a′), meaning the list, the map phase and one claim per thread → Work 1, 1a–1c and 1e.
-  - Item 2, the two-step write → Work 1d.
-  - Item 3 → G37.
-  - Item 4 → G34.
-  
-  Faithful.
-- **Map-order review.**
-  - C1 → the slot sentence and the bitmap sentence.
-  - C2 → option (i): the map phase sets no current ref.
-  - C3 → the drain names the §5.2 victim, plus the debug assertion.
-  - C4 → sources decided under latch and re-checked, never put in the page table.
-  - C5 → the namespace.
-  - C6 → reserved at open.
-  - C7 → E4's B5 adoption guard, under the frame latch.
-  
-  All seven are adopted as the review wrote them.
-- **Limits.** The one new widening, Limit 16's second bullet for C7, loosens nothing else. No other card pins that bullet.
-- **Greps.** The map-order amendment's rewrites of G1, G12, G28–G30 and G32–G34 are all strictly stronger than before. The review amendment's G43 is not (R2).
+I compared the card against the pre-amendment copy `~/.cache/nv3-review/S-1-F7-F2-F2-F4b.pre-rework-amend.local.md`, line by line.
 
-## Substance (judged)
+- **R1.** The ruling's term "plus the waiters queued ahead of it" is restored. The flip clause now counts "the holds ahead of it on that latch, each bounded as above (at most one per thread), plus the bounded bypass", which is what R1 asked for. G14 pins both, and a negative grep pins out "by at most one such hold".
+- **R2.** G58 pins GM1–GM4 in place, including the clause that G43 lost. G59 pins GM3 a second time, plus the new R4c sentence.
+- **R3.** The A-3c quote now names all eight variants inside the quote. The A-4c "Replace" target string occurs verbatim in PLAN-v3 row A-4c (line 875), so the replacement applies. "After A-3c" is stated.
+- **R4a, R4b and R4d.** These are carried as asked. B78's three holders are each pinned, and so are GM5, GM6 and GM8.
+- **Re-anchors.** None is loosened. The new G7, G14, G15 and G27 each contain the old pattern's literal text, plus more text and, for G14 and G27, a negative grep. G13's old literal "a thread that holds a latch never waits for an unpin" changed only because R4a corrects it. The new pattern pins the whole corrected passage, and its negative grep pins out "therefore holds no latch". The `.*` spans in G14 cover the same text as before. X3 and X4 show that two clauses inside them were never pinned, which was true before the rework too (finding R3 below).
 
-- **Deadlock freedom.** I walked these holder shapes:
-  - data writers (one tree, top-down, after the gate);
-  - readers (pin with no latch held, no I/O in the hold);
-  - parked and resuming cursors (they hold nothing);
-  - the stale-name first latch (it holds nothing else, and directory changes never hold a stale name);
-  - eviction (a `try_latch` victim, then the current MapLeaf, which ranks last);
-  - the two-step map write (the child is released before the parent is taken, and no eviction runs under a map latch);
-  - claims (no map latch, so no wait edge);
-  - the data phase (frame, then current MapLeaf);
-  - the map phase (one latch at a time, and it waits holding none);
-  - DropTree's last step (blocks holding the directory leaf, and only brief holders are ahead of it);
-  - DDL, sweep and prune (one tree, or `try_latch`);
-  - recovery (single-threaded);
-  - the pool floor (finite through §5.4 and -F2-F2-F2).
+The amendment answers R1–R4 faithfully. The two blocking findings below come from what the rework's new text says, not from how faithfully it was carried.
 
-  I found no cycle. The map↔map cycle is closed by construction.
-- **Cursor parking.** Carrying the group state is exact. The conversion lands at ts `c ≤ S`, after the parked `x` (a version above `S`), and the carried candidate is then the same version, so nothing is returned twice. The point-read variant holds finalize back, as review C1 requires.
-- **Fair latch.** The bounded-bypass property plus "no FIFO" avoids convoys, and the flip delay is bounded. The stated bound is wrong as written (R1).
-- **Image-record list.**
-  - **Crash cuts.** Before meta `k`, every listed slot is free in image `k−1`. After meta `k`, the map phase has applied the whole list, and step 3 precedes step 4.
-  - **Slot reuse.** C1 closes the current-home hole. C2's race is gone, because only a live-frame write sets current refs. The C3 drain covers the §5.2 victims.
-  - **Size.** The list is bounded at ≤ F (one record per page dirty at the flip) and reserved at open.
-- **Two-step write and C4's re-check.** The pin bars a second eviction, the page-table entry bars a stale reload, and the gate keeps the flip out of the gap. The copy → frame → recheck → list → home chain is TOCTOU-safe in every interleaving I tried. Its two key points:
-  - a copy's install happens under the frame's latch, so "`k+1`, re-check the copy" catches it;
-  - a claim holds the copy's latch until its append, so "no longer the copy" implies a list record.
-- **A-3c and A-4c text.** See R3.
+## Substance
+
+- **R1, the arrival-time bound.** I hold this to be true for every waiter, under §5.3's policy as defined, that is, per waiter: "a waiter is overtaken by at most a bounded number of later requests, or for a bounded time".
+  - A waiter `w` waits for the holders present at its arrival and for the waiters already queued then. Every request granted ahead of it that arrived later is, by definition, a bypass of `w`, so a stream of new arrivals is covered by `w`'s own bypass bound, including arrivals that bypass the waiters ahead of `w`.
+  - Under `try_latch` and the evictor, nothing changes: `try_latch` cannot succeed over a queued exclusive waiter.
+  - "At most one per thread" holds, because there is no recursive latch.
+  - The policy's "bounded time" arm is satisfied by `parking_lot`'s eventual fairness only if the per-waiter time bound covers the bypass periods of the waiters ahead too. That is A-3b's existing check against the pinned latch type, and it changes no text.
+- **What is still false in the bound.** The bound is false for a waiter behind a pool-floor holder. That is R1 below.
+- **R4b.** All three listed holders hold the root briefly and take only a MapLeaf latch or map latches under it. A directory change waits on none of them, so DropTree's blocking wait stays acyclic. "Taken without blocking" keeps `try_latch` out of the paragraph, as G26 requires.
+- **R4c, crash effects.** The epoch copy is memory only. Meta `k` follows the map phase, so a crash anywhere in the window loses only image `k`, which no open uses. After the map phase takes `M`, the frame source cannot produce a new epoch-`k` copy of `M`, because `M` counts as written. No crash effect follows.
+- **R4c, concurrency.** That part is R2 below.
 
 ## Rework (precise)
 
-Every fix below changes text that the card quotes verbatim, so the card needs a P amendment (with its greps) before the implementer reworks.
+**R1 (blocking): §5.3's fairness bound no longer covers every hold, now that §5.3 says a latch holder may wait for an unpin.**
+- **The two bullets now disagree.**
+  - R4a's new text in "Why latching cannot deadlock" says: "A gated operation past its first mutation cannot restart (§5.6 "Restart"), so it may wait for an unpin while it holds its one tree's latches."
+  - The next bullet, "The fairness bound", still says "each hold is bounded by one call's work on one tree, which includes no transaction wait", and lists a batch fill, a descent step, a writer's critical section and "a frame acquisition's victim write".
+- **How the holder's wait escapes the bound.** A wait for an unpin is a wait on other threads' calls, and those threads may be blocked on latches of another tree. It is finite only through §5.4's count, and it is not "one call's work on one tree". Example: a gated insert on a leaf root that has done its split, and so is past its first mutation, then builds a chain (§6.7). Each new overflow page needs a frame. At the pool floor, the insert waits for an unpin while it holds the root exclusively.
+- **Consequence.** A waiter queued behind that hold, and through "each bounded as above" a pending flip, is delayed by a term the bound does not state. The pre-rework text hid this by falsely saying that a latch holder never waits for an unpin, and R4a fixed only one of the two bullets. A-3b sizes `t_root_latch_fair`'s budget from this bound, so the user's question has an answer: the bound is not yet true for every waiter.
+- **Fix (P amendment).** Add the pool-floor unpin wait of a gated operation past its first mutation as a hold term. Say that it is finite through §5.4 (S-1-F7-F2-F2-F2) and bounded by the pinning threads' own calls, not by one call on one tree. Alternatively, state explicitly that A-3b's budget excludes the pool floor and why. Re-anchor G14 on the new term and add a text mutant that drops it.
 
-**R1 (blocking): the fairness bound drops the ruling's queued-ahead term.**
-- **The defect.** §5.3 "The fairness bound" says: "A waiter of either mode is granted once the holders present at its arrival have released, plus the bounded bypass". The ruling's bound was "after the holders present at its arrival release, **plus the waiters queued ahead of it**". Under any queued latch, whether task-fair, strict-FIFO or `parking_lot`, an exclusive waiter that arrives behind an earlier queued writer is granted only after that writer's hold too. Bypass counts only later arrivals, so the bound as written is false for every correct latch.
-- **Why it matters.** It is the normative bound that A-3b's `t_root_latch_fair` budget is derived from.
-- **The flip clause has the same gap.** "A gated writer blocked on a root delays a pending flip by at most one such hold" undercounts: the flip waits for every gated waiter queued on that latch, each behind the ones ahead of it.
-- **Fix.**
-  - Restore "and the waiters queued ahead of it" next to "the holders present at its arrival".
-  - Bound the flip by "the holds ahead of it on that latch, each bounded as above (at most one per thread)".
-  - Re-anchor G14 on both.
-
-**R2 (blocking): G43's re-anchor is weaker than before, against the card's own rule ("the new pattern must be strictly stronger").**
-- **What was lost.** The pre-review G43 pinned the clause "…, with the list's records for its entries applied." The review amendment moved the source chain into G50, and neither grep now pins that clause. GM1 drops it and passes every G. That clause is what makes image `k` hold the data-phase, claim and eviction records at all.
-- **What was never pinned.** These core map-phase sentences sit inside a `.*` and have never been pinned:
-  - GM4: "or that the list's records name". Without it, a MapLeaf that is unchanged since `k−1` but has listed entries is never rewritten, so image `k` loses those writes.
-  - GM2: the fresh-slot and parent-buffer sentence.
-  - GM3: "counts as written for image `k`" for map pages.
-- **Fix.** Pin all four, together with matching B-mutants.
-
-**R3 (fix in the same amendment): the PLAN block's A-3c and A-4c lines name the wrong tests.**
-- **A-3c's replacement text.** It says "`t_step2_waits_for_claimed_copy` with its slot and map-copy variants", then lists six mutants that only the current-home, victim, source, namespace, adoption and allocation variants catch. Those six variant names appear only in a parenthetical outside the quoted replacement, so the applied row would not name them. Put them inside the quote.
-- **A-4c's row.** The PLAN row at line 875 still says "`t_epoch_reserve_two_exhausters` with its deadlock variant (with A-3c, §5.6), failed by EXHAUST-DOUBLE-EVICT and EXHAUST-BLOCKING-CLAIM". The block only appends to that row, so the stale "deadlock variant" text survives, and the row never names the cross variant or CLAIM-LATCHES-MAP. Replace it the same way the A-3c row is replaced.
-- **Ordering.** `t_latch_scope`'s map variant needs A-3c's map phase. State "after A-3c" on A-4c.
-
-**R4 (minor, same amendment).**
-- **(a) Pool floor.** "With no evictable frame it releases its latches and restarts (§5.2)" does not hold for a gated operation past its first mutation, because §5.6 forbids that restart. Its wait is finite only through §5.4's count. Say so, and keep the dependency on -F2-F2-F2.
-- **(b) Who else holds the root during DropTree's last step.** "The root's only possible holder then is a stale-name thread's brief latch" leaves out two other holders:
-  - step 2's data-phase latch, which is brief and then goes to the MapLeaf only;
-  - an evictor's `try_latch`.
+**R2 (blocking): R4c puts a still-latched frame into the `R_EPOCH` reserve.**
+- **The text.** "It takes a map page's epoch copy under the copy's latch and releases the copy to the `R_EPOCH` reserve before it releases that latch". Between those two steps the frame is in the reserve while the map phase holds its latch.
+- **Who can see it.** Before this sentence, a frame in the reserve was never latched. A claim reuses its victim's frame directly and does not return it to the reserve. Now a `write_guard` that draws an epoch-copy frame from the reserve can draw this one.
+- **What happens.** The writer must latch the frame to write the copy's bytes (no `unsafe`, N9). It blocks on the map phase's latch while it holds the page's exclusive latch, and in the cross variant also a MapLeaf's latch. That breaks two rules:
+  - §5.6 "Reserve": "a writer never waits holding a page latch".
+  - §5.3's order: no blocking acquisition after a map latch, which ranks last. Epoch-copy frames have no rank at all.
   
-  Neither causes harm, but the sentence should list them.
-- **(c) A map page's epoch copy after the map phase has taken it.** The text does not say whether the copy is released or can still be claimed. If it can be claimed, a late append for an already-built map page follows. Say that the copy is released, or that the late record is ignored and its slot released.
-- **(d) Unpinned clauses.** GM5, GM6 and GM8 drop clauses that no grep pins. Pin them or accept that.
+  `t_latch_scope`'s tracker, which "asserts rank at every blocking acquisition", would flag it. There is no cycle, because the map phase holds that one latch and waits for nothing. But the deadlock argument and the reserve bound no longer cover this edge as written.
+- **The reverse direction is not affected.** No claim can evict the copy after the map phase has taken it, in either order, provided the copy is detached under the latch.
+- **Fix (P amendment).**
+  - Under the copy's latch, the map phase detaches the copy, so that it is no longer that page's epoch copy and no longer claimable.
+  - It then releases the latch, and only then returns the frame to the reserve.
+  - State that a claim's `try_latch`, once granted, re-checks that the frame is still an epoch copy before it evicts it. This was already implicit in EXHAUST-DOUBLE-EVICT, and it is needed in either order, because a claimant may hold a stale candidate.
+  - Re-anchor G59 and replace B79's companion with a mutant that returns the frame before unlatching.
+
+**R3 (minor, same amendment).** In "The fairness bound", "which includes no transaction wait" (X3) and "a descent step, CPU-bounded for a reader (above)" (X4) sit inside G14's `.*` and are unpinned. This is not a regression, because the old G14 had the same span. Pin them while G14 is being re-anchored for R1.
 
 ## Revert
 
-Mutants were applied only to a scratch clone. The worker's worktree is untouched (`git status` is clean apart from this verdict).
+Mutants were applied only to a scratch clone, which was restored after each run (`git status` clean). The worker's worktree is untouched apart from this verdict.
