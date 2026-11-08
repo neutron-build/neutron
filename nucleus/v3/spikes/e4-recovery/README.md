@@ -2417,6 +2417,75 @@ NEW_FAILING 0 [] BAD_SEEDS 0 []
 
 **Nothing outside X5-R52: no STOP.**
 
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F1)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F1   commit: (this commit; the chain 10ee2e52 → 8bbbfcec → f21a2247 → here)
+
+The seven RESULT items the card requires:
+
+1. **X5-R51 quoted unchanged, X5-R52 verbatim, and the numbering note**
+   — the section above ("Card X-5c-F4-F1-F1-F3-F2-F1-F1's record"),
+   step 0. X5-R51's text and X5-R52's text were extracted verbatim from
+   the card before any code of this card, and neither was edited after
+   step 0.
+2. **The `compare` output over the 10k, in full, with the sha256 of
+   both files** — step 2 above. Run JSON
+   `…acc.campaign.json` sha256
+   `6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`;
+   reference `tip-10k.json` sha256
+   `f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`
+   (both checked by the Acceptance line itself, exit 0).
+3. **The `check-mp` table (52 rows) and the `check-twin` rows** — step 2
+   above: 48 `EXPLAINED (b)5`, 4 `EXPLAINED (b)5'`, none NOT-EXPLAINED;
+   2599 `N=3 k=2` (digest 1546217554), 2859 `N=4 k=1` (2789281219),
+   609 `N=5 k=1` (887984205).
+4. **7078 r0's (iii) row at both ends** — step 2 above.
+5. **The class sizes at both ends** — step 2 above: twin family 6 → 7,
+   MP-A 11 → 10, (ii)'s JSON shape 187 → 190.
+6. **Post-data amendments: X5-R52.** It was written by P **after** the
+   F2-F1 verdict (`verdicts/X-5c-F4-F1-F1-F3-F2-F1.md` at `8992f77f`),
+   after F2-F1's acceptance 10k (`…acc.campaign.json`, the file this
+   card re-reads, its `.campaign.out` and the old comparator's
+   `NEW_FAILING 2` output), after the reference `tip-10k.json`, and
+   after the gate's single-seed evidence in
+   `~/.cache/nv3-review/gate-X-5c-F4-F1-F1-F3-F2-F1/m/` (`b5.txt`,
+   `pend/`, `d_*`, `e_*`, `tip_{2599,2859,7078}.*`). **The rounds it
+   moved were all seen before it was written:** 2599 twin r2 and 2859
+   twin r1 (exemption (i)), 7078 r0 (exemption (iii)), and 1927 r1,
+   7257 r0, 7658 r0 and 8278 r0 (exemption (ii)). Each exemption is
+   drawn around a class that already exists in the reference file, never
+   around those seven rounds. In the pattern of X5-R30 (c) and X5-R32.
+7. **The comparator mutant table and the 0..1000 calibration reading** —
+   step 1 (mutants) and step 2 (calibration) above.
+
+acceptance (this attempt): `cargo test -q --release -p e4-recovery` —
+**262 passed, 0 failed** (nothing in the crate changed; green as at
+`eb9c4328`); `python3 -I …/x5r52_compare.py self-test` — **38 cases,
+0 failed**; the scratch-export `git apply --check` of
+`tools/x5r52-twin-diag.patch` — clean, and the patched build reproduces
+the 10k digests of 609/2859/2599; the Acceptance `compare` line — exit
+0; `scripts/gate.sh` — run last, `GATE EXIT=0`.
+
+judgment calls (all recorded in the sections above): the comparator
+prints `TWIN_FAILING <n> <list> BASE <m>` (the class size at both ends,
+never netted), and counts `FAILING_ROUNDS` from the run JSON (it equals
+the E4 FOLD sum on every file read); `check-mp`/`check-twin` exit 0 on
+EXPLAINED and 1 on NOT-EXPLAINED; the 0..1000 calibration's Base file is
+`gate-X-5c-F4-F1-F1-F3/m/b1k.json` (the card's path names the F2-F1
+gate dir, but the file lives in the F3 gate dir — the same file F2-F1's
+record cites); a twin entry that fails at both ends with a changed text
+is reported in `TWIN_FAILING` only (X5-R51 (a) keeps twins out of
+`TEXT_CHANGED`); the round-start marker prints for MP/MW only (class C
+has no twin chain to read).
+
+ESCALATE: none. anomalies: the `git add`/`git commit` pair prints a
+benign `Unable to create …/.git/packed-refs.lock: Read-only file system`
+line from the host's git maintenance in this sandbox; the commits land
+(the log and the clean tree confirm). F2-F1's hand table counted 457 r0
+in its "changed texts (9)"; the comparator counts it once, as `HEALED`
+(the calibration's `TEXT_CHANGED 8`), because both rules classify the
+Base-`pass=false` shape healed first.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
