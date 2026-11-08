@@ -264,6 +264,7 @@ These consumers do **not** grow with the version count or with retention. Each i
 | Consumer | Bound |
 |---|---|
 | page table | O(F) |
+| the root table (§6.8) | O(trees): one entry per directory entry |
 | MapInner pages | ≈ 1/510 of the MapLeaf count |
 | the two free-set bitmaps | 1 bit per slot plus 1 bit per LPID |
 | the pending-free lists (§13 step 6) | ≤ the pages written in one checkpoint interval |
@@ -285,7 +286,7 @@ Reference: `spikes/e0-btree/src/tree.rs` for search, insert, split, latch coupli
 - One tree per relation and per index.
 
 ### 6.2 Latching (I-LATCH)
-- **Writers** use latch coupling (crabbing) with exclusive latches: they release every ancestor once the latched child is *safe*, meaning it has room for one more maximum-size cell (E0's T-COUPLING). The directory leaf that holds a tree's entry is latched in the mode §6.8 ("Root names") sets, not by this coupling.
+- **Writers** use latch coupling (crabbing) with exclusive latches: they release every ancestor once the latched child is *safe*, meaning it has room for one more maximum-size cell (E0's T-COUPLING). Only an operation that changes the directory latches a directory page (§6.8 "Root names"), and it couples down the directory in the same way.
 - **Readers** use shared latches, top-down. They hold the parent while they latch the child.
 - **Order.** Latches are taken in (depth ascending, then left to right among siblings).
 
@@ -356,11 +357,12 @@ An entry whose value exceeds `V_INLINE` stores a reference `(len u64, first LPID
 - **Tree ids** are C-T0 §10 storage ids, never reused. The WAL names trees only by tree id (§12).
 - **States:** `live` or `dropping`.
 - **DDL visibility** lives in the versioned catalog rows (C-T5), not here.
+- **The root table.** An in-memory map `tree_id → (root LPID, kind, state)`, one entry per directory entry, never persisted. It is a name, not a reference: no image holds it, and I-LINK-ATOMIC's reference list is unchanged. It is built at open (§14 step 2) and changed only by a directory change, inside that change's gated operation, while it holds the directory leaf exclusively. It has no generation counter: tree ids are never reused and an entry only goes `live` → `dropping` → absent, so comparing (root LPID, kind, state) is exact, and no unrelated directory change makes a reader retry. A root-name read performs no store to memory common to all trees, so the table adds no shared cache line to an ordinary operation; A-7b chooses the mechanism. If it is lock-based, its lock is a leaf lock: nothing is acquired under it, and it ranks like the page table and the free-set lock (§4.2).
 
-**CreateTree(id)** descends the directory, then allocates a root leaf and inserts the directory entry, in one gated operation (I-LINK-ATOMIC, §5.6). Its restarts (§5.6) all lie before the allocation. It allocates by the restart arm of §5.6's allocation rule: it takes the root's LPID, with those of any directory split (§6.4), in one hold of the free-set lock only if each one's MapLeaf is resident, pins them before the lock is released, and otherwise restarts; no mutation precedes the allocation, so that restart is legal. It is idempotent: if the id already exists, nothing happens.
+**CreateTree(id)** descends the directory, then allocates a root leaf and inserts the directory entry, in one gated operation (I-LINK-ATOMIC, §5.6). Its restarts (§5.6) all lie before the allocation. It allocates by the restart arm of §5.6's allocation rule: it takes the root's LPID, with those of any directory split (§6.4), in one hold of the free-set lock only if each one's MapLeaf is resident, pins them before the lock is released, and otherwise restarts; no mutation precedes the allocation, so that restart is legal. It is idempotent: if the id already exists, nothing happens. It installs the tree's root-table entry in the same gated operation, after the root page is initialised and while it holds the new root's latch exclusively.
 
 **DropTree(id)**
-1. Set the entry's state to `dropping`, in one directory mutation.
+1. Set the entry's state to `dropping`, in one directory mutation. The same mutation sets the root-table entry's state.
 2. Free the tree's pages bottom-up in bounded gated steps, each reached by a fresh descent from the directory (root names, below):
    - **Chains first.** A chain-bearing entry is deleted with its chain (§6.7) in its own gated operation, holding only its leaf, before the step that unlinks that leaf. So one gated operation frees at most one chain and holds the flip for that chain's length (§6.7), no inner page is latched across the chain's reads (§5.3), and no later step frees a chain. A leaf this empties stays legal until it is unlinked (§6.1).
    - **Unlink.** A step unlinks a child that holds no chain reference from its parent and frees it, in one gated operation. A parent the step empties is freed in that same operation and unlinked from its own parent. Every page it latches, and the MapLeaf of every LPID it frees, is pinned before its first mutation (§5.6), so it reads no page after that mutation and frees at most one path of pages.
@@ -368,7 +370,7 @@ An entry whose value exceeds `V_INLINE` stores a reference `(len u64, first LPID
    A root's parent is its directory entry, so a step that empties the root is the last step (step 3).
 3. **The last step frees the root and removes the directory entry in one gated operation.** A leaf root's chains went first (step 2), so it frees no chain.
    - **Before its first mutation,** it descends the directory and pins the directory leaf, the root and every page it empties (at most height + 1 pages, within §5.4's quota), and the MapLeaf of every LPID it frees (`R_MAP`). A non-resident page restarts it, and that restart releases the gate harmlessly (§5.6). So the flip waits for at most one directory descent over pinned pages, and no page read.
-   - **In one hold,** it latches top-down from the directory leaf to the pages it frees, removes the entry first, and frees the root and any emptied pages after it, top-down (I-LINK-ATOMIC). Once the entry is gone, the pages are unreachable, so a concurrent allocation may take a freed LPID at once (§4.2). The last step does not pack: its pins cover the directory leaf and the tree path only (§5.4), and latching the directory neighbour after the root would break I-LATCH. A later gated operation, or the directory's own sweep, may pack the leaf.
+   - **In one hold,** it latches top-down from the directory leaf to the pages it frees, removes the entry first, and frees the root and any emptied pages after it, top-down (I-LINK-ATOMIC). It removes the tree's root-table entry after the directory entry, while it holds the root's exclusive latch, and before it frees the root; "Root names" below depends on this order. Once the entry is gone, the pages are unreachable, so a concurrent allocation may take a freed LPID at once (§4.2). The last step does not pack: its pins cover the directory leaf and the tree path only (§5.4), and latching the directory neighbour after the root would break I-LATCH. A later gated operation, or the directory's own sweep, may pack the leaf.
 
 **One walk per tree.** At most one walk runs per tree: a DropTree of a tree whose walk is running does nothing. The claim on the walk is in memory and is not persisted, so a crash loses it and §14 step 6 starts each `dropping` entry's walk once.
 
