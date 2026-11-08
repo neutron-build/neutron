@@ -2221,6 +2221,202 @@ discipline, as X5-R6–R51 before it):
   - Comparisons at such a commit run the comparator with `--no-twin-exemption`, and (i) exempts nothing there.
   - After -F2 lands, a twin failure of this family is a recurrence of a class that a landed card claims to have fixed. Under E4's owner rule, F4 counts it as new.
 
+**Step 1 — the comparator and the patch (commit 8bbbfcec).**
+`tools/x5r52_compare.py` (Python 3, stdlib only, `python3 -I`) with the
+four subcommands; `tools/x5r52-twin-diag.patch` (eprintln-only, paths
+relative to `nucleus/v3`, applied only to scratch exports). The patch
+starts from the gate's `GATEDIAG` edits (the recovery-`Err` line, the
+replay listing with `ddl`/`txn`, the apply-FAIL lines — the `tip/`→
+`tipd/` diff) and adds the two X5R52 markers: `X5R52 run seed=<s>
+round=<i> class=<C|Mp|Mw>` at `run_round`'s entry and `X5R52
+round-start seed=<s> round=<i> real_dir=[…] twin_dir=[…]` in
+`run_seed_with` after the broken-chain re-seed (MP/MW only; class C has
+no twin chain).
+
+- **Patch validation:** `git apply --check` clean on a fresh `HEAD`
+  export; built there; single-seed runs of 609, 2859 and 2599 reproduce
+  the 10k file's digests byte-identically (887984205, 2789281219,
+  1546217554) — the patch moves no digest.
+- **self-test:** 38 cases, 0 failed (every X5-R52 (c) still-caught
+  bullet, an MW gain with and without `x33x ∧ cover_err`, MONITOR > 0,
+  a pass→fail with a Base text that is not MP-A, `--no-twin-exemption`,
+  a deadlock tip seed, a range mismatch and a sha256 mismatch).
+- **Comparator mutants** (scratch copies under the run dir, never
+  committed; each must fail `self-test`):
+
+  | mutant | self-test |
+  |---|---|
+  | M-CMP-NO-PF (no bullet-1 check for rounds with a Base text) | FAIL (9 cases, incl. `pass-fail-base-text-not-mpa` and `mpa-pass-fail`) |
+  | M-CMP-MPA-NOJUDGE (drop `(skx ∨ smx) ∧ pass_na`) | FAIL (`mpa-skx-smx-false`, `mpa-pass-na-false`) |
+  | M-CMP-META-ANYSLOT ((b)5′ accepts `Some(n)`) | FAIL (`meta-only-some-finding`) |
+  | M-CMP-TWIN-NODIR (`check-twin` skips T2) | FAIL (`twin-t2-both-dirs-lack-N`) |
+  | M-CMP-TWIN-ANYCLASS (the prefilter accepts MP seeds) | FAIL (`twin-mp-seed-prefilter-fails`) |
+
+  **M-CMP-NO-PF over the real 10k:** its output reads `MPA_PASS_FAIL 0
+  []` — 7078 r0 drops out entirely (not a new failure either; it
+  vanishes), which is the original inline comparator's gap, reproduced.
+
+**Step 2 — the re-read of the same 10k under X5-R52 (this commit).**
+No campaign was run. The sha256 of the run JSON checks against
+`6b686266…739a` and the reference's against `f4d6…c923` (the Acceptance
+line passes both to the comparator and exits 0). The `compare` output,
+in full:
+
+```
+DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 87 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0), (1299, 0), (1319, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1749, 2), (1768, 0), (1927, 1), (1939, 0), (1999, 0), (2079, 0), (2189, 0), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (2859, 1), (2979, 0), (3099, 0), (3148, 0), (3377, 0), (3759, 2), (3838, 0), (3948, 0), (4148, 0), (4179, 0), (4279, 0), (4399, 1), (4439, 0), (4499, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (4659, 1), (4749, 0), (5077, 0), (5279, 0), (5328, 1), (5418, 0), (5499, 0), (5549, 2), (5798, 1), (6178, 1), (6189, 0), (6368, 0), (6369, 0), (6387, 2), (6417, 0), (6539, 0), (6719, 0), (6877, 0), (6917, 0), (7219, 0), (7257, 0), (7368, 1), (7419, 1), (7469, 1), (7658, 0), (7669, 0), (7727, 1), (7958, 1), (8038, 0), (8139, 2), (8278, 0), (8639, 0), (8748, 2), (8788, 1), (8869, 2), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+MOVED_MP_PENDING 52 [(47, 1), (547, 0), (797, 0), (967, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1768, 0), (1927, 1), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (3148, 0), (3377, 0), (3838, 0), (3948, 0), (4148, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (5077, 0), (5328, 1), (5418, 0), (5798, 1), (6178, 1), (6368, 0), (6387, 2), (6417, 0), (6877, 0), (6917, 0), (7257, 0), (7368, 1), (7658, 0), (7727, 1), (7958, 1), (8038, 0), (8278, 0), (8748, 2), (8788, 1), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+META_ONLY_ELIGIBLE 4 [(1927, 1), (7257, 0), (7658, 0), (8278, 0)]
+MPA_PASS_FAIL 1 [(7078, 0)]
+TWIN_DDL_PENDING 2 [(2599, 2), (2859, 1)]
+MOVED_LOST 94 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1), (1018, 0), (1107, 0), (1219, 0), (1367, 1), (1387, 0), (1578, 2), (1588, 0), (1598, 0), (1708, 2), (1747, 0), (1919, 1), (1927, 0), (1949, 0), (2099, 0), (2159, 0), (2259, 0), (2307, 0), (2389, 0), (2397, 0), (2517, 1), (2778, 0), (3029, 0), (3289, 0), (3377, 1), (3397, 0), (3548, 0), (3739, 0), (3759, 0), (3768, 0), (3947, 0), (4118, 0), (4359, 0), (4398, 0), (4399, 0), (4419, 1), (4518, 0), (4537, 1), (4567, 0), (4989, 1), (5129, 0), (5188, 0), (5328, 0), (5427, 0), (5479, 0), (5499, 1), (5619, 0), (5769, 2), (5798, 0), (6178, 0), (6387, 1), (6417, 1), (6458, 0), (6557, 0), (6909, 0), (6917, 1), (6938, 0), (7197, 0), (7219, 1), (7278, 0), (7298, 0), (7368, 0), (7419, 0), (7439, 1), (7447, 0), (7727, 2), (7889, 0), (7958, 0), (8257, 0), (8278, 1), (8307, 0), (8547, 0), (8639, 1), (8748, 0), (8788, 0), (9059, 0), (9159, 2), (9177, 0), (9329, 1), (9387, 0), (9388, 0), (9419, 0), (9429, 1), (9508, 2), (9618, 0), (9637, 1), (9717, 0), (9818, 0), (9967, 0), (9999, 0)]
+HEALED 3 [(457, 0), (1298, 1), (8777, 0)]
+TWIN_HEALED 1 [(6539, 1)]
+TEXT_CHANGED 131 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0), (1117, 0), (1127, 1), (1159, 0), (1197, 0), (1217, 0), (1337, 0), (1417, 0), (1447, 0), (1477, 0), (1628, 0), (1637, 0), (1798, 0), (1899, 0), (1917, 0), (1948, 1), (1959, 0), (1977, 0), (2028, 0), (2078, 0), (2097, 1), (2268, 0), (2377, 0), (2537, 0), (2567, 0), (2597, 0), (2638, 0), (2698, 0), (2757, 0), (2787, 0), (2828, 0), (2939, 0), (2977, 2), (2978, 0), (3068, 0), (3118, 0), (3227, 0), (3259, 1), (3357, 0), (3358, 0), (3438, 0), (3638, 0), (3817, 0), (3927, 0), (4038, 0), (4127, 1), (4247, 0), (4268, 0), (4297, 0), (4337, 0), (4378, 0), (4468, 0), (4489, 0), (4648, 0), (4657, 0), (4677, 0), (4699, 0), (4737, 0), (4758, 0), (5047, 1), (5078, 0), (5087, 0), (5148, 1), (5227, 1), (5298, 0), (5338, 1), (5378, 0), (5517, 0), (5618, 0), (5907, 0), (5958, 0), (6078, 0), (6138, 0), (6248, 0), (6377, 0), (6457, 0), (6517, 0), (6558, 0), (6627, 0), (6638, 0), (6677, 0), (6758, 0), (6807, 0), (6848, 0), (6977, 0), (6987, 0), (6997, 0), (7007, 0), (7098, 0), (7127, 0), (7227, 0), (7297, 0), (7317, 0), (7337, 0), (7338, 0), (7357, 0), (7399, 0), (7457, 1), (7698, 0), (7917, 0), (8098, 0), (8138, 0), (8268, 0), (8287, 0), (8309, 1), (8418, 0), (8617, 0), (8618, 0), (8638, 0), (8687, 0), (8977, 0), (8998, 0), (9028, 0), (9078, 1), (9107, 1), (9228, 0), (9398, 0), (9417, 0), (9528, 0), (9617, 0), (9657, 0), (9827, 0), (9878, 0), (9959, 0)]
+TWIN_FAILING 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)] BASE 6
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+**Exit 0, `NEW_FAILING 0`.** Every row is inside X5-R52: no STOP.
+
+- **`check-mp` on every `MOVED_MP_PENDING` row**, reading the gate's
+  recorded `m/pend/s<seed>.{err,json,out}` (read-only, no runs; every
+  digest equals the 10k file's and every run's own line reads
+  `MONITOR=0`, so T5 holds): **48 `EXPLAINED (b)5`, 4 `EXPLAINED (b)5'`**
+  — the four are 1927 r1, 7257 r0, 7658 r0 and 8278 r0, exactly the
+  `META_ONLY_ELIGIBLE` set. Table (findings' slots, then `tainted`, or
+  the (b)5′ media list):
+
+
+| seed | round | verdict and evidence |
+|---|---|---|
+| 47 | 1 | EXPLAINED (b)5 5 finding(s) slots [9, 47, 85, 36, 11] tainted [9, 11, 36, 47, 85] |
+| 547 | 0 | EXPLAINED (b)5 2 finding(s) slots [66, 167] tainted [66, 167] |
+| 797 | 0 | EXPLAINED (b)5 2 finding(s) slots [13, 40] tainted [13, 40] |
+| 967 | 0 | EXPLAINED (b)5 1 finding(s) slots [10] tainted [10] |
+| 1367 | 0 | EXPLAINED (b)5 1 finding(s) slots [203] tainted [203] |
+| 1567 | 0 | EXPLAINED (b)5 1 finding(s) slots [10] tainted [1, 10] |
+| 1578 | 1 | EXPLAINED (b)5 4 finding(s) slots [46, 16, 51, 142] tainted [16, 46, 51, 142] |
+| 1708 | 1 | EXPLAINED (b)5 1 finding(s) slots [16] tainted [16] |
+| 1747 | 1 | EXPLAINED (b)5 5 finding(s) slots [67, 31, 41, 80, 68] tainted [31, 41, 67, 68, 80] |
+| 1768 | 0 | EXPLAINED (b)5 2 finding(s) slots [11, 13] tainted [11, 13] |
+| 1927 | 1 | EXPLAINED (b)5' 1 finding(s), media [Misdirected to_off=4096 inode=0 off=8192, Lost inode=0 off=98304, Torn { sectors: [717824, 718848, 719360, 719872] } inode=0 off=716800] |
+| 2208 | 0 | EXPLAINED (b)5 1 finding(s) slots [53] tainted [53] |
+| 2258 | 0 | EXPLAINED (b)5 1 finding(s) slots [68] tainted [68] |
+| 2307 | 1 | EXPLAINED (b)5 2 finding(s) slots [8, 104] tainted [8, 104] |
+| 2517 | 0 | EXPLAINED (b)5 1 finding(s) slots [12] tainted [12] |
+| 3148 | 0 | EXPLAINED (b)5 1 finding(s) slots [90] tainted [90] |
+| 3377 | 0 | EXPLAINED (b)5 1 finding(s) slots [5] tainted [5] |
+| 3838 | 0 | EXPLAINED (b)5 1 finding(s) slots [4] tainted [4] |
+| 3948 | 0 | EXPLAINED (b)5 2 finding(s) slots [27, 70] tainted [27, 70] |
+| 4148 | 0 | EXPLAINED (b)5 2 finding(s) slots [117, 77] tainted [77, 117] |
+| 4537 | 0 | EXPLAINED (b)5 1 finding(s) slots [18] tainted [18] |
+| 4548 | 0 | EXPLAINED (b)5 2 finding(s) slots [31, 103] tainted [31, 103] |
+| 4558 | 0 | EXPLAINED (b)5 1 finding(s) slots [10] tainted [10] |
+| 4567 | 1 | EXPLAINED (b)5 5 finding(s) slots [42, 119, 61, 106, 126] tainted [42, 61, 106, 119, 126] |
+| 4647 | 0 | EXPLAINED (b)5 3 finding(s) slots [115, 41, 47] tainted [41, 47, 115] |
+| 5077 | 0 | EXPLAINED (b)5 2 finding(s) slots [5, 3] tainted [3, 5] |
+| 5328 | 1 | EXPLAINED (b)5 1 finding(s) slots [136] tainted [2, 136] |
+| 5418 | 0 | EXPLAINED (b)5 1 finding(s) slots [9] tainted [1, 9] |
+| 5798 | 1 | EXPLAINED (b)5 2 finding(s) slots [39, 83] tainted [39, 83] |
+| 6178 | 1 | EXPLAINED (b)5 3 finding(s) slots [141, 121, 37] tainted [37, 121, 141] |
+| 6368 | 0 | EXPLAINED (b)5 1 finding(s) slots [15] tainted [15] |
+| 6387 | 2 | EXPLAINED (b)5 3 finding(s) slots [115, 126, 207] tainted [115, 126, 207] |
+| 6417 | 0 | EXPLAINED (b)5 2 finding(s) slots [46, 102] tainted [46, 102] |
+| 6877 | 0 | EXPLAINED (b)5 3 finding(s) slots [12, 9, 10] tainted [9, 10, 12] |
+| 6917 | 0 | EXPLAINED (b)5 1 finding(s) slots [3] tainted [3] |
+| 7257 | 0 | EXPLAINED (b)5' 1 finding(s), media [Misdirected to_off=8192 inode=0 off=4096, Misdirected to_off=77824 inode=0 off=0] |
+| 7368 | 1 | EXPLAINED (b)5 4 finding(s) slots [9, 66, 74, 100] tainted [9, 66, 74, 100] |
+| 7658 | 0 | EXPLAINED (b)5' 1 finding(s), media [Misdirected to_off=8192 inode=0 off=4096, Torn { sectors: [17408, 18944, 19456] } inode=0 off=16384, Lost inode=0 off=4096] |
+| 7727 | 1 | EXPLAINED (b)5 4 finding(s) slots [75, 56, 202, 99] tainted [56, 75, 99, 202] |
+| 7958 | 1 | EXPLAINED (b)5 2 finding(s) slots [54, 28] tainted [28, 54] |
+| 8038 | 0 | EXPLAINED (b)5 2 finding(s) slots [16, 19] tainted [16, 19] |
+| 8278 | 0 | EXPLAINED (b)5' 1 finding(s), media [Torn { sectors: [4096, 5120, 6656, 7168, 7680] } inode=0 off=4096] |
+| 8748 | 2 | EXPLAINED (b)5 6 finding(s) slots [89, 8, 198, 141, 189, 23] tainted [8, 23, 89, 141, 189, 198] |
+| 8788 | 1 | EXPLAINED (b)5 4 finding(s) slots [25, 26, 33, 154] tainted [25, 26, 33, 154] |
+| 8898 | 0 | EXPLAINED (b)5 1 finding(s) slots [57] tainted [57] |
+| 9388 | 1 | EXPLAINED (b)5 2 finding(s) slots [27, 40] tainted [27, 40] |
+| 9508 | 0 | EXPLAINED (b)5 2 finding(s) slots [14, 21] tainted [14, 21] |
+| 9547 | 0 | EXPLAINED (b)5 1 finding(s) slots [108] tainted [108] |
+| 9637 | 0 | EXPLAINED (b)5 1 finding(s) slots [120] tainted [120] |
+| 9767 | 0 | EXPLAINED (b)5 1 finding(s) slots [132] tainted [132] |
+| 9818 | 1 | EXPLAINED (b)5 5 finding(s) slots [65, 10, 33, 113, 105] tainted [10, 33, 65, 105, 113] |
+| 9967 | 1 | EXPLAINED (b)5 4 finding(s) slots [74, 41, 38, 29] tainted [29, 38, 41, 74] |
+
+- **The twin evidence** — single-seed runs of 2599, 2859 and 609 in the
+  patched scratch build (Work hygiene: seed < 10000,
+  `ulimit -v 25165824`, output outside the worktree), then `check-twin`
+  on each. 2599 and 2859 are the pending rows; 609 is a twin failure of
+  the reference file, here as evidence of the pre-existing shape (the
+  gate reproduces 2599 and 2859 on its own):
+
+
+| seed | twin round | `check-twin` | digest |
+|---|---|---|---|
+| 2599 | 2 | `EXPLAINED N=3 k=2 (real round 1: lost=1 mis=0 torn=1 cover_err=False frontier=1 hi=5)` | 1546217554 |
+| 2859 | 1 | `EXPLAINED N=4 k=1 (real round 0: lost=0 mis=1 torn=0 cover_err=False frontier=1 hi=7)` | 2789281219 |
+| 609 | 1 | `EXPLAINED N=5 k=1 (real round 0: lost=0 mis=0 torn=2 cover_err=False frontier=2 hi=8)` | 887984205 |
+
+T2's line for each (the round-start line the verdict reads):
+
+```
+X5R52 round-start seed=2599 round=2 real_dir=[1, 2, 3] twin_dir=[1, 2]
+X5R52 round-start seed=2859 round=1 real_dir=[1, 2, 3, 4] twin_dir=[1, 2, 3]
+X5R52 round-start seed=609 round=1 real_dir=[1, 2, 3, 4, 5] twin_dir=[1, 2, 3, 4]
+```
+
+- **7078 r0, the (iii) row, at both ends:**
+
+| end | crash | o1 | o3 | mrb | served | skx | smx | pass_na | c | q[15] | pass |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Base | `uniform@y:5875` | `O-1(a) at c=5: published {} != model {2, 3, 4}` | null | true | false | false | false | null | null | 1 | true |
+| tip | `uniform@y:10344` | `O-1(a) at c=15: published {} != model {2, 3, 4}` | `O-3(a): served corruption` | true | true | false | true | true | null | 1 | false |
+
+  A served round passes iff `(skx ∨ smx) ∧ pass_na` (X5-R30 (c) rule 4):
+  `smx ∧ pass_na` holds, so the round's `pass=false` is the
+  recorded-failure form of rule 5, not a fold regression — `MPA_PASS_FAIL`,
+  exempt under (c)(iii).
+
+- **The class sizes at both ends, reported and never netted:**
+  - the twin family (MW seeds, twin `pass=false` with an O-1(a)
+    `published {}` text): **Base 6** — 609 r1, 849 r1, 3449 r1, 5049 r1,
+    6539 r1, 7179 r1 — **tip 7** (6539 heals; 2599 r2 and 2859 r1 gain);
+  - **MP-A** (MP rounds, `pass=false`, `served=true`, O-3(a)): **Base 11**
+    (457, 537, 1887, 2927, 4098, 7238, 7528, 8107, 8728, 8777, 9358, all
+    r0), **tip 10** (457 and 8777 heal; 7078 gains); every one of the 21
+    meets `(skx ∨ smx) ∧ pass_na`;
+  - **(ii)'s JSON shape** (MP rounds with `c` null, `frontier` 0,
+    `mrb=false`, `served=false`, `q[15]=1`, `q[12..14]=0`): **Base 187,
+    tip 190**.
+
+- **The 0..1000 calibration** (F2's five `m/tip_*.json` merged against
+  the Base 1k file — `gate-X-5c-F4-F1-F1-F3/m/b1k.json`; the card's path
+  names the F2-F1 gate dir, but `b1k.json` lives in the F3 gate dir,
+  the same file F2-F1's record cites — `--range 0..1000`, exit 0):
+
+```
+DIGESTS_MOVED 243 FAILING_ROUNDS 4 MONITOR 0
+MOVED_GAINED 7 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0)]
+MOVED_MP_PENDING 4 [(47, 1), (547, 0), (797, 0), (967, 0)]
+META_ONLY_ELIGIBLE 0 []
+MPA_PASS_FAIL 0 []
+TWIN_DDL_PENDING 0 []
+MOVED_LOST 5 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1)]
+HEALED 1 [(457, 0)]
+TWIN_HEALED 0 []
+TEXT_CHANGED 8 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0)]
+TWIN_FAILING 2 [(609, 1), (849, 1)] BASE 2
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+  Exactly X5-R51's own calibration (7 gained, the same four MP pendings,
+  5 lost, healed `[(457, 0)]`, 0 new) with every X5-R52 row empty. (The
+  `TEXT_CHANGED` count is 8 where F2-F1's hand table said 9: that table
+  also counted 457 r0, which both rules classify `HEALED`, so the
+  comparator counts it once, there.)
+
+**Nothing outside X5-R52: no STOP.**
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
