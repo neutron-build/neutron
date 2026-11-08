@@ -1,6 +1,12 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3-F2-F1 — this card continues F2
+Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F1 — the X5-R52 card: P's
+post-data amendment to X5-R51 (verbatim below, with X5-R51 quoted
+unchanged beside it), written after the F2-F1 gate verdict's ESCALATE;
+the comparator committed as a tool with bullet 1 testable, and the same
+10k re-read under the amendment (no campaign re-run). F2-F1's commits
+merge through this card, on its chain, with no code change.** Before
+it: stage X-5c-F4-F1-F1-F3-F2-F1 — this card continues F2
 (X5-R49) from its tip `1524e284` under the gate verdict's P ruling
 X5-R51, the step-4 movement exemption (fixed verbatim below, with the
 g8 re-selection rule, before any code or literal of this card).**
@@ -2036,6 +2042,184 @@ repo's refs are read-only here); each commit lands on the branch
 correctly — `git log` and `git status` verified after every step.
 
 
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F1's record (X5-R52, P's post-data
+## amendment to X5-R51; the comparator in `tools/`; the re-read of
+## F2-F1's 10k)
+
+The F2-F1 gate verdict (`verdicts/X-5c-F4-F1-F1-F3-F2-F1.md`, at
+`8992f77f`) ESCALATED: seven rounds fall outside X5-R51 as written — the
+two twins it names (2599 r2, 2859 r1), 7078 r0 (a pass→fail the
+comparator never tested), and four `MOVED_MP_PENDING` rounds whose only
+finding is `slot: None` (1927 r1, 7257 r0, 7658 r0, 8278 r0). None is a
+loss caused by X5-R49; each is a pre-existing class the moved schedule
+reaches. X5-R51 was fixed in advance and "any change is an ESCALATE", so
+only P could amend it. **X5-R52 is that amendment, verbatim below.** If
+the re-read and the gate's single-seed checks find nothing outside
+X5-R52, F2-F1's commits merge through this card, on its chain, with no
+code change.
+
+**Numbering.** The highest X5-R number in use in the README, the cards,
+the verdicts, QUEUE and PLAN is R51 (checked on every `card/v3-*` branch
+on 2026-11-07). **This rule is X5-R52.**
+
+### X5-R51, quoted unchanged (the rule this card's record reads against)
+
+Copied verbatim from F2-F1's card and its step-0 quote above; not edited
+by this card:
+
+**X5-R51 (the step-4 movement exemption; a P rule on this card's comparisons only; X5-R49 unchanged).**
+- **(a) Scope.**
+  - X5-R51 amends only bullet 2 of F2's step-4 "new failure" list: "a round with no O-1, O-2 or O-3 text at the Base that has one here".
+  - It applies to `rounds` entries, never to `twin` entries. It compares the same seed at the Base and at the tip under the same `Tuning`.
+  - A round that exists at the tip but not at the Base counts as text-free at the Base.
+  - Bullet 1 (a fold regression) and bullet 3 (a DEADLOCK, PANIC, MONITOR, DEFECT or baton hit the Base lacks) are unchanged.
+  - The rule that a changed text in a round that already carried one is reported, not counted, is unchanged.
+- **(b) Moved, not new.** A bullet-2 round, seed `s` round `i`, is **moved** only when every check below holds. Each check is read from the named output and nothing else:
+  1. **Class.** The seed's `class` in the run JSON is `MP` or `MW`.
+  2. **Pass.** The round's `pass` is `true`.
+  3. **The text.** `o2` and `o3` are null, and `o1` begins with `O-1(a)`.
+  4. **No monitor hit.** The run's `E4 SEEDS=… MONITOR=` count is 0. For a single-seed run, that run's own line counts. A non-zero count exempts nothing in that run.
+  5. **Fully explained.** Run seed `s` alone at the tip with `E4_MPE_DIAG=1 E4_X33_DIAG=1`.
+     - **MP:** take the `amcheck_i findings … tainted …` line inside the `=== seed s round i class Mp ===` block. It must hold:
+       - at least one finding;
+       - a non-empty `tainted` set;
+       - every finding's `slot` is `Some(n)` with `n` in `tainted`.
+
+       A `None` slot, a slot outside `tainted`, an empty finding list or a missing block means the round is **not** explained.
+     - **MW:** the round's JSON `x33x` and `cover_err` are both `true`, and the `X33 diag: seed=s round=i ERR arm: damaged=[…]` line has a non-empty `damaged` list.
+- **(c) Lost.** The reverse direction is a Base round with a text whose tip round is text-free and `pass`, or missing.
+  - It is **moved-lost** when the Base round meets checks 1–3, plus the MW part of check 5 (the JSON fields only).
+  - Any other such round is **healed**.
+  - A Base round with `pass=false` whose tip round has `pass=true` and still carries a text is also **healed**. This is 457r0's shape.
+- **(d) Reporting.** Moved-gained, moved-lost and healed rounds are listed in full, never netted and never counted as new failures or as gains.
+  - **Moved-gained** rows give: seed, round, class, the Base and tip crash, the tip text, and for MP the findings and `tainted`, or for MW `damaged`.
+  - **Moved-lost** and **healed** rows give: seed, round, class, the Base and tip crash, and the Base text.
+- **(e) Outside the rule.** A bullet-2 round that fails any check in (b) is a **new failure**. So is any bullet-1 or bullet-3 hit.
+  - STOP: write the rounds into the README, commit, and ESCALATE. **Do not try a fix.**
+  - This applies at every comparison in this card: the 54 seeds, BASE 0..1000, and share 1000 over 0..200.
+- **(f) The 10k comparator.** The JSON does not carry findings or `tainted`. So the comparator in Acceptance applies checks 1–4, plus the MW part of check 5. It lists every MP round that passes those checks as `MOVED_MP_PENDING`.
+  - **The gate**, not a worker, runs each `MOVED_MP_PENDING` seed alone under (b)5 (seeds < 10000 only). A round that fails that check is a new failure: ESCALATE.
+  - The comparator's exit code is 0 only if nothing outside the rule is found. That is necessary, not sufficient.
+- **(g) Not an oracle change.**
+  - `pass`, the texts, the fold, `verify`, every quota and X5-R1–R50 are unchanged.
+  - X5-R51 decides only what this card's comparisons stop on. It carries to no other card unless P re-issues it.
+
+### X5-R52 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the step-0
+discipline, as X5-R6–R51 before it):
+
+**X5-R52 (the X5-R51 amendment: twin DDL divergence, meta-only detections, MP-A under X5-R30 (c), and bullet 1 made testable; a P rule, post-data; X5-R49 and X5-R51's text unchanged).**
+- **(0) Written after seeing the data.** P wrote X5-R52 **after** reading all of the following. It is a post-data amendment, and RESULT item 6 lists it as one, in the pattern of X5-R30 (c) and X5-R32.
+  - The verdict, `nucleus/v3/verdicts/X-5c-F4-F1-F1-F3-F2-F1.md` at `8992f77f`.
+  - F2-F1's acceptance 10k: `~/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json` (sha256 `6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`; `.prov`: commit `eb9c4328`, `status_lines=0`, `exit=0`, `verify_exit=0`), its `.campaign.out` (MONITOR=0), and the comparator's output, `X-5c-F4-F1-F1-F3-F2-F1.10k-verify-compare.out`.
+  - The reference, `~/.cache/nv3-review/X-5c-F4-F1-F1-CXX-F1/gate/tip-10k.json` (sha256 `f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`).
+  - The gate's single-seed evidence in `~/.cache/nv3-review/gate-X-5c-F4-F1-F1-F3-F2-F1/m/`: `b5.txt`, `pend/`, `d_*`, `e_*` and `tip_{2599,2859,7078}.*`.
+  - P's own reference implementation of the amended comparator, run over those files. Its readings are under "Expected" in Work step 2.
+
+  **The seven rounds it exempts were seen before it was written:** 2599 twin r2, 2859 twin r1, 7078 r0, 1927 r1, 7257 r0, 7658 r0 and 8278 r0. Each exemption below is drawn around a class that already exists in the reference file, never around those seven rounds.
+- **(a) Scope.**
+  - X5-R52 amends X5-R51 for two sets of comparisons: this card's re-read of F2-F1's 10k, and every comparison in card X-5c-F4-F1-F1-F3-F2-F1-F2. **For -F2, P re-issues X5-R51 here**, read with this amendment.
+  - It carries to no other card unless P re-issues it.
+  - **It is not an oracle change.** `pass`, the texts, the fold, `verify`, every quota and X5-R1–R51 are unchanged.
+  - **It is not an E4 judgement rule.** F4's class table and E4's owner rule are unchanged: "a class outside that table keeps E4 open", and "a class that a landed card claims to have fixed and that recurs counts as new". X5-R52 decides only what these comparisons stop on.
+- **(b) Bullet 1, made testable.**
+  - A **fold regression** is any `rounds` or `twin` entry that has `pass=true` at the Base and `pass=false` at the tip, **whatever text the Base round carried**. An entry missing at the Base counts as `pass=true` and text-free there.
+  - X5-R51 (a) keeps bullet 1 unchanged, and it has no exemption. X5-R52 grants exactly two bullet-1 exemptions, (c)(i) and (c)(iii), and nothing else.
+  - A round that carried a text at the Base and still passes at the tip with a different text is reported (`TEXT_CHANGED`), not counted. X5-R51 (a)'s last bullet is unchanged.
+- **(c) The three exemptions.** Each one is checked only from recorded fields: the two JSON files, the run's `.campaign.out`, and the named single-seed diagnostic output. An exemption that cannot be checked from them exempts nothing.
+  - **(i) Twin DDL divergence.** It applies to `twin` entries only. X5-R51 (a)'s "never to `twin` entries" is amended for this shape alone.
+    - **JSON prefilter (the comparator):**
+      - the seed's `class` is `MW`;
+      - the tip twin entry `i` has `pass=false`, and its `o1` begins with `O-1(a)` and contains `published {}`;
+      - some real round `j < i` has `lost + mis + torn ≥ 1` and either `cover_err` is true or `frontier < hi`;
+      - the run's MONITOR count is 0.
+
+      An entry that passes the prefilter is `TWIN_DDL_PENDING`. One that fails it is a new failure.
+    - **The single-seed check (the gate; `check-twin`).** Run seed `s` alone, at the commit under test, in a scratch export with `tools/x5r52-twin-diag.patch` applied. All five checks must hold:
+      - **T1.** The class-C (twin) recovery `Err` line for round `i` is exactly `Corrupt("tree N missing in directory")`.
+      - **T2.** The `X5R52 round-start` line for round `i` has `N` in `real_dir` and `N` absent from `twin_dir`.
+      - **T3.** The twin chain dropped `N` itself: a class-C replay listing of this seed, at a round `≤ i`, shows a commit record with `ddl` containing `D<N>`.
+      - **T4.** Let `k` be the first round start at which `N ∈ real_dir` and `N ∉ twin_dir`. Then `k ≥ 1`, and real round `k−1` in the 10k JSON has `lost + mis + torn ≥ 1` and either `cover_err` or `frontier < hi`. So the divergence first shows right after a WAL-faulted real round whose recovery stopped short.
+      - **T5.** The diagnostic run's digest for `s` equals the 10k file's, and its `E4 … MONITOR=` count is 0. A run whose digest differs is not evidence.
+    - **Why this is a pre-existing class and not a new loss.**
+      - The reference file already has six twin failures of exactly this shape: 609, 849, 3449, 5049, 6539 and 7179, all r1. The gate re-ran each at the Base and at the tip and got the same error.
+      - The failing replay applies a WAL record to a tree that the twin's image correctly dropped. No page slot, no freed home and no `image_refs` is involved, so X5-R49's slot freeing cannot reach it.
+      - X5-R49 moved crash points (2859 r1: `uniform@y:10565` → `6280`), and that is all. 6539 heals by the same movement.
+      - It is the C-XX "recovery-Err default" twin family, a Work 2.5 pairing artefact in the harness. -F2 fixes it.
+    - **Still caught:**
+      - a "tree N missing" twin failure where the real chain lacks `N` too at round `i`'s start. T2 fails: that is a replay bug, not divergence;
+      - a divergence that first shows after a real round with no recorded media fault, which is a crash-cut-only loss. T4 fails;
+      - any other twin `Err` (another `Corrupt` text, `WalLoss`, a panic). T1 fails;
+      - a twin failure in a class MP or C seed. The prefilter fails;
+      - a twin with `pass=false` and an O-2 text, or an O-1 text that is not a failed recovery. The prefilter fails;
+      - any twin failure at a commit that carries -F2's re-seed (see (g)).
+  - **(ii) Meta-only detected loss.** It amends X5-R51 (b)5 for MP moved-gained rounds only.
+    - **JSON prefilter (the comparator; `META_ONLY_ELIGIBLE`).** The round is already `MOVED_MP_PENDING` under X5-R51 (b)1–4, and:
+      - `c` is null and `frontier` is 0, so recovery failed;
+      - `mrb=false`;
+      - `served=false`;
+      - `q[15]` (Q14, a meta-slot fault) is 1;
+      - `q[12]`, `q[13]` and `q[14]` (Q13: a fault on a referenced slot) are all 0.
+    - **(b)5′, the single-seed check (the gate; `check-mp`).** Inside the `=== seed s round i class Mp ===` block:
+      - the `amcheck_i findings` line has at least one finding;
+      - **every** finding is `slot: None` with `what` beginning `no valid meta` (the G7 misplaced-meta form included);
+      - `tainted {}` and `meta_k None`;
+      - the block's `media[…]` lines include at least one fault on page slot 1 or 2, either by `off` or by a Misdirected `to_off` of 4096 or 8192 on inode 0.
+
+      T5's digest and MONITOR checks apply here too. A round outside `META_ONLY_ELIGIBLE` must pass (b)5 exactly as X5-R51 wrote it.
+    - **Why this is a pre-existing class and not a new loss.**
+      - X5-R5 pre-registered meta-slot faults, and Q14 counts them (611 rounds in this 10k).
+      - The reference file has **187** MP rounds of exactly the prefilter's JSON shape, and the tip has 190.
+      - With both meta slots faulted, or the only valid meta misplaced, open has no meta to open. The store reports a detected loss.
+      - The finding names no page slot, `tainted` is empty, and no referenced page slot was hit. The free path is never on the read path.
+    - **Still caught:**
+      - "no valid meta" with `q[15]=0`, meaning the store lost its own meta with no fault drawn. Not eligible, so (b)5 applies and fails;
+      - a meta fault plus any `Some(n)` finding, or any `None` finding whose text is not "no valid meta". (b)5′ fails;
+      - a round that also hit a referenced page slot (`q[12..14]` not all 0). Not eligible, so it must pass (b)5;
+      - `mrb=true` or `served=true`. Not eligible;
+      - `pass=false`. That is bullet 1, never (ii).
+  - **(iii) MP-A under X5-R30 (c).** It applies to bullet-1 `rounds` entries only.
+    - **The check, exact from the JSON (the comparator; no single-seed run):**
+      - the seed's `class` is `MP`;
+      - **the Base round** has `pass=true`, `mrb=true`, `c` null, `q[15]=1`, `o2` and `o3` null, and `o1` beginning with `O-1(a)`. It was already a meta-rollback detected loss;
+      - **the tip round** has `pass=false`, `served=true`, `mrb=true`, `c` null and `q[15]=1`; `o2` is null; `o3` is exactly `O-3(a): served corruption`; `skx` or `smx` is true; and `pass_na` is exactly `true`;
+      - the run's MONITOR count is 0.
+
+      A round that meets every check is `MPA_PASS_FAIL`. Any other bullet-1 round is a new failure.
+    - **Why this is a pre-existing class and not a new loss.**
+      - X5-R30 (c) rule 4 (RULED, binding) says that "a served round passes iff `(skx ∨ smx) ∧ pass_na`". Such a round passes under the judgement that already governs these fields. Its `pass=false` is the recorded-failure form that X5-R30 (c) rule 5 describes, not a fold regression in the judged sense.
+      - MP-A has 11 rounds in the reference file and 10 in the tip's 10k, and every one of the 21 meets `(skx ∨ smx) ∧ pass_na`.
+      - In 7078 r0, the overwritten slot is checkpoint 0's map root (slot 4), rewritten after checkpoint 1's meta was durable. That is superseded-image reuse, which predates X5-R49, and not a `free_lpid` home.
+    - **Still caught:**
+      - a serve outside K and outside the opened meta slot (`skx=smx=false`);
+      - `pass_na` false or null;
+      - a Base round that was text-free, or a Base round with `mrb=false` or a non-null `c`. That is new reach for MP-A;
+      - any O-2 text, or any O-3 text other than exactly `O-3(a): served corruption`;
+      - any class MW serve. X5-R30 (c) rule 3 keeps every MW serve a served corruption.
+- **(d) Reporting.** The comparator lists every row in full, never netted and never counted as a gain.
+  - Rows: `TWIN_DDL_PENDING`, `MOVED_MP_PENDING` with its `META_ONLY_ELIGIBLE` subset, `MPA_PASS_FAIL`, `TWIN_HEALED` and `TEXT_CHANGED`, beside X5-R51's lists.
+  - The README gives each exempt row's fields:
+    - for (i), `N`, `k`, the T2 line and real round `k−1`'s `lost/mis/torn/frontier/hi/cover_err`;
+    - for (ii), the findings, `media[…]` and `q`;
+    - for (iii), the Base and tip `crash/o1/o3/mrb/served/skx/smx/pass_na`.
+  - **Class sizes at both ends, reported and never netted:** the twin family's failing entries, MP-A, and (ii)'s JSON shape.
+- **(e) Outside the rule.** Each of these is a **new failure**:
+  - a bullet-1 entry that is neither (i) nor (iii);
+  - a pending row whose single-seed check fails;
+  - a bullet-2 round outside X5-R51 (b) and outside (ii);
+  - any bullet-3 hit.
+
+  **STOP:** write the rounds into the README, commit, and ESCALATE. Do not try a fix.
+- **(f) The comparator, and who checks what.**
+  - The comparator is `spikes/e4-recovery/tools/x5r52_compare.py`. Its exit code is 0 only if nothing outside the rule is found. That is necessary, not sufficient.
+  - **The gate**, not a worker, runs `check-mp` on every `MOVED_MP_PENDING` row and `check-twin` on every `TWIN_DDL_PENDING` row, singly, on seeds below 10000 only. It may re-read single-seed outputs that a gate already recorded at the same commit, provided T5 holds for each.
+  - A worker may produce twin evidence to validate the patch. The gate reproduces it on its own.
+- **(g) -F2's re-seed voids (i).**
+  - At any commit that carries -F2's re-seed, the twin chain is re-seeded whenever the two directories differ at round start, so T2 cannot hold.
+  - Comparisons at such a commit run the comparator with `--no-twin-exemption`, and (i) exempts nothing there.
+  - After -F2 lands, a twin failure of this family is a recurrence of a class that a landed card claims to have fixed. Under E4's owner rule, F4 counts it as new.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
