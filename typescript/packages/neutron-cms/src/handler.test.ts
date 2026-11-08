@@ -504,3 +504,42 @@ test("a list edited on the site can keep its own admin page", async () => {
   assert.match(page, />Menu links<\/a>/);
   assert.match(page, /<span>Label<\/span>/);
 });
+
+test("a homepage design is always published, answers only at its own address, and can't be taken down", async () => {
+  const site = defineCms({ reservedSlugs: ["gpg"], designs: { home: { title: "Home", url: "/", permanent: true }, gpg: { title: "GPG", url: "/gpg/", published: true }, extra: "Extra" } });
+  const cookie = await logIn();
+  const call2 = (path: string, init: RequestInit = {}) => {
+    const url = new URL(path, SITE);
+    const unsafe = init.method && init.method !== "GET";
+    const headers = new Headers({ cookie, ...(unsafe ? { origin: SITE } : {}) });
+    return (unsafe ? site.POST : site.GET)({ request: new Request(url, { ...init, headers }), params: { path: url.pathname.replace(/^\/n-admin\/?/, "") } });
+  };
+  const list = await (await call2("/n-admin/pages")).text();
+  assert.match(list, />Home<\/a><\/td><td class="status live">live</);
+  assert.match(list, />GPG<\/a><\/td><td class="status live">live</);
+  assert.match(list, />Extra<\/a><\/td><td class="status draft">draft</);
+  assert.equal(site.design("home")?.title, "Home");
+  assert.equal(site.page("home"), undefined, "the homepage doesn't also answer at /home");
+  assert.equal(site.design("gpg")?.title, "GPG");
+  assert.equal(site.design("extra"), undefined);
+
+  const id = list.match(/href="\/n-admin\/posts\/(\d+)">Home</)![1];
+  const editor = await (await call2(`/n-admin/posts/${id}`)).text();
+  assert.doesNotMatch(editor, /value="unpublish"/);
+  assert.doesNotMatch(editor, /value="delete"/);
+  const revision = editor.match(/name="revision" value="([^"]+)"/)![1];
+  await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "unpublish", title: "Home", revision }) });
+  await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "delete" }) });
+  assert.equal(site.design("home")?.title, "Home");
+
+  const gpg = list.match(/href="\/n-admin\/posts\/(\d+)">GPG</)![1];
+  const gpgEditor = await (await call2(`/n-admin/posts/${gpg}`)).text();
+  assert.match(gpgEditor, /value="unpublish"/);
+  const gpgRevision = gpgEditor.match(/name="revision" value="([^"]+)"/)![1];
+  await call2(`/n-admin/posts/${gpg}`, { method: "POST", body: new URLSearchParams({ intent: "unpublish", title: "GPG", revision: gpgRevision }) });
+  assert.equal(site.design("gpg"), undefined, "a reserved address doesn't stop a design being unpublished");
+  const edit = await (await call2(`/n-admin/edit?page=${gpg}`)).text();
+  const src = edit.match(/src="([^"]+)"[^>]*data-edit-frame/)![1].replace(/&amp;/g, "&");
+  assert.match(src, /^\/gpg\/\?cms-preview=/);
+  assert.equal(site.design("gpg", new Request(SITE + src))?.title, "GPG");
+});

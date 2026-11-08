@@ -18,6 +18,18 @@ export interface ListDefinition {
   ownPage?: boolean;
 }
 
+export interface Design {
+  title: string;
+  /** A fixed address, such as "/" for a homepage. Default: the page's own address, from its URL setting. */
+  url?: string;
+  /** Starts out published, for a page that is already live. Default: a draft. */
+  published?: boolean;
+  /** Always published, as a homepage must be: it can't be unpublished, moved or deleted. */
+  permanent?: boolean;
+}
+
+export type ResolvedDesign = Required<Pick<Design, "title" | "published" | "permanent">> & { url?: string };
+
 export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record<string, ListDefinition>> {
   /** Where the route files are. Default `/n-admin`. */
   path?: string;
@@ -26,11 +38,12 @@ export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record
   /** Standalone pages, such as an about page, edited like posts but kept out of the blog. */
   pages?: boolean;
   /**
-   * Pages with their own design, by key and title, such as `{ portfolio: "Portfolio" }`. Each is listed
-   * under Pages, published and unpublished like any page, and its words and pictures are edited on the
-   * page itself. Your route draws it when `cms.page(slug, request)` returns a page whose `layout` is the key.
+   * Pages with their own design, by key, such as `{ portfolio: "Portfolio", home: { title: "Home", url: "/", permanent: true } }`.
+   * Each is listed under Pages, published and unpublished like any page, and its words and pictures are
+   * edited on the page itself. Your route draws it when `cms.page(slug, request)` returns a page whose
+   * `layout` is the key, and a page with a fixed `url` checks `cms.page(key, request)` before it shows.
    */
-  designs?: Record<string, string>;
+  designs?: Record<string, string | Design>;
   /** Where a page lives on the site. Defaults to `postUrl`. */
   pageUrl?: (slug: string) => string;
   /** Where a post lives on the site, for the admin's links. Default `/<slug>`. */
@@ -60,7 +73,7 @@ export interface ResolvedConfig {
   path: string;
   posts: boolean;
   pages: boolean;
-  designs: Record<string, string>;
+  designs: Record<string, ResolvedDesign>;
   postUrl: (slug: string) => string;
   pageUrl: (slug: string) => string;
   reservedSlugs: string[];
@@ -99,9 +112,12 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
     }),
   );
   const postUrl = config.postUrl ?? ((slug: string) => `/${slug}`);
-  const designs = config.designs ?? {};
-  for (const key of Object.keys(designs)) {
+  const designs: Record<string, ResolvedDesign> = {};
+  for (const [key, value] of Object.entries(config.designs ?? {})) {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(key)) throw new Error(`neutron-cms: design "${key}" must be lowercase letters, digits and dashes`);
+    const design = typeof value === "string" ? { title: value } : value;
+    if (design.url !== undefined && !/^\/(?!\/)/.test(design.url)) throw new Error(`neutron-cms: design "${key}" url must start with one "/"`);
+    designs[key] = { title: design.title, url: design.url, published: design.published ?? false, permanent: design.permanent ?? false };
   }
   const onPage = config.onPage ?? [];
   for (const key of onPage) {

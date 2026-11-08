@@ -1,9 +1,9 @@
 import { resolveConfig, type CmsConfig, type ListDefinition } from "./config.js";
 import { createHandler, type RouteArgs } from "./handler.js";
 import { isPreview } from "./auth.js";
-import { allTexts, contentCount, ensureDesigns, listItems, livePostBySlug, livePosts, postBySlug, today, upcoming, type Item, type Post } from "./store.js";
+import { allTexts, contentCount, designPage, ensureDesigns, isLive, listItems, livePostBySlug, livePosts, postBySlug, today, upcoming, type Item, type Post } from "./store.js";
 
-export type { CmsConfig, Field, FieldType, ListDefinition } from "./config.js";
+export type { CmsConfig, Design, Field, FieldType, ListDefinition } from "./config.js";
 export type { Item, Post } from "./store.js";
 export { firstImage, renderMarkdown, summarize } from "./markdown.js";
 
@@ -30,10 +30,10 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
     posts: (): Post[] => livePosts(),
     /** One published post, or undefined. */
     post: (slug: string): Post | undefined => livePostBySlug(slug),
-    /** Published pages, newest first. */
+    /** Published pages at their own slugs, newest first. Designs with a fixed address are left out; ask `design(key)` for those. */
     pages: (): Post[] => {
       withDesigns();
-      return livePosts("page");
+      return livePosts("page").filter((page) => !(Object.hasOwn(config.designs, page.layout) && config.designs[page.layout].url));
     },
     /**
      * One published page, or undefined. Pass the request and a draft opened from the admin's
@@ -41,9 +41,20 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
      */
     page: (slug: string, request?: Request): Post | undefined => {
       withDesigns();
-      const live = livePostBySlug(slug, "page");
-      if (live || !request) return live;
-      return isPreview(slug, new URL(request.url).searchParams.get("cms-preview")) ? postBySlug(slug, "page") : undefined;
+      const found = livePostBySlug(slug, "page") ?? (request && isPreview(slug, new URL(request.url).searchParams.get("cms-preview")) ? postBySlug(slug, "page") : undefined);
+      // A design with its own address answers only there.
+      return found && config.designs[found.layout]?.url && Object.hasOwn(config.designs, found.layout) ? undefined : found;
+    },
+    /**
+     * The page of a design with a fixed address, such as a homepage, when published or opened from
+     * Edit site; otherwise undefined, and the route should answer 404.
+     */
+    design: (key: string, request?: Request): Post | undefined => {
+      withDesigns();
+      const found = designPage(key);
+      if (!found) return undefined;
+      if (isLive(found)) return found;
+      return request && isPreview(key, new URL(request.url).searchParams.get("cms-preview")) ? found : undefined;
     },
     /** A list's items, in their saved order. */
     list: (key: keyof Lists & string): Item[] => listItems(key),

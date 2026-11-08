@@ -150,6 +150,9 @@ export const getPost = (id: number) =>
 export const livePostBySlug = (slug: string, kind: Kind = "post") =>
   db().prepare("SELECT * FROM posts WHERE slug = ? AND kind = ? AND published_at <= ?").get(slug, kind, now()) as Post | undefined;
 
+export const designPage = (key: string) =>
+  db().prepare("SELECT * FROM posts WHERE kind = 'page' AND layout = ?").get(key) as Post | undefined;
+
 /** A page or post at this address, published or not. */
 export const postBySlug = (slug: string, kind: Kind = "post") =>
   db().prepare("SELECT * FROM posts WHERE slug = ? AND kind = ?").get(slug, kind) as Post | undefined;
@@ -158,16 +161,19 @@ export const postBySlug = (slug: string, kind: Kind = "post") =>
  * Every design has a page: a draft is made for one that has none. A page already at the design's
  * address, such as one imported from an older site, becomes the design's page and keeps its state.
  */
-export function ensureDesigns(designs: Record<string, string>): void {
+export function ensureDesigns(given: Record<string, string | { title: string; published?: boolean; permanent?: boolean }>): void {
+  const designs = Object.fromEntries(Object.entries(given).map(([key, value]) => [key, typeof value === "string" ? { title: value } : value])) as Record<string, { title: string; published?: boolean; permanent?: boolean }>;
   const keys = Object.keys(designs);
   if (!keys.length) return;
   const byLayout = db().prepare("SELECT id FROM posts WHERE kind = 'page' AND layout = ?");
   transaction(() => {
     for (const key of keys) {
+      if (designs[key].permanent) db().prepare("UPDATE posts SET published_at = ? WHERE kind = 'page' AND layout = ? AND (published_at IS NULL OR published_at > ?)").run(now(), key, now());
       if (byLayout.get(key)) continue;
       const atAddress = postBySlug(key, "page") ?? (db().prepare("SELECT * FROM posts WHERE slug = ?").get(key) as Post | undefined);
+      const live = designs[key].published || designs[key].permanent ? now() : null;
       if (atAddress?.kind === "page") db().prepare("UPDATE posts SET layout = ? WHERE id = ?").run(key, atAddress.id);
-      else db().prepare("INSERT INTO posts (slug, title, kind, layout, updated_at) VALUES (?, ?, 'page', ?, ?)").run(atAddress ? null : key, designs[key], key, now());
+      else db().prepare("INSERT INTO posts (slug, title, kind, layout, published_at, updated_at) VALUES (?, ?, 'page', ?, ?, ?)").run(atAddress ? null : key, designs[key].title, key, live, now());
     }
   });
 }

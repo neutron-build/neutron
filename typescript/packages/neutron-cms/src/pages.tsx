@@ -107,7 +107,7 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
               {props.posts.map((post) => (
                 <tr key={post.id}>
                   <td><a href={`${admin}/posts/${post.id}`}>{post.title || "Untitled"}</a></td>
-                  <td class="status">{post.status === "live" ? "" : post.status}</td>
+                  <td class={`status ${post.status}`}>{post.status}</td>
                   <td class="date"><time dateTime={post.date}>{DATE.format(new Date(post.date))}</time></td>
                 </tr>
               ))}
@@ -132,7 +132,8 @@ export function EditorPage(props: {
   const live = status === "live";
   const admin = config.path;
   const FORM = "post-form";
-  const design = post.kind === "page" && Object.hasOwn(config.designs, post.layout);
+  const design = post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined;
+  const fixed = design?.url;
   const url = post.kind === "page" ? config.pageUrl : config.postUrl;
   return (
     <>
@@ -144,6 +145,9 @@ export function EditorPage(props: {
         {design ? null : <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>}
         <button class="button quiet" type="button" data-toggle-meta aria-expanded={error ? "true" : "false"} aria-controls="post-settings">Settings</button>
         {design ? null : <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>}
+        {status !== "draft" && !design?.permanent ? (
+          <button class="button quiet on-wide" type="submit" form={FORM} name="intent" value="unpublish" data-confirm={live ? `Take this ${post.kind} offline? You can publish it again any time.` : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
+        ) : null}
         {status === "draft" ? (
           <button class="button primary" type="submit" form={FORM} name="intent" value="publish" data-publish>Publish</button>
         ) : (
@@ -180,11 +184,19 @@ export function EditorPage(props: {
         <iframe class="preview" title="Preview" sandbox="allow-same-origin" data-preview hidden />
 
         <aside class="meta" id="post-settings" aria-label="Post settings">
-          <label class="field">
-            <span>URL</span>
-            <input class="input" name="slug" value={values.slug ?? ""} disabled={live} placeholder="from-the-title" spellcheck={false} autocapitalize="off" />
-            {live ? <small>Fixed while live, so links keep working. Unpublish to change it.</small> : null}
-          </label>
+          {fixed ? (
+            <div class="field">
+              <span>Address</span>
+              <a href={fixed} target="_blank" rel="noreferrer">{fixed}</a>
+              <small>{design?.permanent ? "This page is always published." : "Set by the site's design."}</small>
+            </div>
+          ) : (
+            <label class="field">
+              <span>URL</span>
+              <input class="input" name="slug" value={values.slug ?? ""} disabled={live} placeholder="from-the-title" spellcheck={false} autocapitalize="off" />
+              {live ? <small>Fixed while live, so links keep working. Unpublish to change it.</small> : null}
+            </label>
+          )}
           <label class="field">
             <span>{status === "draft" ? "Publish on" : "Published on"}</span>
             <input class="input" type="datetime-local" name="date_local" value={post.published_at?.slice(0, 16) ?? ""} />
@@ -200,11 +212,11 @@ export function EditorPage(props: {
           </label>
           {design ? null : <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>}
           <footer>
-            {live && post.slug ? <a href={url(post.slug)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
-            {status === "draft" ? null : (
-              <button class="link" type="submit" name="intent" value="unpublish" data-confirm={live ? "Take this post offline?" : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
-            )}
-            <button class="link" type="submit" name="intent" value="delete" data-confirm="Delete this post?" formnovalidate>Delete</button>
+            {live && (fixed || post.slug) ? <a href={fixed ?? url(post.slug!)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
+            {status !== "draft" && !design?.permanent ? (
+              <button class="link on-phone" type="submit" name="intent" value="unpublish" data-confirm={live ? `Take this ${post.kind} offline? You can publish it again any time.` : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
+            ) : null}
+            {design ? null : <button class="link" type="submit" name="intent" value="delete" data-confirm={`Delete this ${post.kind}?`} formnovalidate>Delete</button>}
           </footer>
         </aside>
       </form>

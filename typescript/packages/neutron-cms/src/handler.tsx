@@ -180,14 +180,17 @@ export function createHandler(config: ResolvedConfig) {
     );
   }
 
-  const isDesign = (post: Post) => post.kind === "page" && Object.hasOwn(config.designs, post.layout);
+  const designOf = (post: Post) => (post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined);
+  const isDesign = (post: Post) => designOf(post) !== undefined;
 
   /** The site, or with `?page=` one designed page, drafts included, framed for editing. */
   function editSite(request: Request) {
     const id = Number(new URL(request.url).searchParams.get("page"));
     const designed = id ? getPost(id) : undefined;
-    if (designed && isDesign(designed) && designed.slug) {
-      const src = `${config.pageUrl(designed.slug)}?cms-preview=${encodeURIComponent(previewToken(designed.slug))}`;
+    const design = designed && designOf(designed);
+    if (designed && design && (design.url || designed.slug)) {
+      const address = design.url ?? config.pageUrl(designed.slug!);
+      const src = isLive(designed) ? address : `${address}?cms-preview=${encodeURIComponent(previewToken(design.url ? designed.layout : designed.slug!))}`;
       return page(`Edit ${designed.title || "page"}`, <EditPage config={config} src={src} back={{ href: `${admin}/posts/${designed.id}`, label: designed.title || "Page" }} />);
     }
     return page("Edit site", <EditPage config={config} />);
@@ -205,6 +208,8 @@ export function createHandler(config: ResolvedConfig) {
     const intent = read("intent") || "save";
     const script = isScript(request);
 
+    const design = designOf(post);
+    if (design?.permanent && (intent === "delete" || intent === "unpublish")) return redirect(`${admin}/posts/${id}`);
     if (intent === "delete") {
       deletePost(id);
       return redirect(post.kind === "page" ? `${admin}/pages` : admin);
@@ -221,11 +226,12 @@ export function createHandler(config: ResolvedConfig) {
       description: read("description").trim(),
       label: read("label").trim(),
       body: isDesign(post) ? post.body : read("body"),
-      slug: read("slug"),
+      slug: design?.url ? (post.slug ?? "") : read("slug"),
       published_at,
     };
 
-    const result = savePost(id, fields, read("revision"), config.reservedSlugs);
+    // A design owns its address, even one the site reserves for its own routes.
+    const result = savePost(id, fields, read("revision"), design ? [] : config.reservedSlugs);
     if (!result.ok) {
       const message = SAVE_ERRORS[result.error];
       if (script) return Response.json({ ok: false, error: result.error, message }, { status: 409 });
@@ -329,7 +335,7 @@ export function createHandler(config: ResolvedConfig) {
       return redirect(`${admin}/login`, sessionCookie(null, admin));
     }
     if (isAsset(first) && !second) return serveAsset(first, request);
-    if (first === "edit" && !second && !post && config.onPage.length) return editSite(request);
+    if (first === "edit" && !second && !post && (config.onPage.length || Object.keys(config.designs).length)) return editSite(request);
     if (first === "edit" && second === "data" && rest.length === 0 && !post) return editData();
     if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
     if (first === "upload" && !second && post) return upload(request);

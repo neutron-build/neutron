@@ -147,6 +147,7 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 .posts td:first-child a:hover { color: var(--accent); }
 .posts .status, .posts .date { padding-left: 24px; color: var(--muted); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .posts .status { text-transform: capitalize; }
+.posts .status.live { color: var(--accent); }
 .posts .date { text-align: right; }
 
 /* Login */
@@ -368,7 +369,6 @@ a.button { color: inherit; text-decoration: none; }
   .posts td { border-top: 0; }
   .posts tr { border-top: 1px solid var(--rule); }
   .posts .status { grid-row: 2; padding: 0 0 10px; }
-  .posts .status:empty { display: none; }
   .item { grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 12px 0; }
   .item-tools { min-height: 24px; }
 }
