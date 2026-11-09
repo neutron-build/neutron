@@ -115,16 +115,19 @@ def read_monitor(run_out_texts):
 
     X5-R51 (b)4: a non-zero count exempts nothing in that run. Each
     run-out must carry at least one E4 SEEDS line, else (b)4 cannot be
-    checked and the comparison stops (exit 2).
+    checked and the comparison stops (exit 2) — the per-file check is
+    verdict X-5c-F4-F1-F1-F3-F2-F1-F1-F1 §3's hole: a truncated run-out
+    must not hide that run's MONITOR. Every line of every file is
+    summed.
     """
     total = 0
-    seen = 0
     for text in run_out_texts:
+        seen = 0
         for m in re.finditer(r"E4 SEEDS=\d+ .*?MONITOR=(\d+)", text):
             total += int(m.group(1))
             seen += 1
-    if seen == 0:
-        raise ValueError("no E4 SEEDS line in the run-out files")
+        if seen == 0:
+            raise ValueError("a run-out file carries no E4 SEEDS line")
     return total
 
 
@@ -447,6 +450,16 @@ def cmd_compare(args):
         if sha256_of(args.run[0]) != args.run_sha256:
             print("ERROR run sha256 mismatch: %s" % args.run[0], file=sys.stderr)
             return 2
+    # The count tie (verdict X-5c-F4-F1-F1-F3-F2-F1-F1-F1 §3): one
+    # .campaign.out per run file. A cannot-check exit 2, like the hash
+    # checks above, and checked before any campaign file is read.
+    if len(args.run) != len(args.run_out):
+        print(
+            "ERROR --run count %d does not match --run-out count %d"
+            % (len(args.run), len(args.run_out)),
+            file=sys.stderr,
+        )
+        return 2
     ref_doc = json.load(open(args.ref))
     ref_all = seed_index(ref_doc)
     run_seeds = {}
@@ -1542,6 +1555,74 @@ def self_test():
     a.ref_sha256 = "0" * 64
     rc = cmd_compare(a)
     check("sha256-mismatch", rc == 2, "rc=%d" % rc)
+
+    # --- X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 (verdict §3): every run-out
+    # file carries its own E4 SEEDS line, --run/--run-out counts are
+    # tied, and the MONITOR sum reads every line of every file. The
+    # ref/run docs are equal here, so only MONITOR can move the exit.
+    import contextlib
+    import io
+
+    eq_path = os.path.join(tmp, "eq.json")
+    eq1_path = os.path.join(tmp, "eq1.json")
+    eq2_path = os.path.join(tmp, "eq2.json")
+    json.dump(ref_doc, open(eq_path, "w"))
+    json.dump({"e4": 1, "seeds": [seed_rec(0, "C", [round_rec()])]}, open(eq1_path, "w"))
+    json.dump({"e4": 1, "seeds": [seed_rec(s, "C", [round_rec()]) for s in (1, 2)]}, open(eq2_path, "w"))
+    ok_out = os.path.join(tmp, "ok.out")
+    none_out = os.path.join(tmp, "none.out")
+    mon1_out = os.path.join(tmp, "mon1.out")
+    two_out = os.path.join(tmp, "two.out")
+    open(ok_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n")
+    open(none_out, "w").write("a truncated run-out with no marker line\n")
+    open(mon1_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n")
+    open(two_out, "w").write(
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n"
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+    )
+
+    a.ref_sha256 = None
+    a.run = [eq_path]
+    a.run_out = [none_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-every-run-out-file", rc == 2, "rc=%d" % rc)
+
+    a.run_out = [mon1_out, ok_out]
+    a.run = [eq1_path, eq2_path]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    mon = read_monitor([open(p).read() for p in a.run_out])
+    r = compare_reading(seed_index(json.load(open(ref_path))), seed_index(json.load(open(eq_path))), mon)
+    check(
+        "monitor-sums-every-file",
+        rc == 1
+        and mon == 1
+        and r["new_failing"] == [(-1, "run", None, "bullet3-monitor")]
+        and compare_exit_code(r) == 1,
+        "rc=%d mon=%s %s" % (rc, mon, r["new_failing"]),
+    )
+
+    a.run = [eq_path]
+    a.run_out = [two_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    mon = read_monitor([open(two_out).read()])
+    r = compare_reading(seed_index(json.load(open(ref_path))), seed_index(json.load(open(eq_path))), mon)
+    check(
+        "monitor-sums-every-line",
+        rc == 1
+        and mon == 1
+        and r["new_failing"] == [(-1, "run", None, "bullet3-monitor")]
+        and compare_exit_code(r) == 1,
+        "rc=%d mon=%s %s" % (rc, mon, r["new_failing"]),
+    )
+
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [ok_out]
+    rc = cmd_compare(a)
+    check("monitor-run-out-count-mismatch", rc == 2, "rc=%d" % rc)
 
     print("SELF-TEST %d cases, %d failed" % (cases[0], len(failures)))
     return 1 if failures else 0
