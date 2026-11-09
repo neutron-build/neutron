@@ -6743,6 +6743,182 @@ fn x5_r49_window_freed_unimaged_home_held_by_image_refs() {
     );
 }
 
+// ---- X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2b): the two window reuse
+// counters split at the step-2 freeze (`ckpt_reuse` whole-window for
+// the Q4 arm, `ckpt_reuse_pf` pre-freeze for the Q4-I row) — three
+// directed frees/reuses, one per counting case. ----
+
+/// The two window reuse counters off the world (test helper).
+fn reuse_counters(sched: &Sched<TestWorld>) -> (u64, u64) {
+    let g = sched.lock();
+    (g.st.ckpt_reuse, g.st.ckpt_reuse_pf)
+}
+
+/// Whether `lpid` is in the current window's image map (test helper):
+/// the "freed since this flip" premise the whole-window counter keys on.
+fn in_img_map(sched: &Sched<TestWorld>, lpid: u64) -> bool {
+    let g = sched.lock();
+    g.st.map.img.contains_key(&lpid)
+}
+
+/// Allocate until `alloc_lpid` hands out `lpid` (test helper). The
+/// scan is lowest-free-first, so every free-set entry below `lpid` is
+/// handed out first; the bound is `next_lpid`, which never shrinks
+/// (§4.3) and dominates every free-set entry.
+fn alloc_until(cx: &Cx<'_, TestWorld>, lpid: u64) {
+    let bound = {
+        let g = cx.w.lock();
+        g.st.meta.next_lpid
+    };
+    for _ in 0..=bound {
+        let a = prims::alloc_lpid(cx).expect("alloc");
+        if a == lpid {
+            return;
+        }
+    }
+    panic!("alloc_lpid never handed out {lpid} within {bound} allocations");
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2b): the window reuse
+/// counters split at the freeze.** Three directed cases over
+/// `r49_setup_durable_home`'s one-page tree, each in its own world:
+///
+/// - freed **before the flip** (`Before0`, `flip_window` still false)
+///   and reused in the window (`After0`): the LPID never entered this
+///   window's `map.img`, so it is not a reuse of an LPID freed since
+///   the flip — **neither counter** moves;
+/// - freed **in the window before the freeze** (`After0`; the freeze
+///   is step 2's map phase, after `After1`) and reused there: **both
+///   counters** move;
+/// - freed **in the window after the freeze** (`After2`;
+///   `image_frozen` is `Some` from the freeze to post-5) and reused
+///   there: **only the whole-window counter** moves — the Q4-I row
+///   reads the pre-freeze count.
+///
+/// **G-REUSE-ANY** (the reuse site drops its `map.img` test) counts
+/// the first case; **M-RUPF-NOFREEZE** (`ckpt_reuse_pf` ignores
+/// `image_frozen`) counts the third — each fails this pin.
+#[test]
+fn x5_r42_reuse_counts_window_frees_before_freeze() {
+    // Case 1: freed before the flip, reused in the window — neither.
+    {
+        let seed = 6u64;
+        let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut not_imaged_at_reuse = false;
+        let mut counts = None;
+        cx_checkpoint(&sched, |hook| {
+            if hook == CkptHook::Before0 {
+                prims::free_lpid(&cx, lpid).expect("free before the flip");
+            }
+            if hook == CkptHook::After0 {
+                not_imaged_at_reuse = !in_img_map(&sched, lpid);
+                alloc_until(&cx, lpid);
+            }
+            if hook == CkptHook::After5 {
+                counts = Some(reuse_counters(&sched));
+            }
+            Ok(())
+        });
+        assert!(
+            not_imaged_at_reuse,
+            "seed {seed}: a pre-flip free must not be in this window's map.img (the premise)"
+        );
+        assert_eq!(
+            counts,
+            Some((0, 0)),
+            "seed {seed}: an LPID freed before the flip, reused in the window, counts in \
+             neither counter (G-REUSE-ANY reverts this)"
+        );
+    }
+    // Case 2: freed in the window before the freeze, reused there — both.
+    {
+        let seed = 7u64;
+        let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut imaged_at_free = false;
+        let mut frozen_at_reuse = false;
+        let mut counts = None;
+        cx_checkpoint(&sched, |hook| {
+            if hook == CkptHook::After0 {
+                prims::free_lpid(&cx, lpid).expect("free inside the window, before the freeze");
+                imaged_at_free = in_img_map(&sched, lpid);
+                frozen_at_reuse = {
+                    let g = sched.lock();
+                    g.st.image_frozen.is_none()
+                };
+                alloc_until(&cx, lpid);
+            }
+            if hook == CkptHook::After5 {
+                counts = Some(reuse_counters(&sched));
+            }
+            Ok(())
+        });
+        assert!(
+            imaged_at_free,
+            "seed {seed}: the window free's first touch must enter map.img (the premise)"
+        );
+        assert!(
+            frozen_at_reuse,
+            "seed {seed}: the reuse at After0 is before step 2's freeze (the premise)"
+        );
+        assert_eq!(
+            counts,
+            Some((1, 1)),
+            "seed {seed}: an LPID freed in the window and reused before the freeze counts in \
+             both counters"
+        );
+    }
+    // Case 3: freed in the window after the freeze, reused there —
+    // whole-window only.
+    {
+        let seed = 8u64;
+        let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut imaged_at_free = false;
+        let mut frozen_at_reuse = false;
+        let mut counts = None;
+        cx_checkpoint(&sched, |hook| {
+            if hook == CkptHook::After2 {
+                prims::free_lpid(&cx, lpid).expect("free inside the window, after the freeze");
+                imaged_at_free = in_img_map(&sched, lpid);
+                frozen_at_reuse = {
+                    let g = sched.lock();
+                    g.st.image_frozen.is_some()
+                };
+                alloc_until(&cx, lpid);
+            }
+            if hook == CkptHook::After5 {
+                counts = Some(reuse_counters(&sched));
+            }
+            Ok(())
+        });
+        assert!(
+            imaged_at_free,
+            "seed {seed}: the window free's first touch must enter map.img (the premise)"
+        );
+        assert!(
+            frozen_at_reuse,
+            "seed {seed}: the reuse at After2 is after step 2's freeze (the premise)"
+        );
+        assert_eq!(
+            counts,
+            Some((1, 0)),
+            "seed {seed}: an LPID freed in the window and reused after the freeze counts only \
+             in the whole-window counter (M-RUPF-NOFREEZE reverts this)"
+        );
+    }
+}
+
 /// **X-5c-F4-F1-F1-CXX Work 2: `drop_entry_gone_before_root_free`.**
 /// I-LINK-ATOMIC's cut side (§6.8 as amended by S-1-F7): a directory
 /// entry must never name an unmapped root — not even between two

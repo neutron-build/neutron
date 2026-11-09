@@ -2059,6 +2059,47 @@ fn x5_r42_q4i_keys_on_the_opened_image() {
     assert!(!r0.q4i, "q4i follows q4i_raw");
 }
 
+/// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2b): a post-freeze reuse is
+/// not `q4i`.** The literal seed is **486 round 1** at `r41_share`
+/// 1000 (crash `After2@1` — a pre-step-5 targeted crash, the class the
+/// image arm reasons about; the recovery opened image id 3, the
+/// round's own last completed window, so the record's counts are that
+/// window's own): the opened image's window held exactly **1**
+/// whole-window reuse (`imgreuse == 1`) and **0** pre-freeze reuses
+/// (`imgreuse_pf == 0` — the reuse landed after step 2 froze the
+/// table), so `q4i_raw` (and `q4i`) read **false** under the
+/// pre-freeze count of X-5c-F4-F1-F1-F3-F1 step 2a.
+/// **M-Q4I-WHOLEWINDOW** (`q4i_raw` reads the whole-window count
+/// instead) reads the same window's `imgreuse == 1` as true and fails
+/// this pin. (Scan-found over 0..1000 at share 1000: four such rounds
+/// exist — 190 r2, 486 r1, 792 r2, 93 r2 — all with the opened image
+/// the last completed window; 486 r1 is the targeted one.)
+#[test]
+fn x5_r42_post_freeze_reuse_is_not_q4i() {
+    let mut tun = workload::Tuning::BASE;
+    tun.r41_share = 1000;
+    let rec = workload::run_seed_with(486, None, &tun);
+    assert!(rec.defect.is_none(), "seed 486: {:?}", rec.defect);
+    assert_eq!(rec.digest, 218615732, "seed 486's schedule moved");
+    let r1 = rec.rounds.get(1).expect("seed 486 runs round 1");
+    assert_eq!(r1.crash, "After2@1", "round 1's crash point moved");
+    assert!(r1.fired, "round 1's crash must fire");
+    assert_eq!(
+        r1.imgreuse, 1,
+        "the opened image's window held exactly 1 whole-window reuse"
+    );
+    assert_eq!(
+        r1.imgreuse_pf, 0,
+        "and 0 pre-freeze reuses — the reuse landed after the freeze"
+    );
+    assert!(
+        !r1.q4i_raw,
+        "a post-freeze reuse is not q4i: the pre-freeze count decides \
+         (M-Q4I-WHOLEWINDOW reverts this)"
+    );
+    assert!(!r1.q4i, "q4i follows q4i_raw");
+}
+
 /// **X5-R42 (step 6): a refused round is not `q4i`.** The fold is
 /// `q4i_raw ∧ fired ∧ end.is_some()` (Q18's end): the exclusions match
 /// SIZING's — nested recovery crashes, the harness checkpoint, and
