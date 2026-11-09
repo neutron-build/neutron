@@ -1,6 +1,17 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F2 — the twin directory re-seed
+Status: **stage X-5c-F4-F1-F1-F3-F1 — the Slot mutant made live
+(`M-FREE-HOME-ALLOC` also removes `used_cur`, as the F3 gate's
+prototype form, its false doc comments and README cause corrected),
+F3's four unpinned behaviours pinned (the targeted-crash clause, the
+reuse counter's `map.img` test, the ledger's harness-checkpoint
+removal, the oracle-pass reading of `seeded-faults`), Q4-I counted
+before the freeze (the store observable `ckpt_reuse_pf`, `q4i_raw`
+reading it, `q4reuse` keeping the whole window), and F3's rule applied
+unchanged over 0..1000 under the ladder S0 → S1 → S2 of X5-R50 (built
+only if S0 misses), per the owner decision of 2026-11-07 and the
+image-arm ruling (q4i, pre-freeze) fixed before any measurement.**
+Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F2 — the twin directory re-seed
 (the -F2 the F2-F1 verdict ordered): the twin chain re-seeds from the
 real round's own start whenever the two chains' `dir` key sets differ at
 round start, under the P ruling below, so the C-XX "recovery-Err default"
@@ -3818,6 +3829,153 @@ file this card leaves — `41c307a4…01cd2`, with its `.campaign.out`,
 `.verify.out` and `.prov` — is what F4's REFRESH reads and F4's step 0
 commits, in the X5-R25 pattern). F3-F1, based on this card, moves no
 BASE digest against it.
+
+## Card X-5c-F4-F1-F1-F3-F1's record (the Slot mutant made live, F3's
+## gaps pinned, Q4-I counted before the freeze, and F3's rule applied
+## over 0..1000)
+
+Base: `card/v3-X-5c-F4-F1-F1-F3-F2-F1-F2` (tip `af5c8d63`). Step 0
+below wrote every fixed text — the owner decision, the image-arm
+ruling, the design reasoning, X5-R50 and the decision rule — verbatim,
+before any code or probe of this card.
+
+**Owner decision 2026-11-07 (QUEUE).** Fix both (-F2 has fixed the
+store). The owner delegated the image arm, and the orchestrator's
+ruling is binding on this card:
+- The rule's numbers are unchanged: Q4 ≥ 1,500 per 10k, CPU ≤ +60%,
+  the Q5a/Q7/Q18 floors, and the image arm ≥ 1,500 per 10k.
+- The image arm is **q4i**, the stricter reading: the final recovery
+  actually opened a reused image. It is counted **before the freeze**,
+  as the row text says.
+- There is no switch to imgreuse after seeing data, and no lowered
+  bar.
+- If q4i cannot reach 1,500 within the CPU limit, **change the
+  generator, never the rule.**
+- Dev probe seeds are `0..1000`. The held-out set `10000..20000` and
+  the MP-pressure set are not touched.
+
+This card repairs F3's defects (D1–D4 of verdict
+`X-5c-F4-F1-F1-F3.md`). It then applies F3's rule unchanged over
+0..1000. X5-R50 below is the generator change: its text is fixed now,
+before any measurement, and it is built only if setting S0 misses.
+
+**Why q4i misses: the design reasoning, from the gate's `m/a1k.json`
+(F3-tip numbers, context for X5-R50's design, not a prediction for
+this tip).** At share 1000 over 0..1000, q4i is 140:
+- 127 come from targeted crashes at `After5`, `Mid6` and `After6`
+  (244 rounds);
+- 7 come from targeted crashes before step 5 (542 rounds);
+- 6 come from uniform crashes (752 rounds).
+
+X5-R41 aligns the reuse into the window of the crash's own
+checkpoint, `idx`. A crash before `idx`'s step 5 recovers image
+`idx−1`, and that window was never aligned. Seven of the ten targeted
+hooks are such crashes. Only the three post-step-5 hooks open image
+`idx`. Q4 needs the crash inside window `idx`, while q4i needs the
+recovery to open an aligned image, so one aligned window serves only
+one of the two in a given round. **The fix is to align the previous
+window as well, in exactly the rounds that recover it.**
+
+**Options declined:**
+- **Selecting uniform-crash rounds.** The crash point is drawn after
+  the script is built, so which image opens is unknown when the block
+  is placed. The gate counted 6 q4i in 752 uniform rounds, and
+  selecting them all doubles the selected set's CPU against a
+  +35–41% start.
+- **Moving the block to `idx−1`.** Q4 lives in those same pre-step-5
+  rounds, and Q4's margin is only 1,770 against 1,500.
+- **Re-targeting crashes.** That moves 5.5's crash distribution and
+  Q1's per-hook coverage. It is not the generator's to move.
+
+**Expected, an estimate and not evidence.**
+- Rounds: there are 348 pre-step-5 targeted rounds per 1,000 seeds at
+  `idx` 1–2. At the post-step-5 rounds' yield (127/244 ≈ 52%, the drop
+  exclusion included), q4i should rise by ≈ 180 at `r41p_share` 1000
+  and ≈ 90 at 500. At 500 that gives ≈ 225 per 1,000 seeds (2,250 per
+  10k).
+- CPU: F3's block, in ≈ 41% of rounds, costs +35–41%. Block A, in
+  ≈ 9% of rounds at 500, should cost about +8–10% more.
+
+**X5-R50 (P ruling, verbatim, fixed before any measurement of this
+card; any change is an ESCALATE).**
+- **Knob.** A new `Tuning` field, `r41p_share` (permille), is 0 in
+  BASE and FINAL.
+- **Eligible.** A round is eligible when all of these hold:
+  - it is X5-R41-selected, by the same predicate, unchanged;
+  - its targeted hook `CKPT_HOOKS[(seed/20) % 10]` is one of
+    `Before0`, `After0`, `After1`, `Mid2`, `After2`, `After3` or
+    `After4`;
+  - `knobs.target_ckpt ≥ 1`.
+- **Pick.** One draw from a new stream, `S_R41P`, below
+  `r41p_share`. It is made only when `r41p_share > 0` and the round is
+  eligible.
+- **Block A.** All of block A's content draws come from a second new
+  stream, `S_R41PC`. Both constants are unused anywhere in the crate.
+  So X5-R41's block (block B) is bit-for-bit the same in a round with
+  block A and without it.
+- **Script.** Block A has X5-R41's block shape exactly: the same
+  counts, ceiling values, dense runs and sweep. It is paired with
+  index `idx−1`, and it goes after the barrier and before block B.
+  `R41Arm { idx: idx−1 }` goes before the barrier, beside block B's
+  arm.
+- **Hold, per armed index.** `R41Wait` and `R41Done` carry the index
+  they pair with.
+  - At `After0` of an armed checkpoint `i`, before the crash arm, the
+    hold sets `i`'s window flag. It then spin-yields until
+    `R41Done{i}`, `workload_done`, a task error, or 20,000 turns.
+  - `R41Wait{i}` spin-yields on `i`'s flag, `workload_done`,
+    `tasks_left <= 1`, or the same budget.
+  - No wall clock is used. A single-block round behaves exactly as at
+    F3.
+- **Why this is not contrived.** Under a merge-heavy steady workload,
+  every checkpoint window sees frees and reuse. One aligned window
+  per round is an artifact of the spike's short windows, which is
+  X5-R41's own note.
+- **Unchanged:** Q4, Q4-I, every quota, the crash spec, X5-R41's
+  selection and block B, and every unselected or ineligible round's
+  script.
+- **Settings, in this order, at most three.**
+  - **S0** = (`r41_share` 1000, `r41p_share` 0). This is F3's best,
+    with no X5-R50 code. If S0 meets the rule, choose it and do not
+    build X5-R50.
+  - **S1** = (1000, 500).
+  - If S1 misses only on the image arm: **S2** = (1000, 1000).
+  - If S1 misses only on CPU: **S2** = (1000, 250).
+  - If S1 misses on Q4 or on a floor, or on both the image arm and
+    CPU: no S2, ESCALATE.
+  - If S2 misses: ESCALATE.
+
+  No fourth setting, and no other knob.
+- **Measurement (fixed with the rule).**
+  - **Runs.** Each setting runs over 0..1000 as five 200-seed runs at
+    16 threads, each block run as BASE, then the candidate, back to
+    back. Record user+sys CPU (bash `time`), wall, and the load at
+    each start, and sum the counts over the five blocks.
+  - **CPU term.** The rule's CPU term is ΣCPU(candidate) / ΣCPU(BASE)
+    − 1.
+  - **Near the line.** If that term reads between +55% and +65%, run
+    two more interleaved passes and read the term as the median of the
+    three. Report every pass.
+
+**The decision rule (F3 step 5, unchanged; the owner's 2026-11-07
+readings stated).**
+- **Met:** all of the following hold.
+  - **Q4 × 10 ≥ 1,500** over 0..1000. F3's "× 50" was for 0..200; the
+    per-10k bar is the same.
+  - No Q5a, Q7 or Q18 falls below the lower of its row and BASE's own
+    count × 10 on the same seeds.
+  - **CPU ≤ +60%** of BASE.
+  - **The image arm: `q4i` × 10 ≥ 1,500.** `q4i` here is X5-R42's
+    field with the pre-freeze count of step 2.
+
+  imgreuse is reported and never decides.
+- **Seeded faults:** at the chosen setting, `seeded-faults --seeds
+  0..200` (F4's form) must read Joint CAUGHT and Slot CAUGHT.
+- **Hand off** the chosen setting for F4's REFRESH. FINAL stays BASE
+  at this card's tip.
+- **Not met, or a fault not caught: ESCALATE with the numbers, and no
+  hand-off.** Q4, Q4-I and the rule are never lowered, redefined or
+  re-read by a card, a gate or an orchestrator.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
