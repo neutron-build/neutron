@@ -2075,3 +2075,141 @@ fn x5_r42_refused_round_is_not_q4i() {
         "a round whose own crash never fired is excluded"
     );
 }
+
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (a)): `twin_dirs_differ`
+/// compares the `dir` key sets and nothing else.** Two stores from
+/// `harness::create_store` with equal keys read false (their `DirEntry`
+/// values may differ — roots and pointers differ between any two
+/// chains, and the values are not the predicate); a key removed from
+/// one `dir`, or a key added to one, reads true; equal keys with one
+/// `DirEntry` **value** changed read false. **M-TWIN-PRED-ALWAYS**
+/// (the predicate returns true) and **M-TWIN-PRED-ENTRIES** (the
+/// predicate compares `DirEntry` values too) both fail here.
+#[test]
+fn x5r52_twin_dirs_differ_compares_directory_keys() {
+    use e4_recovery::store::DirEntry;
+    let cfg = Knobs::derive(0, 0, &workload::Tuning::BASE).store_cfg(None);
+    let (_, mut real) = e4_recovery::harness::create_store(cfg.clone(), 0, 0).expect("create");
+    let (_, mut twin) = e4_recovery::harness::create_store(cfg, 0, 0).expect("create");
+    assert!(
+        !workload::twin_dirs_differ(&real, &twin),
+        "two fresh stores have equal (empty) dir key sets"
+    );
+    // Equal key sets populated with different DirEntry values: not a
+    // difference — the values are not the predicate.
+    real.dir.insert(
+        1,
+        DirEntry {
+            root: 11,
+            dropping: false,
+        },
+    );
+    real.dir.insert(
+        2,
+        DirEntry {
+            root: 12,
+            dropping: false,
+        },
+    );
+    twin.dir.insert(
+        1,
+        DirEntry {
+            root: 21,
+            dropping: true,
+        },
+    );
+    twin.dir.insert(
+        2,
+        DirEntry {
+            root: 22,
+            dropping: true,
+        },
+    );
+    assert!(
+        !workload::twin_dirs_differ(&real, &twin),
+        "equal keys with different DirEntry values are not a difference"
+    );
+    // Equal keys, one DirEntry value changed: still not a difference.
+    twin.dir.get_mut(&2).expect("the key exists").root ^= 1;
+    assert!(
+        !workload::twin_dirs_differ(&real, &twin),
+        "a changed DirEntry value with equal keys is not a difference (M-TWIN-PRED-ENTRIES reverts this)"
+    );
+    // A key removed from the twin's dir: a difference.
+    assert!(twin.dir.remove(&2).is_some());
+    assert!(
+        workload::twin_dirs_differ(&real, &twin),
+        "a key the real dir holds and the twin dir lacks is a difference"
+    );
+    // Restoring the key set restores equality.
+    twin.dir.insert(
+        2,
+        DirEntry {
+            root: 12,
+            dropping: false,
+        },
+    );
+    assert!(
+        !workload::twin_dirs_differ(&real, &twin),
+        "restoring the key set restores equality"
+    );
+    // A key added to the twin's dir alone: a difference.
+    twin.dir.insert(
+        4,
+        DirEntry {
+            root: 9,
+            dropping: true,
+        },
+    );
+    assert!(
+        workload::twin_dirs_differ(&real, &twin),
+        "a key the twin dir holds and the real dir lacks is a difference (M-TWIN-PRED-ALWAYS reverts this)"
+    );
+}
+
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b)): the directory re-seed
+/// heals 2859's twin r1.** At the Base (verdict
+/// `X-5c-F4-F1-F1-F3-F2-F1`, finding 1) the faultless twin's recovery
+/// fails with `Corrupt("tree 4 missing in directory")`: real r0's WAL
+/// fault loses `ts=3 DropTree 4`, the twin keeps it, and r1's script —
+/// built from the real model — writes into tree 4. With the re-seed the
+/// twin chain restarts r1 from the real round's own start, so its
+/// directory holds every tree the script touches, and the twin round
+/// passes with no O-1 text. **M-TWIN-NO-DIR-RESEED**, **M-TWIN-RESEED-
+/// FROM-TWIN** and **M-TWIN-RESEED-LATE** all fail here.
+#[test]
+fn x5r52_twin_reseed_heals_2859_r1() {
+    let rec = workload::run_seed_with(2859, None, &workload::Tuning::BASE);
+    let t1 = rec.twin.get(1).expect("2859 runs two rounds");
+    assert!(
+        t1.pass,
+        "2859 twin r1 must pass under the directory re-seed (o1: {:?})",
+        t1.o1_fail
+    );
+    assert!(
+        t1.o1_fail.is_none(),
+        "2859 twin r1 must carry no O-1 text under the directory re-seed (got {:?})",
+        t1.o1_fail
+    );
+}
+
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b)): the same healing for
+/// 609's twin r1** — the reference file's first pre-existing member of
+/// the C-XX twin recovery-Err family (Base twin r1 fails with
+/// `Corrupt("tree N missing in directory")`), pinned by the verdict's
+/// follow-up. The same mutants as 2859 fail here.
+#[test]
+fn x5r52_twin_reseed_heals_609_r1() {
+    let rec = workload::run_seed_with(609, None, &workload::Tuning::BASE);
+    let t1 = rec.twin.get(1).expect("609 runs two rounds");
+    assert!(
+        t1.pass,
+        "609 twin r1 must pass under the directory re-seed (o1: {:?})",
+        t1.o1_fail
+    );
+    assert!(
+        t1.o1_fail.is_none(),
+        "609 twin r1 must carry no O-1 text under the directory re-seed (got {:?})",
+        t1.o1_fail
+    );
+}

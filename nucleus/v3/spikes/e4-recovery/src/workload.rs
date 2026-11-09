@@ -36,7 +36,7 @@ use crate::model::{CATALOG, Model, Op, PUBLIC, to_be64};
 use crate::rng::{Rng, derive};
 use crate::sim::{FaultClass, FaultKnobs, MediaKind};
 use crate::store::ckpt::CKPT_HOOKS;
-use crate::store::{Mutant, StoreCfg, WAL_SEG};
+use crate::store::{Mutant, StoreCfg, StoreInner, WAL_SEG};
 
 /// Stream tags (independent splitmix64 derivations per concern; 1–6 are
 /// the harness's, 7+ are the generator's).
@@ -1514,6 +1514,20 @@ pub fn twin_chain_after_repair(tout: &harness::RoundOutcome) -> Option<Chain> {
     })
 }
 
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (a); the directory re-seed):**
+/// true iff the two chains' `dir` **key sets** differ. The `DirEntry`
+/// values are not compared — roots and pointers differ between any two
+/// chains — and this is exactly the set `recover`'s replay checks when
+/// it fails with `Corrupt("tree N missing in directory")` (the narrow
+/// DDL predicate of the twin re-seed; the two models also differ
+/// whenever a real round loses ordinary commits, which is common in MW,
+/// so re-seeding on a model difference would re-pair most MW rounds and
+/// move digests far past the defect). Both `dir`s are `BTreeMap`s, so
+/// the key comparison is order-deterministic.
+pub fn twin_dirs_differ(real: &StoreInner, twin: &StoreInner) -> bool {
+    real.dir.keys().ne(twin.dir.keys())
+}
+
 /// Run one seed: create, then 1–3 rounds (each with its twin first for
 /// MP/MW), collecting the record. Pure in `(seed, mutant)` (W-DET).
 /// Runs `Tuning::FINAL` — the campaign's generator (X5-R37).
@@ -1686,6 +1700,35 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // same script, crash and F-CRASH resolutions, faultless, judged
         // as class C — from the same base the real round runs).
         if twin_chain.is_none() && class != FaultClass::C {
+            twin_chain = Some(Chain {
+                disk: ch.disk.clone(),
+                st: ch.st.clone(),
+                model: harness::clone_model(&ch.model),
+                cut: ch.cut,
+            });
+        }
+        // **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b); the directory
+        // re-seed):** a real MW round whose WAL fault loses a DropTree
+        // keeps the tree in the real chain's directory while the
+        // faultless twin's drops it, and the next round's script — built
+        // from the real model (`build_round(.., &ch.model, ..)`) — then
+        // writes into a tree the twin's image no longer holds: the
+        // twin's recovery replays a record into a missing tree and
+        // fails with `Corrupt("tree N missing in directory")` (verdict
+        // X-5c-F4-F1-F1-F3-F2-F1, finding 1). That twin no longer runs
+        // "the same script, crash and F-CRASH resolutions, faultless …
+        // from the same base" (Work 2.5), so whenever the two chains'
+        // directory key sets differ at round start it is re-seeded from
+        // the real round's own start — the same clone the broken-chain
+        // re-seed above makes. `twin_chain` is `Some` only on MP/MW
+        // seeds (class C never builds one), which is the ruling's "every
+        // MP/MW round"; nothing else changes (the twin still runs class
+        // C, faultless, at the same crash and resolutions, and no record
+        // field or digest input is added).
+        if twin_chain
+            .as_ref()
+            .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
+        {
             twin_chain = Some(Chain {
                 disk: ch.disk.clone(),
                 st: ch.st.clone(),

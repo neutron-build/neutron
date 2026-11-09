@@ -3367,6 +3367,42 @@ nothing there. After -F2 lands, a twin failure of this family is a
 recurrence of a class that a landed card claims to have fixed. Under E4's
 owner rule, F4 counts it as new."
 
+**Step 0 — the ruling (this commit's parent).** The P ruling above and
+the X5-R52 (a)/(g) note, before any code: X5-R51 is re-issued for this
+card and read with X5-R52, (c)(i) is void (the re-seed makes T2
+impossible), `--no-twin-exemption --max-twin-failing 0` applies, and any
+failing twin entry is a STOP.
+
+**Step 1 — the Base confirmation, the code, and three pins (this
+commit).** At the Base (this card's parent `db1e5162`; `Tuning::FINAL ==
+Tuning::BASE` at this tip, pinned by `x5_r37_final_equals_base_at_this_tip`),
+run singly, both seeds' twin r1 fails exactly as the verdict records —
+2859: digest `2789281219`, twin r1 `pass=false` with
+`O-1(a) at c=10: published {} != model {2, 3}`; 609: digest `887984205`,
+twin r1 `pass=false` with `O-1(a) at c=12: published {} != model {2, 3, 4}`
+(both digests equal the baseline's). The code is (a) and (b) only:
+`twin_dirs_differ` (`real.dir.keys().ne(twin.dir.keys())` — key sets,
+never `DirEntry` values; both `dir`s are `BTreeMap`s, so the comparison
+is order-deterministic) and the (b) call in `run_seed_with`, placed after
+the `twin_chain.is_none()` broken-chain re-seed and before
+`twin_chain.take()`, re-seeding from the real round's own start
+(`disk`, `st`, `harness::clone_model(&ch.model)`, `cut` — the same clone
+the broken-chain re-seed makes). Three pins in `tests/workload.rs`, all
+named `x5r52_twin_*`:
+
+- `x5r52_twin_dirs_differ_compares_directory_keys` — equal keys false
+  (fresh stores, and equal keys with different `DirEntry` values);
+  remove-a-key true; add-a-key true; value-change-with-equal-keys false.
+- `x5r52_twin_reseed_heals_2859_r1` — twin r1 `pass`, no `o1`.
+- `x5r52_twin_reseed_heals_609_r1` — the same for 609.
+
+`cargo test -q --release -p e4-recovery` at this step: **one** literal
+pin red — `x5_r37_base_tuning_reproduces_1b0ce54e`, which fails fast at
+seed 2669 (`357787865` pinned, `1374321949` measured). Re-measured singly
+against the baseline for all 54 of its seeds: **exactly one moved**
+(2669, the same two digests); every other pin in the crate is green.
+The literals are not yet edited (step 4).
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
