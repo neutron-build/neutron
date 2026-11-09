@@ -4170,6 +4170,111 @@ Step 7b pin `x5_r43_slot_caught_on_a_q4_round` (seed 20 r1, crash
 failing `O-1(b)` with `q4sp` 5 / `q4mg` 8 / `q4reuse` 4 in both arms)
 pins the catch on a literal Q4 round.
 
+**Step 8 — the mutant table.** Every mutant applied to its **own
+scratch export of this tip** (its own `CARGO_TARGET_DIR`; the exports
+are fresh `git archive HEAD nucleus` copies, so "reverted" is by
+construction — nothing touched the worktree), run as `cargo test -q
+--release -p e4-recovery --no-fail-fast -- <the row's named pin>`
+under `ulimit -v 25165824`; the worktree stayed clean (`git status`
+empty of every mutant) and every row exited **rc 101** with its named
+pin failing:
+
+| mutant | rc | catching pin shown failing |
+|---|---|---|
+| **8a — this card's seven unconditional rows** | | |
+| G-SLOT-INERT (`FreeHomeAlloc`'s body emptied) | 101 | `x5_r43_free_home_alloc_is_caught` |
+| G-REUSE-ANY (the reuse site drops its `map.img` test) | 101 | `x5_r42_reuse_counts_window_frees_before_freeze` |
+| M-RUPF-NOFREEZE (`ckpt_reuse_pf` ignores `image_frozen`) | 101 | the same pin |
+| M-Q4I-WHOLEWINDOW (`q4i_raw` reads the whole-window count) | 101 | `x5_r42_post_freeze_reuse_is_not_q4i` |
+| G-SEL-NOTARGET (the selection drops `seed/10` even) | 101 | `x5_r41_uniform_round_not_selected` |
+| G-LEDGER-NOREMOVE (the harness checkpoint stays in the ledger) | 101 | `x5_r42_harness_checkpoint_image_is_not_q4i` |
+| G-SEEDED-FOLD (`passes_oracle = cr.pass`) | 101 | `x5_r43_oracle_pass_not_fold` |
+| **8b — F3's 14 rows** | | |
+| M-R41-NOHOLD | 101 | `x5_r41_aligned_round_has_q4_and_reuse` |
+| M-R41-WRONGWINDOW | 101 | the same pin |
+| M-R41-NOPREP | 101 | the same pin |
+| M-R41-DRAW | 101 | `x5_r37_base_tuning_reproduces_1b0ce54e` |
+| M-R41-AFTERCRASHARM | 101 | `x5_r41_aligned_round_has_q4_and_reuse` |
+| G-Q4MG-FROM-SPLITS | 101 | the same pin |
+| M-REUSE-DROPS-IMG | 101 | `x5_r41_completed_window_arm` |
+| M-FREE-HOME-ALLOC | 101 | `x5_r43_free_home_alloc_is_caught` — **no longer UNCAUGHT** (was inert at F3; step 1a's `used_cur` line made it live, X5-R49 (a) unmasked it) |
+| M-Q4I-LASTCKPT | 101 | `x5_r42_q4i_keys_on_the_opened_image` |
+| M-Q4I-REFUSED | 101 | `x5_r42_refused_round_is_not_q4i` |
+| M-Q4I-NOFLOOR | 101 | `campaign::x5_r42_row_at_999_and_1000` |
+| M-Q4I-NOREPRO | 101 | `campaign::x5_r42_flipped_q4i_fails_reproduction` |
+| M-SEEDED-NOBASELINE | 101 | `campaign::x5_r43_known_failures_are_not_new` |
+| M-SEEDED-NOARMRULE | 101 | `campaign::x5_r43_caught_needs_the_arm_predicate` |
+| **8c — the five X5-R50 rows** (X5-R50 was built) | | |
+| M-R50-DRAW | 101 | `x5_r37_base_tuning_reproduces_1b0ce54e` |
+| M-R50-SHAREDSTREAM (block A draws from `S_R41C`) | 101 | `x5_r50_prior_window_round_is_q4i` (block B's identity) |
+| M-R50-SHAREDFLAG (one window flag for both arms) | 101 | `x5_r50_prior_window_round_is_q4i` |
+| M-R50-ANYHOOK | 101 | `x5_r50_ineligible_rounds_draw_nothing` |
+| M-R50-IDX0 | 101 | `x5_r50_ineligible_rounds_draw_nothing` |
+
+**Re-sited mutants, said plainly** (the card's amendment requires
+naming them): X5-R50 moved three sites. **M-R41-WRONGWINDOW**'s site
+`r41_idx == Some(ck_idx)` became the per-slot
+`r41_idx[s] == Some(ck_idx)`; the mutant keys the hold on
+`r41_idx[s].is_some() && ck_idx == 0` — the same behaviour (the hold
+and gate key on checkpoint 0, not the armed index).
+**M-R41-AFTERCRASHARM** moves the now per-slot `After0` hold block to
+after the crash arm, the same code motion as at F3.
+**M-Q4I-LASTCKPT**'s site `rr.q4i_raw = q4i_raw_of(...)` became the
+fold inside `fold_ckpt_windows` (step 3b's extraction); the mutant
+reads the ledger's last row (`values().next_back()`) instead of the
+opened meta's own row — the same behaviour. **M-R50-DRAW** needed two
+edits to express its text ("`S_R41P` drawn at share 0, with its
+result fed into `S_GEN`'s order"): the pick's share-0 guard removed,
+and the pick's result fed into `rng.below(u64::from(b) + 1)` on the
+`S_GEN` stream before the `r41` selection — the M-R41-DRAW shape.
+
+## RESULT (card X-5c-F4-F1-F1-F3-F1)
+
+card: X-5c-F4-F1-F1-F3-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F1   commit: (this commit; the chain 75c5e540 → 38696971 → cd34c3c0 → bf87b03a → eee3451d → 976fb7aa → 404cf52a → 85a8c05b → b6ab9750 → 4f3fa251 → 81efe2ec → f08551d2 → f78b7548 → here)
+
+The card's five RESULT items:
+
+1. **Each setting's numbers, labelled "probe, not evidence"** — S0
+   (step 4) and S1 (step 6, three CPU passes with wall and load, BASE
+   beside each): Q4 177/186 per 1,000 seeds (×10: 1,770/1,860), q4i
+   pre-freeze 135/216 (1,350/2,160), imgreuse 158/258 (1,580/2,580),
+   Q5a 25/25 (250/250), Q7 19/19 (190/190), Q18 99/527 (990/5,270),
+   failing rounds 4/2 (all MP; S1's are 178 r1 and 537 r0, identical
+   in every pass), rounds 1537/1547. CPU: S0 +48.91% (ΣCPU 1766.546
+   vs BASE 1186.526); S1 passes +55.11% / +59.26% / +48.94%, median
+   **+55.11%** (ΣCPU 1874.765/1880.584/1884.028 vs BASE
+   1208.642/1180.856/1264.920).
+2. **The rule applied verbatim** — S0: Q4 met, floors met (Q5a
+   260≥200, Q7 190≥190, Q18 5,000≥990), CPU met (+48.9%), the image
+   arm MISSED (q4i 1,350 < 1,500) → the ladder runs S1. **S1
+   (1000, 500): every term MET — Q4 1,860 ≥ 1,500; floors Q5a 250,
+   Q7 190, Q18 5,270; CPU median +55.11% ≤ +60%; the image arm q4i
+   2,160 ≥ 1,500. The chosen setting is S1 = (1000, 500)**, handed
+   off for F4's REFRESH (FINAL stays BASE at this tip; no probe
+   setting is committed). No S2 was called for.
+3. **The seeded faults' tables and each fault's X5-R43 outcome** —
+   step 7: at S1, 0..200 exits 0 with **Joint CAUGHT** (29 new
+   failing ≥ 5, 8 with `q4i_raw` ≥ 1) and **Slot CAUGHT** (41 ≥ 5,
+   **10 with `q4_split_merge`** ≥ 1); 200..400 both CAUGHT (31 and
+   38). The tables by crash position are in step 7's record.
+4. **The mutant table** — step 8: all 26 rows (7 + 14 + 5) caught,
+   rc 101 each, none UNCAUGHT; the three re-sited mutants and
+   M-R50-DRAW's two-edit form are named above.
+5. **q4i by crash position and by block, against the Goal's
+   reasoning** — step 7's table: the A-window (pre-step-5 crash)
+   rounds supply 11+4 (0..200) and 11+7 (200..400) `q4i_raw`
+   new-failing rounds per arm, the B-window rounds 16+9 and 18+11;
+   every `q4_split_merge` catch is a crash inside block B's window
+   with block A having armed the recovered image's. **The mechanism
+   the Goal states is confirmed; nothing refuted it.**
+
+Anomalies: none beyond the recorded. The one mid-card restart (the
+60-minute cap, during step 5a's test run) followed the card's restart
+rule: the uncommitted edits were discarded (`git diff | git apply
+-R`; `git checkout` is blocked in this container), re-applied as this
+attempt's step-5a work, and re-verified from scratch (build, fmt,
+clippy, the full suite) before the commit.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
