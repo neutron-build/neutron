@@ -672,7 +672,7 @@ v7.8 §8.6 is kept with §0.2.
 
 ### 9.2 What GC removes
 S-STORE §10 owns it: the rule, including X-2-F1's tombstone elision and I-GC-ORDER; the page-local prune; the sweep; and `gc_w`.
-- **Provisional entries are never versions to GC.** GC never counts, keeps or prunes them as versions. Dead ones may be deleted by any GC mutation (§2.4 (c)).
+- **Provisional entries are never versions to GC.** GC never counts, keeps or prunes them as versions. Dead ones may be deleted by a GC mutation within §2.4 (c): the GC sweep deletes them, and the page-local prune deletes dead tags 6–7 only, never tag 8 (S-STORE §10.3).
 - I-GC-READEQ holds at every `S ≥ W` because `W ≤ M`.
 
 ### 9.3 DDL retirement
