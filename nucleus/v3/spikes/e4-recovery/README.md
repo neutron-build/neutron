@@ -2757,6 +2757,30 @@ or below frontier, real_nrec=1)` and 2859 twin r1 `EXPLAINED N=4 k=1
 — the narrowed rules still exempt exactly the two rows, and the details
 carry X5-R53's ts-level facts (RESULT item 4's fields).
 
+**Step 2 — `compare`: (d), (e) and the exit code (this commit).**
+`compare_reading` counts the MP-A class at both ends over the compared
+seeds (rounds entries of seeds with class `MP` where `served` and `mrb`
+are both true — the same count at both ends, range slices included) and
+applies the cap after the round loop: a tip count **greater** than the
+Base's moves every `MPA_PASS_FAIL` row into `new_failing` with reason
+`bullet1-mpa-cap`. `format_rows` prints `MPA_CLASS base <B> tip <T>`
+directly after `MPA_PASS_FAIL`, on every run (X5-R53 (d)). A run whose
+MONITOR total is above 0 gains the `(-1, "run", None,
+"bullet3-monitor")` new-failure row, so the exit is 1 (X5-R53 (e));
+X5-R51 (b)4's voiding inside the prefilters is unchanged. The existing
+`mpa-pass-fail` case's Base file gained a second MP seed holding an
+MP-A round that heals at the tip (Base 1, tip 1 — without it the cap
+would void the row the case asserts); its name and expected row stay.
+Eight cases added: `mpa-cap-equal-keeps`, `mpa-cap-fewer-keeps`,
+`mpa-cap-grown-voids`, `mpa-cap-counts-class-mp-only`, `mpa-class-line`,
+`monitor-run-stops`, `exit-bad-seeds-only` (a deadlock seed at both
+ends: no new failure, exit 1) and `twin-prefilter-fault-at-i-only` (the
+only media-faulted short real round at `j = i`: `bullet1-twin`, not
+pending). `self-test` reads **61 cases, 0 failed**, and the 10k
+`compare` output is byte-identical to the chain-head comparator's
+except the added `MPA_CLASS base 11 tip 10` line (the record is
+below, step 4).
+
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 

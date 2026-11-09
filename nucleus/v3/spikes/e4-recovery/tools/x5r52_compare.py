@@ -229,9 +229,13 @@ def compare_reading(ref_seeds, run_seeds, monitor, twin_exemption=True):
     Rows, per X5-R51 (d) and X5-R52 (d): moved_gained, moved_mp_pending,
     meta_only_eligible, mpa_pass_fail, twin_ddl_pending, moved_lost,
     healed, twin_healed, text_changed, twin_failing (tip), twin_failing
-    base count, new_failing, bad_seeds, digests_moved, failing_rounds.
-    Never netted; a row either exempts (its single-seed check decides),
-    reports, or fails.
+    base count, new_failing, bad_seeds, digests_moved, failing_rounds —
+    plus X5-R53's `mpa_class` (the Base and tip MP-A counts) and, when
+    `monitor` > 0, the `(-1, "run", None, "bullet3-monitor")` new-failure
+    row (X5-R53 (e)); when the tip's MP-A count is greater than the
+    Base's, every `MPA_PASS_FAIL` row becomes a
+    `bullet1-mpa-cap` new failure (X5-R53 (d)). Never netted; a row
+    either exempts (its single-seed check decides), reports, or fails.
     """
     rows = {
         "digests_moved": [],
@@ -250,6 +254,7 @@ def compare_reading(ref_seeds, run_seeds, monitor, twin_exemption=True):
         "twin_failing_base": [],
         "new_failing": [],
         "bad_seeds": [],
+        "mpa_class": (0, 0),
     }
     for s in sorted(run_seeds):
         tip = run_seeds[s]
@@ -348,6 +353,33 @@ def compare_reading(ref_seeds, run_seeds, monitor, twin_exemption=True):
                 tt = twins[i] if i < len(twins) else None
                 if tt is None or tt.get("pass"):
                     rows["twin_healed"].append((s, i))
+    # X5-R53 (e): a MONITOR hit above 0 is a new failure by itself,
+    # beside the (b)4 voiding inside the prefilters above (unchanged).
+    if monitor > 0:
+        rows["new_failing"].append((-1, "run", None, "bullet3-monitor"))
+    # X5-R53 (d): the MP-A class cap. The class is the rounds entries of
+    # seeds with class MP where `served` and `mrb` are both true, over
+    # the compared seeds, counted the same way at both ends; if the
+    # tip's count is greater than the Base's, (iii) exempts nothing.
+    base_mpa = sum(
+        1
+        for s in ref_seeds.values()
+        if s.get("class") == "MP"
+        for r in s.get("rounds", ())
+        if r.get("served") is True and r.get("mrb") is True
+    )
+    tip_mpa = sum(
+        1
+        for s in run_seeds.values()
+        if s.get("class") == "MP"
+        for r in s.get("rounds", ())
+        if r.get("served") is True and r.get("mrb") is True
+    )
+    rows["mpa_class"] = (base_mpa, tip_mpa)
+    if tip_mpa > base_mpa:
+        for s, i in rows["mpa_pass_fail"]:
+            rows["new_failing"].append((s, "round", i, "bullet1-mpa-cap"))
+        rows["mpa_pass_fail"] = []
     return rows
 
 
@@ -380,6 +412,10 @@ def format_rows(rows, max_twin_failing=None):
     ]
     for key, label in names:
         out.append("%s %d %s" % (label, len(rows[key]), rows[key]))
+        if key == "mpa_pass_fail":
+            # X5-R53 (d): the class sizes, printed on every run,
+            # directly after MPA_PASS_FAIL.
+            out.append("MPA_CLASS base %d tip %d" % rows["mpa_class"])
     out.append(
         "TWIN_FAILING %d %s BASE %d"
         % (len(rows["twin_failing"]), rows["twin_failing"], len(rows["twin_failing_base"]))
@@ -1021,8 +1057,13 @@ def self_test():
     )
     mpa_tip["pass"] = False
     mpa_tip["q"][15] = 1
-    ref = {1: seed_rec(1, "MP", [mpa_base])}
-    run = {1: seed_rec(1, "MP", [mpa_tip])}
+    # X5-R53 (d): without the second seed the class reads Base 0, tip 1
+    # and the cap voids the row, so the Base file gains a second MP
+    # seed holding an MP-A round (served and mrb) that heals at the tip.
+    mpa_heal_base = round_rec(o1=o1a, o3=MPA_O3, mrb=True, c=None, frontier=0, served=True, skx=True, pass_na=True)
+    mpa_heal_base["q"][15] = 1
+    ref = {1: seed_rec(1, "MP", [mpa_base]), 2: seed_rec(2, "MP", [mpa_heal_base])}
+    run = {1: seed_rec(1, "MP", [mpa_tip]), 2: seed_rec(2, "MP", [round_rec()])}
     r = rows_of(ref, run)
     check("mpa-pass-fail", r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [], str(r))
 
@@ -1055,6 +1096,58 @@ def self_test():
     run = {1: seed_rec(1, "MW", [json.loads(json.dumps(mpa_tip))])}
     r = rows_of(ref2, run)
     check("mpa-mw-serve", r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1") in r["new_failing"], str(r))
+
+    # --- X5-R53 (d): the MP-A class cap on (iii).
+    mpa_ref = {1: seed_rec(1, "MP", [mpa_base]), 2: seed_rec(2, "MP", [mpa_heal_base])}
+    mpa_run = {1: seed_rec(1, "MP", [mpa_tip]), 2: seed_rec(2, "MP", [round_rec()])}
+    r = rows_of(mpa_ref, mpa_run)
+    check(
+        "mpa-cap-equal-keeps",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # Base 2, tip 1: a second MP-A round heals at the tip.
+    fewer_ref = dict(mpa_ref)
+    fewer_ref[3] = seed_rec(3, "MP", [json.loads(json.dumps(mpa_heal_base))])
+    fewer_run = dict(mpa_run)
+    fewer_run[3] = seed_rec(3, "MP", [round_rec()])
+    r = rows_of(fewer_ref, fewer_run)
+    check(
+        "mpa-cap-fewer-keeps",
+        r["mpa_class"] == (2, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # Base 0, tip 1: the cap voids (iii); the row is a bullet-1 failure.
+    r = rows_of({1: seed_rec(1, "MP", [mpa_base])}, {1: seed_rec(1, "MP", [mpa_tip])})
+    check(
+        "mpa-cap-grown-voids",
+        r["mpa_class"] == (0, 1) and r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1-mpa-cap") in r["new_failing"],
+        str(r),
+    )
+
+    # An MW seed's served+mrb round does not count toward the class:
+    # the class reads 1 -> 1 and the row stays exempt.
+    any_ref = dict(mpa_ref)
+    any_ref[3] = seed_rec(3, "MW", [round_rec()])
+    any_run = dict(mpa_run)
+    any_run[3] = seed_rec(3, "MW", [round_rec(served=True, mrb=True)])
+    r = rows_of(any_ref, any_run)
+    check(
+        "mpa-cap-counts-class-mp-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # format_rows prints MPA_CLASS directly after MPA_PASS_FAIL.
+    out = format_rows(rows_of(mpa_ref, mpa_run)).splitlines()
+    check(
+        "mpa-class-line",
+        "MPA_CLASS base 1 tip 1" in out
+        and out.index("MPA_CLASS base 1 tip 1") == out.index("MPA_PASS_FAIL 1 [(1, 0)]") + 1,
+        str(out),
+    )
 
     # --- X5-R52 (b): a pass→fail with a Base text that is not MP-A
     # (the gap of the original comparator: bullet 1 for rounds that
@@ -1105,6 +1198,38 @@ def self_test():
     run = {1: bad}
     r = rows_of(ref, run)
     check("deadlock-tip-seed", r["bad_seeds"] == [1] and (1, "seed", None, "bullet3") in r["new_failing"], str(r))
+
+    # --- X5-R53 (e): MONITOR > 0 stops the comparison by itself.
+    same = {1: seed_rec(1, "C", [round_rec()])}
+    r = rows_of(same, {1: seed_rec(1, "C", [round_rec()])}, monitor=1)
+    check(
+        "monitor-run-stops",
+        r["new_failing"] == [(-1, "run", None, "bullet3-monitor")] and compare_exit_code(r) == 1,
+        str(r),
+    )
+
+    # A deadlock seed at both ends: no new failure, but the exit is 1.
+    bad_base = seed_rec(1, "C", [round_rec()])
+    bad_base["deadlock"] = True
+    bad_tip = seed_rec(1, "C", [round_rec()])
+    bad_tip["deadlock"] = True
+    r = rows_of({1: bad_base}, {1: bad_tip})
+    check(
+        "exit-bad-seeds-only",
+        r["new_failing"] == [] and r["bad_seeds"] == [1] and compare_exit_code(r) == 1,
+        str(r),
+    )
+
+    # --- The twin prefilter reads real rounds j < i only: the only
+    # media-faulted short real round at j = i is not a prefilter hit.
+    faulted_i = round_rec(lost=1, mis=0, torn=1, frontier=1, hi=5, cover_err=False)
+    ref, run = twin_case("MW", [round_rec(), faulted_i], twins_ok)
+    r = rows_of(ref, run)
+    check(
+        "twin-prefilter-fault-at-i-only",
+        r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"],
+        str(r),
+    )
 
     # --- check-mp: (b)5, and (b)5′ with its still-caught bullets.
     def mp_case(row_mutate=None, findings="Finding { slot: Some(9), what: \"§3.3 fail on mapped page\" }", tainted="{9}", meta_k="Some(1)", media="MPE diag: media[0] Lost inode 0 off 589824 len 4096 (page slot 144)"):
