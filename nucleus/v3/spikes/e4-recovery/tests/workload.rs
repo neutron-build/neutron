@@ -2080,6 +2080,54 @@ fn x5_r42_refused_round_is_not_q4i() {
     );
 }
 
+/// **X5-R43 (card X-5c-F4-F1-F1-F3-F1 step 1b): the Slot fault is
+/// caught at BASE — `M-FREE-HOME-ALLOC` fails the oracle on a round
+/// that passes clean.** The literal seed is **5 round 1**, the lowest
+/// seed in 0..1000 at BASE whose Slot-arm digest differs from clean
+/// and whose round fails O-1, O-2 or O-3 with the mutant while
+/// passing the oracle without it (`pass` and no oracle text). Both
+/// digests and both readings are asserted: clean digest **980071820**
+/// (seed 5's X5-R37 literal, unchanged), Slot-arm digest **204526290**
+/// (they differ — at F3's tip the mutant was inert, digest-identical
+/// to clean, verdict finding D1); the clean round passes with no
+/// O-1/O-2/O-3 text, and the same round under the mutant fails
+/// `O-1(a)`. **G-SLOT-INERT** (the mutant's body emptied) reverts the
+/// digest difference and the oracle failure and fails this pin.
+#[test]
+fn x5_r43_free_home_alloc_is_caught() {
+    use e4_recovery::store::Mutant;
+    let clean = workload::run_seed_with(5, None, &workload::Tuning::BASE);
+    assert!(clean.defect.is_none(), "seed 5 clean: {:?}", clean.defect);
+    assert_eq!(clean.digest, 980071820, "seed 5's clean BASE digest moved");
+    let slot = workload::run_seed_with(5, Some(Mutant::FreeHomeAlloc), &workload::Tuning::BASE);
+    assert!(slot.defect.is_none(), "seed 5 slot: {:?}", slot.defect);
+    assert_eq!(slot.digest, 204526290, "seed 5's Slot-arm digest moved");
+    assert_ne!(
+        clean.digest, slot.digest,
+        "the live Slot fault must move the digest (G-SLOT-INERT reverts this)"
+    );
+    let cr = clean.rounds.get(1).expect("seed 5 runs round 1");
+    let fr = slot.rounds.get(1).expect("the Slot arm runs round 1");
+    // The clean reading: pass, no oracle text.
+    assert!(cr.pass, "the clean round passes: {:?}", cr.o3_fail);
+    assert!(
+        cr.o1_fail.is_none() && cr.o2_fail.is_none() && cr.o3_fail.is_none(),
+        "the clean round carries no oracle text"
+    );
+    // The Slot-arm reading: the same round fails the oracle.
+    assert!(
+        fr.o1_fail.is_some() || fr.o2_fail.is_some() || fr.o3_fail.is_some(),
+        "M-FREE-HOME-ALLOC must fail the oracle on 5 r1: o1={:?} o2={:?} o3={:?}",
+        fr.o1_fail,
+        fr.o2_fail,
+        fr.o3_fail
+    );
+    assert!(
+        !fr.deadlock && !fr.panic,
+        "the catch is an oracle failure, never a hang"
+    );
+}
+
 /// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (a)): `twin_dirs_differ`
 /// compares the `dir` key sets and nothing else.** Two stores from
 /// `harness::create_store` with equal keys read false (their `DirEntry`
