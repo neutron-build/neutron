@@ -3463,6 +3463,70 @@ its digest moved and its re-seed event(s) at the same round(s) the twin
 failed at the Base (2599 at r1 **and** r2, matching its t2; the others
 at r1). The 10k comparison judges them.
 
+**Step 3 — the fourth pin, the mutants, and the diag patch (two
+commits).** The kept-chain pin's selection, by the card's rule: the
+lowest MW seed in 0..1000 with at least two rounds and no step-2
+re-seed event whose digest moves under M-TWIN-RESEED-ALWAYS is **639**
+(`3366243401 → 1144734390` under the mutant, measured); the thirteen
+lower candidates (9, 129, 139, 189, 199, 309, 369, 399, 479, 509, 519,
+559, 569) are inert under it. `x5r52_twin_chain_kept_when_directories_
+agree_639` asserts the Base literal `3366243401`, unchanged.
+
+The two committed patches, each verified in the Acceptance's own form
+(fresh scratch export of HEAD, patch applied, isolated `mut-target`,
+`cargo test --test workload x5r52_twin`):
+
+- `m-twin-no-dir-reseed.patch` — (b)'s whole block (comment, predicate
+  call, re-seed) removed. rc 101, failing exactly
+  `x5r52_twin_reseed_heals_2859_r1` and `x5r52_twin_reseed_heals_609_r1`.
+- `m-twin-reseed-always.patch` — the call re-seeds every MP/MW round
+  (`twin_chain.as_ref().is_some()`). rc 101, failing exactly the
+  kept-chain pin.
+
+Honest note (the follow-up commit `d4767094`): the first generation of
+`m-twin-no-dir-reseed.patch` under-deleted — a brace-walk bug in the
+generator stopped at the condition's second line, and the patch left the
+`.is_some_and` chain behind, so the patched crate did not compile. The
+committed patch deletes the whole block, and its apply roundtrip is
+byte-exact against the intended mutant (verified by `diff` before any
+test ran).
+
+The four worker-only mutants, on the scratch export, never committed —
+each applied, shown failing, reverted, the export's `src/` verified
+byte-identical to the worktree tip afterwards and the worktree's
+`git status` clean throughout:
+
+| mutant | rc | failing pins |
+|---|---|---|
+| M-TWIN-PRED-ALWAYS (`twin_dirs_differ` returns true) | 101 | the predicate pin, the kept-chain pin |
+| M-TWIN-PRED-ENTRIES (compares `DirEntry` values too) | 101 | the predicate pin |
+| M-TWIN-RESEED-FROM-TWIN (the re-seed clones the twin chain) | 101 | the 2859 and 609 pins |
+| M-TWIN-RESEED-LATE ((b) after `twin_chain.take()`) | 101 | the 2859 and 609 pins (and the kept-chain pin — a superset; 639's first round's re-seed then lands after its twin ran, moving the digest) |
+
+(Evidence-hygiene note: every mutant run uses its own isolated
+`CARGO_TARGET_DIR`. A first attempt shared one target dir between two
+exports and a stale artifact produced a phantom reading — re-run
+isolated, the table above is the isolated truth. The first
+M-TWIN-RESEED-FROM-TWIN attempt also did not compile — `tch` unbound —
+and was redone in a compiling form; neither invalid attempt is counted
+as evidence.)
+
+**The diag patch.** `x5r52-twin-diag.patch` still applies at this tip
+(`git apply --check` on a scratch export of HEAD) — **not refreshed**.
+Its round-start hunk now lands after (b)'s re-seed block (the block's
+closing lines are the context it anchors on), so the line prints the
+effective post-re-seed twin chain. 2859, run singly in the patched
+export — every round-start line shows `real_dir == twin_dir`:
+
+```
+X5R52 round-start seed=2859 round=0 real_dir=[] twin_dir=[]
+X5R52 round-start seed=2859 round=1 real_dir=[1, 2, 3, 4] twin_dir=[1, 2, 3, 4]
+```
+
+(r1 pre-fix showed `twin_dir=[1, 2, 3]` — the divergence; the diag
+digest equals the plain tip's `429219074`, and both twin entries pass,
+so T5 holds.)
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
