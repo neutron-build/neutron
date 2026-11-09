@@ -502,8 +502,17 @@ pub struct StoreInner {
     /// this flip** — a reuse during the flip window of an LPID the image
     /// being built still maps (`map.img` holds it), reset at each
     /// `ckpt:begin` exactly like `ckpt_splits`/`ckpt_merges`. The Q4
-    /// reuse half (`q4reuse`) and Q4-I's arm read it.
+    /// reuse half (`q4reuse`) reads it.
     pub ckpt_reuse: u64,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2a; a store observable,
+    /// never a behaviour input): the pre-freeze half of
+    /// [`ckpt_reuse`](Self::ckpt_reuse)** — the same window reuses
+    /// counted only while `image_frozen.is_none()`, i.e. from
+    /// `ckpt:begin` until this checkpoint's step 2 map phase froze the
+    /// table, reset beside `ckpt_reuse`. Q4-I's row reads this count
+    /// (the owner's row text: "reused **before its step 2 froze the
+    /// table**"); `ckpt_reuse` keeps the whole window for the Q4 arm.
+    pub ckpt_reuse_pf: u64,
     /// R_EPOCH exhaustion count (Q10).
     pub epoch_exhausted: u64,
     /// The free-set serialisation grew the file (Q17).
@@ -655,6 +664,7 @@ impl StoreInner {
             ckpt_splits: 0,
             ckpt_merges: 0,
             ckpt_reuse: 0,
+            ckpt_reuse_pf: 0,
             epoch_exhausted: 0,
             freeset_grew: false,
             stale_seg_reads: 0,

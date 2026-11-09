@@ -298,15 +298,19 @@ pub struct HarnessState {
     /// [`ScriptOp::R41Done`]; releases the hold, sticky for the round).
     pub r41_done: bool,
     /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-checkpoint
-    /// window ledger** — one `(ckpt_id, splits, merges, reuses)` row per
-    /// checkpoint whose step 5 returned, appended at the checkpointer's
-    /// `After5` hook (the counters still hold that window's counts; the
-    /// next `ckpt:begin` resets them). The driver carries the rows for
-    /// the whole seed keyed by `ckpt_id`, so a round's final recovery
-    /// reads the opened image's **own** window however far the round
-    /// rolled back. The harness checkpoint's window is never here (it
-    /// runs through a no-op hook closure, in its own world).
-    pub ckpt_windows: Vec<(u64, u64, u64, u64)>,
+    /// window ledger** — one `(ckpt_id, splits, merges, reuses,
+    /// pre-freeze reuses)` row per checkpoint whose step 5 returned,
+    /// appended at the checkpointer's `After5` hook (the counters still
+    /// hold that window's counts; the next `ckpt:begin` resets them).
+    /// The fifth element is the pre-freeze reuse count of
+    /// X-5c-F4-F1-F1-F3-F1 step 2a (`ckpt_reuse_pf`), which `q4i_raw`
+    /// reads; the fourth is the whole-window count the Q4 arm keeps.
+    /// The driver carries the rows for the whole seed keyed by
+    /// `ckpt_id`, so a round's final recovery reads the opened image's
+    /// **own** window however far the round rolled back. The harness
+    /// checkpoint's window is never here (it runs through a no-op hook
+    /// closure, in its own world).
+    pub ckpt_windows: Vec<(u64, u64, u64, u64, u64)>,
     /// The last checkpoint hook the checkpointer passed (0 = none): a
     /// small position code for the Q4 window (1 = Before0 … 6 = After3;
     /// 7+ are later hooks). Maintained by the checkpointer's hook
@@ -1587,11 +1591,17 @@ fn checkpointer_body(
                 // snapshot.
                 if hook == CkptHook::After5 {
                     let _ = cx.with("h:r41win5", |c| {
-                        let (k, sp, mg, ru) = {
+                        let (k, sp, mg, ru, rupf) = {
                             let st = c.store();
-                            (st.k, st.ckpt_splits, st.ckpt_merges, st.ckpt_reuse)
+                            (
+                                st.k,
+                                st.ckpt_splits,
+                                st.ckpt_merges,
+                                st.ckpt_reuse,
+                                st.ckpt_reuse_pf,
+                            )
                         };
-                        c.h().ckpt_windows.push((k, sp, mg, ru));
+                        c.h().ckpt_windows.push((k, sp, mg, ru, rupf));
                         Ok(())
                     });
                 }
@@ -2145,11 +2155,13 @@ pub struct WorkloadObs {
     /// reuse companion of `splits`/`merges` (the store's `ckpt_reuse`).
     pub reuses: u64,
     /// **X5-R42:** the window ledger as of the crash — one
-    /// `(ckpt_id, splits, merges, reuses)` row per checkpoint of this
-    /// workload pass whose step 5 returned before the tasks ended. The
-    /// record's `imgsp`/`imgmg`/`imgreuse` are the last row; the driver
-    /// merges the rows into its per-seed ledger for `q4i_raw`.
-    pub ckpt_windows: Vec<(u64, u64, u64, u64)>,
+    /// `(ckpt_id, splits, merges, reuses, pre-freeze reuses)` row per
+    /// checkpoint of this workload pass whose step 5 returned before
+    /// the tasks ended. The record's `imgsp`/`imgmg`/`imgreuse` (and
+    /// its pre-freeze companion `imgreuse_pf`) are the last row; the
+    /// driver merges the rows into its per-seed ledger for `q4i_raw`,
+    /// which reads the pre-freeze element (X-5c-F4-F1-F1-F3-F1 step 2a).
+    pub ckpt_windows: Vec<(u64, u64, u64, u64, u64)>,
     /// R_EPOCH exhaustion count (Q10).
     pub epoch_exhausted: u64,
     /// The free-set serialisation grew the file (Q17).

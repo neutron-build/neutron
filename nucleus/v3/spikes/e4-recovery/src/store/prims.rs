@@ -380,11 +380,18 @@ pub fn alloc_lpid<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
             // freed inside this window, so handing it out reuses an
             // LPID the image being built still maps. Counted as a store
             // observable (`ckpt_reuse`, reset per window like
-            // `ckpt_splits`); never a behaviour input. M-REUSE-DROPS-IMG
-            // (X5-R43's Joint fault) drops the image entry here.
+            // `ckpt_splits`; never a behaviour input), plus its
+            // pre-freeze half `ckpt_reuse_pf` while `image_frozen` is
+            // still `None` (X5-R42, X-5c-F4-F1-F1-F3-F1 step 2a: Q4-I
+            // reads the pre-freeze count, the Q4 arm the whole window).
+            // M-REUSE-DROPS-IMG (X5-R43's Joint fault) drops the image
+            // entry here.
             if st.flip_window && st.map.img.contains_key(&l) {
                 if st.ckpt_open {
                     st.ckpt_reuse += 1;
+                    if st.image_frozen.is_none() {
+                        st.ckpt_reuse_pf += 1;
+                    }
                 }
                 if matches!(st.cfg.mutant, Some(Mutant::ReuseDropsImg)) {
                     st.map.img.remove(&l);

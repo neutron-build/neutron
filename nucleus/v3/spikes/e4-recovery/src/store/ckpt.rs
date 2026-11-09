@@ -663,6 +663,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         // X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the window's
         // reuse counter resets with the split/merge counters.
         st.ckpt_reuse = 0;
+        // X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2a): its pre-freeze
+        // half resets beside it (Q4-I reads the pre-freeze count).
+        st.ckpt_reuse_pf = 0;
         st.fs_building.clear();
         // Work 5.3's interval fold: the interval this checkpoint closes
         // reached `dirty_now.len()` distinct dirtied LPIDs; the next

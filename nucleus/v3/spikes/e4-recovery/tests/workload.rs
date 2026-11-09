@@ -2018,12 +2018,14 @@ fn x5_r42_q4i_keys_on_the_opened_image() {
     use std::collections::BTreeMap;
     use workload::{Tuning, q4i_raw_of};
     // The discriminating ledger: ids 0..=3, the last row (id 3) holds a
-    // reuse, the opened image is id 1 whose row does not.
-    let mut w: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
-    w.insert(0, (0, 0, 0));
-    w.insert(1, (2, 2, 0));
-    w.insert(2, (9, 9, 9));
-    w.insert(3, (15, 12, 9));
+    // reuse, the opened image is id 1 whose row does not. The fourth
+    // element is the pre-freeze reuse count (X-5c-F4-F1-F1-F3-F1 step
+    // 2a); the assertions are unchanged.
+    let mut w: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
+    w.insert(0, (0, 0, 0, 0));
+    w.insert(1, (2, 2, 0, 0));
+    w.insert(2, (9, 9, 9, 9));
+    w.insert(3, (15, 12, 9, 9));
     assert!(
         !q4i_raw_of(&w, Some(1)),
         "the opened image's own window (no reuse) decides, not the last row"

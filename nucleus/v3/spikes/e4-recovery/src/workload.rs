@@ -1053,14 +1053,21 @@ pub fn r41_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
 
 /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): `q4i_raw`** — did the
 /// window of the checkpoint whose meta the final recovery opened hold a
-/// reuse? Pure in the per-seed ledger (`ckpt_id → (splits, merges,
-/// reuses)`, last write wins: the row for an id is always the most
-/// recent checkpoint with that id, which is exactly the checkpoint whose
-/// meta bytes sit in that id's slot) and the opened meta's `ckpt_id`.
-/// `None` (a refused or failed open — no opened meta) or a missing row
-/// (the harness checkpoint's id, never recorded) is false.
-pub fn q4i_raw_of(windows: &BTreeMap<u64, (u64, u64, u64)>, opened_ckpt_id: Option<u64>) -> bool {
-    opened_ckpt_id.is_some_and(|k| windows.get(&k).is_some_and(|w| w.2 >= 1))
+/// pre-freeze reuse? Pure in the per-seed ledger (`ckpt_id →
+/// (splits, merges, whole-window reuses, pre-freeze reuses)`, last
+/// write wins: the row for an id is always the most recent checkpoint
+/// with that id, which is exactly the checkpoint whose meta bytes sit
+/// in that id's slot) and the opened meta's `ckpt_id`. Reads the
+/// **pre-freeze** element (X-5c-F4-F1-F1-F3-F1 step 2a, the owner's
+/// row text: "reused before its step 2 froze the table"); the
+/// whole-window count stays the Q4 arm's. `None` (a refused or failed
+/// open — no opened meta) or a missing row (the harness checkpoint's
+/// id, never recorded) is false.
+pub fn q4i_raw_of(
+    windows: &BTreeMap<u64, (u64, u64, u64, u64)>,
+    opened_ckpt_id: Option<u64>,
+) -> bool {
+    opened_ckpt_id.is_some_and(|k| windows.get(&k).is_some_and(|w| w.3 >= 1))
 }
 
 /// **X5-R42: `q4i`** — the Q4-I row's per-round predicate:
@@ -1273,6 +1280,14 @@ pub struct RoundRec {
     pub imgmg: u64,
     /// **X5-R41/R42:** the same window's reuses.
     pub imgreuse: u64,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2a): the same window's
+    /// pre-freeze reuses** — `alloc_lpid` reuses of the last completed
+    /// window counted only before its step 2 froze the table (the store
+    /// observable `ckpt_reuse_pf`). The Q4-I row's `q4i_raw` reads this
+    /// count through the per-seed ledger; `imgreuse` above keeps the
+    /// whole window for the Q4 arm. A record diagnostic serialized in
+    /// `campaign.json` as `imgrupf`, never a digest input.
+    pub imgreuse_pf: u64,
     /// **X5-R42 (step 2): the opened image's own window held a reuse** —
     /// the window of the checkpoint whose meta this round's **final
     /// recovery opened** (by that meta's `ckpt_id`, from the per-seed
@@ -1579,12 +1594,15 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
     let mut x33_prev_frontier = 0u64;
     // **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-seed checkpoint
     // window ledger** — every checkpoint's window counts for the whole
-    // seed, keyed by `ckpt_id` (last write wins). A round's `q4i_raw`
-    // looks up the opened meta's own id in it; the round's harness
-    // checkpoint's id is removed after the round (its windows are not
-    // recorded, and without the removal a stale row from an older
-    // checkpoint of the same id could answer for its meta).
-    let mut ckpt_windows: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+    // seed, keyed by `ckpt_id` (last write wins), each row
+    // `(splits, merges, whole-window reuses, pre-freeze reuses)` (the
+    // pre-freeze element added by X-5c-F4-F1-F1-F3-F1 step 2a: Q4-I
+    // reads it, the Q4 arm keeps the whole-window count). A round's
+    // `q4i_raw` looks up the opened meta's own id in it; the round's
+    // harness checkpoint's id is removed after the round (its windows
+    // are not recorded, and without the removal a stale row from an
+    // older checkpoint of the same id could answer for its meta).
+    let mut ckpt_windows: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
     for round in 0..round_counts {
         let Some(ch) = chain.take() else {
             break;
@@ -2253,8 +2271,8 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // on the opened meta's own id, fold `q4i`, then drop the harness
         // checkpoint's id — a later round's recovery can open its meta,
         // and its window is not recorded.
-        for &(k, sp, mg, ru) in &out.obs.ckpt_windows {
-            ckpt_windows.insert(k, (sp, mg, ru));
+        for &(k, sp, mg, ru, rupf) in &out.obs.ckpt_windows {
+            ckpt_windows.insert(k, (sp, mg, ru, rupf));
         }
         rr.q4i_raw = q4i_raw_of(&ckpt_windows, out.opened_ckpt_id);
         rr.q4i = q4i_of(rr.q4i_raw, rr.fired, out.end_store.is_some());
@@ -2390,12 +2408,15 @@ fn round_rec(
     // X5-R41/R42 (card X-5c-F4-F1-F1-F3 step 2): the reuse half in the
     // crash's window, and the completed-window arm — the counts of the
     // last checkpoint whose step 5 returned (the last ledger row at the
-    // crash snapshot).
+    // crash snapshot). X-5c-F4-F1-F1-F3-F1 step 2a adds the pre-freeze
+    // companion `imgreuse_pf` (Q4-I's reading); `imgreuse` keeps the
+    // whole window (the Q4 arm's).
     rr.q4reuse = obs.reuses;
-    if let Some(&(_, sp, mg, ru)) = obs.ckpt_windows.last() {
+    if let Some(&(_, sp, mg, ru, rupf)) = obs.ckpt_windows.last() {
         rr.imgsp = sp;
         rr.imgmg = mg;
         rr.imgreuse = ru;
+        rr.imgreuse_pf = rupf;
     }
     // Q5: the chunked cases. Open: a txn with chunks enqueued and no
     // marker, spanning ≥ 2 segments. Marked: a marker enqueued on a txn
