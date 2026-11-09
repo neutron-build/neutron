@@ -1857,6 +1857,75 @@ fn r47_f1_on_recycled_file() {
     );
 }
 
+/// **X-5c-PINS-1 item 5 (folded card X-5c-F4-F1-F1-O1C-F1-F1; verdict
+/// X-5c-F4-F1-F1-O1C-F1 finding 2): a record completed by a later
+/// write.** One commit whose record the WAL writer issues as two
+/// writes — the first holds its first 100 bytes, header included, the
+/// second the rest from `pos + 100` on — becomes written exactly at
+/// the second write: the replay's overlap window is the record's whole
+/// extent (`pos + len.max(24)`), not its header. **G1-HEADER-WINDOW**
+/// (`pos + 24` in place of `pos + (*len).max(24)`) skips the second
+/// write's test (`pos + 100 ≥ pos + 24`), so the commit never enters
+/// `written` although the image then holds its whole record — this pin
+/// fails. The control — the same commit with only the first write —
+/// stays unwritten and unreported. No live stream reaches the shape
+/// today (the WAL writer splits a batch only at segment boundaries),
+/// so a future writer change is what this pin guards.
+#[test]
+fn r47_record_completed_by_a_later_write() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 8usize;
+    let lsn = 30000u64;
+    let rec = x5r34::rec(33, lsn, 500);
+    assert!(
+        rec.len() > 124,
+        "the record must outlast its first 100 bytes"
+    );
+    let mut ev = x5r34::Ev::new();
+    ev.write(inode, lsn, &rec[..100])
+        .write(inode, lsn + 100, &rec[100..]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(33u64, (false, lsn, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![33u64],
+        "the record is written at its second write — the overlap window is the \
+         record's whole extent, header alone is not the record (G1-HEADER-WINDOW \
+         reverts this)"
+    );
+    assert_eq!(
+        acked,
+        vec![33u64],
+        "SyncOff's acked stays iff written (the commit is SyncOff)"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "the record fits its segment — no F1"
+    );
+    // The control: the first write alone leaves the commit unwritten
+    // and unreported.
+    let mut ev1 = x5r34::Ev::new();
+    ev1.write(inode, lsn, &rec[..100]);
+    let (written1, _acked1, unparsed1) =
+        harness::derive_written_acked(&ev1.events, &commits, 0, &bindings);
+    assert_eq!(
+        written1,
+        Vec::<u64>::new(),
+        "the control: 100 of 500 bytes is not a whole record — the commit stays \
+         unwritten"
+    );
+    assert_eq!(
+        unparsed1,
+        Vec::<u64>::new(),
+        "the control: a torn body is not F1 (the header fits its segment)"
+    );
+}
+
 /// **X5-R47's pairing guard** (the `returned_end` extent test's
 /// replacement): `SimDisk::write_at` emits `WriteIssued` and its
 /// `WriteReturned` in one step, so a paired stream passes quietly and

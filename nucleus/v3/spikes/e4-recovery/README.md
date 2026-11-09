@@ -1199,9 +1199,21 @@ other seed in any run changed verdict.
 change, post = after it): pre wall **12.6 s**, CPU 127.4 s user +
 29.5 s sys (≈ 157 s); post wall 18.5–38.5 s across three runs (the
 host carries other load; the quiet-host run is 18.5 s), CPU 181–192 s
-user + 41–45 s sys (≈ 226–233 s). The replay costs about +45% CPU on
-the campaign's WAL-heavy rounds — the price of the ruling's per-write
-record tests; no `E4 ABORT`, no livelock, no deadlock.
+user + 41–45 s sys (≈ 226–233 s). **[Raw measurements kept, labelled
+host state — the "+45% CPU" sentence that stood here was wrong, and is
+replaced by X-5c-PINS-1 with the O1C-F1 verdict's Cost-section
+numbers, quoted from `verdicts/X-5c-F4-F1-F1-O1C-F1.md`: "The +45%
+does not reproduce. The replay costs less than the walk it
+replaced." — derivation time inside the 0..10000 run: 96.7 s (pre) →
+**63.9 s** (post); 0..200 alternating CPU: pre 174, 251, 250 s, post
+243, 253, 252 s; 0..10000 CPU: 13,171 s → 13,831 s; wall: 22.8 min →
+22.1 min; "The derivation is 0.5% of a run's CPU either way, and the
+change is −33 s CPU over 10k"; the +45% itself "resembles my first
+pre probe of the alternating series, 174 s, taken at a quiet moment …
+Contention inflates CPU seconds on this host", which is exactly what
+the 157 s vs 226–233 s readings above show; budget effect on F4:
+"none (under 15 s at any plausible FINAL)".]** No `E4 ABORT`, no
+livelock, no deadlock.
 
 **The gate's enforcement step in this container (a judgment call,
 recorded with its evidence).** `bash scripts/gate.sh` failed at
@@ -4479,6 +4491,26 @@ through `self-test` (each dies on its named case):
 | **G-MON-MAX** (the maximum, not the sum) | FAIL `monitor-sums-not-max` (prints MONITOR 1) |
 | **G-TIE-ONE-WAY** (refuses only too few) | FAIL `monitor-more-run-outs-than-runs` (rc 0) |
 | **M-MON-DUP-OUT** (the repeated-path refusal removed) | FAIL `monitor-run-out-repeated` (rc 0) |
+
+**Step 5 — R47's header window and the cost sentence (item 5, the
+folded O1C-F1-F1 card's Work verbatim).**
+
+- `r47_record_completed_by_a_later_write` (beside the `r47_*` pins in
+  `tests/harness.rs`): one commit at lsn 30000, len 500; the first
+  write holds its first 100 bytes (header included), the second the
+  rest from `pos + 100`; `written` holds the ts, `unparsed` is empty;
+  the control (first write only) stays unwritten and unreported.
+  **G1-HEADER-WINDOW** (`pos + 24` for `pos + (*len).max(24)`) skips
+  the second write's test and fails the pin (shown on a scratch
+  export: `written` empty, the assertion's exact text).
+- The README's "+45% CPU" sentence in "The 0..200 cost, probe, not
+  evidence" is replaced by the O1C-F1 verdict's Cost-section numbers,
+  quoted from it (derivation time 96.7 s → 63.9 s inside the 0..10000
+  run; the derivation 0.5% of a run's CPU either way; −33 s CPU over
+  10k; budget effect "none"); the worker's raw 0..200 measurements are
+  kept, labelled host state (the verdict attributes the +45% to
+  contention inflating CPU seconds — exactly what those readings
+  show).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
