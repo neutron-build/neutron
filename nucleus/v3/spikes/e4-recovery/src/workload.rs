@@ -35,7 +35,7 @@ use crate::harness::{
 use crate::model::{CATALOG, Model, Op, PUBLIC, to_be64};
 use crate::rng::{Rng, derive};
 use crate::sim::{FaultClass, FaultKnobs, MediaKind};
-use crate::store::ckpt::CKPT_HOOKS;
+use crate::store::ckpt::{CKPT_HOOKS, CkptHook};
 use crate::store::{Mutant, StoreCfg, StoreInner, WAL_SEG};
 
 /// Stream tags (independent splitmix64 derivations per concern; 1–6 are
@@ -65,6 +65,21 @@ const S_R41: u64 = 14;
 /// inside a selected round, so an unselected round consumes nothing on
 /// it (the card's Limit 3).
 const S_R41C: u64 = 15;
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a; a 5.2 amendment, fixed
+/// before any measurement of this card): the prior-window alignment
+/// selection stream.** One draw per round when `r41p_share > 0` **and**
+/// the round is eligible (X5-R41-selected, a pre-step-5 targeted hook,
+/// `target_ckpt ≥ 1`), never drawn (and never constructed) when the
+/// share is 0, so BASE consumes no stream state on it and every BASE
+/// round's script is bit-for-bit the pre-X5-R50 generator's.
+/// Independent of `S_GEN`, `S_R41` and `S_R41PC`.
+const S_R41P: u64 = 16;
+/// **X5-R50:** block A's content stream — the prior-window alignment
+/// block's merge tree, split tree and dense-run bases (block B keeps
+/// `S_R41C`, so block B is bit-for-bit the same in a round with block
+/// A and without it). Drawn only inside an eligible selected round at
+/// `r41p_share > 0`.
+const S_R41PC: u64 = 17;
 
 /// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
 /// frozen tuning.** Every generator constant the X-5c-F4 retune may
@@ -184,6 +199,20 @@ pub struct Tuning {
     /// settings are set in `Tuning::FINAL` only for a probe run and
     /// reverted (never committed); X-5c-F4's REFRESH owns the hand-off.
     pub r41_share: u64,
+    /// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a; a 5.2 amendment,
+    /// fixed before any measurement of this card): the prior-window
+    /// alignment share** (permille). In a round selected by this
+    /// probability — an X5-R41-selected round whose targeted hook is
+    /// one of `Before0`–`After4` (a crash before step 5 recovers image
+    /// `idx−1`) with `target_ckpt ≥ 1` — the GC task runs a second
+    /// alignment block (block A) inside checkpoint `idx−1`'s own held
+    /// window, so the reuse the recovery opens lands in that window's
+    /// own counts (the image arm Q4-I keys on). Block B and every other
+    /// round's script are unchanged; block A's content draws come from
+    /// `S_R41PC`, so block B is bit-for-bit the same with or without
+    /// it. 0 in BASE and this card's FINAL: no draw is made and no op
+    /// is inserted.
+    pub r41p_share: u64,
 }
 
 impl Tuning {
@@ -223,6 +252,7 @@ impl Tuning {
         w11_share: 0,
         w12_share: 0,
         r41_share: 0,
+        r41p_share: 0,
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
@@ -264,6 +294,7 @@ impl Tuning {
         w11_share: 0,
         w12_share: 0,
         r41_share: 0,
+        r41p_share: 0,
     };
 }
 
@@ -745,7 +776,9 @@ pub fn build_round(
                     .collect(),
             });
         }
-        block.push(ScriptOp::R41Wait);
+        block.push(ScriptOp::R41Wait {
+            idx: knobs.target_ckpt,
+        });
         block.push(ScriptOp::Gc { tree: tm, w: None });
         let rl = 20u64.min(ks);
         let b2 = g.below(ks - rl + 1);
@@ -759,17 +792,117 @@ pub fn build_round(
                 })
                 .collect(),
         });
-        block.push(ScriptOp::R41Done);
+        block.push(ScriptOp::R41Done {
+            idx: knobs.target_ckpt,
+        });
         block
     } else {
         Vec::new()
     };
-    // Assemble: the barrier, then (in a selected round) the alignment
-    // block, then the base sweeps and the burst's; the arm goes at the
-    // very front, before the barrier, and **only in a selected round** —
-    // an unselected round's GC task is bit-for-bit the generator's.
+    // **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the prior-window
+    // alignment.** A round is eligible when all hold: it is
+    // X5-R41-selected (the same predicate, unchanged); its targeted
+    // hook `CKPT_HOOKS[(seed/20) % 10]` is one of `Before0`, `After0`,
+    // `After1`, `Mid2`, `After2`, `After3` or `After4` — a crash
+    // before step 5 recovers image `idx−1`, whose window X5-R41 never
+    // aligned (seven of the ten targeted hooks are such crashes; only
+    // the three post-step-5 hooks open image `idx`); and
+    // `knobs.target_ckpt ≥ 1` (index `idx−1` exists). One draw from
+    // the round's own `S_R41P` stream below `r41p_share` permille
+    // decides; nothing is drawn at share 0 (BASE and this card's
+    // FINAL) and nothing in an ineligible round.
+    //
+    // Block A has X5-R41's block shape exactly — the same counts
+    // (two sync-on commits of 20 Puts, two of Deletes, one sweep, one
+    // 20-Put commit), ceiling values, dense runs and sweep — paired
+    // with index `idx−1`, and its content draws all come from the
+    // second new stream `S_R41PC`, so block B is bit-for-bit the same
+    // in a round with block A and without it. Under a merge-heavy
+    // steady workload every checkpoint window sees frees and reuse;
+    // one aligned window per round is an artifact of the spike's
+    // short windows (X5-R41's own note).
+    let r41p = r41
+        && knobs.target_ckpt >= 1
+        && matches!(
+            CKPT_HOOKS[((seed / 20) % 10) as usize],
+            CkptHook::Before0
+                | CkptHook::After0
+                | CkptHook::After1
+                | CkptHook::Mid2
+                | CkptHook::After2
+                | CkptHook::After3
+                | CkptHook::After4
+        )
+        && r41p_pick(seed, round, tun) == Some(true);
+    let r41p_block: Vec<ScriptOp> = if r41p {
+        let mut ga = Rng::new(derive(seed * 100 + round as u64, S_R41PC));
+        let span = write_max - 1; // |2..=write_max|
+        let tm = 2 + ga.below(span);
+        let ts = if span >= 2 {
+            2 + (tm - 2 + 1 + ga.below(span - 1)) % span
+        } else {
+            tm
+        };
+        let ks = knobs.keyspace;
+        let n = 40u64.min(ks);
+        let base = ga.below(ks - n + 1);
+        let hi = tun.value_hi as usize;
+        let mut block: Vec<ScriptOp> = Vec::new();
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Put {
+                        tree: tm,
+                        key: to_be64(k),
+                        value: vec![0x5A; hi],
+                    })
+                    .collect(),
+            });
+        }
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Delete {
+                        tree: tm,
+                        key: to_be64(k),
+                    })
+                    .collect(),
+            });
+        }
+        block.push(ScriptOp::R41Wait {
+            idx: knobs.target_ckpt - 1,
+        });
+        block.push(ScriptOp::Gc { tree: tm, w: None });
+        let rl = 20u64.min(ks);
+        let b2 = ga.below(ks - rl + 1);
+        block.push(ScriptOp::Commit {
+            sync_on: true,
+            ops: (b2..b2 + rl)
+                .map(|k| Op::Put {
+                    tree: ts,
+                    key: to_be64(k),
+                    value: vec![0xA5; hi],
+                })
+                .collect(),
+        });
+        block.push(ScriptOp::R41Done {
+            idx: knobs.target_ckpt - 1,
+        });
+        block
+    } else {
+        Vec::new()
+    };
+    // Assemble: the barrier, then (in a selected round) block A (the
+    // prior window's — checkpoint `idx−1` opens first) and block B,
+    // then the base sweeps and the burst's; the arms go at the very
+    // front, before the barrier, **only in a selected round** — an
+    // unselected round's GC task is bit-for-bit the generator's. Block
+    // B's arm is op 0 (slot 0), block A's beside it (slot 1).
     let mut gc_ops: Vec<ScriptOp> = Vec::new();
     barrier(&mut gc_ops);
+    gc_ops.extend(r41p_block);
     gc_ops.extend(r41_block);
     gc_ops.extend(base_sweep_ops);
     gc_ops.extend(burst_sweep_ops);
@@ -778,6 +911,14 @@ pub fn build_round(
             0,
             ScriptOp::R41Arm {
                 idx: knobs.target_ckpt,
+            },
+        );
+    }
+    if r41p {
+        gc_ops.insert(
+            1,
+            ScriptOp::R41Arm {
+                idx: knobs.target_ckpt - 1,
             },
         );
     }
@@ -1049,6 +1190,26 @@ pub fn r41_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
     }
     let mut r = Rng::new(derive(seed * 100 + round as u64, S_R41));
     Some(r.below(1000) < tun.r41_share)
+}
+
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the prior-window
+/// alignment selection.** One draw from the round's own `S_R41P`
+/// stream, true with probability `r41p_share` permille. Returns
+/// `None` — **no draw made** — when `r41p_share == 0` (BASE and this
+/// card's FINAL): the stream is never constructed, so no stream state
+/// is consumed (the card's Limit 2) and the round's script is
+/// bit-for-bit the pre-X5-R50 generator's — pinned by
+/// `x5_r50_not_drawn_at_base` (BASE pinned by X5-R37's digest
+/// literals). The caller draws only for eligible rounds (X5-R41
+/// selected, a pre-step-5 targeted hook, `target_ckpt ≥ 1`), so an
+/// ineligible round consumes nothing even at a non-zero share — pinned
+/// by `x5_r50_ineligible_rounds_draw_nothing`.
+pub fn r41p_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
+    if tun.r41p_share == 0 {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_R41P));
+    Some(r.below(1000) < tun.r41p_share)
 }
 
 /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): `q4i_raw`** — did the

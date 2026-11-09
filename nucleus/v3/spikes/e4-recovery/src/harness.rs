@@ -110,11 +110,24 @@ pub enum ScriptOp {
     /// spin-yield loop, like the checkpointer's own poll pattern: no
     /// wait key is woken when the flag is set, so a parked waiter could
     /// only ever observe the window after the hold released it.
-    R41Wait,
+    /// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a):** the op carries
+    /// the index it pairs with — the armed checkpoint whose window this
+    /// op's alignment block runs in (`knobs.target_ckpt` for block B,
+    /// `target_ckpt − 1` for block A).
+    R41Wait {
+        /// The checkpoint completion index whose window flag is waited
+        /// on.
+        idx: u64,
+    },
     /// **X5-R41:** the alignment block is complete — releases the
     /// checkpointer's hold (sticky for the rest of the round, so a
-    /// window that opens late never waits on a block that already ran).
-    R41Done,
+    /// window that opens late never waits on a block that already
+    /// ran). **X5-R50:** carries the index it pairs with, exactly as
+    /// [`ScriptOp::R41Wait`] does.
+    R41Done {
+        /// The checkpoint completion index whose hold this releases.
+        idx: u64,
+    },
     /// Set a named park point's budget (the D5 split parking).
     Park {
         /// The park point.
@@ -286,17 +299,24 @@ pub struct HarnessState {
     /// Card Work 5.6's Q18 observable: a GC sweep ran with a watermark
     /// above the previous `gc_w` while a checkpoint window was open.
     pub gc_adv_in_window: bool,
-    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1):** the armed checkpoint
-    /// index (set by [`ScriptOp::R41Arm`]; the hold triggers at the
-    /// `After0` of exactly this completion index).
-    pub r41_idx: Option<u64>,
-    /// **X5-R41:** the window flag — set when the checkpointer's hold
-    /// begins at the armed checkpoint's `After0` (read by
-    /// [`ScriptOp::R41Wait`]).
-    pub r41_win: bool,
-    /// **X5-R41:** the alignment block completed (set by
-    /// [`ScriptOp::R41Done`]; releases the hold, sticky for the round).
-    pub r41_done: bool,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1) / X5-R50 (card
+    /// X-5c-F4-F1-F1-F3-F1 step 5a): the armed checkpoint indices, at
+    /// most two.** Slot 0 is X5-R41's block B's arm (index
+    /// `knobs.target_ckpt`, the crash's own checkpoint); slot 1 is
+    /// X5-R50's block A's arm (index `target_ckpt − 1`, armed only in
+    /// an eligible selected round at `r41p_share > 0`). [`ScriptOp::R41Arm`]
+    /// fills the first empty slot, so a single-block round uses slot 0
+    /// alone and behaves exactly as at F3; the hold triggers at the
+    /// `After0` of exactly the armed completion index in its slot.
+    pub r41_idx: [Option<u64>; 2],
+    /// **X5-R41/X5-R50:** the per-slot window flags — set when the
+    /// checkpointer's hold begins at that slot's armed checkpoint's
+    /// `After0` (read by [`ScriptOp::R41Wait`]).
+    pub r41_win: [bool; 2],
+    /// **X5-R41/X5-R50:** the per-slot completion flags — that slot's
+    /// alignment block completed ([`ScriptOp::R41Done`]; releases that
+    /// slot's hold, sticky for the round).
+    pub r41_done: [bool; 2],
     /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-checkpoint
     /// window ledger** — one `(ckpt_id, splits, merges, reuses,
     /// pre-freeze reuses)` row per checkpoint whose step 5 returned,
@@ -1094,6 +1114,15 @@ fn run_task(
 /// Run one scripted op. Returns the store's `Fail` unchanged (every
 /// `Cx` call already yields `Fail`): the task runner records the
 /// original error, never a masked one (the gate's N3).
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the slot of an armed
+/// checkpoint index.** [`HarnessState::r41_idx`] holds at most two
+/// armed indices (slot 0 = X5-R41's block B, slot 1 = X5-R50's block
+/// A); this maps an index to its slot, `None` when no arm holds it.
+/// Pure over the state.
+fn r41_slot(h: &HarnessState, idx: u64) -> Option<usize> {
+    h.r41_idx.iter().position(|a| *a == Some(idx))
+}
+
 /// Run one scripted op (pub for the harness tests' unit pins).
 pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
     match op {
@@ -1108,14 +1137,25 @@ pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
             wait_ckpt(cx)
         }
         ScriptOp::R41Arm { idx } => cx.with("h:r41arm", |c| {
-            c.h().r41_idx = Some(*idx);
+            // X5-R41/X5-R50: the first arm takes slot 0 (block B's),
+            // a second takes slot 1 (block A's, X5-R50) — at most two
+            // arms exist, so a third (never emitted) is ignored.
+            let h = c.h();
+            if h.r41_idx[0].is_none() {
+                h.r41_idx[0] = Some(*idx);
+            } else if h.r41_idx[1].is_none() {
+                h.r41_idx[1] = Some(*idx);
+            }
             Ok(())
         }),
-        ScriptOp::R41Done => cx.with("h:r41done", |c| {
-            c.h().r41_done = true;
+        ScriptOp::R41Done { idx } => cx.with("h:r41done", |c| {
+            let h = c.h();
+            if let Some(s) = r41_slot(h, *idx) {
+                h.r41_done[s] = true;
+            }
             Ok(())
         }),
-        ScriptOp::R41Wait => {
+        ScriptOp::R41Wait { idx } => {
             // X5-R41: spin-yield (the checkpointer's own poll pattern)
             // until the armed checkpoint's window is held open or the
             // workload can no longer open one. The exit set is wider
@@ -1131,12 +1171,15 @@ pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
             // run ungated — the round proceeds exactly as it would
             // without the alignment, never a hang. A crash unwinds
             // through `yield_now`'s `Err(Crashed)` as every scripted op
-            // does.
+            // does. X5-R50 (step 5a): the op waits on its own index's
+            // slot flag; an index with no armed slot (never emitted)
+            // reads the flag as already set and does not wait.
             let mut turns = 0u64;
             loop {
                 let (win, done, left) = cx.with("h:r41wait", |c| {
                     let h = c.h();
-                    Ok((h.r41_win, h.workload_done, h.tasks_left))
+                    let win = r41_slot(h, *idx).map(|s| h.r41_win[s]).unwrap_or(true);
+                    Ok((win, h.workload_done, h.tasks_left))
                 })?;
                 if win || done || left <= 1 || turns >= R41_TURNS {
                     return Ok(());
@@ -1619,24 +1662,35 @@ fn checkpointer_body(
                 // over a large dirty set stays open far longer than one
                 // tree sweep; the spike's window is short only because
                 // its dirty set is small.
+                //
+                // **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the
+                // hold is per armed index.** Slot 0 holds checkpoint
+                // `idx` (block B), slot 1 holds checkpoint `idx−1`
+                // (block A, in exactly the rounds that recover it);
+                // the two armed indices differ, so at most one slot
+                // triggers at any one `After0`. A single-block round
+                // behaves exactly as at F3.
                 if hook == CkptHook::After0 {
-                    let armed = cx.with("h:r41armed", |c| Ok(c.h().r41_idx == Some(ck_idx)))?;
-                    if armed {
-                        cx.with("h:r41winflag", |c| {
-                            c.h().r41_win = true;
-                            Ok(())
-                        })?;
-                        let mut turns = 0u64;
-                        loop {
-                            let (done, wd, err) = cx.with("h:r41hold", |c| {
-                                let h = c.h();
-                                Ok((h.r41_done, h.workload_done, h.task_error.is_some()))
+                    for s in 0..2 {
+                        let armed =
+                            cx.with("h:r41armed", |c| Ok(c.h().r41_idx[s] == Some(ck_idx)))?;
+                        if armed {
+                            cx.with("h:r41winflag", |c| {
+                                c.h().r41_win[s] = true;
+                                Ok(())
                             })?;
-                            if done || wd || err || turns >= R41_TURNS {
-                                break;
+                            let mut turns = 0u64;
+                            loop {
+                                let (done, wd, err) = cx.with("h:r41hold", |c| {
+                                    let h = c.h();
+                                    Ok((h.r41_done[s], h.workload_done, h.task_error.is_some()))
+                                })?;
+                                if done || wd || err || turns >= R41_TURNS {
+                                    break;
+                                }
+                                turns += 1;
+                                cx.yield_now("h:r41hold")?;
                             }
-                            turns += 1;
-                            cx.yield_now("h:r41hold")?;
                         }
                     }
                 }

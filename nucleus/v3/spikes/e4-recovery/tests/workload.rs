@@ -2136,7 +2136,7 @@ fn x5_r41_uniform_round_not_selected() {
         let has_block = t
             .ops
             .iter()
-            .any(|op| matches!(op, ScriptOp::R41Wait | ScriptOp::R41Done));
+            .any(|op| matches!(op, ScriptOp::R41Wait { .. } | ScriptOp::R41Done { .. }));
         assert!(
             !has_arm && !has_block,
             "a task of seed 10's round 0 must carry neither the arm nor the block \
