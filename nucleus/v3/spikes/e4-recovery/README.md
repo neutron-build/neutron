@@ -2823,6 +2823,152 @@ G-TWIN-PREFILTER-ALLJ, G-T3-ANYCLASS) are caught by the new cases:
 entire output (the original comparator's gap, reproduced under the
 X5-R53 comparator too; `MPA_CLASS base 11 tip 10` still prints).
 
+**Step 4 — the re-read of the same 10k under X5-R53 (this commit).**
+No campaign was run; everything reads recorded files. The inputs and
+their sha256 (each checked by the Acceptance lines themselves): the run
+JSON `X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json`
+`6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`,
+its `.campaign.out` `cf3de932fc2e82e8042e0b784c3fd071d9d3b9d9a7df543a9411152ae1e26059`
+(MONITOR=0), the reference `tip-10k.json`
+`f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`,
+and the prior gate's recordings `t_2599.{err,json,out}`
+(`a22f0fed…5ef`, `7e5aaf13…f49`, `ef1c8441…999`) and
+`t_2859.{err,json,out}` (`2d0dbb54…692`, `25f442f7…a59`,
+`5e9c50f1…afa`) — the six match Acceptance line 3's `sha256sum -c`
+list exactly. The `compare` output, in full (exit 0):
+
+```
+DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 87 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0), (1299, 0), (1319, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1749, 2), (1768, 0), (1927, 1), (1939, 0), (1999, 0), (2079, 0), (2189, 0), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (2859, 1), (2979, 0), (3099, 0), (3148, 0), (3377, 0), (3759, 2), (3838, 0), (3948, 0), (4148, 0), (4179, 0), (4279, 0), (4399, 1), (4439, 0), (4499, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (4659, 1), (4749, 0), (5077, 0), (5279, 0), (5328, 1), (5418, 0), (5499, 0), (5549, 2), (5798, 1), (6178, 1), (6189, 0), (6368, 0), (6369, 0), (6387, 2), (6417, 0), (6539, 0), (6719, 0), (6877, 0), (6917, 0), (7219, 0), (7257, 0), (7368, 1), (7419, 1), (7469, 1), (7658, 0), (7669, 0), (7727, 1), (7958, 1), (8038, 0), (8139, 2), (8278, 0), (8639, 0), (8748, 2), (8788, 1), (8869, 2), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+MOVED_MP_PENDING 52 [(47, 1), (547, 0), (797, 0), (967, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1768, 0), (1927, 1), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (3148, 0), (3377, 0), (3838, 0), (3948, 0), (4148, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (5077, 0), (5328, 1), (5418, 0), (5798, 1), (6178, 1), (6368, 0), (6387, 2), (6417, 0), (6877, 0), (6917, 0), (7257, 0), (7368, 1), (7658, 0), (7727, 1), (7958, 1), (8038, 0), (8278, 0), (8748, 2), (8788, 1), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+META_ONLY_ELIGIBLE 4 [(1927, 1), (7257, 0), (7658, 0), (8278, 0)]
+MPA_PASS_FAIL 1 [(7078, 0)]
+MPA_CLASS base 11 tip 10
+TWIN_DDL_PENDING 2 [(2599, 2), (2859, 1)]
+MOVED_LOST 94 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1), (1018, 0), (1107, 0), (1219, 0), (1367, 1), (1387, 0), (1578, 2), (1588, 0), (1598, 0), (1708, 2), (1747, 0), (1919, 1), (1927, 0), (1949, 0), (2099, 0), (2159, 0), (2259, 0), (2307, 0), (2389, 0), (2397, 0), (2517, 1), (2778, 0), (3029, 0), (3289, 0), (3377, 1), (3397, 0), (3548, 0), (3739, 0), (3759, 0), (3768, 0), (3947, 0), (4118, 0), (4359, 0), (4398, 0), (4399, 0), (4419, 1), (4518, 0), (4537, 1), (4567, 0), (4989, 1), (5129, 0), (5188, 0), (5328, 0), (5427, 0), (5479, 0), (5499, 1), (5619, 0), (5769, 2), (5798, 0), (6178, 0), (6387, 1), (6417, 1), (6458, 0), (6557, 0), (6909, 0), (6917, 1), (6938, 0), (7197, 0), (7219, 1), (7278, 0), (7298, 0), (7368, 0), (7419, 0), (7439, 1), (7447, 0), (7727, 2), (7889, 0), (7958, 0), (8257, 0), (8278, 1), (8307, 0), (8547, 0), (8639, 1), (8748, 0), (8788, 0), (9059, 0), (9159, 2), (9177, 0), (9329, 1), (9387, 0), (9388, 0), (9419, 0), (9429, 1), (9508, 2), (9618, 0), (9637, 1), (9717, 0), (9818, 0), (9967, 0), (9999, 0)]
+HEALED 3 [(457, 0), (1298, 1), (8777, 0)]
+TWIN_HEALED 1 [(6539, 1)]
+TEXT_CHANGED 131 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0), (1117, 0), (1127, 1), (1159, 0), (1197, 0), (1217, 0), (1337, 0), (1417, 0), (1447, 0), (1477, 0), (1628, 0), (1637, 0), (1798, 0), (1899, 0), (1917, 0), (1948, 1), (1959, 0), (1977, 0), (2028, 0), (2078, 0), (2097, 1), (2268, 0), (2377, 0), (2537, 0), (2567, 0), (2597, 0), (2638, 0), (2698, 0), (2757, 0), (2787, 0), (2828, 0), (2939, 0), (2977, 2), (2978, 0), (3068, 0), (3118, 0), (3227, 0), (3259, 1), (3357, 0), (3358, 0), (3438, 0), (3638, 0), (3817, 0), (3927, 0), (4038, 0), (4127, 1), (4247, 0), (4268, 0), (4297, 0), (4337, 0), (4378, 0), (4468, 0), (4489, 0), (4648, 0), (4657, 0), (4677, 0), (4699, 0), (4737, 0), (4758, 0), (5047, 1), (5078, 0), (5087, 0), (5148, 1), (5227, 1), (5298, 0), (5338, 1), (5378, 0), (5517, 0), (5618, 0), (5907, 0), (5958, 0), (6078, 0), (6138, 0), (6248, 0), (6377, 0), (6457, 0), (6517, 0), (6558, 0), (6627, 0), (6638, 0), (6677, 0), (6758, 0), (6807, 0), (6848, 0), (6977, 0), (6987, 0), (6997, 0), (7007, 0), (7098, 0), (7127, 0), (7227, 0), (7297, 0), (7317, 0), (7337, 0), (7338, 0), (7357, 0), (7399, 0), (7457, 1), (7698, 0), (7917, 0), (8098, 0), (8138, 0), (8268, 0), (8287, 0), (8309, 1), (8418, 0), (8617, 0), (8618, 0), (8638, 0), (8687, 0), (8977, 0), (8998, 0), (9028, 0), (9078, 1), (9107, 1), (9228, 0), (9398, 0), (9417, 0), (9528, 0), (9617, 0), (9657, 0), (9827, 0), (9878, 0), (9959, 0)]
+TWIN_FAILING 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)] BASE 6
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+**Exactly the same reading as under X5-R52.** The diff against the
+chain-head comparator's output (`git show 26bcee4b` copy, run over the
+same files by the Acceptance line) is the **`MPA_CLASS base 11 tip 10`
+line alone** — every other byte identical, both exits 0. The cap did
+not void (iii): the class count fell, 11 → 10, so 7078 r0 stays
+`MPA_PASS_FAIL`. MONITOR is 0, so no `bullet3-monitor` row. The two
+`check-twin` rows (Acceptance lines 5 and 6, both exit 0):
+
+```
+EXPLAINED N=3 k=2 (real round 1: lost=1 mis=0 torn=1 cover_err=False frontier=1 hi=5; T6a ts=[7] meta.t=[9]; T6b no D3 at or below frontier, real_nrec=1)
+EXPLAINED N=4 k=1 (real round 0: lost=0 mis=1 torn=0 cover_err=False frontier=1 hi=7; T6a ts=[3] meta.t=[7]; T6b no D4 at or below frontier, real_nrec=1)
+```
+
+RESULT item 4's fields: 2599 `N=3 k=2`, T6a drop `ts` 7 against the
+failing recovery's `meta.t` 9, T6b's real listing 1 record at frontier 1;
+2859 `N=4 k=1`, T6a `ts` 3 against `meta.t` 7, real listing 1 record at
+frontier 1. Both hold by T6b's **second** arm (each real round's
+`cover_err` and `x33x` are false, its listing replays only the
+CreateTree record, `ts=1 ≤ frontier`, no `D<N>`) — exactly the facts P
+listed in X5-R53 (0). **Nothing outside X5-R52 read with X5-R53: no
+STOP.**
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F1-F1)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F1-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F1-F1   commit: (this commit; the chain c51b4218 → 8819a073 → b9ea6ff7 → 888078eb → here)
+
+The six RESULT items the card requires:
+
+1. **X5-R53 verbatim and the numbering note** — the section above, step
+   0. The rule was extracted byte-for-byte from the card before any
+   code of this card (`diff` against the card's lines 146–185 is empty)
+   and not edited after step 0. X5-R51's and X5-R52's texts are
+   unchanged: the only deleted lines in this card's whole README diff
+   are the three Status-paragraph lines the new stage's Status rework
+   replaced (checked `git diff 26bcee4b HEAD`, 3 deleted lines, all in
+   the Status paragraph; X5-R52's block diffs empty).
+2. **P's three rulings, as the card gives them** — "P's three rulings"
+   above: the ts-level check restored as T6 with its real-chain half
+   rewritten onto one clock, the MP-A cap restored, MONITOR > 0 stops
+   the comparison by itself.
+3. **The `compare` output in full, both files' sha256, and the diff
+   against the chain-head comparator's output** — step 4 above: exit 0,
+   the sha256s listed there, and the diff is the `MPA_CLASS base 11
+   tip 10` line only.
+4. **The `check-twin` rows for 2599 and 2859** — step 4 above: `N`, `k`,
+   T6a's `ts` and `meta.t`, and T6b's real listing size and frontier,
+   all in the recorded rows.
+5. **The MP-A class at both ends, and the mutant table** —
+   `MPA_CLASS base 11 tip 10` (the count fell; the cap leaves (iii) as
+   X5-R52 wrote it), and the 25-mutant table of step 3 (none UNCAUGHT).
+6. **Post-data amendments: X5-R53.** It was written by P **after** the
+   re-verdict at `26bcee4b` (both adversarial logs included), after
+   F2-F1's 10k JSON and the reference, after the gate's recorded
+   `t_2599.*`/`t_2859.*`, and after P's own scratch reference
+   implementation — the full list is its (0), quoted verbatim above.
+   **The rounds it moved: none.** X5-R53 exempts no round that X5-R52
+   did not, and the re-read confirms it: every row of the reading is
+   unchanged, the cap voids nothing here, and both pending twin rows
+   pass the sixth check.
+
+acceptance (this attempt, every line run for real): `python3 -I
+spikes/e4-recovery/tools/x5r52_compare.py self-test` — **61 cases,
+0 failed**, exit 0; the two `git diff --quiet ad4fa999… HEAD` lines
+(`src`, `Cargo.toml`, `x5r52-twin-diag.patch`) — both quiet; the
+six-line `sha256sum -c` over `t_2599.*`/`t_2859.*` — all OK; the 10k
+`compare` line — exit 0, byte-identical to the chain-head output except
+`MPA_CLASS base 11 tip 10`, with the four `grep -Fxq` rows green; the
+two `check-twin` lines — exit 0, `EXPLAINED N=3 k=2 ` / `EXPLAINED
+N=4 k=1 `; `scripts/gate.sh` — `STEP test EXIT=0`, `STEP clippy
+EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`,
+`STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=1`
+with exactly **one** FAIL row — `runner e2e: K: SIGTERM kills opencode
+and closes the ledger range` — so the last line reads `GATE EXIT=1`.
+**This is the known, ruled row, not a finding of this card**: the
+container matches the ruling's premise (`/proc/1/comm` = `opencode`),
+verdict `verdicts/X-5c-F4-F1-F1.md` (the K ruling) says "`kill_child`
+is correct. `dead()` asks the wrong question: `killpg` succeeds on a
+zombie-held group" and "It is the only row. The runner's Acceptance is
+the truth. Do not chase it, and do not run a subreaper to make it
+pass." The parent card's own re-verification recorded the identical
+reading in this same container shape (its attempt-1 `GATE EXIT=0` was
+flagged unreproducible there), and the fix is queued as card
+X-5c-F4-F1-F1-F1; `scripts/` is outside this card's Touch only either
+way. Every other step is green and nothing this card touched (a README
+and a Python tool) is exercised by that row.
+
+judgment calls (recorded in the sections above): scratch output and
+mutant copies live under `${CARGO_TARGET_DIR}/x5r53-review/` — the
+card's Run hygiene names `~/.cache/nv3-review/X-5c-…-F1/`, but `$HOME`
+is read-only in this container, and the card's own Notes direct outputs
+under `$CARGO_TARGET_DIR`; the mutant driver asserts every anchor's
+occurrence count before applying; the T3-attribution mutants are caught
+where the fixture's shape forces it — a mutant that wrongly passes T3
+then falls to T6a/T6b's refusal on the same fixture, which is the only
+possible divergence for a check that must fail (the case still fails
+under the mutant, on its named case); `check-twin`'s EXPLAINED detail
+grew to carry T6a's `ts`/`meta.t` and T6b's listing size (RESULT
+item 4 requires them; the `N=… k=… ` prefix the rules and the
+self-test assert is unchanged); the module docstring was updated to
+name X5-R53 (no behaviour; the four functions X5-R53 leaves untouched
+— `check_mp`, `meta_only_eligible`, `mpa_pass_fail`,
+`twin_ddl_prefilter` — are byte-identical to `26bcee4b`).
+
+ESCALATE: none.
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the parent card's record; the commits land — the
+log and the clean tree confirm); (b) the gate's `GATE EXIT=1` on the
+single ruled `runner e2e: K` row as recorded above — environmental,
+pre-existing on this chain in this container, and outside this card's
+scope; (c) the verdict's stacked-tip re-gate (at `60f919d7`, scaffold
+`acc81c77`) read that row ok and `GATE EXIT=0`, while the parent card's
+own in-container re-verification and this attempt read it red — the row
+tracks the container's PID 1, not the tree.
+
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
