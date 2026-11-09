@@ -3527,6 +3527,23 @@ X5R52 round-start seed=2859 round=1 real_dir=[1, 2, 3, 4] twin_dir=[1, 2, 3, 4]
 digest equals the plain tip's `429219074`, and both twin entries pass,
 so T5 holds.)
 
+**Step 4 — the literals re-derived (this commit).** Exactly one literal
+is red at the tip, re-derived with its round from step 2's events:
+
+- `x5_r37_base_tuning_reproduces_1b0ce54e`: **2669 `357787865 →
+  1374321949`**, twin directory re-seed at round 1. The other 53 seeds of
+  the 54 are byte-identical (step 2 measured them singly, against the
+  baseline and against the diag export — both readings agree).
+
+No other pin in the crate is red: `cargo test -q --release -p
+e4-recovery` after the edit is green — 266 tests, 0 failed — so `g8`
+([747, 967]) and F3's share-1000 pins keep their selections by their own
+rules (re-selection applies only to red pins, and none is). The 0..1000
+rows appended to `results/digest-stability.tsv` (its full 0..1000
+movement): 609 `887984205 → 1508388762` and 849 `3570145416 →
+2934853921`, both "twin directory re-seed
+(X-5c-F4-F1-F1-F3-F2-F1-F2), rounds r1".
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read

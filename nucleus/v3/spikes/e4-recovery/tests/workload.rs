@@ -139,6 +139,10 @@ fn smoke_16_seeds() {
 /// the freed-home release changes the allocation scan's yield pattern
 /// from a workload's first free onward, so the drawn crash points and
 /// slot numbers land elsewhere. The other 41 are byte-identical.
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 re-derived one more:** 2669
+/// `357787865 -> 1374321949` (twin directory re-seed at round 1 —
+/// step 2's attribution event; the only one of the 54 that moved, and
+/// the only literal this card re-derives).
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
     const WANT: &[(u64, u64)] = &[
@@ -185,7 +189,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (1787, 1119157608),
         (1887, 3622450829),
         (2376, 926921172),
-        (2669, 357787865),
+        (2669, 1374321949),
         (2927, 1916772534),
         (4049, 2182387428),
         (4309, 3466635396),
