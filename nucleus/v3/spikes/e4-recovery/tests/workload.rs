@@ -10,6 +10,7 @@
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
 use e4_recovery::campaign;
+use e4_recovery::harness::ScriptOp;
 use e4_recovery::workload::{self, Knobs};
 
 /// Seeds 0..16 run mechanically clean: no DEADLOCK, no PANIC, no S-BATON
@@ -2238,6 +2239,278 @@ fn x5_r42_harness_checkpoint_image_is_not_q4i() {
     // count — the removal never leaks to rows that belong there.
     let raw_m2 = fold_ckpt_windows(&mut w, &[(7, 15, 12, 9, 9)], Some(7), None);
     assert!(raw_m2, "a recorded window of the opened image still counts");
+}
+
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5b): nothing is drawn at
+/// share 0, and BASE never moves.** `r41p_pick` returns `None` — no
+/// `S_R41P` stream constructed, no state consumed — for every round at
+/// `r41p_share` 0; a non-zero share draws for every round (both
+/// outcomes at an intermediate share; every draw at 1000). The
+/// BASE-digest half is `x5_r37_base_tuning_reproduces_1b0ce54e`
+/// (X5-R37: a draw made at share 0 whose result reached `S_GEN`'s
+/// order would move a BASE digest). **M-R50-DRAW** (`S_R41P` drawn at
+/// share 0, its result fed into `S_GEN`'s order) reverts this.
+#[test]
+fn x5_r50_not_drawn_at_base() {
+    for seed in 0..64u64 {
+        for round in 0..3u32 {
+            assert_eq!(
+                workload::r41p_pick(seed, round, &workload::Tuning::BASE),
+                None,
+                "seed {seed} round {round}: r41p_share 0 must draw nothing"
+            );
+        }
+    }
+    let mut share1 = workload::Tuning::BASE;
+    share1.r41_share = 1000;
+    share1.r41p_share = 100;
+    let (mut somes, mut trues) = (0usize, 0usize);
+    for seed in 0..500u64 {
+        if let Some(pick) = workload::r41p_pick(seed, 0, &share1) {
+            somes += 1;
+            trues += usize::from(pick);
+        }
+    }
+    assert_eq!(somes, 500, "a non-zero share draws for every round");
+    assert!(
+        trues > 0 && trues < 500,
+        "r41p_share 100 permille must both hit and miss over 500 seeds"
+    );
+    let mut share1000 = workload::Tuning::BASE;
+    share1000.r41_share = 1000;
+    share1000.r41p_share = 1000;
+    for seed in 0..8u64 {
+        assert_eq!(
+            workload::r41p_pick(seed, 0, &share1000),
+            Some(true),
+            "r41p_share 1000 permille selects every eligible round"
+        );
+    }
+}
+
+/// Extract one alignment block's ops from a GC task's op list: the
+/// four commits, the `R41Wait { idx }`, the sweep, the split commit
+/// and the `R41Done { idx }` — the slice from four ops before the
+/// wait through the done (test helper for the X5-R50 pins).
+fn r50_block(ops: &[ScriptOp], idx: u64) -> &[ScriptOp] {
+    let wait = ops
+        .iter()
+        .position(|o| matches!(o, ScriptOp::R41Wait { idx: i } if *i == idx))
+        .unwrap_or_else(|| panic!("no R41Wait {{ idx: {idx} }} in the GC task"));
+    let done = ops
+        .iter()
+        .position(|o| matches!(o, ScriptOp::R41Done { idx: i } if *i == idx))
+        .unwrap_or_else(|| panic!("no R41Done {{ idx: {idx} }} in the GC task"));
+    &ops[wait - 4..=done]
+}
+
+/// The GC task's op list of a built round (test helper).
+fn r50_gc(script: &e4_recovery::harness::Script) -> &[ScriptOp] {
+    &script
+        .tasks
+        .iter()
+        .find(|t| t.ops.iter().any(|o| matches!(o, ScriptOp::Gc { .. })))
+        .expect("the round has a GC task")
+        .ops
+}
+
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5b): an eligible round's
+/// prior window is aligned, and block B is untouched.** The literal
+/// seed is **0 round 0** at (`r41_share` 1000, `r41p_share` 1000):
+/// targeted (`seed/10` even), no drop, hook `Before0` (a pre-step-5
+/// crash), `target_ckpt` 2 — eligible, and its `S_R41P` draw hits at
+/// share 1000. The crash is `Before0@2`: checkpoint 2's window never
+/// completed, so the last completed ledger row **is checkpoint
+/// `idx−1` = 1's window** and the recovery opens its meta — the
+/// record's `imgsp`/`imgmg`/`imgreuse`/`imgreuse_pf` (4/8/3/3 exact)
+/// are that window's counts, and `q4i_raw` (and `q4i`) hold through
+/// block A's pre-freeze reuses. At (`1000`, `0`) the same round reads
+/// `q4i_raw` **false** (image 1's window was never aligned) with seed
+/// 0's X5-R37 BASE digest, and block B's ops are **identical** at both
+/// settings (its content draws come from `S_R41C` alone); block A
+/// exists only at (1000, 1000), with its own arm.
+/// **M-R50-SHAREDSTREAM** (block A draws from `S_R41C`) shifts block
+/// B's draws and breaks the block-B identity; **M-R50-SHAREDFLAG**
+/// (one window flag for both arms) ungates block B and moves the
+/// digest — each fails this pin.
+#[test]
+fn x5_r50_prior_window_round_is_q4i() {
+    use e4_recovery::model::Model;
+    use e4_recovery::store::ckpt::{CKPT_HOOKS, CkptHook};
+    use workload::{Knobs, Tuning, build_round};
+    let mut t50 = Tuning::BASE;
+    t50.r41_share = 1000;
+    let mut tpp = Tuning::BASE;
+    tpp.r41_share = 1000;
+    tpp.r41p_share = 1000;
+    // The eligibility premises, read the same way the generator does
+    // (seed 0: seed/10 = 0, even — targeted; (seed/20) % 10 = 0).
+    let knobs = Knobs::derive(0, 0, &tpp);
+    let zero = 0u64;
+    assert_eq!(
+        zero / 10,
+        0,
+        "seed 0's seed/10 is even: a targeted-crash seed"
+    );
+    assert!(!knobs.drop_tree, "round 0 of seed 0 is not a drop round");
+    assert_eq!(CKPT_HOOKS[0], CkptHook::Before0);
+    assert_eq!(knobs.target_ckpt, 2, "idx is 2, so idx−1 = 1 exists");
+    assert_eq!(
+        workload::r41p_pick(0, 0, &tpp),
+        Some(true),
+        "the S_R41P draw hits at share 1000"
+    );
+    // The (1000, 1000) arm: the aligned prior window makes the round q4i.
+    let rec = workload::run_seed_with(0, None, &tpp);
+    assert!(
+        rec.defect.is_none(),
+        "seed 0 at (1000,1000): {:?}",
+        rec.defect
+    );
+    assert_eq!(
+        rec.digest, 1989125988,
+        "seed 0's (1000,1000) schedule moved"
+    );
+    let r0 = rec.rounds.first().expect("seed 0 runs round 0");
+    assert_eq!(r0.crash, "Before0@2", "round 0's crash point moved");
+    assert!(r0.fired, "round 0's crash must fire");
+    assert_eq!(r0.imgsp, 4, "imgsp exact (checkpoint idx-1 = 1's window)");
+    assert_eq!(r0.imgmg, 8, "imgmg exact");
+    assert_eq!(r0.imgreuse, 3, "imgreuse exact");
+    assert_eq!(
+        r0.imgreuse_pf, 3,
+        "imgreuse_pf exact (block A's reuses, all pre-freeze)"
+    );
+    assert!(
+        r0.q4i_raw,
+        "the opened image is checkpoint 1's (idx-1): its window held reuses"
+    );
+    assert!(r0.q4i, "the round counts for the image arm");
+    assert!(r0.pass, "the aligned round passes: {:?}", r0.o3_fail);
+    // The (1000, 0) arm: no alignment, not q4i, BASE digest.
+    let rec50 = workload::run_seed_with(0, None, &t50);
+    assert_eq!(
+        rec50.digest, 3702394764,
+        "seed 0's (1000,0) digest equals its X5-R37 literal"
+    );
+    let r50 = rec50.rounds.first().expect("seed 0 runs round 0");
+    assert!(
+        !r50.q4i_raw,
+        "without block A the opened window held no reuse"
+    );
+    // Block B's identity across the two settings, and block A's
+    // presence beside it.
+    let (s50, _, _) = build_round(0, 0, &t50, &Knobs::derive(0, 0, &t50), &Model::new(), 0);
+    let (spp, _, _) = build_round(0, 0, &tpp, &Knobs::derive(0, 0, &tpp), &Model::new(), 0);
+    let (g50, gpp) = (r50_gc(&s50), r50_gc(&spp));
+    assert_eq!(
+        format!("{:?}", r50_block(g50, 2)),
+        format!("{:?}", r50_block(gpp, 2)),
+        "block B's ops are bit-for-bit the same at (1000,0) and (1000,1000) \
+         (M-R50-SHAREDSTREAM reverts this)"
+    );
+    assert!(
+        !g50.iter().any(|o| matches!(
+            o,
+            ScriptOp::R41Arm { idx: 1 }
+                | ScriptOp::R41Wait { idx: 1 }
+                | ScriptOp::R41Done { idx: 1 }
+        )),
+        "at (1000, 0) no block A ops exist"
+    );
+    assert!(
+        gpp.iter().any(|o| matches!(o, ScriptOp::R41Arm { idx: 1 })),
+        "at (1000, 1000) block A's arm sits beside block B's"
+    );
+    // Block A exists at (1000, 1000) and is its own draws (would panic
+    // here if the wait/done pair were missing).
+    let _ = r50_block(gpp, 1);
+}
+
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5b): an ineligible round
+/// draws nothing and gains no block, however its draw would read.**
+/// Two literal ineligible seeds at (`1000`, `1000`), both targeted,
+/// both non-drop, both with a hitting `S_R41P` draw at share 1000:
+/// **140 round 0** (hook `After5`, a post-step-5 hook — the crash
+/// opens image `idx` itself, X5-R41's own alignment; `target_ckpt` 1)
+/// and **1 round 0** (hook `Before0`, but `target_ckpt` 0 — index
+/// `idx−1` does not exist). Neither round's GC task carries block A's
+/// arm, wait or done at (1000, 1000), and each round's GC ops are
+/// **identical** to the same round at (1000, 0).
+/// **M-R50-ANYHOOK** (eligibility drops the hook clause) selects 140
+/// and **M-R50-IDX0** (eligibility drops `idx ≥ 1`) selects 1 — each
+/// fails this pin.
+#[test]
+fn x5_r50_ineligible_rounds_draw_nothing() {
+    use e4_recovery::model::Model;
+    use e4_recovery::store::ckpt::{CKPT_HOOKS, CkptHook};
+    use workload::{Knobs, Tuning, build_round};
+    let mut t50 = Tuning::BASE;
+    t50.r41_share = 1000;
+    let mut tpp = Tuning::BASE;
+    tpp.r41_share = 1000;
+    tpp.r41p_share = 1000;
+    for (seed, hook_want) in [(140u64, CkptHook::After5), (1u64, CkptHook::Before0)] {
+        let knobs = Knobs::derive(seed, 0, &tpp);
+        assert_eq!(seed / 10 % 2, 0, "seed {seed} is a targeted-crash seed");
+        assert!(
+            !knobs.drop_tree,
+            "round 0 of seed {seed} is not a drop round"
+        );
+        assert_eq!(CKPT_HOOKS[((seed / 20) % 10) as usize], hook_want);
+        assert_eq!(
+            workload::r41p_pick(seed, 0, &tpp),
+            Some(true),
+            "seed {seed}'s S_R41P draw hits at share 1000 — only the clause keeps it out"
+        );
+        let (s50, _, _) = build_round(
+            seed,
+            0,
+            &t50,
+            &Knobs::derive(seed, 0, &t50),
+            &Model::new(),
+            0,
+        );
+        let (spp, _, _) = build_round(
+            seed,
+            0,
+            &tpp,
+            &Knobs::derive(seed, 0, &tpp),
+            &Model::new(),
+            0,
+        );
+        let (g50, gpp) = (r50_gc(&s50), r50_gc(&spp));
+        // The prior index this round would have paired block A with;
+        // `None` when idx is 0 (seed 1 — the idx clause's case).
+        let prior = knobs.target_ckpt.checked_sub(1);
+        for ops in [g50, gpp] {
+            assert!(
+                !ops.iter().any(|o| matches!(
+                    o,
+                    ScriptOp::R41Arm { idx: i }
+                        | ScriptOp::R41Wait { idx: i }
+                        | ScriptOp::R41Done { idx: i }
+                    if Some(*i) == prior
+                )),
+                "seed {seed}: no block A op for index {prior:?} may exist (M-R50-ANYHOOK for \
+                 seed 140, M-R50-IDX0 for seed 1)"
+            );
+        }
+        assert_eq!(
+            format!("{g50:?}"),
+            format!("{gpp:?}"),
+            "seed {seed}: the GC task is identical at (1000,0) and (1000,1000)"
+        );
+    }
+    // The premise that makes the two seeds ineligible in different
+    // clauses: 140's hook is post-step-5 (idx 1 exists), 1's idx is 0.
+    let k140 = Knobs::derive(140, 0, &tpp);
+    assert_eq!(
+        k140.target_ckpt, 1,
+        "seed 140: only the hook clause excludes it"
+    );
+    let k1 = Knobs::derive(1, 0, &tpp);
+    assert_eq!(k1.target_ckpt, 0, "seed 1: only the idx clause excludes it");
 }
 
 /// **X5-R42 (step 6): a refused round is not `q4i`.** The fold is
