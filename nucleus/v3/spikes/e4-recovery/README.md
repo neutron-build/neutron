@@ -1,12 +1,24 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F1 — the X5-R52 card: P's
+Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1 — the X5-R53 card: P's
+post-data amendment to X5-R52 (verbatim below), written after the
+re-verdict at `26bcee4b` (MERGE-WITH-FOLLOWUPS) named two follow-ups on
+X5-R52's comparator and rule. This card narrows `check-twin` to the
+twin's own segments (T1 and T3 as X5-R53 (b) writes them), adds the
+sixth check T6 (the ts-level link, on one clock per chain), caps
+exemption (iii) on the MP-A class size and prints `MPA_CLASS`
+(X5-R53 (d)), makes a MONITOR>0 run stop the comparison by itself
+(X5-R53 (e)), closes the four self-test coverage holes the gate's
+mutants found, and re-reads the same F2-F1 10k again requiring the same
+reading (no campaign re-run; nothing under `src/`, `tests/`,
+`examples/`, `results/` or `x5r52-twin-diag.patch` changes).** Before
+it: stage X-5c-F4-F1-F1-F3-F2-F1-F1 — the X5-R52 card: P's
 post-data amendment to X5-R51 (verbatim below, with X5-R51 quoted
 unchanged beside it), written after the F2-F1 gate verdict's ESCALATE;
 the comparator committed as a tool with bullet 1 testable, and the same
 10k re-read under the amendment (no campaign re-run). F2-F1's commits
-merge through this card, on its chain, with no code change.** Before
-it: stage X-5c-F4-F1-F1-F3-F2-F1 — this card continues F2
+merge through this card, on its chain, with no code change. Before it:
+stage X-5c-F4-F1-F1-F3-F2-F1 — this card continues F2
 (X5-R49) from its tip `1524e284` under the gate verdict's P ruling
 X5-R51, the step-4 movement exemption (fixed verbatim below, with the
 g8 re-selection rule, before any code or literal of this card).**
@@ -2572,6 +2584,126 @@ X-5c-F4-F1-F1 verdict later forbade, and attempt 1's log was killed
 before its end. The one row that differs is the ruled `runner e2e: K`
 row; every other gate step is green here, and every other recorded
 number of this card reproduces exactly as written above.
+
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F1-F1's record (X5-R53, P's post-data
+## amendment to X5-R52; check-twin narrowed to the twin's own segments,
+## T6 the ts-level link, the MP-A class cap, MONITOR as a stop; the same
+## 10k re-read again)
+
+The re-verdict of the X5-R52 card
+(`verdicts/X-5c-F4-F1-F1-F3-F2-F1-F1.md` at `26bcee4b`,
+MERGE-WITH-FOLLOWUPS) left two follow-ups on X5-R52's comparator and
+rule. Neither changes the reading of F2-F1's 10k; both have to land
+before card X-5c-F4-F1-F1-F3-F2-F1-F2's 10k, because that run uses this
+comparator:
+
+- **The comparator is wider than X5-R52.** `check-twin`'s T1 accepted
+  `Corrupt("tree N missing in directory")` from any class-C `Err` line
+  for round `i` — including the uniform probe on the real chain and a
+  pairing re-run. T3 likewise read probe segments. The gate built two
+  adversarial logs that came back `EXPLAINED` under that reading, and
+  four of its mutants survived `self-test`: G-EXIT-NOBAD, G-T4-NO-SHORT,
+  G-TWIN-PREFILTER-ALLJ and G-T3-ANYCLASS.
+- **X5-R52 dropped two parts of the verdict's proposals at `8992f77f`.**
+  (c)(i) replaced the ts-level link with T3 and T4, and (c)(iii) dropped
+  "while the class count does not grow". P rules on both below, **before
+  any code**, and also on whether a run with MONITOR > 0 fails the
+  comparator's exit by itself.
+
+This card does three things: commits **X5-R53** with X5-R52 quoted
+unchanged, narrows `tools/x5r52_compare.py` to X5-R52 as written and to
+X5-R53 while closing the self-test gaps, and re-reads the **same** 10k
+JSON requiring the **same** reading. No campaign is run again and no
+Rust changes (X5-R31 run hygiene: everything reads recorded files).
+
+**Numbering.** The highest X5-R number in use in the README, the cards,
+the verdicts, QUEUE and PLAN is R52 (checked in the cards tree and on
+every `card/v3-*` branch on 2026-11-08). **This rule is X5-R53.**
+
+### P's three rulings (the reasoning; X5-R53 below is the binding text)
+
+1. **The ts-level check: restored, as a new check T6, with its
+   real-chain half rewritten.**
+   - The check can be computed from recorded fields. Twin listings carry
+     each record's `ts` and `ddl`, the replay-start line carries
+     `meta.t`, and the real listing and JSON give the real side.
+   - T1–T5 show that the directories diverged right after a faulted,
+     short real recovery. They do not tie that divergence to one
+     DropTree in that round. Without T6, a tree the real chain dropped
+     and then re-created, or a drop the twin itself replays in the
+     failing recovery, passes.
+   - **The proposal's real-side test, "its frontier is below that ts",
+     compares two different clocks.** `frontier` is the real chain's and
+     the DropTree's `ts` is the twin's. The clocks do drift apart: in
+     2599 r1 the twin's CreateTree is `ts=5` and the real chain's is
+     `ts=1`. Read literally, the test would pass a real round that did
+     replay the drop whenever the twin's clock is ahead, and refuse a
+     genuine loss whenever it is behind.
+   - So T6 keeps the proposal's intent on one clock: the real round's
+     own replay listing, read against its own `frontier`. The
+     `cover_err`/`x33x` alternative stays, because a refused recovery
+     prints no listing.
+2. **The MP-A cap: restored.**
+   - It can be computed exactly from the two JSON files.
+   - (iii) calls a bullet-1 regression "movement within MP-A". Movement
+     within a class that X5-R30 keeps open is only a fair description
+     while the class is not growing. Without the cap, a real rise in
+     served corruption passes every comparison, one exempt row at a
+     time, and shows up only as a number nobody is required to read.
+   - An ESCALATE on a one-round rise is the cheap outcome: P looks, and
+     rules. A silent rise is the expensive one.
+   - -F2's 10k will use it, so it is fixed here, before that run.
+3. **MONITOR > 0: it stops the comparison by itself.** X5-R51 (a)
+   bullet 3 already calls a MONITOR hit a new failure. The comparator
+   only voids exemptions on one. This makes the existing bullet
+   testable, as X5-R52 (b) did for bullet 1.
+
+### X5-R53 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the step-0
+discipline, as X5-R6–R52 before it):
+
+**X5-R53 (the X5-R52 amendment: `check-twin`'s attribution made exact, the ts-level link T6, the MP-A class cap, and MONITOR as a stop; a P rule, post-data; X5-R49, X5-R51's text and X5-R52's text unchanged).**
+- **(0) What was known when this was written.** X5-R53 is a post-data amendment, and RESULT item 6 lists it as one. P wrote it **after** reading all of the following:
+  - verdict `X-5c-F4-F1-F1-F3-F2-F1-F1` at `26bcee4b`, including both of the gate's adversarial logs;
+  - F2-F1's 10k JSON (sha256 `6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`), the reference (`f4d6f1ff…c923`), and the gate's recorded `t_2599.*` and `t_2859.*`;
+  - P's own scratch reference implementation of (b), (c) and (d), run over those files. Its reading is under "Expected" in Work step 4.
+
+  **So P knew, before writing it, that:** both pending twin rows meet T6 (2599: `ts_D=7`, `meta.t=9`, one real record replayed, frontier 1; 2859: `ts_D=3`, `meta.t=7`, one real record replayed, frontier 1); MP-A is 11 rounds at the reference and 10 at the tip, all class MP and all `pass=false`; and the run's MONITOR is 0. **The rulings do not rest on those facts.** Each was decided on whether the check is computable from recorded fields and on what it rules out. Parts (b), (c) and (d) only remove exemptions. Part (e) only adds a stop. X5-R53 exempts no round that X5-R52 did not.
+- **(a) Scope.**
+  - X5-R53 amends X5-R52 for the same comparisons X5-R52 (a) names: this card's re-read of F2-F1's 10k, and every comparison in card X-5c-F4-F1-F1-F3-F2-F1-F2. **For -F2, P re-issues X5-R52 read with this amendment.**
+  - X5-R52 (g) stands: at a commit carrying -F2's re-seed, (c)(i) is void, so (b) and (c) below have nothing to act on there. (d) and (e) apply there.
+  - It carries to no other card unless P re-issues it.
+  - **It is not an oracle change and not an E4 judgement rule.** `pass`, the texts, the fold, `verify`, every quota, X5-R1–R52, F4's class table and E4's owner rule are unchanged.
+- **(b) T1 and T3 read the twin's own runs.** This states what X5-R52's "class-C (twin)" means; the comparator was wider than that text.
+  - **Segments.** A diag line belongs to the most recent `X5R52 run seed=<s> round=<r> class=<K>` marker for seed `s`. A marker for another seed ends the segment.
+  - **A twin segment of round `r`** is a `class=C` marker for round `r` that comes **after** that seed's `X5R52 round-start` line for round `r`.
+    - That covers the twin's first run, its NEVER-FIRED re-runs and the X5-R21 (c) pairing re-runs, all of which run on the twin chain.
+    - A `class=C` marker for round `r` **before** that line is the uniform probe, which runs on the real chain. It is never a twin segment.
+  - **T1** becomes:
+    - there is at least one class-C recovery `Err` line for round `i` inside a twin segment of round `i`; and
+    - **every** class-C recovery `Err` line for round `i`, in any segment, has the same text, and that text is exactly `Corrupt("tree N missing in directory")`.
+
+    A probe's `Err`, a pairing re-run's `Err` or any other class-C `Err` that differs is NOT-EXPLAINED T1.
+  - **T3** reads twin segments only, for seed `s` only, at rounds `≤ i`. The rest of its text is unchanged.
+  - T2, T4 and T5 are unchanged.
+- **(c) T6, the ts-level link (a sixth check; all six must hold).** Let `N` be T1's tree and `k` be T4's round.
+  - **T6a, the twin side.** Collect each `ts` of a commit record (`kind=1`) whose `ddl` contains `D<N>`, in the replay listings of the twin segments of round `k−1`. At least one must exist. For every twin-segment `Err` line of T1, let `t` be the `meta.t` of that segment's most recent `GATEDIAG replay start` line above it, which must exist. Every collected `ts` must be `≤` every such `t`.
+    - So the twin's image at the failing recovery already holds the drop, and the record is in the twin run paired with real round `k−1`.
+  - **T6b, the real side, on the real chain's own clock.** Real round `k−1` in the 10k JSON has `cover_err` true or `x33x` true; **or** both of these hold:
+    - there is a real-class (`Mw` or `Mp`) segment of round `k−1` with a `GATEDIAG replay start` line;
+    - the listing after the last such line, in the last such segment, has **no** commit record whose `ddl` contains `D<N>` at a `ts` at or below that round's JSON `frontier`.
+  - **What T6b is not.** `frontier` is never compared with T6a's `ts`, because the two chains' clocks differ (2599 r1: twin CreateTree `ts=5`, real `ts=1`). T6 does not establish that a media fault rather than a crash cut lost the record. T4 carries that condition, unchanged.
+  - **Still caught:** a drop at a `ts` above the failing recovery's `meta.t`; a drop listed only in a twin round other than `k−1`; a real round whose recovery replayed the drop at or below its frontier, so that `N` is in `real_dir` for some other reason; a real round with no listing and neither `cover_err` nor `x33x`.
+- **(d) The MP-A class cap on (c)(iii).**
+  - **The class.** The MP-A count of a file is the number of `rounds` entries with seed `class` `MP`, `served=true` and `mrb=true`, over the seeds of the comparison, including a `--range` slice. It is counted the same way at both ends.
+  - **The cap.** If the tip's count is **greater** than the Base's, (iii) exempts nothing in that comparison: every round that would be `MPA_PASS_FAIL` is a new failure, with reason `bullet1-mpa-cap`. An equal or smaller count leaves (iii) as X5-R52 wrote it.
+  - **Reporting.** The comparator prints `MPA_CLASS base <B> tip <T>` directly after `MPA_PASS_FAIL`, on every run.
+  - **What the cap does not do.** A round can join MP-A without a bullet-1 row only by failing at both ends. No exemption is in play there, so the cap does not stop on it. The line is printed, and F4's class table judges the class.
+  - **A one-for-one swap passes** (2 healed and 1 gained passes; so would 1 and 1). The cap is a bound on size, not a proof that no round is new. X5-R52 (c)(iii)'s per-round checks still apply to each row.
+- **(e) MONITOR.** A run whose `E4 SEEDS=… MONITOR=` total is above 0 is a new failure by itself, with row `(-1, "run", None, "bullet3-monitor")`, so the comparator's exit is 1. X5-R51 (b)4's voiding stays. The comparator does not read the reference's MONITOR: F2-F1's run has MONITOR 0, and a run hit is one this comparison must stop on either way.
+- **(f) Outside the rule.** X5-R52 (e) is extended by: a `TWIN_DDL_PENDING` row whose T6 fails; a `bullet1-mpa-cap` row; a `bullet3-monitor` row. **STOP:** write the rounds into the README, commit, and ESCALATE. Do not try a fix.
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
