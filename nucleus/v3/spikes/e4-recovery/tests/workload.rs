@@ -2863,7 +2863,11 @@ fn x5r52_twin_dirs_differ_compares_directory_keys() {
     // **G-PRED-LEN-ONLY** (the predicate compares key counts only)
     // reverts this.
     twin.dir.remove(&2).expect("key 2 is in the twin dir");
-    assert_eq!(real.dir.len(), twin.dir.len(), "the premise: equal key counts");
+    assert_eq!(
+        real.dir.len(),
+        twin.dir.len(),
+        "the premise: equal key counts"
+    );
     assert!(
         workload::twin_dirs_differ(&real, &twin),
         "equal-size dirs with different key sets are a difference (G-PRED-LEN-ONLY reverts this)"
