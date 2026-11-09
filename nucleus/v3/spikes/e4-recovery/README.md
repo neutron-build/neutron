@@ -4051,6 +4051,77 @@ Counts summed over the five blocks (0..1000; ×10 = per-10k):
 rung is **S1 = (1000, 500)** — X5-R50 is built (step 5). imgreuse
 would read 1,580 ≥ 1,500, and never decides.
 
+**Step 5 — X5-R50 built (commits 4f3fa251 and 81efe2ec).** The knob
+`r41p_share` (0 in BASE and FINAL), the streams `S_R41P` (16) and
+`S_R41PC` (17), block A (X5-R41's block shape exactly, paired with
+index `idx−1`, after the barrier and before block B, its arm beside
+block B's) and the per-index hold (`R41Wait`/`R41Done` carry their
+index; the harness state holds two armed slots with their own window
+and done flags). Inert at 0: the suite (275 tests) and every
+`x5_r41_*` pin are green at `r41p_share` 0, and X5-R37's 54 BASE
+literals hold (no BASE digest moves). The step 5b pins:
+`x5_r50_not_drawn_at_base`, `x5_r50_prior_window_round_is_q4i` (seed
+0 r0 at (1000,1000): crash `Before0@2`, so the last completed ledger
+row **is checkpoint `idx−1` = 1's window** and the recovery opens its
+meta — `imgsp`/`imgmg`/`imgreuse`/`imgreuse_pf` 4/8/3/3 exact,
+`q4i` holds; at (1000,0) the same round reads `q4i_raw` false with
+seed 0's BASE digest, and block B's ops are identical at both
+settings) and `x5_r50_ineligible_rounds_draw_nothing` (140 r0, hook
+`After5` with idx 1 — only the hook clause excludes it; 1 r0, idx 0 —
+only the idx clause; both draws hit at share 1000, both GC tasks
+identical to (1000,0)).
+
+**Step 6 — S1 = (1000, 500) (probe, not evidence).** Same protocol
+as S0: five 200-seed blocks, BASE then the candidate back to back,
+16 threads, `ulimit -v 25165824`. The CPU term read **+55.11%** on
+pass 1 — inside the rule's +55%..+65% band — so step 6b ran: two more
+interleaved passes, the term read as the median of the three.
+
+| pass | ΣCPU BASE | ΣCPU S1 | term |
+|---|---|---|---|
+| 1 | 1208.642 | 1874.765 | **+55.11%** |
+| 2 | 1180.856 | 1880.584 | +59.26% |
+| 3 | 1264.920 | 1884.028 | +48.94% |
+| **median** | | | **+55.11%** |
+
+Pass walls (BASE/S1): 16–21 s / 26–31 s; load 6.6→18.9 over the
+session. Counts summed over the five blocks (0..1000; ×10 = per-10k;
+identical in all three passes — the runs are deterministic):
+
+| quantity | BASE | ×10 | S1 | ×10 |
+|---|---|---|---|---|
+| rounds | 1537 | | 1547 | |
+| Q4 | 0 | 0 | **186** | **1,860** |
+| `q4i` (pre-freeze) | 3 | 30 | **216** | **2,160** |
+| `q4i_raw` | 3 | 30 | 216 | 2,160 |
+| imgreuse ≥ 1 (reported, never decides) | 8 | 80 | 258 | 2,580 |
+| Q5a | 25 | 250 | 25 | 250 |
+| Q7 | 19 | 190 | 19 | 190 |
+| Q18 | 99 | 990 | 527 | 5,270 |
+| failing rounds | 4 (MP 4) | | 2 (MP 2) | |
+
+The two S1 failing rounds are 178 r1 and 537 r0, both class MP with
+their expected texts (identical in all three passes; the BASE arms
+carry 4, all MP).
+
+**The rule at S1, verbatim.**
+- Q4 × 10 = 1,860 ≥ 1,500 — **met**.
+- Floors: Q5a 250 ≥ min(200, 250) = 200 — met. Q7 190 ≥ min(200,
+  190) = 190 — met, exactly at the floor (BASE's own × 10; not below
+  it). Q18 5,270 ≥ min(1,000, 990) = 990 — met.
+- CPU term: median of three passes = **+55.11%** ≤ +60% — **met**
+  (every pass reported above).
+- **The image arm: `q4i` × 10 = 2,160 ≥ 1,500 — MET.**
+
+**S1 MEETS the rule.** No S2 is called for (the ladder runs S2 only
+if S1 misses). **The chosen setting is S1 = (`r41_share` 1000,
+`r41p_share` 500)**, handed off for F4's REFRESH; `Tuning::FINAL`
+stays BASE at this card's tip (probe settings are never committed).
+The estimate in the Goal (≈ 225 per 1,000 seeds at 500) read 216
+measured; the CPU estimate (+8–10% over F3's block-B-only cost)
+read +6.2% (55.11% vs 48.9% at S0 — the same BASE/arm pairs,
+measured in one session each).
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
