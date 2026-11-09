@@ -1153,6 +1153,42 @@ def self_test():
         str(r),
     )
 
+    # The cap's three unpinned filters (verdict §2: served-only,
+    # mrb-only and Base MW rounds do not count): the class count needs
+    # class MP and served=true AND mrb=true, at both ends.
+    mrb_ref = dict(mpa_ref)
+    mrb_ref[3] = seed_rec(3, "MP", [round_rec(served=True, mrb=False)])
+    mrb_run = dict(mpa_run)
+    mrb_run[3] = seed_rec(3, "MP", [round_rec(served=True, mrb=False)])
+    r = rows_of(mrb_ref, mrb_run)
+    check(
+        "mpa-cap-counts-mrb-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    served_ref = dict(mpa_ref)
+    served_ref[3] = seed_rec(3, "MP", [round_rec(served=False, mrb=True)])
+    served_run = dict(mpa_run)
+    served_run[3] = seed_rec(3, "MP", [round_rec(served=False, mrb=True)])
+    r = rows_of(served_ref, served_run)
+    check(
+        "mpa-cap-counts-served-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    basemw_ref = dict(mpa_ref)
+    basemw_ref[3] = seed_rec(3, "MW", [round_rec(served=True, mrb=True)])
+    basemw_run = dict(mpa_run)
+    basemw_run[3] = seed_rec(3, "MW", [round_rec()])
+    r = rows_of(basemw_ref, basemw_run)
+    check(
+        "mpa-cap-base-mp-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
     # format_rows prints MPA_CLASS directly after MPA_PASS_FAIL.
     out = format_rows(rows_of(mpa_ref, mpa_run)).splitlines()
     check(
