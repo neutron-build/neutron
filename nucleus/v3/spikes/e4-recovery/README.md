@@ -4317,6 +4317,50 @@ the re-run below is the record).
   the truth. The other five STEP lines (`test`, `clippy`, `fmt`,
   `wasm32`, `core-paths-selftest`) all `EXIT=0`.
 
+## Card X-5c-PINS-1's record (the six pre-final pins: RUPF's window
+## reset, R50's selection, the joint supply's freshness, the re-seed
+## predicate's two halves, the comparator's six survivors and its
+## repeated `.out`, R47's header window, and the eviction arm)
+
+Base: `card/v3-DEP-RUSQLITE-1` (tip `2e8d1b13`, the chain head; the
+branch carries the whole X-5c-F4-F1-F1 stack through the F3-F1
+re-verdict). Test-only: no code behaviour change; the one `src/` addition
+is item 2's supply-freshness diagnostic (the `twin_paired` manner).
+Scratch exports and mutant copies live under `$CARGO_TARGET_DIR/
+x5pins-scratch/` (`~/.cache/nv3-review/` is read-only in this
+container — the accepted judgment call of the -F3-F2-F1-F2 card,
+carried since). Every mutant ran on its own export with its own
+`CARGO_TARGET_DIR` (the `af5c8d63` §5 lesson).
+
+**Step 1 — the two F3-F1 pins (item 1).**
+
+- `x5_r42_second_window_reuse_pf_starts_at_zero` (a sibling beside
+  `x5_r42_reuse_counts_window_frees_before_freeze`, seed 9 over
+  `r49_setup_durable_home`): two checkpoint windows. Window 1 repeats
+  the case-2 shape (free at `After0` before the freeze, reuse there)
+  and reads `(1, 1)` at its `After5`; window 2 reads both counters at
+  its own `After0` **before any free or reuse** — `(0, 0)`, so the
+  pre-freeze half resets with the whole-window half — then repeats the
+  same free-and-reuse and reads `(1, 1)`. No `src/` change was needed:
+  `reuse_counters` already reads `ckpt_reuse_pf` at the window
+  boundary.
+- The uniform literal in `x5_r50_ineligible_rounds_draw_nothing`:
+  **seed 13 round 0** (`seed/10` odd; hook `Before0`, pre-step-5;
+  `target_ckpt` 1; not a drop round; `r41p_pick` hits at share 1000),
+  found by probing `Knobs::derive` over the uniform seeds on the
+  scratch export (candidates 11–13, 16, 17, 19, 31, …; 13 chosen). At
+  (1000, 1000) no `R41Arm/R41Wait/R41Done` for index 0 exists and the
+  GC task is bit-for-bit the (1000, 0) form's.
+  `x5_r41_uniform_round_not_selected` is untouched and still green.
+
+Mutants (each on its own scratch export, `git archive HEAD nucleus`
+copies, so the worktree never held them):
+
+| mutant | rc | the failing assertion |
+|---|---|---|
+| **GX-RUPF-NORESET** (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | 101 | `x5_r42_second_window_reuse_pf_starts_at_zero`: window 2 starts `Some((0, 1))` ≠ `Some((0, 0))` |
+| **GX-R50-NOSELECT** (`r41p` loses `r41 &&`) | 101 | `x5_r50_ineligible_rounds_draw_nothing`: seed 13 carries block A's ops for index 0 |
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
