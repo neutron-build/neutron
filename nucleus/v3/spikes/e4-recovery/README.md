@@ -3614,6 +3614,28 @@ refreshed**; the 10k run, the verify and the compare — above; and
 `bash scripts/gate.sh` — run last, at the tip this record leaves; its
 reading is the gate note beneath, added after the run.)
 
+**The gate note (`bash scripts/gate.sh`, at `22ad7841`, this run):
+`STEP test EXIT=0`** (the whole workspace, e4-recovery's 266 among
+them), **`STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`,
+`STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`,
+`STEP enforcement-tests EXIT=1` with exactly one FAIL row —
+`runner e2e: K: SIGTERM kills opencode and closes the ledger range` —
+so the last line reads `GATE EXIT=1`.** This is the known, ruled,
+environmental row, not a finding of this card: the container matches
+the ruling's premise (`/proc/1/comm` = `opencode`, re-checked this run
+— this container's PID 1 never `wait()`s, so the killed attempt's
+orphaned child stays a zombie and `dead()`'s `killpg` probe succeeds),
+verdict `verdicts/X-5c-F4-F1-F1.md`'s K ruling says "`kill_child` is
+correct. `dead()` asks the wrong question" and "The runner's
+Acceptance is the truth. Do not chase it, and do not run a subreaper
+to make it pass", and the two previous cards on this chain recorded
+the identical reading in this same container shape (their verdicts'
+fresh-gate containers read the row ok, `GATE EXIT=0` — the row tracks
+the container's PID 1, not the tree). Nothing this card touched (the
+twin re-seed block, four tests, two committed patches, the README and
+the tsv) is exercised by that row, and the fix lives in `scripts/`/
+`tools/`, outside this card's Touch only.
+
 judgment calls (this step): the campaign of the first 10k attempt —
 prov `commit=7a9d72e2…`, `exit=0`, killed only in its verify — is
 reused, per the restart rule's "reuses the scratch builds and outputs";
