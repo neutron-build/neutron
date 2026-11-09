@@ -1,26 +1,26 @@
 Card: X-5c-F4-F1-F1-F3-F2-F1-F1
 Class: test
 Card-gate: P
-Verdict: ESCALATE
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: nv3-gate-X-5c-F4-F1-F1-F3-F2-F1-F1 (Claude Code session a8aa6954-8b54-40d6-bfd8-f20560378018)
-Date: 2026-11-07
-Gate-exit: GATE EXIT=1
+Gate-session: Claude Code session 568023ba-72c8-4c86-8f90-f37051c422b0 (stacked-tip re-gate); content review by nv3-gate-X-5c-F4-F1-F1-F3-F2-F1-F1 (Claude Code session a8aa6954-8b54-40d6-bfd8-f20560378018)
+Date: 2026-11-08
+Gate-exit: GATE EXIT=0
 Commit: ad4fa9991e8e3ddfea88909e3180f87c69d33538
 Mutants: M-CMP-NO-PF -> self-test (9 mpa/pass-fail cases) + real 10k (MPA_PASS_FAIL 0, 7078 r0 absent, NEW_FAILING 0), M-CMP-MPA-NOJUDGE -> mpa-skx-smx-false + mpa-pass-na-false, M-CMP-META-ANYSLOT -> meta-only-some-finding, M-CMP-TWIN-NODIR -> twin-t2-both-dirs-lack-N, M-CMP-TWIN-ANYCLASS -> twin-mp-seed-prefilter-fails, G-META-NO-Q13 -> meta-only-referenced-slot, G-EXIT-NOBAD -> UNCAUGHT, G-T4-NO-SHORT -> UNCAUGHT, G-TWIN-PREFILTER-ALLJ -> UNCAUGHT, G-T3-ANYCLASS -> UNCAUGHT
 Followups: X-5c-F4-F1-F1-F2-F2, X-5c-F4-F1-F1-F3-F2-F1-F1-F1, X-5c-F4-F1-F1-F3-F2-F1-F1-F2
 
 ## Verdict in one paragraph
 
-ESCALATE, **on the gate run alone.** The card's content passes; on content I would write MERGE-WITH-FOLLOWUPS, and no rework is needed.
+MERGE-WITH-FOLLOWUPS. The card's content passes and no rework is needed. The fresh gate reads `GATE EXIT=0` on the stacked tip 60f919d7 (see "Stacked-tip gate run"). This replaces the ESCALATE at 3cef0055, which was on the gate run alone.
 
-The fresh gate reads `GATE EXIT=1` twice. The only red is `ack_prefix_two_batches_in_flight` (`STEP test EXIT=101`). That failure is **pre-existing and not caused by this card**:
+At ad4fa999 itself the fresh gate read `GATE EXIT=1` twice. The only red was `ack_prefix_two_batches_in_flight` (`STEP test EXIT=101`). That failure is **pre-existing and not caused by this card**:
 - it fails identically at eb9c4328, whose `src/` and `tests/` are byte-identical to ad4fa999;
 - it has a 30 s wall-clock deadline;
 - on this machine, at idle, it needs about **104 s** in debug. So it now fails deterministically (3/3 when run alone), and it is not a load flake.
 
-`merge-card` accepts only `GATE EXIT=0`, so the owner must decide. Either land X-5c-F4-F1-F1-F2-F2 (the deadline card) and then re-run only the fresh gate on this tip, or rule this row out as was done for `runner e2e: K`. The content findings below stand either way.
+`merge-card` accepts only `GATE EXIT=0`, so that verdict escalated for the owner to decide. The route taken: X-5c-F4-F1-F1-F2-F2 (the deadline card) fixed the test, stacked directly on this card, and only the fresh gate was re-run on that tip. The content findings below stand.
 
 **Content.** The re-read of F2-F1's 10k under X5-R52 holds:
 - I re-derived it independently, from the raw JSON, with my own classifier.
@@ -33,7 +33,23 @@ That gap does not reach this card's data. In both pending rows, the round has ex
 - (iii) has no "class count does not grow" cap;
 - (i) uses T3/T4 in place of the ts-level link.
 
-## Gate run
+## Stacked-tip gate run
+
+Added 2026-11-08. The content was not re-reviewed and no mutants were re-run; every finding below is from the review at 3cef0055.
+
+- **Tip.** `60f919d73295bf657685471682806a30826eb8d2`, on `card/v3-X-5c-F4-F1-F1-F2-F2`. It contains this card's commit ad4fa999.
+- **What differs from ad4fa999.** `git diff ad4fa999 60f919d7 --stat` touches only `nucleus/v3/spikes/e4-recovery/tests/store.rs` and two verdict files (`X-5c-F4-F1-F1-F2-F2.md` and this one). The `store.rs` change (03eb5de1) is the `ack_prefix_two_batches_in_flight` driver's 1 ms poll backoff and its 30 s to 300 s deadlines.
+- **Scaffold.** `acc81c776183bd9853f7a69e2cec4262d300d89f`, extracted through the `--no-local` shallow clone. No `EXTRACT FAILED` line.
+- **Result:**
+  - `fresh-gate: commit 60f919d73295bf657685471682806a30826eb8d2`
+  - `fresh-gate: base acc81c776183bd9853f7a69e2cec4262d300d89f`
+  - `fresh-gate: checks passed (4519 files hashed in 1.52 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - test, clippy, fmt, deny, wasm32, core-paths-selftest and enforcement-tests all EXIT=0. `runner e2e: K` is ok.
+  - Last line: `GATE EXIT=0`.
+- **Attempts.** This was the only run to finish, and it passed the first time it completed. Two earlier starts were killed by host reboots before any step reported, and a third never started because the reboot had removed the extracted script. None of them produced a gate result. No flake re-run was needed.
+
+## Gate run at ad4fa999 (superseded by the stacked-tip run above)
 
 - **Scaffold.** `acc81c776183bd9853f7a69e2cec4262d300d89f`, extracted through the `--no-local` shallow clone. No `EXTRACT FAILED` line.
 - **Run 1** (concurrent with my e4-campaign build and runs):
@@ -168,7 +184,7 @@ The card's five are all caught, and M-CMP-NO-PF over the real 10k drops 7078 r0 
 
 ## Follow-ups
 
-- **X-5c-F4-F1-F1-F2-F2 (existing; raise its priority).** `ack_prefix_two_batches_in_flight` runs about 104 s in debug against a 30 s deadline, even on an idle host. It blocks `GATE EXIT=0` for this card and for every card on the chain until it is fixed or ruled.
+- **X-5c-F4-F1-F1-F2-F2 (existing; raise its priority).** `ack_prefix_two_batches_in_flight` runs about 104 s in debug against a 30 s deadline, even on an idle host. It blocks `GATE EXIT=0` for this card and for every card on the chain until it is fixed or ruled. *Status 2026-11-08: fixed at 03eb5de1, S-gate MERGE at 60f919d7, and this card is now stacked under it.*
 
 - **X-5c-F4-F1-F1-F3-F2-F1-F1-F1 (test/tools, before any reuse of `check-twin`).**
   - In `check-twin`, T1 must take the class-C `Err` line of the twin's own run: the class-C run after round `i`'s `X5R52 round-start` line, its last attempt. It must refuse (NOT-EXPLAINED) when another class-C `Err` line for round `i` differs.
