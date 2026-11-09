@@ -1,6 +1,14 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 — the X5-R53 verdict's
+Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F2 — the twin directory re-seed
+(the -F2 the F2-F1 verdict ordered): the twin chain re-seeds from the
+real round's own start whenever the two chains' `dir` key sets differ at
+round start, under the P ruling below, so the C-XX "recovery-Err default"
+twin family is root-caused and fixed (2859 t1 and 609 t1 pinned healing;
+X5-R52 (g): (c)(i) is void here, the comparator runs with
+`--no-twin-exemption --max-twin-failing 0`, and any failing twin entry is
+a STOP). Its 10k replaces F2-F1's as the BASE baseline of record.**
+Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 — the X5-R53 verdict's
 follow-up -F1: the comparator's two checking holes closed — `read_monitor`
 requires an `E4 SEEDS … MONITOR=` line in **every** run-out file, and
 `compare` refuses a `--run`/`--run-out` count mismatch (both cannot-check
@@ -3299,6 +3307,65 @@ single ruled `runner e2e: K` row, recorded in full in the acceptance
 note above — environmental, pre-existing on this chain in this
 container shape, and outside this card's scope.
 
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F2's record (the twin directory re-seed;
+## the C-XX recovery-Err twin family root-caused and fixed)
+
+Verdict `X-5c-F4-F1-F1-F3-F2-F1.md` (ESCALATE), finding 1, root-caused the
+C-XX "recovery-Err default" twin family. At F2-F1's 10k it has seven
+failing twin entries: 609 t1, 849 t1, 2599 t2, 2859 t1, 3449 t1, 5049 t1
+and 7179 t1. The mechanism has four steps: (1) a real MW round's WAL fault
+loses a DropTree, so the real chain still holds the tree (in 2859, real r0
+recovers to frontier 1 and loses `ts=3 DropTree 4`); (2) the twin chain is
+faultless, so it keeps the DropTree, and its directory no longer holds the
+tree; (3) the next round's script is built from the **real** model
+(`build_round(.., &ch.model, ..)`), so it writes into that tree; (4) the
+twin runs the script on its own chain — its recovery replays a record into
+a tree its image has correctly dropped, and fails with
+`Corrupt("tree N missing in directory")`. So the twin no longer runs "the
+same script, crash and F-CRASH resolutions, faultless … from the same
+base" (Work 2.5) — a harness pairing defect; the store is not involved.
+**The fix:** at round start, re-seed the twin chain from the real round's
+start whenever the two chains' directories differ — the same re-seed the
+harness already makes when the twin chain is broken. This card lands
+before F4's final run and **its 10k replaces F2-F1's as the BASE baseline
+of record**; F3-F1 (the generator card) bases on it.
+
+**Under X5-R52 (a) and (g):** every comparison here is judged by X5-R51,
+re-issued for this card, read with X5-R52; X5-R52 (c)(i) is **void**
+here, because the re-seed makes T2 impossible — the comparator runs with
+`--no-twin-exemption` (and `--max-twin-failing 0`); **any failing twin
+entry is a STOP.**
+
+### The directory re-seed (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+- **(a) The predicate.** Add `pub fn twin_dirs_differ(real: &StoreInner, twin: &StoreInner) -> bool` in `src/workload.rs`. It returns true iff the two `dir` key sets differ.
+  - The `DirEntry` values are not compared. Roots and pointers differ between any two chains.
+  - This is the set that `recover`'s replay checks when it fails with `tree N missing in directory`.
+- **(b) The call.** In `run_seed_with`, on every MP/MW round:
+  - The check runs after the existing `twin_chain.is_none()` re-seed and before `twin_chain.take()`.
+  - If the twin chain is `Some` and `twin_dirs_differ(&ch.st, &twin.st)`, replace it with a clone of the real round's start: `disk`, `st`, `model` (`harness::clone_model`) and `cut`. That is the clone the broken-chain re-seed already makes.
+- **(c) Why the directory and not the model.**
+  - The defect is a script op on a tree that the twin's directory lacks.
+  - The two models also differ whenever a real round loses ordinary commits, which is common in MW. Re-seeding on any model difference would re-pair most MW rounds and move digests far past the defect.
+  - The directory is the narrow DDL predicate.
+- **(d) Nothing else changes.**
+  - The twin still runs class C, faultless, at the same crash, F-CRASH and nested resolutions.
+  - X5-R16's NO-TWIN and NEVER-FIRED paths, X5-R21 (c)'s pairing re-run (`tch_pair`, `tch_retry`), `twin_chain_after_repair`, the twin supply and its judging are unchanged.
+  - The store, the oracle, the model, the sim, K, R, the generators, `Tuning`, every quota, `verify`, X5-R49's code, the record fields and the JSON schema are unchanged.
+  - No record field or digest input is added.
+- **(e) Expected effect (not a target).**
+  - A seed's digest moves **only** if (b) fires in at least one of its rounds. A seed in which it never fires runs bit for bit as at the Base.
+  - The seven failing twin entries above pass.
+  - Real rounds of re-seeded seeds may move, because the twin supply and pairing re-runs feed them. X5-R51 and X5-R52 judge that.
+
+**X5-R52 (g)'s note, verbatim as it governs here:** "At any commit that
+carries -F2's re-seed, the twin chain is re-seeded whenever the two
+directories differ at round start, so T2 cannot hold. Comparisons at such
+a commit run the comparator with `--no-twin-exemption`, and (i) exempts
+nothing there. After -F2 lands, a twin failure of this family is a
+recurrence of a class that a landed card claims to have fixed. Under E4's
+owner rule, F4 counts it as new."
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
