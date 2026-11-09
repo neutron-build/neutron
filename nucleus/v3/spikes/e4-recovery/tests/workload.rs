@@ -2439,7 +2439,9 @@ fn x5_r50_prior_window_round_is_q4i() {
 /// **identical** to the same round at (1000, 0).
 /// **M-R50-ANYHOOK** (eligibility drops the hook clause) selects 140
 /// and **M-R50-IDX0** (eligibility drops `idx ≥ 1`) selects 1 — each
-/// fails this pin.
+/// fails this pin. A third literal (X-5c-PINS-1 item 1) is the
+/// uniform-crash seed **13 round 0** (below), which kills
+/// **GX-R50-NOSELECT** (`r41p` losing `r41 &&`).
 #[test]
 fn x5_r50_ineligible_rounds_draw_nothing() {
     use e4_recovery::model::Model;
@@ -2511,6 +2513,79 @@ fn x5_r50_ineligible_rounds_draw_nothing() {
     );
     let k1 = Knobs::derive(1, 0, &tpp);
     assert_eq!(k1.target_ckpt, 0, "seed 1: only the idx clause excludes it");
+    // **X-5c-PINS-1 item 1 (verdict X-5c-F4-F1-F1-F3-F1 §5's follow-up,
+    // GX-R50-NOSELECT): a uniform-crash round draws nothing and gains no
+    // block A, however its draw reads.** The literal seed is **13 round
+    // 0**: `seed/10` odd (5.5 gives it a uniform crash, so the X5-R41
+    // selection's targeted-crash clause is false), not a drop round,
+    // its hook `Before0` is one of the seven pre-step-5 hooks, and
+    // `target_ckpt` is 1 — every clause of the eligibility except the
+    // selection holds, and at share 1000 the `S_R41P` draw hits. Only
+    // the `r41` conjunction keeps the round out, so nothing is drawn
+    // (the GC task is bit-for-bit the share-0 form's), no
+    // `R41Arm { idx: idx−1 }` appears and block A's content never
+    // enters the script. **GX-R50-NOSELECT** (`r41p` loses `r41 &&`)
+    // selects this round — the draw already hit — and block A appears,
+    // failing this pin.
+    {
+        let seed = 13u64;
+        let knobs = Knobs::derive(seed, 0, &tpp);
+        assert_eq!(seed / 10 % 2, 1, "seed {seed} is a uniform-crash seed");
+        assert!(
+            !knobs.drop_tree,
+            "round 0 of seed {seed} is not a drop round"
+        );
+        assert_eq!(
+            CKPT_HOOKS[((seed / 20) % 10) as usize],
+            CkptHook::Before0,
+            "seed {seed}: a pre-step-5 hook (the hook clause holds)"
+        );
+        assert_eq!(
+            knobs.target_ckpt, 1,
+            "seed {seed}: the idx clause holds (idx−1 = 0 exists)"
+        );
+        assert_eq!(
+            workload::r41p_pick(seed, 0, &tpp),
+            Some(true),
+            "seed {seed}'s S_R41P draw hits at share 1000 — only the r41 clause keeps it out"
+        );
+        let (s50, _, _) = build_round(
+            seed,
+            0,
+            &t50,
+            &Knobs::derive(seed, 0, &t50),
+            &Model::new(),
+            0,
+        );
+        let (spp, _, _) = build_round(
+            seed,
+            0,
+            &tpp,
+            &Knobs::derive(seed, 0, &tpp),
+            &Model::new(),
+            0,
+        );
+        let (g50, gpp) = (r50_gc(&s50), r50_gc(&spp));
+        // No block A op for index idx−1 = 0 in either setting.
+        for ops in [&g50, &gpp] {
+            assert!(
+                !ops.iter().any(|o| matches!(
+                    o,
+                    ScriptOp::R41Arm { idx: 0 }
+                        | ScriptOp::R41Wait { idx: 0 }
+                        | ScriptOp::R41Done { idx: 0 }
+                )),
+                "seed {seed}: an unselected uniform round carries no block A op for index 0 \
+                 (GX-R50-NOSELECT reverts this)"
+            );
+        }
+        assert_eq!(
+            format!("{g50:?}"),
+            format!("{gpp:?}"),
+            "seed {seed}: nothing is drawn and no block A content enters — the GC task is \
+             identical at (1000,0) and (1000,1000)"
+        );
+    }
 }
 
 /// **X5-R43 (card X-5c-F4-F1-F1-F3-F1 step 7b): the Slot fault newly

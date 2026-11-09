@@ -6919,6 +6919,100 @@ fn x5_r42_reuse_counts_window_frees_before_freeze() {
     }
 }
 
+/// **X-5c-PINS-1 item 1 (verdict X-5c-F4-F1-F1-F3-F1 §5's follow-up,
+/// GX-RUPF-NORESET): the pre-freeze reuse counter starts at 0 in the
+/// second window.** Two checkpoint windows over
+/// `r49_setup_durable_home`'s one-page tree: the first performs a
+/// pre-freeze window free and reuse (the case-2 shape — both counters
+/// read 1 at its `After5`), then the second window reads both counters
+/// at its own `After0`, **before any of its frees or reuses**, and
+/// again after repeating the same pre-freeze free-and-reuse there. The
+/// second window's start must read `(0, 0)` and its end `(1, 1)`:
+/// `ckpt:begin` resets `ckpt_reuse_pf` beside `ckpt_reuse` (card
+/// X-5c-F4-F1-F1-F3-F1 step 2a), so the pre-freeze half never carries
+/// one window's count into the next — carrying it would inflate `q4i`
+/// across windows. **GX-RUPF-NORESET** (`ckpt.rs`: drop `st.
+/// ckpt_reuse_pf = 0`) leaves the first window's pre-freeze count in
+/// place, so the second window starts at `(0, 1)` and ends at `(1, 2)`
+/// — each fails this pin.
+#[test]
+fn x5_r42_second_window_reuse_pf_starts_at_zero() {
+    let seed = 9u64;
+    let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Window 1 (checkpoint 2): the case-2 shape — freed inside the
+    // window before the freeze, reused there — both counters move.
+    let mut w1_imaged_at_free = false;
+    let mut w1_counts = None;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After0 {
+            prims::free_lpid(&cx, lpid).expect("free inside window 1, before the freeze");
+            w1_imaged_at_free = in_img_map(&sched, lpid);
+            alloc_until(&cx, lpid);
+        }
+        if hook == CkptHook::After5 {
+            w1_counts = Some(reuse_counters(&sched));
+        }
+        Ok(())
+    });
+    assert!(
+        w1_imaged_at_free,
+        "seed {seed}: window 1's free must enter this window's map.img (the premise)"
+    );
+    assert_eq!(
+        w1_counts,
+        Some((1, 1)),
+        "seed {seed}: window 1's pre-freeze free-and-reuse counts in both counters (the \
+         premise that leaves a non-zero ckpt_reuse_pf behind)"
+    );
+    // Window 2 (checkpoint 3): read both counters at its After0 before
+    // any free or reuse — the second window's start — then repeat the
+    // pre-freeze free-and-reuse and read them at its After5.
+    let mut w2_start = None;
+    let mut w2_imaged_at_free = false;
+    let mut w2_frozen_at_reuse = false;
+    let mut w2_counts = None;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After0 {
+            w2_start = Some(reuse_counters(&sched));
+            prims::free_lpid(&cx, lpid).expect("free inside window 2, before the freeze");
+            w2_imaged_at_free = in_img_map(&sched, lpid);
+            w2_frozen_at_reuse = {
+                let g = sched.lock();
+                g.st.image_frozen.is_none()
+            };
+            alloc_until(&cx, lpid);
+        }
+        if hook == CkptHook::After5 {
+            w2_counts = Some(reuse_counters(&sched));
+        }
+        Ok(())
+    });
+    assert_eq!(
+        w2_start,
+        Some((0, 0)),
+        "seed {seed}: the second window's counters must start at (0, 0) — the pre-freeze \
+         half resets with the whole-window half (GX-RUPF-NORESET reverts this)"
+    );
+    assert!(
+        w2_imaged_at_free,
+        "seed {seed}: window 2's free must enter this window's map.img (the premise)"
+    );
+    assert!(
+        w2_frozen_at_reuse,
+        "seed {seed}: window 2's reuse is before step 2's freeze (the premise)"
+    );
+    assert_eq!(
+        w2_counts,
+        Some((1, 1)),
+        "seed {seed}: window 2's own pre-freeze free-and-reuse counts once in each counter, \
+         not once beside window 1's carried count (GX-RUPF-NORESET reverts this)"
+    );
+}
+
 /// **X-5c-F4-F1-F1-CXX Work 2: `drop_entry_gone_before_root_free`.**
 /// I-LINK-ATOMIC's cut side (§6.8 as amended by S-1-F7): a directory
 /// entry must never name an unmapped root — not even between two
