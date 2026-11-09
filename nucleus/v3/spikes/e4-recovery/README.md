@@ -4007,6 +4007,50 @@ the line and re-measures (step 7 below).
 lines; a sweep for other `[a-zA-Z,)]///` joins over `src/` and
 `tests/` finds none.
 
+**Step 4 — S0 (probe, not evidence).** (`r41_share` 1000,
+`r41p_share` 0; scratch builds of this tip's HEAD, BASE as committed
+and the candidate with only `Tuning::FINAL.r41_share = 1000`, never
+committed.) Five 200-seed runs over 0..1000 at 16 threads, each block
+BASE then the candidate back to back, under `ulimit -v 25165824`,
+bash `time` (user+sys), load recorded at each start:
+
+| block | BASE CPU (u+s) | BASE wall | load | S0 CPU (u+s) | S0 wall | load |
+|---|---|---|---|---|---|---|
+| 0 (0..200) | 182.724 | 14.2 | 2.20 | 316.831 | 24.7 | 5.02 |
+| 1 (200..400) | 236.324 | 18.4 | 9.96 | 335.997 | 25.4 | 12.41 |
+| 2 (400..600) | 231.823 | 18.7 | 14.63 | 335.584 | 26.5 | 14.92 |
+| 3 (600..800) | 278.859 | 21.0 | 15.21 | 400.409 | 29.4 | 15.95 |
+| 4 (800..1000) | 256.796 | 19.4 | 17.07 | 377.725 | 28.9 | 17.38 |
+| **Σ** | **1186.526** | | | **1766.546** | | |
+
+Counts summed over the five blocks (0..1000; ×10 = per-10k):
+
+| quantity | BASE | ×10 | S0 | ×10 |
+|---|---|---|---|---|
+| rounds | 1537 | | 1544 | |
+| Q4 | 0 | 0 | **177** | **1,770** |
+| `q4i` (pre-freeze) | 3 | 30 | **135** | **1,350** |
+| `q4i_raw` | 3 | 30 | 135 | 1,350 |
+| imgreuse ≥ 1 (reported, never decides) | 8 | 80 | 158 | 1,580 |
+| Q5a | 25 | 250 | 26 | 260 |
+| Q7 | 19 | 190 | 19 | 190 |
+| Q18 | 99 | 990 | 500 | 5,000 |
+| failing rounds (C/MP/MW) | 0/4/0 | | 0/2/0 | |
+
+**The rule at S0, verbatim.**
+- Q4 × 10 = 1,770 ≥ 1,500 — **met**.
+- Floors: Q5a 260 ≥ min(200, 250) = 200 — met. Q7 190 ≥ min(200,
+  190) = 190 — met, exactly at the floor (BASE's own count × 10; not
+  below it). Q18 5,000 ≥ min(1,000, 990) = 990 — met.
+- CPU term = ΣCPU(S0)/ΣCPU(BASE) − 1 = 1766.546/1186.526 − 1 =
+  **+48.9%** ≤ +60% — met (not between +55% and +65%: no extra
+  passes; step 4b not called for).
+- **The image arm: `q4i` × 10 = 1,350 < 1,500 — MISSED.**
+
+**S0 misses on the image arm only.** Per X5-R50's ladder the next
+rung is **S1 = (1000, 500)** — X5-R50 is built (step 5). imgreuse
+would read 1,580 ≥ 1,500, and never decides.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
