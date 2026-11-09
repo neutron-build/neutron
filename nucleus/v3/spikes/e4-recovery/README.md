@@ -3652,7 +3652,10 @@ under `$CARGO_TARGET_DIR` (the card's `~/.cache/nv3-review/<card>/` is
 read-only in this container — the base card's accepted judgment call,
 carried by every card since).
 
-ESCALATE: none.
+ESCALATE: none in the first pass; the retry round added one item — the
+runner-rule conflict with the two mutant Acceptance lines, recorded in
+full with its reproduction and its verified fix in the section below
+(the "### ESCALATE (the retry round…)" heading).
 
 anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
 Read-only file system` line from the host's git maintenance on every
@@ -3664,7 +3667,85 @@ worker prompt are) — carried from the two previous cards' records; its
 content as this card quotes it is carried by the README's verbatim rule
 blocks; (c) 9059's move surfaced only in the 10k compare (outside step
 2's mandated 0..1000 attribution window) — attributed singly in the diag
-export the same hour, recorded above, not hidden.
+export the same hour, recorded above, not hidden; (d) this container's
+gate reading (the gate note above) — the runner's own container read
+the same tree `GATE EXIT=0` this round (see the ESCALATE section).
+
+### ESCALATE (the retry round, 2026-11-09): the runner's no-tests-ran rule cannot accept the two mutant Acceptance lines as written
+
+The runner's retry round re-ran every Acceptance line in its own
+container: all passed but the two mutant lines, each of which it failed
+with `no tests ran: a cargo test acceptance command must run at least
+one test` — **after the line's own grep chain had succeeded** (the note
+only fires at rc=0, i.e. only after `grep -qx 'rc=101'` and the
+failures-block greps proved the mutant caught). The rule
+(`tools/run_card.py`, in place since S-0 `1b1b6bd3`, 2026-10-17):
+
+```python
+if rc == 0 and "cargo test" in c and sum(int(n) for n in
+    re.findall(r"test result: ok\. (\d+) passed", out)) == 0:
+    rc, out = 1, out + "\nno tests ran: ..."
+```
+
+`out` for these lines is exactly the `tail -n 40 $D/test.out` output,
+and the run the card mandates is one `cargo test --test workload
+x5r52_twin` under the applied mutant: one exact-named target (`--test
+work` is refused — "no test target named `work` in package"), one
+libtest binary, and a binary with any failure prints exactly one
+summary — `test result: FAILED. 2 passed; 2 failed` (the no-dir-reseed
+line) / `FAILED. 3 passed; 1 failed` (the reseed-always line) — never
+`test result: ok. N passed`. The two requirements are therefore
+mutually exclusive inside one invocation: the grep chain demands the
+failing run, the checker demands a green summary in the same captured
+output. No change under this card's Touch only can satisfy both
+honestly; manufacturing a regex-matching line (a `cargo:warning`, a
+deprecated-note, an eprintln shaped like a summary) would be forging
+test output, and the card text and the runner are both outside the
+card's Touch only. This is a conflict between the card's Acceptance
+lines and the runner's rule, reported unfixed per the hard rules.
+
+Minimal deterministic reproduction (this tip; and the runner's own two
+failure notes this round are the same repro in its container):
+
+```
+D=${CARGO_TARGET_DIR:?}/esc-repro && mkdir -p $D && \
+git -C ../.. archive --format=tar HEAD nucleus | tar -x -C $D && \
+cd $D/nucleus/v3 && git apply spikes/e4-recovery/tools/m-twin-no-dir-reseed.patch && \
+CARGO_TARGET_DIR=$D/t cargo test -q --release -p e4-recovery --test workload x5r52_twin > $D/test.out 2>&1; \
+echo rc=$? >> $D/test.out; tail -n 40 $D/test.out > $D/cmd_out.txt
+grep -qx 'rc=101' $D/test.out && sed -n '/^failures:$/,$p' $D/test.out \
+  | grep -q 'x5r52_twin_reseed_heals_2859_r1' && sed -n '/^failures:$/,$p' $D/test.out \
+  | grep -q 'x5r52_twin_reseed_heals_609_r1'        # exits 0 — the mutant IS caught
+python3 -c "import re; out=open('$D/cmd_out.txt').read(); \
+print(re.findall(r'test result: \w+.*', out), \
+sum(int(n) for n in re.findall(r'test result: ok\. (\d+) passed', out)))"
+# ['test result: FAILED. 2 passed; 2 failed; …'] 0   ← ok-sum 0: the note fires on a proven-catch run
+```
+
+The fix is P's to apply on either side (both halves measured in the
+scratch exports at this tip):
+- **card side** — append one green filtered run to each mutant line,
+  after the grep chain: `&& cargo test -q --release -p e4-recovery
+  --test workload x5r52_twin_dirs_differ`. The predicate pin passes
+  under both mutants (measured: `test result: ok. 1 passed`, exit 0,
+  under m-twin-no-dir-reseed and m-twin-reseed-always alike), so the
+  line keeps rc=0, keeps the whole mutant proof in `test.out`, and
+  prints a genuine green summary into the captured output.
+- **runner side** — exempt mutant-verification lines: the rule could
+  accept a summary of either kind (`test result: (ok|FAILED)`), or skip
+  commands carrying `git apply`.
+
+Nothing else in this round's acceptance moved: the runner's fed-back
+failures list names only these two lines, so its campaign, verify,
+compare and gate lines all passed in its container (its gate read
+`GATE EXIT=0` there — the fresh-container reading of the environmental
+K row, exactly as the two prior cards' verdicts predicted; this
+container still reads the one ruled FAIL row, gate note above). The
+mutant evidence itself stands three times over: the runner's own runs
+(its note fires only after each grep chain succeeded), this round's
+re-runs here (`line3_grep_chain_exit=0`, `line4_grep_chain_exit=0`,
+summaries `FAILED. 2 passed; 2 failed` and `FAILED. 3 passed; 1
+failed`), and the committed patches' first proving in step 3.
 
 ## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F2)
 
