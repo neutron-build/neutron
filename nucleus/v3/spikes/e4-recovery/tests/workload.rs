@@ -2213,3 +2213,23 @@ fn x5r52_twin_reseed_heals_609_r1() {
         t1.o1_fail
     );
 }
+
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, step 3): the twin chain is
+/// kept when the directories agree.** Seed **639** is the lowest MW seed
+/// in 0..1000 with at least two rounds, no re-seed event in step 2's
+/// attribution, and a digest that moves under M-TWIN-RESEED-ALWAYS
+/// (`3366243401 → 1144734390`, measured; the thirteen lower candidates
+/// 9, 129, 139, 189, 199, 309, 369, 399, 479, 509, 519, 559, 569 are
+/// inert under it — their digests equal the baseline's). Its digest at
+/// this tip equals the Base's literal, unchanged: (b) never fires for
+/// it, so the seed runs bit for bit as at the Base (ruling (e)).
+/// **M-TWIN-RESEED-ALWAYS** and **M-TWIN-PRED-ALWAYS** fail here.
+#[test]
+fn x5r52_twin_chain_kept_when_directories_agree_639() {
+    let rec = workload::run_seed_with(639, None, &workload::Tuning::BASE);
+    assert_eq!(
+        rec.digest, 3366243401,
+        "639 has no directory divergence: its digest must equal the Base's, \
+         byte for byte (M-TWIN-RESEED-ALWAYS reverts this)"
+    );
+}
