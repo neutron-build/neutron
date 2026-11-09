@@ -1,6 +1,15 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1 — the X5-R53 card: P's
+Status: **stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 — the X5-R53 verdict's
+follow-up -F1: the comparator's two checking holes closed — `read_monitor`
+requires an `E4 SEEDS … MONITOR=` line in **every** run-out file, and
+`compare` refuses a `--run`/`--run-out` count mismatch (both cannot-check
+exits 2, nothing that counts as exempt moves) — and the verdict's sixteen
+surviving mutants die in `self-test` (seventeen new cases beside the
+refusals' four); the same 10k re-read once more under the hardened
+comparator, same reading (no campaign re-run; nothing under `src/`,
+`tests/`, `examples/`, `results/` or `x5r52-twin-diag.patch` changes).**
+Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1 — the X5-R53 card: P's
 post-data amendment to X5-R52 (verbatim below), written after the
 re-verdict at `26bcee4b` (MERGE-WITH-FOLLOWUPS) named two follow-ups on
 X5-R52's comparator and rule. This card narrows `check-twin` to the
@@ -2968,6 +2977,185 @@ scope; (c) the verdict's stacked-tip re-gate (at `60f919d7`, scaffold
 `acc81c77`) read that row ok and `GATE EXIT=0`, while the parent card's
 own in-container re-verification and this attempt read it red — the row
 tracks the container's PID 1, not the tree.
+
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1's record (the X5-R53 verdict's
+## follow-up -F1: every run-out file carries its own MONITOR line, the
+## --run/--run-out counts are tied, and the sixteen survivors die; the
+## same 10k re-read once more)
+
+The X5-R53 verdict (`verdicts/X-5c-F4-F1-F1-F3-F2-F1-F1-F1.md` at
+`991ee5fe`, MERGE-WITH-FOLLOWUPS) found one code hole in `read_monitor`
+(its §3) and ruled its sixteen surviving mutants "test gaps, not
+rework" (its §4). This card is that verdict's -F1 follow-up, landing
+before X-5c-F4-F1-F1-F3-F2-F1-F2's five-file comparison (that card's
+Limits freeze `x5r52_compare.py`; its Work 2 repeats five `.out` files
+that each carry the line, so both new checks hold there unchanged).
+**No rule text changed:** X5-R51, X5-R52 and X5-R53 stay verbatim
+(checked below), nothing that counts as exempt moves, and the two new
+refusals ride the comparator's existing cannot-check channel (exit 2,
+like the hash and range checks).
+
+**Step 1 — the two refusals (verdict §3).** `read_monitor` now requires
+at least one `E4 SEEDS=… MONITOR=` line in **every** run-out text —
+exactly what its docstring already claimed — and still sums every line
+of every file. `cmd_compare` refuses a comparison whose `--run` and
+`--run-out` counts differ, after the sha256 checks and before any
+campaign file is read. Four cases, in `self_test`'s scratch-file block
+beside `range-mismatch` (equal ref/run docs, so only MONITOR can move
+the exit):
+
+- `monitor-every-run-out-file` — two `--run-out` files, the **first**
+  with no `E4 SEEDS` line, the last with `MONITOR=0`; rc 2.
+- `monitor-sums-every-file` — the first file `MONITOR=1`, the last
+  `MONITOR=0` (two `--run` covering the ref's seeds exactly, so the
+  count tie holds): the `(-1, "run", None, "bullet3-monitor")` row is
+  present and the exit is 1.
+- `monitor-sums-every-line` — one file with two `E4 SEEDS` lines,
+  `MONITOR=1` then `MONITOR=0`: the row is present and the exit is 1.
+- `monitor-run-out-count-mismatch` — two `--run`, one `--run-out`;
+  rc 2.
+
+**Step 2 — the cap's three unpinned filters (verdict §2: "served-only,
+mrb-only and MW rounds do not count").** Three cases beside the existing
+`mpa-cap-*` ones, each asserting the exact `(1, 1)` class tuple and that
+the `MPA_PASS_FAIL` row stays exempt: `mpa-cap-counts-mrb-only` (an
+extra class-MP round `served=true, mrb=false` at both ends),
+`mpa-cap-counts-served-only` (the same with `served=false, mrb=true`)
+and `mpa-cap-base-mp-only` (a Base **MW** seed holding a
+`served=true, mrb=true` round — the mirror of
+`mpa-cap-counts-class-mp-only`).
+
+**Step 3 — the ten twin cases (the verdict's survivors), built on the
+two builders, never forks of them.** `twin_diag` gains seven knobs —
+`twin0_meta_t` (round 0's twin replay-start `meta.t`, 0 as before),
+`twin1_meta_t2` (an older second replay start in round 1's twin
+segment), `twin1_recs` (records in round 1's own twin segment),
+`foreign_seed` (a run marker for another seed between round 1's twin
+replay start and its `Err`), `real0_extra` (a second real segment of
+round 0), `tail_lines` (a later round's segments after round 1's
+blocks) and the two new records `D4_TS5`/`D4_TS7` beside `D4_TS1`/
+`D4_TS2` — and `twin_diag3` gains `div_rounds` (which round-starts
+diverge on `N=4`). Every default keeps the original log byte for byte,
+and no existing case's name or expected verdict moved. The cases, each
+naming the check it expects (and the half, for T6a/T6b):
+
+- `twin-t6a-most-recent-t` — round 1's twin segment holds two replay
+  starts above its `Err` (older `meta.t=9`, most recent `meta.t=5`) and
+  the drop is `D4` at `ts=7` in round 0's twin listing: `ts 7 > t 5`,
+  NOT-EXPLAINED T6a (any start's or the first start's `meta.t` reads 9
+  and wrongly passes).
+- `twin-t6a-ts-equal-t` — `D4` at `ts=5` against `meta.t=5`: EXPLAINED
+  (T6a's bound is `≤`).
+- `twin-t6b-x33x-short` — real round `k−1` `x33x=true, cover_err=false`,
+  no real listing: EXPLAINED (the short-cut's `x33x` half).
+- `twin-t6b-last-listing` — two real (`Mw`) segments of round `k−1`,
+  each with a replay start; the first segment's listing replays `D4` at
+  `ts=1 ≤ frontier=1`, the last's does not: EXPLAINED (T6b reads the
+  last listing).
+- `twin-t6b-real-class-only` — no real-class segment of `k−1` has a
+  replay start; the class-C twin segment's start (lifted to `meta.t=2`
+  so T6a holds) whose listing replays `D4` at `ts=1` does not serve:
+  NOT-EXPLAINED, `T6b no real-class replay listing`.
+- `twin-t6a-twin-segments-only` — round `k−1`'s real listing holds `D4`
+  at `ts=2 > frontier=1` and its twin listing holds none, while round
+  `i`'s own twin segment lists `D4` (so T3 holds): NOT-EXPLAINED T6a.
+- `twin-t1-same-round-only` — the `Err` for round `i` sits inside round
+  0's twin segment (that segment's start at `meta.t=5`, `D4` in its
+  listing); round `i`'s own twin segment has no `Err`: NOT-EXPLAINED
+  T1.
+- `twin-t4-first-k` — round-starts 1 **and** 2 both diverge on `N`
+  (`twin_diag3(div_rounds=(1, 2))`), real round 0 faulted and short,
+  real round 1 clean, the twin failing at `i=2` with `D4` in round 0's
+  twin listing: EXPLAINED `N=4 k=1` (the **first** divergent start).
+- `twin-t3-round-le-i` — `D4` listed only in round 2's twin segment,
+  with `i=1` and `k=1`: NOT-EXPLAINED T3.
+- `twin-walk-foreign-seed` — a marker for another seed between round
+  `i`'s twin marker and its `Err`: NOT-EXPLAINED T1.
+
+`self-test` reads **78 cases, 0 failed** (61 before this card). X5-R52's
+and X5-R53's output lines keep their order and text: `check_mp`,
+`meta_only_eligible`, `mpa_pass_fail`, `twin_ddl_prefilter`,
+`compare_reading`, `compare_exit_code`, `format_rows`, `check_twin` and
+`walk_seed_segments` are byte-identical to `991ee5fe` (`git diff
+991ee5fe HEAD -- tools/x5r52_compare.py` touches only `read_monitor`,
+the count-tie block in `cmd_compare`, and `self_test`).
+
+**Step 4 — the mutants.** Every mutant is a scratch copy under
+`${CARGO_TARGET_DIR}/x5r52-f1-review/` (never the worktree; the card's
+Run hygiene names `~/.cache/nv3-review/…`, read-only in this container —
+the base card's judgment call), applied by an anchored replacement
+(`mutants.py` there, which asserts each anchor's occurrence count
+before applying) and run through `self-test`. Each must make `self-test`
+exit non-zero and fail at least its named case; **all 46 die, none
+UNCAUGHT** — the sixteen survivors of verdict §4, the two refusals'
+regression mutants, the base card's whole 24-row table re-applied, and
+the gate's four caught J-* re-applied:
+
+| mutant | self-test failing cases |
+|---|---|
+| J-MON-LASTFILE (`read_monitor` reads only the last run-out file) | `monitor-every-run-out-file`, `monitor-sums-every-file` |
+| J-MON-LASTLINE-ONLY (only each file's last `E4 SEEDS` line counts) | `monitor-sums-every-line` |
+| M-MON-ANYFILE (the per-file check returned to the any-file check) | `monitor-every-run-out-file` |
+| M-MON-NO-TIE (the count check removed) | `monitor-run-out-count-mismatch` |
+| J-MPA-NO-MRB (the class count drops `mrb=true`) | `mpa-cap-counts-mrb-only` (with every equal-count cap case: the tuple reads `(2, 2)`) |
+| J-MPA-NO-SERVED (the class count drops `served=true`) | `mpa-cap-counts-served-only` (and the other `(1, 1)` cap cases) |
+| J-MPA-BASE-NO-CLASS (the Base end drops `class == "MP"`) | `mpa-cap-base-mp-only` (Base counts the MW round: `(2, 1)`) |
+| J-T6A-ANY-T (`t` may be any replay start's `meta.t`) | `twin-t6a-most-recent-t` |
+| J-META-T-FIRST (`t` is the first replay start above the `Err`) | `twin-t6a-most-recent-t` |
+| J-T6A-LT (T6a requires `ts < t`) | `twin-t6a-ts-equal-t` |
+| J-T6B-NO-X33X (the short-cut drops `x33x`) | `twin-t6b-x33x-short` |
+| J-T6B-FIRST-LISTING (T6b reads the first replay listing) | `twin-t6b-last-listing` |
+| J-T6B-ANYKIND (T6b's real segment may be any class) | `twin-t6b-real-class-only` (and `twin-t6-no-real-listing`) |
+| J-T6A-ANYKIND (T6a collects from any segment) | `twin-t6a-twin-segments-only` |
+| J-T1-SEG-ANYROUND (a twin segment of any round counts) | `twin-t1-same-round-only` |
+| J-T4-K-MAX (`k` is the last divergent round start) | `twin-t4-first-k` |
+| J-T3-ANYROUND (T3 reads twin segments at any round) | `twin-t3-round-le-i` |
+| J-WALK-OTHERSEED (a marker for another seed does not end the segment) | `twin-walk-foreign-seed` |
+| G-EXIT-NOBAD (re-applied) | `exit-bad-seeds-only` |
+| G-T4-NO-SHORT (re-applied) | `twin-t4-no-short` |
+| G-TWIN-PREFILTER-ALLJ (re-applied) | `twin-prefilter-fault-at-i-only` |
+| G-T3-ANYCLASS (re-applied) | `twin-t3-mw-only`, `twin-t3-probe-only` |
+| M-T1-ORIGINAL (re-applied) | `twin-t1-probe-only`, `twin-t1-probe-no-twin-err`, `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-NO-TWIN-REQ (re-applied) | `twin-t1-probe-no-twin-err` |
+| M-T1-NO-DIFFER (re-applied) | `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-DIFFER-TWIN-ONLY (re-applied) | `twin-t1-probe-differs-from-twin` |
+| M-T1-ONE-ERR (re-applied) | `twin-t1-identical-rerun-ok` |
+| M-T3-PROBE (re-applied) | `twin-t3-probe-only`, `twin-t1-probe-no-twin-err` |
+| M-T6-NO-META (re-applied) | `twin-t6-drop-above-meta` |
+| M-T6-ANY-ROUND (re-applied) | `twin-t6-drop-other-round` |
+| M-T6-NO-REAL (re-applied) | `twin-t6-real-replayed-drop`, `twin-t6-no-real-listing` |
+| M-T6-ANY-TS (re-applied) | `twin-t6-real-listed-above-frontier` |
+| M-T6-CROSS-CLOCK (re-applied) | `twin-t6-cross-clock` |
+| M-MPA-NO-CAP (re-applied) | `mpa-cap-grown-voids` |
+| M-MPA-CAP-GE (re-applied) | `mpa-cap-equal-keeps`, `mpa-cap-counts-class-mp-only`, `mpa-pass-fail` |
+| M-MPA-CAP-ANYCLASS (re-applied) | `mpa-cap-counts-class-mp-only` |
+| M-MON-NO-STOP (re-applied) | `monitor-run-stops` |
+| M-CMP-NO-PF (re-applied) | 16 cases: the eight `mpa-base-*`/`mpa-o*`/`mpa-pass-na`/`mpa-skx` set, `mpa-mw-serve`, `mpa-pass-fail` and the seven `mpa-cap-*` cases — see the note below |
+| M-CMP-MPA-NOJUDGE (re-applied) | `mpa-skx-smx-false`, `mpa-pass-na-false` |
+| M-CMP-META-ANYSLOT (re-applied) | `meta-only-some-finding` |
+| M-CMP-TWIN-NODIR (re-applied) | `twin-t2-both-dirs-lack-N` |
+| M-CMP-TWIN-ANYCLASS (re-applied) | `twin-mp-seed-prefilter-fails` |
+| J-MON-GT1 (re-applied) | `monitor-run-stops` |
+| J-MPA-LINE-ORDER (re-applied) | `mpa-class-line` |
+| J-MPA-VOID-KEEPS-ROW (re-applied) | `mpa-cap-grown-voids` |
+| J-MPA-VOID-NO-FAIL (re-applied) | `mpa-cap-grown-voids` |
+
+Two honest notes on that table. First, **M-CMP-NO-PF stops self-test
+early**: the pre-existing `mpa-class-line` case crashes inside its
+`out.index("MPA_PASS_FAIL 1 [(1, 0)]")` (the mutant removes that line),
+a deterministic `ValueError` after the 16 FAIL lines above — the exit is
+already non-zero — so `pass-fail-base-text-not-mpa`, which the base
+card's README table also named, sits behind the crash and cannot print
+FAIL. The verdict's own Mutants line recorded **12** self-test cases
+for this mutant, not the base README's 13: the same crash. The case is
+outside this card's Limits to touch, so the shape is recorded here, not
+hidden. Second, several mutants fail **more** cases than they are named
+for (the table lists every measured FAIL); the named case is always
+among them. **M-CMP-NO-PF over the real 10k**, as the verdict's row
+records: exit 0, `MPA_PASS_FAIL 0 []`, seed 7078 absent from the whole
+output, `MPA_CLASS base 11 tip 10` still printing — reproduced here on
+the scratch copy over the same recorded files.
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)

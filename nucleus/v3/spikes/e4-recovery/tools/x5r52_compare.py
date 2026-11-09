@@ -1743,7 +1743,7 @@ def self_test():
     )
 
     a.ref_sha256 = None
-    a.run = [eq_path]
+    a.run = [eq1_path, eq2_path]
     a.run_out = [none_out, ok_out]
     rc = cmd_compare(a)
     check("monitor-every-run-out-file", rc == 2, "rc=%d" % rc)
