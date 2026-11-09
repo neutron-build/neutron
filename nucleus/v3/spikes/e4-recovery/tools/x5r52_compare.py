@@ -1366,9 +1366,14 @@ def self_test():
     C1234 = 'GATEDIAG   rec lsn=0 kind=1 ts=1 txn=(0, 1) ddl=["C1", "C2", "C3", "C4"] trees={1, 2, 3, 4}'
     D4_TS1 = 'GATEDIAG   rec lsn=100 kind=1 ts=1 txn=(0, 2) ddl=["D4"] trees={1, 4}'
     D4_TS2 = 'GATEDIAG   rec lsn=100 kind=1 ts=2 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    D4_TS5 = 'GATEDIAG   rec lsn=100 kind=1 ts=5 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    D4_TS7 = 'GATEDIAG   rec lsn=100 kind=1 ts=7 txn=(0, 2) ddl=["D4"] trees={1, 4}'
     C1 = 'GATEDIAG   rec lsn=10 kind=1 ts=2 txn=(0, 2) ddl=["C1"] trees={1}'
     TREE4 = 'Corrupt("tree 4 missing in directory")'
     WALLOSS = "WalLoss { valid_end: 1, wal_ckpt_end: 2, t: 3, ts_ckpt_hi: 4 }"
+    #: A round-1 recovery Err line, as `twin_diag` emits it (for cases
+    #: that place it in another round's segment).
+    ERR1 = "GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % TREE4
 
     def fmt_dir(keys):
         return "[%s]" % ", ".join(str(k) for k in keys)
@@ -1384,7 +1389,13 @@ def self_test():
         twin0_recs=None,
         real0_recs=None,
         real0_start=True,
+        twin0_meta_t=0,
         twin1_meta_t=5,
+        twin1_meta_t2=None,
+        twin1_recs=(),
+        foreign_seed=None,
+        real0_extra=(),
+        tail_lines=(),
     ):
         """A diag log in the harness's real order (card
         X-5c-F4-F1-F1-F3-F2-F1-F1-F1 Work 1), per round: the probe
@@ -1398,6 +1409,18 @@ def self_test():
         at ts=3), `twin0_recs`/`real0_recs`/`probe0_recs` override the
         segments individually; `real0_start=False` gives round 0's real
         run no replay listing at all.
+
+        The knobs card X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 adds (defaults
+        keep the original log byte for byte): `twin0_meta_t` sets round
+        0's twin replay-start `meta.t` (0 as before); `twin1_meta_t2`
+        adds an older second replay start to round 1's twin segment, so
+        `twin1_meta_t` stays the most recent above the `Err`;
+        `twin1_recs` are records inside round 1's own twin segment;
+        `foreign_seed` puts a run marker for another seed between round
+        1's twin replay start and its `Err`; `real0_extra` appends extra
+        lines (a second real segment of round 0) after round 0's real
+        run; `tail_lines` are appended after round 1's blocks (a later
+        round's segments).
         """
         starts = starts if starts is not None else [(0, [1, 2, 3, 4], [1, 2, 3, 4]), (1, [1, 2, 3, 4], [1, 2, 3])]
         if twin0_recs is not None:
@@ -1411,19 +1434,25 @@ def self_test():
         lines.extend(probe0_recs)
         lines.append("X5R52 round-start seed=4 round=0 real_dir=%s twin_dir=%s" % (fmt_dir(starts[0][1]), fmt_dir(starts[0][2])))
         lines.append("X5R52 run seed=4 round=0 class=C")
-        lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
+        lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin0_meta_t)
         lines.extend(twin0)
         lines.append("X5R52 run seed=4 round=0 class=Mw")
         if real0_start:
             lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
             lines.extend(real0)
+        lines.extend(real0_extra)
         # round 1: probe, round-start, twin (the Err), real, re-run.
         lines.append("X5R52 run seed=4 round=1 class=C")
         if probe_err is not None:
             lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % probe_err)
         lines.append("X5R52 round-start seed=4 round=1 real_dir=%s twin_dir=%s" % (fmt_dir(starts[1][1]), fmt_dir(starts[1][2])))
         lines.append("X5R52 run seed=4 round=1 class=C")
+        if twin1_meta_t2 is not None:
+            lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t2)
         lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t)
+        lines.extend(twin1_recs)
+        if foreign_seed is not None:
+            lines.append("X5R52 run seed=%d round=0 class=C" % foreign_seed)
         if err is not None:
             lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % err)
         lines.append("X5R52 run seed=4 round=1 class=Mw")
@@ -1433,18 +1462,22 @@ def self_test():
             lines.append("X5R52 run seed=4 round=1 class=C")
             lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t)
             lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % rerun_err)
+        lines.extend(tail_lines)
         diag_seed = {"seed": 4, "class": "MW", "digest": digest, "rounds": [], "twin": []}
         out_text = "E4 SEEDS=1 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
         return "\n".join(lines) + "\n", diag_seed, out_text
 
-    def twin_diag3(digest=1004):
+    def twin_diag3(digest=1004, div_rounds=(2,)):
         """A three-round log in the real order: k=2 (round 2's start
         diverges on N=4) and D4 listed only in the twin segment of
-        round 0 — never in a twin segment of round k−1 = 1."""
+        round 0 — never in a twin segment of round k−1 = 1. Card
+        X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1's `div_rounds` names the rounds
+        whose round-start diverges on N=4 (default `(2,)`, the original
+        shape; every other start is `[1, 2, 3, 4]/[1, 2, 3, 4]`)."""
         lines = []
         for rnd in (0, 1):
             lines.append("X5R52 run seed=4 round=%d class=C" % rnd)
-            lines.append("X5R52 round-start seed=4 round=%d real_dir=%s twin_dir=%s" % (rnd, fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3, 4])))
+            lines.append("X5R52 round-start seed=4 round=%d real_dir=%s twin_dir=%s" % (rnd, fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3] if rnd in div_rounds else [1, 2, 3, 4])))
             lines.append("X5R52 run seed=4 round=%d class=C" % rnd)
             lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
             lines.extend([D4] if rnd == 0 else [C1])
@@ -1452,7 +1485,7 @@ def self_test():
             lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
             lines.append(C1234)
         lines.append("X5R52 run seed=4 round=2 class=C")
-        lines.append("X5R52 round-start seed=4 round=2 real_dir=%s twin_dir=%s" % (fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3])))
+        lines.append("X5R52 round-start seed=4 round=2 real_dir=%s twin_dir=%s" % (fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3] if 2 in div_rounds else [1, 2, 3, 4])))
         lines.append("X5R52 run seed=4 round=2 class=C")
         lines.append("GATEDIAG replay start meta.t=5 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
         lines.append("GATEDIAG recovery Err seed=4 round=2 class=C nested=0 e=%s" % TREE4)
@@ -1556,6 +1589,98 @@ def self_test():
     diag, diag_seed, out_text = twin_diag()
     v, d = check_twin({4: cross}, 4, 1, diag, {4: diag_seed}, out_text)
     check("twin-t6-cross-clock", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # --- X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1: the verdict's sixteen
+    # survivors (its §4), each killed by its own case.
+    # T6a's t is the MOST RECENT replay start above the Err: with an
+    # older start at 9 above the newer 5, the drop at ts=7 is above t=5
+    # and T6a refuses — any other start's meta.t (or the first) reads 9
+    # and wrongly passes.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[D4_TS7], twin1_meta_t2=9)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6a-most-recent-t", v == "NOT-EXPLAINED" and d.startswith("T6a"), "%s %s" % (v, d))
+
+    # T6a's bound is <=: a drop at a ts exactly equal to t passes.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[D4_TS5])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6a-ts-equal-t", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T6b's short-cut half keeps its x33x arm beside cover_err: x33x
+    # with no real listing at all still explains.
+    x33x_short = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7, x33x=True), round_rec()])
+    diag, diag_seed, out_text = twin_diag(real0_start=False)
+    v, d = check_twin({4: x33x_short}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6b-x33x-short", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T6b reads the listing after the LAST real replay start: the first
+    # real segment's replayed drop does not matter when the last
+    # segment's listing does not replay it.
+    diag, diag_seed, out_text = twin_diag(
+        real0_recs=[D4_TS1],
+        real0_extra=[
+            "X5R52 run seed=4 round=0 class=Mw",
+            "GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1",
+            C1234,
+        ],
+    )
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6b-last-listing", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T6b's replay start must sit in a real-class segment: the twin
+    # segment's own start (meta.t=2, so T6a holds) whose listing replays
+    # D4 at ts <= frontier does not serve — with no real-class start of
+    # round k-1, T6b refuses.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[D4_TS1], twin0_meta_t=2, real0_start=False)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check(
+        "twin-t6b-real-class-only",
+        v == "NOT-EXPLAINED" and d.startswith("T6b no real-class replay listing"),
+        "%s %s" % (v, d),
+    )
+
+    # T6a collects from the twin segments of round k-1 only: a drop in
+    # round k-1's real listing above the frontier, with round i's own
+    # twin listing carrying D4 so T3 holds, leaves T6a without its drop.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[C1], real0_recs=[C1234, D4_TS2], twin1_recs=[D4])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6a-twin-segments-only", v == "NOT-EXPLAINED" and d.startswith("T6a"), "%s %s" % (v, d))
+
+    # T1 reads twin segments of round i only: round 1's Err inside
+    # round 0's twin segment (that segment's start at meta.t=5, D4 in
+    # its listing) is not round 1's own twin Err.
+    diag, diag_seed, out_text = twin_diag(err=None, twin0_recs=[D4, ERR1], twin0_meta_t=5)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-same-round-only", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    # T4's k is the FIRST divergent round start: with round-starts 1
+    # and 2 both divergent, real round 0 faulted and short and real
+    # round 1 clean, only k=1 explains (the last divergent start, 2,
+    # has no faulted round before it).
+    first_k = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7), round_rec(), round_rec()])
+    diag, diag_seed, out_text = twin_diag3(div_rounds=(1, 2))
+    v, d = check_twin({4: first_k}, 4, 2, diag, {4: diag_seed}, out_text)
+    check("twin-t4-first-k", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T3 reads twin segments at rounds <= i: D4 listed only in round
+    # 2's twin segment (i=1, k=1) does not serve.
+    diag, diag_seed, out_text = twin_diag(
+        twin0_recs=[C1],
+        tail_lines=[
+            "X5R52 run seed=4 round=2 class=C",
+            "X5R52 round-start seed=4 round=2 real_dir=%s twin_dir=%s" % (fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3, 4])),
+            "X5R52 run seed=4 round=2 class=C",
+            "GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26",
+            D4,
+        ],
+    )
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-round-le-i", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    # A marker for another seed ends the segment (X5-R53 (b)): round
+    # 1's Err after one is in no twin segment, so T1 refuses.
+    diag, diag_seed, out_text = twin_diag(foreign_seed=5)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-walk-foreign-seed", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
 
     # --- compare-level errors: a range mismatch and a sha256 mismatch
     # are exercised through cmd_compare on scratch files.
