@@ -4273,7 +4273,49 @@ Anomalies: none beyond the recorded. The one mid-card restart (the
 rule: the uncommitted edits were discarded (`git diff | git apply
 -R`; `git checkout` is blocked in this container), re-applied as this
 attempt's step-5a work, and re-verified from scratch (build, fmt,
-clippy, the full suite) before the commit.
+clippy, the full suite) before the commit. A second cap hit landed
+during the first Acceptance 10k attempt (nothing committed between;
+the re-run below is the record).
+
+**The Acceptance record (commit 25ae82bd, status_lines=0).**
+- `cargo test -q --release -p e4-recovery` — **276 passed, 0 failed**.
+- The 10k of record (`$CARGO_TARGET_DIR/acc/X-5c-F4-F1-F1-F3-F1.acc.*`):
+  exit 0, wall 14 min 51 s, `E4 SEEDS=10000` with
+  `FOLD FAILING_SEEDS=19 FAILING_ROUNDS=19 TWIN_FAILING_ROUNDS=0
+  DEFECT_SEEDS=0`, `MONITOR=0`; JSON sha256
+  `158ce549c02d8e1367a7b44b43026e2f32450610e0338e2a7edcc353c8d6a69b`
+  (it differs from the baseline's `41c307a4…1cd2` exactly as the
+  amendment predicts: this card adds `imgrupf` and `q4i` reads the
+  pre-freeze count — neither a digest input, and the comparator reads
+  neither).
+- `verify --no-quotas` — exit 0, `VERIFY OK … seeds=10000 digests
+  reproduce` (Q18 979, as at the baseline; the Q4-I quota row reads
+  21 at this tip's FINAL == BASE — the row is frozen under Limit 1 and
+  is not this card's rule, whose image arm is the ×10 reading of
+  step 6).
+- The comparator (`--no-twin-exemption --max-twin-failing 0`) — exit
+  0, and the reading is the amendment's expected one verbatim:
+  `DIGESTS_MOVED 0 FAILING_ROUNDS 19 MONITOR 0`; `MOVED_GAINED`,
+  `MOVED_MP_PENDING`, `META_ONLY_ELIGIBLE`, `MPA_PASS_FAIL`,
+  `TWIN_DDL_PENDING`, `MOVED_LOST`, `HEALED`, `TWIN_HEALED`,
+  `TEXT_CHANGED` all `0 []`; `MPA_CLASS base 10 tip 10`;
+  `TWIN_FAILING 0 [] BASE 0`; `NEW_FAILING 0 [] BAD_SEEDS 0 []`.
+  **This card moves no BASE digest** (Limit 3 held; X5-R37's 54
+  literals stand as they are at `af5c8d63`).
+- `bash scripts/gate.sh` — **`GATE EXIT=1` on two environmental rows,
+  neither in this card's scope**: `STEP deny EXIT=1` is a **new
+  upstream advisory** (RUSTSEC-2026-0459: `libsqlite3-sys` 0.35.0
+  bundles SQLite < 3.54.0), reached only through `e0-btree`'s
+  `rusqlite` — no dependency of `e4-recovery`, and this card changed
+  no dependency (`Cargo.lock` byte-identical to the base commit,
+  `status_lines=0` in the `.prov`); the fix (upgrade or `deny.toml`)
+  sits outside this card's Touch only. `STEP enforcement-tests
+  EXIT=1` is the single ruled `runner e2e: K` row (SIGTERM/ledger
+  range), the known environmental reading of this container shape the
+  card's Notes name — the -F2-F1-F2 gate verdict records that it does
+  not recur in the runner's container, and the runner's Acceptance is
+  the truth. The other five STEP lines (`test`, `clippy`, `fmt`,
+  `wasm32`, `core-paths-selftest`) all `EXIT=0`.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
