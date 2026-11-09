@@ -158,7 +158,7 @@ Any mismatch returns XX001, and the bytes are never served. The check catches to
 - **Allocation.** Take the lowest free LPID; if none is free, take `next_lpid++`.
 - **The free-set lock.** It guards the LPID bitmap's in-memory state and `next_lpid` only, despite its name: slot allocation (§4.4, §4.5) does not take it, and neither does eviction. It ranks after the gate and any frame latches: a thread may take it while holding those, and may take the page table inside it, never the reverse, so a thread holding the page table never takes the free-set lock. Under it a thread only tests and sets LPID bits, advances `next_lpid`, and tests and pins resident MapLeaf frames (§5.6): no I/O, eviction or frame latch runs under it, it creates no page, and it waits on nothing but the page table. So a dirty eviction, which allocates a slot and updates the page table while holding frame latches (§5.2), never meets it, and an allocation that finds a MapLeaf cold or missing releases it before doing anything about that (§5.6).
 - **Freeing.** Freeing an LPID is a mutation of the page and of its map entry, both through `write_guard`, so image `k` keeps the page's epoch-`k` content if the free happens in epoch `k+1`.
-- **Reuse is immediate, in memory.** A freed LPID may be reused at once because LPIDs never appear in the WAL (§12) and readers reach pages only through latched parents (§6.2) or, for a tree's root, through the root table with the name validated under the root's latch (§6.8 "Root names"). The image keeps its own epoch-`k` map version.
+- **Reuse is immediate, in memory.** A freed LPID may be reused at once because LPIDs never appear in the WAL (§12) and readers reach a page that can be freed only through latched parents (§6.2); for a tree's root, through the root table with the name validated under the root's latch (§6.8 "Root names"); or, for an overflow chain, from its entry under the leaf's latch or, after that latch is released, under a registered snapshot `S ≥ W`, whose registration keeps the version, and so its chain, from being freed (§6.7 "Reading without the leaf latch", I-GC-READEQ). The image keeps its own epoch-`k` map version.
 
 ### 4.3 Free set
 The free set is **two bitmaps**, persisted with each image as a radix of physically addressed FreeSet pages (the same shape as the map), with the root ref in the meta (`free_root`):
@@ -299,7 +299,7 @@ Reference: `spikes/e0-btree/src/tree.rs` for search, insert, split, latch coupli
 - **Readers** use shared latches, top-down. They hold the parent while they latch the child.
 - **Order.** Within one tree, latches are taken in (depth ascending, then left to right among siblings); directory pages come before any tree page and map pages after, in §5.3's order.
 
-The consequence that §4.2 and §6.6 rely on: no thread can reach a page except through a latched parent or a re-descent from the root, so an LPID unlinked under its parent's exclusive latch is unreachable afterwards.
+The consequence that §4.2 and §6.6 rely on: no thread can reach an inner or leaf page except through a latched parent or a re-descent from the root, named as §6.8 "Root names" says, so an LPID unlinked under its parent's exclusive latch is unreachable afterwards. An overflow chain's pages are reached from their entry instead, under the terms §4.2 states.
 
 ### 6.3 Stable root (I-ROOT-STABLE)
 A tree's root LPID is fixed when the tree is created and never changes. This departs from E0, which kept the root in a `RwLock<PageId>` and used a T-ROOT restart.
