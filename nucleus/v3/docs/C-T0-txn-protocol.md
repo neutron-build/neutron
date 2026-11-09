@@ -1,6 +1,6 @@
 # C-T0: Transaction protocol (normative)
 
-Status: draft 8.3 (card S-1-F3, 2026-11-03: pointer clauses to S-STORE I-ACK-PREFIX, I-WAL-COVER, the ordered and fresh boot ids, and the poisoned store in every wait; draft 8.2 was card S-2-F2 and its rework, 2026-10-24; draft 8.1 was card S-2-F1, draft 8.0 was card S-2, increment 1 of 4). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`, §11) is made here first, then in the tests and mutants that pin it (and in G0), and only then in code.
+Status: draft 8.4 (card S-1-F7-F2-F3, 2026-11-08: §2.4 (c) and §9.2 limit the page-local prune to dead tags 6–7, as S-STORE §10.3 has it) on draft 8.3 (card S-1-F3, 2026-11-03: pointer clauses to S-STORE I-ACK-PREFIX, I-WAL-COVER, the ordered and fresh boot ids, and the poisoned store in every wait; draft 8.2 was card S-2-F2 and its rework, 2026-10-24; draft 8.1 was card S-2-F1, draft 8.0 was card S-2, increment 1 of 4). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`, §11) is made here first, then in the tests and mutants that pin it (and in G0), and only then in code.
 
 **What v8 is.** v8 is C-T0 draft 7.8 (`nucleus/v2/docs/C-T0-txn-protocol.md` at 8095500b) re-hosted on:
 - **N2**: a private write set and an in-memory lock table, with no write intents, no resolver and no status table;
@@ -236,7 +236,7 @@ Apply maps `Write {key_changed}` and `Delete {moved}` accordingly. The payload b
 **Who settles.** There are exactly three settlers:
 - **(a)** `T` itself: finalize (§3.2) or abort cleanup (§7.1);
 - **(b)** inline: a txn that holds an exclusive lock covering `k` and is about to write its own provisional entry on `k`;
-- **(c)** for dead entries only: the GC sweep, page-local prune, or any writer on `k`. Each is a single conditional delete, with no stripe.
+- **(c)** for dead entries only: the GC sweep, the page-local prune (dead inline entries, tags 6–7, only; never tag 8, S-STORE §10.3), or any writer on `k`. Each is a single conditional delete, with no stripe.
 
 There is **no resolver job**, nothing is persisted about `T` beyond its WAL records, and no state about `T` outlives its own finalize or cleanup.
 
@@ -672,7 +672,7 @@ v7.8 §8.6 is kept with §0.2.
 
 ### 9.2 What GC removes
 S-STORE §10 owns it: the rule, including X-2-F1's tombstone elision and I-GC-ORDER; the page-local prune; the sweep; and `gc_w`.
-- **Provisional entries are never versions to GC.** GC never counts, keeps or prunes them as versions. Dead ones may be deleted by any GC mutation (§2.4 (c)).
+- **Provisional entries are never versions to GC.** GC never counts, keeps or prunes them as versions. Dead ones may be deleted by a GC mutation within §2.4 (c): the GC sweep deletes them, and the page-local prune deletes dead tags 6–7 only, never tag 8 (S-STORE §10.3).
 - I-GC-READEQ holds at every `S ≥ W` because `W ≤ M`.
 
 ### 9.3 DDL retirement
@@ -857,6 +857,7 @@ This file wins over the plan. PL-1 should bring the plan in line:
 ---
 
 ## Changelog
+- **Draft 8.4** (2026-11-08, card S-1-F7-F2-F3, with S-STORE draft 7.8; two clauses). §2.4 (c) no longer lists the page-local prune as a settler of tag-8 entries: since S-STORE draft 7.2, §10.3 prunes only dead inline entries, tags 6–7. §9.2's sentence on dead provisional entries says the same (rework, verdict 8bdfaf47). No rule or settler changes.
 - **Draft 8.3** (2026-11-03, card S-1-F3, with S-STORE draft 5; pointer clauses only):
   - **TxnId and boot ids (§2.5).** `n` starts at 1 (`n = 0` is S-STORE `SegmentEnd`'s). A boot's id is the newest, in serial-number order, of its `ckpt_id`'s low bits, one above the opened meta's `boot_id`, and one above the newest boot id its recovery walk accepted (S-STORE §14 step 8), so a meta rollback cannot make a boot repeat an id whose records a walk can reach. §1's `boot id` row and §11.1's I-BOOT-ID row (statement; mutants BOOT-ID-CKPT-ONLY, BOOT-ID-NO-META-FLOOR) say the same, and §11.1's I-ACK row cites I-ACK-PREFIX. S-STORE §12.5 orders boot ids in serial-number order; the creating session's id is 0.
   - **"Synced" → I-ACK-PREFIX.** §3.1 steps 3 and 5, §3.2's head-of-line bullet and step 2, §3.4's I-ACK and §3.5's `visible_ts` say "durable" in terms of S-STORE I-ACK-PREFIX (§12.4), so an `on` commit never becomes visible or acked over an unwritten earlier batch (X-5c-F3, seed 21).
