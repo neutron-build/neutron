@@ -2781,6 +2781,48 @@ pending). `self-test` reads **61 cases, 0 failed**, and the 10k
 except the added `MPA_CLASS base 11 tip 10` line (the record is
 below, step 4).
 
+**Step 3 — the mutants (this commit).**
+Every mutant is a scratch copy under
+`${CARGO_TARGET_DIR}/x5r53-review/mut/` (never the worktree; the tree
+stayed clean), applied by an anchored replacement
+(`${CARGO_TARGET_DIR}/x5r53-review/mutants.py`, which asserts each
+anchor's count) and run through `self-test`. Each must make `self-test`
+exit non-zero on at least its named case; **all 25 are caught, none
+UNCAUGHT** — the verdict's four survivors (G-EXIT-NOBAD, G-T4-NO-SHORT,
+G-TWIN-PREFILTER-ALLJ, G-T3-ANYCLASS) are caught by the new cases:
+
+| mutant | self-test failing cases |
+|---|---|
+| G-EXIT-NOBAD (`compare_exit_code` ignores `bad_seeds`) | `exit-bad-seeds-only` |
+| G-T4-NO-SHORT (T4 drops `cover_err ∨ frontier < hi`) | `twin-t4-no-short` |
+| G-TWIN-PREFILTER-ALLJ (the prefilter reads every real round) | `twin-prefilter-fault-at-i-only` |
+| G-T3-ANYCLASS (T3 reads any segment's class) | `twin-t3-mw-only`, `twin-t3-probe-only` |
+| M-T1-ORIGINAL (the chain-head T1 scan, restored) | `twin-t1-probe-only`, `twin-t1-probe-no-twin-err`, `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-NO-TWIN-REQ (no "in a twin segment" half) | `twin-t1-probe-no-twin-err` |
+| M-T1-NO-DIFFER (no every-line-same half) | `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-DIFFER-TWIN-ONLY (same-half reads twin segments only) | `twin-t1-probe-differs-from-twin` |
+| M-T1-ONE-ERR (exactly one class-C `Err` line) | `twin-t1-identical-rerun-ok` |
+| M-T3-PROBE (probe segments count as twin) | `twin-t3-probe-only`, `twin-t1-probe-no-twin-err` |
+| M-T6-NO-META (T6a drops `ts ≤ meta.t`) | `twin-t6-drop-above-meta` |
+| M-T6-ANY-ROUND (T6a accepts any round `≤ i`) | `twin-t6-drop-other-round` |
+| M-T6-NO-REAL (T6b always holds) | `twin-t6-real-replayed-drop`, `twin-t6-no-real-listing` |
+| M-T6-ANY-TS (T6b refuses `D<N>` at any `ts`) | `twin-t6-real-listed-above-frontier` |
+| M-T6-CROSS-CLOCK (T6b also requires `frontier < ts`, the proposal's literal form) | `twin-t6-cross-clock` |
+| M-MPA-NO-CAP (the cap is removed) | `mpa-cap-grown-voids` |
+| M-MPA-CAP-GE (`tip ≥ Base` voids) | `mpa-cap-equal-keeps`, `mpa-cap-counts-class-mp-only`, `mpa-pass-fail` |
+| M-MPA-CAP-ANYCLASS (MW rounds count toward the class) | `mpa-cap-counts-class-mp-only` |
+| M-MON-NO-STOP (no `bullet3-monitor` row) | `monitor-run-stops` |
+| M-CMP-NO-PF (no bullet-1 check — re-applied) | 13 cases: the nine `mpa-*`/`pass-fail-base-text-not-mpa` set plus the four new `mpa-cap-*`/`mpa-pass-fail` |
+| M-CMP-MPA-NOJUDGE (re-applied) | `mpa-skx-smx-false`, `mpa-pass-na-false` |
+| M-CMP-META-ANYSLOT (re-applied) | `meta-only-some-finding` |
+| M-CMP-TWIN-NODIR (re-applied) | `twin-t2-both-dirs-lack-N` |
+| M-CMP-TWIN-ANYCLASS (re-applied) | `twin-mp-seed-prefilter-fails` |
+
+**M-CMP-NO-PF over the real 10k**, as in the R52 record: exit 0,
+`MPA_PASS_FAIL 0 []`, `NEW_FAILING 0 []` — 7078 r0 vanishes from the
+entire output (the original comparator's gap, reproduced under the
+X5-R53 comparator too; `MPA_CLASS base 11 tip 10` still prints).
+
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
