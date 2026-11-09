@@ -4406,6 +4406,36 @@ copies, so the worktree never held them):
   9469" is scoped to `r21c`'s literal list, naming 8469 and 8869.
   No literal moved (Limit 2 held).
 
+**Step 3 — the re-seed predicate's two halves (item 3).**
+`tests/workload.rs` only; the predicate, its call site and `src/` are
+unchanged.
+
+- The equal-size case in `x5r52_twin_dirs_differ_compares_directory_keys`:
+  real `{1, 2}` vs twin `{1, 4}` — equal key counts, different key
+  sets — must read **true**. **G-PRED-LEN-ONLY** (the predicate
+  compares key counts only) fails it.
+- The cut half: the search ran exactly as the card prescribes — the
+  committed `tools/x5r52-twin-diag.patch` on a scratch export, plus a
+  scratch-only `RESEEDCUT` eprintln at the re-seed site, single seeds
+  from the README's 0..1000 event list (259, 609, 719, 809, 849).
+  **Every event seed's cuts differ** (259 r1: real 0 vs twin 5; 609/849
+  r1: real 2 vs twin 8; 719 r1: 0 vs 7; 809 r1: 0 vs 3), so the
+  premise holds. But **G-RESEED-TWIN-CUT moves nothing observable**:
+  under the mutant (the re-seeded twin chain keeps its own `cut`) all
+  five event seeds — and the nine further named 10k event seeds (2089,
+  2599, 2669, 2859, 3449, 5049, 5739, 7179, 9059) — produce
+  byte-identical records: same digests, same rounds, same twin
+  outcomes, same defect/stopped flags. The twin's own `cut` feeds only
+  the twin round's build and its `c_prev`/`lo` bound, and at every
+  live event seed the re-seeded twin passes identically either way, so
+  no record field sees it. A digest literal cannot catch it, and the
+  direct unit form does not exist: the re-seed block is inline in
+  `run_seed_with` (no function to unit-call), and extracting one is an
+  `src/` change Work 3 forbids. **G-RESEED-TWIN-CUT: UNCAUGHT at this
+  tip, inert on every measurable event seed** — reported, not hidden.
+  No new literal row was added (Limit 2 allows one; there is nothing
+  for it to pin). ESCALATE item 2.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read

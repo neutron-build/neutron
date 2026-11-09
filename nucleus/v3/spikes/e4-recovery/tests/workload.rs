@@ -2853,6 +2853,21 @@ fn x5r52_twin_dirs_differ_compares_directory_keys() {
         workload::twin_dirs_differ(&real, &twin),
         "a key the twin dir holds and the real dir lacks is a difference (M-TWIN-PRED-ALWAYS reverts this)"
     );
+    // **X-5c-PINS-1 item 3 (verdict `af5c8d63` §5): equal-size
+    // directories with different key sets are a difference too.** The
+    // real dir holds {1, 2} and the twin {1, 4}: the counts are equal,
+    // so a predicate that compared key counts only would read false —
+    // and the round would not re-seed, exactly the shape the verdict's
+    // 10k census found no live case of ("0 cases of equal-size but
+    // different key sets"), which is why no reading depends on it.
+    // **G-PRED-LEN-ONLY** (the predicate compares key counts only)
+    // reverts this.
+    twin.dir.remove(&2).expect("key 2 is in the twin dir");
+    assert_eq!(real.dir.len(), twin.dir.len(), "the premise: equal key counts");
+    assert!(
+        workload::twin_dirs_differ(&real, &twin),
+        "equal-size dirs with different key sets are a difference (G-PRED-LEN-ONLY reverts this)"
+    );
 }
 
 /// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b)): the directory re-seed
