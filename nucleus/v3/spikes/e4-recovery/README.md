@@ -2996,7 +2996,7 @@ that each carry the line, so both new checks hold there unchanged).
 refusals ride the comparator's existing cannot-check channel (exit 2,
 like the hash and range checks).
 
-**Step 1 — the two refusals (verdict §3).** `read_monitor` now requires
+**Step 0 — the two refusals (verdict §3).** `read_monitor` now requires
 at least one `E4 SEEDS=… MONITOR=` line in **every** run-out text —
 exactly what its docstring already claimed — and still sums every line
 of every file. `cmd_compare` refuses a comparison whose `--run` and
@@ -3016,7 +3016,7 @@ the exit):
 - `monitor-run-out-count-mismatch` — two `--run`, one `--run-out`;
   rc 2.
 
-**Step 2 — the cap's three unpinned filters (verdict §2: "served-only,
+**Step 1 — the cap's three unpinned filters (verdict §2: "served-only,
 mrb-only and MW rounds do not count").** Three cases beside the existing
 `mpa-cap-*` ones, each asserting the exact `(1, 1)` class tuple and that
 the `MPA_PASS_FAIL` row stays exempt: `mpa-cap-counts-mrb-only` (an
@@ -3026,7 +3026,7 @@ and `mpa-cap-base-mp-only` (a Base **MW** seed holding a
 `served=true, mrb=true` round — the mirror of
 `mpa-cap-counts-class-mp-only`).
 
-**Step 3 — the ten twin cases (the verdict's survivors), built on the
+**Step 2 — the ten twin cases (the verdict's survivors), built on the
 two builders, never forks of them.** `twin_diag` gains seven knobs —
 `twin0_meta_t` (round 0's twin replay-start `meta.t`, 0 as before),
 `twin1_meta_t2` (an older second replay start in round 1's twin
@@ -3081,7 +3081,7 @@ and X5-R53's output lines keep their order and text: `check_mp`,
 991ee5fe HEAD -- tools/x5r52_compare.py` touches only `read_monitor`,
 the count-tie block in `cmd_compare`, and `self_test`).
 
-**Step 4 — the mutants.** Every mutant is a scratch copy under
+**Step 3 — the mutants.** Every mutant is a scratch copy under
 `${CARGO_TARGET_DIR}/x5r52-f1-review/` (never the worktree; the card's
 Run hygiene names `~/.cache/nv3-review/…`, read-only in this container —
 the base card's judgment call), applied by an anchored replacement
@@ -3156,6 +3156,148 @@ among them. **M-CMP-NO-PF over the real 10k**, as the verdict's row
 records: exit 0, `MPA_PASS_FAIL 0 []`, seed 7078 absent from the whole
 output, `MPA_CLASS base 11 tip 10` still printing — reproduced here on
 the scratch copy over the same recorded files.
+
+**Step 4 — the re-read of the same 10k under the hardened comparator.**
+No campaign was run; everything reads recorded files, exactly as the
+Acceptance line does (the prior comparator is `26bcee4b`'s, extracted
+with `git show`). The inputs and their sha256 (each checked by the
+line itself or measured beside it): the run JSON
+`runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json`
+`6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`,
+its `.campaign.out`
+`cf3de932fc2e82e8042e0b784c3fd071d9d3b9d9a7df543a9411152ae1e26059`
+(MONITOR=0), and the reference `X-5c-F4-F1-F1-CXX-F1/gate/tip-10k.json`
+`f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`.
+**One `--run` and one `--run-out`, so both new checks hold on it
+unchanged.** The output, in full (exit 0):
+
+```
+DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 87 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0), (1299, 0), (1319, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1749, 2), (1768, 0), (1927, 1), (1939, 0), (1999, 0), (2079, 0), (2189, 0), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (2859, 1), (2979, 0), (3099, 0), (3148, 0), (3377, 0), (3759, 2), (3838, 0), (3948, 0), (4148, 0), (4179, 0), (4279, 0), (4399, 1), (4439, 0), (4499, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (4659, 1), (4749, 0), (5077, 0), (5279, 0), (5328, 1), (5418, 0), (5499, 0), (5549, 2), (5798, 1), (6178, 1), (6189, 0), (6368, 0), (6369, 0), (6387, 2), (6417, 0), (6539, 0), (6719, 0), (6877, 0), (6917, 0), (7219, 0), (7257, 0), (7368, 1), (7419, 1), (7469, 1), (7658, 0), (7669, 0), (7727, 1), (7958, 1), (8038, 0), (8139, 2), (8278, 0), (8639, 0), (8748, 2), (8788, 1), (8869, 2), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+MOVED_MP_PENDING 52 [(47, 1), (547, 0), (797, 0), (967, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1768, 0), (1927, 1), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (3148, 0), (3377, 0), (3838, 0), (3948, 0), (4148, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (5077, 0), (5328, 1), (5418, 0), (5798, 1), (6178, 1), (6368, 0), (6387, 2), (6417, 0), (6877, 0), (6917, 0), (7257, 0), (7368, 1), (7658, 0), (7727, 1), (7958, 1), (8038, 0), (8278, 0), (8748, 2), (8788, 1), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+META_ONLY_ELIGIBLE 4 [(1927, 1), (7257, 0), (7658, 0), (8278, 0)]
+MPA_PASS_FAIL 1 [(7078, 0)]
+MPA_CLASS base 11 tip 10
+TWIN_DDL_PENDING 2 [(2599, 2), (2859, 1)]
+MOVED_LOST 94 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1), (1018, 0), (1107, 0), (1219, 0), (1367, 1), (1387, 0), (1578, 2), (1588, 0), (1598, 0), (1708, 2), (1747, 0), (1919, 1), (1927, 0), (1949, 0), (2099, 0), (2159, 0), (2259, 0), (2307, 0), (2389, 0), (2397, 0), (2517, 1), (2778, 0), (3029, 0), (3289, 0), (3377, 1), (3397, 0), (3548, 0), (3739, 0), (3759, 0), (3768, 0), (3947, 0), (4118, 0), (4359, 0), (4398, 0), (4399, 0), (4419, 1), (4518, 0), (4537, 1), (4567, 0), (4989, 1), (5129, 0), (5188, 0), (5328, 0), (5427, 0), (5479, 0), (5499, 1), (5619, 0), (5769, 2), (5798, 0), (6178, 0), (6387, 1), (6417, 1), (6458, 0), (6557, 0), (6909, 0), (6917, 1), (6938, 0), (7197, 0), (7219, 1), (7278, 0), (7298, 0), (7368, 0), (7419, 0), (7439, 1), (7447, 0), (7727, 2), (7889, 0), (7958, 0), (8257, 0), (8278, 1), (8307, 0), (8547, 0), (8639, 1), (8748, 0), (8788, 0), (9059, 0), (9159, 2), (9177, 0), (9329, 1), (9387, 0), (9388, 0), (9419, 0), (9429, 1), (9508, 2), (9618, 0), (9637, 1), (9717, 0), (9818, 0), (9967, 0), (9999, 0)]
+HEALED 3 [(457, 0), (1298, 1), (8777, 0)]
+TWIN_HEALED 1 [(6539, 1)]
+TEXT_CHANGED 131 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0), (1117, 0), (1127, 1), (1159, 0), (1197, 0), (1217, 0), (1337, 0), (1417, 0), (1447, 0), (1477, 0), (1628, 0), (1637, 0), (1798, 0), (1899, 0), (1917, 0), (1948, 1), (1959, 0), (1977, 0), (2028, 0), (2078, 0), (2097, 1), (2268, 0), (2377, 0), (2537, 0), (2567, 0), (2597, 0), (2638, 0), (2698, 0), (2757, 0), (2787, 0), (2828, 0), (2939, 0), (2977, 2), (2978, 0), (3068, 0), (3118, 0), (3227, 0), (3259, 1), (3357, 0), (3358, 0), (3438, 0), (3638, 0), (3817, 0), (3927, 0), (4038, 0), (4127, 1), (4247, 0), (4268, 0), (4297, 0), (4337, 0), (4378, 0), (4468, 0), (4489, 0), (4648, 0), (4657, 0), (4677, 0), (4699, 0), (4737, 0), (4758, 0), (5047, 1), (5078, 0), (5087, 0), (5148, 1), (5227, 1), (5298, 0), (5338, 1), (5378, 0), (5517, 0), (5618, 0), (5907, 0), (5958, 0), (6078, 0), (6138, 0), (6248, 0), (6377, 0), (6457, 0), (6517, 0), (6558, 0), (6627, 0), (6638, 0), (6677, 0), (6758, 0), (6807, 0), (6848, 0), (6977, 0), (6987, 0), (6997, 0), (7007, 0), (7098, 0), (7127, 0), (7227, 0), (7297, 0), (7317, 0), (7337, 0), (7338, 0), (7357, 0), (7399, 0), (7457, 1), (7698, 0), (7917, 0), (8098, 0), (8138, 0), (8268, 0), (8287, 0), (8309, 1), (8418, 0), (8617, 0), (8618, 0), (8638, 0), (8687, 0), (8977, 0), (8998, 0), (9028, 0), (9078, 1), (9107, 1), (9228, 0), (9398, 0), (9417, 0), (9528, 0), (9617, 0), (9657, 0), (9827, 0), (9878, 0), (9959, 0)]
+TWIN_FAILING 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)] BASE 6
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+**Byte-identical to the Base comparator's output and to the verdict's
+record.** The `grep -v '^MPA_CLASS '` diff against `26bcee4b`'s output
+on the same inputs is empty (both exits 0), the pinned
+`MPA_CLASS base 11 tip 10` line prints, and the block above is
+byte-identical to the base card's committed record (its README block
+at `bc18b545`, diffed mechanically). 0 new failing, the same exempt
+rounds — `MPA_PASS_FAIL 1 [(7078, 0)]` still exempt (the class count
+fell, 11 → 10, so the cap voids nothing), `TWIN_DDL_PENDING 2 [(2599,
+2), (2859, 1)]` unchanged, `META_ONLY_ELIGIBLE` the same four,
+`MONITOR 0` — so no `bullet3-monitor` row. **The reading did not move,
+and neither check fired on it: nothing that counts as exempt changed.**
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1   commit: (this commit; the chain 0f881a0b → 8886affd → f780694b → 1d4d4ac8 → here)
+
+The five RESULT items the card requires:
+
+1. **The mutant table** — step 3 above: all 46 rows die on at least
+   their named case; **none survives, none UNCAUGHT**. The two honest
+   notes (M-CMP-NO-PF's early stop; supersets of named cases) are
+   recorded in place.
+2. **The re-read in full, with both files' sha256, and the
+   byte-identity statement** — step 4 above: exit 0, the three sha256s
+   listed there, byte-identical to the Base comparator's output (the
+   `MPA_CLASS` line apart, which the Base lacks) and to the verdict's
+   record: 0 new failing, the same exempt rounds.
+3. **The two refusals and their four cases** — step 0 above: every
+   run-out file carries the line (`monitor-every-run-out-file`), the
+   counts are tied (`monitor-run-out-count-mismatch`), and the sum
+   reads every file (`monitor-sums-every-file`) and every line
+   (`monitor-sums-every-line`); both refusals exit 2.
+4. **No rule text changed** — X5-R51, X5-R52 and X5-R53 verbatim: this
+   card's whole README diff touches the Status paragraph and the new
+   section only (`git diff 991ee5fe HEAD -- spikes/e4-recovery/README.md`
+   deletes nothing inside any rule block); nothing that counts as
+   exempt moved, and the two refusals are cannot-check exits (2).
+5. **Post-data amendments: none.**
+
+acceptance (this attempt, every line run for real): `python3 -I
+spikes/e4-recovery/tools/x5r52_compare.py self-test` — **78 cases,
+0 failed**, exit 0; the 10k re-read line — exit 0 with the identical
+reading above (run with `R` pointing at the sha-pinned run JSON; the
+line as printed in the card names a run path that does not exist —
+see ESCALATE); `bash scripts/gate.sh` — `STEP test EXIT=0`,
+`STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`,
+`STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`,
+`STEP enforcement-tests EXIT=1` with exactly **one** FAIL row —
+`runner e2e: K: SIGTERM kills opencode and closes the ledger range` —
+so the last line reads **`GATE EXIT=1`**. This is the known, ruled,
+environmental row, not a finding of this card: the container matches
+the ruling's premise (`/proc/1/comm` = `opencode` — this container's
+PID 1 never `wait()`s, so the killed attempt's orphaned child stays a
+zombie and `dead()`'s `killpg` probe succeeds), verdict
+`verdicts/X-5c-F4-F1-F1.md`'s K ruling says "`kill_child` is correct.
+`dead()` asks the wrong question" and "The runner's Acceptance is the
+truth. Do not chase it, and do not run a subreaper to make it pass",
+and the X5-R53 card's own attempt recorded the identical reading in
+this same container shape (its verdict's fresh-gate container read
+the row ok, `GATE EXIT=0` — the row tracks the container's PID 1, not
+the tree). Nothing this card touched (a README and a Python tool) is
+exercised by that row, and the fix lives in `scripts/`/`tools/`,
+outside this card's Touch only.
+
+judgment calls (recorded in the sections above): scratch output and
+mutant copies live under `${CARGO_TARGET_DIR}/x5r52-f1-review/` — the
+card's Run hygiene names `~/.cache/nv3-review/X-5c-…-F1/`, but
+`~/.cache/nv3-review/` is read-only in this container and the card's
+own Notes direct outputs under `$CARGO_TARGET_DIR` (the base card's
+accepted judgment call); the two cmd_compare exit-1 cases capture
+`format_rows`'s stdout (`contextlib.redirect_stdout`) so the case
+lines stay one per case; `twin-t6b-real-class-only` asserts the
+specific T6b reason (`no real-class replay listing`), the established
+style for naming a check's half; the driver's anchored replacements
+assert each anchor's occurrence count before applying.
+
+ESCALATE: one item, informational — **the card's Acceptance re-read
+line names a run path that does not exist**: `R=$HOME/.cache/
+nv3-review/runlogs/X-5c-F4-F1-F1-CXX-F1.acc`, but no
+`X-5c-F4-F1-F1-CXX-F1.acc.campaign.json` exists anywhere under
+`~/.cache/nv3-review/`. Minimal repro: run the line verbatim — the
+prior comparator dies with `[Errno 2] No such file or directory:
+'…/runlogs/X-5c-F4-F1-F1-CXX-F1.acc.campaign.json'` and the line's
+final `[ $p -eq 0 ]` fails (both exits 1). The pinned
+`--run-sha256 6b686266…739a` matches exactly one file on disk —
+`runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json`, the file the base
+card's README record (its Acceptance section) and the verdict's own
+re-read both name — so the re-read was run against that file, with
+the sha pin enforced by the comparator itself. The card's Notes say
+the line is "the base card's, copied exactly", which cannot be: the
+base card ran F2-F1's file. No reading depended on the choice (the
+sha decides), but the line as written fails in any container that
+does not happen to have a file at the wrong path.
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the base card's record; the commits land — the log
+and the clean tree confirm); (b) the two card files this card's Read
+list names — `cards/X-5c-F4-F1-F1-F3-F2-F1-F1-F1.local.md` and
+`cards/X-5c-F4-F1-F1-F3-F2-F1-F2.local.md` — are not present in this
+worktree (only this card's own file, PLAN, the cards README and the
+worker prompt are); their content as this card quotes it (X5-R53
+(b)–(f), the builders' log order, -F2's Limits 3 and Work 2) is
+carried by the README's verbatim rule blocks, `twin_diag`'s docstring
+and this card's own Goal/Order, which is what was used; (c) under
+M-CMP-NO-PF the pre-existing `mpa-class-line` case crashes self-test
+after its 16 FAIL lines (recorded in step 3's note — the verdict's own
+12-case record shows the same); (d) the gate's `GATE EXIT=1` on the
+single ruled `runner e2e: K` row, recorded in full in the acceptance
+note above — environmental, pre-existing on this chain in this
+container shape, and outside this card's scope.
 
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
