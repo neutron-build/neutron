@@ -24,8 +24,9 @@ follow-up -F1: the comparator's two checking holes closed — `read_monitor`
 requires an `E4 SEEDS … MONITOR=` line in **every** run-out file, and
 `compare` refuses a `--run`/`--run-out` count mismatch (both cannot-check
 exits 2, nothing that counts as exempt moves) — and the verdict's sixteen
-surviving mutants die in `self-test` (seventeen new cases beside the
-refusals' four); the same 10k re-read once more under the hardened
+surviving mutants die in `self-test` (seventeen new cases in all,
+thirteen beside the refusals' four — count corrected by X-5c-PINS-1,
+verdict `db1e5162` §5 finding 2); the same 10k re-read once more under the hardened
 comparator, same reading (no campaign re-run; nothing under `src/`,
 `tests/`, `examples/`, `results/` or `x5r52-twin-diag.patch` changes).**
 Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1 — the X5-R53 card: P's
@@ -3053,15 +3054,16 @@ and `mpa-cap-base-mp-only` (a Base **MW** seed holding a
 `mpa-cap-counts-class-mp-only`).
 
 **Step 2 — the ten twin cases (the verdict's survivors), built on the
-two builders, never forks of them.** `twin_diag` gains seven knobs —
+two builders, never forks of them.** `twin_diag` gains six knobs —
 `twin0_meta_t` (round 0's twin replay-start `meta.t`, 0 as before),
 `twin1_meta_t2` (an older second replay start in round 1's twin
 segment), `twin1_recs` (records in round 1's own twin segment),
 `foreign_seed` (a run marker for another seed between round 1's twin
 replay start and its `Err`), `real0_extra` (a second real segment of
-round 0), `tail_lines` (a later round's segments after round 1's
-blocks) and the two new records `D4_TS5`/`D4_TS7` beside `D4_TS1`/
-`D4_TS2` — and `twin_diag3` gains `div_rounds` (which round-starts
+round 0) and `tail_lines` (a later round's segments after round 1's
+blocks) — plus the two new records `D4_TS5`/`D4_TS7` beside
+`D4_TS1`/`D4_TS2`, which are records, not knobs (count corrected by
+X-5c-PINS-1, verdict `db1e5162` §5 finding 3) — and `twin_diag3` gains `div_rounds` (which round-starts
 diverge on `N=4`). Every default keeps the original log byte for byte,
 and no existing case's name or expected verdict moved. The cases, each
 naming the check it expects (and the half, for T6a/T6b):
@@ -3256,8 +3258,12 @@ acceptance (this attempt, every line run for real): `python3 -I
 spikes/e4-recovery/tools/x5r52_compare.py self-test` — **78 cases,
 0 failed**, exit 0; the 10k re-read line — exit 0 with the identical
 reading above (run with `R` pointing at the sha-pinned run JSON; the
-line as printed in the card names a run path that does not exist —
-see ESCALATE); `bash scripts/gate.sh` — `STEP test EXIT=0`,
+ESC parenthetical below was wrong about the card's own line —
+corrected by X-5c-PINS-1, verdict `db1e5162` §5 finding 1: the card
+names `runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc`, which exists and carries
+the pinned sha256; the nonexistent `…CXX-F1.acc` path first appeared
+in this worker's own reasoning, not in the card, and no result
+depended on it — the sha decides); `bash scripts/gate.sh` — `STEP test EXIT=0`,
 `STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`,
 `STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`,
 `STEP enforcement-tests EXIT=1` with exactly **one** FAIL row —
@@ -3289,23 +3295,18 @@ specific T6b reason (`no real-class replay listing`), the established
 style for naming a check's half; the driver's anchored replacements
 assert each anchor's occurrence count before applying.
 
-ESCALATE: one item, informational — **the card's Acceptance re-read
-line names a run path that does not exist**: `R=$HOME/.cache/
-nv3-review/runlogs/X-5c-F4-F1-F1-CXX-F1.acc`, but no
-`X-5c-F4-F1-F1-CXX-F1.acc.campaign.json` exists anywhere under
-`~/.cache/nv3-review/`. Minimal repro: run the line verbatim — the
-prior comparator dies with `[Errno 2] No such file or directory:
-'…/runlogs/X-5c-F4-F1-F1-CXX-F1.acc.campaign.json'` and the line's
-final `[ $p -eq 0 ]` fails (both exits 1). The pinned
-`--run-sha256 6b686266…739a` matches exactly one file on disk —
-`runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json`, the file the base
-card's README record (its Acceptance section) and the verdict's own
-re-read both name — so the re-read was run against that file, with
-the sha pin enforced by the comparator itself. The card's Notes say
-the line is "the base card's, copied exactly", which cannot be: the
-base card ran F2-F1's file. No reading depended on the choice (the
-sha decides), but the line as written fails in any container that
-does not happen to have a file at the wrong path.
+ESCALATE: none. (The record originally carried one informational item
+— a claim that the card's Acceptance re-read line named a run path
+that does not exist, `runlogs/X-5c-F4-F1-F1-CXX-F1.acc`. **Corrected
+by X-5c-PINS-1, verdict `db1e5162` §5 finding 1: the claim was
+false.** The card names `R=$HOME/.cache/nv3-review/runlogs/
+X-5c-F4-F1-F1-F3-F2-F1.acc`, which exists and whose JSON carries the
+pinned `--run-sha256 6b686266…739a`; the nonexistent `…CXX-F1.acc`
+path first appeared in the worker's own reasoning, not in the card
+text it was given (the card's file time, 22:03, precedes the worker's
+commits, 22:44), and the re-read itself used the correct file, so no
+result depended on the error. The claim is withdrawn rather than kept:
+it did not deserve to stand as the record.)
 
 anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
 Read-only file system` line from the host's git maintenance on every
@@ -4435,6 +4436,49 @@ unchanged.
   tip, inert on every measurable event seed** — reported, not hidden.
   No new literal row was added (Limit 2 allows one; there is nothing
   for it to pin). ESCALATE item 2.
+
+**Step 4 — the comparator's seven cases, the repeated-`.out` refusal
+and its README corrections (item 4).**
+
+- `cmd_compare` gains exactly one refusal, beside the count tie (after
+  the sha256 checks, before any campaign file is read): a `--run-out`
+  list with a repeated path prints `ERROR …` to stderr and returns 2.
+  Paths only; content-identical distinct paths stay out (Limit 6), and
+  the run-out↔run `E4 SEEDS=N` tie is not decided here.
+- `self_test` gains the seven cases beside the four MONITOR cases
+  (equal ref/run docs throughout, so only the named behaviour can move
+  the exit): `monitor-later-line-counts`, `monitor-last-file-counts`,
+  `monitor-empty-run-out`, `monitor-line-cut-before-monitor`,
+  `monitor-sums-not-max` (asserting the printed `MONITOR 2`),
+  `monitor-more-run-outs-than-runs` (two **distinct** out files, so
+  only the count tie can fire) and `monitor-run-out-repeated` (the
+  same path twice with two `--run`, so the counts tie and only the
+  duplicate refusal fires). `SELF-TEST 85 cases, 0 failed`; none of
+  the existing 78 case names or verdicts moved. `read_monitor`, the
+  count tie, `check_mp`, `meta_only_eligible`, `mpa_pass_fail`,
+  `twin_ddl_prefilter`, `compare_reading`, `compare_exit_code`,
+  `format_rows`, `check_twin` and `walk_seed_segments` are unchanged
+  (the diff touches `cmd_compare`'s refusal and `self_test` only).
+- The README corrections of verdict `db1e5162` §5, inside that card's
+  record: the false ESCALATE withdrawn (the card's Acceptance path
+  exists and carries the pinned sha; the wrong path was the worker's
+  own, and no result depended on it); "seventeen new cases beside the
+  refusals' four" → seventeen in all, thirteen beside the four; step
+  2's "seven knobs" → six (the `D4_TS5`/`D4_TS7` records are not
+  knobs).
+
+The seven mutants, each on its own scratch copy of the script, run
+through `self-test` (each dies on its named case):
+
+| mutant | self-test reading |
+|---|---|
+| **G-MON-FIRSTLINE** (each file's first line only) | FAIL `monitor-later-line-counts` (reads MONITOR 0, exit 0) |
+| **G-MON-FIRSTFILE** (the first file only) | FAIL `monitor-last-file-counts` (and `monitor-sums-not-max`) |
+| **G-MON-EMPTY-OK** (an empty file accepted) | FAIL `monitor-empty-run-out` (rc 0) |
+| **G-MON-NO-MONITOR-FIELD** (a line without `MONITOR=` counts as seen) | FAIL `monitor-line-cut-before-monitor` (rc 0) |
+| **G-MON-MAX** (the maximum, not the sum) | FAIL `monitor-sums-not-max` (prints MONITOR 1) |
+| **G-TIE-ONE-WAY** (refuses only too few) | FAIL `monitor-more-run-outs-than-runs` (rc 0) |
+| **M-MON-DUP-OUT** (the repeated-path refusal removed) | FAIL `monitor-run-out-repeated` (rc 0) |
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 

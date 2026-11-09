@@ -460,6 +460,24 @@ def cmd_compare(args):
             file=sys.stderr,
         )
         return 2
+    # The repeated-path refusal (card X-5c-PINS-1, Limit 3): the same
+    # --run-out path twice would read one run's MONITOR twice and hide
+    # another run's behind the duplicate — the same hole the count tie
+    # closes on counts. Paths only: content-identical distinct paths
+    # stay out (a run-out↔run tie, `E4 SEEDS=N` against that run's
+    # seed count, is a new refusal of its own and is not added here).
+    # A cannot-check exit 2 with an ERROR stderr line, exactly like the
+    # count tie, and like it checked before any campaign file is read.
+    if len(set(args.run_out)) != len(args.run_out):
+        dup = sorted(
+            {p for p in args.run_out if args.run_out.count(p) > 1}
+        )
+        print(
+            "ERROR a repeated --run-out path hides a run's MONITOR behind a duplicate: %s"
+            % dup,
+            file=sys.stderr,
+        )
+        return 2
     ref_doc = json.load(open(args.ref))
     ref_all = seed_index(ref_doc)
     run_seeds = {}
@@ -1784,6 +1802,99 @@ def self_test():
     a.run_out = [ok_out]
     rc = cmd_compare(a)
     check("monitor-run-out-count-mismatch", rc == 2, "rc=%d" % rc)
+
+    # --- X-5c-PINS-1 item 4 (verdict db1e5162 §3's six survivors and
+    # the repeated-path refusal): seven more cases, each built so only
+    # the named behaviour can move the exit (the ref/run docs are
+    # equal throughout).
+    later_out = os.path.join(tmp, "later.out")
+    open(later_out, "w").write(
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n"
+    )
+    cut_out = os.path.join(tmp, "cut.out")
+    open(cut_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0\n")
+    empty_out = os.path.join(tmp, "empty.out")
+    open(empty_out, "w").write("")
+    ok2_out = os.path.join(tmp, "ok2.out")
+    open(ok2_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n")
+
+    # G-MON-FIRSTLINE: every line of one file counts — MONITOR=0 then
+    # MONITOR=1 must read 1 (the row is present, the exit is 1).
+    a.run = [eq_path]
+    a.run_out = [later_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    out_lines = buf.getvalue().splitlines()
+    check(
+        "monitor-later-line-counts",
+        rc == 1
+        and any("bullet3-monitor" in ln for ln in out_lines)
+        and any(ln.startswith("DIGESTS_MOVED 0 FAILING_ROUNDS 0 MONITOR 1") for ln in out_lines),
+        "rc=%d %s" % (rc, out_lines[:2]),
+    )
+
+    # G-MON-FIRSTFILE: every run-out file counts — MONITOR=1 in the
+    # last file only must read 1.
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [ok_out, mon1_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    out_lines = buf.getvalue().splitlines()
+    check(
+        "monitor-last-file-counts",
+        rc == 1
+        and any("bullet3-monitor" in ln for ln in out_lines)
+        and any(ln.startswith("DIGESTS_MOVED 0 FAILING_ROUNDS 0 MONITOR 1") for ln in out_lines),
+        "rc=%d %s" % (rc, out_lines[:2]),
+    )
+
+    # G-MON-EMPTY-OK: an empty run-out file is a cannot-check exit 2.
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [empty_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-empty-run-out", rc == 2, "rc=%d" % rc)
+
+    # G-MON-NO-MONITOR-FIELD: an E4 SEEDS line cut before MONITOR= is
+    # no E4 SEEDS line at all — a cannot-check exit 2.
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [cut_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-line-cut-before-monitor", rc == 2, "rc=%d" % rc)
+
+    # G-MON-MAX: the total is the sum, not the maximum — two files each
+    # MONITOR=1 print MONITOR 2.
+    mon1b_out = os.path.join(tmp, "mon1b.out")
+    open(mon1b_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n")
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [mon1_out, mon1b_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    out_lines = buf.getvalue().splitlines()
+    check(
+        "monitor-sums-not-max",
+        rc == 1
+        and any(ln.startswith("DIGESTS_MOVED 0 FAILING_ROUNDS 0 MONITOR 2") for ln in out_lines)
+        and any("bullet3-monitor" in ln for ln in out_lines),
+        "rc=%d %s" % (rc, out_lines[:2]),
+    )
+
+    # G-TIE-ONE-WAY: more run-outs than runs is as much a count mismatch
+    # as too few — two distinct out files against one run.
+    a.run = [eq_path]
+    a.run_out = [ok_out, ok2_out]
+    rc = cmd_compare(a)
+    check("monitor-more-run-outs-than-runs", rc == 2, "rc=%d" % rc)
+
+    # M-MON-DUP-OUT: the same --run-out path twice (the counts tie, so
+    # only the repeated-path refusal fires).
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [ok_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-run-out-repeated", rc == 2, "rc=%d" % rc)
 
     print("SELF-TEST %d cases, %d failed" % (cases[0], len(failures)))
     return 1 if failures else 0
