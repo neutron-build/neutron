@@ -1070,6 +1070,34 @@ pub fn q4i_raw_of(
     opened_ckpt_id.is_some_and(|k| windows.get(&k).is_some_and(|w| w.3 >= 1))
 }
 
+/// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 3b): the per-round ledger
+/// fold, pure** — the exact steps the driver took inline before this
+/// card: insert this attempt's ledger rows, key `q4i_raw` on the
+/// opened meta's own id, then drop the harness checkpoint's id (a
+/// later round's recovery can open its meta, and its window is not
+/// recorded; without the removal a stale row from an older checkpoint
+/// of the same id could answer for its meta). Pure over the ledger, so
+/// the harness-checkpoint removal is pinnable directly
+/// (`x5_r42_harness_checkpoint_image_is_not_q4i`; no 0..1000 round
+/// exercises the divergence, measured — the pure case is the card's
+/// named fallback). **G-LEDGER-NOREMOVE** (the harness checkpoint
+/// stays in the ledger) drops the removal here and fails that pin.
+pub fn fold_ckpt_windows(
+    ckpt_windows: &mut BTreeMap<u64, (u64, u64, u64, u64)>,
+    rows: &[(u64, u64, u64, u64, u64)],
+    opened_ckpt_id: Option<u64>,
+    harness_ckpt_id: Option<u64>,
+) -> bool {
+    for &(k, sp, mg, ru, rupf) in rows {
+        ckpt_windows.insert(k, (sp, mg, ru, rupf));
+    }
+    let raw = q4i_raw_of(ckpt_windows, opened_ckpt_id);
+    if let Some(hk) = harness_ckpt_id {
+        ckpt_windows.remove(&hk);
+    }
+    raw
+}
+
 /// **X5-R42: `q4i`** — the Q4-I row's per-round predicate:
 /// `q4i_raw` ∧ the round's own crash fired ∧ Q18's `end.is_some()`
 /// (excluded like SIZING: nested recovery crashes — only the final
@@ -2266,19 +2294,18 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // X5-R38: the window pick of record (a digest input only when
         // set — see `RoundRec::cwin`).
         rr.cwin = cwin_pick;
-        // **X5-R42 (step 2): the image arm.** Merge this (final)
+        // **X5-R42 (step 2): the image arm.** Fold this (final)
         // attempt's ledger rows into the per-seed ledger, key `q4i_raw`
-        // on the opened meta's own id, fold `q4i`, then drop the harness
-        // checkpoint's id — a later round's recovery can open its meta,
-        // and its window is not recorded.
-        for &(k, sp, mg, ru, rupf) in &out.obs.ckpt_windows {
-            ckpt_windows.insert(k, (sp, mg, ru, rupf));
-        }
-        rr.q4i_raw = q4i_raw_of(&ckpt_windows, out.opened_ckpt_id);
+        // on the opened meta's own id, then drop the harness
+        // checkpoint's id — all in [`fold_ckpt_windows`], pure for the
+        // X-5c-F4-F1-F1-F3-F1 step 3b pin.
+        rr.q4i_raw = fold_ckpt_windows(
+            &mut ckpt_windows,
+            &out.obs.ckpt_windows,
+            out.opened_ckpt_id,
+            out.harness_ckpt_id,
+        );
         rr.q4i = q4i_of(rr.q4i_raw, rr.fired, out.end_store.is_some());
-        if let Some(hk) = out.harness_ckpt_id {
-            ckpt_windows.remove(&hk);
-        }
         rec.deadlock |= rr.deadlock;
         rec.panic |= rr.panic;
         rec.baton |= rr.baton;

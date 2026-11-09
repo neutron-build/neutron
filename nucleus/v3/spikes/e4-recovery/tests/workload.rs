@@ -2100,6 +2100,142 @@ fn x5_r42_post_freeze_reuse_is_not_q4i() {
     assert!(!r1.q4i, "q4i follows q4i_raw");
 }
 
+/// **X5-R41 (card X-5c-F4-F1-F1-F3-F1 step 3a): a uniform-crash round
+/// is never selected, however its draw reads.** The literal seed is
+/// **10 round 0** (`seed/10` odd, so 5.5 gives it a uniform crash; not
+/// a drop round), and at `r41_share` 1000 its `S_R41` draw reads
+/// `Some(true)` — below the share, a hit. The selection's
+/// targeted-crash clause (`seed / 10` even) still excludes it: the
+/// built GC task carries no `R41Arm` and none of the block's ops, in
+/// any task. **G-SEL-NOTARGET** (the selection drops the targeted
+/// clause) selects this round — the draw already hit — and the arm
+/// appears, failing this pin.
+#[test]
+fn x5_r41_uniform_round_not_selected() {
+    use e4_recovery::harness::ScriptOp;
+    use e4_recovery::model::Model;
+    use workload::{Knobs, Tuning, build_round, r41_pick};
+    let mut tun = Tuning::BASE;
+    tun.r41_share = 1000;
+    let knobs = Knobs::derive(10, 0, &tun);
+    assert_eq!((10u64 / 10) % 2, 1, "seed 10 is a uniform-crash seed");
+    assert!(!knobs.drop_tree, "round 0 of seed 10 is not a drop round");
+    assert_eq!(
+        r41_pick(10, 0, &tun),
+        Some(true),
+        "the S_R41 draw hits at share 1000 — the clause is all that keeps this round out"
+    );
+    let (script, _desc, hook) = build_round(10, 0, &tun, &knobs, &Model::new(), 0);
+    assert!(hook.is_empty(), "a uniform round has no targeted hook name");
+    for t in &script.tasks {
+        let has_arm = t.ops.iter().any(|op| matches!(op, ScriptOp::R41Arm { .. }));
+        let has_block = t
+            .ops
+            .iter()
+            .any(|op| matches!(op, ScriptOp::R41Wait | ScriptOp::R41Done));
+        assert!(
+            !has_arm && !has_block,
+            "a task of seed 10's round 0 must carry neither the arm nor the block \
+             (G-SEL-NOTARGET reverts this)"
+        );
+    }
+}
+
+/// **X5-R43 (card X-5c-F4-F1-F1-F3-F1 step 3a): "passes in the clean
+/// arm" is the oracle, not the fold.** The literal seed is **7 round
+/// 0** at BASE (class MP): the clean round **passes the fold**
+/// (`pass == true`) while carrying the oracle text `O-1(a) at c=23:
+/// published {} != model {2, 3, 4, 5}` — an MP detection round whose
+/// failure text is expected. The same round under the Slot fault
+/// (`M-FREE-HOME-ALLOC`) also fails the oracle. `seeded_new_failures`
+/// must **not** count it: a fault that changes nothing about a round
+/// that already carries an oracle text is not caught by it.
+/// **G-SEEDED-FOLD** (`passes_oracle = cr.pass`) reads this round's
+/// `pass == true` as passing and counts it, failing this pin.
+#[test]
+fn x5_r43_oracle_pass_not_fold() {
+    use e4_recovery::campaign::seeded_new_failures;
+    use e4_recovery::store::Mutant;
+    use workload::Tuning;
+    let clean = workload::run_seed_with(7, None, &Tuning::BASE);
+    assert!(clean.defect.is_none(), "seed 7: {:?}", clean.defect);
+    assert_eq!(clean.digest, 2267580514, "seed 7's BASE digest moved");
+    let cr = clean.rounds.first().expect("seed 7 runs round 0");
+    assert!(cr.pass, "the clean round passes the fold");
+    assert!(
+        cr.o1_fail.is_some() || cr.o2_fail.is_some() || cr.o3_fail.is_some(),
+        "the clean round carries an oracle text: o1={:?}",
+        cr.o1_fail
+    );
+    // The same round in the mutant arm fails the oracle too.
+    let slot = workload::run_seed_with(7, Some(Mutant::FreeHomeAlloc), &Tuning::BASE);
+    let fr = slot.rounds.first().expect("the Slot arm runs round 0");
+    assert!(
+        fr.o1_fail.is_some() || fr.o2_fail.is_some() || fr.o3_fail.is_some(),
+        "the mutant arm's round carries an oracle text: o1={:?}",
+        fr.o1_fail
+    );
+    assert!(
+        !fr.deadlock && !fr.panic,
+        "the arm's round is an oracle failure, never a hang"
+    );
+    let nf = seeded_new_failures(std::slice::from_ref(&clean), std::slice::from_ref(&slot));
+    assert!(
+        !nf.contains(&(7, 0)),
+        "a clean round that already carries an oracle text never counts as new, however \
+         its fold pass reads (G-SEEDED-FOLD reverts this): {nf:?}"
+    );
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 3b): the harness
+/// checkpoint's image is not `q4i`.** No 0..1000 round at share 1000
+/// or at BASE exercises the divergence (measured on a scratch
+/// instrumented export: the harness-checkpoint removal never flips
+/// `q4i_raw`), so this is the card's named fallback — **a
+/// pure-function ledger case with a literal harness id**. Round m
+/// completes its harness checkpoint with id **7**, an id whose stale
+/// row (an older checkpoint of the same id, holding a reuse — a meta
+/// rollback's shape) is in the ledger; the fold keys round m's
+/// `q4i_raw` on its opened image id 3 and then drops id 7. Round m+1's
+/// final recovery opens the harness checkpoint's image, id 7: its
+/// window was never recorded, and the stale row is gone — `q4i_raw`
+/// reads **false**. **G-LEDGER-NOREMOVE** (the harness checkpoint
+/// stays in the ledger) keeps the stale row, and round m+1's lookup
+/// answers with it — `true` — failing this pin.
+#[test]
+fn x5_r42_harness_checkpoint_image_is_not_q4i() {
+    use std::collections::BTreeMap;
+    use workload::fold_ckpt_windows;
+    // The ledger holds a stale row for id 7 (an older checkpoint of
+    // that id, its window held a whole-window reuse with its pre-freeze
+    // half) and a row for the image round m opens.
+    let mut w: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
+    w.insert(3, (4, 8, 2, 2));
+    w.insert(7, (15, 12, 9, 9));
+    // Round m: no rows of its own; opened id 3; harness checkpoint id 7.
+    let raw_m = fold_ckpt_windows(&mut w, &[], Some(3), Some(7));
+    assert!(
+        raw_m,
+        "round m opens image 3, whose own window held a reuse"
+    );
+    assert!(
+        !w.contains_key(&7),
+        "the harness checkpoint's id must leave the ledger — its window is not recorded"
+    );
+    // Round m+1: its final recovery opens the harness checkpoint's
+    // image, id 7. No row answers (the stale row is gone): false.
+    let raw_m1 = fold_ckpt_windows(&mut w, &[], Some(7), None);
+    assert!(
+        !raw_m1,
+        "the harness checkpoint's image is not q4i, and the stale row for its id must not \
+         answer for it (G-LEDGER-NOREMOVE reverts this)"
+    );
+    // And a real checkpoint of id 7, recorded by a later round, does
+    // count — the removal never leaks to rows that belong there.
+    let raw_m2 = fold_ckpt_windows(&mut w, &[(7, 15, 12, 9, 9)], Some(7), None);
+    assert!(raw_m2, "a recorded window of the opened image still counts");
+}
+
 /// **X5-R42 (step 6): a refused round is not `q4i`.** The fold is
 /// `q4i_raw ∧ fired ∧ end.is_some()` (Q18's end): the exclusions match
 /// SIZING's — nested recovery crashes, the harness checkpoint, and
