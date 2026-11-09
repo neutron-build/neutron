@@ -3544,6 +3544,178 @@ movement): 609 `887984205 → 1508388762` and 849 `3570145416 →
 2934853921`, both "twin directory re-seed
 (X-5c-F4-F1-F1-F3-F2-F1-F2), rounds r1".
 
+**Step 5 — the 10k of record, the acceptance, and this RESULT (the
+commits of this step).** The campaign ran at the code tip `7a9d72e2`
+(step 4's commit; every commit after it is this README record, which no
+build reads — the X5-R25 pattern, the same as the Base card's own
+acceptance at `eb9c4328` against its final `db1e5162`): 16 threads under
+`ulimit -v 25165824`, exit 0 in 15 m 36 s (23:57:06 → 00:12:42),
+`status_lines=0`, JSON sha256
+`41c307a470ba51e1eae7911fa7b1b7e7146e810f191ccb348bd0713a19601cd2`:
+
+```
+E4 SEEDS=10000 O1_FAIL=2309 O2_FAIL=0 O3_FAIL=19 DEADLOCK=0 PANIC=0 O1F_FAIL=2309 MONITOR=0
+E4 FOLD FAILING_SEEDS=19 FAILING_ROUNDS=19 TWIN_FAILING_ROUNDS=0 DEFECT_SEEDS=0
+```
+
+`verify --no-quotas` on it (the first attempt of this run was killed
+mid-verify; re-run whole): **`VERIFY OK (--no-quotas) seeds=10000
+digests reproduce`, `verify_exit=0`**, 15 m 26 s (01:18:03 → 01:33:29).
+The comparator against the sha-pinned F2-F1 baseline — `--ref
+runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json --ref-sha256 6b686266…
+739a`, `--no-twin-exemption --max-twin-failing 0` — **exit 0**, in
+full:
+
+```
+DIGESTS_MOVED 9 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 0 []
+MOVED_MP_PENDING 0 []
+META_ONLY_ELIGIBLE 0 []
+MPA_PASS_FAIL 0 []
+MPA_CLASS base 10 tip 10
+TWIN_DDL_PENDING 0 []
+MOVED_LOST 0 []
+HEALED 0 []
+TWIN_HEALED 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)]
+TEXT_CHANGED 0 []
+TWIN_FAILING 0 [] BASE 7
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+Exactly the card's expected (not a target) reading: all seven of the
+verdict's failing twin entries healed at their Base rounds,
+`TWIN_FAILING 0`, `NEW_FAILING 0`, no `NOT-EXPLAINED`,
+`MOVED_MP_PENDING 0 []` (the gate has no check-mp row to run at this
+tip). `MPA_CLASS base 10 tip 10` — the class is unchanged against this
+card's own baseline (the earlier `base 11 tip 10` readings compared the
+older CXX-F1 reference on the base side; this comparison's base side is
+the F2-F1 file itself, which as a tip held 10). The nine moved digests,
+each with its re-seed event (step 2's attribution, extended): 609 r1,
+849 r1, 2599 r1+r2, 2669 r1, 2859 r1, 3449 r1, 5049 r1, 7179 r1 — and
+**9059 r1**, the one move outside step 2's 0..1000 window, measured
+singly in the diag export after the compare: `X5R52 reseed seed=9059
+round=1`, diag digest `1541368872` = the plain tip's (`3239178506 →
+1541368872`, no failing round, no twin failing). Ruling (e)'s "moves
+only if (b) fires" holds on the whole 10k: nine moved digests, nine
+attributed.
+
+acceptance (every line run for real; `cargo test -q --release -p
+e4-recovery` — **266 tests, 0 failed** (18+25+28+43+47+50+55 across nine
+binaries); `cargo test -q --release -p e4-recovery --test workload
+x5r52_twin` — **4 passed, 0 failed**; the M-TWIN-NO-DIR-RESEED line —
+**rc=101**, failing exactly `x5r52_twin_reseed_heals_2859_r1` (panic
+text the Base's own `O-1(a) at c=10: published {} != model {2, 3}`) and
+`x5r52_twin_reseed_heals_609_r1` (`O-1(a) at c=12 … {2, 3, 4}`); the
+M-TWIN-RESEED-ALWAYS line — **rc=101**, failing exactly
+`x5r52_twin_chain_kept_when_directories_agree_639` (639's digest
+`1144734390` ≠ the Base literal `3366243401`, the step-3-measured
+mutant value); the diag line — `git apply --check` clean, **not
+refreshed**; the 10k run, the verify and the compare — above; and
+`bash scripts/gate.sh` — run last, at the tip this record leaves; its
+reading is the gate note beneath, added after the run.)
+
+judgment calls (this step): the campaign of the first 10k attempt —
+prov `commit=7a9d72e2…`, `exit=0`, killed only in its verify — is
+reused, per the restart rule's "reuses the scratch builds and outputs";
+the killed attempt's dangling `verify_head=… verify_start=…` half-line
+was removed from the `.prov` before this attempt's verify so the file
+tells one story (the campaign half is untouched, byte for byte); the
+acceptance lines' `git -C ../.. archive HEAD nucleus` is executed as the
+identical `git archive HEAD nucleus` from the worktree root (the
+container's shell rejects `git -C` outright — the worker prompt's own
+no-global-git-options rule — and the archive bytes are the same); the
+lines' leading `rm -rf $D` is dropped where `$D` does not exist (a
+no-op the container's shell rejects wholesale); scratch output lives
+under `$CARGO_TARGET_DIR` (the card's `~/.cache/nv3-review/<card>/` is
+read-only in this container — the base card's accepted judgment call,
+carried by every card since).
+
+ESCALATE: none.
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the base card's record; the commits land — the log
+and the clean tree confirm); (b) the Read-list card file
+`cards/X-5c-F4-F1-F1-F3-F2-F1-F1.local.md` is not present in this
+worktree (only this card's own file, PLAN, the cards README and the
+worker prompt are) — carried from the two previous cards' records; its
+content as this card quotes it is carried by the README's verbatim rule
+blocks; (c) 9059's move surfaced only in the 10k compare (outside step
+2's mandated 0..1000 attribution window) — attributed singly in the diag
+export the same hour, recorded above, not hidden.
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F2)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F2   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F2   commit: (this commit; the chain e1e46294 → 06b2209d → ba27e950 → 456e2afe → d4767094 → 1d0d2bcd → 7a9d72e2 → here)
+
+The seven RESULT items the card requires:
+
+1. **The ruling, verbatim, with X5-R52 (g)'s note** — the "directory
+   re-seed (P ruling, verbatim …)" block above, ((a)–(e)), committed by
+   step 0 before any code of this card, with the (g) quotation beneath
+   it. X5-R51 is re-issued for this card and read with X5-R52; (c)(i)
+   is void (the re-seed makes T2 impossible); the comparator runs with
+   `--no-twin-exemption --max-twin-failing 0`; any failing twin entry
+   is a STOP.
+2. **The Base confirmation of 2859 and 609 twin r1** — step 1: at the
+   Base (this card's parent `db1e5162`), run singly, 2859's twin r1
+   fails with `O-1(a) at c=10: published {} != model {2, 3}` (digest
+   `2789281219`, equal to the baseline's) and 609's with `O-1(a) at
+   c=12: published {} != model {2, 3, 4}` (digest `887984205`, equal to
+   the baseline's) — the verdict's mechanism confirmed before the code.
+3. **The 0..1000 movement under X5-R51/X5-R52** — step 2's comparator
+   output in full (exit 0; re-derived after the 10k from the preserved
+   five `.json`/`.out` pairs, byte-identical): `DIGESTS_MOVED 2
+   FAILING_ROUNDS 4 MONITOR 0`; `MOVED_GAINED`, `MOVED_MP_PENDING`,
+   `META_ONLY_ELIGIBLE`, `MPA_PASS_FAIL`, `TWIN_DDL_PENDING`,
+   `MOVED_LOST`, `HEALED`, `TEXT_CHANGED` all `0 []`; `MPA_CLASS base 1
+   tip 1`; `TWIN_HEALED 2 [(609, 1), (849, 1)]`; `TWIN_FAILING 0 []
+   BASE 2`; `NEW_FAILING 0 [] BAD_SEEDS 0 []`. check-mp:
+   `MOVED_MP_PENDING 0 []` — no row, so no single-seed run to make.
+4. **The attribution** — step 2: re-seed events 0..1000 = 259 r1,
+   609 r1, 719 r1, 809 r1, 849 r1 (5 events); the eprintln moved no
+   digest (all 1000 diag-export digests equal the plain tip's); moved
+   {609, 849} ⊆ re-seeded, both at r1; re-seeded and not moved = {259,
+   719, 809}; X5-R37's 54 seeds singly — only 2669 moved
+   (`357787865 → 1374321949`, event r1), the other 53 byte-identical
+   with no event. Beyond the required scope, measured singly at the
+   tip: the five remaining verdict entries (2599 r1+r2, 2859 r1, 3449
+   r1, 5049 r1, 7179 r1) each moved with its event(s) at the same
+   round(s) it failed at the Base; and from the 10k, 9059 r1 (step 5).
+   On the whole 10k: nine moved digests, nine attributed — ruling (e)
+   holds everywhere measured.
+5. **Every literal changed, the re-selections, the kept-chain pin's
+   selection** — step 4: exactly one red literal, re-derived with its
+   round — `x5_r37_base_tuning_reproduces_1b0ce54e`'s **2669
+   `357787865 → 1374321949`, twin directory re-seed at round 1**; the
+   other 53 of X5-R37's 54 keep their seeds; no other pin red, so `g8`
+   ([747, 967]) and F3's share-1000 pins keep their selections by their
+   own rules (re-selection applies only to red pins, and none is). The
+   tsv rows appended: 609 and 849, both rounds r1. The kept-chain pin —
+   step 3: **seed 639**, the card's rule's lowest MW seed in 0..1000
+   with at least two rounds, no re-seed event in step 2, and a digest
+   that moves under M-TWIN-RESEED-ALWAYS (`3366243401 → 1144734390`,
+   measured; the thirteen lower candidates 9, 129, 139, 189, 199, 309,
+   369, 399, 479, 509, 519, 559, 569 inert under it); the pin holds the
+   Base literal unchanged.
+6. **The mutant table** — step 3, all six caught, none UNCAUGHT:
+   M-TWIN-NO-DIR-RESEED → both heal pins (re-proven in the Acceptance's
+   own form above); M-TWIN-RESEED-ALWAYS → the kept-chain pin
+   (re-proven the same way); M-TWIN-PRED-ALWAYS → the predicate pin and
+   the kept-chain pin; M-TWIN-PRED-ENTRIES → the predicate pin;
+   M-TWIN-RESEED-FROM-TWIN → both heal pins; M-TWIN-RESEED-LATE → both
+   heal pins (and the kept-chain pin, a superset).
+7. **The class record: the C-XX recovery-Err twin family is
+   root-caused and fixed by this card.** Under E4's owner rule, a
+   recurrence in F4's files counts as new.
+
+**This 10k is the BASE baseline of record.** It replaces F2-F1's
+(`6b686266…739a` stays the reference this card was judged against; the
+file this card leaves — `41c307a4…01cd2`, with its `.campaign.out`,
+`.verify.out` and `.prov` — is what F4's REFRESH reads and F4's step 0
+commits, in the X5-R25 pattern). F3-F1, based on this card, moves no
+BASE digest against it.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
