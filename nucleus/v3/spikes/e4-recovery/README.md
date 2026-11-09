@@ -1296,9 +1296,11 @@ the pin fails on `Some("twin round 1: the crash spec never fired
 
 **Step 4 — `r21c` (commit 70e87d9a).** 7469 is back in the list
 beside 9469, and the pin's doc is corrected per the verdict's finding
-2: at CXX's tip only 9469 reaches the re-pair path with a firing
-twin; 2669 re-derives in the twin's first attempt; 4049, 4309 and
-9809 re-derive nothing.
+2: at CXX's tip, within `r21c`'s literal list, only 9469 reaches the
+re-pair path with a firing twin; 2669 re-derives in the twin's first
+attempt; 4049, 4309 and 9809 re-derive nothing. (Scope corrected by
+X-5c-PINS-1, verdict `5db63057` finding 1: over 0..10000 — outside the
+literal list — 8469 and 8869 reach it with a firing twin too.)
 
 **Step 5 — the last-step pin's second seed (commit 39ddccdd).**
 `drop_last_step_keeps_its_pages_pinned` runs its unchanged body at
@@ -1314,8 +1316,13 @@ exactly as its finding 3 prescribed.
 
 **Step 6 — the digests (commit ba4aac1f).** Single seeds and the one
 contiguous 0..200, under `ulimit -v 25165824`, output outside the
-worktree; pre = CXX's tip (= this card's base, whose literals the
-X5-R37 pin holds byte for byte), post = this tip:
+worktree; pre = O1C-F1 at `86e17a34` (this card's base, whose literals
+the X5-R37 pin holds byte for byte — **not** CXX's tip: corrected by
+X-5c-PINS-1, verdict `5db63057` finding 1. CXX's tip differs from
+O1C-F1 in 3 digests — `1066`, `6555` and `7590` r0, O1C-F1's own named
+movers, outside this list and outside 0..200 — so a comparison against
+CXX's tip would have shown them; the measured table below compares
+against the base as recorded), post = this tip:
 
 | Run | Movement |
 |---|---|
@@ -4360,6 +4367,44 @@ copies, so the worktree never held them):
 |---|---|---|
 | **GX-RUPF-NORESET** (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | 101 | `x5_r42_second_window_reuse_pf_starts_at_zero`: window 2 starts `Some((0, 1))` ≠ `Some((0, 0))` |
 | **GX-R50-NOSELECT** (`r41p` loses `r41 &&`) | 101 | `x5_r50_ineligible_rounds_draw_nothing`: seed 13 carries block A's ops for index 0 |
+
+**Step 2 — the joint-arm supply diagnostic and the CXX-F1 README fixes
+(item 2).**
+
+- The diagnostic, in the `twin_paired` manner: `SeedRec` gains
+  `twin_joint_arm` (did the R21 (c) joint arm run this round) and
+  `twin_joint_stale_reads` (the stale-read count at the joint re-run's
+  start — the reads `treads.clear()` zeroes), both doc-commented
+  diagnostic-only, never read by `SeedRec::finish`, never serialized;
+  defaults for every round without an arm. Recorded beside the
+  `twin_paired` push. The X5-R37 digest pin is unmoved.
+- **The card's premise has drifted, and the pin records it.** At the
+  CXX-F1 tip the joint arm ran at seed 7469 alone of 10000 (verdict
+  `5db63057`); at this tip (`2e8d1b13`) it has **no live seed**: a
+  0..1000 census (in-process, scratch export, 8 threads, 93.6 s) reads
+  `JOINT_ARM_SEEDS=[]`, and every seed of the re-pair family — 2669,
+  4049, 4309, 7469, 8469, 8869, 9469, 9809 — reads
+  `twin_joint_arm` all-false. At 7469 the re-paired twin now fires at
+  the first re-derived spec directly (`Mid2@3`, round 1 fired, no
+  defect — `r48_repaired_twin_fires_at_the_joint_spec` still passes),
+  so the joint draw never runs. X5-R49's slot renumbering
+  (X-5c-F4-F1-F1-F3-F2-F1) and the twin directory re-seed
+  (X-5c-F4-F1-F1-F3-F2-F1-F2) are the movers.
+- `r48_joint_supply_is_fresh_at_7469` therefore holds the honest
+  subset: one diagnostic entry per executed round, a fresh supply
+  (zero stale reads), and the arm's absence asserted as the tripwire
+  (its failure is the signal that the arm is live again and the
+  freshness assertion above is what G5-R48-TREADS-KEPT must fail).
+
+| mutant | rc | outcome |
+|---|---|---|
+| **G5-R48-TREADS-KEPT** (drop `treads.clear()`) | 0 | **UNCAUGHT at this tip** — inert: the whole `--test workload` suite passes under it (56/57 with only the pin's old premise assert, removed in the final form; 57/57 after), because no measurable round reaches the clear. Reported, not hidden; the tripwire above revives the catch the day an arm runs. ESCALATE item 1. |
+
+- README fixes (verdict `5db63057` finding 1): step 6's "pre" now
+  names O1C-F1 at `86e17a34` as the base and attributes 1066, 6555
+  and 7590 r0 to it (CXX's tip's 3-digest difference); step 4's "only
+  9469" is scoped to `r21c`'s literal list, naming 8469 and 8869.
+  No literal moved (Limit 2 held).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 

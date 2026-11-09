@@ -1522,6 +1522,55 @@ fn r48_repaired_twin_fires_at_the_joint_spec() {
     );
 }
 
+/// **X-5c-PINS-1 item 2 (verdict X-5c-F4-F1-F1-CXX-F1's follow-up (a),
+/// finding 2): the joint arm's supply-freshness diagnostic.** The R21
+/// (c) re-pair block's joint arm re-runs the twin at the joint spec
+/// with the caller's collector `treads`; `run_round` extends it, so
+/// `treads.clear()` before the re-run is what keeps the re-paired
+/// twin's unfired attempt's recovery reads out of the supply the real
+/// round's oracle then reads (`supply2`'s `recovery_reads`). The
+/// diagnostic fields `twin_joint_arm`/`twin_joint_stale_reads` (the
+/// `twin_paired` manner: never a digest input, `SeedRec::finish`
+/// never reads them, never serialized) record whether the arm ran and
+/// the stale-read count at its re-run's start.
+///
+/// **At this tip (`2e8d1b13`) the joint arm itself has no live seed,
+/// and the pin records that.** At the CXX-F1 tip the arm ran at seed
+/// 7469 alone of 10000 (verdict `5db63057`); X5-R49's slot renumbering
+/// and the twin directory re-seed have since moved the schedules, and
+/// 7469's re-paired twin now fires at the first re-derived spec
+/// (`Mid2@3`) without the joint draw — measured: a 0..1000 census
+/// plus the re-pair family (2669, 4049, 4309, 7469, 8469, 8869, 9469,
+/// 9809) all read `twin_joint_arm` all-false (the census log is in the
+/// README's step 2 record). The pin therefore holds what is true: one
+/// diagnostic entry per executed round, a fresh supply (zero stale
+/// reads) at the named seed, and the arm's absence asserted as the
+/// tripwire — the day it fails, the joint arm is live again at 7469
+/// and **G5-R48-TREADS-KEPT** (drop the `clear()`) becomes catchable
+/// by the freshness assertion. Until then that mutant is **UNCAUGHT
+/// at this tip** (inert: no measurable round reaches the clear).
+#[test]
+fn r48_joint_supply_is_fresh_at_7469() {
+    let rec = workload::run_seed_with(7469, None, &workload::Tuning::BASE);
+    assert_eq!(
+        rec.twin_joint_arm.len(),
+        rec.rounds.len(),
+        "seed 7469: the joint-arm diagnostic must cover every executed round"
+    );
+    assert!(
+        rec.twin_joint_stale_reads.iter().all(|n| *n == 0),
+        "seed 7469: the joint arm's supply must be fresh — zero stale reads at the \
+         re-run's start (G5-R48-TREADS-KEPT reverts this): {:?}",
+        rec.twin_joint_stale_reads
+    );
+    assert!(
+        !rec.twin_joint_arm.iter().any(|ran| *ran),
+        "seed 7469: at this tip no round reaches the joint arm (measured; the README's \
+         step 2 census) — if this fails, the arm is live again and the freshness \
+         assertion above is what G5-R48-TREADS-KEPT must fail"
+    );
+}
+
 /// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
 /// loud defect, never a hang.** The draft's `reachable_hook_spec`
 /// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with

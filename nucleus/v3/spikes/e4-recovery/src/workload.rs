@@ -1578,6 +1578,25 @@ pub struct SeedRec {
     /// for uniform rounds (whose twin may legitimately wrap its `k`
     /// into its own measured total; 4fedc648).
     pub twin_paired: Vec<bool>,
+    /// **Diagnostic only** (X-5c-PINS-1 item 2, the `twin_paired`
+    /// manner; never a digest input — [`SeedRec::finish`] does not
+    /// read it — and never serialized): per executed round, whether
+    /// the R21 (c) **joint arm** ran — the re-paired twin's re-run at
+    /// the joint spec (`reachable_hook_spec` over the per-index AND of
+    /// the two complete mask lists, X5-R48). `false` for every round
+    /// without one.
+    pub twin_joint_arm: Vec<bool>,
+    /// **Diagnostic only** (beside [`SeedRec::twin_joint_arm`]): the
+    /// stale-read count at the joint re-run's start — the reads the
+    /// re-paired twin's unfired attempt left in the collector, which
+    /// `treads.clear()` zeroes so the joint arm's supply (`supply2`'s
+    /// `recovery_reads`) holds only the final attempt's reads (verdict
+    /// X-5c-F4-F1-F1-CXX-F1 finding 2: an extra read can only suppress
+    /// an oracle failure). `0` in clean code and for every round
+    /// without a joint arm; the unfired attempt's read count when the
+    /// clear is dropped (**G5-R48-TREADS-KEPT** — 17 stale reads at
+    /// seed 7469).
+    pub twin_joint_stale_reads: Vec<usize>,
     /// A DEADLOCK occurred in some round.
     pub deadlock: bool,
     /// A task panicked in some round.
@@ -2187,6 +2206,13 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // and re-runs from the same start; the failed attempt is
         // discarded (the fired-guard never records it).
         let mut real_final_spec: Option<CrashSpec> = script.crash.clone();
+        // X-5c-PINS-1 item 2's diagnostic locals (the `twin_paired`
+        // manner; recorded per round after the retry block): whether
+        // the joint arm ran, and the stale-read count at its re-run's
+        // start. Defaults for every round whose retry never reaches
+        // the joint arm.
+        let mut joint_arm_ran = false;
+        let mut joint_stale_reads = 0usize;
         if let (Some(retry), false, true, Some(crash)) = (
             ch_retry.take(),
             out.obs.crash_fired,
@@ -2329,6 +2355,20 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                                     ..script2.clone()
                                 };
                                 treads.clear();
+                                // X-5c-PINS-1 item 2 diagnostic: the
+                                // stale-read count at the joint
+                                // re-run's start. The clear above is
+                                // what zeroes it — without it (the
+                                // G5-R48-TREADS-KEPT shape) the
+                                // collector still holds the unfired
+                                // re-paired attempt's reads here, and
+                                // the supply below carries them into
+                                // the real round's oracle (17 at seed
+                                // 7469). Never a digest input, never
+                                // serialized; `SeedRec::finish` never
+                                // reads it.
+                                joint_arm_ran = true;
+                                joint_stale_reads = treads.len();
                                 tout = harness::run_round(
                                     seed,
                                     round,
@@ -2430,6 +2470,11 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                 }
                 _ => true,
             });
+        // X-5c-PINS-1 item 2's diagnostic (the twin_paired manner):
+        // one entry per executed round, defaulting to no-joint-arm and
+        // zero stale reads.
+        rec.twin_joint_arm.push(joint_arm_ran);
+        rec.twin_joint_stale_reads.push(joint_stale_reads);
 
         // **G8 (X5-R16's conditional fill):** a poisoned store ended the
         // workload — the crash was delivered at the poison point, and
