@@ -1,21 +1,31 @@
 Card: X-5c-F4-F1-F1-F3-F1
 Class: experiment
 Card-gate: P
-Verdict: ESCALATE
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: Claude Code session 1fdcaedc-7ef7-4a27-bcab-c0d780e4f11f
+Gate-session: Claude Code session 7edf4f8c-cfdd-48c3-b0df-35aed0283a08 (re-verdict on the stacked tip); original gate Claude Code session 1fdcaedc-7ef7-4a27-bcab-c0d780e4f11f
 Date: 2026-11-09
-Gate-exit: GATE EXIT=1
+Gate-exit: GATE EXIT=0
 Commit: 09f9353fb86e4959f0c1315e4783de8e9d073ba2
 Mutants: G-SLOT-INERT -> x5_r43_free_home_alloc_is_caught, G-REUSE-ANY -> x5_r42_reuse_counts_window_frees_before_freeze, M-RUPF-NOFREEZE -> x5_r42_reuse_counts_window_frees_before_freeze, M-Q4I-WHOLEWINDOW -> x5_r42_post_freeze_reuse_is_not_q4i, G-SEL-NOTARGET -> x5_r41_uniform_round_not_selected, G-LEDGER-NOREMOVE -> x5_r42_harness_checkpoint_image_is_not_q4i, G-SEEDED-FOLD -> x5_r43_oracle_pass_not_fold, M-R50-DRAW -> x5_r37_base_tuning_reproduces_1b0ce54e, M-R50-SHAREDSTREAM -> x5_r50_prior_window_round_is_q4i, M-R50-SHAREDFLAG -> x5_r50_prior_window_round_is_q4i, M-R50-ANYHOOK -> x5_r50_ineligible_rounds_draw_nothing, M-R50-IDX0 -> x5_r50_ineligible_rounds_draw_nothing, M-FREE-HOME-ALLOC -> x5_r43_free_home_alloc_is_caught, M-R41-WRONGWINDOW -> x5_r41_aligned_round_has_q4_and_reuse, M-R41-AFTERCRASHARM -> x5_r41_aligned_round_has_q4_and_reuse, M-Q4I-LASTCKPT -> x5_r42_q4i_keys_on_the_opened_image, GX-RUPF-INVERT -> x5_r42_reuse_counts_window_frees_before_freeze, GX-R50-WAITIDX -> x5_r50_prior_window_round_is_q4i, GX-R50-ORDER -> x5_r50_prior_window_round_is_q4i, GX-R50-ARMIDX -> x5_r50_prior_window_round_is_q4i, GX-Q4I-LASTROW -> x5_r42_q4i_keys_on_the_opened_image, GX-RUPF-NORESET -> UNCAUGHT, GX-R50-NOSELECT -> UNCAUGHT
 Followups: X-5c-F4-F1-F1-F3-F1-F1
 
 ## Verdict in one paragraph
 
-ESCALATE, for one reason: the fresh gate reads `GATE EXIT=1`, and `merge-card.sh` will not take a MERGE without `GATE EXIT=0`. The single red step is `deny`, on advisory RUSTSEC-2026-0459. It is not this card's doing, and it is equally red on this card's base and on the scaffold, but it is a real red and its fix lies outside this card's Touch only. How to clear it is the owner's choice, set out below. **The owner's rule itself is MET as written on my own numbers**, X5-R50 is honest, and both planted faults are CAUGHT. Nothing about the experiment needs reworking.
+MERGE-WITH-FOLLOWUPS. The first gate of this card (verdict commit `2b4c82b4`) was ESCALATE for one reason: the fresh gate read `GATE EXIT=1`, and the single red step was `deny`, on advisory RUSTSEC-2026-0459. It was not this card's doing, and it was equally red on this card's base and on the scaffold. The owner chose the upgrade, DEP-RUSQLITE-1 made it, and the fresh gate on the stacked tip reads `GATE EXIT=0` (next section). **The owner's rule itself is MET as written on the first gate's own numbers**, X5-R50 is honest, and both planted faults are CAUGHT. Nothing about the experiment needs reworking. The one follow-up, for two surviving mutants, is below.
+
+## Stacked-tip run (re-verdict, 2026-11-09)
+
+- **Why.** This re-verdict changes the outcome only. The content review is the first gate's and was not repeated. "My" and "I" in the sections below are that gate's.
+- **The run.** Scaffold `187cb226a9bf57ab2a7ba6b2b90fb28cdaf27c6b`, extracted through the `--no-local` shallow clone, on the stacked tip `648a0e5fd1ef94d1f269c64ecd7ebcd00bac0bd1`. `fresh-gate: checks passed (4525 files hashed in 6.74 s)`. Steps: test 0, clippy 0, fmt 0, deny 0, wasm32 0, core-paths-selftest 0, enforcement-tests 0. Literal last line: `GATE EXIT=0`.
+- **What the header means.** `Gate-exit` is that run, on `648a0e5f`. `Commit` stays this card's `09f9353f`, which on its own still reads `GATE EXIT=1` on the advisory.
+- **What sits between.** `git diff 09f9353f..648a0e5f` is two files: the one-line `rusqlite` requirement in `spikes/e0-btree/Cargo.toml`, and this file's own ESCALATE record. `deny.toml` is unchanged. Nothing under `spikes/e4-recovery/` changed.
+- **The digests.** `e4-recovery`'s resolved dependency tree is identical with and without the bump (verdict DEP-RUSQLITE-1), so the condition "unless the fix moves an `e4-recovery` digest" below is not met. The measurements stand as written. The digests were not re-run.
 
 ## FOR THE OWNER
+
+**Decided by the owner on 2026-11-09: upgrade, no `ignore`; carried out by DEP-RUSQLITE-1. The first gate's text follows as the record.**
 
 **One decision is needed: RUSTSEC-2026-0459 (`cargo deny`).** `libsqlite3-sys` 0.35.0, bundling a SQLite older than 3.54.0 (CVE-2026-119375), is reached only through `rusqlite` 0.37 under `e0-btree` and the E1 spike crates. `e4-recovery` does not depend on it. The advisory's stated exposure is a process opening a database and `-wal` that a less trusted party could have written. Its stated fix is `libsqlite3-sys` ≥ 0.39.0.
 
@@ -26,7 +36,7 @@ ESCALATE, for one reason: the fresh gate reads `GATE EXIT=1`, and `merge-card.sh
 
 **For information, no decision needed:** the CPU limit is met, with less margin under load than at idle. See "Reproduction of the rule".
 
-## Gate run
+## Gate run (first gate, at `09f9353f`)
 
 - Scaffold `187cb226a9bf57ab2a7ba6b2b90fb28cdaf27c6b`, extracted through the `--no-local` shallow clone. No `EXTRACT FAILED`, no `FRESH-GATE REFUSED`.
 - `fresh-gate: commit 09f9353fb86e4959f0c1315e4783de8e9d073ba2`; `fresh-gate: base 187cb226…`; `fresh-gate: checks passed (4524 files hashed in 1.32 s)`.
@@ -130,7 +140,7 @@ All 16 mutants run from the card's table, F3's re-sited rows and `M-FREE-HOME-AL
 
 **Still required before F4 runs:**
 
-- This card: the deny decision above, a fresh `GATE EXIT=0`, a re-gate, then fast-forward `card/v3-X-5c-F4`.
+- This card: the deny decision above, a fresh `GATE EXIT=0`, a re-gate, then fast-forward `card/v3-X-5c-F4`. (Re-verdict: the first three are done, as recorded above. The fast-forward remains, and the chain head is now `card/v3-DEP-RUSQLITE-1`.)
 - `X-5c-F4-F1-F1-CXX-F1-F1`: stacks after this card (same files); QUEUE's hard order has it before relaunch.
 - `X-5c-F4-F1-F1-F3-F2-F1-F2-F1` (test gaps) and `X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1-F1` (comparator): both listed "before F4's final run".
 - `X-5c-F4-F1-F1-F3-F1-F1` (below): tests only, moves no digest, should land before F4's final run.
