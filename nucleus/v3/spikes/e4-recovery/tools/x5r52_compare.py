@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""The X5-R51/X5-R52 comparator for E4 campaign JSON files (card
-X-5c-F4-F1-F1-F3-F2-F1-F1).
+"""The X5-R51/X5-R52/X5-R53 comparator for E4 campaign JSON files
+(cards X-5c-F4-F1-F1-F3-F2-F1-F1 and
+X-5c-F4-F1-F1-F3-F2-F1-F1-F1).
 
 This script owns three invariants, and nothing else:
 
@@ -9,14 +10,17 @@ This script owns three invariants, and nothing else:
    every per-seed difference under X5-R51 (the step-4 movement
    exemption, quoted in the crate README) as amended by X5-R52 (the
    post-data amendment: twin DDL divergence, meta-only detections, MP-A
-   under X5-R30 (c), and bullet 1 made testable). Its exit code is 0
-   only if nothing outside the rule is found — necessary, never
-   sufficient: the single-seed checks (`check-mp`, `check-twin`) belong
-   to the gate, per X5-R51 (f) and X5-R52 (f).
+   under X5-R30 (c), and bullet 1 made testable) and by X5-R53 (the
+   post-data amendment: `check-twin`'s attribution made exact, the
+   ts-level link T6, the MP-A class cap, and MONITOR as a stop). Its
+   exit code is 0 only if nothing outside the rule is found —
+   necessary, never sufficient: the single-seed checks (`check-mp`,
+   `check-twin`) belong to the gate, per X5-R51 (f) and X5-R52 (f).
 2. `check-mp` and `check-twin` re-read one recorded single-seed
    diagnostic run (stderr, JSON and stdout) against one row of the run
    JSON and decide X5-R51 (b)5 / X5-R52 (c)(ii) (b)5' and X5-R52 (c)(i)
-   T1–T5 exactly as the rules write them, from recorded fields only.
+   T1–T5 as X5-R53 (b)/(c) amends them (segments; the sixth check T6),
+   exactly as the rules write them, from recorded fields only.
 3. `self-test` runs embedded synthetic records and diag lines through
    the same engines and fails (non-zero exit) if any case reads
    differently.
@@ -642,6 +646,9 @@ RUN_MARKER_RE = re.compile(r"X5R52 run seed=(\d+) round=(\d+) class=(\w+)")
 #: One replay-listing record line: `GATEDIAG   rec lsn=L kind=K ts=T
 #: txn=(…) ddl=[…] trees={…}`.
 REC_LINE_RE = re.compile(r"GATEDIAG   rec lsn=(\d+) kind=(\d+) ts=(\d+) txn=\([^)]*\) ddl=(\[.*?\])")
+#: One `GATEDIAG replay start meta.t=…` line (same patch); X5-R53 (c)
+#: T6a reads the failing recovery's `meta.t` from it.
+REPLAY_START_RE = re.compile(r"GATEDIAG replay start meta\.t=(\d+)")
 
 
 def parse_dir_list(text):
@@ -650,35 +657,119 @@ def parse_dir_list(text):
     return [int(x) for x in inner.split(",")] if inner else []
 
 
+def walk_seed_segments(diag_text, seed):
+    """Yield `(line, seg_id, seg)` for every diag line, per X5-R53 (b).
+
+    A line belongs to the most recent `X5R52 run seed=<s> round=<r>
+    class=<K>` marker for `seed`; a marker for another seed ends that
+    segment, and lines before the first such marker belong to no segment
+    (`seg_id` None). `seg` is the tuple `(klass, round, is_twin,
+    meta_t)`: the marker's class and round; `is_twin` — the marker is
+    class C and follows this seed's `X5R52 round-start` line for that
+    round (the twin chain: its first run, its NEVER-FIRED re-runs and
+    the X5-R21 (c) pairing re-runs; a class-C marker **before** that
+    line is the uniform probe on the real chain, never a twin segment);
+    and `meta_t`, the `meta.t` of the most recent `GATEDIAG replay
+    start` line **above** this one in the same segment, or None. Each
+    marker for `seed` gets a fresh `seg_id` (stable across that
+    segment's `meta_t` updates) so callers can compare segments.
+
+    One walk feeds T1, T3 and T6 (card
+    X-5c-F4-F1-F1-F3-F2-F1-F1-F1 Work 1 — one helper, not three scans).
+    """
+    started = set()
+    next_id = 0
+    seg_id = None
+    seg = None
+    for line in diag_text.splitlines():
+        m = RUN_MARKER_RE.search(line)
+        if m:
+            if int(m.group(1)) != seed:
+                # A marker for another seed ends this seed's segment.
+                seg_id = None
+                seg = None
+                continue
+            next_id += 1
+            seg_id = next_id
+            seg = (
+                m.group(3),
+                int(m.group(2)),
+                m.group(3) == "C" and int(m.group(2)) in started,
+                None,
+            )
+            yield line, seg_id, seg
+            continue
+        rs = ROUND_START_RE.search(line)
+        if rs and int(rs.group(1)) == seed:
+            started.add(int(rs.group(2)))
+        yield line, seg_id, seg
+        ps = REPLAY_START_RE.search(line)
+        if ps and seg_id is not None:
+            seg = (seg[0], seg[1], seg[2], int(ps.group(1)))
+
+
 def check_twin(run_seeds, seed, twin_round, diag_err_text, diag_seeds, diag_out_text):
-    """X5-R52 (c)(i) T1–T5 for one TWIN_DDL_PENDING row.
+    """X5-R52 (c)(i) T1–T5 as amended by X5-R53 (b)/(c), for one
+    TWIN_DDL_PENDING row.
 
     Returns ``(verdict, detail)``; verdict is ``"EXPLAINED"`` (detail
-    ``N=<n> k=<k>``) or ``"NOT-EXPLAINED"`` (detail names the failed
-    check).
+    ``N=<n> k=<k> …``) or ``"NOT-EXPLAINED"`` (detail names the failed
+    check). The order is T5, T1, T2, T3, T4, T6; T6 failures read
+    ``NOT-EXPLAINED T6a/T6b <reason>``.
     """
     run_seed = run_seeds.get(seed)
     reason = t5_checks(run_seed, diag_seeds.get(seed), diag_out_text)
     if reason:
         return ("NOT-EXPLAINED", reason)
-    # T1: the class-C (twin) recovery Err line for this round is exactly
+    # One walk for T1, T3 and T6 (X5-R53 (b): segments, and which are
+    # the twin's own runs).
+    walk = list(walk_seed_segments(diag_err_text, seed))
+    # T1 (X5-R53 (b)): at least one class-C recovery Err line for this
+    # round inside a twin segment of this round, and every class-C Err
+    # line for this round — in any segment — the same text, exactly
     # `Corrupt("tree N missing in directory")`.
-    n = None
-    err_seen = []
-    for line in diag_err_text.splitlines():
+    err_lines = []
+    for line, _seg_id, seg in walk:
         m = RECOVERY_ERR_RE.search(line)
         if not m:
             continue
-        if int(m.group(1)) != seed or int(m.group(2)) != twin_round:
+        if int(m.group(1)) != seed or int(m.group(2)) != twin_round or m.group(3) != "C":
             continue
-        if m.group(3) != "C":
-            continue
-        err_seen.append(m.group(5))
-        cm = re.fullmatch(r'Corrupt\("tree (\d+) missing in directory"\)', m.group(5))
-        if cm:
-            n = int(cm.group(1))
-    if n is None:
-        return ("NOT-EXPLAINED", "T1 no class-C Corrupt(\"tree N missing in directory\") for round %d (saw %s)" % (twin_round, err_seen[:3] or "nothing"))
+        in_twin = seg is not None and seg[2] and seg[1] == twin_round
+        err_lines.append((m.group(5), in_twin, seg[3] if seg is not None else None))
+    if not any(in_twin for _t, in_twin, _mt in err_lines):
+        return (
+            "NOT-EXPLAINED",
+            "T1 no class-C recovery Err for round %d inside a twin segment (saw %s)"
+            % (twin_round, [t for t, _i, _m in err_lines][:3] or "nothing"),
+        )
+    texts = sorted({t for t, _i, _m in err_lines})
+    if len(texts) != 1:
+        return (
+            "NOT-EXPLAINED",
+            "T1 class-C Err texts for round %d differ: %s" % (twin_round, texts),
+        )
+    cm = re.fullmatch(r'Corrupt\("tree (\d+) missing in directory"\)', texts[0])
+    if not cm:
+        return (
+            "NOT-EXPLAINED",
+            "T1 class-C Err text for round %d is %s" % (twin_round, texts[0]),
+        )
+    n = int(cm.group(1))
+
+    def twin_drop_records(round_pred):
+        """`(ts, seg_round)` of kind=1 records with `D<n>` in `ddl`,
+        from the twin segments (this seed's) whose round satisfies
+        `round_pred`."""
+        out = []
+        for line, _seg_id, seg in walk:
+            if seg is None or not seg[2] or not round_pred(seg[1]):
+                continue
+            rm = REC_LINE_RE.search(line)
+            if rm and int(rm.group(2)) == 1 and ('"D%d"' % n) in rm.group(4):
+                out.append((int(rm.group(3)), seg[1]))
+        return out
+
     # T2: the round-start line for this round has N in real_dir and N
     # absent from twin_dir.
     starts = []
@@ -695,24 +786,14 @@ def check_twin(run_seeds, seed, twin_round, diag_err_text, diag_seeds, diag_out_
             "NOT-EXPLAINED",
             "T2 round %d real_dir=%s twin_dir=%s (N=%d)" % (twin_round, real_dir, twin_dir, n),
         )
-    # T3: the twin chain dropped N itself — a class-C replay listing of
-    # this seed, at a round ≤ i, shows a commit record with `ddl`
-    # containing `D<N>`.
-    seg_class = None
-    seg_round = None
-    dropped = False
-    for line in diag_err_text.splitlines():
-        m = RUN_MARKER_RE.search(line)
-        if m:
-            seg_class = m.group(3)
-            seg_round = int(m.group(2))
-            continue
-        rm = REC_LINE_RE.search(line)
-        if rm and seg_class == "C" and seg_round is not None and seg_round <= twin_round:
-            if int(rm.group(2)) == 1 and ('"D%d"' % n) in rm.group(4):
-                dropped = True
-    if not dropped:
-        return ("NOT-EXPLAINED", "T3 no class-C commit record with D%d at a round <= %d" % (n, twin_round))
+    # T3 (X5-R53 (b)): the twin chain dropped N itself — a replay
+    # listing of a twin segment of this seed, at a round ≤ i, shows a
+    # commit record with `ddl` containing `D<N>`.
+    if not twin_drop_records(lambda r: r is not None and r <= twin_round):
+        return (
+            "NOT-EXPLAINED",
+            "T3 no class-C commit record with D%d in a twin segment at a round <= %d" % (n, twin_round),
+        )
     # T4: k is the first round start at which N is in real_dir and not in
     # twin_dir; k ≥ 1, and real round k−1 has a recorded media fault and
     # a recovery that stopped short.
@@ -734,9 +815,69 @@ def check_twin(run_seeds, seed, twin_round, diag_err_text, diag_seeds, diag_out_
             "T4 real round %d cover_err=%s frontier=%d hi=%d"
             % (k - 1, prev.get("cover_err"), prev.get("frontier"), prev.get("hi")),
         )
+    # T6a (X5-R53 (c)), the twin side: the drop is in the twin segments
+    # of round k−1, at a ts at or below the failing recovery's meta.t.
+    t6a_ts = [ts for ts, _r in twin_drop_records(lambda r: r == k - 1)]
+    if not t6a_ts:
+        return (
+            "NOT-EXPLAINED",
+            "T6a no D%d commit record in the twin segments of round %d" % (n, k - 1),
+        )
+    t6a_t = []
+    for _t, in_twin, meta_t in err_lines:
+        if not in_twin:
+            continue
+        if meta_t is None:
+            return (
+                "NOT-EXPLAINED",
+                "T6a twin-segment Err of round %d has no replay-start meta.t above it" % twin_round,
+            )
+        t6a_t.append(meta_t)
+    if any(ts > t for ts in t6a_ts for t in t6a_t):
+        return (
+            "NOT-EXPLAINED",
+            "T6a drop ts %s above the failing recovery's meta.t %s"
+            % (sorted(set(t6a_ts)), sorted(set(t6a_t))),
+        )
+    # T6b (X5-R53 (c)), the real side, on the real chain's own clock:
+    # cover_err or x33x; or a real-class replay listing of round k−1
+    # with no D<N> commit at a ts at or below that round's frontier.
+    t6b_nrec = 0
+    if prev.get("cover_err") or prev.get("x33x"):
+        t6b = "cover_err/x33x"
+    else:
+        last_id = None
+        listing = []
+        for line, seg_id, seg in walk:
+            ps = REPLAY_START_RE.search(line)
+            if ps and seg is not None and seg[0] in ("Mw", "Mp") and seg[1] == k - 1:
+                last_id = seg_id
+                listing = []
+                continue
+            rm = REC_LINE_RE.search(line)
+            if rm and seg_id is not None and seg_id == last_id:
+                listing.append(rm)
+        if last_id is None:
+            return (
+                "NOT-EXPLAINED",
+                "T6b no real-class replay listing for round %d and no cover_err/x33x" % (k - 1),
+            )
+        replayed = [
+            int(rm.group(3))
+            for rm in listing
+            if int(rm.group(2)) == 1 and ('"D%d"' % n) in rm.group(4) and int(rm.group(3)) <= prev.get("frontier", 0)
+        ]
+        if replayed:
+            return (
+                "NOT-EXPLAINED",
+                "T6b real round %d replayed D%d at ts %s <= frontier %d"
+                % (k - 1, n, replayed, prev.get("frontier")),
+            )
+        t6b_nrec = len(listing)
+        t6b = "no D%d at or below frontier" % n
     return (
         "EXPLAINED",
-        "N=%d k=%d (real round %d: lost=%d mis=%d torn=%d cover_err=%s frontier=%d hi=%d)"
+        "N=%d k=%d (real round %d: lost=%d mis=%d torn=%d cover_err=%s frontier=%d hi=%d; T6a ts=%s meta.t=%s; T6b %s, real_nrec=%d)"
         % (
             n,
             k,
@@ -747,6 +888,10 @@ def check_twin(run_seeds, seed, twin_round, diag_err_text, diag_seeds, diag_out_
             prev.get("cover_err"),
             prev.get("frontier"),
             prev.get("hi"),
+            sorted(set(t6a_ts)),
+            sorted(set(t6a_t)),
+            t6b,
+            t6b_nrec,
         ),
     )
 
@@ -830,7 +975,8 @@ def seed_rec(seed, klass, rounds, twin=None):
 
 
 def self_test():
-    """Run every still-caught bullet of X5-R52 (c) through the engines."""
+    """Run every still-caught bullet of X5-R52 (c) and X5-R53 (b)–(e)
+    through the engines."""
     failures = []
     cases = [0]
 
@@ -1041,32 +1187,105 @@ def self_test():
     r = rows_of(ref, run)
     check("meta-only-pass-false-is-bullet1", (3, "round", 0, "bullet1") in r["new_failing"] and r["meta_only_eligible"] == [], str(r))
 
-    # --- check-twin: T1–T5 and the still-caught bullets.
+    # --- check-twin: T1–T6 and the still-caught bullets.
+    D4 = 'GATEDIAG   rec lsn=4183 kind=1 ts=3 txn=(0, 3) ddl=["D4"] trees={1, 4}'
+    C1234 = 'GATEDIAG   rec lsn=0 kind=1 ts=1 txn=(0, 1) ddl=["C1", "C2", "C3", "C4"] trees={1, 2, 3, 4}'
+    D4_TS1 = 'GATEDIAG   rec lsn=100 kind=1 ts=1 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    D4_TS2 = 'GATEDIAG   rec lsn=100 kind=1 ts=2 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    C1 = 'GATEDIAG   rec lsn=10 kind=1 ts=2 txn=(0, 2) ddl=["C1"] trees={1}'
+    TREE4 = 'Corrupt("tree 4 missing in directory")'
+    WALLOSS = "WalLoss { valid_end: 1, wal_ckpt_end: 2, t: 3, ts_ckpt_hi: 4 }"
+
+    def fmt_dir(keys):
+        return "[%s]" % ", ".join(str(k) for k in keys)
+
     def twin_diag(
-        err='Corrupt("tree 4 missing in directory")',
+        err=TREE4,
         starts=None,
         listings=None,
         digest=1004,
+        probe_err=None,
+        rerun_err=None,
+        probe0_recs=(),
+        twin0_recs=None,
+        real0_recs=None,
+        real0_start=True,
+        twin1_meta_t=5,
     ):
+        """A diag log in the harness's real order (card
+        X-5c-F4-F1-F1-F3-F2-F1-F1-F1 Work 1), per round: the probe
+        marker (class C, before the round-start line), the round-start
+        line, the twin marker (class C, after it), the twin's lines, the
+        real marker (class Mw) and the real run's listing. `err` is the
+        twin segment's recovery `Err` for round 1 (None: none);
+        `probe_err` adds one to round 1's probe segment and `rerun_err`
+        to a class-C pairing re-run after the real marker; `listings`
+        overrides round 0's twin-segment records (default the D4 drop
+        at ts=3), `twin0_recs`/`real0_recs`/`probe0_recs` override the
+        segments individually; `real0_start=False` gives round 0's real
+        run no replay listing at all.
+        """
         starts = starts if starts is not None else [(0, [1, 2, 3, 4], [1, 2, 3, 4]), (1, [1, 2, 3, 4], [1, 2, 3])]
-        listings = listings if listings is not None else ["GATEDIAG   rec lsn=4183 kind=1 ts=3 txn=(0, 3) ddl=[\"D4\"] trees={1, 4}"]
+        if twin0_recs is not None:
+            twin0 = twin0_recs
+        else:
+            twin0 = listings if listings is not None else [D4]
+        real0 = real0_recs if real0_recs is not None else [C1234]
         lines = []
-        # round 0: class-C twin run with the drop listing.
+        # round 0: probe, round-start, twin (the drop listing), real.
+        lines.append("X5R52 run seed=4 round=0 class=C")
+        lines.extend(probe0_recs)
+        lines.append("X5R52 round-start seed=4 round=0 real_dir=%s twin_dir=%s" % (fmt_dir(starts[0][1]), fmt_dir(starts[0][2])))
         lines.append("X5R52 run seed=4 round=0 class=C")
         lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
-        lines.extend(listings)
+        lines.extend(twin0)
         lines.append("X5R52 run seed=4 round=0 class=Mw")
-        lines.append("X5R52 round-start seed=4 round=0 real_dir=%s twin_dir=%s" % (fmt_dir(starts[0][1]), fmt_dir(starts[0][2])))
+        if real0_start:
+            lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
+            lines.extend(real0)
+        # round 1: probe, round-start, twin (the Err), real, re-run.
         lines.append("X5R52 run seed=4 round=1 class=C")
-        lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % err)
-        lines.append("X5R52 run seed=4 round=1 class=Mw")
+        if probe_err is not None:
+            lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % probe_err)
         lines.append("X5R52 round-start seed=4 round=1 real_dir=%s twin_dir=%s" % (fmt_dir(starts[1][1]), fmt_dir(starts[1][2])))
+        lines.append("X5R52 run seed=4 round=1 class=C")
+        lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t)
+        if err is not None:
+            lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % err)
+        lines.append("X5R52 run seed=4 round=1 class=Mw")
+        lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
+        lines.append(C1234)
+        if rerun_err is not None:
+            lines.append("X5R52 run seed=4 round=1 class=C")
+            lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t)
+            lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % rerun_err)
         diag_seed = {"seed": 4, "class": "MW", "digest": digest, "rounds": [], "twin": []}
         out_text = "E4 SEEDS=1 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
         return "\n".join(lines) + "\n", diag_seed, out_text
 
-    def fmt_dir(keys):
-        return "[%s]" % ", ".join(str(k) for k in keys)
+    def twin_diag3(digest=1004):
+        """A three-round log in the real order: k=2 (round 2's start
+        diverges on N=4) and D4 listed only in the twin segment of
+        round 0 — never in a twin segment of round k−1 = 1."""
+        lines = []
+        for rnd in (0, 1):
+            lines.append("X5R52 run seed=4 round=%d class=C" % rnd)
+            lines.append("X5R52 round-start seed=4 round=%d real_dir=%s twin_dir=%s" % (rnd, fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3, 4])))
+            lines.append("X5R52 run seed=4 round=%d class=C" % rnd)
+            lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
+            lines.extend([D4] if rnd == 0 else [C1])
+            lines.append("X5R52 run seed=4 round=%d class=Mw" % rnd)
+            lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
+            lines.append(C1234)
+        lines.append("X5R52 run seed=4 round=2 class=C")
+        lines.append("X5R52 round-start seed=4 round=2 real_dir=%s twin_dir=%s" % (fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3])))
+        lines.append("X5R52 run seed=4 round=2 class=C")
+        lines.append("GATEDIAG replay start meta.t=5 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
+        lines.append("GATEDIAG recovery Err seed=4 round=2 class=C nested=0 e=%s" % TREE4)
+        lines.append("X5R52 run seed=4 round=2 class=Mw")
+        diag_seed = {"seed": 4, "class": "MW", "digest": digest, "rounds": [], "twin": []}
+        out_text = "E4 SEEDS=1 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+        return "\n".join(lines) + "\n", diag_seed, out_text
 
     run_seed = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7), round_rec()])
     diag, diag_seed, out_text = twin_diag()
@@ -1093,6 +1312,76 @@ def self_test():
     diag, diag_seed, out_text = twin_diag(digest=999)
     v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
     check("twin-t5-digest-mismatch", v == "NOT-EXPLAINED" and d.startswith("T5"), "%s %s" % (v, d))
+
+    # X5-R53 (b): the twin's own Err decides T1, and every class-C Err
+    # line for the round must carry the same text.
+    diag, diag_seed, out_text = twin_diag(err=WALLOSS, probe_err=TREE4)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-probe-only", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(err=None, probe_err=TREE4)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-probe-no-twin-err", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(rerun_err=WALLOSS)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-pairing-rerun-differs", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(probe_err='Corrupt("checksum mismatch")')
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-probe-differs-from-twin", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(rerun_err=TREE4)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-identical-rerun-ok", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # X5-R53 (b): T3 reads twin segments only — never a probe segment,
+    # never a real-class segment.
+    diag, diag_seed, out_text = twin_diag(probe0_recs=[D4], twin0_recs=[C1])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-probe-only", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[C1], real0_recs=[C1234, D4_TS1])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-mw-only", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    # T4's short-recovery half (cover_err or frontier < hi).
+    no_short = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=7, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag()
+    v, d = check_twin({4: no_short}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t4-no-short", v == "NOT-EXPLAINED" and d.startswith("T4"), "%s %s" % (v, d))
+
+    cover_short = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=7, hi=7, cover_err=True), round_rec()])
+    diag, diag_seed, out_text = twin_diag(real0_start=False)
+    v, d = check_twin({4: cover_short}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t4-cover-err-short", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # X5-R53 (c): T6a and T6b.
+    diag, diag_seed, out_text = twin_diag(twin1_meta_t=2)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-drop-above-meta", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    run3 = seed_rec(4, "MW", [round_rec(), round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag3()
+    v, d = check_twin({4: run3}, 4, 2, diag, {4: diag_seed}, out_text)
+    check("twin-t6-drop-other-round", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(real0_recs=[C1234, D4_TS1])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-real-replayed-drop", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(real0_recs=[C1234, D4_TS2])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-real-listed-above-frontier", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(real0_start=False)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-no-real-listing", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    cross = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=5, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag()
+    v, d = check_twin({4: cross}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-cross-clock", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
 
     # --- compare-level errors: a range mismatch and a sha256 mismatch
     # are exercised through cmd_compare on scratch files.

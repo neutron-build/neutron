@@ -2705,6 +2705,58 @@ discipline, as X5-R6–R52 before it):
 - **(e) MONITOR.** A run whose `E4 SEEDS=… MONITOR=` total is above 0 is a new failure by itself, with row `(-1, "run", None, "bullet3-monitor")`, so the comparator's exit is 1. X5-R51 (b)4's voiding stays. The comparator does not read the reference's MONITOR: F2-F1's run has MONITOR 0, and a run hit is one this comparison must stop on either way.
 - **(f) Outside the rule.** X5-R52 (e) is extended by: a `TWIN_DDL_PENDING` row whose T6 fails; a `bullet1-mpa-cap` row; a `bullet3-monitor` row. **STOP:** write the rounds into the README, commit, and ESCALATE. Do not try a fix.
 
+**Step 1 — `check-twin`: (b) and (c) (this commit).**
+`tools/x5r52_compare.py` gains one line-walking helper,
+`walk_seed_segments(diag_text, seed)`, which yields every diag line
+with `(seg_id, seg)` — the segment's class and round, whether it is a
+**twin segment** (a class-C marker after that seed's `round-start` line
+for that round; a class-C marker before it is the uniform probe on the
+real chain, and a marker for another seed ends the segment), and the
+segment's latest `GATEDIAG replay start` `meta.t` above each line. T1,
+T3 and T6 all read that one walk; T2, T4 and T5 keep their own scans
+and texts. The check order is T5, T1, T2, T3, T4, T6, and T6 failures
+read `NOT-EXPLAINED T6a/T6b <reason>`:
+
+- **T1 (X5-R53 (b)).** At least one class-C recovery `Err` line for
+  round `i` inside a twin segment of round `i`; every class-C `Err`
+  line for round `i`, in any segment, the same text, exactly
+  `Corrupt("tree N missing in directory")`. The probe's `Err`, a
+  pairing re-run's `Err` or any other class-C `Err` that differs is
+  NOT-EXPLAINED T1.
+- **T3 (X5-R53 (b)).** Twin segments of this seed only, at rounds
+  `≤ i`: a kind=1 record with `D<N>` in `ddl`.
+- **T6a (X5-R53 (c)).** The `ts` of every kind=1 `D<N>` record in the
+  twin segments of round `k−1` (at least one), every one `≤` the
+  `meta.t` of each twin-segment `Err` line of T1 (each of which must
+  have one above it).
+- **T6b (X5-R53 (c)).** Real round `k−1` has `cover_err` or `x33x`;
+  or the listing after the last `GATEDIAG replay start` line in the
+  last real-class (`Mw`/`Mp`) segment of round `k−1` holds no kind=1
+  `D<N>` record at a `ts` `≤` that round's JSON `frontier`.
+  `frontier` is never compared with T6a's `ts` — the two chains' clocks
+  differ.
+
+`self_test`'s `twin_diag` was rewritten to the harness's real order
+(per round: probe marker, `round-start`, twin marker, the twin's lines,
+real marker, the real run's listing — the old fixture put the class-C
+marker before its `round-start` line, so the twin read as a probe and
+the `Err` line sat there), with a real listing in its round 0. Every
+existing case keeps its name and its expected verdict; 15 cases were
+added, each named for its check (`twin-t1-probe-only`,
+`twin-t1-probe-no-twin-err`, `twin-t1-pairing-rerun-differs`,
+`twin-t1-probe-differs-from-twin`, `twin-t1-identical-rerun-ok`,
+`twin-t3-probe-only`, `twin-t3-mw-only`, `twin-t4-no-short`,
+`twin-t4-cover-err-short`, `twin-t6-drop-above-meta`,
+`twin-t6-drop-other-round`, `twin-t6-real-replayed-drop`,
+`twin-t6-real-listed-above-frontier`, `twin-t6-no-real-listing`,
+`twin-t6-cross-clock`). `self-test` now reads **53 cases, 0 failed**.
+Against the prior gate's real recordings (read-only):
+2599 twin r2 `EXPLAINED N=3 k=2 (… T6a ts=[7] meta.t=[9]; T6b no D3 at
+or below frontier, real_nrec=1)` and 2859 twin r1 `EXPLAINED N=4 k=1
+(… T6a ts=[3] meta.t=[7]; T6b no D4 at or below frontier, real_nrec=1)`
+— the narrowed rules still exempt exactly the two rows, and the details
+carry X5-R53's ts-level facts (RESULT item 4's fields).
+
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
