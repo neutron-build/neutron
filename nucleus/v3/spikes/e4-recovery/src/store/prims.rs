@@ -478,16 +478,22 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
             }
         }
         // **X5-R43 (card X-5c-F4-F1-F1-F3 step 7; M-FREE-HOME-ALLOC,
-        // I-FREE-SAFE's shape): the freed LPID's durable home leaves
-        // `used_durable` and `image_refs`**, so a later `unpin_home`
-        // releases it from `used_cur` and `alloc_slot` can hand it out
-        // while meta k−1 still references it. Inert when `cfg.mutant`
-        // is `None`. The home is read **before** the map drops the LPID.
+        // I-FREE-SAFE's shape; the `used_cur` line restored by
+        // X-5c-F4-F1-F1-F3-F1 step 1a, the F3 gate's prototype form):
+        // the freed LPID's durable home leaves `used_durable`,
+        // `image_refs` and `used_cur`**, so `alloc_slot` can hand it
+        // out at once while meta k−1 still references it. The
+        // `used_cur` removal is redundant at runtime since X5-R49 (a)
+        // below releases it unconditionally in the clean free; it is
+        // kept anyway so the fault never depends on the clean release.
+        // Inert when `cfg.mutant` is `None`. The home is read
+        // **before** the map drops the LPID.
         if matches!(st.cfg.mutant, Some(Mutant::FreeHomeAlloc))
             && let Some(r) = st.map.cur.get(&lpid).copied()
         {
             st.slots.used_durable.remove(&r.slot);
             st.slots.image_refs.remove(&r.slot);
+            st.slots.used_cur.remove(&r.slot);
         }
         // **X5-R49 (a) (card X-5c-F4-F1-F1-F3-F2; S-STORE §4.2, §4.4,
         // §6.5 item 3): the freed LPID's current home leaves `used_cur`

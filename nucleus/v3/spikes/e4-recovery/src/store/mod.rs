@@ -151,13 +151,20 @@ pub enum Mutant {
     ReuseDropsImg,
     /// **X5-R43 (the verdict's seeded Slot fault, I-FREE-SAFE's shape —
     /// `M-FREE-HOME-ALLOC`): `free_lpid` removes the freed LPID's
-    /// durable home from `used_durable` and `image_refs`.** The slot
-    /// then looks unreferenced by the durable image, so a later
-    /// `unpin_home` (an eviction or step-2 adopt) releases it from
-    /// `used_cur` and `alloc_slot` hands it out while meta k−1 still
-    /// references it — a crash before meta k is durable opens image
-    /// k−1 over the wrong bytes. Inert when `cfg.mutant` is `None`; the
-    /// single site is `free_lpid`'s home-release.
+    /// durable home from `used_durable`, `image_refs` and
+    /// `used_cur`.** With all three references dropped the slot is
+    /// allocatable at once while meta k−1 still references it — a
+    /// crash before meta k is durable opens image k−1 over the wrong
+    /// bytes. The `used_cur` line is the F3 gate's prototype form,
+    /// restored by X-5c-F4-F1-F1-F3-F1 step 1a: F3's card text dropped
+    /// it, which made the mutant inert at F3's tip (the clean free
+    /// never released `used_cur` there, so no slot ever became
+    /// allocatable — verdict X-5c-F4-F1-F1-F3 finding D1). Since X5-R49
+    /// (a) the clean free releases `used_cur` unconditionally, so the
+    /// mutant's own removal is redundant at runtime; it is kept anyway
+    /// so the fault never depends on the clean release. Inert when
+    /// `cfg.mutant` is `None`; the single site is `free_lpid`'s
+    /// home-release.
     FreeHomeAlloc,
 }
 

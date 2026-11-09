@@ -2518,7 +2518,8 @@ mod tests {
         );
     }
 
-    /// X5-R13 (d)'s pins: `0..10000` is 10,000 seeds; `5..5` is empty,    /// which is an error at the command level; the sweep default is the
+    /// X5-R13 (d)'s pins: `0..10000` is 10,000 seeds; `5..5` is empty,
+    /// which is an error at the command level; the sweep default is the
     /// card's `0..500`; and the dispatch loop's bounds are half-open
     /// (`run_range(0, 3)` runs exactly seeds 0, 1, 2).
     #[test]

@@ -3977,6 +3977,36 @@ readings stated).**
   hand-off.** Q4, Q4-I and the rule are never lowered, redefined or
   re-read by a card, a gate or an orchestrator.
 
+**Step 1a — the Slot mutant made live (D1, D3).** `M-FREE-HOME-ALLOC`'s
+single site (`free_lpid`'s home-release) now removes the freed home
+from `used_durable`, `image_refs` **and `used_cur`**, the F3 gate's
+prototype form (`r41-prototype.patch`). The `used_cur` line is
+redundant at runtime since X5-R49 (a) (the clean free releases it
+unconditionally in the same step); it is kept anyway so the fault
+never depends on the clean release — both doc comments (`store/mod.rs`
+and `store/prims.rs`) say so, and their false cause ("a later
+`unpin_home` releases it from `used_cur`" — at F3's tip no release
+ever happened, which is why the mutant was inert) is corrected to the
+verdict's finding D1: the mutant never made a slot allocatable and no
+round record differed at all.
+
+**Correction of F3's README Slot-cause text.** F3's step-7 record says
+the Slot fault's "damage lands only in rounds that already carry
+oracle texts (MP media detections) or pass". That cause was false, as
+the F3 verdict's finding D1 established: the mutant was **inert**
+(digest-identical to clean on 400/400 seeds; 0 new failing rounds
+because nothing differed, not because the damage was masked). The F3
+gate's prototype form (with `used_cur`) read 37 new failing rounds, 6
+of them with `q4_split_merge`, CAUGHT — the machinery detects the
+fault; only the card's text had dropped the line. This card restores
+the line and re-measures (step 7 below).
+
+**D3 repaired.** The two joined doc comments — `campaign.rs`'s
+"`empty,    /// which`" (X5-R13 (d)'s pin block) and `workload.rs`'s
+"`(5.5/// step 2`" (the fired-guard doc) — are split into proper
+lines; a sweep for other `[a-zA-Z,)]///` joins over `src/` and
+`tests/` finds none.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read

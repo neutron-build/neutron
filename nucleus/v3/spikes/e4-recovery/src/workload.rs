@@ -1072,7 +1072,8 @@ pub fn q4i_of(q4i_raw: bool, fired: bool, end_some: bool) -> bool {
     q4i_raw && fired && end_some
 }
 
-/// A round whose crash spec never fired is a **harness defect** (5.5/// step 2: every round crashes). A silent no-crash round would leave
+/// A round whose crash spec never fired is a **harness defect** (5.5
+/// step 2: every round crashes). A silent no-crash round would leave
 /// every downstream field — faults, recovery, the oracle inputs —
 /// meaningless while still being judged, so the driver records this and
 /// fails the seed. The `TaskYield` draw could not miss (its address
