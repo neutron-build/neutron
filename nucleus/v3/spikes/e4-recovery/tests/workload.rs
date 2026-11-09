@@ -2118,7 +2118,11 @@ fn x5_r41_uniform_round_not_selected() {
     let mut tun = Tuning::BASE;
     tun.r41_share = 1000;
     let knobs = Knobs::derive(10, 0, &tun);
-    assert_eq!(10u64 / 10 % 2, 1, "seed 10 is a uniform-crash seed");
+    assert_eq!(
+        10u64 / 10,
+        1,
+        "seed 10's seed/10 is odd: a uniform-crash seed"
+    );
     assert!(!knobs.drop_tree, "round 0 of seed 10 is not a drop round");
     assert_eq!(
         r41_pick(10, 0, &tun),
