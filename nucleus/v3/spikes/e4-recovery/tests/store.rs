@@ -1069,6 +1069,15 @@ fn late_epoch_copy_must_not_enter_the_next_image() {
 /// deviation this card's prescribed fix does not touch, reported under
 /// ESCALATE with its own reproduction; this pin therefore asserts only
 /// the late copy's own LPID (B) and an untouched padding tree.
+/// (Doc comment corrected by X-5c-PINS-1, verdict
+/// X-5c-F4-F1-F1-F2 finding 4: the two-flip crossing this schedule
+/// describes is a test compression — every `store_page` in
+/// `src/store/tree.rs` runs under the gate, a held gate stops the next
+/// flip, so no gated caller crosses a second flip in the real system.
+/// The pin itself is kept: it still catches the mutant through the raw
+/// `store_page`'s compression, and X-5c-PINS-1's
+/// `late_copy_in_the_gap_drops_for_a_gated_touch` adds the reachable
+/// gated form.)
 #[test]
 fn freed_lpids_late_copy_never_remaps() {
     for seed in [3u64] {
@@ -1238,6 +1247,421 @@ fn freed_lpids_late_copy_never_remaps() {
             freed,
             "seed {seed}: the freed LPID stays in the free set (the bitmap marks \
              every LPID the image leaves unmapped)"
+        );
+    }
+}
+
+/// **X-5c-PINS-1 item 6 (folded card X-5c-F4-F1-F1-F2-F1; verdict
+/// X-5c-F4-F1-F1-F2 finding 3): the install guard's eviction arm.**
+/// The same parked first touch as the main pin, but the page's
+/// `Img::CopyPending` is resolved by a **previous-epoch eviction**
+/// while the copy is on its way: inside the window, once the touch has
+/// frozen B's `CopyPending`, an eviction of B's normal frame (its
+/// content epoch is `k`, so `evict:finish` writes it to a fresh slot
+/// `r`, moves `map.cur[B] = r` and records `map.img[B] = Img::At(r)` —
+/// the same `r`, so `cur == r`). The park releases past
+/// `ckpt:freecopies` (at `After2`, before post-5): the re-validation
+/// skips the stale record, the retry reaches the install, and the
+/// guard faces `Img::At(r)` with `cur == r` — an entry whose content
+/// is already recorded, so the copy must drop. **G-GUARD-EVICT-AT**
+/// (the guard lets `Img::At(r)` with `cur == r` install) installs B's
+/// flip-1 copy into the freed reserve frame past its checkpoint's
+/// cleanup; checkpoint 2's scan takes it (`f.is_epoch_copy`) and maps
+/// B to the flip-1 bytes, and the reopened store's current map
+/// contains a page no tree reaches — this pin fails.
+///
+/// Two schedule compressions, stated plainly (the freed-LPID pin's
+/// own). (1) The parked touch is a raw `prims::free_lpid`, not a
+/// gated tree insert: an insert's `fetch_page` pins the leaf's frame
+/// across the parked copy wait, and a pinned frame is not an
+/// evictable victim — the eviction arm needs the page's frame
+/// evictable while the copy is on its way, which the free path (no
+/// fetch, no pin) provides; the tree layer's own free paths hold the
+/// tree mutex and the gate, which a *bounded* copy wait would release
+/// and re-acquire around, so the raw free is the shape that wait
+/// reaches. (2) The eviction runs inside the checkpointer's own Mid2
+/// hook (the scan paused between its writes), so the scan cannot win
+/// the race to B's frame and resolve the `CopyPending` itself — the
+/// deterministic form of the race.
+#[test]
+fn late_copy_after_previous_epoch_eviction_drops() {
+    // The world seed is pinned for the same reason as the main pin's:
+    // the schedule's interleavings are deterministic per seed, and this
+    // one lands them — verified by the mutant failing the pin (the
+    // record in the README's step 6).
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // The same phase A as the main pin: P (tree 11) fills the
+        // reserve, B (tree 12) is the victim above ten padding trees;
+        // no checkpoint yet, so B's frame is dirty at the flip.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            cx.with("evict-arm:budget", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 200_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("evict-arm:wait-fill").map_err(fail_of)?;
+                    }
+                    // The parked first touch: a raw free of B (the
+                    // compression the doc states — no fetch, so no pin
+                    // holds B's frame across the parked copy wait, and
+                    // the eviction below can take it). Its freeze sets
+                    // B's CopyPending and its copy parks in the
+                    // exhausted path once P's fill took the reserve;
+                    // the park releases inside checkpoint 1 (After2).
+                    prims::free_lpid(&cx, root_b).map_err(fail_of)?;
+                    set_flag(sched, "m_done");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        if hook == CkptHook::Mid2
+                            && flag(sched, "filled")
+                            && !flag(sched, "evict1_done")
+                        {
+                            // The window-1 eviction, deterministically
+                            // inside the hook (the scan is paused between
+                            // its writes, so it cannot reach B's frame
+                            // first): wait for the mutator's freeze to
+                            // set B's CopyPending, then evict B's normal
+                            // frame — a previous-epoch victim whose
+                            // `evict:finish` moves `map.cur[B] = r` and
+                            // records `map.img[B] = Img::At(r)` (the same
+                            // r, so `cur == r`), resolving the pending
+                            // copy the way the eviction arm names.
+                            let cxh = Cx { w: sched, t };
+                            loop {
+                                let cp = {
+                                    let g = sched.lock();
+                                    g.st.map.img.get(&root_b) == Some(&Img::CopyPending)
+                                };
+                                if cp {
+                                    break;
+                                }
+                                cxh.yield_now("evict-arm:wait-copy").map_err(fail_of)?;
+                            }
+                            loop {
+                                let gone = cxh
+                                    .with("evict-arm:chk1", |c| {
+                                        Ok(!c
+                                            .store()
+                                            .pool
+                                            .frames
+                                            .iter()
+                                            .any(|f| f.key == root_b && !f.is_epoch_copy))
+                                    })
+                                    .map_err(fail_of)?;
+                                if gone {
+                                    break;
+                                }
+                                if !prims::evict_one(&cxh, false).map_err(fail_of)? {
+                                    cxh.wait_for(e4_recovery::sim::WaitKey::Pin)
+                                        .map_err(fail_of)?;
+                                }
+                                cxh.yield_now("evict-arm:evict1").map_err(fail_of)?;
+                            }
+                            set_flag(sched, "evict1_done");
+                        }
+                        if hook == CkptHook::After2 {
+                            // The hook eviction must have resolved B's
+                            // CopyPending before the park releases.
+                            while !flag(sched, "evict1_done") {
+                                cx.yield_now("evict-arm:wait-evict1").map_err(fail_of)?;
+                            }
+                            // Past freecopies, before post-5: release
+                            // the parked copy — its install is late and
+                            // the map holds B's eviction entry.
+                            let mut g = sched.lock();
+                            g.st.parks.insert("epochcopy:prewrite", 0);
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    while !flag(sched, "m_done") {
+                        cx.yield_now("evict-arm:wait-m").map_err(fail_of)?;
+                    }
+                    // Nobody touches B in window 2 (it is freed): the
+                    // only frame checkpoint 2's scan could take for B
+                    // is a leaked copy.
+                    ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("evict-arm:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the eviction-arm late-copy schedule");
+        assert!(flag(&sched, "m_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "evict1_done"),
+            "seed {seed}: the window-1 eviction ran"
+        );
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        drop(g);
+        crash_clean(&mut disk_after, seed + 80);
+        let sched2 = pass_world(1, seed + 103, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+        assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+        cx2.with("evict-arm:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        // The pin: B is freed, so image 2 must leave it unmapped — a
+        // late copy whose LPID a previous-epoch eviction already
+        // recorded (Img::At(r), cur == r) must not install and re-map
+        // it through checkpoint 2's scan.
+        let mapped = cx2
+            .with("evict-arm:chk-map", |c| {
+                Ok(c.store().map.cur.contains_key(&root_b))
+            })
+            .expect("map check");
+        assert!(
+            !mapped,
+            "seed {seed}: a freed LPID whose copy a previous-epoch eviction resolved \
+             (Img::At(r) with cur == r) must not be remapped in the next image \
+             (G-GUARD-EVICT-AT reverts this: the leaked flip-1 copy installs and \
+             checkpoint 2's scan maps it)"
+        );
+        let freed = cx2
+            .with("evict-arm:chk-free", |c| {
+                Ok(c.store().slots.free_lpids.contains(&root_b))
+            })
+            .expect("free check");
+        assert!(
+            freed,
+            "seed {seed}: the freed LPID stays in the free set (the bitmap marks every \
+             LPID the image leaves unmapped)"
+        );
+        // The control: P — filled by the window-1 hook, untouched in
+        // window 2 — holds both entries in image 2 either way.
+        let want_p2: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
+            (1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec())),
+            (2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec())),
+        ]
+        .into_iter()
+        .collect();
+        let scan_p = tree::tree_scan(&cx2, root_p, 10).expect("scan P after meta 2");
+        assert_eq!(
+            scan_p, want_p2,
+            "seed {seed}: image 2 holds P's flip-2 cut (both entries)"
+        );
+    }
+}
+
+/// **X-5c-PINS-1 item 6 (folded card X-5c-F4-F1-F1-F2-F1; verdict
+/// X-5c-F4-F1-F1-F2 finding 3): a gated touch's late copy in the gap
+/// between the checkpoints.** The parked gated insert releases **after
+/// its checkpoint's post-5 and before the next flip** — the gap — when
+/// post-5 has cleared the map entirely, so the retry's install faces
+/// **no entry at all** for B: the copy's condition stopped holding
+/// (the image is resolved; the window is over) and the guard drops it
+/// on the absent entry exactly as on a resolved one. The mutator then
+/// finishes its insert (B's {1,2} frame lands in the gap), B's frame
+/// is evicted before checkpoint 2, and image 2 must hold B's flip-2
+/// cut. **M-LATECOPY-ATONLY** (the guard tests only `Img::At`) and
+/// **G-GUARD-ABSENT-OK** (an absent entry installs) both install the
+/// flip-1 copy in the gap; checkpoint 2's scan takes it and maps B to
+/// the flip-1 bytes — key 2 is lost and this pin fails.
+#[test]
+fn late_copy_in_the_gap_drops_for_a_gated_touch() {
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // The same phase A: P (tree 11) fills the reserve, B (tree 12)
+        // is the victim above ten padding trees; park budget; no
+        // checkpoint yet.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            cx.with("gap:budget", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 200_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("gap:wait-fill").map_err(fail_of)?;
+                    }
+                    // The gated insert parks in the exhausted path; it
+                    // resumes in the gap, below, and completes there.
+                    ins(&cx, 12, root_b, &2u64.to_be_bytes(), 2, &val(2, 2));
+                    set_flag(sched, "m_done");
+                    // Evict B's normal frame (holding the gap-completed
+                    // insert) before checkpoint 2: the scan must find no
+                    // eligible frame whose record could overwrite a
+                    // leaked entry.
+                    loop {
+                        let gone = cx
+                            .with("gap:chk", |c| {
+                                Ok(!c
+                                    .store()
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root_b && !f.is_epoch_copy))
+                            })
+                            .map_err(fail_of)?;
+                        if gone {
+                            break;
+                        }
+                        if !prims::evict_one(&cx, false).map_err(fail_of)? {
+                            cx.wait_for(e4_recovery::sim::WaitKey::Pin)
+                                .map_err(fail_of)?;
+                        }
+                        cx.yield_now("gap:evict").map_err(fail_of)?;
+                    }
+                    set_flag(sched, "evicted");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    // The gap: post-5 has cleared the map (no entry for
+                    // B at all) and the next flip has not started — the
+                    // mutator still holds the gate shared across its
+                    // parked copy wait. Release the park now.
+                    {
+                        let mut g = sched.lock();
+                        g.st.parks.insert("epochcopy:prewrite", 0);
+                    }
+                    while !flag(sched, "evicted") {
+                        cx.yield_now("gap:wait-evict").map_err(fail_of)?;
+                    }
+                    ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("gap:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the gap late-copy schedule");
+        assert!(flag(&sched, "m_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        drop(g);
+        crash_clean(&mut disk_after, seed + 90);
+        let sched2 = pass_world(1, seed + 104, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+        assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+        cx2.with("gap:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        let want_b2: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
+            (1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec())),
+            (2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec())),
+        ]
+        .into_iter()
+        .collect();
+        let scan_b = tree::tree_scan(&cx2, root_b, 10).expect("scan B after meta 2");
+        assert_eq!(
+            scan_b, want_b2,
+            "seed {seed}: image 2 must hold B's flip-2 cut — a copy released in the \
+             gap finds no entry at all (post-5 cleared the map) and must drop exactly \
+             as on a resolved one (M-LATECOPY-ATONLY and G-GUARD-ABSENT-OK revert \
+             this: the leaked flip-1 copy maps B and key 2 is lost)"
+        );
+        // The control: P holds both entries in image 2.
+        let scan_p = tree::tree_scan(&cx2, root_p, 10).expect("scan P after meta 2");
+        assert_eq!(
+            scan_p, want_b2,
+            "seed {seed}: image 2 holds P's flip-2 cut (both entries)"
         );
     }
 }

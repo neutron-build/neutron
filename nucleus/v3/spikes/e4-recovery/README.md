@@ -4512,6 +4512,67 @@ folded O1C-F1-F1 card's Work verbatim).**
   contention inflating CPU seconds — exactly what those readings
   show).
 
+**Step 6 — the eviction arm and the gap (item 6, the folded F2-F1
+card's Work, judged against this tip's code).**
+
+- `late_copy_after_previous_epoch_eviction_drops`: the parked first
+  touch's `Img::CopyPending` is resolved by a **previous-epoch
+  eviction** — inside the window, the checkpointer's own `Mid2` hook
+  (the scan paused between its writes, so it deterministically cannot
+  win the race to B's frame) waits for the mutator's freeze and then
+  evicts B's normal frame: `evict:finish` writes it to slot `r`, moves
+  `map.cur[B] = r` and records `map.img[B] = Img::At(r)` — the same
+  `r`, so `cur == r`. The park releases at `After2` (past
+  `ckpt:freecopies`, before post-5); the re-validation skips the stale
+  record, the retry reaches the install and the guard faces
+  `Img::At(r)` with `cur == r`. B is then freed (the touch is the
+  free), so image 2 must leave it unmapped — under the mutant the
+  leaked flip-1 copy installs, checkpoint 2's scan takes it, and the
+  freed LPID is remapped: the reopened `map.cur` contains it.
+  **Two departures from the folded card's wording, both forced by this
+  tip's code and stated in the pin's doc:** (a) the parked touch is a
+  raw `free_lpid`, not a gated insert — an insert's `fetch_page` pins
+  the leaf's frame across the parked copy wait (`PinGuard`), a pinned
+  frame is not an evictable victim, so the eviction arm is unreachable
+  through a parked insert (measured: the first draft used `ins`, and
+  the eviction loop could never take B's frame while the park held);
+  the free path pins nothing, and the freed-LPID pin already states
+  this compression openly. (b) The eviction runs inside the
+  checkpointer's hook rather than a third task — a third task's
+  eviction loop loses the race to the scan at seed 3 (measured: the
+  scan resolved the `CopyPending` first, leaving `cur == None` at the
+  guard), and the hook form is deterministic.
+- `late_copy_in_the_gap_drops_for_a_gated_touch`: the parked gated
+  insert (here the real `ins`, holding the gate shared across the
+  park) releases **in the gap** — after checkpoint 1's post-5 cleared
+  the map, before checkpoint 2's flip — so the retry's install faces
+  **no entry at all**; the mutator then completes its insert, B's
+  {1,2} frame is evicted before checkpoint 2, and image 2 must hold
+  B's flip-2 cut. Both absent-entry mutants install the flip-1 copy;
+  checkpoint 2's scan maps B to it and key 2 is lost.
+- `freed_lpids_late_copy_never_remaps`'s doc comment is corrected per
+  the F2 verdict's finding 4: the two-flip crossing it describes is a
+  test compression no gated caller reaches (every `store_page` in
+  `tree.rs` runs under the gate, and a held gate stops the next flip);
+  the pin itself is kept unchanged — it still catches the two
+  absent-arm mutants, re-proven here.
+
+One code-reading correction this step forced, recorded for the gate:
+the CXX re-validation's `return Ok(())` on a cleared frame exits the
+`cx.with` **closure only** — the `record_image_copy` recursion that
+follows always runs, so the install guard stays reachable at every
+release point (past freecopies, in the gap, in the next window). A
+first-draft analysis here assumed the early return blocked the
+recursion; the `G-GUARD-ABSENT-OK` run against the existing
+`freed_lpids` pin falsified it immediately (the pin fails at this tip,
+proving the install ran).
+
+| mutant | rc | catching pin(s) |
+|---|---|---|
+| **G-GUARD-EVICT-AT** (the guard lets `Img::At(r)` with `cur == r` install) | 101 | `late_copy_after_previous_epoch_eviction_drops` (the trace shows the guard facing `At(18)` with `cur == 18`, then the freed LPID remapped); passes the gap pin and `freed_lpids` — specific |
+| **M-LATECOPY-ATONLY** (the guard tests only `Img::At`) | 101 | `late_copy_in_the_gap_drops_for_a_gated_touch` (image 2's B reads `{1}` — key 2 lost) and `freed_lpids_late_copy_never_remaps`; passes the eviction-arm pin |
+| **G-GUARD-ABSENT-OK** (an absent entry installs) | 101 | the same two as M-LATECOPY-ATONLY; passes the eviction-arm pin |
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
