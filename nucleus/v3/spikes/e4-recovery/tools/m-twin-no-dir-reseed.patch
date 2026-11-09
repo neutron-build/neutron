@@ -1,6 +1,6 @@
 --- a/spikes/e4-recovery/src/workload.rs
 +++ b/spikes/e4-recovery/src/workload.rs
-@@ -1707,26 +1707,6 @@
+@@ -1707,35 +1707,6 @@
                  cut: ch.cut,
              });
          }
@@ -24,6 +24,15 @@
 -        // field or digest input is added).
 -        if twin_chain
 -            .as_ref()
-             .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
-         {
-             twin_chain = Some(Chain {
+-            .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
+-        {
+-            twin_chain = Some(Chain {
+-                disk: ch.disk.clone(),
+-                st: ch.st.clone(),
+-                model: harness::clone_model(&ch.model),
+-                cut: ch.cut,
+-            });
+-        }
+         // The targeted draw of a class C round retries on its own
+         // (no twin exists); keep the round's start for the re-run. The
+         // MP/MW real round needs its own retry too (the twin and real
