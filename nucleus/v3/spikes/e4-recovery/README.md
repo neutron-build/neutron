@@ -4122,6 +4122,54 @@ measured; the CPU estimate (+8–10% over F3's block-B-only cost)
 read +6.2% (55.11% vs 48.9% at S0 — the same BASE/arm pairs,
 measured in one session each).
 
+**Step 7 — the seeded faults at S1 (scratch export, FINAL =
+(1000, 500)).** `seeded-faults --seeds 0..200 --threads 16` (required)
+**exits 0: both faults CAUGHT**; `--seeds 200..400` (reported) also
+exits 0, both CAUGHT.
+
+| range | arm | new-failing (≥5) | `q4_split_merge` | `q4i_raw` (≥1) | verdict |
+|---|---|---|---|---|---|
+| 0..200 | Joint | 29 | 9 | 8 | **CAUGHT** |
+| 0..200 | Slot | 41 | **10** | 4 | **CAUGHT** |
+| 200..400 | Joint | 31 | 9 | 7 | **CAUGHT** |
+| 200..400 | Slot | 38 | **13** | 9 | **CAUGHT** |
+
+By crash position (0..200): Joint — After0@2 ×1, After1@2 ×2,
+After2@1 ×1, After2@2 ×1, After3@1 ×1, After3@2 ×2, After4@0 ×1,
+After4@1 ×1, After5@1 ×3, After5@2 ×1, After6@0 ×1, After6@1 ×2,
+After6@2 ×3, Before0@2 ×1, Mid2@2 ×2, Mid6@0 ×2, Mid6@1 ×4. Slot —
+After0@2 ×1, After1@0 ×2, After1@1 ×1, After1@2 ×2, After2@0 ×1,
+After2@1 ×1, After2@2 ×1, After3@1 ×1, After3@2 ×2, After4@1 ×1,
+After5@1 ×2, After5@2 ×1, After6@0 ×1, After6@1 ×1, After6@2 ×3,
+Before0@0 ×1, Mid2@1 ×1, Mid2@2 ×2, Mid6@1 ×1, and 15 uniform-crash
+rounds. (200..400's tables are in the run outputs; the same shape.)
+
+**q4i of the new-failing rounds, by crash position and by the window
+the recovery opens** (pre-step-5 hooks open image `idx−1` — block A's
+window; the post-step-5 hooks `After4`–`After6` open image `idx` —
+block B's; "block" reads the recovered image's own aligned window):
+
+| range | arm | `q4i_raw` via A's window | via B's window | by hook |
+|---|---|---|---|---|
+| 0..200 | Joint | 11 | 16 | Before0 1, After0 1, After1 2, Mid2 2, After2 2, After3 3, After5 4, Mid6 6, After6 6 |
+| 0..200 | Slot | 4 | 9 | After1 1, After2 1, After3 2, After5 3, Mid6 1, After6 5 |
+| 200..400 | Joint | 11 | 18 | Before0 1, After0 4, After1 4, Mid2 1, After4 1, After5 3, Mid6 7, After6 8 |
+| 200..400 | Slot | 7 | 11 | After0 2, After1 3, After2 1, After4 1, After5 2, Mid6 4, After6 5 |
+
+**The mechanism is confirmed, not refuted.** Before X5-R50 the
+pre-step-5 hooks (seven of ten) contributed 7 q4i per 1,000 seeds at
+share 1000 (the Goal's `m/a1k.json` reading); at S1 the A-window
+rounds alone contribute 11 Joint and 4 Slot `q4i_raw` new-failing
+rounds in just 0..200, and every one of the Slot fault's
+`q4_split_merge` catches (10 at 0..200, 13 at 200..400) is a round
+whose crash sits inside checkpoint `idx`'s held window — block B's —
+with block A having armed `idx−1`'s, exactly the "align the previous
+window as well, in exactly the rounds that recover it" fix. The
+Step 7b pin `x5_r43_slot_caught_on_a_q4_round` (seed 20 r1, crash
+`After0@2`: clean digest 462038950 passing, Slot digest 3929895968
+failing `O-1(b)` with `q4sp` 5 / `q4mg` 8 / `q4reuse` 4 in both arms)
+pins the catch on a literal Q4 round.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read

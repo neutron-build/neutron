@@ -2513,6 +2513,62 @@ fn x5_r50_ineligible_rounds_draw_nothing() {
     assert_eq!(k1.target_ckpt, 0, "seed 1: only the idx clause excludes it");
 }
 
+/// **X5-R43 (card X-5c-F4-F1-F1-F3-F1 step 7b): the Slot fault newly
+/// fails a `q4_split_merge` round at the chosen setting.** The literal
+/// seed is **20 round 1** at S1 = (`r41_share` 1000, `r41p_share`
+/// 500), crash `After0@2` — the crash inside checkpoint 2's held
+/// window (block B's: `q4sp` 5, `q4mg` 8, `q4reuse` 4, so
+/// `q4_split_merge` holds) while the recovery opens image 1 (block
+/// A's window). Clean: digest **462038950**, the round passes with no
+/// oracle text. Slot arm (`M-FREE-HOME-ALLOC`): digest **3929895968**,
+/// the same round fails the oracle (`O-1(b): scan read failed`) with
+/// `q4_split_merge` still true — the freed home was handed out inside
+/// the aligned window the Q4 predicate keys on, which is why the Slot
+/// fault now catches where F3 read zero (the mechanism the Goal
+/// states, confirmed; the full tables are in the README's step 7
+/// record).
+#[test]
+fn x5_r43_slot_caught_on_a_q4_round() {
+    use e4_recovery::campaign::seeded_new_failures;
+    use e4_recovery::store::Mutant;
+    let mut tun = workload::Tuning::BASE;
+    tun.r41_share = 1000;
+    tun.r41p_share = 500;
+    let clean = workload::run_seed_with(20, None, &tun);
+    assert!(clean.defect.is_none(), "seed 20: {:?}", clean.defect);
+    assert_eq!(clean.digest, 462038950, "seed 20's S1 clean schedule moved");
+    let slot = workload::run_seed_with(20, Some(Mutant::FreeHomeAlloc), &tun);
+    assert!(slot.defect.is_none(), "seed 20 slot: {:?}", slot.defect);
+    assert_eq!(slot.digest, 3929895968, "seed 20's S1 Slot digest moved");
+    assert_ne!(clean.digest, slot.digest, "the fault must move the digest");
+    let cr = clean.rounds.get(1).expect("seed 20 runs round 1");
+    let fr = slot.rounds.get(1).expect("the Slot arm runs round 1");
+    assert_eq!(cr.crash, "After0@2", "round 1's crash point moved");
+    // The Q4 round's halves, both arms (the crash inside block B's
+    // held window).
+    for r in [cr, fr] {
+        assert!(r.q4_split_merge, "the round carries Q4's own predicate");
+        assert_eq!(r.q4sp, 5, "q4sp exact");
+        assert_eq!(r.q4mg, 8, "q4mg exact");
+        assert!(r.q4reuse >= 1, "the held window reused an LPID");
+    }
+    // The X5-R43 catch shape: clean passes the oracle, the fault's
+    // arm fails it, and the rule counts the round.
+    assert!(cr.pass, "the clean round passes: {:?}", cr.o3_fail);
+    assert!(
+        cr.o1_fail.is_none() && cr.o2_fail.is_none() && cr.o3_fail.is_none(),
+        "the clean round carries no oracle text"
+    );
+    assert!(
+        fr.o1_fail.is_some() || fr.o2_fail.is_some() || fr.o3_fail.is_some(),
+        "M-FREE-HOME-ALLOC fails the oracle on 20 r1: o1={:?}",
+        fr.o1_fail
+    );
+    assert!(!fr.deadlock && !fr.panic, "an oracle failure, never a hang");
+    let nf = seeded_new_failures(std::slice::from_ref(&clean), std::slice::from_ref(&slot));
+    assert_eq!(nf, vec![(20, 1)], "the round counts as new-failing");
+}
+
 /// **X5-R42 (step 6): a refused round is not `q4i`.** The fold is
 /// `q4i_raw ∧ fired ∧ end.is_some()` (Q18's end): the exclusions match
 /// SIZING's — nested recovery crashes, the harness checkpoint, and
