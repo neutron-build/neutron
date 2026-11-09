@@ -2,7 +2,7 @@ import type { ComponentChildren } from "preact";
 import { assetUrl } from "./assets.js";
 import { isPhotoList, TEXT, type ResolvedConfig, type ResolvedField, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
-import type { Item, Post } from "./store.js";
+import type { Item, Post, Trashed, Version } from "./store.js";
 
 export const STATUS_LABEL = { draft: "Draft", live: "Live", scheduled: "Scheduled" } as const;
 export type Status = keyof typeof STATUS_LABEL;
@@ -10,6 +10,11 @@ export type Status = keyof typeof STATUS_LABEL;
 // Dates in the list are the site's dates, in its time zone, as the public pages show them.
 const listDate = (config: ResolvedConfig, iso: string) =>
   new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: config.timeZone }).format(new Date(iso));
+
+const fullDate = (config: ResolvedConfig, iso: string) =>
+  new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZone: config.timeZone }).format(new Date(iso));
+
+const wordCount = (text: string) => text.trim().split(/\s+/).filter(Boolean).length;
 
 export function Document(props: { config: ResolvedConfig; title: string; children: ComponentChildren }) {
   return (
@@ -91,7 +96,7 @@ export interface PostRow {
   status: Status;
 }
 
-export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kind?: "post" | "page" }) {
+export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kind?: "post" | "page"; deleted?: Trashed; trash?: number }) {
   const admin = props.config.path;
   const pages = props.kind === "page";
   return (
@@ -103,6 +108,12 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
             <button class="button primary" type="submit">{pages ? "New page" : "New post"}</button>
           </form>
         </div>
+        {props.deleted ? (
+          <form class="undo" method="post" action={`${admin}/trash/${props.deleted.id}`} role="status">
+            <span>"{props.deleted.title || "Untitled"}" moved to Trash.</span>
+            <button class="button" type="submit">Undo</button>
+          </form>
+        ) : null}
         {props.posts.length === 0 ? (
           <p class="muted">{pages ? "No pages yet." : "No posts yet."}</p>
         ) : (
@@ -118,8 +129,79 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
             </tbody>
           </table>
         )}
+        {props.trash ? <p class="trash-link"><a href={`${admin}/trash`}>Trash ({props.trash})</a></p> : null}
       </main>
     </Shell>
+  );
+}
+
+export function TrashPage(props: { config: ResolvedConfig; items: Trashed[] }) {
+  const { config, items } = props;
+  const admin = config.path;
+  return (
+    <Shell config={config}>
+      <main class="page narrow">
+        <div class="page-head"><h1>Trash</h1></div>
+        {items.length === 0 ? <p class="muted">The Trash is empty.</p> : (
+          <>
+            <table class="posts trash">
+              <tbody>
+                {items.map((item) => (
+                  <tr key={item.id}>
+                    <td><span class="trash-title">{item.title || "Untitled"}</span><small class="muted">{item.kind === "page" ? "Page" : "Post"}, deleted {listDate(config, item.deleted_at)}</small></td>
+                    <td class="actions">
+                      <form method="post" action={`${admin}/trash/${item.id}`}>
+                        <button class="link" type="submit" name="intent" value="forever" data-confirm={`Delete "${item.title || "Untitled"}" for good? This can't be undone.`}>Delete forever</button>
+                        <button class="button" type="submit" name="intent" value="restore">Restore</button>
+                      </form>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p class="trash-link muted">Items are deleted for good 30 days after they land here.</p>
+          </>
+        )}
+      </main>
+    </Shell>
+  );
+}
+
+export function VersionsPage(props: { config: ResolvedConfig; post: Post; versions: Version[]; selected?: Version; document: string; error?: string }) {
+  const { config, post, versions, selected, error } = props;
+  const admin = config.path;
+  const here = `${admin}/posts/${post.id}`;
+  return (
+    <>
+      <header class="top editor-top">
+        <a class="back" href={here} aria-label="Back to the editor">{"\u2190"}<span class="on-wide">&nbsp;Editor</span></a>
+        <span class="state">{post.title || "Untitled"}</span>
+        <span class="spacer" />
+        {selected ? (
+          <form method="post">
+            <input type="hidden" name="version" value={selected.id} />
+            <input type="hidden" name="revision" value={post.updated_at} />
+            <button class="button primary" type="submit">Restore this version</button>
+          </form>
+        ) : null}
+      </header>
+      {error ? <p class="notice error" role="alert">{error}</p> : null}
+      {selected ? (
+        <div class="versions">
+          <nav class="version-list" aria-label="Versions">
+            {versions.map((version) => (
+              <a key={version.id} href={`${here}/versions?v=${version.id}`} aria-current={version.id === selected.id ? "true" : undefined}>
+                <time dateTime={version.saved_at}>{fullDate(config, version.saved_at)}</time>
+                <small>{version.title !== post.title ? `${version.title || "Untitled"}, ` : ""}{wordCount(version.body)} words</small>
+              </a>
+            ))}
+          </nav>
+          <iframe class="version-preview" title="This version" sandbox="allow-same-origin" srcdoc={props.document} />
+        </div>
+      ) : (
+        <main class="page narrow"><p class="muted">No earlier versions yet. One is kept when you update a published post, and every ten minutes while you write a draft.</p></main>
+      )}
+    </>
   );
 }
 
@@ -132,6 +214,8 @@ export function EditorPage(props: {
   fields?: Partial<Post>;
   /** The revision the form was opened at, after a refused save. */
   revision?: string;
+  /** How many earlier versions there are to go back to. */
+  versions?: number;
 }) {
   const { config, post, status, saved, error } = props;
   const values = { ...post, ...props.fields };
@@ -201,10 +285,11 @@ export function EditorPage(props: {
           <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>
           <footer>
             {live && post.slug ? <a href={url(post.slug)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
+            {props.versions ? <a href={`${admin}/posts/${post.id}/versions`}>Versions ({props.versions})</a> : null}
             {status !== "draft" ? (
               <button class="link on-phone" type="submit" name="intent" value="unpublish" data-confirm={live ? `Take this ${post.kind} offline? You can publish it again any time.` : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
             ) : null}
-            <button class="link" type="submit" name="intent" value="delete" data-confirm={`Delete this ${post.kind}?`} formnovalidate>Delete</button>
+            <button class="link" type="submit" name="intent" value="delete" formnovalidate>Move to Trash</button>
           </footer>
         </aside>
       </form>

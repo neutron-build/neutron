@@ -68,6 +68,33 @@ const MIGRATIONS = [
   `ALTER TABLE posts ADD COLUMN label TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'post'`,
   `ALTER TABLE posts ADD COLUMN layout TEXT NOT NULL DEFAULT ''`,
+  // The whole post is kept, so it can come back as it was. Old versions go along under the negative of its trash id.
+  // A draft autosaves as it's typed, so it keeps a version every ten minutes at most; a published post keeps every update.
+  // Versions of posts deleted before there was a Trash move to post 0, so a new post can't inherit them through a reused id.
+  `CREATE TABLE posts_trash (
+     id INTEGER PRIMARY KEY,
+     slug TEXT,
+     title TEXT NOT NULL,
+     description TEXT NOT NULL,
+     label TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     layout TEXT NOT NULL,
+     body TEXT NOT NULL,
+     published_at TEXT,
+     updated_at TEXT NOT NULL,
+     deleted_at TEXT NOT NULL
+   );
+   DROP TRIGGER posts_keep_update;
+   CREATE TRIGGER posts_keep_update AFTER UPDATE ON posts
+   WHEN (old.body <> new.body OR old.title <> new.title)
+     AND (old.published_at IS NOT NULL OR NOT EXISTS (
+       SELECT 1 FROM posts_old WHERE post_id = old.id AND saved_at > strftime('%Y-%m-%dT%H:%M:%fZ', old.updated_at, '-10 minutes')))
+   BEGIN
+     INSERT INTO posts_old (post_id, title, body, saved_at) VALUES (old.id, old.title, old.body, old.updated_at);
+     DELETE FROM posts_old WHERE post_id = old.id AND id NOT IN
+       (SELECT id FROM posts_old WHERE post_id = old.id ORDER BY id DESC LIMIT 50);
+   END;
+   UPDATE posts_old SET post_id = 0 WHERE post_id NOT IN (SELECT id FROM posts);`,
 ];
 
 const store = globalThis as typeof globalThis & { __cmsDb?: DatabaseSync };
@@ -194,6 +221,7 @@ export function ensureDesigns(given: Record<string, string | { title: string; pu
 export function removeAbandonedDrafts(): void {
   const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
   db().prepare("DELETE FROM posts WHERE published_at IS NULL AND layout = '' AND title = '' AND body = '' AND description = '' AND updated_at < ?").run(hourAgo);
+  db().exec("DELETE FROM posts_old WHERE title = '' AND body = '' AND post_id NOT IN (SELECT id FROM posts)");
 }
 
 export function createPost(fields: Partial<PostFields> & { updated_at?: string } = {}): number {
@@ -250,9 +278,103 @@ export function savePost(id: number, fields: PostFields, revision: string, reser
   });
 }
 
-export const deletePost = (id: number) => {
-  db().prepare("DELETE FROM posts WHERE id = ?").run(id);
-};
+// Versions
+
+export interface Version {
+  id: number;
+  title: string;
+  body: string;
+  saved_at: string;
+}
+
+/** Earlier versions, newest first. A draft's first, empty state and anything identical to the post now are not worth showing. */
+export function versionsOf(post: Pick<Post, "id" | "title" | "body">): Version[] {
+  const rows = db().prepare("SELECT id, title, body, saved_at FROM posts_old WHERE post_id = ? AND (title <> '' OR body <> '') ORDER BY id DESC").all(post.id) as unknown as Version[];
+  return rows.filter((row) => row.title !== post.title || row.body !== post.body);
+}
+
+export type RestoreResult = { ok: true } | { ok: false; error: "stale" | "missing" };
+
+/** Puts an old version's title and text back. What it replaces becomes a version, so this can be undone too. */
+export function restoreVersion(id: number, versionId: number, revision: string): RestoreResult {
+  return transaction<RestoreResult>(() => {
+    const current = getPost(id);
+    const version = db().prepare("SELECT title, body FROM posts_old WHERE id = ? AND post_id = ?").get(versionId, id) as Pick<Version, "title" | "body"> | undefined;
+    if (!current || !version) return { ok: false, error: "missing" };
+    if (current.updated_at !== revision) return { ok: false, error: "stale" };
+    // Published posts always keep a version; a draft might be inside its ten minutes, and this one must be kept.
+    if (current.published_at === null) db().prepare("INSERT INTO posts_old (post_id, title, body, saved_at) VALUES (?, ?, ?, ?)").run(id, current.title, current.body, current.updated_at);
+    db().prepare("UPDATE posts SET title = ?, body = ?, updated_at = ? WHERE id = ?").run(version.title, version.body, after(current.updated_at), id);
+    return { ok: true };
+  });
+}
+
+// Trash
+
+export interface Trashed {
+  id: number;
+  title: string;
+  kind: Kind;
+  deleted_at: string;
+}
+
+const TRASH_DAYS = 30;
+
+/** Takes a post off the site and into the Trash, with its address and dates. Returns its place there. */
+export function trashPost(id: number): number | null {
+  return transaction(() => {
+    if (!getPost(id)) return null;
+    const trashed = db().prepare(
+      `INSERT INTO posts_trash (slug, title, description, label, kind, layout, body, published_at, updated_at, deleted_at)
+       SELECT slug, title, description, label, kind, layout, body, published_at, updated_at, ? FROM posts WHERE id = ?`,
+    ).run(now(), id);
+    const trashId = Number(trashed.lastInsertRowid);
+    db().prepare("DELETE FROM posts WHERE id = ?").run(id);
+    // The delete trigger's copy would only repeat what the Trash now holds.
+    db().prepare("DELETE FROM posts_old WHERE id = (SELECT max(id) FROM posts_old WHERE post_id = ?)").run(id);
+    db().prepare("UPDATE posts_old SET post_id = ? WHERE post_id = ?").run(-trashId, id);
+    return trashId;
+  });
+}
+
+export const trashed = () =>
+  db().prepare("SELECT id, title, kind, deleted_at FROM posts_trash ORDER BY deleted_at DESC, id DESC").all() as unknown as Trashed[];
+
+export const inTrash = (id: number) =>
+  db().prepare("SELECT id, title, kind, deleted_at FROM posts_trash WHERE id = ?").get(id) as Trashed | undefined;
+
+export const trashCount = () => (db().prepare("SELECT count(*) AS n FROM posts_trash").get() as { n: number }).n;
+
+/**
+ * Brings a post back as it was. If something else has taken its address or the site now reserves it,
+ * it comes back as a draft with no address, because publishing it there would break the other page.
+ */
+export function restoreFromTrash(trashId: number, reservedSlugs: string[] = []): { id: number; addressLost: boolean } | null {
+  return transaction(() => {
+    const row = db().prepare("SELECT * FROM posts_trash WHERE id = ?").get(trashId) as (Post & { deleted_at: string }) | undefined;
+    if (!row) return null;
+    const addressLost = row.slug !== null && (reservedSlugs.includes(row.slug) || Boolean(db().prepare("SELECT 1 FROM posts WHERE slug = ?").get(row.slug)));
+    const restored = db().prepare("INSERT INTO posts (slug, title, description, label, kind, layout, body, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      addressLost ? null : row.slug, row.title, row.description, row.label, row.kind, row.layout, row.body, addressLost ? null : row.published_at, row.updated_at,
+    );
+    const id = Number(restored.lastInsertRowid);
+    db().prepare("UPDATE posts_old SET post_id = ? WHERE post_id = ?").run(id, -trashId);
+    db().prepare("DELETE FROM posts_trash WHERE id = ?").run(trashId);
+    return { id, addressLost };
+  });
+}
+
+export function deleteForever(trashId: number): void {
+  transaction(() => {
+    db().prepare("DELETE FROM posts_old WHERE post_id = ?").run(-trashId);
+    db().prepare("DELETE FROM posts_trash WHERE id = ?").run(trashId);
+  });
+}
+
+export function emptyOldTrash(): void {
+  const cutoff = new Date(Date.now() - TRASH_DAYS * 86_400_000).toISOString();
+  for (const { id } of db().prepare("SELECT id FROM posts_trash WHERE deleted_at < ?").all(cutoff) as { id: number }[]) deleteForever(id);
+}
 
 // Lists
 

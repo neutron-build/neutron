@@ -372,3 +372,25 @@ a.button { color: inherit; text-decoration: none; }
   .item { grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 12px 0; }
   .item-tools { min-height: 24px; }
 }
+
+/* Trash and versions */
+.undo { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
+.trash-link { margin-top: 16px; font-size: 13px; }
+.trash-link a { color: var(--muted); }
+.trash-title { display: block; color: var(--strong); font-size: 15px; font-weight: 500; }
+.posts.trash small { font-size: 13px; }
+.posts.trash .actions { padding-left: 24px; white-space: nowrap; }
+.posts.trash .actions form { display: flex; align-items: center; gap: 16px; }
+.posts.trash .actions .link { color: var(--muted); font-size: 13px; }
+.versions { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: calc(100dvh - 57px); }
+.version-list { overflow-y: auto; padding: 8px; border-right: 1px solid var(--rule); }
+.version-list a { display: block; padding: 8px 12px; border-radius: 6px; color: inherit; text-decoration: none; }
+.version-list a:hover { background: var(--surface); }
+.version-list a[aria-current] { background: var(--surface); color: var(--strong); font-weight: 500; }
+.version-list small { display: block; color: var(--muted); font-size: 13px; font-weight: 400; overflow-wrap: anywhere; }
+.version-preview { width: 100%; height: 100%; border: 0; background: var(--bg); }
+@media (max-width: 700px) {
+  .versions { grid-template-columns: 1fr; grid-template-rows: 180px minmax(0, 1fr); }
+  .version-list { border-right: 0; border-bottom: 1px solid var(--rule); }
+  .posts.trash .actions form { flex-direction: column-reverse; align-items: flex-end; gap: 6px; }
+}

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import { hashPassword } from "./auth.js";
 import { defineCms } from "./index.js";
-import { closeDb, createPost, db } from "./store.js";
+import { closeDb, createPost, db, restoreVersion } from "./store.js";
 
 const SITE = "https://site.test";
 const PASSWORD = "a-long-enough-test-password";
@@ -534,6 +534,10 @@ test("a homepage design is always published, answers only at its own address, an
   await call2(`/n-admin/posts/${id}`, { method: "POST", body: new URLSearchParams({ intent: "delete" }) });
   assert.equal(site.design("home")?.title, "Home");
 
+  const extra = list.match(/href="\/n-admin\/posts\/(\d+)">Extra</)![1];
+  await call2(`/n-admin/posts/${extra}`, { method: "POST", body: new URLSearchParams({ intent: "delete" }) });
+  assert.match(await (await call2(`/n-admin/pages`)).text(), />Extra<\/a>/, "a design's page can't be thrown away");
+
   const gpg = list.match(/href="\/n-admin\/posts\/(\d+)">GPG</)![1];
   const gpgEditor = await (await call2(`/n-admin/posts/${gpg}`)).text();
   assert.match(gpgEditor, /value="unpublish"/);
@@ -601,4 +605,114 @@ test("a title-made address steps aside for one in use; publishing needs a title"
   assert.ok(cms.post("notes-2"));
   const third = await open();
   assert.match(await (await call(third.path, { method: "POST", cookie, body: form({ intent: "publish", title: "", body: "z", revision: third.revision }) })).text(), /Add a title before publishing/);
+});
+
+test("a deleted post goes to the Trash, and comes back as it was with its versions", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "Keep me", body: "first", slug: "keep-me", published_at: "2020-01-02T00:00:00.000Z" });
+  const open = await (await call(`/n-admin/posts/${id}`, { cookie })).text();
+  await call(`/n-admin/posts/${id}`, { method: "POST", cookie, body: form({ intent: "save", title: "Keep me", body: "second", slug: "keep-me", date: "2020-01-02T00:00:00.000Z", revision: revisionOf(open), label: "", description: "" }) });
+  assert.equal(cms.post("keep-me")?.body, "second");
+
+  const deleted = await call(`/n-admin/posts/${id}`, { method: "POST", cookie, body: form({ intent: "delete" }) });
+  const after = deleted.headers.get("location")!;
+  const trashId = after.match(/deleted=(\d+)/)![1];
+  assert.equal(cms.post("keep-me"), undefined, "off the site at once");
+  assert.match(await (await call(after, { cookie })).text(), /&quot;Keep me&quot; moved to Trash|"Keep me" moved to Trash/);
+  assert.match(await (await call("/n-admin/trash", { cookie })).text(), /Keep me/);
+
+  const restored = await call(`/n-admin/trash/${trashId}`, { method: "POST", cookie, body: form({}) });
+  const newId = restored.headers.get("location")!.match(/posts\/(\d+)$/)![1];
+  const back = cms.post("keep-me");
+  assert.equal(back?.body, "second");
+  assert.equal(back?.published_at, "2020-01-02T00:00:00.000Z", "keeps its date");
+  assert.match(await (await call(`/n-admin/posts/${newId}/versions`, { cookie })).text(), /1 words/);
+  assert.doesNotMatch(await (await call("/n-admin/trash", { cookie })).text(), /Keep me/);
+});
+
+test("a post whose address was taken while in the Trash comes back as a draft", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "Old", body: "x", slug: "shared", published_at: "2020-01-01T00:00:00.000Z" });
+  const deleted = await call(`/n-admin/posts/${id}`, { method: "POST", cookie, body: form({ intent: "delete" }) });
+  const trashId = deleted.headers.get("location")!.match(/deleted=(\d+)/)![1];
+  createPost({ title: "New", body: "y", slug: "shared", published_at: "2020-01-01T00:00:00.000Z" });
+  const restored = await call(`/n-admin/trash/${trashId}`, { method: "POST", cookie, body: form({}) });
+  const location = restored.headers.get("location")!;
+  assert.match(location, /address-lost/);
+  assert.equal(cms.post("shared")?.title, "New");
+  const editor = await (await call(location, { cookie })).text();
+  assert.match(editor, /came back as a draft/);
+  assert.match(editor, /class="status draft"/);
+});
+
+test("delete forever takes the post and its versions, and a new post can't inherit them", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "Gone", body: "one", published_at: "2020-01-01T00:00:00.000Z" });
+  db().prepare("UPDATE posts SET body = 'two' WHERE id = ?").run(id);
+  const deleted = await call(`/n-admin/posts/${id}`, { method: "POST", cookie, body: form({ intent: "delete" }) });
+  const trashId = deleted.headers.get("location")!.match(/deleted=(\d+)/)![1];
+  const fresh = createPost({ title: "Fresh", body: "new" });
+  assert.equal(fresh, id, "sqlite reuses the id, which is the case that matters");
+  assert.match(await (await call(`/n-admin/posts/${fresh}/versions`, { cookie })).text(), /No earlier versions/);
+  await call(`/n-admin/trash/${trashId}`, { method: "POST", cookie, body: form({ intent: "forever" }) });
+  assert.equal((db().prepare("SELECT count(*) AS n FROM posts_old WHERE body = 'one'").get() as { n: number }).n, 0);
+  assert.doesNotMatch(await (await call("/n-admin/trash", { cookie })).text(), /Gone/);
+});
+
+test("the Trash forgets things after 30 days, and needs a login", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "Ancient", body: "x" });
+  await call(`/n-admin/posts/${id}`, { method: "POST", cookie, body: form({ intent: "delete" }) });
+  db().prepare("UPDATE posts_trash SET deleted_at = '2020-01-01T00:00:00.000Z'").run();
+  assert.match(await (await call("/n-admin/trash", { cookie })).text(), /The Trash is empty/);
+  assert.equal((await call("/n-admin/trash")).status, 303);
+  assert.equal((await call("/n-admin/trash/1", { method: "POST", body: form({}) })).status, 303);
+});
+
+test("restoring a version brings it back, and what it replaced can be restored too", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "One", body: "<script>alert(1)</script> old text", published_at: "2020-01-01T00:00:00.000Z" });
+  db().prepare("UPDATE posts SET title = 'Two', body = 'new text', updated_at = '2021-01-01T00:00:00.000Z' WHERE id = ?").run(id);
+  const page = await (await call(`/n-admin/posts/${id}/versions`, { cookie })).text();
+  assert.match(page, /sandbox="allow-same-origin"/);
+  assert.doesNotMatch(page, /<script>alert/);
+  const version = page.match(/name="version" value="(\d+)"/)![1];
+
+  const stale = await call(`/n-admin/posts/${id}/versions`, { method: "POST", cookie, body: form({ version, revision: "old" }) });
+  assert.equal(stale.status, 409);
+  assert.match(await stale.text(), /changed since you opened/);
+
+  const done = await call(`/n-admin/posts/${id}/versions`, { method: "POST", cookie, body: form({ version, revision: "2021-01-01T00:00:00.000Z" }) });
+  assert.equal(done.status, 303);
+  const row = db().prepare("SELECT title, body FROM posts WHERE id = ?").get(id) as { title: string; body: string };
+  assert.equal(row.title, "One");
+  assert.match(row.body, /old text/);
+  assert.match(await (await call(`/n-admin/posts/${id}/versions`, { cookie })).text(), /Two, 2 words/);
+
+  const other = createPost({ title: "Other", body: "x" });
+  assert.equal((await call(`/n-admin/posts/${other}/versions`, { method: "POST", cookie, body: form({ version, revision: "any" }) })).status, 409, "a version belongs to its own post");
+});
+
+test("a draft keeps a version every ten minutes, but restoring always keeps what it replaced", () => {
+  const id = createPost({ title: "Draft", body: "a", updated_at: "2026-01-01T00:00:00.000Z" });
+  const edit = (body: string, at: string) => db().prepare("UPDATE posts SET body = ?, updated_at = ? WHERE id = ?").run(body, at, id);
+  const count = () => (db().prepare("SELECT count(*) AS n FROM posts_old WHERE post_id = ?").get(id) as { n: number }).n;
+  edit("ab", "2026-01-01T00:00:02.000Z");
+  edit("abc", "2026-01-01T00:00:04.000Z");
+  edit("abcd", "2026-01-01T00:00:06.000Z");
+  assert.equal(count(), 1, "typing doesn't flood the history");
+  edit("abcde", "2026-01-01T00:11:00.000Z");
+  edit("abcdef", "2026-01-01T00:12:00.000Z");
+  assert.equal(count(), 2);
+  const version = (db().prepare("SELECT id FROM posts_old WHERE post_id = ? ORDER BY id LIMIT 1").get(id) as { id: number }).id;
+  assert.deepEqual(restoreVersion(id, version, "2026-01-01T00:12:00.000Z"), { ok: true });
+  assert.equal(count(), 3, "the text it replaced is kept even inside the ten minutes");
+});
+
+test("Move to Trash doesn't ask first, because it can be undone", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "Plain", body: "x", kind: "page" });
+  const editor = await (await call(`/n-admin/posts/${id}`, { cookie })).text();
+  assert.match(editor, /value="delete"/);
+  assert.doesNotMatch(editor, /data-confirm="Delete/, "Trash can be undone, so it doesn't ask first");
 });

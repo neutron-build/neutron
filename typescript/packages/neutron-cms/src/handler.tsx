@@ -10,10 +10,10 @@ import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { isSafeUrl } from "./safe-url.js";
 import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
-import { Document, EditorPage, EditPage, type DesignedPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, type Status } from "./pages.js";
+import { Document, EditorPage, EditPage, type DesignedPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deletePost, ensureDesigns, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, saveEdits, savePost, setTexts,
-  sortByDate, type Item, type Post,
+  allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreVersion, saveEdits, savePost, setTexts,
+  sortByDate, trashCount, trashed, trashPost, versionsOf, type Item, type Post,
 } from "./store.js";
 
 const CSP = [
@@ -120,9 +120,12 @@ export function createHandler(config: ResolvedConfig) {
   const notFound = () => page("Not found", <NotFoundPage config={config} />, 404);
   const isScript = (request: Request) => request.headers.has("x-cms");
 
-  function postsPage(kind: "post" | "page" = "post") {
+  function postsPage(request: Request, kind: "post" | "page" = "post") {
     if (kind === "page") ensureDesigns(config.designs);
     removeAbandonedDrafts();
+    emptyOldTrash();
+    const deletedId = Number(new URL(request.url).searchParams.get("deleted"));
+    const deleted = deletedId ? inTrash(deletedId) : undefined;
     const at = new Date().toISOString();
     // Pages that are always there, such as the homepage, lead the list.
     const first = (post: Post) => (kind === "page" && designOf(post)?.permanent ? 0 : 1);
@@ -132,13 +135,13 @@ export function createHandler(config: ResolvedConfig) {
       date: post.published_at ?? post.updated_at,
       status: statusOf(post, at),
     }));
-    return page(kind === "page" ? "Pages" : "Posts", <PostsPage config={config} posts={posts} kind={kind} />);
+    return page(kind === "page" ? "Pages" : "Posts", <PostsPage config={config} posts={posts} kind={kind} deleted={deleted} trash={trashCount()} />);
   }
 
   function home(request: Request) {
     if (config.posts) {
       if (request.method === "POST") return redirect(`${admin}/posts/${createPost()}`);
-      return postsPage();
+      return postsPage(request);
     }
     if (config.onPage.length) return redirect(`${admin}/edit`);
     const first = Object.keys(config.lists)[0] ?? (Object.keys(config.texts).length ? TEXT : null);
@@ -195,19 +198,21 @@ export function createHandler(config: ResolvedConfig) {
     return Response.json({ url, thumb: thumbUrl(url) });
   }
 
-  async function preview(request: Request) {
-    const form = await request.formData();
-    const title = escapeHtml(String(form.get("title") ?? ""));
+  /** A post's text as a whole page, for a frame in the admin. */
+  function previewDocument(request: Request, rawTitle: string, markdown: string) {
+    const title = escapeHtml(rawTitle);
     // The preview frame has no address of its own, and the admin forbids <base>, so the site's own
     // paths are written out in full.
     const site = process.env.SITE_URL ? new URL(process.env.SITE_URL).origin : new URL(request.url).origin;
-    const body = renderMarkdown(String(form.get("body") ?? ""))
+    const body = renderMarkdown(markdown)
       .replace(/\b(src|href|poster)="\/(?!\/)/g, `$1="${site}/`)
       .replace(/\bsrcset="([^"]*)"/g, (_, set: string) => `srcset="${set.replace(/(^|,\s*)\/(?!\/)/g, `$1${site}/`)}"`);
-    return new Response(
-      `<!doctype html><meta charset="utf-8"><style>html{box-sizing:border-box}*{box-sizing:inherit}body{margin:0;font-family:sans-serif}img{max-width:100%;height:auto}main{width:min(768px,100%);margin:0 auto;padding:40px 24px 96px}h1:first-child{margin:0 0 16px;font-size:40px;line-height:1.2}${config.previewCss}</style><main><h1>${title}</h1><div class="prose">${body}</div></main>`,
-      { headers: { "Content-Type": "text/html; charset=utf-8" } },
-    );
+    return `<!doctype html><meta charset="utf-8"><style>html{box-sizing:border-box}*{box-sizing:inherit}body{margin:0;font-family:sans-serif}img{max-width:100%;height:auto}main{width:min(768px,100%);margin:0 auto;padding:40px 24px 96px}h1:first-child{margin:0 0 16px;font-size:40px;line-height:1.2}${config.previewCss}</style><main><h1>${title}</h1><div class="prose">${body}</div></main>`;
+  }
+
+  async function preview(request: Request) {
+    const form = await request.formData();
+    return new Response(previewDocument(request, String(form.get("title") ?? ""), String(form.get("body") ?? "")), { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
   const designOf = (post: Post) => (post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined);
@@ -235,13 +240,19 @@ export function createHandler(config: ResolvedConfig) {
     return page(post.title || "Page", <EditPage config={config} src={src} back={{ href: `${admin}/pages`, label: "Pages" }} page={state} />);
   }
 
+  const editorPage = (post: Post, rest: { saved?: boolean; error?: string; fields?: Partial<Post>; revision?: string } = {}) =>
+    page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={rest.saved ?? false} error={rest.error} fields={rest.fields} revision={rest.revision} versions={versionsOf(post).length} />);
+
+  const editable = (post: Post | undefined): post is Post => Boolean(post) && (post!.kind === "page" ? config.pages : config.posts);
+
   async function editor(request: Request, id: number) {
     const post = getPost(id);
-    if (!post || (post.kind === "page" ? !config.pages : !config.posts)) return notFound();
-    const saved = new URL(request.url).searchParams.has("saved");
+    if (!editable(post)) return notFound();
+    const search = new URL(request.url).searchParams;
     if (request.method !== "POST") {
       if (isDesign(post)) return designedPage(post);
-      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={saved} />);
+      const error = search.has("address-lost") ? "Its old address is now used by something else, so it came back as a draft. Choose a new URL to publish it." : undefined;
+      return editorPage(post, { saved: search.has("saved"), error });
     }
 
     const form = await request.formData();
@@ -250,10 +261,11 @@ export function createHandler(config: ResolvedConfig) {
     const script = isScript(request);
 
     const design = designOf(post);
-    if (design?.permanent && (intent === "delete" || intent === "unpublish")) return redirect(`${admin}/posts/${id}`);
+    // A design's page is part of the site's code, so it can be taken offline but not thrown away.
+    if ((design && intent === "delete") || (design?.permanent && intent === "unpublish")) return redirect(`${admin}/posts/${id}`);
     if (intent === "delete") {
-      deletePost(id);
-      return redirect(post.kind === "page" ? `${admin}/pages` : admin);
+      const trashId = trashPost(id);
+      return redirect(`${post.kind === "page" ? `${admin}/pages` : admin}?deleted=${trashId}`);
     }
 
     const date = parseDate(read("date") || read("date_local"));
@@ -269,7 +281,7 @@ export function createHandler(config: ResolvedConfig) {
       : { title: read("title").trim(), description: read("description").trim(), label: read("label").trim(), body: read("body"), slug: read("slug"), published_at };
 
     if (intent === "publish" && !design && !fields.title) {
-      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={false} error="Add a title before publishing." fields={fields} revision={read("revision")} />);
+      return editorPage(post, { error: "Add a title before publishing.", fields, revision: read("revision") });
     }
 
     // A design owns its address, even one the site reserves for its own routes.
@@ -279,10 +291,44 @@ export function createHandler(config: ResolvedConfig) {
       if (script) return Response.json({ ok: false, error: result.error, message }, { status: 409 });
       if (design) return redirect(`${admin}/posts/${id}`);
       // Keep the revision this form was opened at: the current one would let a second press overwrite the newer text.
-      return page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={false} error={message} fields={fields} revision={read("revision")} />);
+      return editorPage(post, { error: message, fields, revision: read("revision") });
     }
     if (script) return Response.json({ ok: true, revision: result.post.updated_at, slug: result.post.slug });
     return redirect(`${admin}/posts/${id}?saved=1`);
+  }
+
+  async function versions(request: Request, id: number) {
+    const post = getPost(id);
+    if (!editable(post) || isDesign(post)) return notFound();
+    const show = (error?: string, status = 200) => {
+      const all = versionsOf(post);
+      const wanted = Number(new URL(request.url).searchParams.get("v"));
+      const selected = all.find((version) => version.id === wanted) ?? all[0];
+      const doc = selected ? previewDocument(request, selected.title, selected.body) : "";
+      return page(`Versions of ${post.title || "Untitled"}`, <VersionsPage config={config} post={post} versions={all} selected={selected} document={doc} error={error} />, status);
+    };
+    if (request.method !== "POST") return show();
+    const form = await request.formData();
+    const result = restoreVersion(id, Number(form.get("version")), String(form.get("revision") ?? ""));
+    if (result.ok) return redirect(`${admin}/posts/${id}?saved=1`);
+    return show(result.error === "stale" ? "This post changed since you opened this page. Look at the list again, then restore." : "That version is no longer kept.", 409);
+  }
+
+  function trashPage() {
+    emptyOldTrash();
+    return page("Trash", <TrashPage config={config} items={trashed()} />);
+  }
+
+  async function trashAction(request: Request, id: number) {
+    const item = inTrash(id);
+    if (!item) return redirect(`${admin}/trash`);
+    const form = await request.formData();
+    if (form.get("intent") === "forever") {
+      deleteForever(id);
+      return redirect(`${admin}/trash`);
+    }
+    const restored = restoreFromTrash(id, config.reservedSlugs);
+    return redirect(`${admin}/posts/${restored!.id}${restored!.addressLost ? "?address-lost=1" : ""}`);
   }
 
   async function list(request: Request, key: string) {
@@ -386,8 +432,11 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
     if (first === "upload" && !second && post) return upload(request);
     if (first === "preview" && !second && post) return preview(request);
-    if (first === "pages" && config.pages && !second) return post ? redirect(`${admin}/posts/${createPost({ kind: "page" })}`) : postsPage("page");
+    if (first === "pages" && config.pages && !second) return post ? redirect(`${admin}/posts/${createPost({ kind: "page" })}`) : postsPage(request, "page");
     if (first === "posts" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0) return editor(request, Number(second));
+    if (first === "posts" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 1 && rest[0] === "versions") return versions(request, Number(second));
+    if (first === "trash" && (config.posts || config.pages) && !second && !post) return trashPage();
+    if (first === "trash" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0 && post) return trashAction(request, Number(second));
     if (first === "lists" && second && rest.length === 0) return list(request, second);
     return notFound();
   }

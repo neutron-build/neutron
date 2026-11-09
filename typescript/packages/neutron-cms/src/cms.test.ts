@@ -9,7 +9,7 @@ import {
   readLimited, sessionCookie, takeAttempt, verifyPassword,
 } from "./auth.js";
 import {
-  allPosts, backupTo, closeDb, contentCount, createPost, db, deletePost, getPost, isLive, listItems,
+  allPosts, backupTo, closeDb, contentCount, createPost, db, trashPost, getPost, isLive, listItems,
   listRevision, livePostBySlug, livePosts, replaceItems, savePost, slugify, sortByDate, upcoming,
 } from "./store.js";
 import { isPhotoList } from "./config.js";
@@ -94,13 +94,15 @@ test("a scheduled post can still change its slug", () => {
 test("old bodies stay recoverable, including after delete", () => {
   const id = createPost({ title: "T", body: "one", updated_at: iso(-5000) });
   savePost(id, fields({ title: "T", body: "two" }), getPost(id)!.updated_at);
-  deletePost(id);
-  const old = db().prepare("SELECT body FROM posts_old WHERE post_id = ? ORDER BY id").all(id) as { body: string }[];
-  assert.deepEqual(old.map((row) => row.body), ["one", "two"]);
+  const trashId = trashPost(id)!;
+  assert.equal(getPost(id), undefined);
+  const old = db().prepare("SELECT body FROM posts_old WHERE post_id = ? ORDER BY id").all(-trashId) as { body: string }[];
+  assert.deepEqual(old.map((row) => row.body), ["one"], "the last text is in the Trash, the earlier ones go with it");
+  assert.equal((db().prepare("SELECT body FROM posts_trash WHERE id = ?").get(trashId) as { body: string }).body, "two");
 });
 
 test("old bodies are capped at 50 per post", () => {
-  const id = createPost({ body: "0", updated_at: iso(-100_000) });
+  const id = createPost({ body: "0", published_at: iso(-200_000), updated_at: iso(-100_000) });
   for (let n = 1; n <= 60; n++) db().prepare("UPDATE posts SET body = ? WHERE id = ?").run(String(n), id);
   const row = db().prepare("SELECT count(*) AS n, min(body + 0) AS low FROM posts_old WHERE post_id = ?").get(id) as { n: number; low: number };
   assert.equal(row.n, 50);

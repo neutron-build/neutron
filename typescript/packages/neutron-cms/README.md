@@ -147,7 +147,7 @@ npx neutron-cms init             # once, on the new volume
 npx neutron-cms backup out.db    # a consistent copy of the database; copy media/ alongside it
 ```
 
-Serve `cms.ready()` from a health route to stop a deploy that has lost its data. Saving also keeps the last 50 versions of each post in the `posts_old` table.
+Serve `cms.ready()` from a health route to stop a deploy that has lost its data. Each post keeps its last 50 versions, restorable from Settings, Versions: every update of a published post, and one every ten minutes while a draft is written. Deleting moves a post to the Trash, with an Undo, for 30 days. Lists and text fields have no history.
 
 ## Limits
 
