@@ -3403,6 +3403,66 @@ against the baseline for all 54 of its seeds: **exactly one moved**
 (2669, the same two digests); every other pin in the crate is green.
 The literals are not yet edited (step 4).
 
+**Step 2 — the movement over 0..1000 under X5-R51/X5-R52, and the
+attribution (this commit).** Five 200-seed runs at the tip (16 threads,
+`ulimit -v 25165824`, output under `$CARGO_TARGET_DIR/w/`; the card's
+`~/.cache/nv3-review/X-5c-…-F2/` is read-only in this container — the
+base card's accepted judgment call, `$CARGO_TARGET_DIR` instead). Every
+run's own line: `E4 SEEDS=200 … MONITOR=0`, and
+`TWIN_FAILING_ROUNDS=0` in all five folds. The comparator exactly as the
+Acceptance line plus `--range 0..1000`, the five `.json`/`.out` pairs
+repeated through `--run`/`--run-out` (exit 0), in full:
+
+```
+DIGESTS_MOVED 2 FAILING_ROUNDS 4 MONITOR 0
+MOVED_GAINED 0 []
+MOVED_MP_PENDING 0 []
+META_ONLY_ELIGIBLE 0 []
+MPA_PASS_FAIL 0 []
+MPA_CLASS base 1 tip 1
+TWIN_DDL_PENDING 0 []
+MOVED_LOST 0 []
+HEALED 0 []
+TWIN_HEALED 2 [(609, 1), (849, 1)]
+TEXT_CHANGED 0 []
+TWIN_FAILING 0 [] BASE 2
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+- **`check-mp`:** `MOVED_MP_PENDING 0 []` — no row, so no single-seed
+  run to make (the 10k's rows are the gate's to check).
+- **`TWIN_HEALED 2 [(609, 1), (849, 1)]`**, `TWIN_FAILING 0`,
+  `NEW_FAILING 0` — exactly the expected (not a target) reading.
+
+**The attribution** (uncommitted by construction: the `eprintln!` lives
+only in a scratch export of this tip under `$CARGO_TARGET_DIR/e1/`,
+never in the worktree — `git status` clean throughout). One
+`eprintln!("X5R52 reseed seed={seed} round={round}")` added where (b)
+fires; the five 200-seed runs re-run there:
+
+- **The eprintln moved no digest:** all 1000 diag-export digests equal
+  the plain tip's, seed for seed.
+- **Re-seed events, 0..1000 (5):** 259 r1, 609 r1, 719 r1, 809 r1,
+  849 r1.
+- **Every moved digest belongs to a seed with at least one re-seed
+  event:** moved = {609, 849}; both have their event at r1. **No moved
+  digest without a re-seed event.**
+- **Re-seeded and did not move:** 259, 719, 809 (the re-seed replaced
+  the twin chain, but the twin round's own record — pass, no O-1 — was
+  the same either way: the r1 script touches no tree the old twin chain
+  lacked).
+- **X5-R37's 54 seeds, singly, the same check:** exactly one moved —
+  2669 `357787865 → 1374321949`, with its re-seed event at r1; the
+  other 53 are byte-identical with **no** re-seed event; the diag
+  digests equal the plain tip's for all 54.
+
+Beyond the required scope (evidence, singly at the tip): **all seven**
+of the verdict's failing twin entries now pass — 609 t1, 849 t1 (above),
+and 2599 t2, 2859 t1, 3449 t1, 5049 t1, 7179 t1, each of the five with
+its digest moved and its re-seed event(s) at the same round(s) the twin
+failed at the Base (2599 at r1 **and** r2, matching its t2; the others
+at r1). The 10k comparison judges them.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
