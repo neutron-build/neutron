@@ -1697,6 +1697,38 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             });
         }
     }
+    // **E4-R1 (card E4-SILENT-1; S-STORE §12.8 step 3's dependency,
+    // header-design-verify §1.5 item 3):** every `Commit` above `T`
+    // that carries a `RequireCkpt{id}` op names the durable checkpoint
+    // the publication depends on. If `id` is above the opened meta's
+    // `ckpt_id`, this replay runs over an image older than the
+    // checkpoint that made the unlogged load durable — the loaded
+    // entries are in neither the image nor the log, and the open would
+    // serve the published tree silently incomplete. The open fails with
+    // XX001 here, in pass 1 — after the coverage check (worse WAL
+    // damage is reported as itself) and before `recover:install`, pass
+    // 2, any eviction write and `truncate_wal`: **nothing is written**.
+    // A publication at or below `T` is already in the image and never
+    // checks; every commit without the op never checks.
+    for rec in replay.iter() {
+        if rec.kind != K_COMMIT || rec.ts <= meta.t {
+            continue;
+        }
+        for op in wal::rec_ops(rec) {
+            if let wal::WOp::RequireCkpt { id } = op
+                && id > meta.ckpt_id
+            {
+                eprintln!(
+                    "E4_SILENT_REFUSE rule=R1 opened={} need={} ts={}",
+                    meta.ckpt_id, id, rec.ts
+                );
+                return Err(Fail::Corrupt(format!(
+                    "publication at ts {} needs checkpoint {id}; the opened image is {} (E4-R1, 12.8 step 3)",
+                    rec.ts, meta.ckpt_id
+                )));
+            }
+        }
+    }
     // Card X-5c-F4-F1-F1-O1C (`E4_O1C_TRACE`, stderr only, default off,
     // never a digest input): the walk's own record list — every
     // `Commit`/`CommitMarker` the walk accepted, with its ts, kind, lsn
@@ -1850,6 +1882,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                                         wal::WOp::Delete { tree, key } => {
                                             format!("X{tree}/{}", key.len())
                                         }
+                                        wal::WOp::RequireCkpt { id } => format!("R{id}"),
                                     })
                                     .collect::<Vec<_>>()
                                     .join(",")
@@ -2061,6 +2094,10 @@ pub fn apply_op<H: StoreHost>(
             tree::tree_insert(cx, *tree, root, &ekey, &[1u8], chunked)?;
             Ok(())
         }
+        // **E4-R1 (card E4-SILENT-1):** the checkpoint dependency is a
+        // store-level marker, never a data op. Pass 1's check (above)
+        // consumed it before any apply ran; pass 2 ignores it.
+        wal::WOp::RequireCkpt { .. } => Ok(()),
     }
 }
 

@@ -3312,3 +3312,298 @@ fn twin_supply_carries_a_failed_recovery_reads() {
         "the twin collector must not be empty after a failed recovery (M-TWa)"
     );
 }
+
+// ---- card E4-SILENT-1 (the two silent-data fixes before E4's final run) ----
+
+/// **E4-R1's script (card E4-SILENT-1 step 1; the eval appendix of
+/// `header-durability-design-eval.md` §3):** setup and publication of
+/// tree 2, one logged commit, a checkpoint (meta 1), a 20-entry
+/// unlogged bulk load of tree 5 with its forced checkpoint (meta 2) and
+/// publication, one later logged commit, then `Yields(4)`. Seed 4242,
+/// no evictor. `extra` (when non-empty) runs as one more logged commit
+/// between the last put and the yields — the over-refusal shapes.
+fn es1_script(crash: Option<CrashSpec>, extra: Vec<Op>) -> Script {
+    let mut ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..8u64).map(|i| put(i, 1)).collect(),
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::BulkLoad {
+            tree: 5,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (8..12u64).map(|i| put(i, 3)).collect(),
+        },
+    ];
+    if !extra.is_empty() {
+        ops.push(ScriptOp::Commit {
+            sync_on: true,
+            ops: extra,
+        });
+    }
+    ops.push(ScriptOp::Yields(4));
+    Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash,
+        nested: Vec::new(),
+    }
+}
+
+/// The newest durable meta write of a crashed disk, as one directed
+/// `Lost` fault (the d10 pattern, generalized over the ckpt_id: the
+/// highest valid meta the faultless round made durable, its last write
+/// in issue order).
+fn es1_newest_meta_lost(base: &harness::RoundOutcome) -> e4_recovery::sim::MediaFault {
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("es1: the page file");
+    let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
+    for w in base.crashed_disk.dwrites_of(pf).iter() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
+        {
+            best = Some((
+                m.ckpt_id,
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: w.off,
+                    len: 4096,
+                    bytes: w.bytes.clone(),
+                    pre: w.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Lost,
+                },
+            ));
+        }
+    }
+    best.expect("es1: a durable meta write exists").1
+}
+
+/// One directed-fault es1 round (the d17 runner shape: class MP, the
+/// fault applied after F-CRASH, a twin collector supplied).
+fn es1_fault_round(
+    seed: u64,
+    script: &Script,
+    fault: e4_recovery::sim::MediaFault,
+) -> harness::RoundOutcome {
+    let (disk, st) = harness::create_store(cfg(None), seed, 7).expect("create");
+    let mut twin = Vec::new();
+    harness::run_round(
+        seed,
+        0,
+        script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: vec![fault],
+            no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
+        None,
+    )
+}
+
+/// **E4-R1 (card E4-SILENT-1):** a lost forced-checkpoint header must
+/// not serve a published bulk load with its loaded entries missing.
+/// The eval appendix's script at six crash points
+/// (`CrashSpec::TaskYield(1, n)`, `n` in `4..=9`, seed 4242, 20
+/// entries). The faultless class C round passes at every `n` and
+/// supplies the newest meta write. At `n` 5 and 6 (the forced meta 2 is
+/// newest) a directed `Lost` on it gives no opened meta, a detection at
+/// `open`, `pass` and not `served`. At the others it opens and passes.
+#[test]
+fn es1_lost_forced_header_refused() {
+    for n in 4u64..=9 {
+        let script = es1_script(Some(CrashSpec::TaskYield(1, n)), Vec::new());
+        let base = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            base.pass && base.opened_ckpt_id.is_some(),
+            "es1 n={n}: the faultless round passes with an opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+            base.pass,
+            base.opened_ckpt_id,
+            base.o1,
+            base.o3_fail,
+            base.task_error
+        );
+        let out = es1_fault_round(4242, &script, es1_newest_meta_lost(&base));
+        if n == 5 || n == 6 {
+            assert!(
+                out.opened_ckpt_id.is_none(),
+                "es1 n={n}: the older image must never be opened (opened={:?}, det={:?})",
+                out.opened_ckpt_id,
+                out.detections
+            );
+            assert!(
+                out.detections.contains(&"open"),
+                "es1 n={n}: the refusal is a detection at open (det={:?})",
+                out.detections
+            );
+            assert!(
+                out.pass,
+                "es1 n={n}: the detected refusal passes (o1={:?}, o3={:?}, te={:?})",
+                out.o1, out.o3_fail, out.task_error
+            );
+            assert!(
+                !out.served,
+                "es1 n={n}: nothing is served from the refused image"
+            );
+        } else {
+            assert!(
+                out.pass && out.opened_ckpt_id.is_some(),
+                "es1 n={n}: the fall-back opens an image at or above the dependency and passes (pass={}, opened={:?}, det={:?}, o1={:?}, o3={:?})",
+                out.pass,
+                out.opened_ckpt_id,
+                out.detections,
+                out.o1,
+                out.o3_fail
+            );
+        }
+    }
+}
+
+/// **E4-R1:** a torn or far-misdirected forced header is refused too —
+/// the same script at `n` = 6, the newest (forced) meta write faulted
+/// as `Torn` (one reverted sector breaks the meta's CRC) and as
+/// `Misdirected` to a far, unreferenced slot. Both revert the meta slot
+/// to its previous content, so open falls back to meta 1 and the
+/// publication's dependency refuses it (header-design-verify §1.1: both
+/// were the same silent wrong data pre-fix).
+#[test]
+fn es1_torn_or_misdirected_forced_header_refused() {
+    let script = es1_script(Some(CrashSpec::TaskYield(1, 6)), Vec::new());
+    let base = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(base.pass, "es1 torn/mis: the faultless round passes");
+    let lost = es1_newest_meta_lost(&base);
+    for kind in [
+        e4_recovery::sim::MediaKind::Torn {
+            // The meta's fields and CRC all live in [0, 512); a sector
+            // in the zero tail reverts zeros to zeros and the meta
+            // stays valid.
+            sectors: vec![lost.off],
+        },
+        e4_recovery::sim::MediaKind::Misdirected {
+            to_off: lost.off + 100 * 4096,
+        },
+    ] {
+        let fault = e4_recovery::sim::MediaFault {
+            kind,
+            ..lost.clone()
+        };
+        let out = es1_fault_round(4242, &script, fault);
+        assert!(
+            out.opened_ckpt_id.is_none()
+                && out.detections.contains(&"open")
+                && out.pass
+                && !out.served,
+            "es1 torn/misdirected: the forced header's loss is refused, detected, passing, never served (opened={:?}, det={:?}, pass={}, served={}, o1={:?}, o3={:?})",
+            out.opened_ckpt_id,
+            out.detections,
+            out.pass,
+            out.served,
+            out.o1,
+            out.o3_fail
+        );
+    }
+}
+
+/// **E4-R1's deliberate over-refusals, pinned** (header-design-verify
+/// §1.5): a tree dropped after publication, and a tree with logged
+/// writes after publication — neither can serve wrong data, but the
+/// replay still crosses the publication over an image older than its
+/// dependency, and the rule refuses both. Extra logged commit between
+/// the last put and the yields; the crash at task 1's yield 7 (after
+/// the extra commit, with the forced meta 2 still newest).
+#[test]
+fn es1_over_refusals_pinned() {
+    for extra in [
+        // A drop is the catalog Delete plus the DropTree, in one commit
+        // (the model's contract, model.rs's header).
+        vec![
+            Op::Delete {
+                tree: CATALOG,
+                key: to_be64(5),
+            },
+            Op::DropTree { tree: 5 },
+        ],
+        (100..104u64)
+            .map(|i| Op::Put {
+                tree: 5,
+                key: i.to_be_bytes().to_vec(),
+                value: vec![9u8; 8],
+            })
+            .collect(),
+    ] {
+        let script = es1_script(Some(CrashSpec::TaskYield(1, 7)), extra);
+        let base = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            base.pass && base.opened_ckpt_id.is_some(),
+            "es1 over-refusal: the faultless round passes (pass={}, opened={:?}, o1={:?}, te={:?})",
+            base.pass,
+            base.opened_ckpt_id,
+            base.o1,
+            base.task_error
+        );
+        let out = es1_fault_round(4242, &script, es1_newest_meta_lost(&base));
+        assert!(
+            out.opened_ckpt_id.is_none()
+                && out.detections.contains(&"open")
+                && out.pass
+                && !out.served,
+            "es1 over-refusal: refused at open, passing, never served (opened={:?}, det={:?}, pass={}, served={})",
+            out.opened_ckpt_id,
+            out.detections,
+            out.pass,
+            out.served
+        );
+    }
+}
+
+/// **E4-R1's healthy-store proof:** the faultless class C round at
+/// every crash point `n` in `0..40` passes with an opened meta — the
+/// dependency op never fires on a store whose newest valid meta is at
+/// or above `id` (M-R1-GE, which refuses at `id >= ckpt_id`, fails
+/// here: at `n` 5 and 6 the publish replays above meta 2's own `T` with
+/// `id == ckpt_id == 2`).
+#[test]
+fn es1_faultless_every_crash_point() {
+    for n in 0u64..40 {
+        let script = es1_script(Some(CrashSpec::TaskYield(1, n)), Vec::new());
+        let out = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            out.pass && out.opened_ckpt_id.is_some(),
+            "es1 faultless n={n}: pass with an opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+            out.pass,
+            out.opened_ckpt_id,
+            out.o1,
+            out.o3_fail,
+            out.task_error
+        );
+    }
+}

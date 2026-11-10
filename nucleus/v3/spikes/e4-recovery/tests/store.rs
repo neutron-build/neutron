@@ -7885,3 +7885,192 @@ fn x5_r39_ckpt_unflipped_window_edges() {
         "Mid6: past the checkpoint's close"
     );
 }
+
+// ---- card E4-SILENT-1 (E4-R1's refused open writes nothing) ----
+
+/// **E4-R1 (card E4-SILENT-1 step 1; S-STORE §12.8 step 3):** the
+/// refused open writes nothing. From the `n` = 5 LOST round's
+/// `crashed_disk` (the eval appendix's script, the directed `Lost` on
+/// the forced meta 2, seed 4242), 16 non-zero bytes are written 64
+/// bytes past the last non-zero byte of segment 0, durably. `ckpt::
+/// recover` on a `pass_world` must return `Fail::Corrupt` (the
+/// publication's `RequireCkpt{2}` over the opened meta 1), and every
+/// `/wal/` file must read back byte-identical: the check sits in pass
+/// 1, before `recover:install`, pass 2, any eviction write and
+/// `truncate_wal` (M-R1-LATE, the check moved after `truncate_wal`,
+/// keeps the `Corrupt` but zeroes the injected bytes — the
+/// byte-identical comparison is its catcher; M-R1-SKIP fails the
+/// `Corrupt` itself).
+#[test]
+fn es1_refused_open_writes_nothing() {
+    use e4_recovery::harness::{
+        self, CrashSpec, MediaDraw, RoundFaults, Script, ScriptOp, ScriptTask,
+    };
+    use e4_recovery::model::{CATALOG, Model, Op, PUBLIC, to_be64};
+    let seed = 4242u64;
+    let cfg = tcfg(8, 16, 2);
+    let wal_seg = e4_recovery::store::WAL_SEG;
+    let commit = |ops: Vec<Op>| ScriptOp::Commit { sync_on: true, ops };
+    // The es1 script (the eval appendix): the crash at task 1's yield 5
+    // — after the publication, with the forced meta 2 the newest.
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                commit(vec![
+                    Op::CreateTree { tree: 2 },
+                    Op::CreateTree { tree: CATALOG },
+                    Op::Put {
+                        tree: CATALOG,
+                        key: to_be64(2),
+                        value: PUBLIC.to_vec(),
+                    },
+                ]),
+                commit(
+                    (0..8u64)
+                        .map(|i| Op::Put {
+                            tree: 2,
+                            key: i.to_be_bytes().to_vec(),
+                            value: vec![1u8; 8],
+                        })
+                        .collect(),
+                ),
+                ScriptOp::Checkpoint,
+                ScriptOp::BulkLoad {
+                    tree: 5,
+                    entries: (0..20u64)
+                        .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                        .collect(),
+                },
+                commit(
+                    (8..12u64)
+                        .map(|i| Op::Put {
+                            tree: 2,
+                            key: i.to_be_bytes().to_vec(),
+                            value: vec![3u8; 8],
+                        })
+                        .collect(),
+                ),
+                ScriptOp::Yields(4),
+            ],
+        }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 5)),
+        nested: Vec::new(),
+    };
+    // The faultless class C round supplies the crashed disk; the
+    // directed LOST on its newest meta write (the forced meta 2) is the
+    // n = 5 LOST round's crashed disk (F-CRASH then the fault, exactly
+    // as run_round applies them).
+    let (disk0, st0) = harness::create_store(cfg.clone(), seed, 7).expect("create");
+    let base = harness::run_round(
+        seed,
+        0,
+        &script,
+        &RoundFaults {
+            class: e4_recovery::sim::FaultClass::C,
+            knobs: e4_recovery::sim::FaultKnobs {
+                keep_latest_pm: 0,
+                tear_pm: 0,
+            },
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg.clone(),
+        disk0,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(
+        base.pass && base.opened_ckpt_id.is_some(),
+        "es1 writes-nothing: the faultless round passes (pass={}, o1={:?})",
+        base.pass,
+        base.o1
+    );
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("es1: the page file");
+    let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
+    for w in base.crashed_disk.dwrites_of(pf).iter() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
+        {
+            best = Some((
+                m.ckpt_id,
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: w.off,
+                    len: 4096,
+                    bytes: w.bytes.clone(),
+                    pre: w.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Lost,
+                },
+            ));
+        }
+    }
+    let (_, fault) = best.expect("es1: a durable meta write exists");
+    let mut disk = base.crashed_disk.clone();
+    disk.apply_one_media_fault(&fault);
+    // 16 non-zero bytes 64 past the last non-zero byte of segment 0,
+    // durably.
+    let seg0 = disk
+        .stat("/wal/0000000000000000.log")
+        .expect("es1: segment 0 holds the round's records");
+    {
+        let bytes = disk.durable_read(seg0, 0, wal_seg);
+        let last = bytes
+            .iter()
+            .rposition(|b| *b != 0)
+            .expect("es1: segment 0 is not empty");
+        let off = last as u64 + 1 + 64;
+        disk.write_at(seg0, off, &[0xA5u8; 16])
+            .expect("es1: the injected write");
+        disk.sync_data(seg0).expect("es1: the injected sync");
+    }
+    // Every /wal/ file's durable bytes (zero-padded to the segment
+    // size), before the recovery.
+    let before: Vec<(String, usize, Vec<u8>)> = disk
+        .list_dir("/wal/")
+        .into_iter()
+        .map(|(name, fid)| (name, fid, disk.durable_read(fid, 0, wal_seg)))
+        .collect();
+    assert!(
+        before
+            .iter()
+            .any(|(name, _, b)| name == "0000000000000000.log" && b.iter().any(|x| *x != 0)),
+        "es1: segment 0 holds the round's records"
+    );
+    // The refused open: XX001, and nothing written.
+    let world = pass_world(1, seed + 3, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let r = ckpt::recover(&cx, cfg.clone());
+    assert!(
+        matches!(&r, Err(Fail::Corrupt(_))),
+        "es1: recover must refuse with XX001 (E4-R1), got {}",
+        r.is_ok()
+    );
+    {
+        let g = world.lock();
+        for (name, fid, b) in before {
+            let now = g.disk.durable_read(fid, 0, wal_seg);
+            assert_eq!(
+                now, b,
+                "es1: /wal/{name} must read back byte-identical after the refused open"
+            );
+        }
+    }
+}

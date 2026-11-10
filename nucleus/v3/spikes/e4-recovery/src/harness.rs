@@ -465,12 +465,42 @@ fn round_failed(cx: &Cx<'_, RoundWorld>) -> Result<bool, Fail> {
 /// `mark_applied` (visible_ts advances in ts order). Chunked
 /// transactions write their chunks first and apply after the marker's
 /// group sync (§12.7). Returns the commit ts.
+///
+/// **E4-R1 (card E4-SILENT-1):** the plain four-argument form carries no
+/// checkpoint dependency; a bulk load's publishing commit goes through
+/// [`commit_txn_req`] with `require_ckpt` set to the durable checkpoint
+/// id read after `wait_ckpt` returned (§12.8 step 3).
 pub fn commit_txn(
     cx: &Cx<'_, RoundWorld>,
     ops: &[Op],
     sync_on: bool,
     chunked: bool,
 ) -> Result<u64, Fail> {
+    commit_txn_req(cx, ops, sync_on, chunked, None)
+}
+
+/// **E4-R1 (card E4-SILENT-1; §12.8 step 3):** [`commit_txn`]'s body
+/// with an optional checkpoint dependency. `require_ckpt = Some(id)`
+/// encodes a `WOp::RequireCkpt{id}` op **before the other ops** of a
+/// non-chunked commit's payload, so recovery (§14 pass 1, after the
+/// coverage check) can refuse a replay of the publication over an image
+/// older than checkpoint `id`. It is a parameter, never shared state: a
+/// shared slot could be taken by another task's commit while the
+/// publisher waits in the critical section. The prototype's publish is
+/// never chunked, so `chunked` with `Some` is refused with
+/// [`Fail::Invalid`] (the `CommitMarker` form is not built).
+pub fn commit_txn_req(
+    cx: &Cx<'_, RoundWorld>,
+    ops: &[Op],
+    sync_on: bool,
+    chunked: bool,
+    require_ckpt: Option<u64>,
+) -> Result<u64, Fail> {
+    if chunked && require_ckpt.is_some() {
+        return Err(Fail::Invalid(
+            "RequireCkpt with a chunked publish: only the Commit form is built (E4-R1)".into(),
+        ));
+    }
     let txn = cx.with("h:txn", |c| {
         // S-1-F3 §12.2 (W2; X-5c-F3-F3a step 4): the txn id is
         // `(boot_id, n)`, n ≥ 1 dense per boot (the harness's
@@ -568,6 +598,11 @@ pub fn commit_txn(
         let nchunks = ops.len().div_ceil(20) as u32;
         payload.extend_from_slice(&nchunks.to_le_bytes());
     } else {
+        // E4-R1: the dependency op is encoded before the other ops, so
+        // the check reads it first whatever the record holds.
+        if let Some(id) = require_ckpt {
+            wal::enc_op(&wal::WOp::RequireCkpt { id }, &mut payload);
+        }
         for op in ops {
             wal::enc_op(&to_wop(op), &mut payload);
         }
@@ -1408,11 +1443,20 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         wait_ckpt(cx)?;
     }
     // Publication (§12.8 step 3): after the forced meta is durable.
-    cx.with("h:loadph1", |c| {
+    // **E4-R1 (card E4-SILENT-1):** the publish commit names the
+    // durable checkpoint it depends on — `meta_durable_k` as read here,
+    // in the existing `h:loadph1` step, after `wait_ckpt` returned. The
+    // op is appended only after meta `id`'s step 5 `sync_all` returned
+    // (that is where `meta_durable_k` is set), so a healthy store's
+    // newest valid meta always sits at or above `id` and the recovery
+    // check never fires; `id` can exceed the forced checkpoint's own id
+    // (a later non-forced checkpoint already durable at capture), never
+    // fall below it.
+    let need_ckpt = cx.with("h:loadph1", |c| {
         c.h().load_phase.insert(t, LoadPhase::Publishing);
-        Ok(())
+        Ok(c.store().meta_durable_k)
     })?;
-    commit_txn(
+    commit_txn_req(
         cx,
         &[Op::Put {
             tree: CATALOG,
@@ -1421,6 +1465,7 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         }],
         true,
         false,
+        Some(need_ckpt),
     )?;
     cx.with("h:pub", |c| {
         c.h().published.insert(t);

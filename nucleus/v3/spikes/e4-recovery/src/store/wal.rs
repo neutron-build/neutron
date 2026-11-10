@@ -15,7 +15,10 @@
 //! Framing (§12.2): `magic u32 "NWAL", len u32, crc u32 (over the bytes
 //! after it), lsn u64, kind u8, txn (u32, u64), commit_ts u64, payload`.
 //! Kinds: 1 Commit, 2 Chunk, 3 CommitMarker, 4 SegmentEnd. Ops:
-//! CreateTree, DropTree, Put, Delete with user keys (no `before`).
+//! CreateTree, DropTree, Put, Delete with user keys (no `before`), and
+//! **E4-R1's store-level `RequireCkpt{id}`** (card E4-SILENT-1; §12.8
+//! step 3's dependency, encoded as byte `0x52` — never 5, which two WAL
+//! fixtures use as raw payload bytes).
 //!
 //! Group commit (§12.4): writers drain the queue in batches — one
 //! batch write, then one `sync_data` per touched segment, then the
@@ -84,6 +87,26 @@ pub enum WOp {
         /// The user key.
         key: Vec<u8>,
     },
+    /// **E4-R1 (card E4-SILENT-1; S-STORE §12.8 step 3's dependency,
+    /// header-design-verify §1.5 item 1):** the publishing commit of an
+    /// unlogged bulk load names the **durable checkpoint id** that made
+    /// the load durable. It is a checkpoint id, never a WAL position: a
+    /// load writes no WAL, so two checkpoints around it can share
+    /// `wal_ckpt_end` and `ts_ckpt_hi`, and a position test would accept
+    /// the wrong one. Recovery (§14 pass 1, after the coverage check)
+    /// refuses the open with XX001 when a `Commit` above `T` carries an
+    /// `id` above the opened meta's `ckpt_id` — a replay of a
+    /// publication over an image older than the checkpoint it depends
+    /// on serves the published tree with its loaded entries missing.
+    /// Encoded as the byte `0x52` (not 5: raw payload bytes 5 and 6
+    /// appear in two WAL test fixtures and would decode as the op) then
+    /// the id as `u64`. A store-level marker only: `apply_op` ignores
+    /// it, and `commit_txn_req` refuses to combine it with a chunked
+    /// publish.
+    RequireCkpt {
+        /// The durable checkpoint id the publication depends on.
+        id: u64,
+    },
 }
 
 fn wr_u16(b: &mut Vec<u8>, v: u16) {
@@ -132,6 +155,12 @@ pub fn enc_op(op: &WOp, out: &mut Vec<u8>) {
             wr_u16(out, key.len() as u16);
             out.extend_from_slice(key);
         }
+        // E4-R1: the kind byte is 0x52, never 5 (two WAL fixtures use
+        // raw payload bytes 5 and 6; byte 5 would decode as this op).
+        WOp::RequireCkpt { id } => {
+            out.push(0x52);
+            wr_u64(out, *id);
+        }
     }
 }
 
@@ -179,6 +208,12 @@ pub fn dec_op(b: &[u8]) -> Option<(WOp, usize)> {
             let key = b.get(i..i + klen)?.to_vec();
             i += klen;
             Some((WOp::Delete { tree: t, key }, i))
+        }
+        // E4-R1: the dependency op's kind byte (0x52; see enc_op).
+        0x52 => {
+            let id = rd_u64(b, i)?;
+            i += 8;
+            Some((WOp::RequireCkpt { id }, i))
         }
         _ => None,
     }
