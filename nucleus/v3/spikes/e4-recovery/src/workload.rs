@@ -296,6 +296,16 @@ impl Tuning {
         r41_share: 0,
         r41p_share: 0,
     };
+
+    /// **X5-R44 (card X-5c-F4-F2 step 2; REFRESH 9; owner decision
+    /// 2026-11-05, PLAN §10 item 11): the MP-pressure tuning**, written
+    /// as `Tuning { ..Tuning::FINAL }` so it starts equal to FINAL and
+    /// follows it — this card edits neither BASE nor FINAL (Limit 2),
+    /// and the retune is X-5c-F4-F3's. Only the judged mp-pressure set
+    /// and the `--probe mp-pressure` form select it, through
+    /// `TuningId::MpPressure`; because it equals FINAL at this tip,
+    /// only the id can show which one a set selects.
+    pub const MP_PRESSURE: Tuning = Tuning { ..Tuning::FINAL };
 }
 
 /// The per-seed knobs (card Work 5.1, sized against the ≤ 20 min
@@ -1565,6 +1575,14 @@ pub struct RoundRec {
     /// The SZI row counts it. A record diagnostic serialized as `szi`,
     /// never a digest input; compared per round like `szq`.
     pub szi: bool,
+    /// **X5-R46 (card X-5c-F4-F2 step 2; REFRESH 9): `rfs`** — the
+    /// round's final recovery produced no store (`end.is_none()`, read
+    /// at the same point as Q18's `end.is_some()`): a refused or
+    /// failed-open round. The MP refusal rate (`MP_REFUSAL`) counts it
+    /// over class MP only, reported and never an exit input. A record
+    /// diagnostic serialized as `rfs`, never a digest input; compared
+    /// per round between the file and the re-run like `szq`/`szi`.
+    pub rfs: bool,
 }
 
 /// The twin's per-round outcome (judged as class C; Work 2.5).
@@ -2773,6 +2791,9 @@ fn round_rec(
     rr.szi = rr.szq
         && obs.ckpt_closed_dirty >= four_f
         && crate::store::ckpt::ckpt_unflipped(obs.ckpt_step);
+    // X5-R46 (card X-5c-F4-F2 step 2): the refusal flag, at the same
+    // point Q18 reads its `end.is_some()`.
+    rr.rfs = out.end_store.is_none();
     rr
 }
 

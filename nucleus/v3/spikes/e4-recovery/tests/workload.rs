@@ -3104,15 +3104,20 @@ fn x5_r39_a_per_seed_sizing_miss_is_not_an_exit_input() {
         },
     ];
     assert_eq!(
-        campaign::verify_quota_missed(&rows),
+        campaign::verify_quota_missed(campaign::CampaignSet::Main, &rows),
         0,
         "SIZING is INFO: a per-seed miss never counts (M-SZ-EXIT reverts this)"
     );
     assert_eq!(
-        campaign::verify_exit_code(true, 0, campaign::verify_quota_missed(&rows), false),
+        campaign::verify_exit_code(
+            true,
+            0,
+            campaign::verify_quota_missed(campaign::CampaignSet::Main, &rows),
+            false
+        ),
         0
     );
-    // Every judged row still counts: one SZC round short is a miss.
+    // Every judged row still counts: one SZC row short is a miss.
     let rows = vec![
         met("SZC", "szq rounds", 1_000),
         workload::QuotaRow {
@@ -3122,7 +3127,10 @@ fn x5_r39_a_per_seed_sizing_miss_is_not_an_exit_input() {
             required: 1_000,
         },
     ];
-    assert_eq!(campaign::verify_quota_missed(&rows), 1);
+    assert_eq!(
+        campaign::verify_quota_missed(campaign::CampaignSet::Main, &rows),
+        1
+    );
 }
 
 /// **X5-R39 pin (card X-5c-F4-F2 step 1): the `After4` literal config —
@@ -3243,6 +3251,63 @@ fn x5_r39_after5_crash_never_sets_szi() {
     );
 }
 
+/// **X5-R39 pin: the refused round — `szc` true, `szq` false.** Seed
+/// 9149 round 2, under `Tuning::BASE`: the crash (`After5@1`) cut a
+/// checkpoint interval (the fold was 224 ≥ 4·F = 172) but the round's
+/// final recovery produced **no store** (Q18's `end.is_none()` — a
+/// refused or failed-open round), so `szq` is false: PLAN §10 item
+/// 10's exclusion — "a refused round tests detection, not the recovery
+/// under pressure". **M-SZQ-REFUSED** (the `end.is_some()` term
+/// dropped) flips this round's `szq` to true and fails this pin.
+/// (Landed with step 2's commit: the literal search that found it —
+/// 9,149 seeds in — overran step 1's attempt; the pin is step 1's.)
+#[test]
+fn x5_r39_a_refused_round_is_szc_but_never_szq() {
+    let rec = workload::run_seed_with(9149, None, &workload::Tuning::BASE);
+    assert!(rec.defect.is_none(), "seed 9149: {:?}", rec.defect);
+    assert_eq!(
+        rec.digest, 3_826_847_088,
+        "seed 9149: the pinned BASE digest"
+    );
+    let r2 = rec
+        .rounds
+        .get(2)
+        .unwrap_or_else(|| panic!("seed 9149: three rounds"));
+    assert_eq!(r2.crash, "After5@1", "seed 9149 r2: the pinned hook crash");
+    assert!(r2.fired, "seed 9149 r2: the crash fired");
+    assert!(r2.szc, "the checkpoint's fold was 224 >= 172");
+    assert!(
+        !r2.szq,
+        "the final recovery produced no store: szq must stay false \
+         (M-SZQ-REFUSED reverts this)"
+    );
+    assert!(!r2.szi, "szi conjoins szq");
+    // And the refusal flag itself (X5-R46) is recorded on the round.
+    assert!(r2.rfs, "a round whose recovery opened nothing is rfs");
+}
+
+/// **X5-R46 pin: the round-level refusal flag and its per-round
+/// comparison.** Two records with identical digests whose rounds differ
+/// only in `rfs`: the seed counts as non-reproducing (the field stays
+/// out of the digest; the file-versus-re-run comparison is its guard).
+#[test]
+fn x5_r46_flipped_rfs_fails_reproduction() {
+    let rec = |rfs: bool| workload::SeedRec {
+        seed: 9,
+        digest: 4242,
+        rounds: vec![workload::RoundRec {
+            rfs,
+            ..workload::RoundRec::default()
+        }],
+        ..workload::SeedRec::default()
+    };
+    let (bad, _) = campaign::verify_digest_report(&[rec(false)], &[rec(false)]);
+    assert_eq!(bad, 0, "identical records reproduce");
+    let (bad, list) = campaign::verify_digest_report(&[rec(true)], &[rec(false)]);
+    assert_eq!(bad, 1, "a flipped rfs counts the seed as non-reproducing");
+    assert_eq!(list, vec![9]);
+}
+
 /// **X5-R39 pin: a flipped `szi` (or `szq`) fails reproduction.** Two
 /// records with identical digests whose rounds differ only in `szi`
 /// (or `szq`): the seed counts as non-reproducing — the fields stay out
@@ -3274,4 +3339,428 @@ fn x5_r39_flipped_szi_fails_reproduction() {
     let flipped_q = (rec(true, false), rec(false, false));
     let (bad, _) = campaign::verify_digest_report(&[flipped_q.0], &[flipped_q.1]);
     assert_eq!(bad, 1, "a flipped szq counts the seed as non-reproducing");
+}
+
+// ---- card X-5c-F4-F2 step 2: X5-R44–R46, the sets and the modes ----
+
+use e4_recovery::campaign::{
+    CampaignSet, RunForm, TuningId, is_exit_row, mp_refusal_line, probe_mp_seeds, run_form,
+    run_form_set, verify_quota_missed, verify_recorded_set_ok, verify_seed_set_for,
+};
+
+/// A sorted record set for a seed list (identity digests; the checks
+/// read seeds only).
+fn set_recs(seeds: &[u64]) -> Vec<workload::SeedRec> {
+    seeds
+        .iter()
+        .map(|&s| workload::SeedRec {
+            seed: s,
+            ..workload::SeedRec::default()
+        })
+        .collect()
+}
+
+/// **X5-R44 pin: the three seed sets, exactly** — `main` is `0..10000`,
+/// `held-out` is `10000..20000`, and `mp-pressure` is the 2,000 seeds
+/// `s` in `20000..30000` with `s % 10 ∈ {7, 8}` (the MP class), each
+/// named as the `--set` value. **M-MP-CLASS** (the set takes every seed
+/// in the range: 10,000 seeds) and **M-HELD-RANGE** (held-out accepts
+/// `0..10000`) fail the mp-pressure and held-out halves.
+#[test]
+fn x5_r44_the_three_seed_sets() {
+    let main = CampaignSet::Main.seeds();
+    assert_eq!(main.len(), 10_000);
+    assert_eq!(&main[..3], &[0, 1, 2]);
+    assert_eq!(*main.last().unwrap_or(&u64::MAX), 9_999);
+    let held = CampaignSet::HeldOut.seeds();
+    assert_eq!(held.len(), 10_000);
+    assert_eq!(held.first().copied(), Some(10_000));
+    assert_eq!(*held.last().unwrap_or(&u64::MAX), 19_999);
+    let mp = CampaignSet::MpPressure.seeds();
+    assert_eq!(mp.len(), 2_000, "20 seeds per 100 in 20000..30000");
+    assert!(mp.iter().all(|s| (20_000..30_000).contains(s)));
+    assert!(mp.iter().all(|s| s % 10 == 7 || s % 10 == 8));
+    assert_eq!(mp.first().copied(), Some(20_007));
+    assert_eq!(*mp.last().unwrap_or(&u64::MAX), 29_998);
+    // The names round-trip.
+    for set in [
+        CampaignSet::Main,
+        CampaignSet::HeldOut,
+        CampaignSet::MpPressure,
+    ] {
+        assert_eq!(CampaignSet::from_name(set.name()), Some(set));
+    }
+    assert_eq!(CampaignSet::from_name("bogus"), None);
+}
+
+/// **X5-R44 pin: each mode's seed-set check at one seed short, one seed
+/// over and one wrong class.** The check is exact set equality
+/// ([`verify_seed_set_for`]): dropping the last seed (short), adding
+/// one past the end (over), or swapping in a seed outside the set
+/// (wrong class — a non-MP seed inside `mp-pressure`'s range) each
+/// fails, and the exact list passes.
+#[test]
+fn x5_r45_seed_set_checks_short_over_wrong_class() {
+    for set in [
+        CampaignSet::Main,
+        CampaignSet::HeldOut,
+        CampaignSet::MpPressure,
+    ] {
+        let seeds = set.seeds();
+        assert!(
+            verify_seed_set_for(set, &set_recs(&seeds)),
+            "{}: the exact list passes",
+            set.name()
+        );
+        // One short.
+        let short = &seeds[..seeds.len() - 1];
+        assert!(
+            !verify_seed_set_for(set, &set_recs(short)),
+            "{}: one seed short must fail",
+            set.name()
+        );
+        // One over.
+        let mut over = seeds.clone();
+        over.push(over[over.len() - 1] + 1);
+        assert!(
+            !verify_seed_set_for(set, &set_recs(&over)),
+            "{}: one seed over must fail",
+            set.name()
+        );
+    }
+    // Wrong class, mp-pressure: a seed of the range that is not MP.
+    let mp = CampaignSet::MpPressure.seeds();
+    let mut wrong = mp.clone();
+    wrong[0] = 20_000; // 20000 % 10 == 0: class C, inside the range
+    assert!(
+        !verify_seed_set_for(CampaignSet::MpPressure, &set_recs(&wrong)),
+        "mp-pressure: a non-MP seed of the range must fail (M-MP-CLASS reverts this)"
+    );
+    // Wrong class, held-out: a main seed in a held-out check
+    // (M-HELD-RANGE makes held-out's list 0..10000, which this then
+    // accepts).
+    let wrong_held: Vec<u64> = (0..10_000).collect();
+    assert!(
+        !verify_seed_set_for(CampaignSet::HeldOut, &set_recs(&wrong_held)),
+        "held-out: 0..10000 must fail (M-HELD-RANGE reverts this)"
+    );
+}
+
+/// **X5-R45 pin: the per-set exit rows.** `main` judges every row
+/// except `SZC-MP` and `SIZING` (plus Q4-I); `held-out` judges none;
+/// `mp-pressure` judges `SZC-MP` only. **M-MP-MAINEXIT** (`SZC-MP`
+/// exits in `main`), **M-MP-NOEXIT** (`SZC-MP` never exits in
+/// `mp-pressure`) and **M-HELD-QUOTA** (held-out exits on a quota)
+/// each fail their half.
+#[test]
+fn x5_r45_exit_rows_per_set() {
+    assert!(is_exit_row(CampaignSet::Main, "Q4"));
+    assert!(is_exit_row(CampaignSet::Main, "Q18"));
+    assert!(is_exit_row(CampaignSet::Main, "SZC"));
+    assert!(is_exit_row(CampaignSet::Main, "SZC-MW"));
+    assert!(is_exit_row(CampaignSet::Main, "SZI"));
+    assert!(is_exit_row(CampaignSet::Main, "Q4-I"), "Q4-I exits in main");
+    assert!(
+        !is_exit_row(CampaignSet::Main, "SZC-MP"),
+        "SZC-MP is the mp-pressure set's own row (M-MP-MAINEXIT reverts this)"
+    );
+    assert!(
+        !is_exit_row(CampaignSet::Main, "SIZING"),
+        "SIZING is per-seed reporting, never an exit row"
+    );
+    for id in [
+        "Q4", "Q18", "SZC", "SZC-MP", "SZC-MW", "SZI", "SIZING", "Q4-I",
+    ] {
+        assert!(
+            !is_exit_row(CampaignSet::HeldOut, id),
+            "held-out judges no row ({id}; M-HELD-QUOTA reverts this)"
+        );
+    }
+    assert!(
+        is_exit_row(CampaignSet::MpPressure, "SZC-MP"),
+        "SZC-MP is mp-pressure's one exit row (M-MP-NOEXIT reverts this)"
+    );
+    for id in ["Q4", "Q18", "SZC", "SZC-MW", "SZI", "SIZING", "Q4-I"] {
+        assert!(
+            !is_exit_row(CampaignSet::MpPressure, id),
+            "mp-pressure judges SZC-MP only ({id})"
+        );
+    }
+}
+
+/// **X5-R45 pins: SZC-MP at 99/100 in `mp-pressure`, and 99 in `main`
+/// exits 0.** A literal table with every other row met and SZC-MP one
+/// short: in `mp-pressure` the miss counts (exit non-zero); in `main`
+/// SZC-MP is INFO and the exit is 0.
+#[test]
+fn x5_r45_szc_mp_99_in_each_mode() {
+    let met = |id: &'static str, n: u64| workload::QuotaRow {
+        id,
+        what: id.to_owned(),
+        achieved: n,
+        required: n,
+    };
+    let mut rows: Vec<_> = ["Q4", "Q18", "SZC", "SZC-MW", "SZI", "SIZING"]
+        .iter()
+        .map(|id| met(Box::leak(id.to_string().into_boxed_str()), 1))
+        .collect();
+    rows.push(workload::QuotaRow {
+        id: "SZC-MP",
+        what: "MP szq rounds".to_owned(),
+        achieved: 99,
+        required: 100,
+    });
+    assert_eq!(
+        verify_quota_missed(CampaignSet::MpPressure, &rows),
+        1,
+        "SZC-MP at 99 misses in mp-pressure (M-MP-NOEXIT reverts this)"
+    );
+    assert_eq!(
+        verify_quota_missed(CampaignSet::Main, &rows),
+        0,
+        "SZC-MP at 99 never fails main's exit (M-MP-MAINEXIT reverts this)"
+    );
+    // At the floor, mp-pressure meets too.
+    let rows100 = vec![workload::QuotaRow {
+        id: "SZC-MP",
+        what: "MP szq rounds".to_owned(),
+        achieved: 100,
+        required: 100,
+    }];
+    assert_eq!(verify_quota_missed(CampaignSet::MpPressure, &rows100), 0);
+}
+
+/// **X5-R45 pin: a held-out file with every quota short exits 0.**
+/// `held-out` judges no row, so a table with every row short still
+/// misses nothing. **M-HELD-QUOTA** reverts this.
+#[test]
+fn x5_r45_held_out_exits_zero_with_every_quota_short() {
+    let short = |id: &'static str| workload::QuotaRow {
+        id,
+        what: id.to_owned(),
+        achieved: 0,
+        required: 100,
+    };
+    let rows = vec![
+        short("Q4"),
+        short("Q18"),
+        short("SZC"),
+        short("SZC-MP"),
+        short("SZC-MW"),
+        short("SZI"),
+    ];
+    assert_eq!(verify_quota_missed(CampaignSet::HeldOut, &rows), 0);
+    assert_eq!(
+        campaign::verify_exit_code(
+            true,
+            0,
+            verify_quota_missed(CampaignSet::HeldOut, &rows),
+            false
+        ),
+        0,
+        "held-out exits 0 with every quota short (M-HELD-QUOTA reverts this)"
+    );
+}
+
+/// **X5-R45 pins: a mismatched `--set` is refused, and a file with no
+/// set is refused** ([`verify_recorded_set_ok`], pure — the refusal
+/// path re-runs nothing, which is why the pin is on the predicate the
+/// command calls before anything runs). **M-SET-MISMATCH** (`verify`
+/// ignores the file's set) reverts this. **M-PROBE-SET-NAME** (the
+/// probe form records a set) is caught by the no-set half through the
+/// emit: a probe file must carry no `set` key.
+#[test]
+fn x5_r45_the_recorded_set_gates_verify() {
+    assert!(verify_recorded_set_ok(Some("main"), CampaignSet::Main));
+    assert!(verify_recorded_set_ok(
+        Some("held-out"),
+        CampaignSet::HeldOut
+    ));
+    assert!(verify_recorded_set_ok(
+        Some("mp-pressure"),
+        CampaignSet::MpPressure
+    ));
+    assert!(
+        !verify_recorded_set_ok(Some("main"), CampaignSet::HeldOut),
+        "a mismatched --set is refused (M-SET-MISMATCH reverts this)"
+    );
+    assert!(
+        !verify_recorded_set_ok(None, CampaignSet::Main),
+        "a file with no set is refused"
+    );
+    assert!(!verify_recorded_set_ok(Some("bogus"), CampaignSet::Main));
+    // The emit side: a --set run records its set, a probe records none
+    // (M-PROBE-SET-SET-NAME's shape would put a set in the probe file).
+    let recs = vec![workload::SeedRec {
+        seed: 1,
+        digest: 2,
+        ..workload::SeedRec::default()
+    }];
+    let set_json = campaign::emit_campaign_for(&recs, Some(&CampaignSet::Main));
+    assert!(
+        set_json.starts_with("{\"e4\":1,\"set\":\"main\",\"seeds\":["),
+        "the set form records the set: {set_json}"
+    );
+    let probe_json = campaign::emit_campaign_for(&recs, None);
+    assert!(
+        !probe_json.contains("\"set\":"),
+        "a probe file records no set (M-PROBE-SET-NAME reverts this)"
+    );
+    // And the parser reads the set back.
+    let (set, back) = campaign::parse_campaign_with_set(&set_json).expect("parse");
+    assert_eq!(set.as_deref(), Some("main"));
+    assert_eq!(back.len(), 1);
+    let (set, _) = campaign::parse_campaign_with_set(&probe_json).expect("parse");
+    assert_eq!(set, None);
+}
+
+/// **X5-R44 pin: `tuning_id()` is `MpPressure` for that set only**, and
+/// `MP_PRESSURE` equals `FINAL` at this tip (Limit 2 writes it as
+/// `Tuning { ..Tuning::FINAL }`, so it starts equal and follows).
+/// **M-MP-TUNING** (`mp-pressure` selects `TuningId::Final`) fails the
+/// id half; because the constants are equal here, only the id can show
+/// which one a set selects.
+#[test]
+fn x5_r44_tuning_id_is_mp_pressure_for_that_set_only() {
+    assert_eq!(CampaignSet::Main.tuning_id(), TuningId::Final);
+    assert_eq!(CampaignSet::HeldOut.tuning_id(), TuningId::Final);
+    assert_eq!(
+        CampaignSet::MpPressure.tuning_id(),
+        TuningId::MpPressure,
+        "M-MP-TUNING reverts this"
+    );
+    assert_eq!(workload::Tuning::MP_PRESSURE, workload::Tuning::FINAL);
+    assert_eq!(workload::Tuning::FINAL, workload::Tuning::BASE);
+    // The constants are equal at this tip, so the id is the only
+    // discriminator (the linker may even fold them into one constant);
+    // `tuning()` matches on the id, and F4-F3's retune of FINAL moves
+    // MP_PRESSURE with it.
+}
+
+/// **X5-R46 pin: `MP_REFUSAL` on a literal record set with mixed
+/// classes** — class MP only: two MP rounds, one refused, beside C and
+/// MW rounds whose `rfs` never counts. **M-REFUSAL-ALL** (every class
+/// counted) reads rounds=4 refused=3 and fails the exact line.
+#[test]
+fn x5_r46_mp_refusal_counts_class_mp_only() {
+    let round = |rfs: bool| workload::RoundRec {
+        rfs,
+        ..workload::RoundRec::default()
+    };
+    let recs = vec![
+        workload::SeedRec {
+            seed: 1,
+            class: "C".to_owned(),
+            rounds: vec![round(true)],
+            ..workload::SeedRec::default()
+        },
+        workload::SeedRec {
+            seed: 2,
+            class: "MP".to_owned(),
+            rounds: vec![round(true), round(false)],
+            ..workload::SeedRec::default()
+        },
+        workload::SeedRec {
+            seed: 3,
+            class: "MW".to_owned(),
+            rounds: vec![round(true)],
+            ..workload::SeedRec::default()
+        },
+    ];
+    assert_eq!(
+        mp_refusal_line(&recs),
+        "MP_REFUSAL rounds=2 refused=1 rate=0.5000",
+        "M-REFUSAL-ALL reverts this (it would read rounds=4 refused=3 rate=0.7500)"
+    );
+    // A set with no MP rounds reads zero, never a division by zero.
+    assert_eq!(
+        mp_refusal_line(&recs[..1]),
+        "MP_REFUSAL rounds=0 refused=0 rate=0.0000"
+    );
+}
+
+/// **REFRESH 9 pins (card step 2): the two probe forms' seed lists and
+/// refusals.** The MP-pressure probe runs exactly the 200 MP-class
+/// seeds of `30000..31000` (`s % 10 ∈ {7, 8}`); the range probe is
+/// refused at any bound reaching 10000 or above, and the forms refuse
+/// every conflicting flag combination. **M-PROBE-RANGE** (the probe
+/// form accepts a range reaching 10000) fails the bound half.
+#[test]
+fn x5_r44_probe_forms_seed_lists_and_refusals() {
+    let probe = probe_mp_seeds();
+    assert_eq!(probe.len(), 200);
+    assert_eq!(probe.first().copied(), Some(30_007));
+    assert_eq!(*probe.last().unwrap_or(&u64::MAX), 30_998);
+    assert!(probe.iter().all(|s| (30_000..31_000).contains(s)));
+    assert!(probe.iter().all(|s| s % 10 == 7 || s % 10 == 8));
+    // The forms.
+    let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // Neither flag means main (the set is recorded).
+    assert_eq!(
+        run_form(None, None, None),
+        Ok(RunForm::Set(CampaignSet::Main))
+    );
+    // --set dispatch.
+    assert_eq!(
+        run_form(Some("held-out"), None, None),
+        Ok(RunForm::Set(CampaignSet::HeldOut))
+    );
+    assert_eq!(
+        run_form(Some("main"), None, Some((0, 10_000))),
+        Ok(RunForm::Set(CampaignSet::Main)),
+        "--set main may name its own range"
+    );
+    assert!(run_form(Some("main"), None, Some((0, 500))).is_err());
+    assert!(
+        run_form(Some("mp-pressure"), None, Some((20_007, 20_009))).is_err(),
+        "mp-pressure is not a range: --seeds with it is always refused"
+    );
+    assert!(run_form(Some("bogus"), None, None).is_err());
+    // The probe range: below 10000 runs FINAL and records no set.
+    assert_eq!(
+        run_form(None, None, Some((9_900, 9_999))),
+        Ok(RunForm::ProbeRange(9_900, 9_999))
+    );
+    assert!(
+        run_form(None, None, Some((0, 10_000))).is_err(),
+        "a range reaching 10000 is refused (M-PROBE-RANGE reverts this)"
+    );
+    assert!(
+        run_form(None, None, Some((9_999, 10_001))).is_err(),
+        "a range reaching past 10000 is refused"
+    );
+    assert!(
+        run_form(None, None, Some((5, 5))).is_err(),
+        "empty is refused"
+    );
+    // The mp-pressure probe refuses --set and --seeds.
+    assert_eq!(
+        run_form(None, Some("mp-pressure"), None),
+        Ok(RunForm::ProbeMp)
+    );
+    assert!(run_form(Some("main"), Some("mp-pressure"), None).is_err());
+    assert!(run_form(None, Some("mp-pressure"), Some((0, 5))).is_err());
+    assert!(run_form(None, Some("bogus"), None).is_err());
+    // The probe forms record no set (M-PROBE-SET-NAME reverts this).
+    assert_eq!(run_form_set(RunForm::ProbeRange(9_900, 9_999)), None);
+    assert_eq!(run_form_set(RunForm::ProbeMp), None);
+    assert_eq!(
+        run_form_set(RunForm::Set(CampaignSet::Main)),
+        Some(CampaignSet::Main)
+    );
+    // Command level: the refusals exit 2 before anything runs (the
+    // 0..10000 bound is pinned at the pure level, so a mutant that
+    // shifts it cannot turn this loop into a 10k-seed run).
+    let out = "/tmp/opencode/x5f2-probe-refusal.json";
+    for args in [
+        a(&["--seeds", "5000..10001", "--out", out]),
+        a(&["--probe", "mp-pressure", "--seeds", "0..5", "--out", out]),
+        a(&["--probe", "mp-pressure", "--set", "main", "--out", out]),
+        a(&["--set", "mp-pressure", "--seeds", "0..100", "--out", out]),
+        a(&["--set", "bogus", "--out", out]),
+    ] {
+        let mut full = vec!["run".to_string()];
+        full.extend(args.iter().cloned());
+        assert_eq!(campaign::main(&full), 2, "the refusal exits 2: {args:?}");
+    }
 }
