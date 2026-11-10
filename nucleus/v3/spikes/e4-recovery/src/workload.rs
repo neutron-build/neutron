@@ -258,13 +258,22 @@ impl Tuning {
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
-    /// **X-5c-F4-F3 step 1: FINAL = S1** — `r41_share` 1000,
-    /// `r41p_share` 500, the setting of verdict `2e8d1b13`; every other
-    /// field still equals [`Tuning::BASE`], and the pre-registered
-    /// ladders change only the knobs the card lists. Pinned by
-    /// `x5_r37_final_r41_is_s1` (S1's two constants),
-    /// `x5_r37_final_stays_in_card_ranges` (Limit 4) and
-    /// `x5_r37_mp_pressure_r41_equals_final`.
+    /// **X-5c-F4-F4: FINAL = rung 7.3** (owner decision 2026-11-10,
+    /// QUEUE "OWNER 2026-11-10 (F4-F3 ESCALATE 2c041aae)"; verdict
+    /// `2c041aae` option A): the kept 6.1 setting of X-5c-F4-F3 —
+    /// S1's `r41_share` 1000 and `r41p_share` 500 (the setting of
+    /// verdict `2e8d1b13`), `syncoff_table` `[3, 7, 7]`,
+    /// `keep_latest_pm_table` `[100, 100, 300, 500, 700]`,
+    /// `w11_share` 100, `w12_share` 100 — plus 7.1–7.3's fields:
+    /// `ckpt_every_lo` 8, `value_lo` 280, `chunked_ops_lo` 700 and
+    /// `chunked_ops_span` 201, exactly what `db572b5f` changed over
+    /// `0775b735`, and nothing else. The per-run box that pays for it
+    /// is **X5-R54** (3,000 s per main/held-out `run`). Every field
+    /// of FINAL and of MP_PRESSURE is pinned by
+    /// `x5_r37_final_is_the_kept_setting`; the S1 halves, the card
+    /// ranges and the MP ladder fields by `x5_r37_final_r41_is_s1`,
+    /// `x5_r37_final_stays_in_card_ranges` and
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`.
     pub const FINAL: Tuning = Tuning {
         committers_lo: 2,
         committers_span: 3,
@@ -280,15 +289,15 @@ impl Tuning {
         tear_pm_table: [100, 300, 500, 700, 900],
         rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
         target_ckpt_span: 3,
-        ckpt_every_lo: 4,
+        ckpt_every_lo: 8,
         ckpt_every_span: 5,
         commit_budget_lo: 18,
         commit_budget_span: 20,
         commit_ops_lo: 1,
         commit_ops_span: 20,
-        chunked_ops_lo: 320,
-        chunked_ops_span: 381,
-        value_lo: 8,
+        chunked_ops_lo: 700,
+        chunked_ops_span: 201,
+        value_lo: 280,
         value_hi: 400,
         delete_one_in: 4,
         gc_sweeps_lo: 2,

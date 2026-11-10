@@ -398,6 +398,112 @@ fn x5_r37_mp_pressure_differs_only_in_ladder_fields() {
     same!(r41p_share);
 }
 
+/// **X-5c-F4-F4 step 1 (folding X-5c-F4-F3-F1): FINAL is the kept
+/// setting of record — rung 7.3** — and this pin holds every field of
+/// it, and of `Tuning::MP_PRESSURE`, against a literal written out
+/// field by field (no `..`, no reference to another constant). The
+/// owner decision of 2026-11-10 (QUEUE "OWNER 2026-11-10 (F4-F3
+/// ESCALATE 2c041aae)", verdict `2c041aae` option A) takes rung 7.3 —
+/// the kept 6.1 setting plus `ckpt_every_lo` 8, `value_lo` 280,
+/// `chunked_ops_lo` 700 and `chunked_ops_span` 201, exactly what
+/// `db572b5f` changed over `0775b735`. MP_PRESSURE keeps its 9.1
+/// ladder fields and follows FINAL in every other field, so its
+/// `value_lo` becomes 280 — recorded, not tuned (X-5c-F4-F5 re-anchors
+/// MP on it). **G-FINAL-SYNCOFF-BASE**, **G-FINAL-W11-OFF**,
+/// **M-FINAL-NOT-73** and **M-MP-GC** all revert a field of this
+/// literal and fail here; every later commit that changes a constant
+/// of FINAL or MP_PRESSURE updates this literal in the same commit.
+#[test]
+fn x5_r37_final_is_the_kept_setting() {
+    let final_literal = workload::Tuning {
+        committers_lo: 2,
+        committers_span: 3,
+        trees_lo: 2,
+        trees_span: 3,
+        keyspace_lo: 1200,
+        keyspace_span: 1801,
+        syncoff_table: [3, 7, 7],
+        map_leaf_cap_table: [8, 16, 254],
+        freeset_leaf_bits_table: [128, 512, 32_576],
+        r_epoch_table: [1, 2, 4],
+        keep_latest_pm_table: [100, 100, 300, 500, 700],
+        tear_pm_table: [100, 300, 500, 700, 900],
+        rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
+        target_ckpt_span: 3,
+        ckpt_every_lo: 8,
+        ckpt_every_span: 5,
+        commit_budget_lo: 18,
+        commit_budget_span: 20,
+        commit_ops_lo: 1,
+        commit_ops_span: 20,
+        chunked_ops_lo: 700,
+        chunked_ops_span: 201,
+        value_lo: 280,
+        value_hi: 400,
+        delete_one_in: 4,
+        gc_sweeps_lo: 2,
+        gc_sweeps_span: 3,
+        bulk_load_one_in: 4,
+        drop_one_in: 3,
+        burst_frac: 0,
+        burst_gc_loops: 0,
+        w11_share: 100,
+        w12_share: 100,
+        r41_share: 1000,
+        r41p_share: 500,
+    };
+    assert_eq!(
+        workload::Tuning::FINAL,
+        final_literal,
+        "Tuning::FINAL must be rung 7.3, the kept setting of record (X-5c-F4-F4): every \
+         field is pinned by this literal"
+    );
+    let mp_pressure_literal = workload::Tuning {
+        ckpt_every_lo: 4,
+        ckpt_every_span: 5,
+        commit_budget_lo: 20,
+        commit_budget_span: 12,
+        chunked_ops_lo: 900,
+        chunked_ops_span: 301,
+        gc_sweeps_lo: 12,
+        gc_sweeps_span: 1,
+        burst_frac: 600,
+        burst_gc_loops: 8,
+        w11_share: 200,
+        w12_share: 200,
+        committers_lo: 2,
+        committers_span: 3,
+        trees_lo: 2,
+        trees_span: 3,
+        keyspace_lo: 1200,
+        keyspace_span: 1801,
+        syncoff_table: [3, 7, 7],
+        map_leaf_cap_table: [8, 16, 254],
+        freeset_leaf_bits_table: [128, 512, 32_576],
+        r_epoch_table: [1, 2, 4],
+        keep_latest_pm_table: [100, 100, 300, 500, 700],
+        tear_pm_table: [100, 300, 500, 700, 900],
+        rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
+        target_ckpt_span: 3,
+        commit_ops_lo: 1,
+        commit_ops_span: 20,
+        value_lo: 280,
+        value_hi: 400,
+        delete_one_in: 4,
+        bulk_load_one_in: 4,
+        drop_one_in: 3,
+        r41_share: 1000,
+        r41p_share: 500,
+    };
+    assert_eq!(
+        workload::Tuning::MP_PRESSURE,
+        mp_pressure_literal,
+        "Tuning::MP_PRESSURE must be FINAL with the kept 9.1 ladder fields only (its \
+         value_lo is 280 by following FINAL — recorded, not tuned; X-5c-F4-F5 re-anchors \
+         MP on it)"
+    );
+}
+
 /// **X-5c-F4-F1-F1-F2 step 3: no late epoch copy installs at BASE**
 /// (verdict X-5c-F4-F1-F1 finding 1). The late-copy events this card
 /// fixes occur at BASE on their own (7 over 0..200: seed 96 twice, 104,
