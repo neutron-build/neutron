@@ -144,6 +144,12 @@ fn smoke_16_seeds() {
 /// `357787865 -> 1374321949` (twin directory re-seed at round 1 —
 /// step 2's attribution event; the only one of the 54 that moved, and
 /// the only literal this card re-derives).
+///
+/// **X-5c-PINS-1 item 3 (verdict `74f411f0` finding 1):** `6849` is a
+/// new row; no existing literal moved. At round 1 of this MW seed the
+/// twin directory re-seed fires with real `cut` 0 and twin `cut` 5.
+/// Keeping the twin's own `cut` (**G-RESEED-TWIN-CUT**) moves the
+/// digest `3952923334 -> 1958644185`.
 #[test]
 fn x5_r37_base_tuning_reproduces_1b0ce54e() {
     const WANT: &[(u64, u64)] = &[
@@ -197,6 +203,7 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
         (5549, 3614535945),
         (5808, 2754578359),
         (6149, 123186068),
+        (6849, 3952923334),
         (7469, 1742707490),
         (7528, 3346573892),
         (8728, 3345856243),
