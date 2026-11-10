@@ -48,6 +48,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
     <>
       <header class="top">
         <a class="name" href={admin}>Neutron CMS</a>
+        <nav aria-label="Sections">
         {config.posts ? <a href={admin} aria-current={current("posts")}>Posts</a> : null}
         {config.pages ? <a href={`${admin}/pages`} aria-current={current("pages")}>Pages</a> : null}
         {config.onPage.length && !Object.keys(config.designs).length ? <a href={`${admin}/edit`} aria-current={current("edit")}>Edit site</a> : null}
@@ -56,6 +57,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
         ))}
         {Object.keys(config.texts).length && !config.onPage.includes(TEXT) ? <a href={`${admin}/lists/${TEXT}`} aria-current={current(TEXT)}>Text</a> : null}
         <a href={`${admin}/media`} aria-current={current("media")}>Media</a>
+        </nav>
         <span class="spacer" />
         <a href="/" target="_blank" rel="noreferrer">View site</a>
         {viewer?.kind === "owner" ? <a href={`${admin}/people`} aria-current={current("people")}>People</a> : null}

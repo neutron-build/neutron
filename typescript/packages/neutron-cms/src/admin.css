@@ -65,8 +65,9 @@ a { color: inherit; }
   border-bottom: 1px solid var(--rule);
 }
 
-.top > a:not(.button) { color: var(--muted); text-decoration: none; }
-.top > a:not(.button):hover, .top > a[aria-current] { color: var(--strong); }
+.top > a:not(.button), .top nav a { color: var(--muted); text-decoration: none; }
+.top > a:not(.button):hover, .top nav a:hover, .top a[aria-current] { color: var(--strong); }
+.top nav { display: contents; }
 .top a[aria-current] { font-weight: 600; }
 .top > a.name { color: var(--strong); font-weight: 600; }
 .top .spacer { flex: 1; }
@@ -353,7 +354,12 @@ a.button { color: inherit; text-decoration: none; }
 }
 
 @media (max-width: 560px) {
-  .top { gap: 4px 16px; padding-inline: 16px; }
+  .top { gap: 4px 12px; padding-inline: 16px; }
+  .top:not(.editor-top) { font-size: 14px; }
+  .top:not(.editor-top) .link { font-size: inherit; }
+  /* The sections get a row of their own that slides sideways, so the bar stays two lines however many there are. */
+  .top nav { display: flex; order: 1; flex: 0 0 calc(100% + 32px); gap: 20px; margin: 0 -16px; padding: 6px 16px 4px; overflow-x: auto; white-space: nowrap; scrollbar-width: none; }
+  .top nav::-webkit-scrollbar { display: none; }
   .page { padding: 16px 16px 32px; }
   .page-head { margin-bottom: 12px; }
   .writing { padding: 20px 16px 48px; }

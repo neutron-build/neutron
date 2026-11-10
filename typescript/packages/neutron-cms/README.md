@@ -136,13 +136,16 @@ Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type
 |---|---|---|
 | `path` | `/n-admin` | Where the route files are |
 | `posts` | `true` | Set `false` on a site with no blog |
-| `pages` | `false` | Standalone pages, edited like posts and kept out of the blog |
+| `pages` | `false`, or `true` when `designs` is set | Standalone pages, edited like posts and kept out of the blog |
 | `designs` | `{}` | Pages with their own design, by key: a title, or `{ title, url?, published?, permanent? }`. Each is listed under Pages and opens framed for click-to-edit, with Publish in the same bar. `url` fixes its address (a homepage at `/`); `permanent` keeps it always published |
 | `postUrl` | `/<slug>` | Where a post lives, for the admin's links |
+| `pageUrl` | same as `postUrl` | Where a page lives |
 | `reservedSlugs` | none | URLs a post may not take, usually your other pages |
 | `previewCss` | none | Your post styles as a string, so previews match the site |
 | `timeZone` | `UTC` | When a date has passed |
 | `onPage` | none | Lists edited by clicking them on the page. Use `"text"` for the text fields |
+
+A list also takes `label`, its name in the admin, and `ownPage: true`, which keeps its page in the admin menu even when it is edited on the site. A post with a future "Publish on" date is scheduled: it appears on the site when that time comes, with nothing to run. `@neutron-build/cms/store` exports the storage functions for seed and migration scripts.
 
 ## Environment
 
