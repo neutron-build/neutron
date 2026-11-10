@@ -17,8 +17,8 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/nucleus` | 0.3.1 |
 | `@neutron-build/data` | 0.3.1 |
 | `@neutron-build/agents` | 0.3.0 |
-| `@neutron-build/core` | 0.5.3 |
-| `@neutron-build/cli` | 0.5.3 |
+| `@neutron-build/core` | 0.5.4 |
+| `@neutron-build/cli` | 0.5.4 |
 | `@neutron-build/create` | 0.1.12 |
 | `@neutron-build/auth` | 0.1.7 |
 | `@neutron-build/cache-redis` | 0.2.1 |

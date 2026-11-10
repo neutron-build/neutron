@@ -1,7 +1,9 @@
 import { cacheOperation, publishCacheEntry, supportsBoundedPublication, CACHE_MAX_OPERATIONS } from "./cache-publication.js";
 import { sharedResponseMaxAge } from "../core/shared-cache-policy.js";
-import { normalizePathname } from "../core/route-path.js";
+import { canonicalRequestPath, normalizePathname } from "../core/route-path.js";
 export { normalizePathname } from "../core/route-path.js";
+
+const DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
 import { beginCacheMutation, encodeCacheInvalidationPath } from "./cache-mutation.js";
 import { captureCacheBody } from "./cache-capture.js";
 import * as fs from "node:fs";
@@ -305,8 +307,10 @@ export interface NeutronServerOptions {
    * `maxRequestBodyBytes` bytes fails the read with a 413 — covering chunked
    * bodies with no Content-Length and requests whose declared length lies.
    * The middleware's Content-Length check stays as the early rejection for
-   * honestly-declared sizes (cheaper: no body read at all). Unset = no
-   * adapter cap; the input-limits middleware alone applies.
+   * honestly-declared sizes (cheaper: no body read at all). Defaults to
+   * 10 MiB, so an endpoint that reads its body before authenticating cannot be
+   * made to hold arbitrary amounts of memory. Raise it for apps that take
+   * uploads directly; 0 turns the cap off.
    */
   maxRequestBodyBytes?: number;
   /**
@@ -911,6 +915,19 @@ export async function createServer(
     });
     app.use("*", compression());
   }
+
+  // Before anything that reads the path. Global middleware matches on the raw
+  // URL and the router on the decoded path, so a second spelling of a path
+  // (`/%61dmin`, `//admin`) would reach the route without passing a gate that
+  // names it. Not here: `..`, which the URL parser has already resolved.
+  app.use("*", async (c, next) => {
+    const url = new URL(c.req.raw.url);
+    const canonical = canonicalRequestPath(url.pathname);
+    if (canonical !== url.pathname) {
+      return new Response(null, { status: 308, headers: { Location: canonical + url.search } });
+    }
+    return next();
+  });
 
   // Innermost of the framework's response post-processors (request id,
   // security headers, CORS, Vary, compression all set headers after next()).
@@ -1653,8 +1670,8 @@ export async function createServer(
   // can. Content-Length stays as the early check (both in the middleware
   // and here, so the cap holds even for requests that never see it).
   let fetchFn: typeof app.fetch = app.fetch;
-  if (options.maxRequestBodyBytes !== undefined && options.maxRequestBodyBytes > 0) {
-    const cap = options.maxRequestBodyBytes;
+  const cap = options.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES;
+  if (cap > 0) {
     fetchFn = (request, env, executionCtx) => {
       const declared = request.headers.get("content-length");
       if (declared !== null && Number(declared) > cap) {

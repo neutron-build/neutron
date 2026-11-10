@@ -33,4 +33,4 @@ export { applyRouteRuleHeaders } from "../core/route-rules.js";
 export { mutableResponse } from "../core/response.js";
 export { beginCacheMutation, encodeCacheInvalidationPath } from "../server/cache-mutation.js";
 export { installTransportPeer } from "../server/peer.js";
-export { normalizePathname } from "../core/route-path.js";
+export { canonicalRequestPath, normalizePathname } from "../core/route-path.js";
