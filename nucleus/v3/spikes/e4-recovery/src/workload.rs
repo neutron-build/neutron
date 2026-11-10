@@ -322,8 +322,8 @@ impl Tuning {
     /// `r41` knobs come from FINAL (S1),
     /// `x5_r37_mp_pressure_r41_equals_final`.
     pub const MP_PRESSURE: Tuning = Tuning {
-        ckpt_every_lo: 12,
-        ckpt_every_span: 8,
+        ckpt_every_lo: 4,
+        ckpt_every_span: 5,
         commit_budget_lo: 20,
         commit_budget_span: 12,
         chunked_ops_lo: 900,

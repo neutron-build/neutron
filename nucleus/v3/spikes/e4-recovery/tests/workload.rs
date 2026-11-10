@@ -346,6 +346,58 @@ fn x5_r37_mp_pressure_r41_equals_final() {
     );
 }
 
+/// **X-5c-F4-F3 step 9:** every field of `MP_PRESSURE` that is not in
+/// the step 9 ladder table equals FINAL's — the tuning is written
+/// `{ <ladder fields>, ..Tuning::FINAL }`, so the ladder fields
+/// (`ckpt_every_lo`/`_span`, `commit_budget_lo`/`_span`,
+/// `chunked_ops_lo`/`_span`, `gc_sweeps_lo`/`_span`, `burst_frac`,
+/// `burst_gc_loops`, `w11_share`, `w12_share`) are the only ones the
+/// MP ladder may set, and every other knob follows FINAL exactly.
+/// **M-MP-OTHERFIELD** (MP_PRESSURE's `delete_one_in` 3) reverts this
+/// and fails here. The two `r41` fields are also pinned by
+/// `x5_r37_mp_pressure_r41_equals_final`; they appear here again so
+/// this one test carries the whole non-ladder field list.
+#[test]
+fn x5_r37_mp_pressure_differs_only_in_ladder_fields() {
+    let mp = &workload::Tuning::MP_PRESSURE;
+    let fin = &workload::Tuning::FINAL;
+    macro_rules! same {
+        ($f:ident) => {
+            assert_eq!(
+                mp.$f, fin.$f,
+                concat!(
+                    "MP_PRESSURE's ",
+                    stringify!($f),
+                    " is not a step 9 ladder field: it must equal FINAL's"
+                )
+            );
+        };
+    }
+    same!(committers_lo);
+    same!(committers_span);
+    same!(trees_lo);
+    same!(trees_span);
+    same!(keyspace_lo);
+    same!(keyspace_span);
+    same!(syncoff_table);
+    same!(map_leaf_cap_table);
+    same!(freeset_leaf_bits_table);
+    same!(r_epoch_table);
+    same!(keep_latest_pm_table);
+    same!(tear_pm_table);
+    same!(rounds_weights);
+    same!(target_ckpt_span);
+    same!(commit_ops_lo);
+    same!(commit_ops_span);
+    same!(value_lo);
+    same!(value_hi);
+    same!(delete_one_in);
+    same!(bulk_load_one_in);
+    same!(drop_one_in);
+    same!(r41_share);
+    same!(r41p_share);
+}
+
 /// **X-5c-F4-F1-F1-F2 step 3: no late epoch copy installs at BASE**
 /// (verdict X-5c-F4-F1-F1 finding 1). The late-copy events this card
 /// fixes occur at BASE on their own (7 over 0..200: seed 96 twice, 104,
@@ -3712,14 +3764,15 @@ fn x5_r45_the_recorded_set_gates_verify() {
     assert_eq!(set, None);
 }
 
-/// **X5-R44 pin: `tuning_id()` is `MpPressure` for that set only**, and
-/// `MP_PRESSURE` equals `FINAL` while it is written as
-/// `Tuning { ..Tuning::FINAL }` (it starts equal and follows).
+/// **X5-R44 pin: `tuning_id()` is `MpPressure` for that set only.**
 /// **M-MP-TUNING** (`mp-pressure` selects `TuningId::Final`) fails the
 /// id half. X-5c-F4-F3 step 1 makes FINAL = S1, so the `FINAL == BASE`
 /// half this test pinned at X-5c-F4-F2's tip is gone — that is this
 /// card's Goal ("a `Tuning::FINAL` that is not BASE"); S1's two
-/// constants are pinned by `x5_r37_final_r41_is_s1`.
+/// constants are pinned by `x5_r37_final_r41_is_s1`. Step 9 gives
+/// `MP_PRESSURE` its ladder fields, so it no longer equals FINAL
+/// field for field either: `x5_r37_mp_pressure_differs_only_in_ladder_fields`
+/// pins that the difference is exactly those fields.
 #[test]
 fn x5_r44_tuning_id_is_mp_pressure_for_that_set_only() {
     assert_eq!(CampaignSet::Main.tuning_id(), TuningId::Final);
@@ -3729,16 +3782,14 @@ fn x5_r44_tuning_id_is_mp_pressure_for_that_set_only() {
         TuningId::MpPressure,
         "M-MP-TUNING reverts this"
     );
-    assert_eq!(workload::Tuning::MP_PRESSURE, workload::Tuning::FINAL);
     assert_ne!(
         workload::Tuning::FINAL,
         workload::Tuning::BASE,
         "X-5c-F4-F3: FINAL is S1, not BASE (the card's Goal)"
     );
-    // MP_PRESSURE equals FINAL while it is `{ ..Tuning::FINAL }`, so
-    // the id remains the only discriminator between them;
-    // `tuning()` matches on the id, and the retune moves
-    // MP_PRESSURE with FINAL until step 9 gives it ladder fields.
+    // Which tuning a set runs is decided by the id alone
+    // (`tuning()` matches on it); the constants' relationship to
+    // FINAL is pinned by the differs-only test.
 }
 
 /// **X5-R46 pin: `MP_REFUSAL` on a literal record set with mixed
