@@ -315,7 +315,11 @@ measure() {
     echo "x5_cpu_term: expected 1 'step 1 -' commit in $base_ref..HEAD, found $count" >&2
     return 2
   fi
-  local arm ref
+  local arm ref toplevel
+  toplevel=$(git rev-parse --show-toplevel) || {
+    echo "x5_cpu_term: not inside the worktree (git rev-parse failed)" >&2
+    return 2
+  }
   for arm in BASE S1 FINAL; do
     case "$arm" in
       BASE) ref=$base_commit ;;
@@ -323,7 +327,13 @@ measure() {
       FINAL) ref=HEAD ;;
     esac
     mkdir -p "$prefix.src.$arm" "$prefix.target.$arm" || return 2
-    git archive "$ref" | tar -x -C "$prefix.src.$arm" || {
+    # The archive is taken from the worktree root so nucleus/v2 is
+    # present: e1-bench's path dependency (../../../v2/crates/…) is
+    # resolved for every workspace member even though only
+    # e4-recovery is built (an archive rooted at nucleus/v3 breaks
+    # workspace manifest loading — the E4-SILENT-1 gate hit the same
+    # thing and excluded e1-bench; archiving the root needs no edit).
+    (cd "$toplevel" && git archive "$ref") | tar -x -C "$prefix.src.$arm" || {
       echo "x5_cpu_term: git archive failed for $arm ($ref)" >&2
       return 2
     }
