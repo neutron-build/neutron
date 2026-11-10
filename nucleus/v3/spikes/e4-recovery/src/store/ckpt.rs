@@ -355,9 +355,37 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
     // nested recovery crash that landed on this yield was reported as
     // "start segment missing" — an XX001 at Open in a faultless class C
     // round (seed 1769's family), with the crash never fired.
+    //
+    // **E4-R2 (card E4-SILENT-1; S-STORE §14 step 3a's start-segment
+    // proof, header-design-verify §1.4):** an open from a meta whose
+    // `wal_start_lsn` is 0 also needs proof its log start survives.
+    // Without this arm a lost header over a recycled segment 0 opened
+    // meta 0 with segment 0 gone and another segment present: the walk
+    // stopped at once (a missing segment is a §12.5 stop), the coverage
+    // check passed vacuously (`wal_ckpt_end == wal_start_lsn == 0` at a
+    // quiescent flip), and the store served an empty database with
+    // acknowledged commits gone — silently. The proof is the listing:
+    // `wal_recycle` renames segments lowest first and directory
+    // operations persist as a prefix of issue order, so if the start
+    // segment is present, no segment at or above it was recycled — and
+    // start 0 with segment 0 missing while any other `*.log` segment
+    // exists can only be a recycled-or-never-created segment 0 under a
+    // meta that claims start 0. The one exception is `wal_start_lsn ==
+    // 0` with no `*.log` file in `/wal/` at all: a store that never
+    // made a segment durable (`/wal/.keep` is not a segment and does
+    // not count — the filter is `*.log`). The start-0 probe is
+    // yield-free (`wal_names` adds no yield), and at start above 0 the
+    // `exists` call is exactly as at the Base.
     let start_seg = meta.wal_start_lsn - (meta.wal_start_lsn % WAL_SEG);
     let name = format!("/wal/{start_seg:016x}.log");
-    if meta.wal_start_lsn > 0 && !cx.env().exists(&name).map_err(Fail::Sim)? {
+    let start_missing = if meta.wal_start_lsn > 0 {
+        !cx.env().exists(&name).map_err(Fail::Sim)?
+    } else {
+        let names = cx.env().wal_names().map_err(Fail::Sim)?;
+        let segs: Vec<&String> = names.iter().filter(|n| n.ends_with(".log")).collect();
+        !segs.is_empty() && !segs.iter().any(|n| name.ends_with(n.as_str()))
+    };
+    if start_missing {
         if matches!(meta_is_mutant(cx)?, Some(Mutant::StartSegmentMissingOk)) {
             // The mutant treats the WAL as empty.
             cx.with("open:mutwal", |c| {
@@ -368,6 +396,10 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
                 Ok(())
             })?;
         } else {
+            eprintln!(
+                "E4_SILENT_REFUSE rule=R2 opened={} start={}",
+                meta.ckpt_id, meta.wal_start_lsn
+            );
             return Err(Fail::Corrupt(format!("start segment {name} missing (G3)")));
         }
     }

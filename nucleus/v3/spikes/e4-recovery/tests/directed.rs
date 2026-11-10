@@ -3370,15 +3370,22 @@ fn es1_script(crash: Option<CrashSpec>, extra: Vec<Op>) -> Script {
 /// highest valid meta the faultless round made durable, its last write
 /// in issue order).
 fn es1_newest_meta_lost(base: &harness::RoundOutcome) -> e4_recovery::sim::MediaFault {
+    es_meta_lost(base, None)
+}
+
+/// [`es1_newest_meta_lost`] for one named meta id (`Some(k)`), or the
+/// newest (`None`).
+fn es_meta_lost(base: &harness::RoundOutcome, want: Option<u64>) -> e4_recovery::sim::MediaFault {
     let pf = base
         .crashed_disk
         .stat(e4_recovery::sim::PAGE_FILE)
-        .expect("es1: the page file");
+        .expect("es: the page file");
     let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
     for w in base.crashed_disk.dwrites_of(pf).iter() {
         if (w.off == 4096 || w.off == 8192)
             && w.bytes.len() == 4096
             && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && want.is_none_or(|k| m.ckpt_id == k)
             && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
         {
             best = Some((
@@ -3394,7 +3401,7 @@ fn es1_newest_meta_lost(base: &harness::RoundOutcome) -> e4_recovery::sim::Media
             ));
         }
     }
-    best.expect("es1: a durable meta write exists").1
+    best.expect("es: the named durable meta write exists").1
 }
 
 /// One directed-fault es1 round (the d17 runner shape: class MP, the
@@ -3603,6 +3610,197 @@ fn es1_faultless_every_crash_point() {
             out.opened_ckpt_id,
             out.o1,
             out.o3_fail,
+            out.task_error
+        );
+    }
+}
+
+// ---- E4-R2 (card E4-SILENT-1 step 2: an open needs proof its log
+// start survives) ----
+
+/// The es2 setup: the standard publication of tree 2.
+fn es2_setup() -> ScriptOp {
+    ScriptOp::Commit {
+        sync_on: true,
+        ops: vec![
+            Op::CreateTree { tree: 2 },
+            Op::CreateTree { tree: CATALOG },
+            publish(2),
+        ],
+    }
+}
+
+/// Seven commits of 100 puts of 120 bytes each — enough logged bytes to
+/// push the append position across segment 0 (~100 KiB of records).
+fn es2_seven_commits() -> Vec<ScriptOp> {
+    (0..7u64)
+        .map(|k| ScriptOp::Commit {
+            sync_on: true,
+            ops: ((k * 100)..((k + 1) * 100))
+                .map(|i| putv(i, 1, 120))
+                .collect(),
+        })
+        .collect()
+}
+
+/// **E4-R2 (card E4-SILENT-1; header-design-verify §1.4's first row):**
+/// a lost header over a recycled start segment must not open with
+/// acknowledged commits gone. Setup, seven commits of 100 puts of 120
+/// bytes, one checkpoint (meta 1, start above 0; its step 6 recycles
+/// segment 0), the crash at `CkptHook::After6` of checkpoint 0, seed
+/// 77. The faultless round passes with metas 0 (start 0) and 1 (start
+/// above 0). A directed `Lost` on meta 1 falls back to meta 0, whose
+/// start segment was recycled while another segment is present — the
+/// E4-R2 arm refuses at G3: no opened meta, a detection at `open`,
+/// `pass`, not `served` (pre-fix this opened an empty database with
+/// every acked commit gone, silently).
+#[test]
+fn es2_recycled_start_zero_refused() {
+    let mut ops = vec![es2_setup()];
+    ops.extend(es2_seven_commits());
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Yields(3));
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 0,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let base = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass && base.opened_ckpt_id == Some(1),
+        "es2 recycled: the faultless round passes opening meta 1 (pass={}, opened={:?}, o1={:?}, te={:?})",
+        base.pass,
+        base.opened_ckpt_id,
+        base.o1,
+        base.task_error
+    );
+    let out = es1_fault_round(77, &script, es_meta_lost(&base, Some(1)));
+    assert!(
+        out.opened_ckpt_id.is_none() && out.detections.contains(&"open") && out.pass && !out.served,
+        "es2 recycled: the start-0 meta over a recycled segment 0 is refused at G3, detected, passing, never served (opened={:?}, det={:?}, pass={}, served={}, o1={:?}, o3={:?})",
+        out.opened_ckpt_id,
+        out.detections,
+        out.pass,
+        out.served,
+        out.o1,
+        out.o3_fail
+    );
+}
+
+/// **E4-R2's control:** a start **above** 0 whose segment was recycled
+/// is refused exactly as at the Base — E4-R2 changes nothing on that
+/// path. Setup, one commit of one put, a checkpoint (meta 1, a small
+/// nonzero start inside segment 0), the same seven commits, a second
+/// checkpoint (meta 2, start above 0; its step 6 recycles segment 0),
+/// the crash at `CkptHook::After6` of checkpoint 1, seed 77. A directed
+/// `Lost` on the newest meta (2) falls back to meta 1, whose start sits
+/// in the recycled segment 0: G3's start-above-0 arm refuses, as it
+/// always has.
+#[test]
+fn es2_nonzero_start_control() {
+    let mut ops = vec![
+        es2_setup(),
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(0, 1)],
+        },
+        ScriptOp::Checkpoint,
+    ];
+    ops.extend(es2_seven_commits());
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Yields(3));
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 1,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let base = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass && base.opened_ckpt_id == Some(2),
+        "es2 control: the faultless round passes opening meta 2 (pass={}, opened={:?}, o1={:?}, te={:?})",
+        base.pass,
+        base.opened_ckpt_id,
+        base.o1,
+        base.task_error
+    );
+    let out = es1_fault_round(77, &script, es1_newest_meta_lost(&base));
+    assert!(
+        out.opened_ckpt_id.is_none() && out.detections.contains(&"open") && out.pass && !out.served,
+        "es2 control: the nonzero start in a recycled segment refuses at G3 as at the Base (opened={:?}, det={:?}, pass={}, served={})",
+        out.opened_ckpt_id,
+        out.detections,
+        out.pass,
+        out.served
+    );
+}
+
+/// **E4-R2's healthy-store proof:** the start-0 arm never fires on a
+/// healthy store. The same script as `es2_recycled_start_zero_refused`
+/// at `CrashSpec::TaskYield(1, n)` for `n` in `0..30`, and a
+/// one-commit script at `n` in `0..4` (the store with no segment at
+/// all — the empty-directory exception): `pass` and an opened meta at
+/// every point. M-R2-ALWAYS (no empty-directory exception) and
+/// M-R2-ANYNAME (no `*.log` filter, so `.keep` counts) both fail the
+/// one-commit arm.
+#[test]
+fn es2_healthy_start_zero_every_crash_point() {
+    let mut ops = vec![es2_setup()];
+    ops.extend(es2_seven_commits());
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Yields(3));
+    for n in 0u64..30 {
+        let script = Script {
+            tasks: vec![ScriptTask { ops: ops.clone() }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, n)),
+            nested: Vec::new(),
+        };
+        let out = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            out.pass && out.opened_ckpt_id.is_some(),
+            "es2 healthy n={n}: pass with an opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+            out.pass,
+            out.opened_ckpt_id,
+            out.o1,
+            out.o3_fail,
+            out.task_error
+        );
+    }
+    // The store with no segment: one commit, then yields; the crash at
+    // n=1 lands before the commit, so no record was ever appended and
+    // `/wal/` holds only `.keep`.
+    for n in 0u64..4 {
+        let script = Script {
+            tasks: vec![ScriptTask {
+                ops: vec![es2_setup(), ScriptOp::Yields(3)],
+            }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, n)),
+            nested: Vec::new(),
+        };
+        let out = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            out.pass && out.opened_ckpt_id.is_some(),
+            "es2 healthy one-commit n={n}: the store with no segment opens (pass={}, opened={:?}, o1={:?}, te={:?})",
+            out.pass,
+            out.opened_ckpt_id,
+            out.o1,
             out.task_error
         );
     }

@@ -8074,3 +8074,83 @@ fn es1_refused_open_writes_nothing() {
         }
     }
 }
+
+/// **WR-1 (card E4-SILENT-1 step 2; E4-R2's precondition, S-STORE
+/// §2.3's shape):** segment 0 is created, and its directory entry made
+/// durable, before any other segment, whenever the durable meta's start
+/// is 0. One task on a `TestWorld`: after `ckpt::create` (meta 0,
+/// start 0), `wal.append`, `wal.written` and `wal.durable` are seated
+/// at `WAL_SEG` — a boot whose next batch starts in segment 1 while
+/// segment 0 is uncreated — then one record is enqueued and
+/// `wal_wait_durable`d. Segment 0 must exist (WR-1 created it ahead of
+/// segment 1, with the same create-or-open, `set_len`, bind and
+/// `sync_dir` steps), and after `apply_crash` (both segments' directory
+/// entries durable) `ckpt::recover` is `Ok`: meta 0's start-0 open
+/// finds segment 0 present, the walk stops on its zeros, and the empty
+/// stream is a legal recovery. With WR-1 removed (M-SEG0-ORDER),
+/// segment 0 never exists, the start-0 open sees segment 1 alone, and
+/// E4-R2 refuses — the recovery is `Err` and this pin fails.
+#[test]
+fn es2_segment_zero_created_first() {
+    use e4_recovery::store::WAL_SEG;
+    let seed = 4343u64;
+    let cfg = tcfg(8, 16, 2);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    let world = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    // Seat the writer frontiers at segment 1's first LSN: the next
+    // enqueue lands in segment 1, and the batch that writes it creates
+    // segment 1 — the WR-1 history.
+    cx.with("es2:seat", |c| {
+        let wal = &mut c.store().wal;
+        wal.append = WAL_SEG;
+        wal.written = WAL_SEG;
+        wal.durable = WAL_SEG;
+        Ok(())
+    })
+    .expect("seat the WAL frontiers");
+    let (lsn, len) = wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 1, &[9u8; 8]).expect("enqueue");
+    assert_eq!(lsn, WAL_SEG, "the record starts segment 1");
+    wal::wal_wait_durable(&cx, lsn + len).expect("the record is durable");
+    // Segment 0 exists — created before segment 1, its directory entry
+    // synced by the same steps.
+    assert!(
+        world
+            .lock()
+            .disk
+            .stat("/wal/0000000000000000.log")
+            .is_some(),
+        "es2: WR-1 must create segment 0 before segment 1"
+    );
+    assert!(
+        world
+            .lock()
+            .disk
+            .stat("/wal/0000000000010000.log")
+            .is_some(),
+        "es2: segment 1 holds the enqueued record"
+    );
+    // After the crash (both segments' entries durable), the start-0
+    // open recovers: the walk stops on segment 0's zeros and the empty
+    // stream is legal.
+    let mut d2 = g_of(&world);
+    crash_clean(&mut d2, seed + 1);
+    assert!(
+        d2.stat("/wal/0000000000000000.log").is_some(),
+        "es2: segment 0's directory entry is durable across the crash"
+    );
+    let world2 = pass_world(1, seed + 2, d2, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &world2,
+        t: HARNESS,
+    };
+    let r = ckpt::recover(&cx2, cfg.clone());
+    assert!(
+        r.is_ok(),
+        "es2: the start-0 open over the WR-1-created segment 0 recovers (got {:?})",
+        r.map_err(|_| "Err")
+    );
+}

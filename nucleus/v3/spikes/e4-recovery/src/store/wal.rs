@@ -597,6 +597,54 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     res
 }
 
+/// Create + preallocate + G1 for one WAL segment (the creation branch
+/// of [`wal_write_batch`]'s segment loop, as one function so **WR-1**
+/// (E4-SILENT-1) can create segment 0 with the **same** create-or-open,
+/// `set_len`, bind and `sync_dir` steps before a higher segment).
+/// With more than one batch in flight (X-5c-F3-F3a step 3) two tasks
+/// can race this create for the same segment: the loser's `create`
+/// fails "exists" and falls back to `open`, which resolves to the same
+/// inode; the second `set_len` and `sync_dir` are idempotent, and
+/// durability of the segment's records is never counted before at least
+/// one completed dirsync.
+///
+/// G8 (9.2, W8): a segment's creation, preallocation and `/wal/`
+/// directory sync are WAL-path operations — a non-crash failure there
+/// poisons the store (the test hook can only fire on the write/sync
+/// shapes; the create/set_len/dirsync sites share the poison rule
+/// through their callers' error exit above).
+fn wal_create_segment<H: StoreHost>(cx: &Cx<'_, H>, seg: u64) -> Result<usize, Fail> {
+    let name = format!("/wal/{seg:016x}.log");
+    let created = cx.env().create(&name);
+    let f = match created {
+        Ok(f) => f,
+        Err(_) => cx.env().open(&name).map_err(Fail::Sim)?,
+    };
+    cx.env().set_len(f, WAL_SEG).map_err(Fail::Sim)?;
+    cx.with("wal_writer:bind", |c| {
+        let st = c.store();
+        st.wal.segs.insert(seg, f);
+        if !st.wal.seg_needs_dirsync.contains(&seg) {
+            st.wal.seg_needs_dirsync.push(seg);
+        }
+        Ok(())
+    })?;
+    if !cx.with("wal_writer:mut", |c| {
+        Ok(matches!(
+            c.store().cfg.mutant,
+            Some(Mutant::RenameNoDirsync)
+        ))
+    })? {
+        cx.env().sync_dir("/wal/").map_err(Fail::Sim)?;
+        cx.with("wal_writer:dirsynced", |c| {
+            let st = c.store();
+            st.wal.seg_needs_dirsync.retain(|s| *s != seg);
+            Ok(())
+        })?;
+    }
+    Ok(f)
+}
+
 /// One in-flight batch's write-out: the optional `writer:prewrite`
 /// hold, the segment loop, the `written` advance over the interval
 /// set, the `writer:presync` park, the group sync and the `durable`
@@ -636,49 +684,37 @@ fn wal_write_batch<H: StoreHost>(
             match existing {
                 Some(f) => f,
                 None => {
-                    // Create + preallocate + G1. With more than one
-                    // batch in flight (X-5c-F3-F3a step 3) two tasks
-                    // can race this create for the same segment: the
-                    // loser's `create` fails "exists" and falls back to
-                    // `open`, which resolves to the same inode; the
-                    // second `set_len` and `sync_dir` are idempotent,
-                    // and durability of the segment's records is never
-                    // counted before at least one completed dirsync.
-                    let name = format!("/wal/{seg:016x}.log");
-                    // G8 (9.2, W8): a segment's creation, preallocation
-                    // and `/wal/` directory sync are WAL-path operations
-                    // — a non-crash failure there poisons the store (the
-                    // hook below can only fire on the write/sync shapes;
-                    // the create/set_len/dirsync sites share the poison
-                    // rule through their callers' error exit above).
-                    let created = cx.env().create(&name);
-                    let f = match created {
-                        Ok(f) => f,
-                        Err(_) => cx.env().open(&name).map_err(Fail::Sim)?,
-                    };
-                    cx.env().set_len(f, WAL_SEG).map_err(Fail::Sim)?;
-                    cx.with("wal_writer:bind", |c| {
-                        let st = c.store();
-                        st.wal.segs.insert(seg, f);
-                        if !st.wal.seg_needs_dirsync.contains(&seg) {
-                            st.wal.seg_needs_dirsync.push(seg);
-                        }
-                        Ok(())
-                    })?;
-                    if !cx.with("wal_writer:mut", |c| {
-                        Ok(matches!(
-                            c.store().cfg.mutant,
-                            Some(Mutant::RenameNoDirsync)
-                        ))
-                    })? {
-                        cx.env().sync_dir("/wal/").map_err(Fail::Sim)?;
-                        cx.with("wal_writer:dirsynced", |c| {
+                    // **WR-1 (card E4-SILENT-1; E4-R2's precondition,
+                    // S-STORE §2.3's shape): segment 0 is created, and
+                    // its directory entry made durable, before any
+                    // other segment, whenever the durable meta's start
+                    // is 0.** Without it, a first batch starting in
+                    // segment 1 while segment 0 is uncreated (`wal_
+                    // wait_durable` and the writer task can hold two
+                    // batches) leaves a healthy store whose start-0 open
+                    // finds another segment present and no segment 0 —
+                    // a false E4-R2 XX001. The check acts only in that
+                    // history (segment 0 missing while the store creates
+                    // a higher segment under a start-0 meta), so no
+                    // seed-reached path in `0..10000` moves. The durable
+                    // meta's start is `st.meta.wal_start_lsn`: `st.meta`
+                    // is installed only from a meta a completed step 5
+                    // made durable (or the opened one), and only
+                    // `next_lpid`/`slot_count` grow afterwards. The
+                    // `wal_names` probe adds no yield (E4Env's doc).
+                    if seg > 0 {
+                        let meta_start0 = cx.with("wal_writer:wr1", |c| {
                             let st = c.store();
-                            st.wal.seg_needs_dirsync.retain(|s| *s != seg);
-                            Ok(())
+                            Ok(st.meta.wal_start_lsn == 0 && !st.wal.segs.contains_key(&0))
                         })?;
+                        if meta_start0 {
+                            let names = cx.env().wal_names().map_err(Fail::Sim)?;
+                            if !names.iter().any(|n| n == "0000000000000000.log") {
+                                wal_create_segment(cx, 0)?;
+                            }
+                        }
                     }
-                    f
+                    wal_create_segment(cx, seg)?
                 }
             }
         };

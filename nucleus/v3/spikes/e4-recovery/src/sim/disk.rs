@@ -1141,6 +1141,23 @@ impl SimDisk {
         out
     }
 
+    /// **E4-R2 (card E4-SILENT-1): the sorted names currently bound in
+    /// `dir`** — the store's G3 probe reads them (through
+    /// [`crate::sim::env::E4Env::wal_names`]) to prove, at
+    /// `wal_start_lsn == 0`, that the segment holding the start exists:
+    /// `wal_recycle` renames segments lowest first and directory
+    /// operations persist as a prefix of issue order, so if the start
+    /// segment is present, no segment at or above it was recycled. The
+    /// `BTreeMap` iteration is already name-sorted (all namespace
+    /// iteration is over `BTreeMap`s); no read is recorded and no taint
+    /// applies (this is a directory listing, not a file read).
+    pub fn dir_names(&self, dir: &str) -> Vec<String> {
+        self.cur_bindings
+            .get(dir)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// **X5-R34 (b) 3** — the one read-only observer accessor this card
     /// adds to `src/sim/`: the **durable** directory bindings of `dir`
     /// (the name → inode map a `sync_dir` last made durable; a binding
