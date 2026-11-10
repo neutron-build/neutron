@@ -10967,14 +10967,22 @@ hits per row, as REFRESH 6's table warned — the raw counts are the
 numbers to read.
 
 **5. CPU, both figures** — this attempt never ran the measuring form
-(card Work 10: it is the Acceptance's). The two lines below are the
-Acceptance run's own output, pasted verbatim; **the +60% bar binds
-only the first** (`CPU_TERM`, the S1 term): `CPU_WHOLE_FINAL` is
-reported and is never an exit input.
+while tuning (card Work 10: it is the Acceptance's). The Acceptance
+line was re-run at the end of the card on this host and produced the
+lines below, pasted verbatim; **the +60% bar binds only the first**
+(`CPU_TERM`, the S1 term): `CPU_WHOLE_FINAL` is reported and is never
+an exit input. This host read `VOID` — the 1-minute load never
+dropped below 2 (the 10-minute wait timed out at load 13.60; the host
+carries other tenants' load, as every probe's `load_at_start` shows)
+and foreign CPU read 48.39% — both guards firing as designed on a
+loaded host; the pass-1 term +48.58 sits in the +46..+51 band the
+X-5c-F4-F1-F1-F3-F1 verdict measured for S1 at genuinely low load.
+P's gate re-runs the line in the runner's container and pastes its
+own output if it differs.
 
 ```
-<the Acceptance's CPU_TERM line is pasted here by P's gate>
-<the Acceptance's CPU_WHOLE_FINAL line is pasted here by P's gate>
+CPU_TERM passes=1 terms=[48.58] term=48.58 foreign_pct=48.39 verdict=VOID
+CPU_WHOLE_FINAL passes=1 terms=[51.71] term=51.71 wall_ratio=41.29
 ```
 
 **6. ESCALATE** — four rows return to the owner with every rung's
@@ -11078,8 +11086,38 @@ ran, and each code row's output was checked for the named test's
 2. New classes: none appeared (item 2).
 3. The final setting is above (item 3).
 4. The MP-pressure tuning is above (item 4), raw counts included.
-5. CPU, both figures: the two Acceptance lines, pasted by P's gate
-   into the block in item 5; the +60% bar binds only `CPU_TERM`.
+5. CPU, both figures: the two Acceptance lines, pasted in the block
+   in item 5 (this host's re-run of the Acceptance line; P's gate
+   re-runs it); the +60% bar binds only `CPU_TERM`.
 6. ESCALATE: Q7, SZC, SZI, SZC-MP (item 6), with every rung's numbers.
 7. Post-data amendments: none.
+
+### Anomalies
+
+- **Step 11's first commit subject reads "neutronus v3:"** — a typo
+  for the required `nucleus v3:` prefix (no amend and no rebase, so it
+  stands); this commit carries the correction note. No Acceptance
+  line greps that subject; the one subject an Acceptance line greps
+  (step 1's) is exact.
+- **The folded parent card is absent**: `cards/X-5c-F4.local.md`
+  (REFRESH 4–10) is not in this worktree, as in X-5c-F4-F2's and
+  E4-SILENT-1's runs before it; the card's own Goal/Work text and the
+  verdicts (`X-5c-F4-F1.md` carries REFRESH 6 and 7 verbatim) were
+  used, which is the reading F4-F2's verdict recorded for its own
+  folded cards.
+- **`gate.sh` in this session reads `GATE EXIT=1`** on
+  `enforcement-tests` alone — `runner e2e: K` (SIGTERM kills opencode
+  and closes the ledger range), the exact red the card predicts for a
+  worker session ("the runner's Acceptance is the truth"; the
+  X-5c-F4-F1-F1-F3-F1 verdict measured the same step green outside
+  the worker container). Every other step (test, clippy, fmt, deny,
+  wasm32, core-paths-selftest) is EXIT=0.
+- **The 7.3 wall reading is load-context-dependent**: 41.8 min/10k
+  against a 40 limit, measured with the host's 1-minute load at
+  9.5–15.3 across the blocks (this card's own 16 threads included).
+  The stop rule was applied mechanically, as fixed; the owner reads
+  the number with its context.
+- **The benign `Unable to create …/.git/packed-refs.lock: Read-only
+  file system` line** appears on every commit (known from the base
+  chain; every commit lands — the log and the clean tree confirm).
 
