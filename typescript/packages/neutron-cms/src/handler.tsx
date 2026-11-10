@@ -10,10 +10,10 @@ import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { isSafeUrl } from "./safe-url.js";
 import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
-import { Document, EditorPage, EditPage, type DesignedPage, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
+import { Document, EditorPage, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreVersion, saveEdits, savePost, setTexts,
-  sortByDate, trashCount, trashed, trashPost, versionsOf, type Item, type Post,
+  allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
+  sortByDate, trashCount, trashed, trashPost, valuesNow, versionsOf, type Item, type Post, type Save, type Snapshot,
 } from "./store.js";
 
 const CSP = [
@@ -222,7 +222,7 @@ export function createHandler(config: ResolvedConfig) {
   function editSite(request: Request) {
     const id = Number(new URL(request.url).searchParams.get("page"));
     if (id) return redirect(`${admin}/posts/${id}`);
-    return page("Edit site", <EditPage config={config} />);
+    return page("Edit site", <EditPage config={config} history={saveCount() > 0} />);
   }
 
   /** A designed page opens as itself, drafts included, ready to click and edit, and is published from the same bar. */
@@ -237,7 +237,7 @@ export function createHandler(config: ResolvedConfig) {
     }
     const src = isLive(post) ? address : `${address}?cms-preview=${encodeURIComponent((design.url ? previewToken("design", post.layout) : previewToken("page", post.slug!)))}`;
     const state: DesignedPage = { id: post.id, status: statusOf(post), revision: post.updated_at, permanent: design.permanent };
-    return page(post.title || "Page", <EditPage config={config} src={src} back={{ href: `${admin}/pages`, label: "Pages" }} page={state} />);
+    return page(post.title || "Page", <EditPage config={config} src={src} back={{ href: `${admin}/pages`, label: "Pages" }} page={state} history={saveCount() > 0} />);
   }
 
   const editorPage = (post: Post, rest: { saved?: boolean; error?: string; fields?: Partial<Post>; revision?: string } = {}) =>
@@ -337,7 +337,7 @@ export function createHandler(config: ResolvedConfig) {
 
     if (key === TEXT) {
       if (Object.keys(config.texts).length === 0) return notFound();
-      if (request.method !== "POST") return page("Text", <TextPage config={config} texts={allTexts()} saved={showsSaved} />);
+      if (request.method !== "POST") return page("Text", <TextPage config={config} texts={allTexts()} saved={showsSaved} history={hasHistory(TEXT)} />);
       const form = await request.formData();
       setTexts(Object.fromEntries(Object.keys(config.texts).map((name) => [name, String(form.get(name) ?? "").trim()])));
       return saved();
@@ -347,7 +347,7 @@ export function createHandler(config: ResolvedConfig) {
     if (!definition) return notFound();
     // A refused save keeps the revision it was made from, so pressing Save again can't overwrite a newer list.
     const show = (items: Item[], error?: string, revision = listRevision(key)) =>
-      page(definition.label, <ListPage config={config} listKey={key} items={items} revision={revision} saved={showsSaved && !error} error={error} />);
+      page(definition.label, <ListPage config={config} listKey={key} items={items} revision={revision} saved={showsSaved && !error} error={error} history={hasHistory(key)} />);
     if (request.method !== "POST") return show(listItems(key));
 
     const form = await request.formData();
@@ -364,6 +364,50 @@ export function createHandler(config: ResolvedConfig) {
     if (items.length === 0 && form.get("confirm_empty") !== "1") return show(items, `${definition.label} was not cleared. Confirm to remove everything.`, submitted);
     if (!replaceItems(key, items, submitted).ok) return show(items, `${definition.label} changed elsewhere. Copy anything you need, then reload.`, submitted);
     return saved();
+  }
+
+  const declared = () => ({ texts: Object.keys(config.texts), lists: Object.keys(config.lists) });
+  /** A save touches a list by its key, or the text fields as a whole. */
+  const touches = (save: Save, only: string) => (only === TEXT ? Object.keys(save.before.texts).length > 0 : Object.hasOwn(save.before.lists, only));
+  const hasHistory = (only: string) => saves().some((save) => touches(save, only));
+
+  /** Each save with the values it left behind: the next newer save's "before", or today's value. */
+  function withAfter(all: Save[]): HistoryEntry[] {
+    const keys = { texts: new Set<string>(), lists: new Set<string>() };
+    for (const save of all) {
+      Object.keys(save.before.texts).forEach((key) => keys.texts.add(key));
+      Object.keys(save.before.lists).forEach((key) => keys.lists.add(key));
+    }
+    const running = valuesNow({ texts: [...keys.texts], lists: [...keys.lists] });
+    const now: Snapshot = { texts: { ...running.texts }, lists: { ...running.lists } };
+    return all.map((save) => {
+      const after: Snapshot = { texts: {}, lists: {} };
+      for (const [key, value] of Object.entries(save.before.texts)) {
+        after.texts[key] = running.texts[key];
+        running.texts[key] = value;
+      }
+      for (const [key, items] of Object.entries(save.before.lists)) {
+        after.lists[key] = running.lists[key];
+        running.lists[key] = items;
+      }
+      return { save, after, now };
+    });
+  }
+
+  async function history(request: Request, id?: number) {
+    const search = new URL(request.url).searchParams;
+    const wanted = search.get("only") ?? "";
+    const only = wanted === TEXT || Object.hasOwn(config.lists, wanted) ? wanted : "";
+    const here = (extra: string) => `${admin}/history${only || extra ? "?" : ""}${[only ? `only=${only}` : "", extra].filter(Boolean).join("&")}`;
+    if (id !== undefined) {
+      const result = restoreSave(id, declared());
+      if (!result.ok) return redirect(here(""));
+      return redirect(here(`${result.save ? `restored=${result.save}&` : ""}s=${id}`));
+    }
+    const entries = withAfter(saves()).filter((entry) => !only || touches(entry.save, only));
+    const selected = entries.find((entry) => entry.save.id === Number(search.get("s"))) ?? entries[0];
+    const restored = Number(search.get("restored")) || undefined;
+    return page("History", <HistoryPage config={config} entries={entries} selected={selected} only={only} restored={restored} />);
   }
 
   /** Everything the editor needs. Only signed-in requests reach it. */
@@ -438,6 +482,8 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "trash" && (config.posts || config.pages) && !second && !post) return trashPage();
     if (first === "trash" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0 && post) return trashAction(request, Number(second));
     if (first === "lists" && second && rest.length === 0) return list(request, second);
+    if (first === "history" && !second && !post) return history(request);
+    if (first === "history" && second && /^\d+$/.test(second) && rest.length === 0 && post) return history(request, Number(second));
     return notFound();
   }
 

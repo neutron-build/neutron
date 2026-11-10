@@ -394,3 +394,31 @@ a.button { color: inherit; text-decoration: none; }
   .version-list { border-right: 0; border-bottom: 1px solid var(--rule); }
   .posts.trash .actions form { flex-direction: column-reverse; align-items: flex-end; gap: 6px; }
 }
+
+/* History of lists and texts */
+.head-link { color: var(--muted); font-size: 13px; }
+.head-link:hover { color: var(--strong); }
+.history-filter { margin-bottom: 16px; }
+.history { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: start; }
+.history-list { display: grid; gap: 2px; }
+.history-list a { display: block; padding: 8px 12px; border-radius: 6px; color: inherit; text-decoration: none; }
+.history-list a:hover { background: var(--surface); }
+.history-list a[aria-current] { background: var(--surface); color: var(--strong); font-weight: 500; }
+.history-list small { display: block; color: var(--muted); font-size: 13px; font-weight: 400; overflow-wrap: anywhere; }
+.history-detail { display: grid; gap: 24px; min-width: 0; }
+.history-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.history-detail h2 { color: var(--strong); font-size: 15px; font-weight: 600; }
+.history-detail h3 { margin: 16px 0 8px; color: var(--strong); font-size: 13px; font-weight: 600; }
+.history-detail section { display: grid; gap: 8px; padding-top: 16px; border-top: 1px solid var(--rule); }
+.history-value { padding: 8px 12px; background: var(--surface); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-now { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-rows { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.history-rows li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; overflow-wrap: anywhere; }
+.history-rows li > span { min-width: 0; }
+.history-rows img { flex: none; width: 48px; height: 48px; object-fit: cover; background: var(--surface); border-radius: 6px; }
+.history-rows small { color: var(--muted); font-size: 12px; }
+.history-rows .changed > span, .history-rows .changed > img { opacity: .6; }
+@media (max-width: 700px) {
+  .history { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .history-list { max-height: 220px; overflow-y: auto; padding-bottom: 8px; border-bottom: 1px solid var(--rule); }
+}

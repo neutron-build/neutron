@@ -319,6 +319,7 @@ async function save(after) {
     if (!response.ok) return say(result.error ?? "Could not save", true);
     dirty = false;
     justSaved = true;
+    $("[data-edit-history]")?.removeAttribute("hidden");
     if (after) return after();
     openPage(true);
   } catch {

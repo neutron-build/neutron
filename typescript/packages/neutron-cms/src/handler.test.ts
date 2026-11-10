@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import { hashPassword } from "./auth.js";
 import { defineCms } from "./index.js";
-import { closeDb, createPost, db, restoreVersion } from "./store.js";
+import { closeDb, createPost, db, listRevision, replaceItems, restoreVersion, saveEdits, saves, setTexts, type Item } from "./store.js";
 
 const SITE = "https://site.test";
 const PASSWORD = "a-long-enough-test-password";
@@ -67,7 +67,7 @@ before(async () => {
   process.env.CMS_PASSWORD_HASH = await hashPassword(PASSWORD);
 });
 beforeEach(() => {
-  for (const table of ["posts", "items", "texts", "posts_old"]) db().exec(`DELETE FROM ${table}`);
+  for (const table of ["posts", "items", "texts", "posts_old", "saves"]) db().exec(`DELETE FROM ${table}`);
 });
 after(() => {
   closeDb();
@@ -715,4 +715,125 @@ test("Move to Trash doesn't ask first, because it can be undone", async () => {
   const editor = await (await call(`/n-admin/posts/${id}`, { cookie })).text();
   assert.match(editor, /value="delete"/);
   assert.doesNotMatch(editor, /data-confirm="Delete/, "Trash can be undone, so it doesn't ask first");
+});
+
+const savesCount = () => saves().length;
+
+test("every way of saving lists and texts keeps what it replaced, and only what changed", async () => {
+  const cookie = await logIn();
+  const revision = revisionOf(await (await call("/n-admin/lists/links", { cookie })).text());
+  const saveLinks = (rev: string) => call("/n-admin/lists/links", { method: "POST", cookie, body: form({ revision: rev, "f.label": ["a"], "f.url": ["https://a.test"] }) });
+  assert.equal((await saveLinks(revision)).status, 303);
+  assert.equal(savesCount(), 1);
+  assert.deepEqual(saves()[0].before, { texts: {}, lists: { links: [] } });
+  assert.equal((await saveLinks(revisionOf(await (await call("/n-admin/lists/links", { cookie })).text()))).status, 303);
+  assert.equal(savesCount(), 1, "the same list again keeps nothing");
+
+  await call("/n-admin/lists/text", { method: "POST", cookie, body: form({ tagline: "" }) });
+  assert.equal(savesCount(), 1, "an empty text that was never saved hasn't changed");
+  await call("/n-admin/lists/text", { method: "POST", cookie, body: form({ tagline: "Hello" }) });
+  assert.deepEqual(saves()[0].before, { texts: { tagline: "" }, lists: {} });
+  await call("/n-admin/lists/text", { method: "POST", cookie, body: form({ tagline: "Hello" }) });
+  assert.equal(savesCount(), 2);
+
+  const { lists } = await (await call("/n-admin/edit/data", { cookie })).json();
+  assert.equal((await edit(cookie, { texts: { tagline: "Hi" }, lists: { links: { revision: lists.links.revision, items: [{ label: "a", url: "https://a.test" }] } } })).status, 200);
+  assert.deepEqual(saves()[0].before, { texts: { tagline: "Hello" }, lists: {} }, "the unchanged list is left out");
+  const fresh = (await (await call("/n-admin/edit/data", { cookie })).json()).lists.links.revision;
+  await edit(cookie, { texts: { tagline: "Hi" }, lists: { links: { revision: fresh, items: [{ label: "a", url: "https://a.test" }] } } });
+  assert.equal(savesCount(), 3, "a click-to-edit save that changes nothing keeps nothing");
+});
+
+test("History lists saves newest first in plain words, and filters to one list or the texts", async () => {
+  const cookie = await logIn();
+  replaceItems("gallery", [{ image: "/n-admin/media/a.png", caption: "A" }, { image: "/n-admin/media/b.png", caption: "B" }, { image: "/n-admin/media/c.png", caption: "C" }]);
+  replaceItems("gallery", [{ image: "/n-admin/media/a.png", caption: "A" }]);
+  setTexts({ tagline: "Hello" });
+  const page = await (await call("/n-admin/history", { cookie })).text();
+  const order = ["Tagline", "Gallery: 2 photos removed", "Gallery: 3 photos added"].map((text) => page.indexOf(text));
+  assert.ok(order.every((at) => at > 0), page);
+  assert.deepEqual([...order].sort((a, b) => a - b), order, "newest first");
+
+  const gallery = await (await call("/n-admin/history?only=gallery", { cookie })).text();
+  assert.match(gallery, /Showing saves of Gallery/);
+  assert.doesNotMatch(gallery, /<small>Tagline<\/small>/);
+  const texts = await (await call("/n-admin/history?only=text", { cookie })).text();
+  assert.match(texts, /<small>Tagline<\/small>/);
+  assert.doesNotMatch(texts, /photos/);
+  assert.match(await (await call("/n-admin/history?only=events", { cookie })).text(), /Nothing to go back to yet/);
+
+  // Selecting the second save shows the three photos it replaced, as thumbnails.
+  const id = saves()[1].id;
+  const detail = await (await call(`/n-admin/history?s=${id}`, { cookie })).text();
+  assert.equal(detail.match(/<img src="\/n-admin\/media\/[abc]\.png"/g)?.length, 3);
+  assert.match(detail, /3 photos then, 1 now/);
+  assert.equal(detail.match(/Not there now/g)?.length, 2);
+});
+
+test("Restore puts a save back, and the restore can itself be undone", async () => {
+  const cookie = await logIn();
+  setTexts({ tagline: "One" });
+  replaceItems("links", [{ label: "a", url: "https://a.test" }]);
+  const wrong = saveEditsLike({ tagline: "Oops" }, { links: [] });
+  assert.equal(cms.text("tagline"), "Oops");
+
+  const restored = await call(`/n-admin/history/${wrong}?only=links`, { method: "POST", cookie, body: form({}) });
+  assert.equal(restored.status, 303);
+  const location = restored.headers.get("location")!;
+  assert.match(location, /^\/n-admin\/history\?only=links&restored=\d+&s=\d+$/);
+  assert.equal(cms.text("tagline"), "One");
+  assert.deepEqual(cms.list("links"), [{ label: "a", url: "https://a.test" }]);
+  const after = await (await call(location, { cookie })).text();
+  assert.match(after, /Restored\./);
+  assert.match(after, /Nothing to restore: this is how it is now/);
+
+  const undo = location.match(/restored=(\d+)/)![1];
+  assert.equal((await call(`/n-admin/history/${undo}`, { method: "POST", cookie, body: form({}) })).status, 303);
+  assert.equal(cms.text("tagline"), "Oops");
+  assert.deepEqual(cms.list("links"), []);
+  assert.equal(savesCount(), 5);
+
+  assert.equal((await call("/n-admin/history/99999", { method: "POST", cookie, body: form({}) })).headers.get("location"), "/n-admin/history");
+});
+
+/** One click-to-edit save, returning its save id. */
+function saveEditsLike(texts: Record<string, string>, lists: Record<string, Item[]>) {
+  const fresh = Object.fromEntries(Object.entries(lists).map(([key, items]) => [key, { revision: listRevision(key), items }]));
+  assert.equal(saveEdits(texts, fresh).ok, true);
+  return saves()[0].id;
+}
+
+test("a save naming a list or text the site no longer declares is labelled, and never written back", async () => {
+  const cookie = await logIn();
+  db().prepare("INSERT INTO saves (saved_at, before) VALUES (?, ?)").run("2026-01-01T00:00:00.000Z", JSON.stringify({ texts: { motto: "Old motto", tagline: "Kept" }, lists: { menu: [{ label: "Home" }] } }));
+  const id = saves()[0].id;
+  const page = await (await call("/n-admin/history", { cookie })).text();
+  assert.match(page, /menu \(no longer on the site\)/);
+  assert.match(page, /motto \(no longer on the site\)/);
+  assert.match(page, /This list is no longer on the site/);
+  assert.equal((await call(`/n-admin/history/${id}`, { method: "POST", cookie, body: form({}) })).status, 303);
+  assert.equal(cms.text("tagline"), "Kept");
+  assert.equal(cms.texts().motto, undefined);
+  assert.deepEqual(cms.list("menu" as "links"), []);
+
+  db().exec("DELETE FROM saves");
+  db().prepare("INSERT INTO saves (saved_at, before) VALUES (?, ?)").run("2026-01-01T00:00:00.000Z", JSON.stringify({ texts: { motto: "x" }, lists: {} }));
+  assert.match(await (await call("/n-admin/history", { cookie })).text(), /Nothing to restore/);
+});
+
+test("History needs a login, writes need the site's origin, and its links show only when there is something to go back to", async () => {
+  assert.equal((await call("/n-admin/history")).status, 303);
+  setTexts({ tagline: "x" });
+  const id = saves()[0].id;
+  assert.equal((await call(`/n-admin/history/${id}`, { method: "POST", body: form({}) })).status, 303);
+  const cookie = await logIn();
+  assert.equal((await call(`/n-admin/history/${id}`, { method: "POST", cookie, origin: "https://evil.test", body: form({}) })).status, 403);
+  assert.equal((await call(`/n-admin/history/${id}`, { cookie })).status, 404, "restoring is a POST");
+  assert.equal(cms.text("tagline"), "x");
+
+  assert.doesNotMatch(await (await call("/n-admin/lists/gallery", { cookie })).text(), /history\?only=gallery/);
+  assert.match(await (await call("/n-admin/lists/text", { cookie })).text(), /href="\/n-admin\/history\?only=text"/);
+  assert.match(await (await call("/n-admin/edit", { cookie })).text(), /<a class="button quiet" href="\/n-admin\/history" data-edit-history="true">/);
+  db().exec("DELETE FROM saves");
+  assert.match(await (await call("/n-admin/edit", { cookie })).text(), /data-edit-history="true" hidden/);
 });

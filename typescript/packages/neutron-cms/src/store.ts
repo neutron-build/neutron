@@ -95,6 +95,12 @@ const MIGRATIONS = [
        (SELECT id FROM posts_old WHERE post_id = old.id ORDER BY id DESC LIMIT 50);
    END;
    UPDATE posts_old SET post_id = 0 WHERE post_id NOT IN (SELECT id FROM posts);`,
+  // Each save of lists and texts keeps what it replaced, as JSON: { texts: { key: old or null }, lists: { key: [items] } }.
+  `CREATE TABLE saves (
+     id INTEGER PRIMARY KEY,
+     saved_at TEXT NOT NULL,
+     before TEXT NOT NULL
+   );`,
 ];
 
 const store = globalThis as typeof globalThis & { __cmsDb?: DatabaseSync };
@@ -386,13 +392,18 @@ export const listItems = (list: string): Item[] =>
 export const listRevision = (list: string) =>
   createHash("sha256").update(JSON.stringify(listItems(list))).digest("hex").slice(0, 16);
 
+function writeList(list: string, items: Item[]): void {
+  db().prepare("DELETE FROM items WHERE list = ?").run(list);
+  const insert = db().prepare("INSERT INTO items (list, position, data) VALUES (?, ?, ?)");
+  items.forEach((item, position) => insert.run(list, position, JSON.stringify(item)));
+}
+
 /** Replaces a whole list at once, which is what makes reordering free. */
 export function replaceItems(list: string, items: Item[], revision?: string): { ok: boolean } {
   return transaction(() => {
     if (revision !== undefined && revision !== listRevision(list)) return { ok: false };
-    db().prepare("DELETE FROM items WHERE list = ?").run(list);
-    const insert = db().prepare("INSERT INTO items (list, position, data) VALUES (?, ?, ?)");
-    items.forEach((item, position) => insert.run(list, position, JSON.stringify(item)));
+    keepBefore({}, { [list]: items });
+    writeList(list, items);
     return { ok: true };
   });
 }
@@ -403,13 +414,9 @@ export function saveEdits(texts: Record<string, string>, lists: Record<string, {
     for (const [key, list] of Object.entries(lists)) {
       if (list.revision !== listRevision(key)) return { ok: false, stale: key };
     }
-    const upsert = db().prepare("INSERT INTO texts (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
-    for (const [key, value] of Object.entries(texts)) upsert.run(key, value);
-    const insert = db().prepare("INSERT INTO items (list, position, data) VALUES (?, ?, ?)");
-    for (const [key, list] of Object.entries(lists)) {
-      db().prepare("DELETE FROM items WHERE list = ?").run(key);
-      list.items.forEach((item, position) => insert.run(key, position, JSON.stringify(item)));
-    }
+    keepBefore(texts, Object.fromEntries(Object.entries(lists).map(([key, list]) => [key, list.items])));
+    for (const [key, value] of Object.entries(texts)) writeText(key, value);
+    for (const [key, list] of Object.entries(lists)) writeList(key, list.items);
     return { ok: true };
   });
 }
@@ -431,10 +438,93 @@ export function allTexts(): Record<string, string> {
   return Object.fromEntries(rows.map((row) => [row.key, row.value]));
 }
 
+const textNow = (key: string) =>
+  (db().prepare("SELECT value FROM texts WHERE key = ?").get(key) as { value: string } | undefined)?.value ?? null;
+
+/** A text that was never saved reads as empty, so null takes it back to never saved. */
+function writeText(key: string, value: string | null): void {
+  if (value === null) db().prepare("DELETE FROM texts WHERE key = ?").run(key);
+  else db().prepare("INSERT INTO texts (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(key, value);
+}
+
 export function setTexts(values: Record<string, string>): void {
   transaction(() => {
-    const upsert = db().prepare("INSERT INTO texts (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
-    for (const [key, value] of Object.entries(values)) upsert.run(key, value);
+    keepBefore(values, {});
+    for (const [key, value] of Object.entries(values)) writeText(key, value);
+  });
+}
+
+// History of lists and texts
+
+export interface Snapshot {
+  /** null: the text had never been saved. */
+  texts: Record<string, string | null>;
+  lists: Record<string, Item[]>;
+}
+
+export interface Save {
+  id: number;
+  saved_at: string;
+  /** What this save replaced, only for the keys it changed. */
+  before: Snapshot;
+}
+
+const SAVES_KEPT = 50;
+
+/**
+ * Keeps what a save is about to replace, for the keys it actually changes. Runs inside the save's
+ * transaction, before it writes. Returns the new save's id, or null when nothing changes.
+ */
+function keepBefore(texts: Record<string, string | null>, lists: Record<string, Item[]>): number | null {
+  const before: Snapshot = { texts: {}, lists: {} };
+  for (const [key, value] of Object.entries(texts)) {
+    const old = textNow(key);
+    if ((old ?? "") !== (value ?? "")) before.texts[key] = old;
+  }
+  for (const [key, items] of Object.entries(lists)) {
+    const old = listItems(key);
+    if (JSON.stringify(old) !== JSON.stringify(items)) before.lists[key] = old;
+  }
+  if (!Object.keys(before.texts).length && !Object.keys(before.lists).length) return null;
+  const result = db().prepare("INSERT INTO saves (saved_at, before) VALUES (?, ?)").run(now(), JSON.stringify(before));
+  db().prepare("DELETE FROM saves WHERE id NOT IN (SELECT id FROM saves ORDER BY id DESC LIMIT ?)").run(SAVES_KEPT);
+  return Number(result.lastInsertRowid);
+}
+
+function parseSave(row: { id: number; saved_at: string; before: string }): Save {
+  const parsed = JSON.parse(row.before) as Partial<Snapshot>;
+  return { id: row.id, saved_at: row.saved_at, before: { texts: parsed.texts ?? {}, lists: parsed.lists ?? {} } };
+}
+
+/** Saves of lists and texts, newest first. */
+export const saves = (): Save[] =>
+  (db().prepare("SELECT id, saved_at, before FROM saves ORDER BY id DESC").all() as { id: number; saved_at: string; before: string }[]).map(parseSave);
+
+export const saveCount = () => (db().prepare("SELECT count(*) AS n FROM saves").get() as { n: number }).n;
+
+/** Today's value of every key a snapshot names. */
+export function valuesNow(keys: { texts: string[]; lists: string[] }): Snapshot {
+  return {
+    texts: Object.fromEntries(keys.texts.map((key) => [key, textNow(key)])),
+    lists: Object.fromEntries(keys.lists.map((key) => [key, listItems(key)])),
+  };
+}
+
+/**
+ * Puts back what a save replaced, for the keys the site still declares. What it replaces is kept
+ * as a new save first, so a restore can be undone too. Returns that save's id, null when nothing changed.
+ */
+export function restoreSave(id: number, declared: { texts: string[]; lists: string[] }): { ok: true; save: number | null } | { ok: false } {
+  return transaction(() => {
+    const row = db().prepare("SELECT id, saved_at, before FROM saves WHERE id = ?").get(id) as { id: number; saved_at: string; before: string } | undefined;
+    if (!row) return { ok: false as const };
+    const { before } = parseSave(row);
+    const texts = Object.fromEntries(Object.entries(before.texts).filter(([key]) => declared.texts.includes(key)));
+    const lists = Object.fromEntries(Object.entries(before.lists).filter(([key]) => declared.lists.includes(key)));
+    const save = keepBefore(texts, lists);
+    for (const [key, value] of Object.entries(texts)) writeText(key, value);
+    for (const [key, items] of Object.entries(lists)) writeList(key, items);
+    return { ok: true as const, save };
   });
 }
 

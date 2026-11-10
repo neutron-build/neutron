@@ -10,7 +10,7 @@ import {
 } from "./auth.js";
 import {
   allPosts, backupTo, closeDb, contentCount, createPost, db, trashPost, getPost, isLive, listItems,
-  listRevision, livePostBySlug, livePosts, replaceItems, savePost, slugify, sortByDate, upcoming,
+  listRevision, livePostBySlug, livePosts, replaceItems, restoreSave, saveEdits, savePost, saves, setTexts, slugify, sortByDate, upcoming,
 } from "./store.js";
 import { isPhotoList } from "./config.js";
 import { imageSize, photoAttributes, thumbUrl } from "./images.js";
@@ -27,7 +27,7 @@ before(() => {
   db({ create: true });
 });
 beforeEach(() => {
-  for (const table of ["posts", "items", "texts", "sessions", "posts_old"]) db().exec(`DELETE FROM ${table}`);
+  for (const table of ["posts", "items", "texts", "sessions", "posts_old", "saves"]) db().exec(`DELETE FROM ${table}`);
 });
 after(() => {
   closeDb();
@@ -255,4 +255,37 @@ test("post images carry their size and offer the thumbnail", () => {
   assert.match(sized, /width="2000" height="1000"/);
   assert.match(renderMarkdown("![B](/media/b-600x400.webp)"), /src="\/media\/b-600x400\.webp" alt="B" width="600" height="400"/);
   assert.match(renderMarkdown("![C](/img/old.jpg)"), /^<p><img src="\/img\/old\.jpg" alt="C" loading="lazy"/);
+});
+
+test("lists and texts keep their last 50 saves", () => {
+  for (let n = 1; n <= 60; n++) replaceItems("menu", [{ label: String(n) }]);
+  const kept = saves();
+  assert.equal(kept.length, 50);
+  assert.deepEqual(kept[0].before.lists.menu, [{ label: "59" }], "newest first");
+  assert.deepEqual(kept[49].before.lists.menu, [{ label: "10" }], "the oldest go first");
+});
+
+test("restoring a save writes only declared keys, and keeps what it replaced", () => {
+  setTexts({ a: "one", b: "x" });
+  saveEdits({ a: "two" }, { menu: { revision: listRevision("menu"), items: [{ label: "m" }] } });
+  const id = saves()[0].id;
+  assert.deepEqual(saves()[0].before, { texts: { a: "one" }, lists: { menu: [] } });
+  const result = restoreSave(id, { texts: ["a"], lists: [] });
+  assert.deepEqual(result, { ok: true, save: saves()[0].id });
+  assert.deepEqual(saves()[0].before, { texts: { a: "two" }, lists: {} }, "the undeclared list is neither written nor kept");
+  assert.deepEqual(listItems("menu"), [{ label: "m" }]);
+  assert.deepEqual(restoreSave(id, { texts: ["a"], lists: [] }), { ok: true, save: null }, "nothing left to change keeps nothing");
+  assert.deepEqual(restoreSave(9999, { texts: [], lists: [] }), { ok: false });
+});
+
+test("a text that was never saved goes back to never saved", () => {
+  setTexts({ fresh: "typed" });
+  assert.deepEqual(saves()[0].before.texts, { fresh: null });
+  restoreSave(saves()[0].id, { texts: ["fresh"], lists: [] });
+  assert.equal(db().prepare("SELECT 1 FROM texts WHERE key = 'fresh'").get(), undefined);
+});
+
+test("the history table is added after the existing migrations", () => {
+  const version = (db().prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+  assert.equal(version, 6);
 });

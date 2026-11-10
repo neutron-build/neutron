@@ -2,7 +2,8 @@ import type { ComponentChildren } from "preact";
 import { assetUrl } from "./assets.js";
 import { isPhotoList, TEXT, type ResolvedConfig, type ResolvedField, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
-import type { Item, Post, Trashed, Version } from "./store.js";
+import { isSafeUrl } from "./safe-url.js";
+import type { Item, Post, Save, Snapshot, Trashed, Version } from "./store.js";
 
 export const STATUS_LABEL = { draft: "Draft", live: "Live", scheduled: "Scheduled" } as const;
 export type Status = keyof typeof STATUS_LABEL;
@@ -347,6 +348,8 @@ export function ListPage(props: {
   revision: string;
   saved: boolean;
   error?: string;
+  /** Whether there is an earlier save of this list to go back to. */
+  history?: boolean;
 }) {
   const { config, listKey, items, revision, saved, error } = props;
   const list = config.lists[listKey];
@@ -354,7 +357,7 @@ export function ListPage(props: {
   return (
     <Shell config={config} active={listKey}>
       <main class={photos ? "page" : "page narrow"}>
-        <div class="page-head"><h1>{list.label}</h1></div>
+        <div class="page-head"><h1>{list.label}</h1>{props.history ? <HistoryLink config={config} only={listKey} /> : null}</div>
         <form class="list-form" method="post" data-list>
           <input type="hidden" name="revision" value={revision} />
           <input type="hidden" name="confirm_empty" value="" />
@@ -378,12 +381,16 @@ export function ListPage(props: {
   );
 }
 
-export function TextPage(props: { config: ResolvedConfig; texts: Record<string, string>; saved: boolean }) {
+function HistoryLink(props: { config: ResolvedConfig; only: string }) {
+  return <a class="head-link" href={`${props.config.path}/history?only=${props.only}`}>History</a>;
+}
+
+export function TextPage(props: { config: ResolvedConfig; texts: Record<string, string>; saved: boolean; history?: boolean }) {
   const { config, texts, saved } = props;
   return (
     <Shell config={config} active={TEXT}>
       <main class="page narrow">
-        <div class="page-head"><h1>Text</h1></div>
+        <div class="page-head"><h1>Text</h1>{props.history ? <HistoryLink config={config} only={TEXT} /> : null}</div>
         <form class="text-form" method="post">
           {Object.entries(config.texts).map(([name, field]) => (
             <label class="field" key={name}>
@@ -409,7 +416,7 @@ export interface DesignedPage {
   permanent: boolean;
 }
 
-export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string }; page?: DesignedPage; notice?: string }) {
+export function EditPage(props: { config: ResolvedConfig; src?: string; back?: { href: string; label: string }; page?: DesignedPage; notice?: string; history?: boolean }) {
   const { config } = props;
   const admin = config.path;
   // A site with no blog opens on this page, so going back to its home would land here again.
@@ -424,6 +431,7 @@ export function EditPage(props: { config: ResolvedConfig; src?: string; back?: {
         <span class="spacer" />
         <div class="edit-tools" data-edit-tools hidden />
         {props.src ? null : <a class="button quiet on-wide" href="/" target="_blank" rel="noreferrer">View site</a>}
+        <a class="button quiet" href={`${admin}/history`} data-edit-history hidden={!props.history}>History</a>
         <button class="button" type="button" data-edit-discard disabled>Discard</button>
         <button class="button primary" type="button" data-edit-save disabled>Save</button>
         {props.page && !(props.page.permanent && props.page.status === "live") ? (
@@ -441,5 +449,153 @@ export function EditPage(props: { config: ResolvedConfig; src?: string; back?: {
       <script defer src={assetUrl(admin, "admin.js")} />
       {props.notice ? null : <script defer src={assetUrl(admin, "edit.js")} />}
     </>
+  );
+}
+
+/** A save of lists and texts, with what it left behind and what is there today. */
+export interface HistoryEntry {
+  save: Save;
+  after: Snapshot;
+  now: Snapshot;
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const sameItems = (a: Item, b: Item) => JSON.stringify(a) === JSON.stringify(b);
+const listName = (config: ResolvedConfig, key: string) => (Object.hasOwn(config.lists, key) ? config.lists[key].label : `${key} (no longer on the site)`);
+const textName = (config: ResolvedConfig, key: string) => (Object.hasOwn(config.texts, key) ? config.texts[key].label : `${key} (no longer on the site)`);
+
+/** In words: "Gallery: 2 photos removed, Tagline". */
+function describe(config: ResolvedConfig, entry: HistoryEntry): string {
+  const parts: string[] = [];
+  for (const [key, before] of Object.entries(entry.save.before.lists)) {
+    const known = Object.hasOwn(config.lists, key);
+    const noun = known && isPhotoList(config.lists[key]) ? "photo" : "item";
+    const change = (entry.after.lists[key]?.length ?? before.length) - before.length;
+    parts.push(change > 0 ? `${listName(config, key)}: ${plural(change, noun)} added` : change < 0 ? `${listName(config, key)}: ${plural(-change, noun)} removed` : listName(config, key));
+  }
+  const texts = Object.keys(entry.save.before.texts).map((key) => textName(config, key));
+  parts.push(...(texts.length > 3 ? [...texts.slice(0, 2), `${texts.length - 2} more texts`] : texts));
+  return parts.join(", ");
+}
+
+function SavedRow(props: { list?: ResolvedList; item: Item; note?: string }) {
+  const { list, item } = props;
+  const fields = list ? Object.entries(list.fields) : Object.keys(item).map((key) => [key, undefined] as const);
+  const images = fields.filter(([key, field]) => field?.type === "image" && item[key] && isSafeUrl(item[key]));
+  const words = fields.filter(([key, field]) => field?.type !== "image" && item[key]).map(([key]) => item[key]);
+  return (
+    <li class={props.note ? "changed" : undefined}>
+      {images.map(([key]) => <img key={key} src={thumbUrl(item[key])} alt="" loading="lazy" />)}
+      <span>{words.join(" \u00b7 ") || (images.length ? "" : "Empty")}</span>
+      {props.note ? <small>{props.note}</small> : null}
+    </li>
+  );
+}
+
+function SavedList(props: { config: ResolvedConfig; listKey: string; before: Item[]; now?: Item[] }) {
+  const { config, listKey, before } = props;
+  const list = Object.hasOwn(config.lists, listKey) ? config.lists[listKey] : undefined;
+  const now = props.now ?? [];
+  const added = now.filter((item) => !before.some((old) => sameItems(old, item)));
+  const same = before.length === now.length && before.every((item, index) => sameItems(item, now[index]));
+  const noun = list && isPhotoList(list) ? "photo" : "item";
+  return (
+    <section>
+      <h2>{listName(config, listKey)}</h2>
+      <p class="muted">
+        {!list ? "This list is no longer on the site, so it isn't restored. " : null}
+        {same ? "Same as now." : `${plural(before.length, noun)} then, ${now.length} now.`}
+      </p>
+      {before.length ? (
+        <ul class="history-rows">
+          {before.map((item, index) => <SavedRow key={index} list={list} item={item} note={list && !now.some((other) => sameItems(other, item)) ? "Not there now" : undefined} />)}
+        </ul>
+      ) : <p class="history-value muted">Empty</p>}
+      {list && added.length ? (
+        <>
+          <h3>Added since</h3>
+          <ul class="history-rows">{added.map((item, index) => <SavedRow key={index} list={list} item={item} />)}</ul>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function SavedText(props: { config: ResolvedConfig; textKey: string; before: string | null; now: string | null }) {
+  const { config, textKey } = props;
+  const known = Object.hasOwn(config.texts, textKey);
+  const before = props.before ?? "";
+  const now = props.now ?? "";
+  return (
+    <section>
+      <h2>{textName(config, textKey)}</h2>
+      <p class={before ? "history-value" : "history-value muted"}>{before || "Empty"}</p>
+      <p class="muted">
+        {!known ? "This text is no longer on the site, so it isn't restored." : before === now ? "Same as now." : <>Now: <span class="history-now">{now || "empty"}</span></>}
+      </p>
+    </section>
+  );
+}
+
+export function HistoryPage(props: { config: ResolvedConfig; entries: HistoryEntry[]; selected?: HistoryEntry; only: string; restored?: number }) {
+  const { config, entries, selected, only } = props;
+  const admin = config.path;
+  const query = (extra: string) => {
+    const parts = [only ? `only=${only}` : "", extra].filter(Boolean);
+    return parts.length ? `?${parts.join("&")}` : "";
+  };
+  const onlyName = only === TEXT ? "Text" : only ? listName(config, only) : "";
+  // Only what the site still declares is put back, and only if it differs from now.
+  const restorable = selected && (
+    Object.entries(selected.save.before.lists).some(([key, items]) => Object.hasOwn(config.lists, key) && JSON.stringify(items) !== JSON.stringify(selected.now.lists[key])) ||
+    Object.entries(selected.save.before.texts).some(([key, value]) => Object.hasOwn(config.texts, key) && (value ?? "") !== (selected.now.texts[key] ?? ""))
+  );
+  const listKeys = selected ? Object.keys(selected.save.before.lists) : [];
+  const textKeys = selected ? Object.keys(selected.save.before.texts) : [];
+  return (
+    <Shell config={config}>
+      <main class="page">
+        <div class="page-head">
+          <h1>History</h1>
+          {only ? <a class="head-link" href={`${admin}/history`}>Show everything</a> : null}
+        </div>
+        {props.restored ? (
+          <form class="undo" method="post" action={`${admin}/history/${props.restored}${query("")}`} role="status">
+            <span>Restored.</span>
+            <button class="button" type="submit">Undo</button>
+          </form>
+        ) : null}
+        {only ? <p class="muted history-filter">Showing saves of {onlyName}.</p> : null}
+        {!selected ? (
+          <p class="muted">Nothing to go back to yet. Every save of {only ? onlyName : "a list or text"} is kept here, the last 50.</p>
+        ) : (
+          <div class="history">
+            <nav class="history-list" aria-label="Saves">
+              {entries.map((entry) => (
+                <a key={entry.save.id} href={`${admin}/history${query(`s=${entry.save.id}`)}`} aria-current={entry === selected ? "true" : undefined}>
+                  <time dateTime={entry.save.saved_at}>{fullDate(config, entry.save.saved_at)}</time>
+                  <small>{describe(config, entry)}</small>
+                </a>
+              ))}
+            </nav>
+            <div class="history-detail">
+              <div class="history-head">
+                <div>
+                  <h2>Before the save of {fullDate(config, selected.save.saved_at)}</h2>
+                  <p class="muted">{restorable ? "Restore puts these back as they were. Everything else stays as it is." : "Nothing to restore: this is how it is now."}</p>
+                </div>
+                {restorable ? (
+                  <form method="post" action={`${admin}/history/${selected.save.id}${query("")}`}>
+                    <button class="button primary" type="submit">Restore</button>
+                  </form>
+                ) : null}
+              </div>
+              {listKeys.map((key) => <SavedList key={key} config={config} listKey={key} before={selected.save.before.lists[key]} now={selected.now.lists[key]} />)}
+              {textKeys.map((key) => <SavedText key={key} config={config} textKey={key} before={selected.save.before.texts[key]} now={selected.now.texts[key]} />)}
+            </div>
+          </div>
+        )}
+      </main>
+    </Shell>
   );
 }
