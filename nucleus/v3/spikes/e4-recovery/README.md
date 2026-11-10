@@ -10792,3 +10792,18 @@ failing rounds (class × count, seeds listed).
   fails — Q5a 120 < 200 (it met 200 at 6.1). Not kept. Probe, not
   evidence.
 
+- **rung 7.2** (7.1 and `value_lo` 280): wall **27.0** min/10k (raw
+  161.9 s; load 9.49 12.72 12.13; cpu 2132.4 s); Q4 1630, Q4-I 2180,
+  Q5a 170, Q7 20, Q18 4360. Changed rows vs 7.1: SZC 500→890, SZC-MW
+  50→90, SZI 180→360, Q5a 120→170, Q11 270→380, Q12 210→220, Q8
+  210→330, Q14 510→410, Q6a 1980→1790, Q6b 1260→1440. All rows
+  (per10k): Q1 8000 (hooks 680–900, all ≥ 300), Q2 4290, Q3 1300,
+  Q4 1630, Q5a 170, Q5b 6460, Q5c 4890, Q6a 1790, Q6b 1440, Q7 20,
+  Q8 330, Q9 9960, Q10 650, Q11 380, Q12 220, Q13a 860, Q13b 1000,
+  Q13c 940, Q14 410, Q15 1320, Q16 6480, Q17 9740, Q18 4360, SIZING
+  8600 misses, SZC 890, SZC-MP 0 (this file), SZC-MW 90, SZI 360.
+  Fails: none in 0..1000 (the redraw moved the failing rounds out of
+  the sample; nothing new appeared). **Rejected:** SZC 890 < 1,250 and
+  SZI 360 < 375 (SZC-MW 90 ≥ 62.5), and the hold set still fails —
+  Q5a 170 < 200. Not kept. Probe, not evidence.
+

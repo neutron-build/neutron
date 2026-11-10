@@ -288,7 +288,7 @@ impl Tuning {
         commit_ops_span: 20,
         chunked_ops_lo: 320,
         chunked_ops_span: 381,
-        value_lo: 8,
+        value_lo: 280,
         value_hi: 400,
         delete_one_in: 4,
         gc_sweeps_lo: 2,
