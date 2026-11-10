@@ -10683,3 +10683,26 @@ failing rounds (class × count, seeds listed).
   SZC-MW 30 < 50 is allowed (its ladder, step 7, is still to come).
   Not kept. Probe, not evidence.
 
+- **rung 3.2** (`drop_one_in` 1): wall **17.8** min/10k (raw 106.9 s;
+  load 6.73 9.82 9.12; cpu 1405.3 s); Q4 90, Q4-I 120, Q5a 360,
+  Q7 320, Q18 2550. Changed rows vs 3.1: Q4 1440→90, Q4-I 1570→120,
+  Q7 230→320, Q5a 300→360, Q18 4520→2550, SZC 360→230, SZC-MW 30→40,
+  SZI 90→60. All rows (per10k): Q1 7990 (hooks 680–890, all ≥ 300),
+  Q2 4250, Q3 1250, Q4 90, Q5a 360, Q5b 8510, Q5c 6810, Q6a 2220,
+  Q6b 790, Q7 320, Q8 90, Q9 13000, Q10 940, Q11 0, Q12 0, Q13a 940,
+  Q13b 960, Q13c 950, Q14 530, Q15 1080, Q16 5570, Q17 8880,
+  Q18 2550, SIZING 9460 misses, SZC 230, SZC-MP 0 (this file),
+  SZC-MW 40, SZI 60. Fails: MP ×1 (537 r0). **Rejected:** Q7 320 ≥ 250
+  and the wall passes, but the hold set fails far harder — Q4 90 and
+  Q4-I 120, both far under the owner's 1,500 bars (a no-drop-eligible
+  round is almost gone at `drop_one_in` 1, so the r41 alignment that
+  raises Q4 has nothing to align). Not kept. Probe, not evidence.
+
+- **Q7 ladder outcome: ESCALATE.** Both rungs reach Q7's required 200
+  (230, 320) and neither exceeds the wall limit, but both fail the
+  hold set (Q4 under the owner's 1,500 bar at 3.1; Q4 90 / Q4-I 120
+  at 3.2), so per the stop rule FINAL keeps the setting before the
+  ladder — the 2.0 anchor, `drop_one_in` 3, reading **Q7 190 < 200**.
+  Q7 returns to the owner with every rung's numbers (owner decision:
+  no threshold moves). Later steps still run.
+

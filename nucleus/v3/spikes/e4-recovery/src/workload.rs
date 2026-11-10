@@ -294,7 +294,7 @@ impl Tuning {
         gc_sweeps_lo: 2,
         gc_sweeps_span: 3,
         bulk_load_one_in: 4,
-        drop_one_in: 2,
+        drop_one_in: 1,
         burst_frac: 0,
         burst_gc_loops: 0,
         w11_share: 0,
