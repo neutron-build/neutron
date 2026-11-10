@@ -110,6 +110,7 @@ export const docsNavigation = [
       },
       { label: "Schemas", link: "/docs/content/schemas" },
       { label: "Markdown & MDX", link: "/docs/content/markdown-mdx" },
+      { label: "CMS", link: "/docs/content/cms" },
     ],
   },
   {

@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+cms 0.1.0 (not yet published).
+
+### Added
+
+- **`@neutron-build/cms` 0.1.0 (first publish).** A small CMS for Neutron
+  sites: posts, standalone pages, lists (photo galleries, dated events, any
+  declared fields) and one-off text fields, edited at `/n-admin`. Content is
+  declared with `defineCms` and read synchronously in loaders (`posts`,
+  `post`, `pages`, `page`, `design`, `list`, `upcoming`, `text`, `texts`,
+  `ready`). Storage is one SQLite file plus a `media/` folder in
+  `CMS_DATA_DIR` (`node:sqlite`, so Node 22.16 or later); visitors get no
+  JavaScript. The admin has a visual Markdown editor that refuses lossy round
+  trips, embeds, a media library, post versions, a 30-day trash, history and
+  restore for lists and texts, owner plus named editors with their own
+  passwords, and search. Marked elements (`data-cms-text`, `data-cms-item`,
+  `data-cms`) are edited by clicking them on the real page, and `designs`
+  gives pages with their own layout a draft and publish flow. Production
+  never creates the database: `neutron-cms init` once per volume,
+  `neutron-cms backup <file>` for a consistent copy, and `cms.ready()` for a
+  health check. Admin saves are accepted only from `SITE_URL`. Run sites with
+  `neutron-ts start`; the `docker` preset drops the route type the admin uses
+  (as of core 0.5.3). Docs: `/docs/content/cms`.
+
 ## 2026-11-05
 
 core 0.5.3, cli 0.5.3, create 0.1.12, agents 0.3.0, ai 0.1.3, auth 0.1.7,
