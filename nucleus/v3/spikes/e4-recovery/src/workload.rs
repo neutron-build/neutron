@@ -280,7 +280,7 @@ impl Tuning {
         tear_pm_table: [100, 300, 500, 700, 900],
         rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
         target_ckpt_span: 3,
-        ckpt_every_lo: 4,
+        ckpt_every_lo: 8,
         ckpt_every_span: 5,
         commit_budget_lo: 18,
         commit_budget_span: 20,

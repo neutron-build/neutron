@@ -10776,3 +10776,19 @@ failing rounds (class × count, seeds listed).
   minimum), Q11 330 and Q8 230 over theirs — and the wall passes.**
   The last kept setting is now 6.1. Probe, not evidence.
 
+- **rung 7.1** (`ckpt_every` 8–12, on 6.1): wall **25.1** min/10k (raw
+  150.4 s; load 9.83 12.47 11.78; cpu 1957.7 s); Q4 1620, Q4-I 2170,
+  Q5a 120, Q7 30, Q18 4400. Changed rows vs 6.1: SZC 620→500, SZI
+  150→180, Q5a 200→120, Q4 1810→1620, Q7 170→30, Q18 5250→4400, Q9
+  12740→10020, Q10 1140→500. All rows (per10k): Q1 8060 (hooks 680–920,
+  all ≥ 300), Q2 4350, Q3 1340, Q4 1620, Q5a 120, Q5b 6800, Q5c 5300,
+  Q6a 1980, Q6b 1260, Q7 30, Q8 210, Q9 10020, Q10 500, Q11 270,
+  Q12 210, Q13a 810, Q13b 920, Q13c 930, Q14 510, Q15 1360, Q16 6140,
+  Q17 9360, Q18 4400, SIZING 9040 misses, SZC 500, SZC-MP 10 (this
+  file), SZC-MW 50, SZI 180. Fails: MP ×2 (17 r0, 787 r0 — a redraw:
+  the knobs moved every draw; both are the same known O-3(e) MP shape
+  as the baseline's 19). **Rejected:** the ladder's rows are short
+  (SZC 500 < 1,250, SZC-MW 50 < 62.5, SZI 180 < 375) and the hold set
+  fails — Q5a 120 < 200 (it met 200 at 6.1). Not kept. Probe, not
+  evidence.
+
