@@ -1896,6 +1896,13 @@ def self_test():
     rc = cmd_compare(a)
     check("monitor-run-out-repeated", rc == 2, "rc=%d" % rc)
 
+    # OWN-DUP-ADJACENT (verdict 74f411f0 finding 5): a repeat that is
+    # not adjacent, three distinct runs so the count tie holds.
+    a.run = [eq_path, eq1_path, eq2_path]
+    a.run_out = [ok_out, ok2_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-run-out-repeated-non-adjacent", rc == 2, "rc=%d" % rc)
+
     print("SELF-TEST %d cases, %d failed" % (cases[0], len(failures)))
     return 1 if failures else 0
 
