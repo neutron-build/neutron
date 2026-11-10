@@ -1,7 +1,7 @@
 /*
   One system for every screen.
   Container: one column, --width wide, the same left edge in the header and on every page.
-    Text forms keep to --measure inside it, from that same edge.
+    Lists and text forms keep to --measure, centred under the header.
   Spacing: --s1..--s7 = 4 8 12 16 24 32 48. Type: --t-xs..--t-2xl = 12 13 14 16 20 24.
   Controls: 36 tall (40 on a phone), 32 in bars, radius 6; panels radius 10; one border colour (--rule),
     one field colour (--field), one focus ring (2px --accent).
@@ -197,7 +197,8 @@ textarea.input { display: block; min-height: 80px; resize: vertical; }
 /* Pages: one column, one left edge. */
 
 .page { padding: var(--s6) var(--edge) var(--s7); }
-:where(.page.narrow > *) { max-width: var(--measure); }
+/* Narrow pages (lists, forms) sit centred under the header. */
+.page.narrow { padding-inline: max(var(--gutter), calc((100% - var(--measure)) / 2)); }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s4); min-height: var(--control); margin-bottom: var(--s5); }
 .page-head h1 { color: var(--strong); font-size: var(--t-2xl); font-weight: 600; letter-spacing: -.015em; }
 .page-head .head-link { margin-right: calc(-1 * var(--s2)); }
