@@ -10834,3 +10834,18 @@ failing rounds (class × count, seeds listed).
   120/170/230 across the rungs against the 200 it must not fall
   below). Later steps still run. Probe, not evidence.
 
+- **rung 9.0** (`MP_PRESSURE` = the kept FINAL 6.1; read with
+  `--mp`): wall **2.9** min/2000 (raw 17.7 s; load 10.75 13.82 13.25;
+  cpu 222.2 s); SZC-MP **raw 0**, per10k 0. Other rows (per10k = raw
+  × 10, the 2,000-seed set's count, INFO here — only SZC-MP is an
+  exit row in the `mp-pressure` set): Q1 1110 (hooks 100–120), Q2 220,
+  Q3 60, Q4 240, Q4-I 70, Q5a 80, Q5b 1070, Q5c 710, Q6a 210, Q6b 140,
+  Q7 20, Q8 0 (class C only), Q9 1730, Q10 100, Q11 10, Q12 60,
+  Q13a 920, Q13b 950, Q13c 820, Q14 620, Q15 0 (MW only), Q16 860,
+  Q17 1020, Q18 220, SIZING 1980 misses, SZC 0, SZC-MW 0, SZI 0.
+  Fails: MP ×3 (30178 r0, 30528 r0, 30837 r0 — the known O-1(a)
+  MP shape). SZC-MP 0 < 125: the ladder runs. The main file's hold
+  bars (Q4/Q4-I ≥ 1,500) are unaffected by this ladder — it edits
+  `MP_PRESSURE` only, and FINAL stays the kept 6.1 (Q4 1810, Q4-I
+  2250). Probe, not evidence.
+
