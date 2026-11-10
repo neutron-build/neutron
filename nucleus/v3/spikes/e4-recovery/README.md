@@ -10747,3 +10747,17 @@ failing rounds (class × count, seeds listed).
   that met its minimum at 4.2 still does) and the wall passes.** The
   last kept setting is now 4.3. Probe, not evidence.
 
+- **rung 5.1** (`w11_share` 100, on 4.3): wall **22.8** min/10k (raw
+  136.8 s; load 6.74 11.74 11.08; cpu 1789.3 s); Q4 1810, Q4-I 2250,
+  Q5a 210, Q7 180, Q18 5240. Changed rows vs 4.3: Q11 0→270, Q8
+  130→300, Q5a 220→210, Q5b 8970→8630, Q5c 6380→6060. All rows
+  (per10k): Q1 7930 (hooks 680–850, all ≥ 300), Q2 4210, Q3 1280,
+  Q4 1810, Q5a 210, Q5b 8630, Q5c 6060, Q6a 2280, Q6b 810, Q7 180,
+  Q8 300, Q9 12760, Q10 1120, Q11 270, Q12 0, Q13a 890, Q13b 990,
+  Q13c 940, Q14 530, Q15 1150, Q16 5940, Q17 9420, Q18 5240, SIZING
+  9130 misses, SZC 580, SZC-MP 0 (this file), SZC-MW 60, SZI 160.
+  Fails: MP ×2 (178 r1, 537 r0). **Stop-and-keep: Q11 270 ≥ 125
+  (required 100 × 1.25), the hold set passes — Q4 1810 and Q4-I 2250
+  over the owner's bars, and Q5a (watched) 210 ≥ 200 — and the wall
+  passes.** The last kept setting is now 5.1. Probe, not evidence.
+

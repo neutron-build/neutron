@@ -297,7 +297,7 @@ impl Tuning {
         drop_one_in: 3,
         burst_frac: 0,
         burst_gc_loops: 0,
-        w11_share: 0,
+        w11_share: 100,
         w12_share: 0,
         r41_share: 1000,
         r41p_share: 500,
