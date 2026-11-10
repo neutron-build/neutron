@@ -4433,21 +4433,14 @@ unchanged.
   from the README's 0..1000 event list (259, 609, 719, 809, 849).
   **Every event seed's cuts differ** (259 r1: real 0 vs twin 5; 609/849
   r1: real 2 vs twin 8; 719 r1: 0 vs 7; 809 r1: 0 vs 3), so the
-  premise holds. But **G-RESEED-TWIN-CUT moves nothing observable**:
-  under the mutant (the re-seeded twin chain keeps its own `cut`) all
-  five event seeds — and the nine further named 10k event seeds (2089,
-  2599, 2669, 2859, 3449, 5049, 5739, 7179, 9059) — produce
-  byte-identical records: same digests, same rounds, same twin
-  outcomes, same defect/stopped flags. The twin's own `cut` feeds only
-  the twin round's build and its `c_prev`/`lo` bound, and at every
-  live event seed the re-seeded twin passes identically either way, so
-  no record field sees it. A digest literal cannot catch it, and the
-  direct unit form does not exist: the re-seed block is inline in
-  `run_seed_with` (no function to unit-call), and extracting one is an
-  `src/` change Work 3 forbids. **G-RESEED-TWIN-CUT: UNCAUGHT at this
-  tip, inert on every measurable event seed** — reported, not hidden.
-  No new literal row was added (Limit 2 allows one; there is nothing
-  for it to pin). ESCALATE item 2.
+  premise holds. **Corrected by the rework (verdict `74f411f0` finding
+  1):** the first attempt tried 14 event seeds, saw no record move and
+  called the mutant untestable. That was wrong. The 10k has 36 event
+  seeds at BASE and the mutant moves two: 6209 (`2438621228 ->
+  870698661`) and 6849 (`3952923334 -> 1958644185`). The pin is the
+  new X5-R37 row `(6849, 3952923334)`; no existing literal moved.
+  G-RESEED-TWIN-CUT fails `x5_r37_base_tuning_reproduces_1b0ce54e` at
+  seed 6849.
 
 **Step 4 — the comparator's seven cases, the repeated-`.out` refusal
 and its README corrections (item 4).**
@@ -4573,6 +4566,41 @@ proving the install ran).
 | **M-LATECOPY-ATONLY** (the guard tests only `Img::At`) | 101 | `late_copy_in_the_gap_drops_for_a_gated_touch` (image 2's B reads `{1}` — key 2 lost) and `freed_lpids_late_copy_never_remaps`; passes the eviction-arm pin |
 | **G-GUARD-ABSENT-OK** (an absent entry installs) | 101 | the same two as M-LATECOPY-ATONLY; passes the eviction-arm pin |
 
+**Rework (verdict `74f411f0`).** The P gate returned REWORK; every
+digest held (0 of 10000 BASE records differ). R1 landed the cut
+literal: the new X5-R37 row `(6849, 3952923334)` with its doc
+paragraph, green on the real code, and G-RESEED-TWIN-CUT shown on a
+scratch export of this commit failing
+`x5_r37_base_tuning_reproduces_1b0ce54e` at seed 6849 (`3952923334`
+against the mutant's `1958644185`, rc 101). R2 corrected
+the stale text: the `twin_joint_stale_reads` doc and the inline
+comment at the diagnostic (comment lines only in `src/` — `git diff
+74f411f0 -- spikes/e4-recovery/src/` checked), `r48_repaired`'s doc
+paragraph and its two assertion messages (the first re-derived spec
+`Mid2@3`, not the joint spec), and `r48_joint`'s doc tail (P ruling
+G5-CENSUS); no compared value changed, both `r48` tests green. R3
+added the non-adjacent repeated `--run-out` self-test case (beside
+`monitor-run-out-repeated`; `SELF-TEST 86 cases, 0 failed`), and
+OWN-DUP-ADJACENT on a scratch copy of the script fails exactly it
+(rc 0 under the mutant, the adjacent case still green). No census, no
+seed search, no campaign; no token of `src/` code changed from
+`74f411f0`.
+
+### P ruling G5-CENSUS (nv3-PINS-G5-ruling-1, 2026-11-09; binding; copy this block verbatim into the README in R4)
+- **(a) Accepted at this tip.** G5-R48-TREADS-KEPT has no must-fail case at this tip. No seed of 0..9999 reaches the R21 (c) joint arm at BASE or at S1 (verdict `74f411f0` finding 2), so on those seeds the mutant and the real code execute the same instructions. Forcing the arm needs a seam Limit 1 forbids. `twin_joint_arm`, `twin_joint_stale_reads` and the tripwire in `r48_joint_supply_is_fresh_at_7469` stay and are accepted as the whole of item 2's pin.
+- **(b) Why it cannot simply be dropped.** The mutant's direction is a false pass: a stale read in the twin's supply can only suppress an oracle failure. So the arm's liveness must be read on the runs that are judged.
+- **(c) The census is read from the judged runs, not run beside them.** A separate 0..9999 loop is not enough: S1 is not all of F4's knobs, any retune would stale it, and it would miss two of the three judged sets. Those two cannot be censused ahead of the run, because F4's REFRESH 9 says no probe, gate or diagnosis runs a seed in `10000..30000` before the final run. Therefore F4's driver, in `run`, for each of `--set main`, `held-out` and `mp-pressure`, prints exactly one stdout line, computed in memory from the `SeedRec`s that process executed:
+  `JOINT_ARM_CENSUS set=<set> seeds=<n> arm_rounds=<n> stale_reads=<n> arm_seeds=[<ascending seeds>]`
+  `seeds` is the count of seeds run by that process. `arm_rounds` counts true entries of `twin_joint_arm`. `stale_reads` sums `twin_joint_stale_reads`. The two fields stay unserialized and never digest inputs. The line does not change `verify`'s or `run`'s exit rules (REFRESH 9's list stands).
+- **(d) The result is checked, and it fails closed.** F4's Acceptance gains one line per set, before `scripts/gate.sh`, with `F` that set's run `.out` of record and `<set>`/`<n>` being `main`/`10000`, `held-out`/`10000`, `mp-pressure`/`2000`: `test "$(grep -c '^JOINT_ARM_CENSUS ' F)" = 1 && grep -Eq '^JOINT_ARM_CENSUS set=<set> seeds=<n> arm_rounds=0 stale_reads=0 arm_seeds=\[\]$' F`. The P gate and the E4 judgement read all three lines. A census line from any file other than the run of record counts for nothing.
+- **(e) What each reading means.** A failing line in (d) is a STOP. The worker does not retune, re-run, change code, widen a pattern or edit the line. It commits the three census lines to the README and ESCALATEs. A retune aimed at removing a live arm is forbidden.
+  1. **All three read `arm_rounds=0 stale_reads=0`:** G5 stays closed for this FINAL. The README records the three lines. Any later change to FINAL or MP_PRESSURE voids them with the run they came from.
+  2. **`arm_rounds > 0`, `stale_reads=0` (a live seed):** the mutant has become killable and a pin is **required**. E4 is not judged until it lands. P writes a test-only follow-up card: a literal pin at the lowest `arm_seeds` entry of the first set that has one (main, then held-out, then mp-pressure), at that set's tuning, asserting the arm ran and zero stale reads, with G5-R48-TREADS-KEPT back as a must-fail row showing a non-zero stale count. If every live seed reads zero stale reads under the mutant, P rules on those numbers. The pin moves no digest, so the run of record stands once the pin passes its gate; those rounds ran with a fresh supply.
+  3. **`stale_reads > 0`:** a defect, whatever `arm_rounds` reads. The named rounds' oracle ran on a stale supply and could have false-passed. STOP; that run is void as E4 evidence until P rules.
+  4. **Line missing, repeated, malformed, or `seeds` short of the set:** cannot-check. It is a STOP and is never read as zero.
+- **(f) The tripwire is the same rule at BASE.** If the arm assertion in `r48_joint_supply_is_fresh_at_7469` fails on any later card, the arm is live at 7469: STOP and ESCALATE to P. Do not delete or invert the assertion. The required pin in (e) 2 applies, at BASE.
+- **(g) Carried to F4.** Paragraphs (b)–(f) go into X-5c-F4's REFRESH, and `Touch only` there must cover the driver file that prints the line. That is P's or the orchestrator's edit, not this card's. This card implements none of (c)–(e).
+
 ## RESULT (card X-5c-PINS-1)
 
 card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chain 5a0f3ed5 → b57ca484 → 78225b95 → 249111aa → a2be7919 → 02d58b89 → f21d68f9 → fd8bf4eb → here)
@@ -4586,9 +4614,9 @@ card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chai
    |---|---|
    | GX-RUPF-NORESET (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | `x5_r42_second_window_reuse_pf_starts_at_zero` |
    | GX-R50-NOSELECT (`r41p` loses `r41 &&`) | `x5_r50_ineligible_rounds_draw_nothing` (the uniform literal 13) |
-   | G5-R48-TREADS-KEPT (drop `treads.clear()`) | **UNCAUGHT at this tip** — inert: no measurable seed reaches the joint arm (step 2's census); the tripwire in `r48_joint_supply_is_fresh_at_7469` revives the catch the day one does. ESCALATE 1 |
+   | G5-R48-TREADS-KEPT (drop `treads.clear()`) | no must-fail case at this tip: P ruling G5-CENSUS (no seed of 0..9999 reaches the joint arm; F4's judged runs carry the census) |
    | G-PRED-LEN-ONLY (the predicate compares key counts only) | `x5r52_twin_dirs_differ_compares_directory_keys` (the equal-size case) |
-   | G-RESEED-TWIN-CUT (the re-seeded twin keeps its own `cut`) | **UNCAUGHT at this tip** — inert on every measurable event seed (step 3's measurement); no digest and no record field moves. ESCALATE 2 |
+   | G-RESEED-TWIN-CUT (the re-seeded twin keeps its own `cut`) | `x5_r37_base_tuning_reproduces_1b0ce54e` (seed 6849, `3952923334 -> 1958644185`) |
    | G-MON-FIRSTLINE | `monitor-later-line-counts` |
    | G-MON-FIRSTFILE | `monitor-last-file-counts` |
    | G-MON-EMPTY-OK | `monitor-empty-run-out` |
@@ -4596,10 +4624,11 @@ card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chai
    | G-MON-MAX | `monitor-sums-not-max` |
    | G-TIE-ONE-WAY | `monitor-more-run-outs-than-runs` |
    | M-MON-DUP-OUT (the repeated-path refusal removed) | `monitor-run-out-repeated` |
+   | OWN-DUP-ADJACENT (only the first two `--run-out` paths compared) | `monitor-run-out-repeated-non-adjacent` |
    | G1-HEADER-WINDOW (`pos + 24` for `pos + (*len).max(24)`) | `r47_record_completed_by_a_later_write` |
    | G-GUARD-EVICT-AT (the guard lets `Img::At(r)` with `cur == r` install) | `late_copy_after_previous_epoch_eviction_drops` |
    | M-LATECOPY-ATONLY / G-GUARD-ABSENT-OK | `late_copy_in_the_gap_drops_for_a_gated_touch` (and `freed_lpids_late_copy_never_remaps`, unchanged) |
-   | verdict `db1e5162`'s caught rows, re-applied | their cases there, unchanged — the 85-case self-test is green and none of its 78 prior case names or verdicts moved |
+   | verdict `db1e5162`'s caught rows, re-applied | their cases there, unchanged — the 86-case self-test is green and none of its 78 prior case names or verdicts moved |
 
 2. **The re-read** (the Acceptance line, run for real; ref sha256
    `41c307a4…1cd2`, run sha256 `158ce549…a69b`, both verified by the
@@ -4624,19 +4653,14 @@ card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chai
    NEW_FAILING 0 [] BAD_SEEDS 0 []
    ```
 
-3. **Item 3's cut pin used neither form.** The literal form was
-   attempted first exactly as prescribed: the committed diag patch on
-   a scratch export plus a scratch-only `RESEEDCUT` cut print, single
-   seeds from the README's 0..1000 event list. Every event seed's cuts
-   differ at the event (259 r1: 0 vs 5; 609/849: 2 vs 8; 719: 0 vs 7;
-   809: 0 vs 3), so a literal seed existed — but under
-   G-RESEED-TWIN-CUT no digest and no record field moves on any of the
-   five, nor on the nine further named 10k event seeds (2089, 2599,
-   2669, 2859, 3449, 5049, 5739, 7179, 9059): byte-identical records
-   both ways. The direct unit form does not exist — the re-seed block
-   is inline in `run_seed_with`, and extracting it is an `src/` change
-   Work 3 forbids. No new literal row was added (nothing for it to
-   pin); no existing literal changed.
+3. **Item 3's cut pin used the literal form (corrected by the rework,
+   verdict `74f411f0` finding 1).** Seed 6849, class MW. The event: at
+   round 1 the twin directory re-seed fires with real `cut` 0 and twin
+   `cut` 5. The new row is `(6849, 3952923334)` in
+   `x5_r37_base_tuning_reproduces_1b0ce54e`; no existing literal
+   changed. G-RESEED-TWIN-CUT moves the digest to `1958644185` and
+   fails that test. The seed comes from the gate's run over all 36 BASE
+   event seeds, which the first attempt's 14 did not cover.
 4. **No rule text changed:** X5-R51, X5-R52 and X5-R53 verbatim; no
    tuning, quota, threshold, literal or exemption moved (`Tuning::BASE`
    and `Tuning::FINAL` untouched; the X5-R37 literals stand byte for
@@ -4652,7 +4676,7 @@ acceptance (every line run for real): `cargo test -q --release -p
 e4-recovery` — **281 tests, 0 failed** (18+25+44+55+28+54+57 across the
 binaries; 276 at the Base + this card's 5 new pins);
 `python3 -I spikes/e4-recovery/tools/x5r52_compare.py self-test` —
-**85 cases, 0 failed**, exit 0; the re-read line — **exit 0, the
+**86 cases, 0 failed**, exit 0; the re-read line — **exit 0, the
 reading above, byte-identical**; `bash scripts/gate.sh` — the gate
 note beneath.
 
@@ -4686,8 +4710,9 @@ stated in the pin's doc and step 6's record); the two new store pins
 use a 200_000 park budget (the 900_000 of the older pins, multiplied
 by the extra spinning, trips X5-R13 (b)'s 1_000_000 `YIELD_BUDGET`).
 
-ESCALATE: two items, both "the card's premise has drifted at the chain
-head; no code defect found".
+ESCALATE: one item; the card's premise has drifted at the chain head;
+no code defect found. Item 2 (G-RESEED-TWIN-CUT) is withdrawn: verdict
+`74f411f0` finding 1 showed it false.
 
 1. **The R21 (c) joint arm has no live seed at this tip, so
    G5-R48-TREADS-KEPT is uncatchable.** The card (and verdict
@@ -4703,15 +4728,8 @@ head; no code defect found".
    renumbering and the twin directory re-seed, both after the CXX
    census. The diagnostic and the tripwire pin are in place; the
    day any seed reaches the arm again, the freshness assertion is
-   what the mutant must fail.
-2. **G-RESEED-TWIN-CUT is behaviourally inert on every measurable
-   event seed.** The premise (cuts differ at the event) holds — all
-   five 0..1000 event seeds differ — but keeping the twin's `cut`
-   moves no record anywhere measurable (step 3's table). A digest
-   literal cannot catch it and the direct unit form needs an `src/`
-   extraction Work 3 forbids. The shipped code takes the real chain's
-   `cut` (confirmed by reading); the mutant is reported UNCAUGHT
-   rather than pinned by a vacuous literal.
+   what the mutant must fail. **Ruled: P ruling G5-CENSUS, in this
+   card's record.**
 
 anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
 Read-only file system` line from the host's git maintenance on every
