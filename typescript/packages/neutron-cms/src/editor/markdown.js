@@ -3,11 +3,15 @@
 // written back exactly as it came in.
 import { MarkdownSerializer, MarkdownSerializerState, defaultMarkdownSerializer as base } from "prosemirror-markdown";
 import { schema } from "./schema.js";
+import { isEmbed } from "./embed.js";
 
 class Unsupported extends Error {}
 
 const hasHtml = (tokens = []) => tokens.some((token) => token.type === "html" || hasHtml(token.tokens));
-const raw = (source) => schema.nodes.raw.create({ source: source.replace(/\n+$/, "") });
+const raw = (text) => {
+  const source = text.replace(/\n+$/, "");
+  return schema.nodes[isEmbed(source) ? "embed" : "raw"].create({ source });
+};
 
 function inline(tokens, decode, marks = []) {
   const out = [];
@@ -106,6 +110,10 @@ const serializer = new MarkdownSerializer(
   {
     ...base.nodes,
     raw(state, node) {
+      state.write(node.attrs.source);
+      state.closeBlock(node);
+    },
+    embed(state, node) {
       state.write(node.attrs.source);
       state.closeBlock(node);
     },

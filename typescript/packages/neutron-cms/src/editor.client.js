@@ -3,7 +3,7 @@
 import { EditorState, NodeSelection, Plugin, TextSelection } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { keymap } from "prosemirror-keymap";
-import { history, undo, redo } from "prosemirror-history";
+import { closeHistory, history, undo, redo } from "prosemirror-history";
 import { baseKeymap, chainCommands, exitCode, lift, setBlockType, toggleMark, wrapIn } from "prosemirror-commands";
 import { InputRule, inputRules, textblockTypeInputRule, wrappingInputRule } from "prosemirror-inputrules";
 import { liftListItem, sinkListItem, splitListItem, wrapInList } from "prosemirror-schema-list";
@@ -12,6 +12,7 @@ import { gapCursor } from "prosemirror-gapcursor";
 import { Marked } from "marked";
 import { isSafeUrl, schema } from "./editor/schema.js";
 import { fromMarkdown, toMarkdown } from "./editor/markdown.js";
+import { embedFrom, iframeAttributes, providerEmbed } from "./editor/embed.js";
 
 const { nodes, marks } = schema;
 
@@ -74,7 +75,7 @@ function start(body) {
       view = new EditorView(host, {
         state: stateFor(doc),
         attributes: () => ({ class: `prose${isEmpty(view?.state.doc) ? " empty" : ""}`, "aria-label": "Body", "data-placeholder": "Start writing, or paste an image" }),
-        nodeViews: { image: (node, v, getPos) => new ImageView(node, v, getPos), raw: (node, v, getPos) => new RawView(node, v, getPos) },
+        nodeViews: { image: (node, v, getPos) => new ImageView(node, v, getPos), raw: (node, v, getPos) => new RawView(node, v, getPos), embed: (node) => new EmbedView(node) },
         dispatchTransaction(tr) {
           const next = view.state.apply(tr);
           view.updateState(next);
@@ -183,6 +184,57 @@ function start(body) {
     v.dispatch(tr.scrollIntoView());
   }
 
+  // Embeds: from the Embed button, or a player link pasted alone on an empty line.
+
+  /** Puts an embed on an empty line, or after the block the cursor is in; `line` replaces that line. */
+  function placeEmbed(v, source, line = false) {
+    const { state: s } = v;
+    const { $from } = s.selection;
+    const embed = nodes.embed.create({ source });
+    const emptyLine = line || ($from.depth === 1 && $from.parent.type === nodes.paragraph && $from.parent.content.size === 0);
+    const from = emptyLine ? $from.before() : $from.depth > 0 ? $from.after(1) : s.selection.to;
+    const to = emptyLine ? $from.after() : from;
+    // Room to keep writing after an embed at the end.
+    const content = to === s.doc.content.size ? [embed, nodes.paragraph.create()] : [embed];
+    const tr = s.tr.replaceWith(from, to, content);
+    return tr.setSelection(NodeSelection.create(tr.doc, from)).scrollIntoView();
+  }
+
+  async function addEmbed() {
+    const source = await askEmbed();
+    if (!source) return;
+    if (view && body.dataset.visual) {
+      view.dispatch(placeEmbed(view, source));
+      view.focus();
+      panel.update(view);
+      return;
+    }
+    const at = body.selectionStart;
+    const text = `${at > 0 && body.value[at - 1] !== "\n" ? "\n\n" : ""}${source}\n\n`;
+    body.focus();
+    body.setSelectionRange(at, body.selectionEnd);
+    if (!document.execCommand("insertText", false, text)) {
+      body.setRangeText(text, at, body.selectionEnd, "end");
+      body.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  document.querySelector("[data-add-embed]")?.addEventListener("click", addEmbed);
+  // On a phone one Add button stands for both, to keep the bar on one line.
+  document.querySelector("[data-add-menu]")?.addEventListener("click", async () => {
+    const choice = await ask("Add", (form, done) => {
+      form.innerHTML = '<div class="ask-choices"><button class="button" type="button" value="image">Image</button><button class="button" type="button" value="embed">Embed</button></div><div class="chooser-head"><span></span><button class="link" type="button">Cancel</button></div>';
+      form.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (!button) return;
+        done(button.value || null);
+        // Still inside the tap, so the file picker may open.
+        if (button.value === "image") document.querySelector("[data-add-image]").click();
+      });
+    });
+    if (choice === "embed") addEmbed();
+  });
+
   function insertImages(v, files, at) {
     for (const file of files) {
       const local = URL.createObjectURL(file);
@@ -227,7 +279,17 @@ function start(body) {
       return true;
     }
     const text = event.clipboardData?.getData("text/plain").trim() ?? "";
-    const { from, to, empty } = v.state.selection;
+    const { from, to, empty, $from } = v.state.selection;
+    // A player link or embed code alone on an empty line becomes the embed. The paste itself is one
+    // step and the embed another, so Undo, or Keep as link, leaves the link as typed text.
+    const player = empty && $from.depth === 1 && $from.parent.type === nodes.paragraph && $from.parent.content.size === 0 ? embedFrom(text) : null;
+    if (player) {
+      v.dispatch(v.state.tr.insertText(text));
+      v.dispatch(closeHistory(placeEmbed(v, player, true)));
+      panel.pasted = providerEmbed(text) ? v.state.selection.from : null;
+      panel.update(v);
+      return true;
+    }
     if (!empty && /^(https?:\/\/|mailto:)\S+$/.test(text) && isSafeUrl(text)) {
       v.dispatch(v.state.tr.addMark(from, to, marks.link.create({ href: text })));
       return true;
@@ -404,6 +466,7 @@ class Panel {
     this.el.hidden = true;
     this.visible = false;
     this.mode = null;
+    this.pasted = null;
   }
 
   update(view) {
@@ -412,7 +475,9 @@ class Panel {
     if (!view.hasFocus() && !this.el.contains(document.activeElement)) return this.hide();
     const { state } = view;
     const sel = state.selection;
+    if (!(sel instanceof NodeSelection && sel.from === this.pasted)) this.pasted = null;
     if (sel instanceof NodeSelection && sel.node.type === nodes.image) return this.showImage(sel);
+    if (sel instanceof NodeSelection && sel.node.type === nodes.embed) return this.showEmbed(sel);
     if (!sel.empty && !(sel instanceof NodeSelection)) return this.showFormat();
     const link = sel.empty ? linkAt(state) : null;
     if (link) return this.showLink(link);
@@ -468,6 +533,25 @@ class Panel {
       this.button("bullets", "Bulleted list", inside(state, nodes.bullet_list), () => this.run(listToggle(nodes.bullet_list))),
       this.button("numbers", "Numbered list", inside(state, nodes.ordered_list), () => this.run(listToggle(nodes.ordered_list))),
     ], "format");
+  }
+
+  showEmbed(sel) {
+    const pos = sel.from;
+    const buttons = [
+      this.button("", "Edit code", false, () => {
+        const { view } = this;
+        view.dispatch(view.state.tr.setNodeMarkup(pos, nodes.raw));
+        this.hide();
+        view.nodeDOM(pos)?.querySelector("textarea")?.focus();
+      }),
+      this.button("", "Remove", false, () => this.run((state, dispatch) => {
+        dispatch(state.tr.delete(pos, pos + 1));
+        return true;
+      })),
+    ];
+    // Right after a pasted link, it can go back to being the link.
+    if (this.pasted === pos) buttons.unshift(this.button("", "Keep as link", false, () => this.run(undo)));
+    this.render(buttons, "embed");
   }
 
   showLink(link) {
@@ -579,7 +663,7 @@ class Panel {
     const bar = 56 + 8;
     const isImage = this.mode === "image";
     let top = isImage ? rect.bottom - box.height - 12 : rect.top - box.height - 8;
-    if (!isImage && top < bar) top = rect.bottom + 8;
+    if (!isImage && top < bar) top = Math.min(rect.bottom + 8, innerHeight - box.height - 8);
     if (isImage && top < bar) top = Math.min(innerHeight - box.height - 8, bar);
     const centre = (rect.left + rect.right) / 2;
     const left = Math.max(8, Math.min(innerWidth - box.width - 8, centre - box.width / 2));
@@ -715,6 +799,103 @@ class RawView {
     return true;
   }
 }
+
+// A player, shown live and at its own height. The bar above it is what selects, drags and removes it.
+
+const MAX_EMBED = 640;
+
+class EmbedView {
+  constructor(node) {
+    this.dom = Object.assign(document.createElement("div"), { className: "embed", contentEditable: "false" });
+    this.bar = Object.assign(document.createElement("div"), { className: "embed-bar" });
+    this.dom.append(this.bar);
+    this.update(node);
+  }
+
+  update(node) {
+    if (node.type !== nodes.embed) return false;
+    if (node.attrs.source === this.source) return true;
+    this.source = node.attrs.source;
+    const a = iframeAttributes(this.source) ?? {};
+    const src = (a.src ?? "").replace(/&amp;/g, "&");
+    const frame = document.createElement("iframe");
+    // Only what a player needs, and never the top of the admin.
+    frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-presentation");
+    for (const name of ["title", "allow", "referrerpolicy"]) if (a[name]) frame.setAttribute(name, a[name]);
+    if ("allowfullscreen" in a) frame.allowFullscreen = true;
+    frame.src = src;
+    const px = (value) => (/^\d+(px)?$/.test(value ?? "") ? parseInt(value, 10) : 0);
+    const ratio = /aspect-ratio:\s*([\d.]+)\s*\/\s*([\d.]+)/.exec(a.style ?? "");
+    if (px(a.width) && px(a.height)) frame.style.aspectRatio = `${px(a.width)} / ${px(a.height)}`;
+    else if (px(a.height)) frame.style.height = `${Math.min(px(a.height), MAX_EMBED)}px`;
+    else frame.style.aspectRatio = ratio ? `${ratio[1]} / ${ratio[2]}` : "16 / 9";
+    frame.style.maxHeight = `${MAX_EMBED}px`;
+    let host = "";
+    try { host = new URL(src).hostname.replace(/^(www|open|player)\./, ""); } catch {}
+    this.bar.textContent = `Embed${host ? `, ${host}` : ""}`;
+    this.frame?.remove();
+    this.frame = frame;
+    this.dom.append(frame);
+    return true;
+  }
+
+  selectNode() {
+    this.dom.classList.add("selected");
+  }
+
+  deselectNode() {
+    this.dom.classList.remove("selected");
+  }
+
+  ignoreMutation() {
+    return true;
+  }
+}
+
+/** A small dialog. `fill` builds its form and calls `done(value)` to close it. */
+function ask(label, fill) {
+  return new Promise((resolve) => {
+    const dialog = Object.assign(document.createElement("dialog"), { className: "chooser ask" });
+    dialog.setAttribute("aria-label", label);
+    const form = document.createElement("form");
+    dialog.append(form);
+    let result = null;
+    const done = (value) => {
+      result = value;
+      dialog.close();
+    };
+    fill(form, done);
+    dialog.addEventListener("click", (event) => { if (event.target === dialog) done(null); });
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      resolve(result);
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+/** Asks for a link or embed code, and resolves to the iframe to add, or null. */
+const askEmbed = () => ask("Embed", (form, done) => {
+  form.innerHTML = '<label class="field"><span>Link or embed code</span><textarea class="input" rows="3" spellcheck="false" autocapitalize="off"></textarea><small>A YouTube, Vimeo or Spotify link, or an iframe from another site.</small></label><p class="error" role="alert" hidden></p><div class="chooser-head"><button class="button primary" type="submit">Embed</button><button class="link" type="button">Cancel</button></div>';
+  const [area, error] = [form.querySelector("textarea"), form.querySelector(".error")];
+  area.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  area.addEventListener("input", () => { error.hidden = true; });
+  form.querySelector(".link").addEventListener("click", () => done(null));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const source = embedFrom(area.value);
+    if (source) return done(source);
+    error.textContent = "Use a YouTube, Vimeo or Spotify link, or one <iframe> with an https address.";
+    error.hidden = false;
+  });
+  setTimeout(() => area.focus());
+});
 
 const body = document.querySelector("[data-editor] [name=body]");
 if (body) start(body);

@@ -232,6 +232,10 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 .prose .raw.selected { border-color: var(--accent); }
 .raw-label { position: absolute; top: 6px; left: 14px; color: var(--muted); font: 600 11px/16px var(--sans); letter-spacing: .04em; text-transform: uppercase; }
 .raw textarea { display: block; width: 100%; padding: 0; overflow: hidden; resize: none; background: none; border: 0; outline: 0; color: var(--ink); font: 13px/1.6 var(--mono); white-space: pre-wrap; }
+.prose .embed { overflow: hidden; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
+.prose .embed.selected { border-color: var(--accent); outline: 1px solid var(--accent); }
+.embed-bar { padding: 6px 14px; color: var(--muted); font: 600 11px/16px var(--sans); letter-spacing: .04em; text-transform: uppercase; cursor: grab; user-select: none; }
+.embed iframe { display: block; width: 100%; border: 0; background: var(--bg); }
 
 .float-panel {
   position: fixed;
@@ -275,6 +279,7 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 
 .editor[data-meta-open] .meta { display: grid; }
 .on-phone { display: none; }
+.editor-top .phone-add { display: none; }
 
 .meta [data-toggle-markdown] { justify-self: start; }
 .meta footer { display: flex; flex-wrap: wrap; gap: 16px; padding-top: 12px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 13px; }
@@ -365,6 +370,8 @@ a.button { color: inherit; text-decoration: none; }
   .edit-top .state { display: inline; margin-left: 0; }
   .on-wide { display: none; }
   .on-phone { display: inline; }
+  .editor-top .wide-add { display: none; }
+  .editor-top .phone-add { display: inline-flex; }
   .meta { width: 100vw; border-left: 0; }
   .posts tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
   .posts td { border-top: 0; }
@@ -459,6 +466,11 @@ a.button { color: inherit; text-decoration: none; }
 .chooser-grid button { padding: 0; background: var(--surface); border: 0; border-radius: 6px; }
 .chooser-grid button:hover img { opacity: .85; }
 .chooser-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }
+.chooser.ask[open] { grid-template-rows: auto; }
+.ask form { display: grid; gap: 12px; }
+.ask textarea.input { min-height: 0; font: 13px/1.5 var(--mono); }
+.ask-choices { display: flex; gap: 8px; }
+.ask-choices .button { flex: 1; }
 
 /* Account and people */
 .account-who { margin-bottom: 24px; }

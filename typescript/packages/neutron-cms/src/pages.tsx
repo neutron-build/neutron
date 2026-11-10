@@ -347,7 +347,9 @@ export function EditorPage(props: {
         <span class={`status ${status}`}>{STATUS_LABEL[status]}</span>
         <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
         <span class="spacer" />
-        <button class="button quiet" type="button" data-add-image aria-label="Add image"><span class="on-wide">Add image</span><span class="on-phone">Image</span></button>
+        <button class="button quiet wide-add" type="button" data-add-image>Add image</button>
+        <button class="button quiet wide-add" type="button" data-add-embed>Embed</button>
+        <button class="button quiet phone-add" type="button" data-add-menu>Add</button>
         <button class="button quiet" type="button" data-toggle-meta aria-expanded={error ? "true" : "false"} aria-controls="post-settings">Settings</button>
         <button class="button" type="button" data-toggle-preview aria-pressed="false">Preview</button>
         {status !== "draft" ? (

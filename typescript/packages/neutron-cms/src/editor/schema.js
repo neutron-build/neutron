@@ -54,6 +54,15 @@ export const schema = new Schema({
       selectable: true,
       toDOM: (node) => ["pre", { class: "raw" }, node.attrs.source],
     },
+    // A raw block that is one https iframe, shown as itself. Written back exactly as it came in, like raw.
+    embed: {
+      attrs: { source: {} },
+      group: "block",
+      atom: true,
+      selectable: true,
+      draggable: true,
+      toDOM: (node) => ["pre", { class: "raw" }, node.attrs.source],
+    },
     text: { group: "inline" },
     image: {
       attrs: { src: {}, alt: { default: "" }, title: { default: null } },
