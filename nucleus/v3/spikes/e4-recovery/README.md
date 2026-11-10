@@ -10637,3 +10637,33 @@ loops and no `scripts/gate.sh` in the attempt; no seed in
 `10000..30000`, ever; no seed filtering. Probe output and mutant
 copies go under `$CARGO_TARGET_DIR/x5f3-scratch/`; each mutant gets
 its own scratch export and its own target directory.
+
+### X-5c-F4-F3 probe rows
+
+One row per rung tried, in walk order (the ladder above is committed
+before the first of them). Every number is a **probe, not evidence**:
+`per10k` = raw × 10 over the 0..1000 sample (for `--mp`, the 200-seed
+sample, the count of the 2,000-seed judged set). "all rows" carries
+every quota row's per10k so each hold-set decision below can be
+re-derived. Wall is the five blocks' summed wall (minutes per 10k =
+raw_s/6); cpu is their summed user+sys; fails are the pass-fold
+failing rounds (class × count, seeds listed).
+
+- **rung 2.0 — the S1 anchor** (FINAL = S1: `r41_share` 1000,
+  `r41p_share` 500; nothing else): wall **21.7** min/10k (raw 130.2 s;
+  load 2.59 6.93 7.85; cpu 1698.7 s); Q4 1860, Q4-I 2160, Q5a 250,
+  Q7 190, Q18 5270. Changed rows (from BASE's whole-file numbers,
+  which are not this file's sample): Q4 186→1860, Q4-I 216→2160,
+  Q18 527→5270, SZC 53→530. All rows (per10k): Q1 7950 (per hook
+  680–850, all 10 hooks ≥ 300), Q2 4220, Q3 1260, Q4 1860, Q5a 250,
+  Q5b 8860, Q5c 6290, Q6a 2230, Q6b 810, Q7 190, Q8 40, Q9 12550,
+  Q10 1070, Q11 0, Q12 0, Q13a 870, Q13b 930, Q13c 940, Q14 550,
+  Q15 1140, Q16 5880, Q17 9370, Q18 5270, SIZING 9200 misses, SZC
+  530, SZC-MP 0 (this file), SZC-MW 60, SZI 130. Fails: MP ×2 (178
+  r1, 537 r0 — the two known E4-SILENT-1 baseline rounds in range).
+  Hold set at 2.0: Q4 1860 ≥ 1500 ✓, Q4-I 2160 ≥ 1500 ✓; rows met at
+  this setting (Q1 all hooks, Q2, Q3, Q4, Q4-I, Q5a/b/c, Q6a/b, Q9,
+  Q10, Q13a/b/c, Q14, Q15, Q16, Q17, Q18, SZC-MW); rows short with a
+  ladder still to come: Q7, Q8, Q11, Q12, SZC, SZI (and SZC-MP, judged
+  on the MP probe). Probe, not evidence.
+
