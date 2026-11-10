@@ -728,8 +728,53 @@ fn cmd_run(args: &[String]) -> i32 {
         }
         println!("PROBE_QUOTA Q4-I {}", q4i_count(&recs));
     }
+    // **Card step 3 (P ruling G5-CENSUS (c)): the census line** — one
+    // stdout line per `--set` run, immediately before the final
+    // `E4 SEEDS=` line, computed in memory from the `SeedRec`s this
+    // process executed. It changes no exit rule, and the two census
+    // fields stay unserialized and never digest inputs.
+    if let Some(set) = set_of_record {
+        println!("{}", joint_arm_census_line(set, &recs));
+    }
     print_final_line(&recs);
     0
+}
+
+/// **P ruling G5-CENSUS (c), in `cmd_run` (card X-5c-F4-F2 step 3): the
+/// `JOINT_ARM_CENSUS` line** — `seeds` counts the records this process
+/// executed, `arm_rounds` counts true entries of `twin_joint_arm`,
+/// `stale_reads` sums `twin_joint_stale_reads`, and `arm_seeds` is
+/// ascending, comma-separated and empty as `[]`. Pure in
+/// `(set, &[SeedRec])`; it changes no exit rule, and the two census
+/// fields stay unserialized and never digest inputs (X-5c-PINS-1's
+/// Limit: G5-CENSUS (d)'s Acceptance line greps this exact form).
+pub fn joint_arm_census_line(set: CampaignSet, recs: &[SeedRec]) -> String {
+    let seeds = recs.len() as u64;
+    let arm_rounds = recs
+        .iter()
+        .flat_map(|r| r.twin_joint_arm.iter())
+        .filter(|x| **x)
+        .count() as u64;
+    let stale_reads = recs
+        .iter()
+        .flat_map(|r| r.twin_joint_stale_reads.iter())
+        .sum::<usize>() as u64;
+    let mut arm_seeds: Vec<u64> = recs
+        .iter()
+        .filter(|r| r.twin_joint_arm.iter().any(|x| *x))
+        .map(|r| r.seed)
+        .collect();
+    arm_seeds.sort_unstable();
+    let list = arm_seeds
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "JOINT_ARM_CENSUS set={} seeds={seeds} arm_rounds={arm_rounds} \
+         stale_reads={stale_reads} arm_seeds=[{list}]",
+        set.name()
+    )
 }
 
 /// Retires a watchdog on drop (the command's own writes are about to

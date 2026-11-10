@@ -3764,3 +3764,70 @@ fn x5_r44_probe_forms_seed_lists_and_refusals() {
         assert_eq!(campaign::main(&full), 2, "the refusal exits 2: {args:?}");
     }
 }
+
+// ---- card X-5c-F4-F2 step 3: the JOINT_ARM_CENSUS (P ruling G5-CENSUS (c)) ----
+
+/// A record with per-round census fields (`twin_joint_arm`,
+/// `twin_joint_stale_reads`), one entry per executed round.
+fn census_rec(seed: u64, arms: Vec<bool>, stale: Vec<usize>) -> workload::SeedRec {
+    workload::SeedRec {
+        seed,
+        twin_joint_arm: arms,
+        twin_joint_stale_reads: stale,
+        ..workload::SeedRec::default()
+    }
+}
+
+/// **G5-CENSUS (c) pins (card step 3), on literal record sets.** The
+/// line is pure in `(set, &[SeedRec])`: `seeds` counts the records
+/// (never the set's requested count — **M-CENSUS-NOTFROMRUN** reverts
+/// this), `arm_rounds` counts true `twin_joint_arm` entries
+/// (**M-CENSUS-ZERO** reverts this), `stale_reads` sums
+/// `twin_joint_stale_reads` (**M-CENSUS-NOSTALE** reverts this), and
+/// `arm_seeds` is ascending even when the records arrive unsorted.
+/// All zero reads the exact all-zero line of G5-CENSUS (d).
+#[test]
+fn x5f2s3_joint_arm_census_line() {
+    use e4_recovery::campaign::joint_arm_census_line;
+    // All zero: the known reading at BASE (G5-CENSUS (a)).
+    assert_eq!(
+        joint_arm_census_line(
+            CampaignSet::Main,
+            &[
+                census_rec(0, vec![false, false], vec![0, 0]),
+                census_rec(1, vec![false], vec![0]),
+            ]
+        ),
+        "JOINT_ARM_CENSUS set=main seeds=2 arm_rounds=0 stale_reads=0 arm_seeds=[]"
+    );
+    // One live arm (seed 5 round 1) and one stale read elsewhere: the
+    // arm_rounds, stale_reads and arm_seeds terms each move on their
+    // own.
+    assert_eq!(
+        joint_arm_census_line(
+            CampaignSet::MpPressure,
+            &[
+                census_rec(5, vec![false, true], vec![0, 0]),
+                census_rec(20_007, vec![false], vec![3]),
+            ]
+        ),
+        "JOINT_ARM_CENSUS set=mp-pressure seeds=2 arm_rounds=1 stale_reads=3 arm_seeds=[5]"
+    );
+    // Unsorted input prints ascending seeds, and the count is taken
+    // from the records (three records of main's ten thousand).
+    assert_eq!(
+        joint_arm_census_line(
+            CampaignSet::Main,
+            &[
+                census_rec(900, vec![true], vec![1]),
+                census_rec(7, vec![true, true], vec![0, 2]),
+                census_rec(100, vec![false], vec![0]),
+            ]
+        ),
+        "JOINT_ARM_CENSUS set=main seeds=3 arm_rounds=3 stale_reads=3 arm_seeds=[7,900]"
+    );
+    assert_eq!(
+        joint_arm_census_line(CampaignSet::HeldOut, &[]),
+        "JOINT_ARM_CENSUS set=held-out seeds=0 arm_rounds=0 stale_reads=0 arm_seeds=[]"
+    );
+}
