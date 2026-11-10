@@ -8,6 +8,18 @@ document.addEventListener("click", (event) => {
   if (message && !confirm(message)) event.preventDefault();
 });
 
+// The account menu closes on a click elsewhere and on Escape.
+document.addEventListener("click", (event) => {
+  for (const menu of $$("details.menu[open]")) if (!menu.contains(event.target)) menu.open = false;
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  for (const menu of $$("details.menu[open]")) {
+    menu.open = false;
+    $("summary", menu).focus();
+  }
+});
+
 // Images are re-encoded here: phone photos shrink, and EXIF location data never leaves the device.
 
 const MAX_SIDE = 2000;

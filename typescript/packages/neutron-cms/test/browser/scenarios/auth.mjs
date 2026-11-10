@@ -14,6 +14,16 @@ scenario("log in: wrong password, then right, then log out", async (t) => {
   await page.waitForURL(/\/n-admin\/posts\/1$/);
   t.check(true, "back where it was after logging in");
   await t.go(page, "/n-admin");
+  const menu = page.locator("details.menu");
+  t.equal(await page.getByRole("button", { name: "Log out" }).count(), 0, "Log out is inside the closed menu");
+  await menu.locator("summary").click();
+  t.check(await page.getByRole("link", { name: "Account" }).isVisible(), "the menu opens");
+  await page.keyboard.press("Escape");
+  t.check(!(await menu.evaluate((el) => el.open)), "Escape closes the menu");
+  await menu.locator("summary").click();
+  await page.locator("h1").click();
+  t.check(!(await menu.evaluate((el) => el.open)), "a click elsewhere closes the menu");
+  await menu.locator("summary").click();
   await page.getByRole("button", { name: "Log out" }).click();
   await page.waitForURL(/\/n-admin\/login$/);
   await t.go(page, "/n-admin/media");

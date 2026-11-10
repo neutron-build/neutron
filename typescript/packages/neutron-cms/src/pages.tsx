@@ -60,11 +60,22 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
         </nav>
         <span class="spacer" />
         <a href="/" target="_blank" rel="noreferrer">View site</a>
-        {viewer?.kind === "owner" ? <a href={`${admin}/people`} aria-current={current("people")}>People</a> : null}
-        {viewer ? <a href={`${admin}/account`} aria-current={current("account")} title={viewer.kind === "person" ? `Logged in as ${viewer.name}` : "Logged in as the owner"}>Account</a> : null}
-        <form method="post" action={`${admin}/logout`}>
-          <button class="link" type="submit">Log out</button>
-        </form>
+        {viewer ? (
+          <details class="menu">
+            <summary aria-current={active === "account" || active === "people" ? "page" : undefined}>{viewer.kind === "person" ? viewer.name : "Owner"}</summary>
+            <div class="menu-items">
+              {viewer.kind === "owner" ? <a href={`${admin}/people`} aria-current={current("people")}>People</a> : null}
+              <a href={`${admin}/account`} aria-current={current("account")}>Account</a>
+              <form method="post" action={`${admin}/logout`}>
+                <button type="submit">Log out</button>
+              </form>
+            </div>
+          </details>
+        ) : (
+          <form method="post" action={`${admin}/logout`}>
+            <button class="link" type="submit">Log out</button>
+          </form>
+        )}
       </header>
       {props.children}
       <script defer src={assetUrl(admin, "admin.js")} />
@@ -235,7 +246,7 @@ export function PostsPage(props: {
   const here = (at: number) => `${base}${[query ? `q=${encodeURIComponent(query)}` : "", at > 1 ? `page=${at}` : ""].filter(Boolean).join("&").replace(/^./, "?$&")}`;
   return (
     <Shell config={props.config} active={pages ? "pages" : "posts"}>
-      <main class="page">
+      <main class="page narrow">
         <div class="page-head">
           <h1>{pages ? "Pages" : "Posts"}</h1>
           <form method="post" action={pages ? `${admin}/pages` : admin}>
@@ -288,7 +299,7 @@ export function TrashPage(props: { config: ResolvedConfig; items: Trashed[] }) {
   const admin = config.path;
   return (
     <Shell config={config}>
-      <main class="page">
+      <main class="page narrow">
         <div class="page-head"><h1>Trash</h1></div>
         {items.length === 0 ? <p class="empty-state">The Trash is empty.</p> : (
           <>

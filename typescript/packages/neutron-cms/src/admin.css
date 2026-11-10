@@ -98,6 +98,18 @@ a { color: inherit; }
 .top a[aria-current] { font-weight: 600; }
 .top > a.name { color: var(--strong); font-weight: 600; }
 .top .spacer { flex: 1; }
+/* The account menu: one name, with People, Account and Log out under it. */
+.menu { position: relative; }
+.menu summary { display: inline-flex; align-items: center; gap: 6px; min-height: var(--control-sm); color: var(--muted); list-style: none; cursor: pointer; border-radius: var(--radius); }
+.menu summary::-webkit-details-marker { display: none; }
+.menu summary::after { content: ""; width: 6px; height: 6px; margin: -3px 2px 0 0; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
+.menu summary:hover, .menu[open] summary, .menu summary[aria-current] { color: var(--strong); }
+.menu summary[aria-current] { font-weight: 600; }
+.menu-items { position: absolute; top: calc(100% + var(--s2)); right: 0; z-index: 10; display: grid; min-width: 168px; padding: var(--s1); background: var(--raised); border: 1px solid var(--rule); border-radius: var(--radius-lg); box-shadow: 0 8px 24px rgb(0 0 0 / .14); }
+.menu-items a, .menu-items button { display: flex; align-items: center; width: 100%; height: var(--control); padding: 0 var(--s3); background: none; border: 0; border-radius: var(--radius); color: var(--ink); font: inherit; font-weight: 400; text-align: left; text-decoration: none; cursor: pointer; }
+.menu-items a:hover, .menu-items button:hover { background: var(--hover); color: var(--strong); }
+.menu-items a[aria-current] { font-weight: 600; }
+.menu-items form { border-top: 1px solid var(--rule); margin-top: var(--s1); padding-top: var(--s1); }
 
 .top.editor-top { gap: var(--s1); padding: var(--s2) var(--s4); }
 .editor-top > a.back { height: var(--control); padding: 0 var(--s2); border-radius: var(--radius); }
@@ -528,7 +540,8 @@ body:has(.edit-frame) .top { position: static; flex: none; }
 @media (max-width: 560px) {
   :root { --gutter: 16px; --control: 40px; }
   .top { gap: 0 var(--s3); padding-block: 0; }
-  .top > a:not(.button), .top nav a, .top .link { min-height: 40px; }
+  .top > a:not(.button), .top nav a, .top .link, .menu summary { min-height: 40px; }
+  .menu-items a, .menu-items button { height: 44px; }
   /* The sections get a row of their own that slides sideways, so the bar stays two lines however many there are. */
   .top nav { display: flex; order: 1; flex: 0 0 calc(100% + 32px); gap: 20px; margin: 0 -16px; padding: 0 16px; overflow-x: auto; white-space: nowrap; scrollbar-width: none; border-top: 1px solid var(--rule); }
   .top nav::-webkit-scrollbar { display: none; }
@@ -562,7 +575,7 @@ body:has(.edit-frame) .top { position: static; flex: none; }
   .posts tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: var(--s3); padding: var(--s2) 0; border-bottom: 1px solid var(--rule); }
   .posts tr:first-child { border-top: 1px solid var(--rule); }
   .posts td, .posts tr:first-child td { height: auto; padding: 0; border: 0; }
-  .posts .status { grid-row: 2; font-size: var(--t-xs); }
+  .posts .status { grid-row: 2; padding-left: 0; font-size: var(--t-xs); }
   .posts .date { padding-left: 0; }
   .posts .actions { grid-row: 1 / 3; grid-column: 2; padding-left: 0; }
   .posts .actions form, .posts .actions > div { flex-direction: column-reverse; align-items: flex-end; gap: 0; }

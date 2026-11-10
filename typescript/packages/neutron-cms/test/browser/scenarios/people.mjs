@@ -47,7 +47,10 @@ scenario("people: add, log in as them, account, reset, remove", async (t) => {
   t.equal(await sam.getByLabel("Name").inputValue(), "sam", "the name is kept after a wrong password");
   await logIn(t, sam, "Sam", password);
   await sam.waitForURL(`${t.origin}/n-admin`);
-  t.equal(await sam.getByRole("link", { name: "People" }).count(), 0, "a person has no People link");
+  await sam.locator("details.menu summary").click();
+  t.check(await sam.getByRole("link", { name: "Account" }).isVisible(), "a person's menu has Account");
+  t.equal(await sam.locator("details.menu a", { hasText: "People" }).count(), 0, "a person has no People link");
+  t.equal((await sam.locator("details.menu summary").textContent()).trim(), "sam", "the menu carries their name");
   const blocked = await sam.goto(`${t.origin}/n-admin/people`);
   t.equal(blocked.status(), 404, "and can't open People");
   await t.go(sam, "/n-admin/account");

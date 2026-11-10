@@ -115,7 +115,7 @@ const ringed = (page) => page.evaluate(() => {
 scenario("keyboard: Tab reaches the main controls with a visible focus ring", async (t) => {
   const page = await t.page();
   await t.go(page, "/n-admin");
-  for (const control of ["Posts", "Media", "Log out", "New post"]) {
+  for (const control of ["Posts", "Media", "Owner", "New post"]) {
     t.check(await tabTo(t, page, control), `Tab reaches ${control} on Posts`);
     t.check(await ringed(page), `${control} shows a focus ring`);
   }
