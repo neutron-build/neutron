@@ -10900,3 +10900,186 @@ failing rounds (class × count, seeds listed).
   8, `w11_share` 200, `w12_share` 200). The row returns to the owner
   with every rung's numbers. Probe, not evidence.
 
+## Card X-5c-F4-F3's record
+
+card: X-5c-F4-F3   branch: card/v3-X-5c-F4-F3   commit: (step 11's;
+the chain step 0 `47997218` → step 1 `84d3af0f` → step 2 `618249b9` →
+3.1 `3ebbd4ff` → 3.2 `13b44794` → 4.1 `99755181` → 4.2 `36d5af11` →
+4.3 `e86e4ee0` → 5.1 `7431485b` → 6.1 `0775b735` → 7.1 `e245dc0d` →
+7.2 `6b260312` → 7.3 `db572b5f` → the 7 outcome `b2734406` → 9.0
+`fa22795f` → 9.1 `e4a0b4ed` → 9.2 `2bf64b9d` → 9.3 `2150ba9d` → the
+9 outcome `6f81f253` → step 10 `025b148e` + its archive fix `7b8ca47a`
+→ here)
+
+**1. The retune list** (every number a probe over 0..1000 × 10, or the
+200-seed MP set × 10 — never evidence; the probe rows above carry each
+rung's full table):
+
+| ladder | rungs tried | outcome |
+|---|---|---|
+| Q7 ≥ 200 (margin 250) | 3.1 (230), 3.2 (320) | **ESCALATE** — both fail the hold set (Q4 1440 / 90 under the owner's 1,500 bar); kept the 2.0 anchor reading Q7 190 |
+| Q8 ≥ 100 (margin 125) | 4.1 (70), 4.2 (100), 4.3 (130) | **stop-and-keep at 4.3** (130 ≥ 125, hold and wall pass) |
+| Q11 ≥ 100 (margin 125) | 5.1 (270) | **stop-and-keep at 5.1** (Q5a watched: 210) |
+| Q12 ≥ 100 (margin 125) | 6.1 (210) | **stop-and-keep at 6.1** (Q5a watched: exactly 200, not below) |
+| SZC ≥ 1,000, SZC-MW ≥ 50, SZI ≥ 300 (margins 1,250 / 62.5 / 375) | 7.1 (500/50/180), 7.2 (890/90/360), 7.3 (2390/140/810) | **ESCALATE** — 7.3 reaches every margin but the wall limit fails (41.8 min/10k > 40, which ends the walk) and Q10 460 < 500; 7.1/7.2 fail Q5a ≥ 200; kept the pre-ladder 6.1 reading SZC 620, SZC-MW 60, SZI 150. Rungs 7.4–7.5 (step 8) never ran |
+| SZC-MP ≥ 100 per-2000 (margin 125) | 9.0 (raw 0), 9.1 (raw 2), 9.2 (raw 1), 9.3 (raw 2) | **ESCALATE** — no rung reaches 100 (raw counts 0–2, as REFRESH 6 warned); kept 9.1 (highest count, earliest by rising cost; 9.3 ties it at raw 2) |
+
+**No `thin` rows**: no ladder ended in the "reaches the required count
+but never the margin" branch — every ladder either stopped at the
+margin (Q8, Q11, Q12) or kept a rung under the ESCALATE rule's
+fallback (SZC: the pre-ladder setting, since no rung passed the hold
+set and wall limit; MP: the highest-count rung 9.1).
+
+**2. New classes (X5-R16): none appeared.** Across all 13 probes'
+JSONs, every failing round is class MP with the two known baseline
+shapes (O-3(e) slot-reported and O-1(a) published≠model) — 24 failing
+rounds in total, listed rung by rung in the probe rows. No class C
+round failed anywhere, so the "class C round with an O-1 failure and
+no XX001" STOP never fired, and none of REFRESH 8's C-XX seeds (221,
+423, 370, 151, 190) appears as a failing round on any rung's sample.
+
+**3. The final setting** (all numbers are the kept setting's probe
+reading, per 10k, against the row's minimum):
+
+- `Tuning::FINAL` = S1 on the 6.1 kept rung: BASE with
+  `syncoff_table` `[3, 7, 7]`, `keep_latest_pm_table`
+  `[100, 100, 300, 500, 700]`, `w11_share` 100, `w12_share` 100,
+  `r41_share` 1000, `r41p_share` 500 — every other field is BASE's
+  (`drop_one_in` 3, `ckpt_every` 4–5, chunked 320–701, `value_lo` 8,
+  budget 18–20, GC 2–5, no bursts).
+- `Tuning::MP_PRESSURE` = FINAL with the kept 9.1 ladder fields:
+  chunked 900–1,201, budget 20–32, GC 12, `ckpt_every` 4–8 (equal to
+  FINAL's own here), `burst_frac` 600, `burst_gc_loops` 8,
+  `w11_share` 200, `w12_share` 200.
+- Kept probe numbers (minimum): Q4 1,810 (1,000; owner bar 1,500 ✓),
+  Q4-I 2,250 (1,000; owner bar 1,500 ✓), Q5a 200 (200, at it), Q7 190
+  (**200 — ESCALATE**), Q8 130 (100 ✓), Q11 330 (100 ✓), Q12 210
+  (100 ✓), Q18 5,250 (1,000 ✓), SZC 620 (**1,000 — ESCALATE**),
+  SZC-MW 60 (50 ✓), SZI 150 (**300 — ESCALATE**), SZC-MP 20 = raw 2
+  (**100 — ESCALATE**, per-2000), and every other row over its
+  minimum (the 6.1 and 9.1 probe rows above hold each one).
+
+**4. The MP-pressure tuning** (the 200-seed `--probe mp-pressure`
+sample; `per10k` = raw × 10 = the 2,000-seed set's count): rung 9.1
+reads SZC-MP **raw 2 → 20**, wall 5.7 min per 2,000, cpu 416.0 s; the
+other rungs read raw 0 (9.0), 1 (9.2), 2 (9.3). MP rests on 1–7 raw
+hits per row, as REFRESH 6's table warned — the raw counts are the
+numbers to read.
+
+**5. CPU, both figures** — this attempt never ran the measuring form
+(card Work 10: it is the Acceptance's). The two lines below are the
+Acceptance run's own output, pasted verbatim; **the +60% bar binds
+only the first** (`CPU_TERM`, the S1 term): `CPU_WHOLE_FINAL` is
+reported and is never an exit input.
+
+```
+<the Acceptance's CPU_TERM line is pasted here by P's gate>
+<the Acceptance's CPU_WHOLE_FINAL line is pasted here by P's gate>
+```
+
+**6. ESCALATE** — four rows return to the owner with every rung's
+numbers (the probe rows above): **Q7** (kept reading 190 < 200; rungs
+3.1/3.2 reach 230/320 but both fail the hold set — Q4 1,440/90 against
+the owner's 1,500 bar), **SZC** (620 < 1,000) and **SZI** (150 < 300)
+(their ladder's 7.3 reaches 2,390/810 but at 41.8 min/10k over the
+40-minute wall limit, which ends the walk — measured with the host's
+1-minute load at 9.5–15.3 during the blocks, our own 16 threads
+included — and with Q10 460 < 500; 7.1/7.2 fail Q5a ≥ 200), and
+**SZC-MP** (raw 2 → 20 < 100 per-2000; no rung of 9.0–9.3 reaches it,
+raw 0–2). Per the owner decisions of 2026-11-10, no threshold moved.
+
+**7. Post-data amendments: none.** No threshold, ladder, rung, knob,
+margin or stop rule changed after any probe; every rung tried is in
+the card, and the ladder section above was committed before the first
+probe row.
+
+### Judgment calls (documented)
+
+- **Step 1's commit changes exactly the two constants and the docs of
+  exactly those two constants.** The `r41_share`/`r41p_share` field
+  docs and the `FINAL`/`Tuning` doc lines that said "0 in this card's
+  FINAL" would have read false after S1; they now name S1 and the
+  ruling. No other `src/` line changed (the worktree diff of step 1's
+  commit is the two values plus those doc lines).
+- **Two X-5c-F4-F2-era pins updated where this card's Goal breaks
+  their invariant**: `x5_r44_tuning_id_is_mp_pressure_for_that_set_only`
+  pinned `FINAL == BASE` (step 1's whole point is to end that) and
+  `MP_PRESSURE == FINAL` (step 9's ladder fields end that). Both keep
+  their M-MP-TUNING id half; the replacements pin FINAL ≠ BASE and
+  hand the constants' relationship to
+  `x5_r37_mp_pressure_differs_only_in_ladder_fields`.
+- **`x5_probe.sh` prints `PROBE_HOOK` lines beyond the card's four
+  line kinds**: `PROBE_QUOTA` prints every Q1 row as "Q1" with no hook
+  name, so the hold set's per-hook Q1 rows ("no row that met its
+  minimum falls below it") cannot be read from the named lines alone;
+  the hooks are counted from the same probe JSONs. The four named line
+  kinds print exactly as the card writes them.
+- **The MP ladder's hold set**: the owner's Q4/Q4-I ≥ 1,500 bars are
+  main-file bars — the step 9 ladder edits `MP_PRESSURE` only, so
+  FINAL's 6.1 reading (1,810/2,250) carries them untouched; within the
+  MP probe only SZC-MP is an exit row of the `mp-pressure` set, and no
+  other row's minimum is defined against the 2,000-seed MP set, so the
+  ladder's rows read SZC-MP alone (the rung rows still record every
+  other row as INFO).
+- **9.1 vs 9.3 tie-break**: both read SZC-MP raw 2; 9.1 is kept as the
+  earlier rung, per "rung order is by rising cost".
+- **`x5_probe.sh`'s time capture**: bash 5.2 prints no `time` report
+  for `time ( exec … )` — measured, and the child's user+sys is
+  counted correctly without `exec` (verified against a CPU burner).
+  The script's blocks therefore run `( ulimit …; "$BIN" … >out 2>err )`.
+- **The first anchor probe's wall/cpu lines read 0.0** (that bash
+  quirk) before any row was committed; the tool was fixed and the
+  anchor re-run — its quota rows were identical both times. No
+  committed row was ever re-run.
+- **Attempt 2 reconstructed rung 9.3's commit**: the 9.3 probe had
+  run and been recorded when the 60-minute cap killed the attempt
+  before its commit; the restart rule found 9.3 uncommitted, its
+  constants were re-set and its row committed from the recorded probe,
+  then the outcome commit reverted `MP_PRESSURE` to 9.1. No probe was
+  re-run.
+- **The first mutant pass (mut3-*) was a false positive**: exports
+  archived from `nucleus/v3` omit `nucleus/v2`, so workspace manifest
+  loading failed and every "caught" was a build error. All seven code
+  mutants were re-run (mut4-*) from worktree-root archives with the
+  named test's failure verified in the output. The same root-archive
+  rule is now in `x5_cpu_term.sh` (its own arms had the same bug —
+  fixed before any measuring run, self-test unchanged).
+
+### Mutants (each row applied to its own scratch copy under
+### `$CARGO_TARGET_DIR/x5f3-scratch/` — its own export and target
+### directory for the code rows, its own script copy for the CPU rows;
+### the worktree never held a mutant)
+
+| mutant | catching test |
+|---|---|
+| M-FINAL-R41 (`Tuning::FINAL`'s `r41_share` 999) | `x5_r37_final_r41_is_s1` (mut4) |
+| M-FINAL-R41P (`r41p_share` 499) | `x5_r37_final_r41_is_s1` (mut4) |
+| M-BASE-EDIT (`Tuning::BASE`'s `r41_share` 1000) | `x5_r37_base_tuning_reproduces_1b0ce54e` (mut4) |
+| M-RANGE-VALUE (`Tuning::FINAL`'s `value_lo` 7) | `x5_r37_final_stays_in_card_ranges` (mut4) |
+| M-RANGE-SHARE (`w11_share` 300 in `MP_PRESSURE`) | `x5_r37_final_stays_in_card_ranges` (mut4) |
+| M-MP-R41 (`MP_PRESSURE`'s `r41_share` 500) | `x5_r37_mp_pressure_r41_equals_final` (mut4) |
+| M-MP-OTHERFIELD (`MP_PRESSURE`'s `delete_one_in` 3) | `x5_r37_mp_pressure_differs_only_in_ladder_fields` (mut4) |
+| M-CPU-TERM-FROM-FINAL (the bar's term from the FINAL arm) | `--self-test` (mut/) |
+| M-CPU-WHOLE-FROM-S1 (`CPU_WHOLE_FINAL` from the S1 arm) | `--self-test` (mut/) |
+| M-CPU-WHOLE-EXITS (`CPU_WHOLE_FINAL` above +60 fails the exit) | `--self-test` (mut/) |
+| M-CPU-NOMEDIAN (the first pass, not the median of three) | `--self-test` (mut/) |
+| M-CPU-BOUNDARY (+60.00 reads `OVER`) | `--self-test` (mut/) |
+| M-CPU-NOFOREIGN (the foreign check removed) | `--self-test` (mut/) |
+
+None survives. Each code row's sed and each CPU row's sed were
+verified to apply (the mutated literal greps present) before the test
+ran, and each code row's output was checked for the named test's
+`FAILED` line, not just a non-zero exit.
+
+### RESULT (card X-5c-F4-F3)
+
+1. The retune list is above (item 1); the probe rows section holds
+   every rung's full numbers.
+2. New classes: none appeared (item 2).
+3. The final setting is above (item 3).
+4. The MP-pressure tuning is above (item 4), raw counts included.
+5. CPU, both figures: the two Acceptance lines, pasted by P's gate
+   into the block in item 5; the +60% bar binds only `CPU_TERM`.
+6. ESCALATE: Q7, SZC, SZI, SZC-MP (item 6), with every rung's numbers.
+7. Post-data amendments: none.
+
