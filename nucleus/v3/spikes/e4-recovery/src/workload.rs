@@ -311,7 +311,31 @@ impl Tuning {
     /// and the `--probe mp-pressure` form select it, through
     /// `TuningId::MpPressure`; because it equals FINAL at this tip,
     /// only the id can show which one a set selects.
-    pub const MP_PRESSURE: Tuning = Tuning { ..Tuning::FINAL };
+    ///
+    /// **X-5c-F4-F3 step 9: the MP ladder's fields** (the card's
+    /// rung 9.1, "k1" — over FINAL): chunked 900–1,200, budget
+    /// 20–31, GC 12 (`gc_sweeps_lo` 12, `gc_sweeps_span` 1),
+    /// `ckpt_every` 4–8, `burst_frac` 600, `burst_gc_loops` 8,
+    /// `w11_share` 200, `w12_share` 200. Every field not in that
+    /// table equals FINAL's (`..Tuning::FINAL` below), pinned by
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`; the two
+    /// `r41` knobs come from FINAL (S1),
+    /// `x5_r37_mp_pressure_r41_equals_final`.
+    pub const MP_PRESSURE: Tuning = Tuning {
+        ckpt_every_lo: 4,
+        ckpt_every_span: 5,
+        commit_budget_lo: 20,
+        commit_budget_span: 12,
+        chunked_ops_lo: 900,
+        chunked_ops_span: 301,
+        gc_sweeps_lo: 12,
+        gc_sweeps_span: 1,
+        burst_frac: 600,
+        burst_gc_loops: 8,
+        w11_share: 200,
+        w12_share: 200,
+        ..Tuning::FINAL
+    };
 }
 
 /// The per-seed knobs (card Work 5.1, sized against the ≤ 20 min

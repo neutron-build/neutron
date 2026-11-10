@@ -10849,3 +10849,18 @@ failing rounds (class × count, seeds listed).
   `MP_PRESSURE` only, and FINAL stays the kept 6.1 (Q4 1810, Q4-I
   2250). Probe, not evidence.
 
+- **rung 9.1 (k1)** (chunked 900–1,200, budget 20–31, GC 12,
+  `ckpt_every` 4–8, `burst_frac` 600, `burst_gc_loops` 8,
+  `w11_share` 200, `w12_share` 200 — `MP_PRESSURE` only, over FINAL):
+  wall **5.7** min/2000 (raw 34.4 s; load 5.18 11.71 12.58; cpu
+  416.0 s); SZC-MP **raw 2**, per10k 20. Changed rows vs 9.0 (per10k):
+  SZC-MP 0→20, SZC 0→20, Q11 10→30, Q18 220→250, Q5b 1070→1130,
+  Q13b 950→1050, Q14 620→530, Q2 220→180, Q3 60→50. Other rows
+  (per10k, INFO): Q1 1110 (hooks 100–130), Q2 180, Q3 50, Q4 230,
+  Q4-I 80, Q5a 70, Q5b 1130, Q5c 760, Q6a 250, Q6b 190, Q7 30, Q8 0,
+  Q9 1830, Q10 100, Q11 30, Q12 60, Q13a 950, Q13b 1050, Q13c 910,
+  Q14 530, Q15 0, Q16 920, Q17 1090, Q18 250, SIZING 1920 misses,
+  SZC 20, SZC-MW 0, SZI 0. Fails: MP ×2 (30037 r0, 30337 r0 — the
+  known O-1(a) MP shape). SZC-MP 20 < 125; the wall passes — the walk
+  continues. Probe, not evidence.
+
