@@ -4656,6 +4656,26 @@ binaries; 276 at the Base + this card's 5 new pins);
 reading above, byte-identical**; `bash scripts/gate.sh` — the gate
 note beneath.
 
+**The gate note (`bash scripts/gate.sh`, at `8f1d51b6`, this run, in
+this session's container): `STEP test EXIT=0`, `STEP clippy EXIT=0`,
+`STEP fmt EXIT=0`, `STEP deny EXIT=0` (the advisory fixed on the Base
+by DEP-RUSQLITE-1), `STEP wasm32 EXIT=0`, `STEP core-paths-selftest
+EXIT=0`, `STEP enforcement-tests EXIT=1` with exactly one FAIL row —
+`runner e2e: K: SIGTERM kills opencode and closes the ledger range` —
+so the last line reads `GATE EXIT=1`.** This is the known, ruled,
+environmental row the card's own Notes name ("If you run `gate.sh` in
+your own session, `runner e2e: K` reads red (X-5c-F4-F1-F1) … The
+runner's Acceptance is the truth"): this container's PID 1 is the
+card session's own `opencode` process, which never `wait()`s, so the
+killed attempt's orphaned child stays a zombie and `dead()`'s
+`killpg` probe succeeds — verdict `verdicts/X-5c-F4-F1-F1.md`'s K
+ruling ("`kill_child` is correct. `dead()` asks the wrong question")
+says do not chase it, and the fresh-gate containers of the chain's
+verdicts read the row ok (`GATE EXIT=0` — the row tracks the
+container's PID 1, not the tree). The other 235 enforcement rows are
+green, nothing this card touched is exercised by that row, and the
+fix lives in `scripts/`/`tools/`, outside this card's Touch only.
+
 judgment calls (recorded in the steps above): scratch under
 `$CARGO_TARGET_DIR/x5pins-scratch/` (`~/.cache/nv3-review/` is
 read-only here, the carried judgment call); the joint-arm pin holds
