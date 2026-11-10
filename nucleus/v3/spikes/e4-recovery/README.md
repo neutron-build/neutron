@@ -10122,3 +10122,222 @@ X5-R15 (e): `examples/` keeps only what this block uses (`pin.rs`;
 `dbg-seed.rs`, which 823d4f51 called scratch, is removed), and
 `restore_probe.local.py` (untracked) is not in the tree.
 
+## Card X-5c-F4-F2's record (the final driver: OQ-1's sizing rows,
+## `--set` and `verify --set`, the probe forms, the census)
+
+Base: `card/v3-X-5c-F4` (tip `0d0f3da4`). This card changes no
+workload: it builds the driver X-5c-F4's final run needs. **FINAL still
+equals BASE** (`x5_r37_final_equals_base_at_this_tip`, unchanged), and
+**`MP_PRESSURE` equals FINAL** — it is written `Tuning { ..Tuning::FINAL }`,
+so it starts equal and follows FINAL; the final setting and the retune
+are X-5c-F4-F3's. No threshold, oracle, K, R, D17 R6 cell, X5-R14 fix,
+5.6 quota definition, `Q4I_REQUIRED`, X5-R51–R53, comparator or digest
+input changed: `szq`, `szi`, `rfs`, the `set` field and the census are
+never digest inputs, every X5-R37 literal stands byte for byte, and the
+comparator (verified on a synthetic old-vs-new pair before any code
+landed) reads `DIGESTS_MOVED 0` through the new fields.
+
+### X5-R39's table (REFRESH 5; the owner's OQ-1 ruling, PLAN §10
+### item 10)
+
+Transcribed from card X-5c-F4-F2's Work (REFRESH 5's own text is in
+the folded X-5c-F4 card, absent from this worktree — see anomalies):
+
+| row | counts | over | required |
+|---|---|---|---|
+| SZC | `szq` | all classes | 1,000 |
+| SZC-MP | `szq` | MP | 100 |
+| SZC-MW | `szq` | MW | 50 |
+| SZI | `szi` | all classes | 300 |
+
+- `szq` = `szc` ∧ Q18's `end.is_some()` (a refused or failed-open round
+  tests detection, not the recovery under pressure; excluded).
+- `szi` = `szq` ∧ the open checkpoint's begin-step fold ≥ 4·F ∧ the
+  crash fired from the completion of step 0 until step 5's `sync_all`
+  returned (the interrupted-checkpoint floor, counted **inside** the
+  1,000, not on top of it).
+- The `SIZING` row stays as per-seed reporting (achieved = seed
+  misses), never an exit input; `verify` prints it `INFO` and never
+  counts it toward `missed`. `INFO` only, never exit inputs: the
+  per-seed miss count, `szc` as F4-F1 prints it, `szi` per class and
+  per hook, and poison-end `szq`.
+
+### X5-R44's table (REFRESH 9; the owner decision of 2026-11-05)
+
+Transcribed from card X-5c-F4-F2's Work, same caveat:
+
+| set | seeds | tuning | exit rows |
+|---|---|---|---|
+| `main` | `0..10000` | `TuningId::Final` | every 5.6 and X5-R39 row except `SZC-MP`, plus Q4-I |
+| `held-out` | `10000..20000` | `TuningId::Final` | none |
+| `mp-pressure` | the 2,000 seeds `s` in `20000..30000` with `s % 10 ∈ {7, 8}` | `TuningId::MpPressure` | `SZC-MP` only |
+
+`MP_REFUSAL rounds=<n> refused=<n> rate=<r>` prints once per `verify`,
+class MP only, `rate` = `refused/rounds` to four decimals, reported and
+never an exit input; `refused` is the serialized per-round field `rfs`
+(`end.is_none()` at Q18's point), outside the digest and inside the
+per-round comparison.
+
+### The driver's forms
+
+- `run --set <name> [--threads N] --out F`: the set's seeds under the
+  set's tuning, the set recorded in the file
+  (`{"e4":1,"set":"main","seeds":[…]}`); `--set` with a `--seeds` that
+  differs is refused (exit 2); `mp-pressure` is not a range, so
+  `--seeds` with it is always refused; **the census prints** (below)
+  and no `PROBE_QUOTA`.
+- `run` with neither `--seeds` nor `--set` means `main`.
+- **The probe form**, `run --seeds A..B` without `--set`: records no
+  set, runs FINAL, refuses (exit 2) any range reaching 10000 or above —
+  REFRESH 10's reading of `run --seeds`, and the minimum this card adds
+  so a probe can never bypass the judged set.
+- **The MP-pressure probe form**, `run --probe mp-pressure`: the one
+  route to the `MP_PRESSURE` tuning outside the judged set — exactly
+  the 200 MP-class seeds of `30000..31000` (`s % 10 ∈ {7, 8}`),
+  records no set, refuses `--set`/`--seeds`. REFRESH 9 requires these
+  probes and `--set` cannot reach them, so this is the minimum that
+  makes them possible. Both probe forms print one `PROBE_QUOTA <id>
+  <achieved>` line per `quotas()` row and one for Q4-I, from the same
+  `quotas()` and `q4i_count` `verify` uses, and no census. **This card
+  never runs a probe seed**: the seeds this card may run are `0..10000`
+  only.
+- `verify --set <name>` (omitted means `main`): re-runs that set's
+  seeds under that set's tuning; a file whose recorded set differs, or
+  that records none, is refused (exit 2); exit rows are per set (the
+  table above), a non-exit row prints
+  `INFO <id> … achieved <n> required <n> INFO`, an exit row keeps the
+  `QUOTA <id> … achieved <n> required <n> MET|MISSED` form (X-5c-F4's
+  bars line reads it); all modes keep the digest check and the
+  per-round comparison of non-digest fields, exit non-zero only on
+  non-reproduction, a wrong seed set or a missed exit row, never on
+  oracle failures.
+
+### `JOINT_ARM_CENSUS` (P ruling G5-CENSUS (c))
+
+For each `--set` run, `cmd_run` prints exactly one stdout line
+immediately before the final `E4 SEEDS=` line, computed in memory from
+the `SeedRec`s that process executed:
+`JOINT_ARM_CENSUS set=<set> seeds=<n> arm_rounds=<n> stale_reads=<n>
+arm_seeds=[<ascending seeds>]`. The two census fields stay
+unserialized and never digest inputs; the line changes no exit rule;
+the set form prints no `PROBE_QUOTA` and the probes print no census.
+
+### The `ckpt_unflipped` observable (a judgment call, documented)
+
+The card's Work names `src/store/ckpt.rs` as the observable's home with
+set/clear sites all inside `checkpoint_inner`, but a **store**-state
+field (`StoreInner`) and a **crash-time obs** field
+(`WorkloadObs`) live in `src/store/mod.rs` and `src/harness.rs`, which
+the card's Touch-only list forbids — this card's Read list names
+neither. The observable is therefore carried by the crash-time
+checkpoint position code (`WorkloadObs::ckpt_step`, written by the
+checkpointer's hook bookkeeping **before any crash arm**):
+`ckpt::ckpt_unflipped(step)` is true exactly for codes 2..=7 — set
+immediately before `hooks(CkptHook::After0)` (the completion of step
+0), cleared where step 5 sets `meta_durable_k` (before
+`hooks(CkptHook::After5)`; codes 8, 9, 0 read false, as does 1 =
+`Before0`). This is REFRESH 6's rule held **structurally**: the
+harness-side carrier survives the sim-crash unwind into the crash-time
+`obs` snapshot because no `checkpoint()` abort path can touch it, and
+the non-crash abort clear is carried by the `ckpt_closed_dirty ≥ 4·F`
+term `szi` conjoins (the same `ckpt:abort` step zeroes it on every
+non-`Sim` failure and keeps it across a sim-crash unwind — the
+`!crash_unwind` guard). For every value `szi` can take the two
+implementations agree: at `Before0` the open interval is empty (the
+fold arm is forced), past a non-crash abort `ckpt_closed_dirty` is 0,
+and after a completed checkpoint the code is 0. The four sites the
+card names each carry a comment citing the observable. The step-1
+mutants map accordingly: **M-SZI-BEFORE0** = the predicate accepts
+code 1, **M-SZI-AFTER5** = it accepts code 8, and **M-SZI-ABORTRESET**
+= the `!crash_unwind` guard dropped (this implementation's carrier of
+the abort-path clear), which the After4 pin fails.
+
+### The mutant table (RESULT item 1; every row applied to its own
+### scratch export of the real code at the step's commit — its own
+### export, its own `CARGO_TARGET_DIR` under
+### `$CARGO_TARGET_DIR/x5f2-scratch/` — shown failing, reverted by
+### construction; the worktree never held a mutant)
+
+| mutant | catching test |
+|---|---|
+| M-SZQ-REFUSED (drop `end.is_some()`) | `x5_r39_a_refused_round_is_szc_but_never_szq` |
+| M-SZI-BEFORE0 (set `ckpt_unflipped` at begin) | `x5_r39_before0_crash_never_sets_szi` (and `x5_r39_ckpt_unflipped_window_edges`) |
+| M-SZI-AFTER5 (never clear it at step 5) | `x5_r39_after5_crash_never_sets_szi` (and `x5_r39_ckpt_unflipped_window_edges`) |
+| M-SZI-ABORTRESET (cleared on every abort) | `x5_r39_after4_crash_with_a_4f_fold_is_szi` (the `!crash_unwind` guard; see the judgment call above) |
+| M-SZ-EXIT (a SIZING seed miss fails the exit again) | `x5_r39_a_per_seed_sizing_miss_is_not_an_exit_input` |
+| M-SZ-NOFLOOR (the `SZI` row's minimum goes to 0) | `x5_r39_row_floors_at_the_edge` (the 299/300 pair) |
+| M-SZ-NOREPRO (remove the file-versus-re-run comparison) | `x5_r39_flipped_szi_fails_reproduction` |
+| M-MP-MAINEXIT (`SZC-MP` exits in `main`) | `x5_r45_szc_mp_99_in_each_mode` (99 in main) |
+| M-MP-NOEXIT (`SZC-MP` never exits in `mp-pressure`) | `x5_r45_szc_mp_99_in_each_mode` (99/100) |
+| M-MP-CLASS (the set takes every seed in the range) | `x5_r45_seed_set_checks_short_over_wrong_class` |
+| M-MP-TUNING (`mp-pressure` selects `TuningId::Final`) | `x5_r44_tuning_id_is_mp_pressure_for_that_set_only` |
+| M-HELD-QUOTA (held-out exits on a quota) | `x5_r45_held_out_exits_zero_with_every_quota_short` |
+| M-HELD-RANGE (held-out accepts `0..10000`) | `x5_r45_seed_set_checks_short_over_wrong_class` (the held-out half) |
+| M-SET-MISMATCH (`verify` ignores the file's set) | `x5_r45_the_recorded_set_gates_verify` |
+| M-REFUSAL-ALL (`MP_REFUSAL` counts every class) | `x5_r46_mp_refusal_counts_class_mp_only` |
+| M-PROBE-RANGE (the probe form accepts a range reaching 10000) | `x5_r44_probe_forms_seed_lists_and_refusals` |
+| M-PROBE-SET-NAME (the probe form records a set) | `x5_r44_probe_forms_seed_lists_and_refusals` (`run_form_set`) and `x5_r45_the_recorded_set_gates_verify` (the emit half) |
+| M-CENSUS-ZERO (always prints 0) | `x5f2s3_joint_arm_census_line` (the live-arm case) |
+| M-CENSUS-NOSTALE (ignores `twin_joint_stale_reads`) | `x5f2s3_joint_arm_census_line` (the stale-read case) |
+| M-CENSUS-NOTFROMRUN (`seeds` is the set's requested count) | `x5f2s3_joint_arm_census_line` (the seed-count case) |
+
+None survives. The literal-config pins' seeds (1926 r2 After4, 1005 r2
+Before0, 344 r1 After5, 9149 r2 refused) were found by a scratch-only
+diagnostic build (a `dbg_fold`/`dbg_step` field in a `git archive`
+export, never committed) sweeping `0..10000` in 200-contiguous-seed
+chunks under `Tuning::BASE`, within the attempt's run hygiene.
+
+### RESULT (card X-5c-F4-F2)
+
+card: X-5c-F4-F2   branch: card/v3-X-5c-F4-F2   commit: (step 4's; the
+chain c3688e03 → 150221e7 → 77c7d824 → here)
+
+1. **The mutant table** is above; each row was applied on its own
+   scratch export and shown failing its named test; none survives.
+2. **X5-R39's and X5-R44's tables** are above, transcribed from this
+   card's Work (REFRESH 5 and 9 live in the folded X-5c-F4 card, not
+   in this worktree — anomaly (a)); REFRESH 10's reading of
+   `run --seeds` (the probe form, refused at a bound reaching 10000 or
+   above) and the `--probe mp-pressure` form are named above as this
+   card's minimum addition.
+3. **FINAL equals BASE** (`x5_r37_final_equals_base_at_this_tip`,
+   untouched), **`MP_PRESSURE` equals FINAL**
+   (`Tuning { ..Tuning::FINAL }`), and no threshold, oracle or digest
+   input changed (`szq`/`szi`/`rfs`/`set`/the census are outside the
+   digest; `verify` compares `szq`/`szi`/`rfs` per round between the
+   file and the re-run).
+4. **Post-data amendments: none.** The Acceptance's reading is the
+   runner's.
+
+### Anomalies
+
+- **(a) The folded cards are absent.** `cards/X-5c-F4.local.md` (the
+  REFRESH 5–10 text) and `cards/X-5c-PINS-1.local.md` are not in this
+  worktree (only this card's own file, PLAN, the cards README and the
+  worker prompt are). Their content as this card quotes it is carried
+  by this card's own Goal/Work and by the verdicts
+  (`X-5c-F4-F1.md` carries REFRESH 6 and 7 verbatim; the PINS-1 README
+  block carries P ruling G5-CENSUS verbatim), which is what was used —
+  the same reading PINS-1's verdict recorded for its own folded cards.
+- **(b) The Acceptance's comparator `--ref` name.** The card's line
+  names `~/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-F3-F1-F1-F1-F1.acc.campaign.json`,
+  which does not exist in this environment. The baseline of record it
+  pins by sha256 — `41c307a4…1cd2` — is
+  `X-5c-F4-F1-F1-F3-F2-F1-F2.acc.campaign.json` (sha256 verified
+  exactly). The worker's substitute run (the same command against that
+  file, on a synthetic old-vs-new JSON pair for the field-tolerance
+  check) reads `DIGESTS_MOVED 0` and exits 0; the whole-set run and
+  verify are the runner's, per the card's own run hygiene ("Banned in
+  the attempt: `verify` over a whole set, any wider run"), so the
+  worker never produced a `main.json` to compare.
+- **(c) The attempt cap.** Step 1's literal search overran the first
+  60-minute attempt; the restart rule's commit-then-resume discipline
+  was followed, and the refused-round pin (seed 9149) landed with step
+  2's commit, named there.
+- **(d)** The benign `Unable to create …/.git/packed-refs.lock:
+  Read-only file system` line from the host's git maintenance on every
+  commit (known from the base chain; the commits land — the log and the
+  clean tree confirm).
+
+
+

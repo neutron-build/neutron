@@ -341,10 +341,14 @@ pub fn run_form(
                 CampaignSet::MpPressure => (u64::MAX, u64::MAX),
             };
             if (lo, hi) != (wlo, whi) {
-                return Err(format!(
-                    "--set {name} cannot take --seeds {lo}..{hi} \
-                     (the set is {wlo}..{whi})"
-                ));
+                return Err(if set == CampaignSet::MpPressure {
+                    format!("--set mp-pressure is not a range: it cannot take --seeds {lo}..{hi}")
+                } else {
+                    format!(
+                        "--set {name} cannot take --seeds {lo}..{hi} \
+                         (the set is {wlo}..{whi})"
+                    )
+                });
             }
         }
         return Ok(RunForm::Set(set));
@@ -1085,7 +1089,7 @@ pub fn verify_quota_missed(set: CampaignSet, rows: &[workload::QuotaRow]) -> u64
 
 /// The recorded-set display for `verify`'s refusal line (`"none"` when
 /// the file records no set).
-fn recordeded_display(recorded: &Option<String>) -> String {
+fn recorded_display(recorded: &Option<String>) -> String {
     recorded.clone().unwrap_or_else(|| "none".to_owned())
 }
 
@@ -1165,7 +1169,7 @@ fn cmd_verify(args: &[String]) -> i32 {
         eprintln!(
             "e4-campaign verify: {path} records set {:?}, not {:?} (or no set): \
              refusing (each set is re-run under its own seeds and tuning)",
-            recordeded_display(&recorded_set),
+            recorded_display(&recorded_set),
             set.name()
         );
         return 2;
