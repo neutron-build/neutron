@@ -4573,6 +4573,139 @@ proving the install ran).
 | **M-LATECOPY-ATONLY** (the guard tests only `Img::At`) | 101 | `late_copy_in_the_gap_drops_for_a_gated_touch` (image 2's B reads `{1}` — key 2 lost) and `freed_lpids_late_copy_never_remaps`; passes the eviction-arm pin |
 | **G-GUARD-ABSENT-OK** (an absent entry installs) | 101 | the same two as M-LATECOPY-ATONLY; passes the eviction-arm pin |
 
+## RESULT (card X-5c-PINS-1)
+
+card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chain 5a0f3ed5 → b57ca484 → 78225b95 → 249111aa → a2be7919 → 02d58b89 → f21d68f9 → fd8bf4eb → here)
+
+1. **The mutant table** (every row applied to a scratch export of the
+   real code — its own export, its own `CARGO_TARGET_DIR` — shown
+   failing, reverted by construction; the worktree never held a
+   mutant):
+
+   | mutant | catching test |
+   |---|---|
+   | GX-RUPF-NORESET (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | `x5_r42_second_window_reuse_pf_starts_at_zero` |
+   | GX-R50-NOSELECT (`r41p` loses `r41 &&`) | `x5_r50_ineligible_rounds_draw_nothing` (the uniform literal 13) |
+   | G5-R48-TREADS-KEPT (drop `treads.clear()`) | **UNCAUGHT at this tip** — inert: no measurable seed reaches the joint arm (step 2's census); the tripwire in `r48_joint_supply_is_fresh_at_7469` revives the catch the day one does. ESCALATE 1 |
+   | G-PRED-LEN-ONLY (the predicate compares key counts only) | `x5r52_twin_dirs_differ_compares_directory_keys` (the equal-size case) |
+   | G-RESEED-TWIN-CUT (the re-seeded twin keeps its own `cut`) | **UNCAUGHT at this tip** — inert on every measurable event seed (step 3's measurement); no digest and no record field moves. ESCALATE 2 |
+   | G-MON-FIRSTLINE | `monitor-later-line-counts` |
+   | G-MON-FIRSTFILE | `monitor-last-file-counts` |
+   | G-MON-EMPTY-OK | `monitor-empty-run-out` |
+   | G-MON-NO-MONITOR-FIELD | `monitor-line-cut-before-monitor` |
+   | G-MON-MAX | `monitor-sums-not-max` |
+   | G-TIE-ONE-WAY | `monitor-more-run-outs-than-runs` |
+   | M-MON-DUP-OUT (the repeated-path refusal removed) | `monitor-run-out-repeated` |
+   | G1-HEADER-WINDOW (`pos + 24` for `pos + (*len).max(24)`) | `r47_record_completed_by_a_later_write` |
+   | G-GUARD-EVICT-AT (the guard lets `Img::At(r)` with `cur == r` install) | `late_copy_after_previous_epoch_eviction_drops` |
+   | M-LATECOPY-ATONLY / G-GUARD-ABSENT-OK | `late_copy_in_the_gap_drops_for_a_gated_touch` (and `freed_lpids_late_copy_never_remaps`, unchanged) |
+   | verdict `db1e5162`'s caught rows, re-applied | their cases there, unchanged — the 85-case self-test is green and none of its 78 prior case names or verdicts moved |
+
+2. **The re-read** (the Acceptance line, run for real; ref sha256
+   `41c307a4…1cd2`, run sha256 `158ce549…a69b`, both verified by the
+   comparator before any file was read), exit 0, **byte-identical to
+   `runlogs/X-5c-F4-F1-F1-F3-F1.acc.compare.out` and to verdict
+   `2e8d1b13`'s record** — `DIGESTS_MOVED 0`, 0 new failing, the same
+   exempt rounds (none):
+
+   ```
+   DIGESTS_MOVED 0 FAILING_ROUNDS 19 MONITOR 0
+   MOVED_GAINED 0 []
+   MOVED_MP_PENDING 0 []
+   META_ONLY_ELIGIBLE 0 []
+   MPA_PASS_FAIL 0 []
+   MPA_CLASS base 10 tip 10
+   TWIN_DDL_PENDING 0 []
+   MOVED_LOST 0 []
+   HEALED 0 []
+   TWIN_HEALED 0 []
+   TEXT_CHANGED 0 []
+   TWIN_FAILING 0 [] BASE 0
+   NEW_FAILING 0 [] BAD_SEEDS 0 []
+   ```
+
+3. **Item 3's cut pin used neither form.** The literal form was
+   attempted first exactly as prescribed: the committed diag patch on
+   a scratch export plus a scratch-only `RESEEDCUT` cut print, single
+   seeds from the README's 0..1000 event list. Every event seed's cuts
+   differ at the event (259 r1: 0 vs 5; 609/849: 2 vs 8; 719: 0 vs 7;
+   809: 0 vs 3), so a literal seed existed — but under
+   G-RESEED-TWIN-CUT no digest and no record field moves on any of the
+   five, nor on the nine further named 10k event seeds (2089, 2599,
+   2669, 2859, 3449, 5049, 5739, 7179, 9059): byte-identical records
+   both ways. The direct unit form does not exist — the re-seed block
+   is inline in `run_seed_with`, and extracting it is an `src/` change
+   Work 3 forbids. No new literal row was added (nothing for it to
+   pin); no existing literal changed.
+4. **No rule text changed:** X5-R51, X5-R52 and X5-R53 verbatim; no
+   tuning, quota, threshold, literal or exemption moved (`Tuning::BASE`
+   and `Tuning::FINAL` untouched; the X5-R37 literals stand byte for
+   byte); the comparator's one new refusal is a cannot-check exit 2,
+   and `read_monitor`, the count tie and every classifier are
+   unchanged. The one `src/` addition is item 2's diagnostic pair, in
+   the `twin_paired` manner (never a digest input — `SeedRec::finish`
+   never reads it; never serialized; the X5-R37 digest pin and the
+   chain-head 10k re-read prove no digest moved).
+5. **Post-data amendments: none.**
+
+acceptance (every line run for real): `cargo test -q --release -p
+e4-recovery` — **281 tests, 0 failed** (18+25+44+55+28+54+57 across the
+binaries; 276 at the Base + this card's 5 new pins);
+`python3 -I spikes/e4-recovery/tools/x5r52_compare.py self-test` —
+**85 cases, 0 failed**, exit 0; the re-read line — **exit 0, the
+reading above, byte-identical**; `bash scripts/gate.sh` — the gate
+note beneath.
+
+judgment calls (recorded in the steps above): scratch under
+`$CARGO_TARGET_DIR/x5pins-scratch/` (`~/.cache/nv3-review/` is
+read-only here, the carried judgment call); the joint-arm pin holds
+the honest subset with the arm's absence asserted as a tripwire; the
+eviction-arm pin's parked touch is a raw `free_lpid` and its eviction
+runs inside the `Mid2` hook (both forced by this tip's code, both
+stated in the pin's doc and step 6's record); the two new store pins
+use a 200_000 park budget (the 900_000 of the older pins, multiplied
+by the extra spinning, trips X5-R13 (b)'s 1_000_000 `YIELD_BUDGET`).
+
+ESCALATE: two items, both "the card's premise has drifted at the chain
+head; no code defect found".
+
+1. **The R21 (c) joint arm has no live seed at this tip, so
+   G5-R48-TREADS-KEPT is uncatchable.** The card (and verdict
+   `5db63057` finding 2) prescribe the pin at seed 7469 with the arm
+   running and 17 stale reads; at `2e8d1b13` it does not run there —
+   the re-paired twin now fires at the first re-derived spec
+   (`Mid2@3`) without the joint draw. Minimal deterministic repro (the
+   census): run seeds 0..1000 plus the re-pair family (2669, 4049,
+   4309, 7469, 8469, 8869, 9469, 9809) with the diagnostic fields —
+   `twin_joint_arm` reads all-false everywhere (`JOINT_ARM_SEEDS=[]`,
+   the step 2 log); dropping `treads.clear()` leaves the whole
+   `--test workload` suite green. The movers are X5-R49's slot
+   renumbering and the twin directory re-seed, both after the CXX
+   census. The diagnostic and the tripwire pin are in place; the
+   day any seed reaches the arm again, the freshness assertion is
+   what the mutant must fail.
+2. **G-RESEED-TWIN-CUT is behaviourally inert on every measurable
+   event seed.** The premise (cuts differ at the event) holds — all
+   five 0..1000 event seeds differ — but keeping the twin's `cut`
+   moves no record anywhere measurable (step 3's table). A digest
+   literal cannot catch it and the direct unit form needs an `src/`
+   extraction Work 3 forbids. The shipped code takes the real chain's
+   `cut` (confirmed by reading); the mutant is reported UNCAUGHT
+   rather than pinned by a vacuous literal.
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the base chain; the commits land — the log and the
+clean tree confirm); (b) the two folded card files and
+`cards/X-5c-F4-F1-F1-F3-F1.local.md` this card's Read list names are
+not present in this worktree (only this card's own file, PLAN, the
+cards README and the worker prompt are) — their content as this card
+quotes it is carried by the verdicts and this card's own Goal/Work,
+which is what was used; (c) `cargo fmt`'s first run of step 1 exited
+loudly on the same read-only packed-refs (the formatting itself
+succeeded; `cargo fmt --check` green throughout, one follow-up commit
+for a line it reflowed); (d) the gate's `GATE EXIT` reading below.
+
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
 Copied verbatim from the card before any campaign output was read
