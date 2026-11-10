@@ -10864,3 +10864,16 @@ failing rounds (class × count, seeds listed).
   known O-1(a) MP shape). SZC-MP 20 < 125; the wall passes — the walk
   continues. Probe, not evidence.
 
+- **rung 9.2** (9.1 with `ckpt_every` 8–12): wall **6.2** min/2000
+  (raw 37.4 s; load 5.91 11.02 12.30; cpu 501.0 s); SZC-MP **raw 1**,
+  per10k 10. Changed rows vs 9.1 (per10k): SZC-MP 20→10, SZC 20→10,
+  Q10 100→40, Q11 30→70, Q12 60→80, Q2 180→240, Q3 50→80, Q13b
+  1050→1130, Q5b 1130→890. Other rows (per10k, INFO): Q1 1130 (hooks
+  100–130), Q2 240, Q3 80, Q4 230, Q4-I 90, Q5a 70, Q5b 890, Q5c 710,
+  Q6a 210, Q6b 230, Q7 60, Q8 0, Q9 1420, Q10 40, Q11 70, Q12 80,
+  Q13a 970, Q13b 1130, Q13c 950, Q14 500, Q15 0, Q16 960, Q17 1070,
+  Q18 220, SIZING 1950 misses, SZC 10, SZC-MW 0, SZI 0. Fails: MP ×3
+  (30098 r1, 30337 r0, 30697 r0 — the known O-1(a)/O-3(e) MP shapes).
+  SZC-MP 10 < 125 — lower than 9.1's 20; the wall passes, the walk
+  continues. Probe, not evidence.
+
