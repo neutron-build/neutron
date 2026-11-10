@@ -10807,3 +10807,30 @@ failing rounds (class × count, seeds listed).
   SZI 360 < 375 (SZC-MW 90 ≥ 62.5), and the hold set still fails —
   Q5a 170 < 200. Not kept. Probe, not evidence.
 
+- **rung 7.3** (7.2 and chunked 700–900): wall **41.8** min/10k (raw
+  250.7 s; load 9.45 13.17 12.56; cpu 3355.2 s); Q4 1670, Q4-I 2160,
+  Q5a 230, Q7 50, Q18 4290. Changed rows vs 7.2: SZC 890→2390, SZC-MW
+  90→140, SZI 360→810, Q5a 170→230, Q11 380→450, Q12 220→270, Q10
+  650→460, Q9 9960→10220, SIZING 8600→7110. All rows (per10k): Q1
+  7990 (hooks 680–900, all ≥ 300), Q2 4370, Q3 1310, Q4 1670, Q5a 230,
+  Q5b 6920, Q5c 5420, Q6a 2160, Q6b 1210, Q7 50, Q8 340, Q9 10220,
+  Q10 460, Q11 450, Q12 270, Q13a 890, Q13b 960, Q13c 970, Q14 400,
+  Q15 1280, Q16 6770, Q17 10420, Q18 4290, SIZING 7110 misses, SZC
+  2390, SZC-MP 0 (this file), SZC-MW 140, SZI 810. Fails: none in
+  0..1000. **Rejected:** every ladder row reaches its margin (SZC
+  2390 ≥ 1,250, SZC-MW 140 ≥ 62.5, SZI 810 ≥ 375) — but the wall
+  limit fails (41.8 > 40), which ends the ladder's walk, and the hold
+  set fails too (Q10 460 < 500, met at 6.1). Not kept. Probe, not
+  evidence.
+
+- **SZC ladder outcome (steps 7–8): ESCALATE.** Rungs 7.4–7.5 (step 8)
+  never run: 7.3 is over the wall limit, which ends the walk. No rung
+  passes the hold set and wall limit together (7.1 and 7.2 fail Q5a ≥
+  200; 7.3 fails the wall and Q10 ≥ 500), so FINAL keeps the setting
+  before the ladder — 6.1 — reading **SZC 620 < 1,000 and SZI 150 <
+  300** (SZC-MW 60 ≥ 50 is met there). Both rows return to the owner
+  with every rung's numbers, exactly the card's stated likely ESCALATE
+  (REFRESH 6's k4/k5 read Q5a short too; the sample here reads Q5a
+  120/170/230 across the rungs against the 200 it must not fall
+  below). Later steps still run. Probe, not evidence.
+
