@@ -10479,6 +10479,161 @@ the chain 70934c1b → 033fb23b → here)
 5. **Post-data amendments: none.** The Acceptance's reading is the
    runner's.
 
+## Card X-5c-F4-F3 (FINAL = S1, the pre-registered retune of Q7, Q8,
+## Q11, Q12, SZC, SZC-MW, SZI and MP_PRESSURE, and the CPU term)
 
+Base: `card/v3-E4-SILENT-1` (tip `8d679ccd`), which carries
+X-5c-F4-F2 (`9f96f31e`) and the two E4-SILENT fixes. FINAL = S1 —
+`r41_share` 1000, `r41p_share` 500, the setting of verdict `2e8d1b13`
+— then the pre-registered ladders below retune the listed knobs of
+`Tuning::FINAL` (and, in step 9, `Tuning::MP_PRESSURE`) and nothing
+else. `Tuning::BASE` is never edited. Every number this card produces
+is a **probe, not evidence**; the final run's own `verify` is the only
+quota evidence. The baseline of record is
+`~/.cache/nv3-review/runlogs/E4-SILENT-1.baseline.json`, sha256
+`fe598604e1918b9c9a15366b6b393e3711b1efd4bcddc6b6c5d0f44d2a97ede8`.
 
+### X-5c-F4-F3 ladder
 
+Pre-registered at step 0, before any probe (card Work 0). Copied from
+the card: the stop rule, every ladder table and the owner decisions.
+No threshold, ladder, rung, knob, margin or stop rule is added or
+changed after any probe; every rung tried below is in the card.
+
+**The stop rule, fixed here for every ladder.** A rung's result is
+read by the probe's `per10k`:
+
+- **Stop-and-keep** at the first rung where the ladder's rows reach
+  **required × 1.25** and the hold set and wall limit pass. The 1.25
+  is a stopping margin for a sampled probe, not a threshold:
+  `0..1000 × 10` read Q7 190 against the 10k's 172, and 0..400 × 25
+  read Q8 325 against the 10k's 90.
+- **The hold set:** Q4 ≥ 1,500 and Q4-I ≥ 1,500 (the owner's bars),
+  and no row that met its minimum at the last kept setting falls below
+  that minimum. A row whose ladder is still to come may be short.
+- **The wall limit:** `min_per_10k` ≤ 40 (`min_per_2000` ≤ 40 for
+  `MP_PRESSURE`).
+- **If no rung reaches the margin, keep the highest rung that reaches
+  the required count and passes the hold set and wall limit,** and
+  record it as `thin`.
+- **Rung order is by rising cost.** A rung over the wall limit ends
+  that ladder's walk.
+- **If no rung reaches the required count: ESCALATE with the
+  numbers.** The row and every rung's README row go to the owner, as
+  REFRESH 5, 8 and 9 require. FINAL keeps the rung of that ladder with
+  the highest count that passes the hold set and wall limit, or the
+  setting before the ladder if none does. Later steps still run, so
+  the owner gets every row and both CPU figures.
+
+**Owner decisions of 2026-11-10 (X-5c-F4 REFRESH 10, "Conflicts"; a
+scope reading made with the data known, delegated by the owner).**
+
+- CPU ≤ +60% binds the `r41` alignment setting it was set for (S1).
+  The whole run's cost is limited by the owner's existing
+  40-minute-per-campaign time box. The whole-FINAL CPU is still
+  measured and reported.
+- FINAL = S1 fixes the two `r41` knobs, and the pre-registered retune
+  raises Q7, Q8, Q11, Q12, SZC and SZI within limits.
+- **No threshold moves. A row that is unreachable returns to the owner
+  with numbers.**
+
+The ladders, in the card's order (Q7, Q8, Q11, Q12, then SZC, SZC-MW
+and SZI; then `MP_PRESSURE`). For each row, if the last kept setting
+already reaches required × 1.25, a "no retune needed" row citing the
+last probe is recorded and the ladder is skipped. Each rung changes
+only the fields listed, on top of the last kept setting; every commit
+changes FINAL's constants only to that rung.
+
+**Step 3 — Q7 ≥ 200** (required × 1.25 = 250):
+
+| Rung | Change |
+|---|---|
+| 3.1 | `drop_one_in` 2 |
+| 3.2 | `drop_one_in` 1 |
+
+**Step 4 — Q8 ≥ 100** (required × 1.25 = 125; direction per REFRESH 4:
+the SyncOff mix and the F-CRASH keep):
+
+| Rung | Change |
+|---|---|
+| 4.1 | `syncoff_table` `[0, 7, 7]` |
+| 4.2 | `syncoff_table` `[3, 7, 7]` |
+| 4.3 | 4.2 and `keep_latest_pm_table` `[100, 100, 300, 500, 700]` |
+
+**Step 5 — Q11 ≥ 100** (required × 1.25 = 125; watch Q5a). If no rung
+reaches it, also report how often a failed recycling rename (`to`
+exists) happens on FINAL (REFRESH 7), from a scratch export with a
+logging patch over `0..200`, never committed:
+
+| Rung | Change |
+|---|---|
+| 5.1 | `w11_share` 100 |
+| 5.2 | `w11_share` 150 |
+| 5.3 | `w11_share` 200 |
+
+**Step 6 — Q12 ≥ 100** (required × 1.25 = 125; watch Q5a):
+
+| Rung | Change |
+|---|---|
+| 6.1 | `w12_share` 100 |
+| 6.2 | `w12_share` 150 |
+| 6.3 | `w12_share` 200 |
+
+**Steps 7–8 — SZC ≥ 1,000, SZC-MW ≥ 50 and SZI ≥ 300** (required ×
+1.25 = 1,250 / 62.5 / 375). One ladder: all three rows read together,
+and the stop rule needs all three. Each rung is cumulative, from
+REFRESH 6's k4 and k5 directions. Wider or longer intervals and larger
+chunked sets, with the pool untouched. Step 8 (rungs 7.4–7.5) runs
+only if the stop rule has not ended the ladder:
+
+| Rung | Change |
+|---|---|
+| 7.1 | `ckpt_every` 8–12 (`ckpt_every_lo` 8, `ckpt_every_span` 5) |
+| 7.2 | 7.1 and `value_lo` 280 |
+| 7.3 | 7.2 and chunked 700–900 (`chunked_ops_lo` 700, `chunked_ops_span` 201) |
+| 7.4 | 7.3 and GC 6–8 (`gc_sweeps_lo` 6, `gc_sweeps_span` 3) |
+| 7.5 | 7.4, chunked 900–1200 (`chunked_ops_lo` 900, `chunked_ops_span` 301), budget 20–31 (`commit_budget_lo` 20, `commit_budget_span` 12) and GC 8 (`gc_sweeps_lo` 8, `gc_sweeps_span` 1) |
+
+**Step 9 — `MP_PRESSURE`: SZC-MP ≥ 100 on the 200 MP-class seeds ×
+10** (required × 1.25 = 125). These fields are set in
+`Tuning::MP_PRESSURE` only, `{ <rung's fields>, ..Tuning::FINAL }`;
+FINAL does not change. Read with `x5_probe.sh --mp`. REFRESH 6's table
+reads MP on 1–7 raw hits, so the raw count is reported. Rung 9.0 is
+`MP_PRESSURE` equal to the kept FINAL:
+
+| Rung | Change, over FINAL |
+|---|---|
+| 9.1 (k1) | chunked 900–1200, budget 20–31, GC 12 (`gc_sweeps_lo` 12, `gc_sweeps_span` 1), `ckpt_every` 4–8 (`ckpt_every_lo` 4, `ckpt_every_span` 5), `burst_frac` 600, `burst_gc_loops` 8, `w11_share` 200, `w12_share` 200 |
+| 9.2 | 9.1 with `ckpt_every` 8–12 |
+| 9.3 (k2) | 9.1 with `ckpt_every` 12–19 (`ckpt_every_lo` 12, `ckpt_every_span` 8) |
+
+**The probe and the README row.** `x5_probe.sh <name> <outdir>` is
+five 200-seed `run --seeds <b>..<b+200> --threads 16` blocks over
+`0..1000`, with the release binary run directly and user+sys taken
+from bash `time`. `x5_probe.sh --mp <name> <outdir>` is one `run
+--probe mp-pressure --threads 16`. Each prints `PROBE_ROW <id>
+raw=<sum> per10k=<sum × 10>` per `PROBE_QUOTA` row, one `PROBE_WALL
+raw_s=<s> min_per_10k=<x> load_at_start=<a b c>` (for `--mp`,
+`min_per_2000`), one `PROBE_CPU user_sys_s=<s>`, and one `PROBE_FAIL
+<class> <seed> r<n> <the round's o1, o2 or o3 text cut to 80
+characters>` per failing round, read from the JSON with `python3 -I`.
+For `--mp`, the `per10k` field holds `raw × 10`, which is the
+2,000-seed set's count. The README row per rung records: the rung, the
+knobs, every changed row's raw and per-10k count, Q4, Q4-I, Q5a, Q7,
+Q18, wall per 10k with the load, user+sys, failing rounds by class,
+and "probe, not evidence".
+
+**New classes (X5-R16).** Seeds 221, 423, 370, 151 and 190 on retuned
+knobs are C-XX (REFRESH 8) and are recorded. A class C round with an
+O-1 failure and no `XX001` in its texts, or any `PROBE_FAIL` class you
+cannot name from REFRESH 6 and 8, is a STOP: the row is committed and
+the attempt ends with an ESCALATE naming the seed. Workers do not
+triage it.
+
+**Run hygiene (X5-R31).** Tests, single seeds and the probes below,
+each process running at most 200 contiguous seeds, under `ulimit -v
+25165824`. No `verify`, no `seeded-faults`, no wider run, no stress
+loops and no `scripts/gate.sh` in the attempt; no seed in
+`10000..30000`, ever; no seed filtering. Probe output and mutant
+copies go under `$CARGO_TARGET_DIR/x5f3-scratch/`; each mutant gets
+its own scratch export and its own target directory.
