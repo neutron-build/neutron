@@ -40,13 +40,142 @@ export const passwordHash = () => process.env.CMS_PASSWORD_HASH || null;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
-// Sessions. Binding each to the password means changing it signs everything out.
+function transaction<T>(work: () => T): T {
+  db().exec("BEGIN IMMEDIATE");
+  try {
+    const result = work();
+    db().exec("COMMIT");
+    return result;
+  } catch (error) {
+    db().exec("ROLLBACK");
+    throw error;
+  }
+}
 
-export function createSession(hash: string): string {
+// Accounts. The owner logs in with CMS_PASSWORD_HASH, or with a password set in the admin against
+// it. Everyone else is a person, with a name and a password of their own.
+
+export type Account = { kind: "owner" } | { kind: "person"; id: number; name: string };
+export interface Person {
+  id: number;
+  name: string;
+  created_at: string;
+}
+
+export const MIN_PASSWORD = 12;
+/** Long enough for any passphrase, short enough that refusing one costs no hashing. */
+export const MAX_PASSWORD = 200;
+
+/** As strong as the command line's. Shown once, never stored. */
+export const generatePassword = () => randomBytes(24).toString("base64url");
+
+const envTag = (env: string) => sha256(`neutron-cms owner\n${env}`);
+
+/**
+ * The hash the owner's password is checked against now. A password set in the admin counts only while
+ * CMS_PASSWORD_HASH is the one it was set against: setting a new one from the command line replaces
+ * it, and it is removed, so the command line is always the way back in.
+ */
+export function ownerHash(): string | null {
+  const env = passwordHash();
+  if (!env) return null;
+  const row = db().prepare("SELECT env_tag, password_hash FROM owner_password WHERE id = 1").get() as { env_tag: string; password_hash: string } | undefined;
+  if (!row) return env;
+  if (row.env_tag === envTag(env)) return row.password_hash;
+  db().prepare("DELETE FROM owner_password WHERE env_tag <> ?").run(envTag(env));
+  return env;
+}
+
+/**
+ * A login name, trimmed and in lower case, or null when it isn't one: letters, digits, dot, dash and
+ * underscore, or an email address. Nothing that looks like another character, and nothing to escape.
+ */
+export function loginName(raw: string): string | null {
+  const name = raw.trim().toLowerCase();
+  if (name.length > 100) return null;
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(name) || /^[a-z0-9._+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name) ? name : null;
+}
+
+export const people = () => db().prepare("SELECT id, name, created_at FROM people ORDER BY name").all() as unknown as Person[];
+export const personById = (id: number) => db().prepare("SELECT id, name, created_at FROM people WHERE id = ?").get(id) as Person | undefined;
+export const hasPeople = () => Boolean(db().prepare("SELECT 1 FROM people LIMIT 1").get());
+
+// Shaped like a real hash, so checking a name nobody has costs the same as checking one somebody has.
+// What it says is never used.
+const DECOY = `scrypt.${SCRYPT.N}.${SCRYPT.r}.${SCRYPT.p}.${"A".repeat(22)}.${"A".repeat(43)}`;
+
+/**
+ * Who this name and password belong to. No name is the owner. Exactly one password check runs either
+ * way, so an unknown name and a wrong password take the same time and give the same answer.
+ */
+export async function checkLogin(rawName: string, password: string): Promise<{ account: Account; hash: string } | null> {
+  if (!rawName.trim()) {
+    const hash = ownerHash();
+    return hash && (await verifyPassword(password, hash)) ? { account: { kind: "owner" }, hash } : null;
+  }
+  const name = loginName(rawName);
+  const person = name ? (db().prepare("SELECT id, name, password_hash FROM people WHERE name = ?").get(name) as { id: number; name: string; password_hash: string } | undefined) : undefined;
+  const verified = await verifyPassword(password, person?.password_hash ?? DECOY);
+  return person && verified ? { account: { kind: "person", id: person.id, name: person.name }, hash: person.password_hash } : null;
+}
+
+/** Checks the password of an account that is logged in. */
+export async function checkPassword(account: Account, password: string): Promise<boolean> {
+  const hash = account.kind === "owner" ? ownerHash() : (db().prepare("SELECT password_hash FROM people WHERE id = ?").get(account.id) as { password_hash: string } | undefined)?.password_hash;
+  return verifyPassword(password, hash ?? DECOY).then((verified) => Boolean(hash) && verified);
+}
+
+export function addPerson(name: string, hash: string): number | "taken" {
+  const result = db().prepare("INSERT INTO people (name, password_hash, created_at) VALUES (?, ?, ?) ON CONFLICT (name) DO NOTHING").run(name, hash, new Date().toISOString());
+  return result.changes ? Number(result.lastInsertRowid) : "taken";
+}
+
+/** Removes a person and ends their sessions at once. */
+export function removePerson(id: number): boolean {
+  return transaction(() => {
+    db().prepare("DELETE FROM sessions WHERE person_id = ?").run(id);
+    const removed = db().prepare("DELETE FROM people WHERE id = ?").run(id).changes > 0;
+    if (removed) rotatePreviewKey();
+    return removed;
+  });
+}
+
+/**
+ * A new password for an account. Its other sessions end; `keep`, the session making the change, stays
+ * logged in. Draft preview links end too.
+ */
+export function setPassword(account: Account, hash: string, keep?: string): boolean {
+  return transaction(() => {
+    const env = passwordHash();
+    if (!env) return false;
+    if (account.kind === "owner") {
+      db().prepare("INSERT INTO owner_password (id, env_tag, password_hash, set_at) VALUES (1, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET env_tag = excluded.env_tag, password_hash = excluded.password_hash, set_at = excluded.set_at")
+        .run(envTag(env), hash, new Date().toISOString());
+      db().prepare("DELETE FROM sessions WHERE person_id IS NULL AND token_hash <> ?").run(keep ?? "");
+      if (keep) db().prepare("UPDATE sessions SET password_tag = ? WHERE token_hash = ? AND person_id IS NULL").run(sessionTag(hash), keep);
+    } else {
+      if (!db().prepare("UPDATE people SET password_hash = ? WHERE id = ?").run(hash, account.id).changes) return false;
+      db().prepare("DELETE FROM sessions WHERE person_id = ? AND token_hash <> ?").run(account.id, keep ?? "");
+      if (keep) db().prepare("UPDATE sessions SET password_tag = ? WHERE token_hash = ? AND person_id = ?").run(sessionTag(hash, env), keep, account.id);
+    }
+    rotatePreviewKey();
+    return true;
+  });
+}
+
+// Sessions. Each carries a tag of the password it was made with, so a new password ends it. A person's
+// tag takes in CMS_PASSWORD_HASH too, so a new one from the command line still signs out everyone.
+// The owner's tag is the bare hash, as it always was, so sessions from before people existed carry on.
+
+const sessionTag = (hash: string, env?: string) => (env === undefined ? sha256(hash) : sha256(`neutron-cms person\n${env}\n${hash}`));
+
+/** `hash` is the password hash just checked: the owner's, or with `person`, that person's. */
+export function createSession(hash: string, person?: number): string {
   const token = randomBytes(32).toString("base64url");
   const expires = new Date(Date.now() + SESSION_DAYS * 86_400_000).toISOString();
+  const tag = person === undefined ? sessionTag(hash) : sessionTag(hash, passwordHash() ?? "");
   db().prepare("DELETE FROM sessions WHERE expires_at < ?").run(new Date().toISOString());
-  db().prepare("INSERT INTO sessions (token_hash, password_tag, expires_at) VALUES (?, ?, ?)").run(sha256(token), sha256(hash), expires);
+  db().prepare("INSERT INTO sessions (token_hash, password_tag, expires_at, person_id) VALUES (?, ?, ?, ?)").run(sha256(token), tag, expires, person ?? null);
   return token;
 }
 
@@ -59,24 +188,58 @@ function cookieValues(request: Request): string[] {
   return values.slice(0, 8);
 }
 
-/** A browser can send several cookies of this name; any one that is valid counts. */
-export function hasSession(request: Request): boolean {
-  const hash = passwordHash();
+/**
+ * Who is logged in, and the session that says so. A browser can send several cookies of this name;
+ * the first valid one counts. Nothing is logged in while CMS_PASSWORD_HASH is unset.
+ */
+export function sessionOf(request: Request): { account: Account; session: string } | null {
+  const env = passwordHash();
   const tokens = cookieValues(request);
-  if (!hash || tokens.length === 0) return false;
-  const find = db().prepare("SELECT 1 FROM sessions WHERE token_hash = ? AND password_tag = ? AND expires_at > ?");
+  if (!env || tokens.length === 0) return null;
+  const owner = ownerHash()!;
+  const find = db().prepare(
+    `SELECT sessions.person_id, sessions.password_tag, people.name, people.password_hash FROM sessions
+     LEFT JOIN people ON people.id = sessions.person_id WHERE sessions.token_hash = ? AND sessions.expires_at > ?`,
+  );
   const now = new Date().toISOString();
-  return tokens.some((token) => Boolean(find.get(sha256(token), sha256(hash), now)));
+  for (const token of tokens) {
+    const session = sha256(token);
+    const row = find.get(session, now) as { person_id: number | null; password_tag: string; name: string | null; password_hash: string | null } | undefined;
+    if (!row) continue;
+    if (row.person_id === null) {
+      if (row.password_tag === sessionTag(owner)) return { account: { kind: "owner" }, session };
+    } else if (row.password_hash !== null && row.name !== null && row.password_tag === sessionTag(row.password_hash, env)) {
+      return { account: { kind: "person", id: row.person_id, name: row.name }, session };
+    }
+  }
+  return null;
 }
+
+export const hasSession = (request: Request): boolean => sessionOf(request) !== null;
 
 // Drafts of designed pages open in the Edit site frame, on the site's own address, where the
 // session cookie (scoped to the admin) never reaches. A short-lived signed key in the address does.
-// Signed with the password hash: it survives a deploy and every instance agrees, and changing the
-// password ends every key at once.
+// The key comes from CMS_PASSWORD_HASH and a random value kept in the database: every instance
+// agrees and it survives a deploy, a stolen database alone can't make one, and a new password from
+// the command line ends every link. The random value is replaced whenever a password changes or a
+// person is removed or given a new password, which ends every link made before.
 export type PreviewScope = "page" | "design";
 const PREVIEW_HOURS = 2;
+
+function previewSecret(): string {
+  const read = () => (db().prepare("SELECT value FROM auth_keys WHERE name = 'preview'").get() as { value: string } | undefined)?.value;
+  const found = read();
+  if (found) return found;
+  db().prepare("INSERT INTO auth_keys (name, value) VALUES ('preview', ?) ON CONFLICT (name) DO NOTHING").run(randomBytes(32).toString("base64url"));
+  return read()!;
+}
+
+function rotatePreviewKey(): void {
+  db().prepare("INSERT INTO auth_keys (name, value) VALUES ('preview', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value").run(randomBytes(32).toString("base64url"));
+}
+
 const previewMac = (scope: PreviewScope, name: string, expires: string) =>
-  createHmac("sha256", sha256(`neutron-cms preview\n${passwordHash()}`)).update(`${scope}\n${name}\n${expires}`).digest("base64url");
+  createHmac("sha256", sha256(`neutron-cms preview\n${passwordHash()}\n${previewSecret()}`)).update(`${scope}\n${name}\n${expires}`).digest("base64url");
 
 export function previewToken(scope: PreviewScope, name: string): string {
   const expires = String(Date.now() + PREVIEW_HOURS * 3_600_000);

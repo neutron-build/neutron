@@ -101,6 +101,26 @@ const MIGRATIONS = [
      saved_at TEXT NOT NULL,
      before TEXT NOT NULL
    );`,
+  // People who log in with their own name and password. Names are stored trimmed and lower case, so
+  // they are unique however they are typed. AUTOINCREMENT: a removed person's id is never reused.
+  // A session with no person_id is the owner's, as every session made before this was.
+  // owner_password is a password the owner set in the admin, valid only while CMS_PASSWORD_HASH is
+  // the one it was set against (env_tag). auth_keys holds the random part of the preview key.
+  `CREATE TABLE people (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     name TEXT NOT NULL UNIQUE,
+     password_hash TEXT NOT NULL,
+     created_at TEXT NOT NULL
+   );
+   ALTER TABLE sessions ADD COLUMN person_id INTEGER;
+   CREATE INDEX sessions_person ON sessions(person_id);
+   CREATE TABLE owner_password (
+     id INTEGER PRIMARY KEY CHECK (id = 1),
+     env_tag TEXT NOT NULL,
+     password_hash TEXT NOT NULL,
+     set_at TEXT NOT NULL
+   );
+   CREATE TABLE auth_keys (name TEXT PRIMARY KEY, value TEXT NOT NULL);`,
 ];
 
 const store = globalThis as typeof globalThis & { __cmsDb?: DatabaseSync };

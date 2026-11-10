@@ -36,7 +36,15 @@ export const config = { mode: "app" };
 export const { GET, POST } = cms;
 ```
 
-Log in at `/n-admin`.
+Log in at `/n-admin` with that password. It belongs to the owner.
+
+## People and passwords
+
+The owner can let others edit without sharing a password. **People** in the admin adds a person by name (letters, numbers, dots, dashes and underscores, or an email address; upper and lower case are the same) and shows a strong password once, to pass on. Once anyone is added, the login asks for a name too; the owner leaves it empty, as before. People can edit all content but not manage people. The owner can give a person a new password or remove them, and either logs them out at once.
+
+Everyone can change their own password under **Account**: at least 12 characters, at most 200. It logs that account out on other devices and keeps the current one.
+
+The owner's password changed there is kept in the database and counts only while `CMS_PASSWORD_HASH` stays the same. If the owner forgets it, run `npx neutron-cms password` and set the new hash: that password works, the one set in the admin is removed, and everyone is logged out. A person who forgets theirs asks the owner for a new one.
 
 ## Show content
 
@@ -136,7 +144,7 @@ Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type
 
 | Variable | Purpose |
 |---|---|
-| `CMS_PASSWORD_HASH` | From `npx neutron-cms password` |
+| `CMS_PASSWORD_HASH` | The owner's password, from `npx neutron-cms password`. Changing it logs everyone out and undoes an owner password set in the admin. Without it, nobody can log in |
 | `SITE_URL` | Your public origin. Required in production, because admin saves must come from it |
 | `CMS_DATA_DIR` | Where `site.db` and `media/` live. Required in production, normally a mounted volume |
 
@@ -156,7 +164,8 @@ Serve `cms.ready()` from a health route to stop a deploy that has lost its data.
 The admin trusts your public site. Any script running on the site's own address, including an analytics or embed script, runs with the owner's login when the owner visits. That is normal for a CMS on the same domain, WordPress included. For real separation, serve the admin from its own subdomain.
 
 
-- One account with one password.
+- Two kinds of account: the owner, and people who can edit everything but not manage people.
+- Draft preview links from Edit site last two hours, and end when any password changes or a person is removed.
 - Uploads are limited to 2000px on the long side, and the original is not kept.
 - Images are not deleted when content stops using them. Delete them from Media; "Delete all unused" leaves those kept for undo and any added in the last day.
 - If you disallow `/n-admin` in `robots.txt`, add `Allow: /n-admin/media/` so search engines can see your images.

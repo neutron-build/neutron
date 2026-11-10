@@ -1,5 +1,7 @@
-import type { ComponentChildren } from "preact";
+import { createContext, type ComponentChildren } from "preact";
+import { useContext } from "preact/hooks";
 import { assetUrl } from "./assets.js";
+import { MAX_PASSWORD, MIN_PASSWORD, type Account, type Person } from "./auth.js";
 import { isPhotoList, TEXT, type ResolvedConfig, type ResolvedField, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { isSafeUrl } from "./safe-url.js";
@@ -34,9 +36,13 @@ export function Document(props: { config: ResolvedConfig; title: string; childre
   );
 }
 
+/** Who is logged in, for the header. */
+export const Viewer = createContext<Account | null>(null);
+
 function Shell(props: { config: ResolvedConfig; active?: string; children: ComponentChildren }) {
   const { config, active } = props;
   const admin = config.path;
+  const viewer = useContext(Viewer);
   const current = (name: string) => (active === name ? "page" : undefined);
   return (
     <>
@@ -52,6 +58,8 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
         <a href={`${admin}/media`} aria-current={current("media")}>Media</a>
         <span class="spacer" />
         <a href="/" target="_blank" rel="noreferrer">View site</a>
+        {viewer?.kind === "owner" ? <a href={`${admin}/people`} aria-current={current("people")}>People</a> : null}
+        {viewer ? <a href={`${admin}/account`} aria-current={current("account")} title={viewer.kind === "person" ? `Logged in as ${viewer.name}` : "Logged in as the owner"}>Account</a> : null}
         <form method="post" action={`${admin}/logout`}>
           <button class="link" type="submit">Log out</button>
         </form>
@@ -70,7 +78,7 @@ export function NotFoundPage(props: { config: ResolvedConfig }) {
   );
 }
 
-export function LoginPage(props: { config: ResolvedConfig; configured: boolean; error?: string; next?: string | null }) {
+export function LoginPage(props: { config: ResolvedConfig; configured: boolean; named?: boolean; name?: string; error?: string; next?: string | null }) {
   return (
     <main class="login">
       <h1>Log in</h1>
@@ -78,9 +86,16 @@ export function LoginPage(props: { config: ResolvedConfig; configured: boolean; 
       {props.configured ? (
         <form method="post" action={`${props.config.path}/login`}>
           {props.next ? <input type="hidden" name="next" value={props.next} /> : null}
+          {props.named ? (
+            <label class="field">
+              <span>Name</span>
+              <input class="input" name="name" value={props.name ?? ""} autocomplete="username" autocapitalize="off" spellcheck={false} autofocus />
+              <small>Leave empty if you are the owner.</small>
+            </label>
+          ) : null}
           <label class="field">
             <span>Password</span>
-            <input class="input" type="password" name="password" autocomplete="current-password" required autofocus />
+            <input class="input" type="password" name="password" autocomplete="current-password" required autofocus={!props.named} />
           </label>
           {props.error ? <p class="error" role="alert">{props.error}</p> : null}
           <button class="button primary" type="submit">Log in</button>
@@ -89,6 +104,105 @@ export function LoginPage(props: { config: ResolvedConfig; configured: boolean; 
         <p>No password is set. Run <code>npx neutron-cms password</code>.</p>
       )}
     </main>
+  );
+}
+
+export function AccountPage(props: { config: ResolvedConfig; account: Account; changed: boolean; error?: string }) {
+  const { config, account } = props;
+  const owner = account.kind === "owner";
+  return (
+    <Shell config={config} active="account">
+      <main class="page narrow">
+        <div class="page-head"><h1>Account</h1></div>
+        <p class="muted account-who">{owner ? "You are the owner." : <>You are logged in as <strong>{account.name}</strong>.</>}</p>
+        {props.changed ? <p class="undo" role="status">Password changed. You are still logged in here, and logged out everywhere else.</p> : null}
+        <form class="account-form" method="post">
+          {owner ? null : <input type="hidden" name="username" value={account.name} autocomplete="username" />}
+          <h2>Change password</h2>
+          <label class="field">
+            <span>Current password</span>
+            <input class="input" type="password" name="current" autocomplete="current-password" required />
+          </label>
+          <label class="field">
+            <span>New password</span>
+            <input class="input" type="password" name="password" autocomplete="new-password" minLength={MIN_PASSWORD} maxLength={MAX_PASSWORD} required />
+            <small>At least {MIN_PASSWORD} characters. A few unrelated words make a good one.</small>
+          </label>
+          <label class="field">
+            <span>New password again</span>
+            <input class="input" type="password" name="repeat" autocomplete="new-password" minLength={MIN_PASSWORD} maxLength={MAX_PASSWORD} required />
+          </label>
+          {props.error ? <p class="error" role="alert">{props.error}</p> : null}
+          <button class="button primary" type="submit">Change password</button>
+          <p class="muted account-note">
+            {owner
+              ? <>Changing it logs you out on your other devices. Forgot it? Whoever runs the site can run <code>npx neutron-cms password</code> and set the new <code>CMS_PASSWORD_HASH</code>. That replaces the password set here.</>
+              : "Changing it logs you out on your other devices. Forgot it? Ask the owner for a new one."}
+          </p>
+        </form>
+      </main>
+    </Shell>
+  );
+}
+
+export function PeoplePage(props: {
+  config: ResolvedConfig;
+  people: Person[];
+  /** A password just made, shown this once. */
+  given?: { name: string; password: string; added: boolean };
+  removed?: boolean;
+  error?: string;
+}) {
+  const { config, given } = props;
+  const admin = config.path;
+  return (
+    <Shell config={config} active="people">
+      <main class="page narrow">
+        <div class="page-head"><h1>People</h1></div>
+        <p class="muted people-intro">People you add log in with their own name and password. They can edit everything, but only you can add or remove people.</p>
+        {given ? (
+          <div class="given" role="status">
+            <p>{given.added ? `${given.name} is added.` : `${given.name} has a new password and is logged out.`} Give them these. The password is shown only now.</p>
+            <dl>
+              <dt>Name</dt><dd><code>{given.name}</code></dd>
+              <dt>Password</dt><dd><code>{given.password}</code></dd>
+            </dl>
+            <button class="button" type="button" data-copy-text={given.password}>Copy password</button>
+          </div>
+        ) : null}
+        {props.removed ? <p class="undo" role="status">Removed, and logged out.</p> : null}
+        <form class="people-add" method="post" action={`${admin}/people`}>
+          <label class="field">
+            <span>Name</span>
+            <input class="input" name="name" required maxLength={100} placeholder="sam or sam@example.com" autocomplete="off" autocapitalize="off" spellcheck={false} />
+            <small>Letters, numbers, dots, dashes and underscores, or an email address.</small>
+          </label>
+          <button class="button primary" type="submit">Add person</button>
+        </form>
+        {props.error ? <p class="error people-error" role="alert">{props.error}</p> : null}
+        {props.people.length === 0 ? (
+          <p class="muted">Only you can log in now.</p>
+        ) : (
+          <table class="posts people">
+            <tbody>
+              {props.people.map((person) => (
+                <tr key={person.id}>
+                  <td><span class="person-name">{person.name}</span><small class="muted">Added {listDate(config, person.created_at)}</small></td>
+                  <td class="actions"><div>
+                    <form method="post" action={`${admin}/people/${person.id}/reset`}>
+                      <button class="link" type="submit" data-confirm={`Give ${person.name} a new password? The old one stops working and they are logged out.`}>New password</button>
+                    </form>
+                    <form method="post" action={`${admin}/people/${person.id}/remove`}>
+                      <button class="link" type="submit" data-confirm={`Remove ${person.name}? They are logged out and can't log in again.`}>Remove</button>
+                    </form>
+                  </div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </main>
+    </Shell>
   );
 }
 

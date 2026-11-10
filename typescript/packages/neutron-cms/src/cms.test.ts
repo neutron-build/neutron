@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -285,9 +286,18 @@ test("a text that was never saved goes back to never saved", () => {
   assert.equal(db().prepare("SELECT 1 FROM texts WHERE key = 'fresh'").get(), undefined);
 });
 
-test("the history table is added after the existing migrations", () => {
+test("people are added after the existing migrations, and the previous release still reads and writes sessions", async () => {
   const version = (db().prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
-  assert.equal(version, 6);
+  assert.equal(version, 7);
+  // The statements the previous release runs, against the new schema, during a deploy.
+  const hash = await hashPassword("old release");
+  process.env.CMS_PASSWORD_HASH = hash;
+  const tag = createHash("sha256").update(hash).digest("hex");
+  db().prepare("INSERT INTO sessions (token_hash, password_tag, expires_at) VALUES (?, ?, ?)").run(createHash("sha256").update("old-token").digest("hex"), tag, iso(60_000));
+  assert.ok(db().prepare("SELECT 1 FROM sessions WHERE token_hash = ? AND password_tag = ? AND expires_at > ?").get(createHash("sha256").update("old-token").digest("hex"), tag, iso(0)));
+  // A session it made is the owner's here.
+  assert.equal(hasSession(new Request("http://x/", { headers: { cookie: "n_session=old-token" } })), true);
+  delete process.env.CMS_PASSWORD_HASH;
 });
 
 test("image uses are found by file name in every place, with a thumbnail counting as its image", () => {

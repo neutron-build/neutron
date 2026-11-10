@@ -1,16 +1,18 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { VNode } from "preact";
 import { render } from "preact-render-to-string";
 import { isAsset, serveAsset } from "./assets.js";
 import {
-  clearAttempts, clientAddress, createSession, endSession, hasSession, passwordHash, previewToken, readLimited, sessionCookie,
-  takeAttempt, verifyPassword, withPasswordCheck,
+  type Account, addPerson, checkLogin, checkPassword, clearAttempts, clientAddress, createSession, endSession, generatePassword, hashPassword, hasPeople, hasSession,
+  loginName, MAX_PASSWORD, MIN_PASSWORD, passwordHash, people, personById, previewToken, readLimited, removePerson, sessionCookie, sessionOf, setPassword,
+  takeAttempt, withPasswordCheck,
 } from "./auth.js";
 import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { isSafeUrl } from "./safe-url.js";
 import { deleteImage, isImageName, listImages, MAX_UPLOAD_BYTES, saveImage, serveImage, type StoredImage } from "./media.js";
-import { Document, EditorPage, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
+import { AccountPage, Document, EditorPage, PeoplePage, Viewer, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
   allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
   sortByDate, trashCount, trashed, trashPost, valuesNow, versionsOf, type Item, type Post, type Save, type Snapshot,
@@ -99,6 +101,9 @@ function isSameOrigin(request: Request): boolean {
 
 const statusOf = (post: Post, at?: string): Status => (!post.published_at ? "draft" : isLive(post, at) ? "live" : "scheduled");
 
+/** Who is logged in, for the request being answered. */
+const viewer = new AsyncLocalStorage<{ account: Account; session: string }>();
+
 export interface RouteArgs {
   request: Request;
   params?: Record<string, string | undefined>;
@@ -112,7 +117,7 @@ export function createHandler(config: ResolvedConfig) {
   const admin = config.path;
 
   const page = (title: string, body: VNode, status = 200) =>
-    new Response(`<!doctype html>${render(<Document config={config} title={title}>{body}</Document>)}`, {
+    new Response(`<!doctype html>${render(<Viewer.Provider value={viewer.getStore()?.account ?? null}><Document config={config} title={title}>{body}</Document></Viewer.Provider>)}`, {
       status,
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
@@ -154,14 +159,18 @@ export function createHandler(config: ResolvedConfig) {
 
   async function login(request: Request) {
     const hash = passwordHash();
+    const named = hash ? hasPeople() : false;
     if (request.method !== "POST") {
       const next = backTo(new URL(request.url).searchParams.get("next"));
       if (hasSession(request)) return redirect(next ?? admin);
-      return page("Log in", <LoginPage config={config} configured={Boolean(hash)} next={next} />);
+      return page("Log in", <LoginPage config={config} configured={Boolean(hash)} named={named} next={next} />);
     }
     let next: string | null = null;
-    const refuse = (error: string, status = 200) => page("Log in", <LoginPage config={config} configured={Boolean(hash)} error={error} next={next} />, status);
+    let name = "";
+    const refuse = (error: string, status = 200) => page("Log in", <LoginPage config={config} configured={Boolean(hash)} named={named} name={name} error={error} next={next} />, status);
     if (!hash) return refuse("No password is set.");
+    // One answer for an unknown name and a wrong password.
+    const wrong = named ? "Wrong name or password." : "Wrong password.";
 
     const client = clientAddress(request);
     if (!takeAttempt(client)) return refuse("Too many attempts. Try again in 15 minutes.");
@@ -169,14 +178,80 @@ export function createHandler(config: ResolvedConfig) {
     const raw = await readLimited(request, 4096);
     const fields = new URLSearchParams(raw ?? "");
     next = backTo(fields.get("next"));
+    const typed = fields.get("name") ?? "";
+    name = typed.trim().slice(0, 100);
     const password = raw === null ? null : fields.get("password");
-    if (!password) return refuse("Wrong password.");
-    const verified = await withPasswordCheck(() => verifyPassword(password, hash));
-    if (verified === "busy") return refuse("The server is busy. Try again in a moment.", 503);
-    if (!verified) return refuse("Wrong password.");
+    if (!password) return refuse(wrong);
+    const found = await withPasswordCheck(() => checkLogin(typed, password));
+    if (found === "busy") return refuse("The server is busy. Try again in a moment.", 503);
+    if (!found) return refuse(wrong);
 
     clearAttempts(client);
-    return redirect(next ?? admin, sessionCookie(createSession(hash), admin));
+    const token = found.account.kind === "owner" ? createSession(found.hash) : createSession(found.hash, found.account.id);
+    return redirect(next ?? admin, sessionCookie(token, admin));
+  }
+
+  // Account and people
+
+  async function account(request: Request) {
+    const { account: who, session } = viewer.getStore()!;
+    const show = (error?: string, status = 200) =>
+      page("Account", <AccountPage config={config} account={who} changed={new URL(request.url).searchParams.has("changed") && !error} error={error} />, status);
+    if (request.method !== "POST") return show();
+
+    const raw = await readLimited(request, 4096);
+    if (raw === null) return show("That was too long.", 413);
+    const fields = new URLSearchParams(raw);
+    const current = fields.get("current") ?? "";
+    const next = fields.get("password") ?? "";
+    if (!current) return show("Type your current password.");
+    if (next.length < MIN_PASSWORD) return show(`Use at least ${MIN_PASSWORD} characters for the new password.`);
+    if (next.length > MAX_PASSWORD) return show(`Use at most ${MAX_PASSWORD} characters for the new password.`);
+    if (next !== (fields.get("repeat") ?? "")) return show("The two new passwords don't match.");
+
+    // Counted per client and per account, so a stolen session can't guess at the password from many addresses.
+    const keys = [`change ${clientAddress(request)}`, `change ${who.kind === "owner" ? "owner" : `person ${who.id}`}`];
+    if (!keys.map((key) => takeAttempt(key)).every(Boolean)) return show("Too many attempts. Try again in 15 minutes.", 429);
+    const verified = await withPasswordCheck(() => checkPassword(who, current));
+    if (verified === "busy") return show("The server is busy. Try again in a moment.", 503);
+    if (!verified) return show("Your current password is wrong.");
+    keys.forEach(clearAttempts);
+
+    const hash = await withPasswordCheck(() => hashPassword(next));
+    if (hash === "busy") return show("The server is busy. Try again in a moment.", 503);
+    if (!setPassword(who, hash, session)) return show("Your account no longer exists.", 409);
+    return redirect(`${admin}/account?changed=1`);
+  }
+
+  /** Only the owner manages people. Checked here on every request, not by hiding links. */
+  async function peopleScreen(request: Request, id?: number, action?: string) {
+    if (viewer.getStore()?.account.kind !== "owner") return notFound();
+    const show = (extra: { error?: string; given?: { name: string; password: string; added: boolean }; removed?: boolean } = {}, status = 200) =>
+      page("People", <PeoplePage config={config} people={people()} {...extra} />, status);
+    if (request.method !== "POST") return show({ removed: new URL(request.url).searchParams.has("removed") });
+
+    const fields = new URLSearchParams((await readLimited(request, 4096)) ?? "");
+    const give = async (person: { name: string }, added: boolean, store: (hash: string) => boolean) => {
+      const password = generatePassword();
+      const hash = await withPasswordCheck(() => hashPassword(password));
+      if (hash === "busy") return show({ error: "The server is busy. Try again in a moment." }, 503);
+      if (!store(hash)) return show({ error: added ? "Someone already has that name." : "That person was removed." }, 409);
+      // Shown on this page only, never in an address, and never stored.
+      return show({ given: { name: person.name, password, added } });
+    };
+
+    if (id === undefined) {
+      const name = loginName(fields.get("name") ?? "");
+      if (!name) return show({ error: "Use letters, numbers, dots, dashes or underscores for the name, or an email address." }, 422);
+      return give({ name }, true, (hash) => addPerson(name, hash) !== "taken");
+    }
+    const person = personById(id);
+    if (!person) return redirect(`${admin}/people`);
+    if (action === "remove") {
+      removePerson(id);
+      return redirect(`${admin}/people?removed=1`);
+    }
+    return give(person, false, (hash) => setPassword({ kind: "person", id, name: person.name }, hash));
   }
 
   async function upload(request: Request) {
@@ -563,6 +638,9 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "media" && second === "delete" && rest.length === 0 && post) return mediaDelete(request);
     if (first === "media" && second === "delete-unused" && rest.length === 0 && post) return mediaDeleteUnused();
     if (first === "history" && second && /^\d+$/.test(second) && rest.length === 0 && post) return history(request, Number(second));
+    if (first === "account" && !second) return account(request);
+    if (first === "people" && !second) return peopleScreen(request);
+    if (first === "people" && second && /^\d+$/.test(second) && rest.length === 1 && (rest[0] === "remove" || rest[0] === "reset") && post) return peopleScreen(request, Number(second), rest[0]);
     return notFound();
   }
 
@@ -578,7 +656,8 @@ export function createHandler(config: ResolvedConfig) {
 
     // Only an exact /login is exempt, so anything unusual stays gated.
     const isLogin = segments.length === 1 && segments[0] === "login";
-    if (!isLogin && !hasSession(request)) {
+    const signedIn = isLogin ? null : sessionOf(request);
+    if (!isLogin && !signedIn) {
       if (isScript(request)) return Response.json({ error: "signed-out" }, { status: 401 });
       // Back to the same page after logging in.
       const here = new URL(request.url);
@@ -586,7 +665,7 @@ export function createHandler(config: ResolvedConfig) {
       return redirect(`${admin}/login${next}`);
     }
 
-    const response = await route(request, segments);
+    const response = signedIn ? await viewer.run(signedIn, () => route(request, segments)) : await route(request, segments);
     const headers = new Headers(response.headers);
     // Versioned scripts say how long they keep; everything else behind the login is never stored.
     if (!isAsset(segments[0]) || segments.length !== 1) headers.set("Cache-Control", "no-store");

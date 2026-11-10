@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
-import { hashPassword } from "./auth.js";
+import { createHash } from "node:crypto";
+import { hashPassword, isPreview, previewToken } from "./auth.js";
 import { defineCms } from "./index.js";
 import { closeDb, createPost, db, listRevision, replaceItems, restoreVersion, saveEdits, saves, setTexts, trashPost, type Item } from "./store.js";
 
@@ -67,7 +68,7 @@ before(async () => {
   process.env.CMS_PASSWORD_HASH = await hashPassword(PASSWORD);
 });
 beforeEach(() => {
-  for (const table of ["posts", "items", "texts", "posts_old", "saves"]) db().exec(`DELETE FROM ${table}`);
+  for (const table of ["posts", "items", "texts", "posts_old", "saves", "people", "owner_password"]) db().exec(`DELETE FROM ${table}`);
 });
 after(() => {
   closeDb();
@@ -995,4 +996,289 @@ test("Media needs a login, and its writes need the site's origin", async () => {
   assert.equal((await call("/n-admin/media/delete")).status, 404, "a GET only ever serves an image");
   assert.ok(exists(name));
   assert.equal((await call(`/n-admin/media/${name}`)).status, 200, "images stay public");
+});
+
+// People and passwords
+
+let lastAddress = 0;
+const freshAddress = () => `10.1.${Math.floor(++lastAddress / 250)}.${lastAddress % 250}`;
+const logInAs = (fields: Record<string, string>, address = freshAddress()) =>
+  call("/n-admin/login", { method: "POST", body: form(fields), headers: { "x-forwarded-for": address } });
+const cookieOf = (response: Response) => {
+  assert.equal(response.status, 303);
+  return response.headers.get("set-cookie")!.split(";")[0];
+};
+const shownPassword = (html: string) => html.match(/<dt>Password<\/dt><dd><code>([^<]+)<\/code>/)?.[1];
+const personId = (name: string) => (db().prepare("SELECT id FROM people WHERE name = ?").get(name) as { id: number } | undefined)?.id;
+const signedIn = async (cookie: string) => (await call("/n-admin/account", { cookie })).status === 200;
+
+async function addPerson(owner: string, name: string) {
+  const response = await call("/n-admin/people", { method: "POST", cookie: owner, body: form({ name }) });
+  assert.equal(response.status, 200);
+  const password = shownPassword(await response.text());
+  assert.ok(password);
+  return password;
+}
+
+function changePassword(cookie: string, current: string, password: string, repeat = password) {
+  return call("/n-admin/account", { method: "POST", cookie, body: form({ current, password, repeat }), headers: { "x-forwarded-for": freshAddress() } });
+}
+
+/** Runs with another CMS_PASSWORD_HASH, as if the owner had run `neutron-cms password` again. */
+async function withEnvPassword(password: string, work: () => Promise<void>) {
+  const saved = process.env.CMS_PASSWORD_HASH;
+  process.env.CMS_PASSWORD_HASH = await hashPassword(password);
+  try {
+    await work();
+  } finally {
+    process.env.CMS_PASSWORD_HASH = saved;
+  }
+}
+
+test("with nobody else, the login asks only for the password, and the owner sees People and Account", async () => {
+  const login = await (await call("/n-admin/login")).text();
+  assert.doesNotMatch(login, /name="name"/);
+  assert.match(login, /name="password"/);
+  assert.match(await (await logInAs({ password: "wrong" })).text(), /Wrong password\./);
+  const owner = cookieOf(await logInAs({ password: PASSWORD }));
+  const html = await (await call("/n-admin", { cookie: owner })).text();
+  assert.match(html, />People<\/a>/);
+  assert.match(html, />Account<\/a>/);
+  assert.match(await (await call("/n-admin/account", { cookie: owner })).text(), /You are the owner[\s\S]*npx neutron-cms password/);
+});
+
+test("the owner adds a person, sees the password once, and the login then asks for a name", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "  Sam.Smith@Example.com ");
+  assert.match(password, /^[A-Za-z0-9_-]{32}$/);
+  assert.ok(personId("sam.smith@example.com"), "stored trimmed and in lower case");
+  const list = await (await call("/n-admin/people", { cookie: owner })).text();
+  assert.match(list, /sam\.smith@example\.com/);
+  assert.ok(!list.includes(password), "shown once");
+  assert.equal(db().prepare("SELECT 1 FROM people WHERE password_hash LIKE ?").get(`%${password}%`), undefined);
+
+  assert.match(await (await call("/n-admin/login")).text(), /name="name"[\s\S]*Leave empty if you are the owner/);
+  const sam = cookieOf(await logInAs({ name: "SAM.smith@example.com", password }));
+  const html = await (await call("/n-admin", { cookie: sam })).text();
+  assert.match(html, />Account<\/a>/);
+  assert.doesNotMatch(html, />People<\/a>/);
+  assert.match(await (await call("/n-admin/account", { cookie: sam })).text(), /logged in as <strong>sam\.smith@example\.com<\/strong>/);
+  // The owner's habit doesn't change: no name, the owner's password.
+  assert.equal(await signedIn(cookieOf(await logInAs({ name: "", password: PASSWORD }))), true);
+  assert.equal(await signedIn(cookieOf(await logInAs({ password: PASSWORD }))), true);
+  assert.equal((await logInAs({ name: "sam.smith@example.com", password: PASSWORD })).status, 200, "a person's name with the owner's password is wrong");
+});
+
+test("names have one simple shape and are unique however they are typed", async () => {
+  const owner = await logIn();
+  for (const bad of ["", "   ", "<b>x</b>", "a b", "-sam", "s\u0430m", "x".repeat(101), "a@b", "sam@@x.com"]) {
+    const response = await call("/n-admin/people", { method: "POST", cookie: owner, body: form({ name: bad }) });
+    assert.equal(response.status, 422, bad);
+    assert.match(await response.text(), /Use letters, numbers/);
+  }
+  await addPerson(owner, "sam_1");
+  const again = await call("/n-admin/people", { method: "POST", cookie: owner, body: form({ name: " SAM_1" }) });
+  assert.equal(again.status, 409);
+  assert.match(await again.text(), /Someone already has that name/);
+  assert.equal((db().prepare("SELECT count(*) AS n FROM people").get() as { n: number }).n, 1);
+});
+
+test("an unknown name and a wrong password get the same reply and the same work", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "sam");
+  const reply = async (fields: Record<string, string>) => {
+    const started = performance.now();
+    const response = await logInAs(fields);
+    const html = (await response.text()).replace(/ value="[^"]*"/g, "");
+    return { status: response.status, html, ms: performance.now() - started };
+  };
+  const wrong = await reply({ name: "sam", password: `${password}x` });
+  const unknown = await reply({ name: "nobody", password });
+  const malformed = await reply({ name: "no body!", password });
+  assert.match(wrong.html, /Wrong name or password\./);
+  for (const other of [unknown, malformed]) {
+    assert.equal(other.status, wrong.status);
+    assert.equal(other.html, wrong.html);
+    // One password check either way: without it an unknown name would answer in about a millisecond.
+    assert.ok(other.ms > wrong.ms * 0.4, `${other.ms} ms against ${wrong.ms} ms`);
+  }
+  assert.match(await (await logInAs({ password: "wrong" })).text(), /Wrong name or password\./, "the owner's wrong password reads the same");
+});
+
+test("the login throttle still applies with names", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "sam");
+  const address = "10.8.8.8";
+  for (let index = 0; index < 5; index++) await logInAs({ name: index % 2 ? "nobody" : "sam", password: "wrong" }, address);
+  const blocked = await logInAs({ name: "sam", password }, address);
+  assert.equal(blocked.status, 200);
+  assert.match(await blocked.text(), /Too many attempts/);
+});
+
+test("only the owner manages people, checked on the server", async () => {
+  const owner = await logIn();
+  await addPerson(owner, "sam");
+  const alex = cookieOf(await logInAs({ name: "alex", password: await addPerson(owner, "alex") }));
+  assert.doesNotMatch(await (await call("/n-admin", { cookie: alex })).text(), />People<\/a>/);
+  const self = personId("alex")!;
+  for (const [path, body] of [
+    ["/n-admin/people", undefined],
+    ["/n-admin/people", { name: "mallory" }],
+    [`/n-admin/people/${personId("sam")}/remove`, {}],
+    [`/n-admin/people/${personId("sam")}/reset`, {}],
+    [`/n-admin/people/${self}/remove`, {}],
+  ] as const) {
+    const response = body ? await call(path, { method: "POST", cookie: alex, body: form(body) }) : await call(path, { cookie: alex });
+    assert.equal(response.status, 404, path);
+    assert.ok(!shownPassword(await response.text()));
+  }
+  assert.equal((await call("/n-admin/people", { method: "POST", cookie: owner, origin: "https://evil.test", body: form({ name: "mallory" }) })).status, 403);
+  assert.equal((await call(`/n-admin/people/${self}/remove`, { method: "POST", cookie: owner, origin: null, body: form({}) })).status, 403);
+  assert.equal((await call("/n-admin/account", { method: "POST", cookie: alex, origin: "https://evil.test", body: form({ current: "x", password: "y".repeat(12), repeat: "y".repeat(12) }) })).status, 403);
+  assert.equal((await call(`/n-admin/people/${self}/remove`, { cookie: owner })).status, 404, "actions are POST only");
+  assert.equal((await call("/n-admin/people", { method: "POST", body: form({ name: "mallory" }) })).status, 303, "signed out");
+  assert.equal(personId("mallory"), undefined);
+  assert.ok(personId("sam") && personId("alex"));
+  assert.equal(await signedIn(alex), true, "and refusing them changed nothing");
+});
+
+test("removing a person ends their sessions at once and their password stops working", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "sam");
+  const phone = cookieOf(await logInAs({ name: "sam", password }));
+  const laptop = cookieOf(await logInAs({ name: "sam", password }));
+  const id = personId("sam")!;
+  const response = await call(`/n-admin/people/${id}/remove`, { method: "POST", cookie: owner, body: form({}) });
+  assert.equal(response.headers.get("location"), "/n-admin/people?removed=1");
+  assert.equal(await signedIn(phone), false);
+  assert.equal(await signedIn(laptop), false);
+  assert.equal((db().prepare("SELECT count(*) AS n FROM sessions WHERE person_id = ?").get(id) as { n: number }).n, 0);
+  assert.equal((await logInAs({ name: "sam", password })).status, 200);
+  // Someone new with the same name is a new account; nothing of the old one carries over.
+  const again = await addPerson(owner, "sam");
+  assert.notEqual(personId("sam"), id);
+  assert.equal(await signedIn(phone), false);
+  assert.equal(await signedIn(cookieOf(await logInAs({ name: "sam", password: again }))), true);
+  assert.equal(await signedIn(owner), true);
+});
+
+test("a new password from the owner ends that person's sessions, and only the new one works", async () => {
+  const owner = await logIn();
+  const old = await addPerson(owner, "sam");
+  const alex = cookieOf(await logInAs({ name: "alex", password: await addPerson(owner, "alex") }));
+  const sam = cookieOf(await logInAs({ name: "sam", password: old }));
+  const response = await call(`/n-admin/people/${personId("sam")}/reset`, { method: "POST", cookie: owner, body: form({}) });
+  const html = await response.text();
+  assert.match(html, /sam has a new password and is logged out/);
+  const fresh = shownPassword(html)!;
+  assert.notEqual(fresh, old);
+  assert.equal(await signedIn(sam), false);
+  assert.equal(await signedIn(alex), true, "only that person");
+  assert.equal((await logInAs({ name: "sam", password: old })).status, 200);
+  assert.equal(await signedIn(cookieOf(await logInAs({ name: "sam", password: fresh }))), true);
+  assert.equal((await call("/n-admin/people/99999/reset", { method: "POST", cookie: owner, body: form({}) })).status, 303);
+});
+
+test("changing your own password: its rules, a wrong current password, and only this session kept", async () => {
+  const owner = await logIn();
+  const old = await addPerson(owner, "sam");
+  const here = cookieOf(await logInAs({ name: "sam", password: old }));
+  const elsewhere = cookieOf(await logInAs({ name: "sam", password: old }));
+  const next = "correct horse battery";
+  const refused = async (response: Response, message: RegExp) => {
+    assert.match(await response.text(), message);
+    assert.equal(await signedIn(elsewhere), true);
+  };
+  await refused(await changePassword(here, "", next), /Type your current password/);
+  await refused(await changePassword(here, old, "short"), /at least 12 characters/);
+  await refused(await changePassword(here, old, "x".repeat(201)), /at most 200 characters/);
+  await refused(await changePassword(here, old, next, `${next}!`), /don.{1,6}t match/);
+  await refused(await changePassword(here, `${old}x`, next), /current password is wrong/);
+
+  const changed = await changePassword(here, old, next);
+  assert.equal(changed.headers.get("location"), "/n-admin/account?changed=1");
+  assert.equal(changed.headers.get("set-cookie"), null, "this session carries on as it is");
+  assert.match(await (await call("/n-admin/account?changed=1", { cookie: here })).text(), /Password changed/);
+  assert.equal(await signedIn(elsewhere), false);
+  assert.equal(await signedIn(owner), true, "other accounts are untouched");
+  assert.equal((await logInAs({ name: "sam", password: old })).status, 200);
+  assert.equal(await signedIn(cookieOf(await logInAs({ name: "sam", password: next }))), true);
+});
+
+test("wrong current passwords are throttled, from any address", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "sam");
+  const sam = cookieOf(await logInAs({ name: "sam", password }));
+  for (let index = 0; index < 5; index++) assert.match(await (await changePassword(sam, "wrong", "a new long password")).text(), /current password is wrong/);
+  const blocked = await changePassword(sam, password, "a new long password");
+  assert.equal(blocked.status, 429);
+  assert.match(await blocked.text(), /Too many attempts/);
+  assert.equal(await signedIn(cookieOf(await logInAs({ name: "sam", password }))), true, "the password didn't change");
+});
+
+test("the owner's password set here works until CMS_PASSWORD_HASH changes, then it is removed", async () => {
+  const owner = await logIn();
+  const elsewhere = await logIn();
+  const next = "the owner's own new password";
+  assert.equal((await changePassword(owner, PASSWORD, next)).status, 303);
+  assert.equal(await signedIn(owner), true);
+  assert.equal(await signedIn(elsewhere), false);
+  assert.equal((await logInAs({ password: PASSWORD })).status, 200, "the environment's password stops working");
+  assert.equal(await signedIn(cookieOf(await logInAs({ password: next }))), true);
+  const stored = db().prepare("SELECT password_hash FROM owner_password").get() as { password_hash: string };
+  assert.ok(!stored.password_hash.includes(next) && stored.password_hash.startsWith("scrypt."));
+
+  // Forgot it: the owner runs `neutron-cms password` and sets the new hash.
+  await withEnvPassword("from the command line", async () => {
+    assert.equal(await signedIn(owner), false, "a new CMS_PASSWORD_HASH signs the owner out");
+    assert.equal((await logInAs({ password: next })).status, 200, "the password set here no longer counts");
+    assert.equal(db().prepare("SELECT 1 FROM owner_password").get(), undefined, "and is removed");
+    assert.equal(await signedIn(cookieOf(await logInAs({ password: "from the command line" }))), true);
+  });
+  // Even with the old hash back, the removed password stays gone.
+  assert.equal((await logInAs({ password: next })).status, 200);
+  assert.equal(await signedIn(cookieOf(await logInAs({ password: PASSWORD }))), true);
+});
+
+test("a new CMS_PASSWORD_HASH signs out people too", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "sam");
+  const sam = cookieOf(await logInAs({ name: "sam", password }));
+  await withEnvPassword("another", async () => {
+    assert.equal(await signedIn(sam), false);
+    assert.equal(await signedIn(cookieOf(await logInAs({ name: "sam", password }))), true, "their password still works");
+  });
+});
+
+test("draft preview links end when a password changes, a person goes or the command line sets a new one", async () => {
+  const owner = await logIn();
+  const password = await addPerson(owner, "sam");
+  const sam = cookieOf(await logInAs({ name: "sam", password }));
+  let link = previewToken("page", "draft");
+  assert.equal(isPreview("page", "draft", link), true);
+  assert.equal(isPreview("page", "other", link), false);
+
+  assert.equal((await changePassword(sam, password, "sam's own new password")).status, 303);
+  assert.equal(isPreview("page", "draft", link), false);
+  link = previewToken("page", "draft");
+  assert.equal(isPreview("page", "draft", link), true, "a new link works");
+
+  await call(`/n-admin/people/${personId("sam")}/remove`, { method: "POST", cookie: owner, body: form({}) });
+  assert.equal(isPreview("page", "draft", link), false);
+  link = previewToken("page", "draft");
+  await withEnvPassword("another", async () => {
+    assert.equal(isPreview("page", "draft", link), false);
+  });
+  assert.equal(isPreview("page", "draft", link), true, "the key is stable otherwise, so every instance agrees");
+});
+
+test("a session made before people existed is the owner's", async () => {
+  const token = "made-by-the-previous-release";
+  const sha = (value: string) => createHash("sha256").update(value).digest("hex");
+  db().prepare("INSERT INTO sessions (token_hash, password_tag, expires_at) VALUES (?, ?, ?)").run(sha(token), sha(process.env.CMS_PASSWORD_HASH!), new Date(Date.now() + 60_000).toISOString());
+  const cookie = `n_session=${token}`;
+  assert.equal((await call("/n-admin/people", { cookie })).status, 200);
+  // A forged tag, or one row claiming to be a person who doesn't exist, is nobody.
+  db().prepare("INSERT INTO sessions (token_hash, password_tag, expires_at, person_id) VALUES (?, ?, ?, 4242)").run(sha("ghost"), sha(process.env.CMS_PASSWORD_HASH!), new Date(Date.now() + 60_000).toISOString());
+  assert.equal(await signedIn("n_session=ghost"), false);
 });

@@ -691,15 +691,16 @@ $$("[data-list]").forEach((form) => {
 // Media
 
 document.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-copy]");
+  const button = event.target.closest("[data-copy], [data-copy-text]");
   if (!button) return;
-  const address = new URL(button.dataset.copy, location.origin).href;
+  const plain = button.dataset.copyText !== undefined;
+  const text = plain ? button.dataset.copyText : new URL(button.dataset.copy, location.origin).href;
   try {
-    await navigator.clipboard.writeText(address);
+    await navigator.clipboard.writeText(text);
     button.textContent = "Copied";
-    setTimeout(() => { button.textContent = "Copy address"; }, 1500);
+    setTimeout(() => { button.textContent = plain ? "Copy password" : "Copy address"; }, 1500);
   } catch {
-    prompt("Copy this address", address);
+    prompt(plain ? "Copy this password" : "Copy this address", text);
   }
 });
 
