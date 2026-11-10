@@ -44,6 +44,11 @@ export interface CmsConfig<Lists extends Record<string, ListDefinition> = Record
    * `layout` is the key, and a page with a fixed `url` checks `cms.page(key, request)` before it shows.
    */
   designs?: Record<string, string | Design>;
+  /**
+   * The browser tab icon for the admin, as a URL on your site such as `/img/icon.png`.
+   * Left out, the browser uses your site's `/favicon.ico` if there is one.
+   */
+  icon?: string;
   /** Where a page lives on the site. Defaults to `postUrl`. */
   pageUrl?: (slug: string) => string;
   /** Where a post lives on the site, for the admin's links. Default `/<slug>`. */
@@ -76,6 +81,7 @@ export interface ResolvedConfig {
   designs: Record<string, ResolvedDesign>;
   postUrl: (slug: string) => string;
   pageUrl: (slug: string) => string;
+  icon: string;
   reservedSlugs: string[];
   previewCss: string;
   timeZone: string;
@@ -130,6 +136,7 @@ export function resolveConfig(config: CmsConfig): ResolvedConfig {
     pages: config.pages ?? Object.keys(designs).length > 0,
     postUrl,
     pageUrl: config.pageUrl ?? postUrl,
+    icon: config.icon ?? "",
     designs,
     reservedSlugs: [...new Set([...(firstSegment ? [firstSegment] : []), ...(config.reservedSlugs ?? [])])],
     previewCss: config.previewCss ?? "",

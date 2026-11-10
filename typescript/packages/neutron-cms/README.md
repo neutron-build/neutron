@@ -141,6 +141,7 @@ Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type
 | `designs` | `{}` | Pages with their own design, by key: a title, or `{ title, url?, published?, permanent? }`. Each is listed under Pages and opens framed for click-to-edit, with Publish in the same bar. `url` fixes its address (a homepage at `/`); `permanent` keeps it always published |
 | `postUrl` | `/<slug>` | Where a post lives, for the admin's links |
 | `pageUrl` | same as `postUrl` | Where a page lives |
+| `icon` | your site's `/favicon.ico`, if it has one | The admin's browser tab icon, as a URL such as `/img/icon.png` |
 | `reservedSlugs` | none | URLs a post may not take, usually your other pages |
 | `previewCss` | none | Your post styles as a string, so previews match the site |
 | `timeZone` | `UTC` | When a date has passed |

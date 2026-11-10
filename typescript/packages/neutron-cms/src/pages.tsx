@@ -28,7 +28,7 @@ export function Document(props: { config: ResolvedConfig; title: string; childre
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="robots" content="noindex" />
         <title>{`${props.title} - Neutron CMS`}</title>
-        <link rel="icon" href="data:," />
+        {props.config.icon ? <link rel="icon" href={props.config.icon} /> : null}
         <link rel="stylesheet" href={assetUrl(props.config.path, "admin.css")} />
       </head>
       <body>{props.children}</body>

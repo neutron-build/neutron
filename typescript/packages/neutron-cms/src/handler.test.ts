@@ -256,6 +256,12 @@ test("the admin can live at another path", async () => {
   assert.match(await moved.GET({ request: new Request(`${SITE}/edit`) }).then((r) => r.headers.get("location")!), /^\/edit\/login$/);
 });
 
+test("the tab icon is the site's: its favicon by default, or the one named in icon", async () => {
+  const login = (site: { GET: typeof cms.GET }) => site.GET({ request: new Request(`${SITE}/n-admin/login`), params: { path: "login" } }).then((r) => r.text());
+  assert.doesNotMatch(await login(cms), /rel="icon"/);
+  assert.match(await login(defineCms({ icon: "/img/icon.png" })), /<link rel="icon" href="\/img\/icon\.png"/);
+});
+
 test("ready is true on an empty database, so a new site can deploy, and false when the database is gone", () => {
   assert.equal(cms.ready(), true);
   closeDb();
