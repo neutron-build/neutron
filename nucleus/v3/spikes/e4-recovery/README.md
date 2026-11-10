@@ -10877,3 +10877,26 @@ failing rounds (class × count, seeds listed).
   SZC-MP 10 < 125 — lower than 9.1's 20; the wall passes, the walk
   continues. Probe, not evidence.
 
+- **rung 9.3 (k2)** (9.1 with `ckpt_every` 12–19): wall **7.1**
+  min/2000 (raw 42.9 s; load 7.66 10.86 12.18; cpu 553.7 s); SZC-MP
+  **raw 2**, per10k 20. Changed rows vs 9.2 (per10k): SZC-MP 10→20,
+  SZC 10→20, Q10 40→0, Q11 70→20, Q12 80→100, Q16 960→1010, Q17
+  1070→1140, Q18 220→170, Q4 230→180, Q4-I 90→110, Q5a 70→40, Q6a
+  210→270. Other rows (per10k, INFO): Q1 1180 (hooks 100–150), Q2 230,
+  Q3 90, Q4 180, Q4-I 110, Q5a 40, Q5b 880, Q5c 720, Q6a 270, Q6b 250,
+  Q7 20, Q8 0, Q9 1440, Q10 0, Q11 20, Q12 100, Q13a 950, Q13b 1100,
+  Q13c 940, Q14 470, Q15 0, Q16 1010, Q17 1140, Q18 170, SIZING 1900
+  misses, SZC 20, SZC-MW 0, SZI 0. Fails: MP ×4 (30297 r0, 30337 r0,
+  30368 r0, 30697 r0 — the known O-1(a)/O-3(e) MP shapes). SZC-MP 20 <
+  125. Probe, not evidence.
+
+- **MP ladder outcome (step 9): ESCALATE.** No rung reaches SZC-MP's
+  required 100 per-2000 (raw counts 0, 2, 1, 2 — REFRESH 6's warning
+  that MP rests on 1–7 raw hits is what the sample shows); every wall
+  passes. `MP_PRESSURE` keeps the rung with the highest count: 9.1
+  and 9.3 tie at raw 2 (20 per10k) and 9.1 is the earlier rung by
+  rising cost, so the kept setting is 9.1's (chunked 900–1,200, budget
+  20–31, GC 12, `ckpt_every` 4–8, `burst_frac` 600, `burst_gc_loops`
+  8, `w11_share` 200, `w12_share` 200). The row returns to the owner
+  with every rung's numbers. Probe, not evidence.
+
