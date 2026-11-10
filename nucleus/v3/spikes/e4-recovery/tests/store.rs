@@ -7843,3 +7843,45 @@ fn drop_replay_only_marks() {
         "tree 3 holds all sixteen replayed cells across its split"
     );
 }
+
+/// **X5-R39 pin (card X-5c-F4-F2 step 1): the `ckpt_unflipped` window's
+/// edges.** The observable is true exactly "from the completion of step
+/// 0 until step 5's `sync_all` returned" (PLAN §10 item 10), carried by
+/// the crash-time hook position code: false before step 0 completes
+/// (`none` = 0 and `Before0` = 1 — **M-SZI-BEFORE0**, set at begin,
+/// reverts the 1), true from `After0` (2) through `After4` (7), and
+/// false again from `After5` (8, `sync_all` returned and
+/// `meta_durable_k` is set) through `Mid6` (9) and `After6`/none (0) —
+/// **M-SZI-AFTER5**, never cleared at step 5, reverts the 8. The
+/// sim-crash-unwind half of REFRESH 6's abort rule is structural for
+/// this carrier (the harness-side position code is written before any
+/// crash arm, so no store abort path can clear it); the non-crash half
+/// is carried by the `ckpt_closed_dirty` reset `szi` conjoins (pinned
+/// by the After4 literal-config pin in `tests/workload.rs`, which
+/// **M-SZI-ABORTRESET** fails).
+#[test]
+fn x5_r39_ckpt_unflipped_window_edges() {
+    assert!(
+        !ckpt::ckpt_unflipped(0),
+        "no hook passed yet: nothing of the checkpoint has happened"
+    );
+    assert!(
+        !ckpt::ckpt_unflipped(1),
+        "Before0: the flip has not run — nothing of the checkpoint has happened \
+         (M-SZI-BEFORE0 reverts this)"
+    );
+    for step in 2..=7 {
+        assert!(
+            ckpt::ckpt_unflipped(step),
+            "codes 2..=7 (After0..After4) are inside the window: step {step}"
+        );
+    }
+    assert!(
+        !ckpt::ckpt_unflipped(8),
+        "After5: step 5's sync_all returned and the meta is durable (M-SZI-AFTER5 reverts this)"
+    );
+    assert!(
+        !ckpt::ckpt_unflipped(9),
+        "Mid6: past the checkpoint's close"
+    );
+}

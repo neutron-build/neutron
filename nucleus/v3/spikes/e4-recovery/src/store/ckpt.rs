@@ -75,6 +75,37 @@ pub const CKPT_HOOKS: [CkptHook; 10] = [
     CkptHook::After6,
 ];
 
+/// **X5-R39 (card X-5c-F4-F2 step 1; REFRESH 5 as corrected by REFRESH
+/// 6; PLAN §10 item 10): the `ckpt_unflipped` observable** — true iff
+/// the round's own crash fired **from the completion of step 0 until
+/// step 5's `sync_all` returned**. PLAN §10 item 10's floor: "only from
+/// the completion of step 0 until step 5's `sync_all` returns. Before
+/// that, nothing of the checkpoint has happened. After it, the meta is
+/// durable and the interval is closed."
+///
+/// The window's carrier is the crash-time checkpoint position code
+/// (`WorkloadObs::ckpt_step`, written by the checkpointer's hook
+/// bookkeeping at every hook **before any crash arm**): the harness
+/// state lives outside the store, so no `checkpoint()` abort path can
+/// touch it and it survives the sim-crash unwind into the crash-time
+/// `obs` snapshot — which is REFRESH 6's rule ("never on a sim-crash
+/// unwind, because `obs` is read after the unwind") held structurally.
+/// Set immediately before `hooks(CkptHook::After0)` — code 2, the
+/// completion of step 0 — and cleared where step 5 sets
+/// `meta_durable_k` (before `hooks(CkptHook::After5)` — code 8,
+/// `sync_all` returned); `Mid6`/`After6` (9/0, past `ckpt:end`) and
+/// `Before0` (1, nothing of the checkpoint has happened yet) read
+/// false. The abort-path clear of a **non-crash** failure (REFRESH 6)
+/// is carried by the `ckpt_closed_dirty ≥ 4·F` term `szi` conjoins:
+/// `checkpoint()`'s `ckpt:abort` step zeroes `ckpt_closed_dirty` on
+/// every non-`Sim` failure and keeps it across a sim-crash unwind (the
+/// `!crash_unwind` guard), so a checkpoint aborted without a crash can
+/// never leave a live `szi` behind. A pure observable, never a
+/// behaviour input.
+pub fn ckpt_unflipped(step: u8) -> bool {
+    (2..=7).contains(&step)
+}
+
 /// The hook's position bit in [`CKPT_HOOKS`] (X5-R16 NEVER-FIRED's
 /// per-index hook mask: the harness records which hooks each completed
 /// checkpoint reached, and the driver's targeted draw picks an index
@@ -637,7 +668,14 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
             st.image_frozen = None;
             // SIZING-C: no checkpoint is open (the abort path) — except
             // across a sim-crash unwind, where the observable must
-            // survive into the crash-time `obs` snapshot.
+            // survive into the crash-time `obs` snapshot. X5-R39's
+            // `ckpt_unflipped` keeps the same rule (REFRESH 6: cleared
+            // on the abort path of a non-crash failure, never on a
+            // sim-crash unwind): this reset is its abort-path clear —
+            // `szi` conjoins `ckpt_closed_dirty ≥ 4·F`, so a checkpoint
+            // aborted without a crash cannot leave a live `szi` — while
+            // the unwind half is structural for the position-code
+            // carrier (see [`ckpt_unflipped`]).
             if !crash_unwind {
                 st.ckpt_closed_dirty = 0;
             }
@@ -785,6 +823,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         }
     };
     prims::gate_flip_release(cx);
+    // X5-R39's `ckpt_unflipped` is set here — immediately before the
+    // `After0` hook fires, the completion of step 0 (see
+    // [`ckpt_unflipped`]: carried by the hook position code).
     hooks(CkptHook::After0)?;
     // FREE-EARLY (I-FREE-SAFE): the step-5/6 frees happen **at the
     // flip** — while durable meta k−1 still references these slots.
@@ -986,6 +1027,10 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
             st.meta.slot_count = live_sc;
         }
         st.meta_durable_k = k;
+        // X5-R39's `ckpt_unflipped` is cleared here — step 5's
+        // `sync_all` returned and the meta is durable, the interval
+        // closed (see [`ckpt_unflipped`]: code 8 from the `After5`
+        // hook on).
         st.flip_window = false;
         st.image_frozen = None;
         let old_durable = std::mem::take(&mut st.slots.used_durable);
@@ -1021,7 +1066,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let st = c.store();
         st.ckpt_done += 1;
         st.ckpt_open = false;
-        // SIZING-C: no checkpoint is open.
+        // SIZING-C: no checkpoint is open. (X5-R39's `ckpt_unflipped`
+        // is already false here — cleared at step 5 — and the position
+        // code left the window at `After5`; see [`ckpt_unflipped`].)
         st.ckpt_closed_dirty = 0;
         Ok(())
     })?;

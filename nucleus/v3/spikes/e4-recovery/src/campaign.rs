@@ -603,15 +603,19 @@ pub fn verify_seed_set_ok(recs: &[SeedRec]) -> bool {
 /// file and the re-run — `q4i` stays out of the digest (X5-R37's BASE
 /// literals must not move), so the file-versus-re-run comparison is its
 /// only guard (M-Q4I-NOREPRO removes it).
+///
+/// **X5-R39 (card X-5c-F4-F2 step 1):** `szq` and `szi` join the same
+/// comparison, for the same reason (never digest inputs; a mismatch
+/// counts that seed as non-reproducing — M-SZ-NOREPRO removes it).
 pub fn verify_digest_report(recs: &[SeedRec], rerun: &[SeedRec]) -> (u64, Vec<u64>) {
     let mut bad_list = Vec::new();
     for (a, b) in recs.iter().zip(rerun.iter()) {
-        let q4i_differs = a.rounds.len() != b.rounds.len()
+        let nondigest_differs = a.rounds.len() != b.rounds.len()
             || a.rounds
                 .iter()
                 .zip(b.rounds.iter())
-                .any(|(x, y)| x.q4i != y.q4i);
-        if a.seed != b.seed || a.digest != b.digest || q4i_differs {
+                .any(|(x, y)| x.q4i != y.q4i || x.szq != y.szq || x.szi != y.szi);
+        if a.seed != b.seed || a.digest != b.digest || nondigest_differs {
             bad_list.push(a.seed);
         }
     }
@@ -638,6 +642,20 @@ pub fn q4i_count(recs: &[SeedRec]) -> u64 {
 /// minimum to 0).
 pub fn q4i_row_ok(achieved: u64) -> bool {
     achieved >= Q4I_REQUIRED
+}
+
+/// **X5-R39 (card X-5c-F4-F2 step 1): the quota rows' miss count** —
+/// every row except `SIZING`, whose achieved is the per-seed miss
+/// count. OQ-1's ruling (PLAN §10 item 10) replaced "every seed" with
+/// the coverage quota and kept the per-seed count as reporting only:
+/// "The per-seed count stays reported (option A's `INFO`), and is no
+/// longer an exit input." A per-seed miss with every judged row met
+/// exits 0 (**M-SZ-EXIT**, the SIZING seed miss failing the exit
+/// again, reverts this and fails that pin).
+pub fn verify_quota_missed(rows: &[workload::QuotaRow]) -> u64 {
+    rows.iter()
+        .filter(|row| row.id != "SIZING" && row.achieved < row.required)
+        .count() as u64
 }
 
 /// X5-R15 (b): the exit decision, pure and **at the end** — every check
@@ -759,18 +777,24 @@ fn cmd_verify(args: &[String]) -> i32 {
             }
         );
     }
-    // 3. Every 5.6 quota is met (and Work 5.3's sizing assertion holds:
-    // its row's achieved counts **misses**, which must be zero). The
-    // table always prints; with `--no-quotas` a miss is reported but
-    // does not fail the exit.
+    // 3. Every 5.6 quota is met. The table always prints; with
+    // `--no-quotas` a miss is reported but does not fail the exit.
+    // **X5-R39 (card X-5c-F4-F2 step 1): OQ-1's ruling ends SIZING's
+    // exit role** (PLAN §10 item 10: "The per-seed count stays reported
+    // … and is no longer an exit input") — the row prints as
+    // `INFO SIZING …` and never counts toward `missed`
+    // ([`verify_quota_missed`]); the old `achieved == 0` branch is
+    // gone.
     let rows = workload::quotas(&recs, CAMPAIGN_SEEDS);
-    let mut missed = 0u64;
     for row in &rows {
-        let ok = if row.id == "SIZING" {
-            row.achieved == 0
-        } else {
-            row.achieved >= row.required
-        };
+        if row.id == "SIZING" {
+            println!(
+                "INFO SIZING {:<62} achieved {:>6} required {:>6} INFO",
+                row.what, row.achieved, row.required
+            );
+            continue;
+        }
+        let ok = row.achieved >= row.required;
         println!(
             "QUOTA {} {:<62} achieved {:>6} required {:>6} {}",
             row.id,
@@ -779,10 +803,8 @@ fn cmd_verify(args: &[String]) -> i32 {
             row.required,
             if ok { "MET" } else { "MISSED" }
         );
-        if !ok {
-            missed += 1;
-        }
     }
+    let mut missed = verify_quota_missed(&rows);
     // **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row** — the
     // owner's option A, judged like every quota row (a miss fails the
     // exit; `--no-quotas` keeps its exemption). Printed after the 5.6
@@ -817,6 +839,55 @@ fn cmd_verify(args: &[String]) -> i32 {
         println!(
             "INFO SIZING-C crash rounds cutting a >= 4*F interval: C {} MP {} MW {}",
             by_class[0].1, by_class[1].1, by_class[2].1
+        );
+    }
+    // **X5-R39 (step 1): `INFO` diagnostics only, never exit inputs.**
+    // `szi` per class and per hook (the interrupted-checkpoint floor's
+    // own reading — the crash-cut hook of each counted round; a uniform
+    // round's crash point is no hook, counted as `uniform`), and
+    // poison-end `szq` (REFRESH 6: "Poison ends count as the round's
+    // crash, and F4 reports that count as `INFO`").
+    {
+        let mut by_class = [("C", 0u64), ("MP", 0u64), ("MW", 0u64)];
+        const HOOKS: [&str; 11] = [
+            "Before0", "After0", "After1", "Mid2", "After2", "After3", "After4", "After5", "Mid6",
+            "After6", "uniform",
+        ];
+        let mut by_hook = [0u64; 11];
+        for rec in recs.iter() {
+            if let Some((_, n)) = by_class.iter_mut().find(|(c, _)| *c == rec.class) {
+                *n += rec.rounds.iter().filter(|r| r.szi).count() as u64;
+            }
+            for r in rec.rounds.iter().filter(|r| r.szi) {
+                let h = if r.hook.is_empty() {
+                    "uniform"
+                } else {
+                    r.hook.as_str()
+                };
+                if let Some(i) = HOOKS.iter().position(|x| *x == h) {
+                    by_hook[i] += 1;
+                }
+            }
+        }
+        println!(
+            "INFO SZI crash rounds interrupting the closing checkpoint, by class: C {} MP {} MW {}",
+            by_class[0].1, by_class[1].1, by_class[2].1
+        );
+        let pairs: Vec<String> = HOOKS
+            .iter()
+            .zip(by_hook.iter())
+            .map(|(h, n)| format!("{h}={n}"))
+            .collect();
+        println!("INFO SZI by hook: {}", pairs.join(" "));
+    }
+    {
+        let n = recs
+            .iter()
+            .flat_map(|r| r.rounds.iter())
+            .filter(|r| r.szq && r.crash == "poison")
+            .count() as u64;
+        println!(
+            "INFO SZQ-POISON poison-end crash rounds cutting a >= 4*F interval, recovery opened: {n}"
         );
     }
     if missed > 0 && !no_quotas {
@@ -1686,7 +1757,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"q4sp\":{},\"q4mg\":{},\"q4ru\":{},\"imgsp\":{},\"imgmg\":{},\"imgru\":{},\"imgrupf\":{},\"q4ir\":{},\"q4i\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"szq\":{},\"szi\":{},\"q4sp\":{},\"q4mg\":{},\"q4ru\":{},\"imgsp\":{},\"imgmg\":{},\"imgru\":{},\"imgrupf\":{},\"q4ir\":{},\"q4i\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1737,6 +1808,8 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.task_error.is_some(),
                 esc(x.cwin.unwrap_or("u")),
                 u8::from(x.szc),
+                u8::from(x.szq),
+                u8::from(x.szi),
                 x.q4sp,
                 x.q4mg,
                 x.q4reuse,
@@ -2194,6 +2267,19 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "szc" => {
                 // SIZING-C (step 4): the crash-cut diagnostic.
                 x.szc = j.int()? != 0;
+            }
+            "szq" => {
+                // X5-R39 (card X-5c-F4-F2 step 1): the sizing quota's
+                // per-round predicate. Absent in older files, where it
+                // defaults to 0.
+                x.szq = j.int()? != 0;
+            }
+            "szi" => {
+                // X5-R39: the interrupted-checkpoint floor's per-round
+                // predicate, compared per round between the file and
+                // the re-run by `verify` (a mismatch counts the seed as
+                // non-reproducing), never a digest input.
+                x.szi = j.int()? != 0;
             }
             "q4sp" => {
                 // X-5c-F4-F1-F1 step 1: the Q4 halves (splits inside the

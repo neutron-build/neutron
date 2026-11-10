@@ -2949,3 +2949,329 @@ fn x5r52_twin_chain_kept_when_directories_agree_639() {
          byte for byte (M-TWIN-RESEED-ALWAYS reverts this)"
     );
 }
+
+// ---- card X-5c-F4-F2 step 1: X5-R39's rows, pins on literal records ----
+
+/// A record helper for the X5-R39 pins: one seed, `class`, whose rounds
+/// are built by `mk` (a round's szc/szq/szi flags), with a stable
+/// digest placeholder (these pins read the quota rows and the
+/// reproduction comparison, never the digest itself).
+fn x5r39_rec(class: &str, rounds: Vec<(bool, bool, bool)>) -> workload::SeedRec {
+    workload::SeedRec {
+        seed: 0,
+        class: class.to_owned(),
+        rounds: rounds
+            .into_iter()
+            .map(|(szc, szq, szi)| workload::RoundRec {
+                szc,
+                szq,
+                szi,
+                ..workload::RoundRec::default()
+            })
+            .collect(),
+        ..workload::SeedRec::default()
+    }
+}
+
+/// **X5-R39 pin (step 1): the four rows' shape and class split, on a
+/// literal record set.** One C round with `szq ∧ szi`, two MP rounds
+/// with `szq` (one of them `szi`), one MW round with `szq`, and one
+/// refused C round (`szc` without `szq` — PLAN §10 item 10's exclusion:
+/// "a refused round tests detection, not the recovery under pressure"):
+/// SZC counts 4 (every class), SZC-MP 2, SZC-MW 1, SZI 2, and the
+/// refused round counts in none of them. **M-SZQ-REFUSED** (the
+/// `end.is_some()` term dropped, so a refused round's `szq` is its
+/// `szc`) fails the SZC/SZC-MP/SZC-MW counts here.
+#[test]
+fn x5_r39_rows_shape_and_class_split() {
+    let recs = vec![
+        x5r39_rec("C", vec![(true, true, true)]),
+        x5r39_rec("MP", vec![(true, true, false), (true, true, true)]),
+        x5r39_rec("MW", vec![(true, true, false)]),
+        // The refused round: the crash cut the interval, the recovery
+        // opened nothing.
+        x5r39_rec("C", vec![(true, false, false)]),
+    ];
+    let rows = workload::quotas(&recs, 4);
+    let row = |id: &str| -> &workload::QuotaRow {
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("row {id}"))
+    };
+    assert_eq!(
+        row("SZC").achieved,
+        4,
+        "every class counts, the refused round does not"
+    );
+    assert_eq!(row("SZC-MP").achieved, 2);
+    assert_eq!(row("SZC-MW").achieved, 1);
+    assert_eq!(row("SZI").achieved, 2);
+    assert_eq!(
+        row("SZC").required,
+        1_000,
+        "the owner's quota (PLAN §10 item 10)"
+    );
+    assert_eq!(row("SZC-MP").required, 100);
+    assert_eq!(row("SZC-MW").required, 50);
+    assert_eq!(row("SZI").required, 300, "the interrupted-checkpoint floor");
+    // A round that is szq without the fold/window terms is never szi
+    // (the floor is a subset of the quota, counted inside it).
+    let recs = vec![x5r39_rec("C", vec![(true, true, false)])];
+    let rows = workload::quotas(&recs, 1);
+    let szi = rows.iter().find(|r| r.id == "SZI").expect("the SZI row");
+    assert_eq!(szi.achieved, 0);
+}
+
+/// **X5-R39 pin: the rows at 999/1,000, 99/100, 49/50 and 299/300.**
+/// Each row misses at one under its floor and meets at it — the
+/// floor's own edge, on literal records. **M-SZ-NOFLOOR** (the SZI
+/// row's minimum goes to 0) fails the 299 half of the last pair.
+#[test]
+fn x5_r39_row_floors_at_the_edge() {
+    let mk = |n: usize| {
+        (0..n)
+            .map(|_| x5r39_rec("C", vec![(true, true, true)]))
+            .collect::<Vec<_>>()
+    };
+    let read = |recs: &[workload::SeedRec], id: &str| -> workload::QuotaRow {
+        let rows = workload::quotas(recs, recs.len() as u64);
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("row {id}"))
+            .clone()
+    };
+    for (id, floor) in [("SZC", 1_000u64), ("SZI", 300u64)] {
+        let under = read(&mk(floor as usize - 1), id);
+        assert_eq!(under.achieved, floor - 1);
+        assert!(under.achieved < under.required, "{id} misses at one under");
+        let at = read(&mk(floor as usize), id);
+        assert_eq!(at.achieved, floor);
+        assert!(at.achieved >= at.required, "{id} meets at its floor");
+    }
+    // The per-class rows: MP and MW rounds only.
+    let mk_mp = |n: usize| {
+        (0..n)
+            .map(|_| x5r39_rec("MP", vec![(true, true, true)]))
+            .collect::<Vec<_>>()
+    };
+    let mk_mw = |n: usize| {
+        (0..n)
+            .map(|_| x5r39_rec("MW", vec![(true, true, true)]))
+            .collect::<Vec<_>>()
+    };
+    for (id, mk, floor) in [
+        ("SZC-MP", mk_mp as fn(usize) -> Vec<_>, 100u64),
+        ("SZC-MW", mk_mw as fn(usize) -> Vec<_>, 50u64),
+    ] {
+        let under = read(&mk(floor as usize - 1), id);
+        assert_eq!(under.achieved, floor - 1);
+        assert!(under.achieved < under.required, "{id} misses at one under");
+        let at = read(&mk(floor as usize), id);
+        assert_eq!(at.achieved, floor);
+        assert!(at.achieved >= at.required, "{id} meets at its floor");
+    }
+}
+
+/// **X5-R39 pin: a per-seed miss with every row met exits 0.** OQ-1's
+/// ruling (PLAN §10 item 10: "The per-seed count stays reported … and
+/// is no longer an exit input") removed SIZING's exit role: the row's
+/// achieved (the per-seed miss count) prints as `INFO SIZING …` and
+/// never counts toward `missed`. The literal table has every judged row
+/// met and SIZING achieved 3 required 0: no row is missed and the exit
+/// is 0. **M-SZ-EXIT** (a SIZING seed miss fails the exit again) counts
+/// the row and fails this pin.
+#[test]
+fn x5_r39_a_per_seed_sizing_miss_is_not_an_exit_input() {
+    let met = |id: &'static str, what: &str, n: u64| workload::QuotaRow {
+        id,
+        what: what.to_owned(),
+        achieved: n,
+        required: n,
+    };
+    let rows = vec![
+        met("Q1", "crash at hook After0", 300),
+        met("Q4", "interrupted ckpt with split and merge", 1_000),
+        met("SZC", "szq rounds", 1_000),
+        met("SZC-MP", "MP szq rounds", 100),
+        met("SZC-MW", "MW szq rounds", 50),
+        met("SZI", "szi rounds", 300),
+        // The per-seed miss count: achieved 3, judged by nothing.
+        workload::QuotaRow {
+            id: "SIZING",
+            what: "seeds missing Work 5.3's >= 4*F dirtied LPIDs (per-seed reporting)".to_owned(),
+            achieved: 3,
+            required: 0,
+        },
+    ];
+    assert_eq!(
+        campaign::verify_quota_missed(&rows),
+        0,
+        "SIZING is INFO: a per-seed miss never counts (M-SZ-EXIT reverts this)"
+    );
+    assert_eq!(
+        campaign::verify_exit_code(true, 0, campaign::verify_quota_missed(&rows), false),
+        0
+    );
+    // Every judged row still counts: one SZC round short is a miss.
+    let rows = vec![
+        met("SZC", "szq rounds", 1_000),
+        workload::QuotaRow {
+            id: "SZC",
+            what: "a second row".to_owned(),
+            achieved: 999,
+            required: 1_000,
+        },
+    ];
+    assert_eq!(campaign::verify_quota_missed(&rows), 1);
+}
+
+/// **X5-R39 pin (card X-5c-F4-F2 step 1): the `After4` literal config —
+/// `szc`, `szq` and `szi` all true.** Seed 1926 round 2, under
+/// `Tuning::BASE`: the crash (`After4@1`) fired inside the
+/// `ckpt_unflipped` window (position code 7) with the open checkpoint's
+/// begin-step fold at 180 ≥ 4·F = 176 dirtied LPIDs, and the final
+/// recovery opened a store — so `szi` is true through all three terms.
+/// **M-SZI-ABORTRESET** (cleared on every abort: the `!crash_unwind`
+/// guard on `checkpoint()`'s abort-path `ckpt_closed_dirty` reset
+/// dropped — this implementation's carrier of REFRESH 6's non-crash
+/// clear, which `szi` conjoins) reads the fold as 0 after the sim-crash
+/// unwind and fails this pin (`szi` false).
+#[test]
+fn x5_r39_after4_crash_with_a_4f_fold_is_szi() {
+    let rec = workload::run_seed_with(1926, None, &workload::Tuning::BASE);
+    assert!(rec.defect.is_none(), "seed 1926: {:?}", rec.defect);
+    assert_eq!(
+        rec.digest, 1_452_311_068,
+        "seed 1926: the pinned BASE digest"
+    );
+    let r2 = rec
+        .rounds
+        .get(2)
+        .unwrap_or_else(|| panic!("seed 1926: three rounds"));
+    assert_eq!(
+        r2.crash, "After4@1",
+        "seed 1926 r2: the pinned hook crash inside the window"
+    );
+    assert!(r2.fired, "seed 1926 r2: the crash fired");
+    assert!(
+        r2.szc,
+        "the crash cut a >= 4*F interval (the fold was 180 >= 176)"
+    );
+    assert!(r2.szq, "the final recovery opened a store");
+    assert!(
+        r2.szi,
+        "szc with the 4*F fold and the crash inside the ckpt_unflipped window \
+         must set szi (M-SZI-ABORTRESET reverts this)"
+    );
+    assert!(
+        r2.pass,
+        "seed 1926 r2: the round passes (o1={:?} o2={:?} o3={:?})",
+        r2.o1_fail, r2.o2_fail, r2.o3_fail
+    );
+}
+
+/// **X5-R39 pin: the `Before0` literal config — `szc` and `szq` true,
+/// `szi` false.** Seed 1005 round 2, under `Tuning::BASE`: the crash
+/// (`Before0@2`) fired with the checkpoint open (its begin step had
+/// folded 209 ≥ 4·F = 184 — at `Before0` the open interval is still
+/// empty, so `szc` can only be true through the fold) and the final
+/// recovery opened a store; but nothing of the checkpoint had happened
+/// yet at the crash point — the flip had not run — so `szi` is false.
+/// **M-SZI-BEFORE0** (`ckpt_unflipped` set at begin) reads the position
+/// code 1 as inside the window and fails this pin (`szi` true).
+#[test]
+fn x5_r39_before0_crash_never_sets_szi() {
+    let rec = workload::run_seed_with(1005, None, &workload::Tuning::BASE);
+    assert!(rec.defect.is_none(), "seed 1005: {:?}", rec.defect);
+    assert_eq!(
+        rec.digest, 3_142_266_577,
+        "seed 1005: the pinned BASE digest"
+    );
+    let r2 = rec
+        .rounds
+        .get(2)
+        .unwrap_or_else(|| panic!("seed 1005: three rounds"));
+    assert_eq!(r2.crash, "Before0@2", "seed 1005 r2: the pinned hook crash");
+    assert!(r2.fired, "seed 1005 r2: the crash fired");
+    assert!(r2.szc, "the open checkpoint's fold was 209 >= 184");
+    assert!(r2.szq, "the final recovery opened a store");
+    assert!(
+        !r2.szi,
+        "the crash at Before0 is before step 0 completes: nothing of the \
+         checkpoint has happened, so szi must stay false (M-SZI-BEFORE0 reverts this)"
+    );
+    assert!(
+        r2.pass,
+        "seed 1005 r2: the round passes (o1={:?} o2={:?} o3={:?})",
+        r2.o1_fail, r2.o2_fail, r2.o3_fail
+    );
+}
+
+/// **X5-R39 pin: the `After5` literal config — `szc` and `szq` true,
+/// `szi` false.** Seed 344 round 1, under `Tuning::BASE`: the crash
+/// (`After5@1`) fired with the checkpoint's fold at 173 ≥ 4·F = 172 and
+/// the final recovery opening a store; but step 5's `sync_all` had
+/// returned and the meta was durable (`meta_durable_k` set, the
+/// interval closed), so `szi` is false. **M-SZI-AFTER5** (never cleared
+/// at step 5) reads the position code 8 as inside the window and fails
+/// this pin (`szi` true).
+#[test]
+fn x5_r39_after5_crash_never_sets_szi() {
+    let rec = workload::run_seed_with(344, None, &workload::Tuning::BASE);
+    assert!(rec.defect.is_none(), "seed 344: {:?}", rec.defect);
+    assert_eq!(
+        rec.digest, 3_836_486_934,
+        "seed 344: the pinned BASE digest"
+    );
+    let r1 = rec
+        .rounds
+        .get(1)
+        .unwrap_or_else(|| panic!("seed 344: two rounds"));
+    assert_eq!(r1.crash, "After5@1", "seed 344 r1: the pinned hook crash");
+    assert!(r1.fired, "seed 344 r1: the crash fired");
+    assert!(r1.szc, "the checkpoint's fold was 173 >= 172");
+    assert!(r1.szq, "the final recovery opened a store");
+    assert!(
+        !r1.szi,
+        "the crash at After5 is past step 5's sync_all: the meta is durable \
+         and the interval closed, so szi must stay false (M-SZI-AFTER5 reverts this)"
+    );
+    assert!(
+        r1.pass,
+        "seed 344 r1: the round passes (o1={:?} o2={:?} o3={:?})",
+        r1.o1_fail, r1.o2_fail, r1.o3_fail
+    );
+}
+
+/// **X5-R39 pin: a flipped `szi` (or `szq`) fails reproduction.** Two
+/// records with identical digests whose rounds differ only in `szi`
+/// (or `szq`): the seed counts as non-reproducing — the fields stay out
+/// of the digest (X5-R37's BASE literals must not move), so the
+/// file-versus-re-run comparison is their only guard.
+/// **M-SZ-NOREPRO** (the comparison removed) fails this pin.
+#[test]
+fn x5_r39_flipped_szi_fails_reproduction() {
+    let rec = |szq: bool, szi: bool| workload::SeedRec {
+        seed: 7,
+        digest: 12345,
+        rounds: vec![workload::RoundRec {
+            szq,
+            szi,
+            ..workload::RoundRec::default()
+        }],
+        ..workload::SeedRec::default()
+    };
+    let same = (rec(true, true), rec(true, true));
+    let (bad, _) = campaign::verify_digest_report(&[same.0], &[same.1]);
+    assert_eq!(bad, 0, "identical records reproduce");
+    let flipped = (rec(true, true), rec(true, false));
+    let (bad, list) = campaign::verify_digest_report(&[flipped.0], &[flipped.1]);
+    assert_eq!(
+        bad, 1,
+        "a flipped szi must count the seed as non-reproducing (M-SZ-NOREPRO reverts this)"
+    );
+    assert_eq!(list, vec![7]);
+    let flipped_q = (rec(true, false), rec(false, false));
+    let (bad, _) = campaign::verify_digest_report(&[flipped_q.0], &[flipped_q.1]);
+    assert_eq!(bad, 1, "a flipped szq counts the seed as non-reproducing");
+}

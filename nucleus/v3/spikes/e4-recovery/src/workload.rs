@@ -1544,6 +1544,27 @@ pub struct RoundRec {
     /// changes to count crash-cut intervals is the owner's question);
     /// never a digest input, never an exit input.
     pub szc: bool,
+    /// **X5-R39 (card X-5c-F4-F2 step 1; OQ-1's ruling, PLAN §10 item
+    /// 10): `szq`** — the crash cut a ≥ 4·F interval (`szc`) **and the
+    /// round's final recovery opened a store** (Q18's `end.is_some()`,
+    /// read at the same point). PLAN §10 item 10's exclusion: "rounds
+    /// whose final recovery yields no state (refused or failed open,
+    /// Q18's condition)" never count — "a refused round tests
+    /// detection, not the recovery under pressure". The SZC, SZC-MP and
+    /// SZC-MW rows count it. A record diagnostic serialized as `szq`,
+    /// never a digest input; `verify` compares it per round between the
+    /// file and the re-run.
+    pub szq: bool,
+    /// **X5-R39: `szi`** — `szq`, the open checkpoint's begin-step fold
+    /// ≥ 4·F (`ckpt_closed_dirty`), and the crash inside the
+    /// [`crate::store::ckpt::ckpt_unflipped`] window (from the
+    /// completion of step 0 until step 5's `sync_all` returned): the
+    /// interrupted-checkpoint floor — "the same, but only from the
+    /// completion of step 0 until step 5's `sync_all` returns" (PLAN
+    /// §10 item 10) — counted **inside** the 1,000, not on top of it.
+    /// The SZI row counts it. A record diagnostic serialized as `szi`,
+    /// never a digest input; compared per round like `szq`.
+    pub szi: bool,
 }
 
 /// The twin's per-round outcome (judged as class C; Work 2.5).
@@ -2742,6 +2763,16 @@ fn round_rec(
     rr.sizing_ok = sizing_ok_of(obs, four_f);
     // SIZING-C (step 4): the crash cut a ≥ 4·F interval.
     rr.szc = szc_of(obs, four_f);
+    // X5-R39 (card X-5c-F4-F2 step 1): the sizing rows' predicates.
+    // `szq` is `szc` and Q18's `end.is_some()` (a refused or failed-open
+    // round tests detection, not the recovery under pressure); `szi` is
+    // `szq`, the open checkpoint's folded interval ≥ 4·F, and the crash
+    // inside the `ckpt_unflipped` window (the interrupted-checkpoint
+    // floor). Record diagnostics, never digest inputs.
+    rr.szq = rr.szc && out.end_store.is_some();
+    rr.szi = rr.szq
+        && obs.ckpt_closed_dirty >= four_f
+        && crate::store::ckpt::ckpt_unflipped(obs.ckpt_step);
     rr
 }
 
@@ -2778,7 +2809,8 @@ fn class_name(class: FaultClass) -> &'static str {
 /// numbers.
 #[derive(Debug, Clone)]
 pub struct QuotaRow {
-    /// The quota id (Q1…Q18, or SIZING for Work 5.3's assertion).
+    /// The quota id (Q1…Q18, SIZING for Work 5.3's per-seed reporting,
+    /// or X5-R39's SZC/SZC-MP/SZC-MW/SZI sizing rows).
     pub id: &'static str,
     /// What the row counts.
     pub what: String,
@@ -2809,6 +2841,9 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
     let mut q16 = 0u64;
     let mut q17 = 0u64;
     let mut q18 = 0u64;
+    // **X5-R39 (card X-5c-F4-F2 step 1): the sizing rows' round
+    // counters** — `szq` per class and overall, and the `szi` floor.
+    let (mut szc_all, mut szc_mp, mut szc_mw, mut szi) = (0u64, 0u64, 0u64, 0u64);
     // **X5-R17: the SIZING row counts seeds, not rounds** — Work 5.3
     // asserts per seed ("every seed must reach, in at least one
     // checkpoint interval, ≥ 4·F distinct dirtied LPIDs"), so a seed
@@ -2832,6 +2867,24 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
         }
         if rec.rounds.iter().any(|r| r.q16_map_depth2) {
             q16 += 1;
+        }
+        // X5-R39: the per-class `szq` counts (SZC-MP/SZC-MW read them;
+        // SZC counts every class).
+        let mp = rec.class == "MP";
+        let mw = rec.class == "MW";
+        for r in &rec.rounds {
+            if r.szq {
+                szc_all += 1;
+                if mp {
+                    szc_mp += 1;
+                }
+                if mw {
+                    szc_mw += 1;
+                }
+            }
+            if r.szi {
+                szi += 1;
+            }
         }
         for r in &rec.rounds {
             if r.fired && !r.hook.is_empty() {
@@ -3037,9 +3090,42 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
         },
         QuotaRow {
             id: "SIZING",
-            what: "seeds missing Work 5.3's ≥ 4·F dirtied LPIDs (harness defects)".into(),
+            what: "seeds missing Work 5.3's >= 4*F dirtied LPIDs (per-seed reporting)".into(),
             achieved: sizing_miss,
             required: 0,
+        },
+        // **X5-R39 (card X-5c-F4-F2 step 1; OQ-1's ruling, PLAN §10
+        // item 10): the four sizing rows.** SZC is the ≥ 1,000 quota
+        // ("≥ 1,000 crash rounds whose crash cuts an interval of
+        // ≥ 4·F or interrupts the checkpoint that closes one"), with
+        // MP ≥ 100 and MW ≥ 50 beside it; SZI is the
+        // interrupted-checkpoint floor (≥ 300, counted inside the
+        // 1,000, not on top of it). The SIZING row above stays
+        // per-seed reporting (PLAN item 10: "The per-seed count stays
+        // reported … and is no longer an exit input").
+        QuotaRow {
+            id: "SZC",
+            what: "crash rounds cutting a >= 4*F interval, recovery opened (szq)".into(),
+            achieved: szc_all,
+            required: 1000,
+        },
+        QuotaRow {
+            id: "SZC-MP",
+            what: "MP crash rounds cutting a >= 4*F interval, recovery opened".into(),
+            achieved: szc_mp,
+            required: 100,
+        },
+        QuotaRow {
+            id: "SZC-MW",
+            what: "MW crash rounds cutting a >= 4*F interval, recovery opened".into(),
+            achieved: szc_mw,
+            required: 50,
+        },
+        QuotaRow {
+            id: "SZI",
+            what: "crash rounds interrupting the checkpoint closing a >= 4*F interval".into(),
+            achieved: szi,
+            required: 300,
         },
     ]);
     rows
