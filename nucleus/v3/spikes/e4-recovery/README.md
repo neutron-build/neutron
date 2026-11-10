@@ -11121,3 +11121,84 @@ ran, and each code row's output was checked for the named test's
   file system` line** appears on every commit (known from the base
   chain; every commit lands — the log and the clean tree confirm).
 
+## Card X-5c-F4-F4 (FINAL = rung 7.3, the 50-minute box X5-R54, the
+## live joint-arm pins at 1069 and 3669, and the F3 follow-ups)
+
+Base: `card/v3-X-5c-F4-F3` (tip `2c041aae`, whose verdict file is
+`X-5c-F4-F3.md`, ESCALATE; the card folds that verdict's follow-ups
+X-5c-F4-F3-F1 and X-5c-F4-F3-F2). Class: experiment. Every count this
+card produces is a **probe, not evidence**.
+
+### X-5c-F4-F4: owner decision and X5-R54
+
+Pre-registered at step 0, before any measurement (card Work 0). The
+owner decisions and Goal items 1–3 as the card carries them.
+
+**Owner decisions (2026-11-10, QUEUE "OWNER 2026-11-10 (F4-F3
+ESCALATE 2c041aae)").** The F3 verdict escalated Q7, SZC, SZI and
+SZC-MP. The owner chose, with the numbers known:
+
+1. **Take rung 7.3 for SZC and SZI,** and raise the per-run box for
+   the main and held-out sets to about 50 minutes. This card.
+2. **Fix SZC-MP's cause in E4 now,** confined to the MP-pressure set.
+   Card X-5c-F4-F5.
+3. **Try a targeted Q7 change that keeps Q4 ≥ 1,500.** Q7 is a stated
+   gap only if that fails. Card X-5c-F4-F5.
+
+**No threshold moves.** No quota, bar, floor or exit row changes in
+this card or the next.
+
+**Goal 1 — `Tuning::FINAL` = rung 7.3:** the kept 6.1 setting plus
+7.1–7.3's fields, `ckpt_every_lo` 8, `value_lo` 280, `chunked_ops_lo`
+700 and `chunked_ops_span` 201. These four fields are exactly what
+`db572b5f` changed over `0775b735`. Nothing else in FINAL changes.
+`Tuning::MP_PRESSURE` keeps its 9.1 fields and follows FINAL in every
+other field, so its `value_lo` becomes 280. That is recorded, not
+tuned. X-5c-F4-F5 re-anchors MP on it.
+
+**Goal 2 — X5-R54, the per-run box: 3,000 s (50 minutes) per `run`,
+for the main and held-out sets.** This is an owner-approved parameter,
+recorded as **X5-R54**. It is not a threshold.
+
+- **Derivation.** Rung 7.3 measured **45.4 min per 10k** on an idle
+  host. That is the F3 gate's probe form: five 200-seed blocks,
+  272.5 s, load 1.87 at start, foreign CPU 8.1%. The margin is **10%**
+  (4.54 min) for run-to-run variance on a host kept idle:
+  45.4 × 1.10 = 49.94, rounded up to the whole minute, gives
+  **50 min = 3,000 s**.
+- **Readings not used.** The single-process run that read 52.8 min
+  carried 37.5% foreign CPU. The worker's 41.8 was taken under load.
+  Neither is a clean reading.
+- **The MP-pressure set keeps its own 40 minutes (2,400 s).** Its 9.1
+  probe used about 6 of them.
+- **Where REFRESH 10's 40 becomes 50.** This card edits none of these
+  places, because `cards/` is outside its Touch list. P's next
+  REFRESH of X-5c-F4 carries the change:
+  - REFRESH 9, X5-R46 "The box" ("Each `run` has its 40-minute
+    budget") and "When the box misses" ("a `run` over 40 min"), for
+    main and held-out.
+  - REFRESH 10's final-run table, rows Main and Held-out ("≤ 40 min").
+  - REFRESH 10's "The time box" bullet: the expected total grows from
+    about 4.5 h to about 5 h. The "Any other failure" and "Launch /
+    The 60-minute caps" bullets ("`run` over 40 minutes", "A `run`
+    budget is 40 minutes") change likewise.
+  - Conflicts answer 1 ("the owner's existing 40-minute-per-campaign
+    time box").
+  - **X-5c-F4's own Acceptance lines 431 (main `run`) and 434
+    (held-out `run`):** `test $((e-s)) -le 2400` becomes `-le 3000`.
+    Line 436 (MP-pressure) stays `-le 2400`.
+  - Every later probe's wall limit for FINAL: `min_per_10k` ≤ 50.
+- **What the new box does not cover.** `verify` re-runs every seed, so
+  the main and held-out `verify` take about as long as their `run`.
+  Neither is box-limited, but each runs under the runner's 60-minute
+  kill. At 7.3 that leaves about 10–14 minutes. X-5c-F4's own text
+  (line 296, "so that `verify` stays inside the runner's" kill)
+  should say so when P refreshes it.
+
+**Goal 3 — the live joint arm (P ruling G5-CENSUS (e) 2).** At 7.3 the
+F3 gate's whole-10k census read `JOINT_ARM_CENSUS set=main seeds=10000
+arm_rounds=2 stale_reads=0 arm_seeds=[1069,3669]`. A live seed is a
+STOP, and a pin is required before E4 is judged. This card adds
+literal pins at **both** seeds, at FINAL, with G5-R48-TREADS-KEPT as
+their must-fail mutant.
+
