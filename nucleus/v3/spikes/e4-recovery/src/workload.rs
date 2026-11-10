@@ -1594,8 +1594,9 @@ pub struct SeedRec {
     /// X-5c-F4-F1-F1-CXX-F1 finding 2: an extra read can only suppress
     /// an oracle failure). `0` in clean code and for every round
     /// without a joint arm; the unfired attempt's read count when the
-    /// clear is dropped (**G5-R48-TREADS-KEPT** — 17 stale reads at
-    /// seed 7469).
+    /// clear is dropped (**G5-R48-TREADS-KEPT**; 17 stale reads at
+    /// seed 7469 at CXX-F1's tip, verdict `5db63057`; no seed of
+    /// 0..9999 reaches the arm at `2e8d1b13`, verdict `74f411f0`).
     pub twin_joint_stale_reads: Vec<usize>,
     /// A DEADLOCK occurred in some round.
     pub deadlock: bool,
@@ -2364,9 +2365,11 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                                 // re-paired attempt's reads here, and
                                 // the supply below carries them into
                                 // the real round's oracle (17 at seed
-                                // 7469). Never a digest input, never
-                                // serialized; `SeedRec::finish` never
-                                // reads it.
+                                // 7469 at CXX-F1's tip; no seed of
+                                // 0..9999 reaches this arm at
+                                // `2e8d1b13`). Never a digest input,
+                                // never serialized; `SeedRec::finish`
+                                // never reads it.
                                 joint_arm_ran = true;
                                 joint_stale_reads = treads.len();
                                 tout = harness::run_round(

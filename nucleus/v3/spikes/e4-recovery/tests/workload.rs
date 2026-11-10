@@ -1492,12 +1492,12 @@ fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
 /// joint draw returns `Mid2@1` again, the re-paired twin never fires,
 /// and the fired-guard defect returns — this pin fails.
 ///
-/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the joint spec's draw
-/// moved `Mid2@4 -> Mid2@3` — checkpoint 1's slot numbering shifted
-/// when freed homes became allocatable, so the per-index AND of the two
-/// complete mask lists re-derives `Mid2@3`; the twin and the real
-/// round both still fire there (measured at this tip: 2 rounds, no
-/// defect, round 1 `Mid2@3` fired and passing).
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2), corrected by
+/// X-5c-PINS-1 (verdict `74f411f0` finding 4):** round 1's spec moved
+/// `Mid2@4 -> Mid2@3`. `Mid2@3` is the **first re-derived spec**, not
+/// the joint spec: the re-paired twin fires there, so the joint draw
+/// is not entered at this tip (`twin_joint_arm` reads false). Measured:
+/// 2 rounds, no defect, round 1 `Mid2@3` fired and passing.
 #[test]
 fn r48_repaired_twin_fires_at_the_joint_spec() {
     let rec = workload::run_seed_with(7469, None, &workload::Tuning::BASE);
@@ -1521,11 +1521,11 @@ fn r48_repaired_twin_fires_at_the_joint_spec() {
     );
     assert_eq!(
         rec.rounds[1].crash, "Mid2@3",
-        "seed 7469: round 1 must run the joint spec (X5-R48)"
+        "seed 7469: round 1 must run the first re-derived spec (Mid2@3), not the joint draw"
     );
     assert!(
         rec.rounds[1].fired,
-        "seed 7469: round 1's joint-spec crash must fire"
+        "seed 7469: round 1's re-derived-spec crash must fire"
     );
 }
 
@@ -1554,8 +1554,10 @@ fn r48_repaired_twin_fires_at_the_joint_spec() {
 /// reads) at the named seed, and the arm's absence asserted as the
 /// tripwire — the day it fails, the joint arm is live again at 7469
 /// and **G5-R48-TREADS-KEPT** (drop the `clear()`) becomes catchable
-/// by the freshness assertion. Until then that mutant is **UNCAUGHT
-/// at this tip** (inert: no measurable round reaches the clear).
+/// by the freshness assertion. Until then that mutant has no
+/// must-fail case (P ruling G5-CENSUS; no seed of 0..9999 reaches the
+/// clear, verdict `74f411f0`). A failure of the arm assertion is a
+/// STOP for P, never an edit.
 #[test]
 fn r48_joint_supply_is_fresh_at_7469() {
     let rec = workload::run_seed_with(7469, None, &workload::Tuning::BASE);
