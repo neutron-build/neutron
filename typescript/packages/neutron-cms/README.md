@@ -163,6 +163,12 @@ npx neutron-cms backup out.db    # a consistent copy of the database; copy media
 
 Serve `cms.ready()` from a health route to stop a deploy that has lost its data. Each post keeps its last 50 versions, restorable from Settings, Versions: every update of a published post, and one every ten minutes while a draft is written. Deleting moves a post to the Trash, with an Undo, for 30 days. Every save of a list or text field keeps what it changed, the last 50 saves in all, in the `saves` table; History, linked from each list, the Text page and Edit site, shows them and restores one, and a restore can itself be undone.
 
+## Testing
+
+`pnpm run test` runs the unit tests. `pnpm run test:browser` drives the admin in a real browser: it starts a small site around the handler on a free local port, with a fresh data folder that is removed afterwards, and runs every scenario in Chrome and then WebKit, headless, one browser at a time. A scenario fails on an uncaught page error, a console error from the admin, or a screen that scrolls sideways.
+
+It uses `playwright-core`, which downloads no browsers: Chrome must be installed, and WebKit must already be in Playwright's cache (`npx playwright-core install webkit`). Add `-- chrome` or `-- webkit` for one browser, `-- --grep media` for matching scenarios, and set `SHOTS=folder` to keep the screenshots of the newer screens, light and dark, at desktop and phone size.
+
 ## Limits
 
 The admin trusts your public site. Any script running on the site's own address, including an analytics or embed script, runs with the owner's login when the owner visits. That is normal for a CMS on the same domain, WordPress included. For real separation, serve the admin from its own subdomain.

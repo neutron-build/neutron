@@ -42,7 +42,8 @@
   "scripts": {
     "build": "node scripts/embed.mjs && tsc",
     "lint": "node scripts/embed.mjs && tsc --noEmit --pretty false",
-    "test": "pnpm run build && node --test --no-warnings dist/*.test.js"
+    "test": "pnpm run build && node --test --no-warnings dist/*.test.js",
+    "test:browser": "pnpm run build && node --no-warnings test/browser/run.mjs"
   },
   "dependencies": {
     "marked": "15.0.12",
@@ -54,6 +55,7 @@
   "devDependencies": {
     "@types/node": "^22.10.7",
     "esbuild": "^0.28.2",
+    "playwright-core": "1.65.0",
     "preact": "^10.25.4",
     "prosemirror-commands": "^1.7.2",
     "prosemirror-dropcursor": "^1.8.4",
