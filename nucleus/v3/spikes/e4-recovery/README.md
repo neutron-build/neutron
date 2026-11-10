@@ -10706,3 +10706,16 @@ failing rounds (class × count, seeds listed).
   Q7 returns to the owner with every rung's numbers (owner decision:
   no threshold moves). Later steps still run.
 
+- **rung 4.1** (`syncoff_table` `[0, 7, 7]`, on the 2.0 anchor): wall
+  **22.3** min/10k (raw 133.9 s; load 8.19 10.77 9.69; cpu 1763.3 s);
+  Q4 1850, Q4-I 2150, Q5a 240, Q7 190, Q18 5270. Changed rows vs 2.0:
+  Q8 40→70, Q4 1860→1850, Q4-I 2160→2150, Q5a 250→240, SZC 530→540,
+  SZI 130→140. All rows (per10k): Q1 7930 (hooks 680–850, all ≥ 300),
+  Q2 4200, Q3 1260, Q4 1850, Q5a 240, Q5b 8840, Q5c 6230, Q6a 2270,
+  Q6b 770, Q7 190, Q8 70, Q9 12590, Q10 1100, Q11 0, Q12 0, Q13a 860,
+  Q13b 950, Q13c 950, Q14 590, Q15 1160, Q16 5900, Q17 9360,
+  Q18 5270, SIZING 9190 misses, SZC 540, SZC-MP 0 (this file),
+  SZC-MW 60, SZI 140. Fails: MP ×2 (178 r1, 537 r0). Hold set and
+  wall pass; Q8 70 < 125 (margin) and < 100 (required) — the walk
+  continues. Not kept. Probe, not evidence.
+
