@@ -10667,3 +10667,19 @@ failing rounds (class × count, seeds listed).
   ladder still to come: Q7, Q8, Q11, Q12, SZC, SZI (and SZC-MP, judged
   on the MP probe). Probe, not evidence.
 
+- **rung 3.1** (`drop_one_in` 2): wall **20.6** min/10k (raw 123.8 s;
+  load 5.45 8.44 8.43; cpu 1602.5 s); Q4 1440, Q4-I 1570, Q5a 300,
+  Q7 230, Q18 4520. Changed rows vs 2.0: Q4 1860→1440, Q4-I
+  2160→1570, Q7 190→230, Q8 40→90, Q18 5270→4520, SZC 530→360,
+  SZC-MW 60→30, SZI 130→90, Q5a 250→300. All rows (per10k): Q1 7960
+  (hooks 680–890, all ≥ 300), Q2 4260, Q3 1240, Q4 1440, Q5a 300,
+  Q5b 8760, Q5c 6400, Q6a 2220, Q6b 810, Q7 230, Q8 90, Q9 12850,
+  Q10 980, Q11 0, Q12 0, Q13a 900, Q13b 920, Q13c 900, Q14 580,
+  Q15 1150, Q16 5810, Q17 9160, Q18 4520, SIZING 9360 misses, SZC
+  360, SZC-MP 0 (this file), SZC-MW 30, SZI 90. Fails: MP ×2 (178 r1,
+  537 r0). **Rejected:** Q7 230 < 250 (margin), and the hold set
+  fails — Q4 1440 < 1,500 (the owner's bar; Q4's only raise path,
+  the r41 alignment, needs no-drop rounds, so more drops shrink it).
+  SZC-MW 30 < 50 is allowed (its ladder, step 7, is still to come).
+  Not kept. Probe, not evidence.
+
