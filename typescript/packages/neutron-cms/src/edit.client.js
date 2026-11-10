@@ -20,6 +20,11 @@ const PAGE_STYLES = `
   [contenteditable]:empty::before { content: attr(data-cms-placeholder); opacity: .5; }
   img[data-cms-field] { cursor: pointer; }
   img[data-cms-field]:not([src]) { min-width: 80px; min-height: 80px; background: rgb(128 128 128 / .3); }
+  [data-cms-empty] { list-style: none; }
+  [data-cms-empty] button { padding: 12px 20px; background: rgb(47 128 237 / .06); border: 1px dashed #2f80ed; border-radius: 6px; color: #1d5fc4; font: 600 14px/1.2 system-ui, sans-serif; cursor: pointer; }
+  [data-cms-empty] button:hover { background: rgb(47 128 237 / .12); }
+  [data-cms-empty] button:focus-visible { outline: 2px solid #2f80ed; outline-offset: 2px; }
+  [data-cms-new] img { display: block; max-width: 100%; height: auto; }
 `;
 
 let data = null;
@@ -30,6 +35,7 @@ let pending = 0;
 let notice = "";
 let bad = false;
 let justSaved = false;
+let leaving = false;
 let touchedTexts = {};
 let touchedLists = new Set();
 const itemOf = new WeakMap();
@@ -121,6 +127,12 @@ function bindField(el, field, write) {
   el.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && field.type !== "textarea") event.preventDefault();
   });
+}
+
+/** The image field of a photo list: one image and at most one other field, as the admin decides. */
+function photoField(list) {
+  const fields = Object.entries(list.fields);
+  return fields.length <= 2 ? fields.find(([, field]) => field.type === "image")?.[0] : undefined;
 }
 
 const isInline = (field) => field.type === "text" || field.type === "textarea" || field.type === "image";
@@ -260,6 +272,62 @@ function drawTools() {
   }
 
   if (list.arrangeable) tools.append(...arrangeTools(key, list));
+
+  // The list's own page has everything this bar doesn't, such as uploading many photos at once.
+  const all = Object.assign(document.createElement("a"), { className: "button edit-list", href: `${ADMIN}/lists/${encodeURIComponent(key)}`, textContent: photoField(list) ? "All photos" : "Edit list" });
+  all.addEventListener("click", (event) => {
+    if (!dirty && !pending) return;
+    if (!confirm("Leave this page? Your unsaved changes will be lost.")) return event.preventDefault();
+    leaving = true;
+  });
+  tools.append(all);
+}
+
+/** An empty list has nothing to click, so its marked container offers to add the first item. */
+function offerFirst(container, key, list) {
+  const holder = page.createElement(/^(UL|OL)$/.test(container.tagName) ? "li" : "div");
+  holder.setAttribute("data-cms-empty", "");
+  const add = page.createElement("button");
+  add.type = "button";
+  add.textContent = `Add to ${list.label}`;
+  holder.append(add);
+  container.append(holder);
+  add.addEventListener("click", async () => {
+    const item = {};
+    const image = photoField(list);
+    if (image) {
+      let chosen = false;
+      await chooseFor((url) => {
+        item[image] = url;
+        chosen = true;
+      });
+      if (!chosen) return;
+    }
+    // A stand-in until the save: the site draws the item its own way when the page reloads.
+    holder.textContent = "";
+    holder.removeAttribute("data-cms-empty");
+    holder.setAttribute("data-cms-new", "");
+    holder.setAttribute("data-cms-item", `${key}.0`);
+    for (const [name, field] of Object.entries(list.fields)) {
+      if (field.type === "image") {
+        const img = Object.assign(page.createElement("img"), { alt: "" });
+        if (item[name]) img.src = item[name];
+        img.setAttribute("data-cms", name);
+        holder.append(img);
+      } else if (field.type === "text" || field.type === "textarea") {
+        const words = page.createElement("div");
+        words.setAttribute("data-cms", name);
+        holder.append(words);
+      }
+    }
+    list.items.push(item);
+    bindItem(holder, key, item);
+    decideArrangeable(key);
+    touchedLists.add(key);
+    select(holder);
+    changed();
+    boundFields(holder).find((el) => el.isContentEditable)?.focus();
+  });
 }
 
 function bindPage() {
@@ -286,6 +354,11 @@ function bindPage() {
     if (item) bindItem(el, key, item);
   }
   Object.keys(data.lists).forEach(decideArrangeable);
+  for (const container of page.querySelectorAll("[data-cms-list]")) {
+    const key = container.getAttribute("data-cms-list");
+    const list = Object.hasOwn(data.lists, key) ? data.lists[key] : null;
+    if (list && !list.items.length && !rendered(key).length) offerFirst(container, key, list);
+  }
 
   page.addEventListener("click", (event) => {
     const target = event.target;
@@ -388,7 +461,7 @@ frame.addEventListener("load", async () => {
     if (!frame.contentDocument?.body) throw new Error("blocked");
     bindPage();
     // A page whose content comes from elsewhere, such as a README, has nothing to edit here.
-    const editable = page.querySelector("[data-cms-field], [data-cms-item]");
+    const editable = page.querySelector("[data-cms-field], [data-cms-item], [data-cms-empty]");
     saveButton.hidden = discardButton.hidden = !editable;
     say(justSaved ? "Saved" : editable ? "" : "Nothing on this page is edited here.");
   } catch {
@@ -423,5 +496,5 @@ openPage(false);
 
 addEventListener("keydown", shortcuts);
 addEventListener("beforeunload", (event) => {
-  if (dirty || pending) event.preventDefault();
+  if ((dirty || pending) && !leaving) event.preventDefault();
 });

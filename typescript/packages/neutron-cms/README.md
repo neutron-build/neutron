@@ -111,6 +111,7 @@ defineCms({
 ```
 
 - `data-cms-text` marks a text field, `data-cms-item` marks one list item by its index in `cms.list()`, and `data-cms` marks a field inside that item.
+- `data-cms-list="team"` on the element that holds a list's items lets an empty list be filled: while it is empty, it shows an Add button that adds the first item, asking for the image first in a photo list. Once the item is saved, the page shows it in your own markup.
 - A marked element should hold only that field's text.
 - The editor loads your site in a frame, and Neutron forbids framing by default. Allow your own site to frame itself in `neutron.config.ts`, and use `frame-ancestors 'self'` if you set a Content-Security-Policy:
 

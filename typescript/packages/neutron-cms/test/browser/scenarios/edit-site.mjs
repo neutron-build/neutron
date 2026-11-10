@@ -112,3 +112,53 @@ scenario("edit site: a designed draft is edited and published from its bar", asy
   await t.seeText(visitor.locator("p"), "Written on the draft");
   await t.visible(page.getByRole("button", { name: "Unpublish" }), "Unpublish is offered");
 });
+
+scenario("edit site: the bar links to the list's own page, warning about unsaved changes", async (t) => {
+  const page = await t.page();
+  await t.go(page, "/n-admin/edit");
+  await ready(t, page);
+  await site(page).locator("[data-cms-item='team.0'] [data-cms=name]").click({ force: true });
+  const link = page.locator("[data-edit-tools]").getByRole("link", { name: "Edit list" });
+  await t.visible(link, "a list item offers its list's page");
+  t.equal(await link.getAttribute("href"), "/n-admin/lists/team", "and links to it");
+
+  await typeInto(page, site(page).locator("[data-cms-item='team.0'] [data-cms=name]"), "Changed, not saved");
+  let asked = "";
+  page.once("dialog", (dialog) => { asked = dialog.message(); });
+  page.answers.push(false);
+  await link.click();
+  await t.eventually(() => asked.includes("unsaved changes"), "leaving with changes asks first");
+  t.check(page.url().endsWith("/n-admin/edit"), "and staying keeps the page");
+
+  page.answers.push(true);
+  await link.click();
+  await page.waitForURL(/\/n-admin\/lists\/team$/);
+  await t.visible(page.getByRole("heading", { name: "Team" }), "going opens the list page");
+});
+
+scenario("edit site: an empty list marked on the page offers Add, and the first item is saved", async (t) => {
+  const page = await t.page();
+  await t.go(page, "/n-admin/edit");
+  await ready(t, page);
+  const addPress = site(page).getByRole("button", { name: "Add to Press" });
+  await t.visible(addPress, "an empty marked list offers Add");
+  if (t.browserName === "chrome") await t.shot(page, "edit-site-empty-list-desktop-light");
+  await addPress.click();
+  const tools = page.locator("[data-edit-tools]");
+  await t.visible(tools.getByText("Press"), "the new item is selected in the bar");
+  await page.keyboard.type("The Daily");
+  await tools.getByLabel("Link").fill("https://daily.example.com");
+  await saveEdits(t, page);
+  t.equal(listItems("press").length, 1, "the first item is saved");
+  t.equal(listItems("press")[0].outlet, "The Daily", "with what was typed in place");
+  await t.visible(site(page).locator("[data-cms-item='press.0']"), "and the site shows it");
+  t.equal(await site(page).getByRole("button", { name: "Add to Press" }).count(), 0, "a list with items has no empty Add");
+
+  // A photo list asks for the image first.
+  const addShot = site(page).getByRole("button", { name: "Add to Shots" });
+  await addImageByButton(t, page, imageFile(t.fixture.files, "shot.png"), { click: () => addShot.click() });
+  await t.eventually(async () => !(await saveButton(page).isDisabled()), "the photo is ready to save");
+  await t.visible(tools.getByRole("link", { name: "All photos" }), "a photo list's bar links to All photos");
+  await saveEdits(t, page);
+  t.check(listItems("shots")[0]?.image.startsWith("/n-admin/media/"), "the first photo is saved");
+});

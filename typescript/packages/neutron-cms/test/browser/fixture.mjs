@@ -16,12 +16,14 @@ export const cms = defineCms({
   designs: { portfolio: "Portfolio" },
   reservedSlugs: ["about"],
   texts: { tagline: "text", intro: "textarea", hero: { type: "image", label: "Hero image" } },
-  onPage: ["team"],
+  onPage: ["team", "press", "shots"],
   lists: {
     links: { fields: { label: { type: "text", required: true }, url: { type: "url", required: true } } },
     gallery: { fields: { image: { type: "image", required: true }, caption: "text" } },
     events: { sortBy: "date", fields: { title: { type: "text", required: true }, date: { type: "date", required: true } } },
     team: { fields: { name: "text", photo: "image", site: "url" } },
+    press: { fields: { outlet: "text", link: "url" } },
+    shots: { fields: { image: "image", caption: "text" } },
   },
 });
 
@@ -49,6 +51,8 @@ function sitePage(request) {
           <h3 data-cms="name">${escape(person.name)}</h3>
         </li>`).join("")}
       </ul>
+      <ul class="press" data-cms-list="press">${cms.list("press").map((entry, index) => `<li data-cms-item="press.${index}"><span data-cms="outlet">${escape(entry.outlet)}</span></li>`).join("")}</ul>
+      <div class="shots" data-cms-list="shots">${cms.list("shots").map((shot, index) => `<figure data-cms-item="shots.${index}"><img data-cms="image" src="${escape(shot.image)}" alt="" width="120"></figure>`).join("")}</div>
       <p><a href="/portfolio">Portfolio</a> <a href="https://example.com/">Elsewhere</a></p>`);
   }
   if (path === "/portfolio") {
