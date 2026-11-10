@@ -1,12 +1,34 @@
 #!/usr/bin/env bash
 # X-5c-F4-F3 step 10: the CPU term tool (card Work 10, REFRESH 10's
 # "CPU, fresh" contract as the owner read it on 2026-11-10).
+# X-5c-F4-F4 step 3 (folding X-5c-F4-F3-F2): the --dry-run form, and
+# the arm resolution and the band decision extracted into the shared
+# functions resolve_arms and band_passes — the measuring form and the
+# dry-run resolve the three arms through the same function, not a
+# copy; the self-test gains the band-decision and dry-run cases.
 #
 # Forms:
-#   x5_cpu_term.sh --self-test        drive the arithmetic with fixture
-#                                     CPU numbers (no build, no run) and
-#                                     print CPU_SELFTEST OK, or exit
+#   x5_cpu_term.sh --self-test        drive the arithmetic, the band
+#                                     decision and the dry-run arm
+#                                     resolution with fixture CPU
+#                                     numbers and a fixture git repo
+#                                     (no build, no run) and print
+#                                     CPU_SELFTEST OK, or exit
 #                                     non-zero on the first mismatch
+#   x5_cpu_term.sh --dry-run <base-ref> <prefix>
+#                                     resolve the three arms exactly
+#                                     as the measuring form does and
+#                                     print exactly one line
+#                                     CPU_ARMS base=<h> s1=<h> final=<h>
+#                                     (40-hex each; exit 0). Builds
+#                                     nothing, runs nothing and writes
+#                                     nothing under <prefix>. When the
+#                                     S1 subject ("nucleus v3:
+#                                     X-5c-F4-F3 step 1 - ") matches
+#                                     anything other than one commit
+#                                     in <base-ref>..HEAD, prints an
+#                                     error and exits 2 with no
+#                                     CPU_ARMS line
 #   x5_cpu_term.sh <base-ref> <prefix>  measure: three arms — BASE from
 #                                     <base-ref>, S1 from the one commit
 #                                     in <base-ref>..HEAD whose subject
@@ -72,6 +94,23 @@ in_band() {
   local h
   h=$(hc "$1")
   [ "$h" -ge 5500 ] && [ "$h" -le 6500 ]
+}
+
+# The band decision (X-5c-F4-F4 step 3, folding X-5c-F4-F3-F2): how
+# many passes the first pass owes — 3 when the first-pass term sits in
+# the +55..+65 band, else 1. **A function of the S1 and BASE pass-1
+# columns only** (the inputs the measuring form holds at that point):
+# the FINAL column is present among the pass-1 inputs and must not
+# enter the decision — the self-test's band case pins that
+# (G-CPU-BAND-FROM-FINAL). Sets BAND_TERM to the pass-1 S1 term; echo
+# 3 or 1; return 2 when pass 1 measured no BASE cpu.
+band_passes() {
+  BAND_TERM=$(pct "${EVAL_S1_CPU[1]}" "${EVAL_BASE_CPU[1]}")
+  if [ "$BAND_TERM" = ERR ]; then
+    echo "x5_cpu_term: pass 1 measured no BASE cpu" >&2
+    return 2
+  fi
+  if in_band "$BAND_TERM"; then echo 3; else echo 1; fi
 }
 
 cpu_term_eval() {
@@ -236,6 +275,95 @@ self_test() {
     "CPU_WHOLE_FINAL passes=1 terms=[80.00] term=80.00 wall_ratio=100.00" \
     1
 
+  # Case G (X-5c-F4-F4 step 3, case (a)) — the band decision is a
+  # function of the S1 and BASE pass-1 columns only: the FINAL column
+  # is set to a value that would flip the answer if it were read. S1
+  # at +50 with FINAL at +60 takes one pass; S1 at +58 with FINAL at
+  # +70 takes three. (G-CPU-BAND-FROM-FINAL reverts this and fails.)
+  reset
+  EVAL_BASE_CPU[1]=1000 EVAL_S1_CPU[1]=1500 EVAL_FIN_CPU[1]=1600
+  if [ "$(band_passes)" != 1 ]; then
+    echo "self-test FAIL band-decision-one-pass (S1 +50, FINAL +60 must take one pass)" >&2
+    fails=$((fails + 1))
+  fi
+  reset
+  EVAL_BASE_CPU[1]=1000 EVAL_S1_CPU[1]=1580 EVAL_FIN_CPU[1]=1700
+  if [ "$(band_passes)" != 3 ]; then
+    echo "self-test FAIL band-decision-three-passes (S1 +58, FINAL +70 must take three)" >&2
+    fails=$((fails + 1))
+  fi
+
+  # Case H (X-5c-F4-F4 step 3, cases (b) and (c)) — the dry-run
+  # resolves the three arms through resolve_arms, the same function
+  # the measuring form uses, on a fixture git repository built under
+  # ${CARGO_TARGET_DIR:?}/x5-cpu-selftest.<pid>/: a base commit, a
+  # commit with the S1 subject, and a later HEAD commit (case b:
+  # s1 resolves to the middle commit, final to HEAD, and s1 differs
+  # from final; nothing is written under the prefix — G-CPU-S1-IS-HEAD
+  # reverts this and fails). The same repository with a second
+  # S1-subject commit exits 2 with no CPU_ARMS line, and so does a
+  # repository with none (case c — M-CPU-DRYRUN-MULTI reverts this
+  # and fails). The fixture directory is removed before the verdict.
+  local fx repo repo2 base mid tip out rc dry_ok=1
+  fx=${CARGO_TARGET_DIR:?}/x5-cpu-selftest.$$
+  repo=$fx/repo
+  if mkdir -p "$repo" &&
+     (cd "$repo" &&
+       git init -q &&
+       git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base &&
+       git -c user.name=t -c user.email=t@t commit -q --allow-empty \
+         -m "nucleus v3: X-5c-F4-F3 step 1 - fixture S1" &&
+       git -c user.name=t -c user.email=t@t commit -q --allow-empty -m later)
+  then
+    base=$(cd "$repo" && git rev-parse HEAD~2)
+    mid=$(cd "$repo" && git rev-parse HEAD~1)
+    tip=$(cd "$repo" && git rev-parse HEAD)
+    out=$(cd "$repo" && dry_run "$base" "$fx/prefix" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] ||
+       [ "$out" != "CPU_ARMS base=$base s1=$mid final=$tip" ] ||
+       [ "$mid" = "$tip" ] ||
+       [ -e "$fx/prefix.src.S1" ]; then
+      echo "self-test FAIL dry-run-resolves (rc=$rc, out=$out)" >&2
+      dry_ok=0
+    fi
+    # Case (c), first half: a second S1-subject commit.
+    (cd "$repo" &&
+      git -c user.name=t -c user.email=t@t commit -q --allow-empty \
+        -m "nucleus v3: X-5c-F4-F3 step 1 - fixture S1 again")
+    out=$(cd "$repo" && dry_run "$base" "$fx/prefix" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 2 ] || printf '%s\n' "$out" | grep -q '^CPU_ARMS '; then
+      echo "self-test FAIL dry-run-two-s1 (rc=$rc, out=$out)" >&2
+      dry_ok=0
+    fi
+  else
+    echo "self-test FAIL dry-run-fixture (the fixture repo could not be built)" >&2
+    dry_ok=0
+  fi
+  repo2=$fx/repo2
+  if mkdir -p "$repo2" &&
+     (cd "$repo2" &&
+       git init -q &&
+       git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base &&
+       git -c user.name=t -c user.email=t@t commit -q --allow-empty -m later)
+  then
+    base=$(cd "$repo2" && git rev-parse HEAD~1)
+    out=$(cd "$repo2" && dry_run "$base" "$fx/prefix" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 2 ] || printf '%s\n' "$out" | grep -q '^CPU_ARMS '; then
+      echo "self-test FAIL dry-run-no-s1 (rc=$rc, out=$out)" >&2
+      dry_ok=0
+    fi
+  else
+    echo "self-test FAIL dry-run-fixture-2 (the second fixture repo could not be built)" >&2
+    dry_ok=0
+  fi
+  rm -rf "$fx"
+  if [ "$dry_ok" -ne 1 ]; then
+    fails=$((fails + 1))
+  fi
+
   # The band edges: 55.00 and 65.00 owe three passes; 54.99 and 65.01
   # do not.
   local edges_ok=1
@@ -297,9 +425,16 @@ timed_run() {
   } 2>"$base.time"
 }
 
-measure() {
-  local base_ref=$1 prefix=$2
-  local base_commit s1_commit c count subject
+# Resolve the three arms' commits (X-5c-F4-F4 step 3): BASE from
+# <base-ref>, S1 from the one commit in <base-ref>..HEAD whose subject
+# starts "nucleus v3: X-5c-F4-F3 step 1 - ", FINAL from HEAD. The
+# measuring form and --dry-run both resolve through this one function
+# — not a copy — so the two forms cannot drift. Sets ARM_BASE, ARM_S1
+# and ARM_FINAL (full 40-hex ids). Returns 2 with a message on stderr
+# when the base ref does not resolve, or when the S1 subject matches
+# anything other than one commit in the range.
+resolve_arms() {
+  local base_ref=$1 base_commit s1_commit c count subject
   base_commit=$(git rev-parse --verify --quiet "$base_ref^{commit}") || {
     echo "x5_cpu_term: cannot resolve base ref $base_ref" >&2
     return 2
@@ -315,16 +450,35 @@ measure() {
     echo "x5_cpu_term: expected 1 'step 1 -' commit in $base_ref..HEAD, found $count" >&2
     return 2
   fi
+  ARM_BASE=$base_commit
+  ARM_S1=$s1_commit
+  ARM_FINAL=$(git rev-parse HEAD)
+}
+
+# The dry-run form (X-5c-F4-F4 step 3): resolve the three arms through
+# resolve_arms and print the one CPU_ARMS line. Builds nothing, runs
+# nothing and writes nothing under <prefix> (the argument is part of
+# the form and deliberately unused here). Exits 0, or 2 through
+# resolve_arms with no CPU_ARMS line.
+dry_run() {
+  local base_ref=$1 prefix=$2
+  resolve_arms "$base_ref" || return 2
+  echo "CPU_ARMS base=$ARM_BASE s1=$ARM_S1 final=$ARM_FINAL"
+}
+
+measure() {
+  local base_ref=$1 prefix=$2
   local arm ref toplevel
+  resolve_arms "$base_ref" || return 2
   toplevel=$(git rev-parse --show-toplevel) || {
     echo "x5_cpu_term: not inside the worktree (git rev-parse failed)" >&2
     return 2
   }
   for arm in BASE S1 FINAL; do
     case "$arm" in
-      BASE) ref=$base_commit ;;
-      S1) ref=$s1_commit ;;
-      FINAL) ref=HEAD ;;
+      BASE) ref=$ARM_BASE ;;
+      S1) ref=$ARM_S1 ;;
+      FINAL) ref=$ARM_FINAL ;;
     esac
     mkdir -p "$prefix.src.$arm" "$prefix.target.$arm" || return 2
     # The archive is taken from the worktree root so nucleus/v2 is
@@ -384,15 +538,13 @@ measure() {
     EVAL_FIN_WALL[$pass]=${PASS_WALL[FINAL]}
     EVAL_BUSY[$pass]=${PASS_BUSY[$pass]}
     if [ "$pass" -eq 1 ] && [ "$passes" -eq 1 ]; then
-      local t1
-      t1=$(pct "${EVAL_S1_CPU[1]}" "${EVAL_BASE_CPU[1]}")
-      if [ "$t1" = ERR ]; then
-        echo "x5_cpu_term: pass 1 measured no BASE cpu" >&2
-        return 2
-      fi
-      if in_band "$t1"; then
+      # The band decision, shared with the self-test: a function of
+      # the S1 and BASE pass-1 columns only (band_passes).
+      local np
+      np=$(band_passes) || return 2
+      if [ "$np" -eq 3 ]; then
         passes=3
-        echo "BAND pass1_term=$t1 inside +55..+65: three passes, the median rules"
+        echo "BAND pass1_term=$BAND_TERM inside +55..+65: three passes, the median rules"
       fi
     fi
   done
@@ -410,8 +562,16 @@ if [ "${1:-}" = "--self-test" ]; then
   self_test
   exit $?
 fi
+if [ "${1:-}" = "--dry-run" ]; then
+  if [ $# -ne 3 ]; then
+    echo "usage: x5_cpu_term.sh --dry-run <base-ref> <prefix> | <base-ref> <prefix> | --self-test" >&2
+    exit 2
+  fi
+  dry_run "$2" "$3"
+  exit $?
+fi
 if [ $# -ne 2 ]; then
-  echo "usage: x5_cpu_term.sh <base-ref> <prefix> | --self-test" >&2
+  echo "usage: x5_cpu_term.sh <base-ref> <prefix> | --dry-run <base-ref> <prefix> | --self-test" >&2
   exit 2
 fi
 measure "$1" "$2"
