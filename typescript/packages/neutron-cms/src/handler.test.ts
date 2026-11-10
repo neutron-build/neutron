@@ -1341,3 +1341,26 @@ test("Posts and Pages page through 50 at a time, keeping the query", async () =>
   assert.match(pages, /action="\/n-admin\/pages"/);
   assert.deepEqual(rowsOf(pages), ["Page 12"]);
 });
+
+test("the Text page wires its image fields to the upload script", async () => {
+  const image = defineCms({ texts: { hero: "image" }, lists: {} });
+  const cookie = await logIn();
+  const request = new Request(`${SITE}/n-admin/lists/text`, { headers: { cookie } });
+  const page = await (await image.GET({ request, params: { path: "lists/text" } })).text();
+  assert.match(page, /<form class="text-form" method="post">[\s\S]*class="image-field"[\s\S]*data-row="upload"[\s\S]*data-state/);
+  const script = await (await call("/n-admin/admin.js", { cookie })).text();
+  assert.match(script, /\$\$\("\.text-form"\)[\s\S]*button\[data-row=upload\]/);
+});
+
+test("restoring a save writes only the fields the list declares now", async () => {
+  const cookie = await logIn();
+  db().prepare("INSERT INTO saves (saved_at, before) VALUES (?, ?)").run(
+    "2026-01-01T00:00:00.000Z",
+    JSON.stringify({ texts: {}, lists: { links: [{ label: "Old", url: "https://old.test", icon: "star" }, { label: "No url" }] } }),
+  );
+  const id = saves()[0].id;
+  assert.match(await (await call("/n-admin/history", { cookie })).text(), />Restore<\/button>/);
+  assert.equal((await call(`/n-admin/history/${id}`, { method: "POST", cookie, body: form({}) })).status, 303);
+  assert.deepEqual(cms.list("links"), [{ label: "Old", url: "https://old.test" }, { label: "No url", url: "" }]);
+  assert.doesNotMatch(await (await call(`/n-admin/history?s=${id}`, { cookie })).text(), />Restore<\/button>/, "restored as the list declares it, there is nothing left to restore");
+});

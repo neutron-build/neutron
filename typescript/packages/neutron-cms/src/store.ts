@@ -282,15 +282,16 @@ export function slugify(title: string): string {
     .replace(/-+$/, "");
 }
 
-/**
- * Saves only when `revision` still matches, so a stale tab cannot overwrite newer text.
- * A live post keeps its slug, because changing it would break every link to it.
- */
 /** Now, or a moment later than `previous`: a revision must change on every save, even two in the same millisecond. */
 function after(previous: string): string {
   const stamp = now();
   return stamp > previous ? stamp : new Date(Date.parse(previous) + 1).toISOString();
 }
+
+/**
+ * Saves only when `revision` still matches, so a stale tab cannot overwrite newer text.
+ * A live post keeps its slug, because changing it would break every link to it.
+ */
 
 export function savePost(id: number, fields: PostFields, revision: string, reservedSlugs: string[] = []): SaveResult {
   return transaction<SaveResult>(() => {
@@ -544,17 +545,24 @@ export function valuesNow(keys: { texts: string[]; lists: string[] }): Snapshot 
   };
 }
 
+/** Items with exactly these fields, as every save writes them: a missing one empty, an undeclared one gone. */
+export const withFields = (items: Item[], fields: string[]): Item[] =>
+  items.map((item) => Object.fromEntries(fields.map((name) => [name, typeof item[name] === "string" ? item[name] : ""])));
+
 /**
- * Puts back what a save replaced, for the keys the site still declares. What it replaces is kept
- * as a new save first, so a restore can be undone too. Returns that save's id, null when nothing changed.
+ * Puts back what a save replaced, for the keys and list fields the site still declares. What it
+ * replaces is kept as a new save first, so a restore can be undone too. Returns that save's id,
+ * null when nothing changed.
  */
-export function restoreSave(id: number, declared: { texts: string[]; lists: string[] }): { ok: true; save: number | null } | { ok: false } {
+export function restoreSave(id: number, declared: { texts: string[]; lists: Record<string, string[]> }): { ok: true; save: number | null } | { ok: false } {
   return transaction(() => {
     const row = db().prepare("SELECT id, saved_at, before FROM saves WHERE id = ?").get(id) as { id: number; saved_at: string; before: string } | undefined;
     if (!row) return { ok: false as const };
     const { before } = parseSave(row);
     const texts = Object.fromEntries(Object.entries(before.texts).filter(([key]) => declared.texts.includes(key)));
-    const lists = Object.fromEntries(Object.entries(before.lists).filter(([key]) => declared.lists.includes(key)));
+    const lists = Object.fromEntries(
+      Object.entries(before.lists).filter(([key]) => Object.hasOwn(declared.lists, key)).map(([key, items]) => [key, withFields(items, declared.lists[key])]),
+    );
     const save = keepBefore(texts, lists);
     for (const [key, value] of Object.entries(texts)) writeText(key, value);
     for (const [key, items] of Object.entries(lists)) writeList(key, items);

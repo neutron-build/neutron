@@ -6,7 +6,7 @@ import { isPhotoList, TEXT, type ResolvedConfig, type ResolvedField, type Resolv
 import { thumbUrl } from "./images.js";
 import { isSafeUrl } from "./safe-url.js";
 import type { StoredImage } from "./media.js";
-import type { Item, Post, Save, Snapshot, Trashed, Version } from "./store.js";
+import { withFields, type Item, type Post, type Save, type Snapshot, type Trashed, type Version } from "./store.js";
 
 export const STATUS_LABEL = { draft: "Draft", live: "Live", scheduled: "Scheduled" } as const;
 export type Status = keyof typeof STATUS_LABEL;
@@ -547,7 +547,7 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
           ))}
           <div class="save">
             <button class="button primary" type="submit">Save</button>
-            {saved ? <span class="muted" role="status">Saved</span> : null}
+            <span class="muted" data-state role="status">{saved ? "Saved" : ""}</span>
           </div>
         </form>
       </main>
@@ -694,7 +694,7 @@ export function HistoryPage(props: { config: ResolvedConfig; entries: HistoryEnt
   const onlyName = only === TEXT ? "Text" : only ? listName(config, only) : "";
   // Only what the site still declares is put back, and only if it differs from now.
   const restorable = selected && (
-    Object.entries(selected.save.before.lists).some(([key, items]) => Object.hasOwn(config.lists, key) && JSON.stringify(items) !== JSON.stringify(selected.now.lists[key])) ||
+    Object.entries(selected.save.before.lists).some(([key, items]) => Object.hasOwn(config.lists, key) && JSON.stringify(withFields(items, Object.keys(config.lists[key].fields))) !== JSON.stringify(selected.now.lists[key])) ||
     Object.entries(selected.save.before.texts).some(([key, value]) => Object.hasOwn(config.texts, key) && (value ?? "") !== (selected.now.texts[key] ?? ""))
   );
   const listKeys = selected ? Object.keys(selected.save.before.lists) : [];

@@ -688,6 +688,38 @@ $$("[data-list]").forEach((form) => {
   }
 });
 
+// Image fields on the Text page: chosen or uploaded here, saved with the form.
+
+$$(".text-form").forEach((form) => {
+  const save = $("[type=submit]", form);
+  const state = $("[data-state]", form);
+  form.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-row=upload]");
+    if (!button) return;
+    const field = button.closest(".image-field");
+    let choice = await chooseImage();
+    if (choice?.files) {
+      save.disabled = button.disabled = true;
+      state.classList.toggle("error", false);
+      state.textContent = "Uploading";
+      try {
+        choice = await uploadAndRemember(choice.files[0]);
+        state.textContent = "";
+      } catch (error) {
+        choice = null;
+        state.classList.toggle("error", true);
+        state.textContent = error.message;
+      }
+      save.disabled = button.disabled = false;
+    }
+    if (!choice) return;
+    $("input", field).value = choice.url;
+    $("img", field).src = choice.thumb;
+    button.textContent = "Replace";
+    state.textContent = "Unsaved changes";
+  });
+});
+
 // Media
 
 document.addEventListener("click", async (event) => {

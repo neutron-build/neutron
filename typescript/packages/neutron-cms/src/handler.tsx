@@ -58,7 +58,6 @@ function parseDate(value: string): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
-/** The first thing wrong with these rows, in words the editor can act on. */
 /** A link typed the way people type them, "fylun.ai" or "me@site.com", made into one that works. */
 function completeUrl(value: string): string {
   if (/^[^\s@/:]+@[^\s@/]+\.[a-z]{2,}$/i.test(value)) return `mailto:${value}`;
@@ -453,7 +452,10 @@ export function createHandler(config: ResolvedConfig) {
     return saved();
   }
 
-  const declared = () => ({ texts: Object.keys(config.texts), lists: Object.keys(config.lists) });
+  const declared = () => ({
+    texts: Object.keys(config.texts),
+    lists: Object.fromEntries(Object.entries(config.lists).map(([key, list]) => [key, Object.keys(list.fields)])),
+  });
   /** A save touches a list by its key, or the text fields as a whole. */
   const touches = (save: Save, only: string) => (only === TEXT ? Object.keys(save.before.texts).length > 0 : Object.hasOwn(save.before.lists, only));
   const hasHistory = (only: string) => saves().some((save) => touches(save, only));
