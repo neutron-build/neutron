@@ -276,7 +276,7 @@ impl Tuning {
         map_leaf_cap_table: [8, 16, 254],
         freeset_leaf_bits_table: [128, 512, 32_576],
         r_epoch_table: [1, 2, 4],
-        keep_latest_pm_table: [100, 300, 500, 700, 900],
+        keep_latest_pm_table: [100, 100, 300, 500, 700],
         tear_pm_table: [100, 300, 500, 700, 900],
         rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
         target_ckpt_span: 3,

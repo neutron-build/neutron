@@ -10732,3 +10732,18 @@ failing rounds (class × count, seeds listed).
   pass; Q8 100 ≥ 100 (required) but < 125 (margin) — the walk
   continues to 4.3. Probe, not evidence.
 
+- **rung 4.3** (4.2 and `keep_latest_pm_table`
+  `[100, 100, 300, 500, 700]`): wall **22.8** min/10k (raw 137.0 s;
+  load 10.30 12.49 10.95; cpu 1785.6 s); Q4 1810, Q4-I 2250, Q5a 220,
+  Q7 180, Q18 5240. Changed rows vs 4.2: Q8 100→130, Q4-I 2200→2250,
+  Q5a 230→220, Q18 5250→5240. All rows (per10k): Q1 7930 (hooks
+  680–850, all ≥ 300), Q2 4210, Q3 1270, Q4 1810, Q5a 220, Q5b 8970,
+  Q5c 6380, Q6a 2310, Q6b 740, Q7 180, Q8 130, Q9 12600, Q10 1110,
+  Q11 0, Q12 0, Q13a 880, Q13b 980, Q13c 920, Q14 560, Q15 1150,
+  Q16 5900, Q17 9330, Q18 5240, SIZING 9140 misses, SZC 590, SZC-MP 0
+  (this file), SZC-MW 60, SZI 160. Fails: MP ×2 (178 r1, 537 r0).
+  **Stop-and-keep: Q8 130 ≥ 125 (required 100 × 1.25), the hold set
+  passes (Q4 1810 and Q4-I 2250 over the owner's 1,500 bars; every row
+  that met its minimum at 4.2 still does) and the wall passes.** The
+  last kept setting is now 4.3. Probe, not evidence.
+
