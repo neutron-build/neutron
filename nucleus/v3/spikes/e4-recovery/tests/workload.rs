@@ -235,16 +235,114 @@ fn x5_r37_base_tuning_reproduces_1b0ce54e() {
     }
 }
 
-/// **X5-R37: this card does no retune** — `Tuning::FINAL` equals
-/// `Tuning::BASE` at this card's tip (X-5c-F4's relaunch is the only
-/// card that may change FINAL, and the probe shares it sets in step 3
-/// are reverted).
+/// **X-5c-F4-F3 step 1: FINAL = S1** (verdict `2e8d1b13`'s setting,
+/// handed off by X-5c-F4-F1-F1-F3-F1 §6.1 and fixed by this card's
+/// Goal: no other value of either without a new ruling). Every other
+/// FINAL field still equals BASE's at this step; the ladders that
+/// follow change only the knobs the card lists, and
+/// `x5_r37_final_stays_in_card_ranges` holds them in Limit 4's ranges.
 #[test]
-fn x5_r37_final_equals_base_at_this_tip() {
+fn x5_r37_final_r41_is_s1() {
     assert_eq!(
-        workload::Tuning::FINAL,
-        workload::Tuning::BASE,
-        "this card builds the machinery only: FINAL == BASE (the card's Goal)"
+        workload::Tuning::FINAL.r41_share,
+        1000,
+        "FINAL's r41_share is S1's 1000 (X-5c-F4-F3 step 1)"
+    );
+    assert_eq!(
+        workload::Tuning::FINAL.r41p_share,
+        500,
+        "FINAL's r41p_share is S1's 500 (X-5c-F4-F3 step 1)"
+    );
+}
+
+/// **X-5c-F4-F3 Limit 4 (REFRESH 6's pin, absent at the Base):** both
+/// `Tuning::FINAL` and `Tuning::MP_PRESSURE` stay inside Work 5.1,
+/// 5.2 and X5-R38's ranges — committers 2–4, trees 2–4, keys ≤ 3,000,
+/// values 8–400 B, commits 1–20 ops, SyncOff from {0, 3, 7} tenths,
+/// chunked 300–1,500 ops, `bulk_load_one_in` 4, and each W-share 0 or
+/// in [50, 200] permille. The two `r41` shares are not W-shares: S1
+/// fixes them (1000/500, `x5_r37_final_r41_is_s1`). The existing
+/// `knobs_derive_in_range` derives under BASE only, which is why this
+/// pin names the two retuned constants directly. A draw is
+/// `lo + below(span)`, so a range `[lo, hi]` means
+/// `lo ≥ min` and `lo + span − 1 ≤ hi`.
+#[test]
+fn x5_r37_final_stays_in_card_ranges() {
+    fn in_card_ranges(t: &workload::Tuning, name: &str) {
+        assert!(
+            t.committers_lo >= 2 && t.committers_lo as u64 + t.committers_span <= 5,
+            "{name}: committers must draw in 2..=4 (lo {}, span {})",
+            t.committers_lo,
+            t.committers_span
+        );
+        assert!(
+            t.trees_lo >= 2 && t.trees_lo + t.trees_span <= 5,
+            "{name}: trees must draw in 2..=4 (lo {}, span {})",
+            t.trees_lo,
+            t.trees_span
+        );
+        assert!(
+            t.keyspace_lo + t.keyspace_span <= 3001,
+            "{name}: keys must stay <= 3,000 (lo {}, span {})",
+            t.keyspace_lo,
+            t.keyspace_span
+        );
+        assert!(
+            t.value_lo >= 8 && t.value_hi <= 400 && t.value_lo <= t.value_hi,
+            "{name}: values must draw in 8..=400 B (lo {}, hi {})",
+            t.value_lo,
+            t.value_hi
+        );
+        assert!(
+            t.commit_ops_lo >= 1 && t.commit_ops_lo + t.commit_ops_span <= 21,
+            "{name}: commit ops must draw in 1..=20 (lo {}, span {})",
+            t.commit_ops_lo,
+            t.commit_ops_span
+        );
+        for (i, tenths) in t.syncoff_table.iter().enumerate() {
+            assert!(
+                [0, 3, 7].contains(tenths),
+                "{name}: syncoff_table[{i}] must be 0, 3 or 7 (got {tenths})"
+            );
+        }
+        assert!(
+            t.chunked_ops_lo >= 300 && t.chunked_ops_lo + t.chunked_ops_span <= 1501,
+            "{name}: chunked ops must draw in 300..=1,500 (lo {}, span {})",
+            t.chunked_ops_lo,
+            t.chunked_ops_span
+        );
+        assert_eq!(
+            t.bulk_load_one_in, 4,
+            "{name}: bulk_load_one_in is fixed at 4 (Limit 4)"
+        );
+        for (name_of, share) in [("w11_share", t.w11_share), ("w12_share", t.w12_share)] {
+            assert!(
+                share == 0 || (50..=200).contains(&share),
+                "{name}: {name_of} must be 0 or in 50..=200 permille (got {share})"
+            );
+        }
+    }
+    in_card_ranges(&workload::Tuning::FINAL, "Tuning::FINAL");
+    in_card_ranges(&workload::Tuning::MP_PRESSURE, "Tuning::MP_PRESSURE");
+}
+
+/// **X-5c-F4-F3 step 1:** `Tuning::MP_PRESSURE` shares FINAL's two
+/// `r41` knobs — it is written `{ ..Tuning::FINAL }` (and, from step
+/// 9, `{ <ladder fields>, ..Tuning::FINAL }`), neither `r41` field
+/// among them, so the MP-pressure probes judge the MP knobs on the
+/// same S1 alignment the main set runs. **M-MP-R41** (MP_PRESSURE's
+/// `r41_share` 500) reverts this and fails here.
+#[test]
+fn x5_r37_mp_pressure_r41_equals_final() {
+    assert_eq!(
+        workload::Tuning::MP_PRESSURE.r41_share,
+        workload::Tuning::FINAL.r41_share,
+        "MP_PRESSURE's r41_share must equal FINAL's (S1's 1000)"
+    );
+    assert_eq!(
+        workload::Tuning::MP_PRESSURE.r41p_share,
+        workload::Tuning::FINAL.r41p_share,
+        "MP_PRESSURE's r41p_share must equal FINAL's (S1's 500)"
     );
 }
 
@@ -3615,11 +3713,13 @@ fn x5_r45_the_recorded_set_gates_verify() {
 }
 
 /// **X5-R44 pin: `tuning_id()` is `MpPressure` for that set only**, and
-/// `MP_PRESSURE` equals `FINAL` at this tip (Limit 2 writes it as
-/// `Tuning { ..Tuning::FINAL }`, so it starts equal and follows).
+/// `MP_PRESSURE` equals `FINAL` while it is written as
+/// `Tuning { ..Tuning::FINAL }` (it starts equal and follows).
 /// **M-MP-TUNING** (`mp-pressure` selects `TuningId::Final`) fails the
-/// id half; because the constants are equal here, only the id can show
-/// which one a set selects.
+/// id half. X-5c-F4-F3 step 1 makes FINAL = S1, so the `FINAL == BASE`
+/// half this test pinned at X-5c-F4-F2's tip is gone — that is this
+/// card's Goal ("a `Tuning::FINAL` that is not BASE"); S1's two
+/// constants are pinned by `x5_r37_final_r41_is_s1`.
 #[test]
 fn x5_r44_tuning_id_is_mp_pressure_for_that_set_only() {
     assert_eq!(CampaignSet::Main.tuning_id(), TuningId::Final);
@@ -3630,11 +3730,15 @@ fn x5_r44_tuning_id_is_mp_pressure_for_that_set_only() {
         "M-MP-TUNING reverts this"
     );
     assert_eq!(workload::Tuning::MP_PRESSURE, workload::Tuning::FINAL);
-    assert_eq!(workload::Tuning::FINAL, workload::Tuning::BASE);
-    // The constants are equal at this tip, so the id is the only
-    // discriminator (the linker may even fold them into one constant);
-    // `tuning()` matches on the id, and F4-F3's retune of FINAL moves
-    // MP_PRESSURE with it.
+    assert_ne!(
+        workload::Tuning::FINAL,
+        workload::Tuning::BASE,
+        "X-5c-F4-F3: FINAL is S1, not BASE (the card's Goal)"
+    );
+    // MP_PRESSURE equals FINAL while it is `{ ..Tuning::FINAL }`, so
+    // the id remains the only discriminator between them;
+    // `tuning()` matches on the id, and the retune moves
+    // MP_PRESSURE with FINAL until step 9 gives it ladder fields.
 }
 
 /// **X5-R46 pin: `MP_REFUSAL` on a literal record set with mixed

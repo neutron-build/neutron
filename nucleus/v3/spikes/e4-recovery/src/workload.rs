@@ -92,9 +92,11 @@ const S_R41PC: u64 = 17;
 ///   updates that digest literal in its own commit, naming the seeds
 ///   and why — X5-R37's moved-digest rule). Every seed pin runs BASE.
 /// - [`Tuning::FINAL`] — the campaign's generator (`run`/`verify`
-///   re-run seeds under it). At this card's tip `FINAL == BASE`: this
-///   card builds the machinery and does no retune. X-5c-F4's relaunch
-///   changes FINAL only.
+///   re-run seeds under it). X-5c-F4-F3 sets it to S1 and runs the
+///   pre-registered retune ladders on it; every other card keeps
+///   `FINAL == BASE`.
+/// - [`Tuning::MP_PRESSURE`] — X5-R44's MP-pressure tuning, written
+///   over FINAL so it follows it (step 9 may set its ladder fields).
 ///
 /// The knob-derivation streams and the draw order are unchanged by this
 /// refactor: with `Tuning::BASE` every draw consumes the same stream
@@ -194,10 +196,9 @@ pub struct Tuning {
     /// runs the alignment block of step 1 inside the target checkpoint's
     /// own window (the checkpointer holds it open at `After0`), so the
     /// block's splits, merges and LPID reuses land in that window's own
-    /// counters (Q4's halves, and the reuse Q4-I keys on). 0 in BASE and
-    /// this card's FINAL: no draw is made and no op is inserted — probe
-    /// settings are set in `Tuning::FINAL` only for a probe run and
-    /// reverted (never committed); X-5c-F4's REFRESH owns the hand-off.
+    /// counters (Q4's halves, and the reuse Q4-I keys on). 0 in BASE;
+    /// **1000 in FINAL (X-5c-F4-F3 step 1: S1, the setting of verdict
+    /// `2e8d1b13` — no other value without a new ruling)**.
     pub r41_share: u64,
     /// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a; a 5.2 amendment,
     /// fixed before any measurement of this card): the prior-window
@@ -210,8 +211,9 @@ pub struct Tuning {
     /// own counts (the image arm Q4-I keys on). Block B and every other
     /// round's script are unchanged; block A's content draws come from
     /// `S_R41PC`, so block B is bit-for-bit the same with or without
-    /// it. 0 in BASE and this card's FINAL: no draw is made and no op
-    /// is inserted.
+    /// it. 0 in BASE; **500 in FINAL (X-5c-F4-F3 step 1: S1, the
+    /// setting of verdict `2e8d1b13` — no other value without a new
+    /// ruling)**.
     pub r41p_share: u64,
 }
 
@@ -256,9 +258,13 @@ impl Tuning {
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
-    /// **Equal to [`Tuning::BASE`] at this card's tip** (this card does
-    /// no retune); X-5c-F4's relaunch changes it — pinned by
-    /// `x5_r37_final_equals_base_at_this_tip`.
+    /// **X-5c-F4-F3 step 1: FINAL = S1** — `r41_share` 1000,
+    /// `r41p_share` 500, the setting of verdict `2e8d1b13`; every other
+    /// field still equals [`Tuning::BASE`], and the pre-registered
+    /// ladders change only the knobs the card lists. Pinned by
+    /// `x5_r37_final_r41_is_s1` (S1's two constants),
+    /// `x5_r37_final_stays_in_card_ranges` (Limit 4) and
+    /// `x5_r37_mp_pressure_r41_equals_final`.
     pub const FINAL: Tuning = Tuning {
         committers_lo: 2,
         committers_span: 3,
@@ -293,8 +299,8 @@ impl Tuning {
         burst_gc_loops: 0,
         w11_share: 0,
         w12_share: 0,
-        r41_share: 0,
-        r41p_share: 0,
+        r41_share: 1000,
+        r41p_share: 500,
     };
 
     /// **X5-R44 (card X-5c-F4-F2 step 2; REFRESH 9; owner decision
