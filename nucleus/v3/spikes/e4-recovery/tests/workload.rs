@@ -1836,6 +1836,77 @@ fn r48_joint_supply_is_fresh_at_7469() {
     );
 }
 
+/// **X-5c-F4-F4 step 2 (P ruling G5-CENSUS (e) 2; folding the F3
+/// verdict `2c041aae`'s live-arm reading): the joint arm is live at
+/// FINAL, seed 1069, and its supply is fresh.** At rung 7.3 the F3
+/// gate's whole-10k census read `JOINT_ARM_CENSUS set=main seeds=10000
+/// arm_rounds=2 stale_reads=0 arm_seeds=[1069,3669]`; G5-CENSUS (e) 2
+/// makes a live seed a STOP until a pin lands, and this is that pin.
+/// Measured at this tip (X-5c-F4-F4 step 2's scratch run, at
+/// `Tuning::FINAL`): `rounds.len()` 2, `twin_joint_arm`
+/// `[false, true]`, `twin_joint_stale_reads` `[0, 0]` — the arm runs
+/// in round 1 alone, zero stale reads.
+///
+/// A later change to FINAL that moves the arm makes this pin fail, and
+/// the failure is a **STOP for P, never an edit** (G5-CENSUS (f)'s
+/// rule, at FINAL): do not re-pick the seed, retune, or loosen the
+/// assertion. **G5-R48-TREADS-KEPT** (drop `treads.clear()`) must fail
+/// the stale-read assertion below with a non-zero count.
+#[test]
+fn x5f4_joint_arm_live_at_1069_is_fresh() {
+    let rec = workload::run_seed_with(1069, None, &workload::Tuning::FINAL);
+    assert_eq!(
+        rec.twin_joint_arm.len(),
+        rec.rounds.len(),
+        "seed 1069: the joint-arm diagnostic must cover every executed round"
+    );
+    assert_eq!(
+        rec.twin_joint_arm,
+        [false, true],
+        "seed 1069: the arm must run at round 1 (the census's measured round index, \
+         X-5c-F4-F4 step 2) and in no other round"
+    );
+    assert!(
+        rec.twin_joint_stale_reads.iter().all(|n| *n == 0),
+        "seed 1069: every joint-arm re-run must start from a fresh supply — zero \
+         stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): {:?}",
+        rec.twin_joint_stale_reads
+    );
+}
+
+/// **X-5c-F4-F4 step 2 (P ruling G5-CENSUS (e) 2), the second census
+/// seed: the joint arm is live at FINAL, seed 3669, and its supply is
+/// fresh.** Same census line, same ruling, same measurement as
+/// [`x5f4_joint_arm_live_at_1069_is_fresh`]: at `Tuning::FINAL` this
+/// seed reads `rounds.len()` 2, `twin_joint_arm` `[false, true]`,
+/// `twin_joint_stale_reads` `[0, 0]` — the arm runs in round 1 alone,
+/// zero stale reads. A later change to FINAL that moves the arm makes
+/// this pin fail, and the failure is a **STOP for P, never an edit**
+/// (G5-CENSUS (f)'s rule, at FINAL). **G5-R48-TREADS-KEPT** (drop
+/// `treads.clear()`) must fail the stale-read assertion below with a
+/// non-zero count.
+#[test]
+fn x5f4_joint_arm_live_at_3669_is_fresh() {
+    let rec = workload::run_seed_with(3669, None, &workload::Tuning::FINAL);
+    assert_eq!(
+        rec.twin_joint_arm.len(),
+        rec.rounds.len(),
+        "seed 3669: the joint-arm diagnostic must cover every executed round"
+    );
+    assert_eq!(
+        rec.twin_joint_arm,
+        [false, true],
+        "seed 3669: the arm must run at round 1 (the census's measured round index, \
+         X-5c-F4-F4 step 2) and in no other round"
+    );
+    assert!(
+        rec.twin_joint_stale_reads.iter().all(|n| *n == 0),
+        "seed 3669: every joint-arm re-run must start from a fresh supply — zero \
+         stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): {:?}",
+        rec.twin_joint_stale_reads
+    );
+}
+
 /// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
 /// loud defect, never a hang.** The draft's `reachable_hook_spec`
 /// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with

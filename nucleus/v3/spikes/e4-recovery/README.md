@@ -4614,7 +4614,7 @@ card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chai
    |---|---|
    | GX-RUPF-NORESET (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | `x5_r42_second_window_reuse_pf_starts_at_zero` |
    | GX-R50-NOSELECT (`r41p` loses `r41 &&`) | `x5_r50_ineligible_rounds_draw_nothing` (the uniform literal 13) |
-   | G5-R48-TREADS-KEPT (drop `treads.clear()`) | no must-fail case at this tip: P ruling G5-CENSUS (no seed of 0..9999 reaches the joint arm; F4's judged runs carry the census) |
+   | G5-R48-TREADS-KEPT (drop `treads.clear()`) | `x5f4_joint_arm_live_at_1069_is_fresh` and `x5f4_joint_arm_live_at_3669_is_fresh` (X-5c-F4-F4 step 2, G5-CENSUS (e) 2's pins at FINAL, the census's live seeds; under the mutant the stale-read assertion fails with stale counts **12** at 1069 and **56** at 3669) |
    | G-PRED-LEN-ONLY (the predicate compares key counts only) | `x5r52_twin_dirs_differ_compares_directory_keys` (the equal-size case) |
    | G-RESEED-TWIN-CUT (the re-seeded twin keeps its own `cut`) | `x5_r37_base_tuning_reproduces_1b0ce54e` (seed 6849, `3952923334 -> 1958644185`) |
    | G-MON-FIRSTLINE | `monitor-later-line-counts` |
