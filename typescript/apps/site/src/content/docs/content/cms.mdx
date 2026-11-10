@@ -1,0 +1,347 @@
+---
+title: CMS
+description: "@neutron-build/cms: posts, pages, lists and text fields, edited at /n-admin and stored in one SQLite file."
+---
+
+`@neutron-build/cms` is a small CMS for Neutron sites. It covers posts, standalone pages, photo galleries, events and any other list you declare, plus one-off text fields. The site owner edits them at `/n-admin`, or by clicking them on the real page.
+
+It is built for sites where a developer owns the layout and someone else owns the words and pictures: a personal site, a band, a small business, a portfolio. Everything lives in one SQLite file and one media folder, so there is no database server to run. Visitors get no JavaScript from it. Layout stays in your code; there is no page builder.
+
+Requirements:
+
+- Node 22.16 or newer.
+- Run the site with `neutron-ts start`. The `docker` preset drops the route type the admin uses (as of Neutron 0.5.3).
+
+## Set up
+
+Install the package (0.1.0 is not on npm yet; this is the command once it is published) and generate the owner's password:
+
+```bash
+npm install @neutron-build/cms
+npx neutron-cms password
+```
+
+`neutron-cms password` prints a new password once, and the hash to set as `CMS_PASSWORD_HASH`. Keep the password; only the hash goes in the environment.
+
+Declare what can be edited in `src/cms.ts`:
+
+```ts
+import { defineCms } from "@neutron-build/cms";
+
+export default defineCms({
+  postUrl: (slug) => `/posts/${slug}`,
+  texts: { heading: "text", intro: "textarea" },
+  lists: {
+    gallery: { fields: { image: { type: "image", required: true }, caption: "text" } },
+    events: { sortBy: "date", fields: { title: "text", date: "date", location: "text" } },
+    links: { fields: { label: "text", url: "url" } },
+  },
+});
+```
+
+The admin needs two route files, `src/routes/n-admin/index.ts` and `src/routes/n-admin/[...path].ts`, both with the same content:
+
+```ts
+import cms from "../../cms.ts";
+
+export const config = { mode: "app" };
+export const { GET, POST } = cms;
+```
+
+Start the dev server and log in at `/n-admin` with the password. That password belongs to the owner.
+
+In development the database is created on first use in `./data` (`data/site.db` and `data/media/`). Add `data/` to `.gitignore`. A config mistake, such as a `sortBy` that is not a date field or an `onPage` entry that is not a list, stops the site at startup.
+
+### Environment
+
+- `CMS_PASSWORD_HASH`: the owner's password hash, from `npx neutron-cms password`. Without it nobody can log in. Changing it logs everyone out.
+- `SITE_URL`: your public origin, such as `https://example.com`. Required in production, because admin saves are only accepted from this origin. Set it to the address people actually use, or every save is refused.
+- `CMS_DATA_DIR`: where `site.db` and `media/` live. Required in production, normally a mounted volume.
+
+## Show content
+
+Read content in a loader. The calls are synchronous and read the SQLite file directly.
+
+```tsx
+import { Photo } from "@neutron-build/cms/photo";
+import cms from "../cms.ts";
+
+export const config = { mode: "app", hydrate: false };
+
+export async function loader() {
+  return {
+    heading: cms.text("heading"),
+    gallery: cms.list("gallery"),
+    events: cms.upcoming("events"),
+  };
+}
+
+type Data = Awaited<ReturnType<typeof loader>>;
+
+export default function Home(props: { data?: Data }) {
+  if (!props.data) return null;
+  const { heading, gallery, events } = props.data;
+  return (
+    <main>
+      <h1>{heading}</h1>
+      {gallery.map((photo) => (
+        <Photo src={photo.image} alt={photo.caption} sizes="(max-width: 700px) 50vw, 240px" />
+      ))}
+      <ul>
+        {events.map((event) => (
+          <li>{event.date} {event.title}, {event.location}</li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+The object returned by `defineCms` has these reads:
+
+- `cms.posts()`: published posts, newest first.
+- `cms.post(slug)`: one published post, or `undefined`.
+- `cms.pages()`: published standalone pages, newest first. Designed pages with a fixed address are left out.
+- `cms.page(slug, request?)`: one published page. Pass the request and a draft opened from the admin's Edit site shows too.
+- `cms.design(key, request?)`: the page of a design with a fixed address, such as a homepage. `undefined` while unpublished, so answer 404.
+- `cms.list(key)`: a list's items, in their saved order. Each item is an object of strings keyed by field name.
+- `cms.upcoming(key)`: a dated list's items up to and including today, with undated items kept.
+- `cms.text(key)`: one text field, or an empty string. `cms.texts()` returns all of them at once.
+- `cms.ready()`: `false` when the database is missing, as it is on a lost volume.
+
+A post or page has `slug`, `title`, `description`, `body` (Markdown), `kind` (`"post"` or `"page"`), `layout`, `published_at` and `updated_at`.
+
+### Posts
+
+Your site chooses the post URLs, so post pages, feeds and sitemaps are ordinary routes. Tell the admin where posts live with `postUrl` so its links are right. A post page:
+
+```tsx
+import type { LoaderArgs } from "@neutron-build/core";
+import { notFound } from "@neutron-build/core";
+import { renderMarkdown } from "@neutron-build/cms";
+import cms from "../../cms.ts";
+
+export const config = { mode: "app", hydrate: false };
+
+export async function loader({ params }: LoaderArgs) {
+  const post = cms.post(params.slug);
+  if (!post) return notFound();
+  return { title: post.title, html: renderMarkdown(post.body) };
+}
+
+export default function PostPage(props: { data?: { title: string; html: string } }) {
+  if (!props.data) return null;
+  return (
+    <main>
+      <h1>{props.data.title}</h1>
+      <div dangerouslySetInnerHTML={{ __html: props.data.html }} />
+    </main>
+  );
+}
+```
+
+`@neutron-build/cms` exports three helpers for post bodies:
+
+- `renderMarkdown(text, options?)`: renders with the same parser the editor uses. Links and images that could run code (`javascript:` and the like) lose their link. `renderMarkdown(text, { html: false })` shows raw HTML as text, for Markdown you do not control.
+- `summarize(post, length?)`: the post's description, or the start of its text (160 characters by default), for meta descriptions and feeds.
+- `firstImage(body)`: the first image's address, or `null`, for social cards.
+
+### Images
+
+`<Photo>` from `@neutron-build/cms/photo` serves a thumbnail or the full image to suit the screen, reserves space so the page does not jump, and loads lazily. It takes `src`, `alt`, an optional `sizes`, and any other `<img>` attribute. Set `height: auto` on it if your CSS sets its width.
+
+Uploaded images are stored in `media/` under the data directory and served at `/n-admin/media/`.
+
+## Fields and lists
+
+A field type is one of `text`, `textarea`, `url`, `image` or `date`. A field is either a type or an object `{ type, label, required }`. Labels default to the key, capitalized.
+
+```ts
+defineCms({
+  lists: {
+    team: {
+      label: "Team members",
+      fields: {
+        name: { type: "text", required: true },
+        photo: "image",
+        bio: { type: "textarea", label: "Short bio" },
+      },
+    },
+  },
+});
+```
+
+- **Photo lists.** A list with an image field and at most one other field is edited as a grid. Drop files anywhere on the page and drag to reorder.
+- **Dated lists.** `sortBy` names a date field and keeps the list in date order instead of hand order. `cms.upcoming` keeps an item up through its own day, in the configured `timeZone`.
+- **Text fields.** `texts: { tagline: "text" }` adds a Text page in the admin for one-off values.
+- A list cannot be called `text`, and every list needs at least one field.
+
+## Click to edit
+
+Mark content on the page, list it in `onPage`, and a new **Edit site** page in the admin opens your real site with those parts editable. Words are typed in place, images are clicked, and anything the page does not show, such as a link's address, appears in a small toolbar along with Add, Remove and move. Lists in `onPage` leave the admin menu unless they set `ownPage: true`.
+
+```ts
+defineCms({
+  texts: { tagline: "text" },
+  lists: { team: { fields: { name: "text", photo: "image", site: "url" } } },
+  onPage: ["team", "text"],
+});
+```
+
+Use `"text"` in `onPage` for the text fields. Then mark the page:
+
+```tsx
+<p data-cms-text="tagline">{tagline}</p>
+<ul>
+  {team.map((person, index) => (
+    <li data-cms-item={`team.${index}`}>
+      <a href={person.site}>
+        <Photo data-cms="photo" src={person.photo} alt={person.name} />
+      </a>
+      <h3 data-cms="name">{person.name}</h3>
+    </li>
+  ))}
+</ul>
+```
+
+- `data-cms-text` marks a text field.
+- `data-cms-item` marks one list item, as `list.index`, where the index is its position in `cms.list()`.
+- `data-cms` marks a field inside that item.
+- A marked element should hold only that field's text.
+- Use `hydrate: false` on these pages, so a client render cannot overwrite an edit in progress.
+- It changes content, not layout. A filtered list, such as one from `cms.upcoming`, can edit its fields on the page but not add or move items; edit those on the list's own admin page.
+- Visitors get the same page as before. The attributes do nothing for them, and the editing script runs only inside the admin.
+
+The editor loads your site in a frame, and Neutron forbids framing by default. Allow the site to frame itself in `neutron.config.ts`:
+
+```ts
+import { defineConfig } from "@neutron-build/core";
+
+export default defineConfig({
+  routes: {
+    headers: [{ source: "/:path*", headers: { "X-Frame-Options": "SAMEORIGIN" } }],
+  },
+});
+```
+
+If you set a Content-Security-Policy, use `frame-ancestors 'self'`.
+
+## Pages, designed pages and drafts
+
+`pages: true` adds standalone pages, such as an about page. They are edited like posts but kept out of `cms.posts()`. Route them yourself with `cms.page(slug)`, and list their addresses in `reservedSlugs` if posts share the same URL space, so a post cannot take a page's address. Set `pageUrl` if pages live somewhere other than `postUrl`.
+
+`designs` declares pages that have their own design in your code, by key. Each is listed under Pages in the admin, opens framed for click-to-edit, and has Publish in the same bar. Declaring any design turns on `pages`.
+
+```ts
+defineCms({
+  designs: {
+    home: { title: "Home", url: "/", permanent: true },
+    about: { title: "About", url: "/about/", published: true },
+    portfolio: "Portfolio",
+  },
+});
+```
+
+- A string is the title. The object form is `{ title, url, published, permanent }`.
+- `url` fixes the page's address. Without it, the page answers at its own slug, like any page.
+- `published` starts the page published, for one that is already live. The default is a draft.
+- `permanent` keeps it always published, as a homepage must be: it cannot be unpublished, moved or deleted.
+- Keys are lowercase letters, digits and dashes.
+
+A design with a fixed address checks `cms.design(key, request)` and answers 404 when it returns `undefined`:
+
+```tsx
+import type { LoaderArgs } from "@neutron-build/core";
+import { notFound } from "@neutron-build/core";
+import cms from "../cms.ts";
+
+export const config = { mode: "app", hydrate: false };
+
+export async function loader({ request }: LoaderArgs) {
+  if (!cms.design("about", request)) return notFound();
+  return { intro: cms.text("aboutIntro"), team: cms.list("team") };
+}
+```
+
+A design without a fixed address is drawn by the route that serves pages: when `cms.page(slug, request)` returns a page whose `layout` is the design's key, render that design instead of the Markdown body.
+
+Passing `request` is what makes drafts work. Edit site opens an unpublished page with a preview link, and `cms.page` and `cms.design` show the draft only for that link. Preview links last two hours and end when any password changes or a person is removed. Without `request`, both return published pages only.
+
+Posts and pages have a "Publish on" date. Leaving it empty publishes now; a future date schedules the post, and it appears in `cms.posts()` from that time. A live post's address is fixed, so links keep working; unpublish it to change the address.
+
+## What the owner gets
+
+- **Editor.** Post and page bodies are Markdown, written in a visual editor: headings, lists, links and images show as they will look, a toolbar appears over selected text, and typed Markdown such as `## ` or `**bold**` turns into formatting. Clicking an image asks for its description. The editor reads with the same parser the site renders with and refuses any round trip that would change the page, so HTML and anything else it cannot draw stays as an editable source block; a post it cannot show exactly opens as Markdown. Settings has a switch to write in Markdown instead. Set `previewCss` to your post styles as a string so the admin's preview matches the site.
+- **Images and media library.** Uploads are scaled to at most 2000px on the long side, with a thumbnail. **Media** shows every upload, newest first, with where each is used, a filter for unused ones, upload by drop, Copy address and Delete. An image used in a post, page, list or text cannot be deleted. "Add image" in the editor, and image fields, offer recent uploads to reuse.
+- **Embeds.** **Embed** in the editor takes a YouTube, Vimeo or Spotify link, or an `<iframe>` from any https site, and shows the player in the post. A player link pasted alone on an empty line becomes one too, with Keep as link to undo it. It is stored as plain iframe HTML.
+- **Versions.** Each post keeps its last 50 versions, restorable from Settings, Versions: every update of a published post, and one every ten minutes while a draft is written.
+- **Trash.** Deleting moves a post to the Trash, with an Undo, for 30 days.
+- **History.** Every save of a list or text field records what it changed, the last 50 saves in all. History, linked from each list, the Text page and Edit site, shows them and restores one, and a restore can itself be undone.
+- **People and passwords.** **People** lets the owner add editors by name (letters, numbers, dots, dashes and underscores, or an email address) and shows each a strong password once, to pass on. Once anyone is added, the login asks for a name; the owner leaves it empty. People can edit all content but not manage people. The owner can give a person a new password or remove them, and either logs them out at once. Everyone can change their own password under **Account** (12 to 200 characters).
+- **Search.** Posts and Pages offer a search by title and text once there are more than ten, and show 50 at a time.
+
+If the owner forgets their password, run `npx neutron-cms password` and set the new hash. That password works, any owner password set in the admin is removed, and everyone is logged out. A person who forgets theirs asks the owner for a new one.
+
+## Production
+
+Everything is in `CMS_DATA_DIR`: `site.db` and `media/`. Mount it as a persistent volume.
+
+Production never creates the database, so a lost or unmounted volume fails loudly instead of showing an empty site. Create it once on a new volume, with the same `CMS_DATA_DIR` set:
+
+```bash
+npx neutron-cms init
+```
+
+Back up with:
+
+```bash
+npx neutron-cms backup out.db
+```
+
+That writes a consistent copy of the database while the site runs. Copy `media/` alongside it.
+
+Serve `cms.ready()` from a health route, so a deploy that has lost its data stops instead of serving a blank site:
+
+```ts
+// src/routes/api/health.ts
+import cms from "../../cms.ts";
+
+export const config = { mode: "app" };
+
+export function GET() {
+  const ready = cms.ready();
+  return Response.json(
+    { status: ready ? "ok" : "unavailable" },
+    { status: ready ? 200 : 503, headers: { "Cache-Control": "no-store" } },
+  );
+}
+```
+
+Other notes:
+
+- **Same-origin trust.** The admin trusts your public site. Any script running on the site's own address, including an analytics or embed script, runs with the owner's login when the owner visits. That is normal for a CMS on the same domain. For real separation, serve the admin from its own subdomain.
+- **Embeds and CSP.** Your site's Content-Security-Policy decides which embedded players visitors see. If you set one, allow the player hosts in `frame-src`, for example `frame-src 'self' https://www.youtube-nocookie.com https://player.vimeo.com https://open.spotify.com`.
+- **robots.txt.** If you disallow `/n-admin`, add `Allow: /n-admin/media/` so search engines can see your images.
+
+## Options
+
+- `path`: where the admin route files are. Default `/n-admin`.
+- `posts`: set `false` on a site with no blog. Default `true`.
+- `pages`: standalone pages, edited like posts and kept out of the blog. Default `false`, or `true` when `designs` is set.
+- `designs`: pages with their own design, by key. See above.
+- `postUrl`: where a post lives, for the admin's links. Default `` (slug) => `/${slug}` ``.
+- `pageUrl`: where a page lives. Defaults to `postUrl`.
+- `reservedSlugs`: URLs a post may not take, usually your other pages. The admin path's first segment is always reserved.
+- `previewCss`: your post styles as a string, so previews match the site.
+- `timeZone`: decides when a date has passed, for example `"America/Phoenix"`. Default `UTC`.
+- `lists`: lists by key. Each has `fields`, and optionally `label`, `sortBy` and `ownPage`.
+- `texts`: one-off text fields by key.
+- `onPage`: lists edited by clicking them on the page. Use `"text"` for the text fields.
+
+## Limits
+
+- Two kinds of account: the owner, and people who can edit everything but not manage people.
+- Uploads are limited to 2000px on the long side, and the original is not kept.
+- Images are not deleted when content stops using them. Delete them from Media; "Delete all unused" leaves those kept for undo and any added in the last day.
+- Images that are not uploads, such as files in your `public/` folder, are not listed in Media.
+- It edits content, not layout.

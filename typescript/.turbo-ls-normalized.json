@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 25,
+    "count": 26,
     "items": [
       {
         "name": "@neutron-build/agents",
@@ -24,8 +24,16 @@
         "path": "packages/neutron-cli"
       },
       {
+        "name": "@neutron-build/cms",
+        "path": "packages/neutron-cms"
+      },
+      {
         "name": "@neutron-build/core",
         "path": "packages/neutron"
+      },
+      {
+        "name": "@neutron-build/create",
+        "path": "packages/create-neutron"
       },
       {
         "name": "@neutron-build/data",
@@ -86,10 +94,6 @@
       {
         "name": "@neutron/playground-react-compat",
         "path": "apps/playground-react-compat"
-      },
-      {
-        "name": "@neutron-build/create",
-        "path": "packages/create-neutron"
       },
       {
         "name": "neutron-site",
