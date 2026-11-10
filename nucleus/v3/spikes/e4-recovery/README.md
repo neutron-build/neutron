@@ -10719,3 +10719,16 @@ failing rounds (class × count, seeds listed).
   wall pass; Q8 70 < 125 (margin) and < 100 (required) — the walk
   continues. Not kept. Probe, not evidence.
 
+- **rung 4.2** (`syncoff_table` `[3, 7, 7]`, on the 2.0 anchor): wall
+  **22.8** min/10k (raw 136.7 s; load 7.77 11.24 10.17; cpu 1787.4 s);
+  Q4 1810, Q4-I 2200, Q5a 230, Q7 180, Q18 5250. Changed rows vs 4.1:
+  Q8 70→100, Q4 1850→1810, Q4-I 2150→2200, Q5a 240→230, Q7 190→180,
+  SZC 540→590, SZI 140→160. All rows (per10k): Q1 7930 (hooks 680–850,
+  all ≥ 300), Q2 4200, Q3 1270, Q4 1810, Q5a 230, Q5b 8970, Q5c 6380,
+  Q6a 2300, Q6b 740, Q7 180, Q8 100, Q9 12590, Q10 1120, Q11 0, Q12 0,
+  Q13a 890, Q13b 980, Q13c 950, Q14 570, Q15 1150, Q16 5900, Q17 9300,
+  Q18 5250, SIZING 9140 misses, SZC 590, SZC-MP 0 (this file),
+  SZC-MW 60, SZI 160. Fails: MP ×2 (178 r1, 537 r0). Hold set and wall
+  pass; Q8 100 ≥ 100 (required) but < 125 (margin) — the walk
+  continues to 4.3. Probe, not evidence.
+

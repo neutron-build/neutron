@@ -272,7 +272,7 @@ impl Tuning {
         trees_span: 3,
         keyspace_lo: 1200,
         keyspace_span: 1801,
-        syncoff_table: [0, 7, 7],
+        syncoff_table: [3, 7, 7],
         map_leaf_cap_table: [8, 16, 254],
         freeset_leaf_bits_table: [128, 512, 32_576],
         r_epoch_table: [1, 2, 4],
