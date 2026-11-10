@@ -22,11 +22,33 @@ export async function everyWay(t, path, name, setup, { sizes = SIZES, state } = 
 
 scenario("screens: every admin screen fits at both sizes, light and dark", async (t) => {
   const { ids } = t.fixture;
-  const plain = ["/n-admin", "/n-admin/pages", "/n-admin/lists/links", "/n-admin/lists/gallery", "/n-admin/lists/events", "/n-admin/lists/team", "/n-admin/lists/text", "/n-admin/edit", `/n-admin/posts/${ids.untouched}`];
-  for (const path of plain) await everyWay(t, path);
-  const missing = await t.page({ size: PHONE });
-  t.equal((await missing.goto(`${t.origin}/n-admin/nope`)).status(), 404, "an unknown address is Not found");
-  await t.fits(missing, "not found");
+  const named = [["/n-admin", "posts"], ["/n-admin/pages", "pages"], ["/n-admin/lists/links", "list-links"], ["/n-admin/lists/gallery", "list-gallery"], ["/n-admin/lists/events", "list-events"], ["/n-admin/lists/team", "list-team"], ["/n-admin/lists/text", "text"], [`/n-admin/posts/${ids.untouched}`, "editor"]];
+  for (const [path, name] of named) await everyWay(t, path, name);
+  await everyWay(t, "/n-admin/edit", "edit-site", async (page) => {
+    await page.frameLocator("[data-edit-frame]").locator("[data-cms-field]").first().waitFor();
+  });
+  await everyWay(t, "/n-admin/edit", "edit-site-selected", async (page) => {
+    await page.frameLocator("[data-edit-frame]").locator("[data-cms-item='team.0'] [data-cms=name]").click({ force: true });
+    await page.locator("[data-edit-tools]").getByLabel("Site").waitFor();
+  });
+  await everyWay(t, `/n-admin/posts/${ids.untouched}`, "editor-markdown", async (page) => {
+    await page.locator("[data-toggle-meta]").click();
+    await page.getByRole("button", { name: "Edit as Markdown" }).click();
+    await page.locator("[data-toggle-meta]").click();
+  });
+  await everyWay(t, `/n-admin/posts/${ids.untouched}`, "editor-preview", async (page) => {
+    await page.locator("[data-toggle-preview]").click();
+    await page.frameLocator("[data-preview]").locator("h1").first().waitFor();
+  });
+  for (const [sizeName, size] of SIZES) {
+    for (const dark of [false, true]) {
+      const missing = await t.page({ size, dark });
+      t.equal((await missing.goto(`${t.origin}/n-admin/nope`)).status(), 404, "an unknown address is Not found");
+      await t.fits(missing, "not found");
+      if (t.browserName === "chrome") await t.shot(missing, `not-found-${sizeName}-${dark ? "dark" : "light"}`);
+    }
+  }
+  await everyWay(t, "/n-admin/login", "login", undefined, { state: { cookies: [], origins: [] } });
   await everyWay(t, "/n-admin?q=seed", "posts-search");
   await everyWay(t, `/n-admin/posts/${ids.versioned ?? ids.untouched}/versions`, "versions");
   await everyWay(t, "/n-admin/trash", "trash");

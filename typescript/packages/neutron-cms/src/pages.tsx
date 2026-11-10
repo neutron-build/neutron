@@ -75,7 +75,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
 export function NotFoundPage(props: { config: ResolvedConfig }) {
   return (
     <Shell config={props.config}>
-      <main class="page"><p class="muted">Not found.</p></main>
+      <main class="page"><p class="empty-state">Not found.</p></main>
     </Shell>
   );
 }
@@ -183,7 +183,7 @@ export function PeoplePage(props: {
         </form>
         {props.error ? <p class="error people-error" role="alert">{props.error}</p> : null}
         {props.people.length === 0 ? (
-          <p class="muted">Only you can log in now.</p>
+          <p class="empty-state">Only you can log in now.</p>
         ) : (
           <table class="posts people">
             <tbody>
@@ -195,7 +195,7 @@ export function PeoplePage(props: {
                       <button class="link" type="submit" data-confirm={`Give ${person.name} a new password? The old one stops working and they are logged out.`}>New password</button>
                     </form>
                     <form method="post" action={`${admin}/people/${person.id}/remove`}>
-                      <button class="link" type="submit" data-confirm={`Remove ${person.name}? They are logged out and can't log in again.`}>Remove</button>
+                      <button class="link danger" type="submit" data-confirm={`Remove ${person.name}? They are logged out and can't log in again.`}>Remove</button>
                     </form>
                   </div></td>
                 </tr>
@@ -235,7 +235,7 @@ export function PostsPage(props: {
   const here = (at: number) => `${base}${[query ? `q=${encodeURIComponent(query)}` : "", at > 1 ? `page=${at}` : ""].filter(Boolean).join("&").replace(/^./, "?$&")}`;
   return (
     <Shell config={props.config} active={pages ? "pages" : "posts"}>
-      <main class="page narrow">
+      <main class="page">
         <div class="page-head">
           <h1>{pages ? "Pages" : "Posts"}</h1>
           <form method="post" action={pages ? `${admin}/pages` : admin}>
@@ -256,7 +256,7 @@ export function PostsPage(props: {
           </form>
         ) : null}
         {props.posts.length === 0 ? (
-          <p class="muted">{query ? `Nothing matches "${query}".` : pages ? "No pages yet." : "No posts yet."}</p>
+          <p class="empty-state">{query ? `Nothing matches "${query}".` : pages ? "No pages yet." : "No posts yet."}</p>
         ) : (
           <table class="posts">
             <tbody>
@@ -288,9 +288,9 @@ export function TrashPage(props: { config: ResolvedConfig; items: Trashed[] }) {
   const admin = config.path;
   return (
     <Shell config={config}>
-      <main class="page narrow">
+      <main class="page">
         <div class="page-head"><h1>Trash</h1></div>
-        {items.length === 0 ? <p class="muted">The Trash is empty.</p> : (
+        {items.length === 0 ? <p class="empty-state">The Trash is empty.</p> : (
           <>
             <table class="posts trash">
               <tbody>
@@ -299,7 +299,7 @@ export function TrashPage(props: { config: ResolvedConfig; items: Trashed[] }) {
                     <td><span class="trash-title">{item.title || "Untitled"}</span><small class="muted">{item.kind === "page" ? "Page" : "Post"}, deleted {listDate(config, item.deleted_at)}</small></td>
                     <td class="actions">
                       <form method="post" action={`${admin}/trash/${item.id}`}>
-                        <button class="link" type="submit" name="intent" value="forever" data-confirm={`Delete "${item.title || "Untitled"}" for good? This can't be undone.`}>Delete forever</button>
+                        <button class="link danger" type="submit" name="intent" value="forever" data-confirm={`Delete "${item.title || "Untitled"}" for good? This can't be undone.`}>Delete forever</button>
                         <button class="button" type="submit" name="intent" value="restore">Restore</button>
                       </form>
                     </td>
@@ -347,7 +347,7 @@ export function VersionsPage(props: { config: ResolvedConfig; post: Post; versio
           <iframe class="version-preview" title="This version" sandbox="allow-same-origin" srcdoc={props.document} />
         </div>
       ) : (
-        <main class="page narrow"><p class="muted">No earlier versions yet. One is kept when you update a published post, and every ten minutes while you write a draft.</p></main>
+        <main class="page narrow"><p class="empty-state">No earlier versions yet. One is kept when you update a published post, and every ten minutes while you write a draft.</p></main>
       )}
     </>
   );
@@ -439,7 +439,7 @@ export function EditorPage(props: {
             {status !== "draft" ? (
               <button class="link on-phone" type="submit" name="intent" value="unpublish" data-confirm={live ? `Take this ${post.kind} offline? You can publish it again any time.` : undefined}>{live ? "Unpublish" : "Unschedule"}</button>
             ) : null}
-            <button class="link" type="submit" name="intent" value="delete" formnovalidate>Move to Trash</button>
+            <button class="link danger" type="submit" name="intent" value="delete" formnovalidate>Move to Trash</button>
           </footer>
         </aside>
       </form>
@@ -491,7 +491,7 @@ function Row(props: { list: ResolvedList; item?: Item }) {
       <div class="item-tools">
         {sorted ? null : <button class="link" type="button" data-row="up" aria-label="Move earlier">{grid ? "←" : "↑"}</button>}
         {sorted ? null : <button class="link" type="button" data-row="down" aria-label="Move later">{grid ? "→" : "↓"}</button>}
-        <button class="link" type="button" data-row="remove">Remove</button>
+        <button class="link danger" type="button" data-row="remove">Remove</button>
       </div>
     </div>
   );
@@ -722,7 +722,7 @@ export function HistoryPage(props: { config: ResolvedConfig; entries: HistoryEnt
         ) : null}
         {only ? <p class="muted history-filter">Showing saves of {onlyName}.</p> : null}
         {!selected ? (
-          <p class="muted">Nothing to go back to yet. Every save of {only ? onlyName : "a list or text"} is kept here, the last 50.</p>
+          <p class="empty-state">Nothing to go back to yet. Every save of {only ? onlyName : "a list or text"} is kept here, the last 50.</p>
         ) : (
           <div class="history">
             <nav class="history-list" aria-label="Saves">
@@ -808,7 +808,7 @@ export function MediaPage(props: {
         </div>
         {unused && props.unusedCount > props.deletable ? <p class="muted media-note">"Delete all unused" leaves images kept for undo, and any added in the last day, in case they are in work not saved yet.</p> : null}
         {images.length === 0 ? (
-          <p class="muted">{unused ? "No unused images." : "No images yet. Upload some, or drop them on this page."}</p>
+          <p class="empty-state">{unused ? "No unused images." : "No images yet. Upload some, or drop them on this page."}</p>
         ) : (
           <ul class="media-grid">
             {images.map((image) => (
@@ -825,7 +825,7 @@ export function MediaPage(props: {
                     <form method="post" action={`${admin}/media/delete`}>
                       <input type="hidden" name="name" value={image.name} />
                       {unused ? <input type="hidden" name="unused" value="1" /> : null}
-                      <button class="link" type="submit" data-confirm={image.kept.length
+                      <button class="link danger" type="submit" data-confirm={image.kept.length
                         ? `Delete this image for good? It is only kept for undo in ${image.kept.join(" and ")}, so restoring that would show a broken image. This can't be undone.`
                         : "Delete this image for good? This can't be undone."}>Delete</button>
                     </form>
