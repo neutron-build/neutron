@@ -463,6 +463,14 @@ function Input(props: { name: string; field: ResolvedField; value?: string }) {
   return <input class="input" name={name} inputMode={field.type === "url" ? "url" : undefined} value={value} placeholder={field.label} aria-label={field.label} />;
 }
 
+/** A field with its name. An image field isn't a label: that would name its button after the field and send clicks on the picture to it. */
+function Labelled(props: { field: ResolvedField; children: ComponentChildren }) {
+  const { field } = props;
+  return field.type === "image"
+    ? <div class="field" role="group" aria-label={field.label}><span>{field.label}</span>{props.children}</div>
+    : <label class="field"><span>{field.label}</span>{props.children}</label>;
+}
+
 function Row(props: { list: ResolvedList; item?: Item }) {
   const entries = Object.entries(props.list.fields);
   const grid = isPhotoList(props.list);
@@ -473,10 +481,9 @@ function Row(props: { list: ResolvedList; item?: Item }) {
         {entries.map(([key, field]) => grid
           ? <Input key={key} name={`f.${key}`} field={field} value={props.item?.[key]} />
           : (
-            <label class="field" key={key}>
-              <span>{field.label}</span>
+            <Labelled key={key} field={field}>
               <Input name={`f.${key}`} field={field} value={props.item?.[key]} />
-            </label>
+            </Labelled>
           ))}
       </div>
       <div class="item-tools">
@@ -540,10 +547,9 @@ export function TextPage(props: { config: ResolvedConfig; texts: Record<string, 
         <div class="page-head"><h1>Text</h1>{props.history ? <HistoryLink config={config} only={TEXT} /> : null}</div>
         <form class="text-form" method="post">
           {Object.entries(config.texts).map(([name, field]) => (
-            <label class="field" key={name}>
-              <span>{field.label}</span>
+            <Labelled key={name} field={field}>
               <Input name={name} field={field} value={texts[name]} />
-            </label>
+            </Labelled>
           ))}
           <div class="save">
             <button class="button primary" type="submit">Save</button>

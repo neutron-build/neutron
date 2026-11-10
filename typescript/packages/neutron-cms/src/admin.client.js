@@ -42,13 +42,17 @@ async function prepareImage(file) {
   }
 }
 
-async function uploadImage(picked) {
+async function uploadImage(picked, again = true) {
   const prepared = await prepareImage(picked);
   const form = new FormData();
   for (const [key, value] of Object.entries(prepared)) if (value) form.set(key, value);
   const response = await cms("upload", form);
   if (response.status === 401) throw new Error("Signed out. Log in again in another tab, then retry.");
-  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? "Upload failed");
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    if (result.empty && again) return uploadImage(picked, false);
+    throw new Error(result.error ?? "Upload failed");
+  }
   return response.json();
 }
 
@@ -69,6 +73,13 @@ const imageFiles = (list) => [...list].filter((file) => file.type.startsWith("im
 let recent = [];
 if ($("[data-add-image], [data-row=add-photos], [data-edit-frame], .image-field") || $$("template").some((t) => t.content.querySelector(".image-field"))) {
   fetch(`${ADMIN}/media`, { headers: { "x-cms": "1" } }).then((r) => (r.ok ? r.json() : { images: [] })).then((data) => { recent = data.images; }, () => {});
+}
+
+/** A click on a dialog's backdrop. Its own padding is the dialog too, so the target alone can't tell. */
+function outside(dialog, event) {
+  if (event.target !== dialog) return false;
+  const box = dialog.getBoundingClientRect();
+  return event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom;
 }
 
 /** Resolves to { files }, to { url, thumb } for an image already here, or null. */
@@ -97,7 +108,7 @@ function chooseImage(multiple = false) {
       pickImages(multiple).then((files) => done(files.length ? { files } : null));
     });
     cancel.addEventListener("click", () => done(null));
-    dialog.addEventListener("click", (event) => { if (event.target === dialog) done(null); });
+    dialog.addEventListener("click", (event) => { if (outside(dialog, event)) done(null); });
     dialog.addEventListener("close", () => {
       dialog.replaceWith();
       resolve(result);
@@ -344,7 +355,8 @@ function startEditor(form) {
   // A normal save lands on ?saved=1, which is the only proof the browser copy can go.
 
   const url = new URL(location.href);
-  if (url.searchParams.has("saved")) {
+  const justSaved = url.searchParams.has("saved");
+  if (justSaved) {
     store.clear();
     url.searchParams.delete("saved");
     history.replaceState(null, "", url);
@@ -505,7 +517,8 @@ function startEditor(form) {
     if (!opening) fitAll();
   });
 
-  show(words());
+  // The server's "Saved" stays, or Update and Publish would show no sign that they worked.
+  show(justSaved ? `Saved, ${words()}` : words());
 }
 
 // Site lists

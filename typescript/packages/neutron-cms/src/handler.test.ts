@@ -191,6 +191,22 @@ test("text fields save and read back", async () => {
   assert.match(await (await call("/n-admin/lists/text", { cookie })).text(), /value="Hello"/);
 });
 
+test("form text keeps plain line ends, as the editors save them", async () => {
+  const cookie = await logIn();
+  await call("/n-admin/lists/text", { method: "POST", cookie, body: form({ tagline: "one\r\ntwo" }) });
+  assert.equal(cms.text("tagline"), "one\ntwo");
+  const revision = revisionOf(await (await call("/n-admin/lists/links", { cookie })).text());
+  await call("/n-admin/lists/links", { method: "POST", cookie, body: form({ revision, "f.label": ["a\r\nb"], "f.url": ["https://a.test"] }) });
+  assert.equal(cms.list("links")[0].label, "a\nb");
+});
+
+test("an upload that arrives empty says so, so the page can try again", async () => {
+  const cookie = await logIn();
+  const response = await send(cookie, new Uint8Array(0));
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).empty, true);
+});
+
 test("uploads land under the mount, keep their thumbnail and are served to anyone", async () => {
   const cookie = await logIn();
   const sized = await (await send(cookie, png(1), { width: "2000", height: "1000", thumb: new File([png(2) as BlobPart], "t", { type: "image/png" }) })).json();

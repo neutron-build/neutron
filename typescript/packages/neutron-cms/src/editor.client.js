@@ -820,7 +820,8 @@ class EmbedView {
     const src = (a.src ?? "").replace(/&amp;/g, "&");
     const frame = document.createElement("iframe");
     // Only what a player needs, and never the top of the admin.
-    frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-presentation");
+    // Safari doesn't know allow-presentation and logs an error for it, so only known flags are set.
+    frame.setAttribute("sandbox", ["allow-scripts", "allow-same-origin", "allow-popups", "allow-presentation"].filter((flag) => frame.sandbox.supports?.(flag) ?? true).join(" "));
     for (const name of ["title", "allow", "referrerpolicy"]) if (a[name]) frame.setAttribute(name, a[name]);
     if ("allowfullscreen" in a) frame.allowFullscreen = true;
     frame.src = src;
@@ -865,7 +866,11 @@ function ask(label, fill) {
       dialog.close();
     };
     fill(form, done);
-    dialog.addEventListener("click", (event) => { if (event.target === dialog) done(null); });
+    // Only a click on the backdrop: the dialog's own padding is the dialog too.
+    dialog.addEventListener("click", (event) => {
+      const box = dialog.getBoundingClientRect();
+      if (event.target === dialog && (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom)) done(null);
+    });
     dialog.addEventListener("close", () => {
       dialog.remove();
       resolve(result);

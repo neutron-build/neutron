@@ -46,6 +46,9 @@ const redirect = (location: string, cookie?: string) =>
 const escapeHtml = (text: string) =>
   text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 
+/** A form field's text, with the browser's \r\n line ends made plain, as the editors save them. */
+const formText = (value: unknown) => String(value ?? "").replace(/\r\n?/g, "\n").trim();
+
 const isDate = (value: string) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const date = new Date(`${value}T00:00:00Z`);
@@ -272,6 +275,8 @@ export function createHandler(config: ResolvedConfig) {
     const file = form.get("file");
     const thumb = form.get("thumb");
     if (!(file instanceof File)) return Response.json({ error: "No file." }, { status: 400 });
+    // WebKit now and then sends a file's bytes as nothing; the page tries once more.
+    if (file.size === 0) return Response.json({ error: "The image arrived empty. Try again.", empty: true }, { status: 400 });
     if (file.size + (thumb instanceof File ? thumb.size : 0) > MAX_UPLOAD_BYTES) return tooLarge();
 
     const name = saveImage(new Uint8Array(await file.arrayBuffer()), {
@@ -425,7 +430,7 @@ export function createHandler(config: ResolvedConfig) {
       if (Object.keys(config.texts).length === 0) return notFound();
       if (request.method !== "POST") return page("Text", <TextPage config={config} texts={allTexts()} saved={showsSaved} history={hasHistory(TEXT)} />);
       const form = await request.formData();
-      setTexts(Object.fromEntries(Object.keys(config.texts).map((name) => [name, String(form.get(name) ?? "").trim()])));
+      setTexts(Object.fromEntries(Object.keys(config.texts).map((name) => [name, formText(form.get(name))])));
       return saved();
     }
 
@@ -438,7 +443,7 @@ export function createHandler(config: ResolvedConfig) {
 
     const form = await request.formData();
     const names = Object.keys(definition.fields);
-    const columns = names.map((name) => form.getAll(`f.${name}`).map((value) => String(value).trim()));
+    const columns = names.map((name) => form.getAll(`f.${name}`).map(formText));
     const rows = columns[0].map((_, index) => Object.fromEntries(names.map((name, column) => [name, columns[column][index] ?? ""])) as Item);
     const filled = rows.filter((row) => Object.values(row).some(Boolean));
     const items = definition.sortBy ? sortByDate(filled, definition.sortBy) : filled;
