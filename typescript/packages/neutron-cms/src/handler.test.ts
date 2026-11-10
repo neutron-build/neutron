@@ -1282,3 +1282,62 @@ test("a session made before people existed is the owner's", async () => {
   db().prepare("INSERT INTO sessions (token_hash, password_tag, expires_at, person_id) VALUES (?, ?, ?, 4242)").run(sha("ghost"), sha(process.env.CMS_PASSWORD_HASH!), new Date(Date.now() + 60_000).toISOString());
   assert.equal(await signedIn("n_session=ghost"), false);
 });
+
+const rowsOf = (html: string) => [...html.matchAll(/<td><a href="\/n-admin\/posts\/\d+">([^<]*)<\/a>/g)].map((match) => match[1]);
+
+test("Posts offers a search past ten, by title and text, with LIKE wildcards taken as typed", async () => {
+  const cookie = await logIn();
+  for (let n = 1; n <= 10; n++) createPost({ title: `Post ${n}`, body: "plain words" });
+  assert.doesNotMatch(await (await call("/n-admin", { cookie })).text(), /name="q"/, "ten rows need no search");
+  createPost({ title: "Spring notes", body: "On 50% off and snake_case" });
+  createPost({ title: "Other", body: "mentions SPRING in the text" });
+  const all = await (await call("/n-admin", { cookie })).text();
+  assert.match(all, /<form class="search" method="get" action="\/n-admin" role="search">/);
+
+  assert.deepEqual(rowsOf(await (await call("/n-admin?q=spring", { cookie })).text()).sort(), ["Other", "Spring notes"]);
+  assert.deepEqual(rowsOf(await (await call("/n-admin?q=50%25", { cookie })).text()), ["Spring notes"]);
+  assert.deepEqual(rowsOf(await (await call("/n-admin?q=e_c", { cookie })).text()), ["Spring notes"]);
+  assert.deepEqual(rowsOf(await (await call("/n-admin?q=%25", { cookie })).text()), ["Spring notes"]);
+  const none = await (await call("/n-admin?q=_", { cookie })).text();
+  assert.deepEqual(rowsOf(none), ["Spring notes"], "an underscore matches only an underscore");
+  const nothing = await (await call(`/n-admin?q=${encodeURIComponent("<b>x</b>")}`, { cookie })).text();
+  assert.match(nothing, /Nothing matches &quot;&lt;b>x&lt;\/b>&quot;\./);
+  assert.match(nothing, /value="&lt;b>x&lt;\/b>"/);
+  assert.match(nothing, /href="\/n-admin">Show all/);
+});
+
+test("a search shows with few rows while a query is active, and keeps the Undo banner and Trash link", async () => {
+  const cookie = await logIn();
+  const id = createPost({ title: "Gone", body: "x" });
+  createPost({ title: "Kept", body: "x" });
+  const trashId = trashPost(id);
+  const page = await (await call(`/n-admin?q=kept&deleted=${trashId}`, { cookie })).text();
+  assert.match(page, /name="q"/);
+  assert.deepEqual(rowsOf(page), ["Kept"]);
+  assert.match(page, /&quot;Gone&quot; moved to Trash\./);
+  assert.match(page, new RegExp(`action="/n-admin/trash/${trashId}"`));
+  assert.match(page, /href="\/n-admin\/trash">Trash \(1\)/);
+  assert.doesNotMatch(await (await call("/n-admin", { cookie })).text(), /name="q"/);
+});
+
+test("Posts and Pages page through 50 at a time, keeping the query", async () => {
+  const cookie = await logIn();
+  for (let n = 1; n <= 51; n++) createPost({ title: `Note ${n}`, published_at: new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString() });
+  createPost({ title: "Other", published_at: "2025-01-01T00:00:00.000Z" });
+  const first = await (await call("/n-admin", { cookie })).text();
+  assert.equal(rowsOf(first).length, 50);
+  assert.match(first, /Page 1 of 2/);
+  assert.match(first, /href="\/n-admin\?page=2">Older/);
+  const found = await (await call("/n-admin?q=note", { cookie })).text();
+  assert.equal(rowsOf(found).length, 50);
+  assert.match(found, /href="\/n-admin\?q=note&amp;page=2">Older/);
+  const second = await (await call("/n-admin?q=note&page=2", { cookie })).text();
+  assert.deepEqual(rowsOf(second), ["Note 1"]);
+  assert.match(second, /href="\/n-admin\?q=note">Newer/);
+  assert.deepEqual(rowsOf(await (await call("/n-admin?q=note&page=9", { cookie })).text()), ["Note 1"], "past the end shows the last page");
+
+  for (let n = 1; n <= 12; n++) createPost({ title: `Page ${n}`, kind: "page" });
+  const pages = await (await call("/n-admin/pages?q=page%2012", { cookie })).text();
+  assert.match(pages, /action="\/n-admin\/pages"/);
+  assert.deepEqual(rowsOf(pages), ["Page 12"]);
+});

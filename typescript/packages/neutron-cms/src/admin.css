@@ -384,6 +384,9 @@ a.button { color: inherit; text-decoration: none; }
 /* Trash and versions */
 .undo { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
 .trash-link { margin-top: 16px; font-size: 13px; }
+.search { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+.search .input { flex: 1; min-width: 0; }
+.search a { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .trash-link a { color: var(--muted); }
 .trash-title { display: block; color: var(--strong); font-size: 15px; font-weight: 500; }
 .posts.trash small { font-size: 13px; }

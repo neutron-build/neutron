@@ -80,6 +80,8 @@ Post bodies are Markdown, written in a visual editor: headings, lists, links and
 
 **Embed** in the editor's bar takes a YouTube, Vimeo or Spotify link, or an `<iframe>` from any https site, and shows the player in the post; a player link pasted alone on an empty line becomes one too, with Keep as link to undo it. It is stored as plain iframe HTML. Your site's own Content-Security-Policy decides which players visitors see, so if you set one, allow those hosts in `frame-src`, for example `frame-src 'self' https://www.youtube-nocookie.com https://player.vimeo.com https://open.spotify.com`.
 
+Posts and Pages offer a search, by title and text, once there are more than ten, and show 50 at a time.
+
 Uploaded images live in `media/` and are served at `/n-admin/media/`. **Media** in the admin shows them all, newest first, with where each is used, a filter for unused ones, upload by drop, Copy address and Delete. An image in a post, page, list or text can't be deleted; one only in the Trash, an old version or list history can, with a warning. "Add image" in the editor, and image fields, offer the newest images to reuse as well as Upload. Images that aren't uploads, such as files in your `public/` folder, aren't listed.
 
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.

@@ -197,6 +197,20 @@ export const allPosts = (kind: Kind = "post") =>
 export const livePosts = (kind: Kind = "post") =>
   db().prepare("SELECT * FROM posts WHERE kind = ? AND published_at <= ? ORDER BY published_at DESC").all(kind, now()) as unknown as Post[];
 
+/** Posts or pages whose title or text contains `query`, in the order of allPosts, without their text. */
+export function findPosts(kind: Kind, query = ""): Omit<Post, "body">[] {
+  const columns = "id, slug, title, description, label, kind, layout, published_at, updated_at";
+  const order = "ORDER BY published_at IS NOT NULL, published_at DESC, updated_at DESC";
+  if (!query) return db().prepare(`SELECT ${columns} FROM posts WHERE kind = ? ${order}`).all(kind) as unknown as Omit<Post, "body">[];
+  // Typed % and _ are looked for as themselves.
+  const like = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
+  return db()
+    .prepare(`SELECT ${columns} FROM posts WHERE kind = ? AND (title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\') ${order}`)
+    .all(kind, like, like) as unknown as Omit<Post, "body">[];
+}
+
+export const postCount = (kind: Kind = "post") => (db().prepare("SELECT count(*) AS n FROM posts WHERE kind = ?").get(kind) as { n: number }).n;
+
 export const getPost = (id: number) =>
   db().prepare("SELECT * FROM posts WHERE id = ?").get(id) as Post | undefined;
 

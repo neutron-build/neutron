@@ -14,7 +14,7 @@ import { isSafeUrl } from "./safe-url.js";
 import { deleteImage, isImageName, listImages, MAX_UPLOAD_BYTES, saveImage, serveImage, type StoredImage } from "./media.js";
 import { AccountPage, Document, EditorPage, PeoplePage, Viewer, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
+  allPosts, allTexts, createPost, findPosts, postCount, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
   sortByDate, trashCount, trashed, trashPost, valuesNow, versionsOf, type Item, type Post, type Save, type Snapshot,
 } from "./store.js";
 
@@ -99,7 +99,7 @@ function isSameOrigin(request: Request): boolean {
   return origin === expected;
 }
 
-const statusOf = (post: Post, at?: string): Status => (!post.published_at ? "draft" : isLive(post, at) ? "live" : "scheduled");
+const statusOf = (post: Pick<Post, "published_at">, at?: string): Status => (!post.published_at ? "draft" : isLive(post, at) ? "live" : "scheduled");
 
 /** Who is logged in, for the request being answered. */
 const viewer = new AsyncLocalStorage<{ account: Account; session: string }>();
@@ -125,22 +125,34 @@ export function createHandler(config: ResolvedConfig) {
   const notFound = () => page("Not found", <NotFoundPage config={config} />, 404);
   const isScript = (request: Request) => request.headers.has("x-cms");
 
+  const POSTS_PAGE = 50;
+
   function postsPage(request: Request, kind: "post" | "page" = "post") {
     if (kind === "page") ensureDesigns(config.designs);
     removeAbandonedDrafts();
     emptyOldTrash();
-    const deletedId = Number(new URL(request.url).searchParams.get("deleted"));
+    const search = new URL(request.url).searchParams;
+    const deletedId = Number(search.get("deleted"));
     const deleted = deletedId ? inTrash(deletedId) : undefined;
+    const query = (search.get("q") ?? "").trim().slice(0, 200);
     const at = new Date().toISOString();
     // Pages that are always there, such as the homepage, lead the list.
-    const first = (post: Post) => (kind === "page" && designOf(post)?.permanent ? 0 : 1);
-    const posts = allPosts(kind).sort((a, b) => first(a) - first(b)).map((post) => ({
+    const first = (post: Pick<Post, "kind" | "layout">) => (kind === "page" && designOf(post)?.permanent ? 0 : 1);
+    const found = findPosts(kind, query).sort((a, b) => first(a) - first(b));
+    const pages = Math.max(1, Math.ceil(found.length / POSTS_PAGE));
+    const current = Math.min(pages, Math.max(1, Math.floor(Number(search.get("page")) || 1)));
+    const posts = found.slice((current - 1) * POSTS_PAGE, current * POSTS_PAGE).map((post) => ({
       id: post.id,
       title: post.title,
       date: post.published_at ?? post.updated_at,
       status: statusOf(post, at),
     }));
-    return page(kind === "page" ? "Pages" : "Posts", <PostsPage config={config} posts={posts} kind={kind} deleted={deleted} trash={trashCount()} />);
+    return page(kind === "page" ? "Pages" : "Posts", (
+      <PostsPage
+        config={config} posts={posts} kind={kind} deleted={deleted} trash={trashCount()}
+        query={query} total={query ? postCount(kind) : found.length} page={current} pageCount={pages}
+      />
+    ));
   }
 
   function home(request: Request) {
@@ -290,7 +302,7 @@ export function createHandler(config: ResolvedConfig) {
     return new Response(previewDocument(request, String(form.get("title") ?? ""), String(form.get("body") ?? "")), { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
-  const designOf = (post: Post) => (post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined);
+  const designOf = (post: Pick<Post, "kind" | "layout">) => (post.kind === "page" && Object.hasOwn(config.designs, post.layout) ? config.designs[post.layout] : undefined);
   const isDesign = (post: Post) => designOf(post) !== undefined;
 
   /** The site, framed for editing. `?page=` was the old way to open a designed page; it now opens as itself. */

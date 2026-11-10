@@ -213,9 +213,24 @@ export interface PostRow {
   status: Status;
 }
 
-export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kind?: "post" | "page"; deleted?: Trashed; trash?: number }) {
+export function PostsPage(props: {
+  config: ResolvedConfig;
+  posts: PostRow[];
+  kind?: "post" | "page";
+  deleted?: Trashed;
+  trash?: number;
+  /** What was searched for, if anything. */
+  query?: string;
+  /** How many there are in all, which decides whether searching is offered. */
+  total?: number;
+  page?: number;
+  pageCount?: number;
+}) {
   const admin = props.config.path;
   const pages = props.kind === "page";
+  const { query = "", page = 1, pageCount = 1 } = props;
+  const base = pages ? `${admin}/pages` : admin;
+  const here = (at: number) => `${base}${[query ? `q=${encodeURIComponent(query)}` : "", at > 1 ? `page=${at}` : ""].filter(Boolean).join("&").replace(/^./, "?$&")}`;
   return (
     <Shell config={props.config} active={pages ? "pages" : "posts"}>
       <main class="page narrow">
@@ -231,8 +246,15 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
             <button class="button" type="submit">Undo</button>
           </form>
         ) : null}
+        {(props.total ?? 0) > 10 || query ? (
+          <form class="search" method="get" action={base} role="search">
+            <input class="input" type="search" name="q" value={query} placeholder={pages ? "Find a page" : "Find a post"} aria-label={pages ? "Find a page" : "Find a post"} />
+            <button class="button" type="submit">Find</button>
+            {query ? <a href={base}>Show all</a> : null}
+          </form>
+        ) : null}
         {props.posts.length === 0 ? (
-          <p class="muted">{pages ? "No pages yet." : "No posts yet."}</p>
+          <p class="muted">{query ? `Nothing matches "${query}".` : pages ? "No pages yet." : "No posts yet."}</p>
         ) : (
           <table class="posts">
             <tbody>
@@ -246,6 +268,13 @@ export function PostsPage(props: { config: ResolvedConfig; posts: PostRow[]; kin
             </tbody>
           </table>
         )}
+        {pageCount > 1 ? (
+          <nav class="pager" aria-label="Pages">
+            {page > 1 ? <a href={here(page - 1)}>Newer</a> : <span />}
+            <span class="muted">Page {page} of {pageCount}</span>
+            {page < pageCount ? <a href={here(page + 1)}>Older</a> : <span />}
+          </nav>
+        ) : null}
         {props.trash ? <p class="trash-link"><a href={`${admin}/trash`}>Trash ({props.trash})</a></p> : null}
       </main>
     </Shell>
