@@ -10318,8 +10318,7 @@ chain c3688e03 → 150221e7 → 77c7d824 → here)
   by this card's own Goal/Work and by the verdicts
   (`X-5c-F4-F1.md` carries REFRESH 6 and 7 verbatim; the PINS-1 README
   block carries P ruling G5-CENSUS verbatim), which is what was used —
-  the same reading PINS-1's verdict recorded for its own folded cards.
-- **(b) The Acceptance's comparator `--ref` name.** The card's line
+  the same reading PINS-1's verdict recorded for its own folded cards.- **(b) The Acceptance's comparator `--ref` name.** The card's line
   names `~/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-F3-F1-F1-F1-F1.acc.campaign.json`,
   which does not exist in this environment. The baseline of record it
   pins by sha256 — `41c307a4…1cd2` — is
@@ -10338,6 +10337,148 @@ chain c3688e03 → 150221e7 → 77c7d824 → here)
   Read-only file system` line from the host's git maintenance on every
   commit (known from the base chain; the commits land — the log and the
   clean tree confirm).
+
+## Card E4-SILENT-1's record (the two silent-data fixes before E4's
+## final run: E4-R1 and E4-R2, with WR-1)
+
+Owner decision 2026-11-10 (delegated, header-design-verify §1, §3),
+card `E4-SILENT-1`, base `card/v3-X-5c-F4-F2` (`9f96f31e`). Two faults
+opened with `O-3(d): silent Ok` at the Base:
+
+1. A lost, torn or misdirected **forced-checkpoint header** left a
+   bulk-loaded tree published with its loaded entries missing
+   (header-durability-design-eval §3, verified §1.1).
+2. A lost header could open an older snapshot whose **log was already
+   recycled**, so acknowledged commits were gone — the prototype could
+   open empty (header-design-verify §1.4's first row).
+
+### The two rules and WR-1 (fixed before any code, per the card)
+
+**E4-R1: a publication names the checkpoint it depends on.** The
+commit that publishes an unlogged bulk load (S-STORE §12.8 step 3)
+carries a store-level op `RequireCkpt{id}`, where `id` is the durable
+checkpoint id read after `wait_ckpt` returned (`meta_durable_k` in the
+`h:loadph1` step). It is a checkpoint id, never a WAL position: a load
+writes no WAL, so two checkpoints around it can share `wal_ckpt_end`
+and `ts_ckpt_hi`. The op's kind byte is `0x52`, not 5 — two WAL
+fixtures use raw payload bytes 5 and 6, and byte 5 would decode as the
+op. Recovery checks every `Commit` above `T` in pass 1, after the
+coverage check and before `recover:install`; `id` above the opened
+meta's `ckpt_id` prints `E4_SILENT_REFUSE rule=R1 opened=<k> need=<id>
+ts=<ts>` (stderr, unconditional, one line per refusal, never a digest
+input) and fails XX001, writing nothing. `apply_op` ignores the op;
+`commit_txn_req` (the new `commit_txn` body, with the dependency a
+parameter, never shared state) encodes it before the other ops and
+refuses `chunked` with `Some`. It deliberately over-refuses, pinned:
+a tree dropped after publication, and a tree with logged writes after
+publication (`es1_over_refusals_pinned`). It still opens an image at
+or above `id`, every commit without the op, and a publication at or
+below `T`.
+
+**E4-R2: an open needs proof its log start survives.** An open from a
+meta continues only if the segment holding its `wal_start_lsn` exists;
+the one exception is `wal_start_lsn == 0` with no `*.log` file in
+`/wal/` at all (a store that never made a segment durable; `.keep` is
+not a segment). Otherwise the open fails XX001 at G3, before the walk
+and before any write, printing `E4_SILENT_REFUSE rule=R2 opened=<k>
+start=<lsn>`. The start-above-0 `exists` probe is exactly as at the
+Base; the start-0 probe is `wal_names` — a read-only listing on
+`E4Env` built on `step` with **no yield** — so no schedule moves on
+any path a seed reaches. The proof is the listing: `wal_recycle`
+renames segments lowest first and directory operations persist as a
+prefix of issue order, so if the start segment is present, no segment
+at or above it was recycled.
+
+**WR-1 (E4-R2's precondition):** segment 0 is created, and its
+directory entry made durable, before any other segment, whenever the
+durable meta's start is 0 — in `wal_write_batch`'s creation branch
+(`wal_create_segment`, extracted unchanged), when `seg > 0`, the
+durable meta's start is 0, `segs` has no entry for 0 and `wal_names`
+has no segment 0. Without it, a batch starting in segment 1 while
+segment 0 is uncreated (two batches in flight) gave a false XX001 on a
+healthy store. It acts only in that history; no seed-reached path in
+`0..10000` moves with it in place.
+
+### The CONFLICT note (P accepted both by writing the card)
+
+1. **WR-1 is a third code change.** It takes a first batch of at least
+   64 KiB to reach, but it is reachable (`wal_wait_durable` and the
+   writer task can hold two batches). With it in place, the
+   moved-digest set in `0..10000` is the verification's 37, which had
+   no WR-1, minus its 19 `nested`-only seeds. The alternative — the
+   verification's "create segment 0 at file creation" — would change
+   every seed's schedule and belongs to Phase A.
+2. **A read-only `wal_names` is added to the sim's `E4Env`.** It
+   changes no fault or taint model. The verification's probe of
+   `exists` calls added yields, which alone moved 19 seeds' `nested`
+   draws; this form moves none of those: expect **18** moved digests,
+   not 37.
+
+### The mutant table (RESULT item 1; every row applied to its own
+### scratch export of the real code at its step's commit — its own
+### export under `$CARGO_TARGET_DIR/es1-scratch/`, its own
+### `CARGO_TARGET_DIR` — shown failing, reverted by construction; the
+### worktree never held a mutant)
+
+| mutant | catching test |
+|---|---|
+| M-R1-SKIP (the check never refuses) | `es1_lost_forced_header_refused`, `es1_refused_open_writes_nothing` |
+| M-R1-GE (refuses at `id >= meta.ckpt_id`) | `es1_faultless_every_crash_point`, `es1_lost_forced_header_refused` |
+| M-R1-ZERO (the publish records id 0) | `es1_lost_forced_header_refused` |
+| M-R1-LATE (the check moved after `truncate_wal`) | `es1_refused_open_writes_nothing` (the byte-identical arm) |
+| M-OP-TAG5 (the op's byte is 5) | `wal_exact_segment_end_hops`, `wal_tail_short_never_placed` |
+| M-R2-GUARD (the start-0 arm always reads present) | `es2_recycled_start_zero_refused` |
+| M-R2-ALWAYS (no empty-directory exception) | `es2_healthy_start_zero_every_crash_point` |
+| M-R2-ANYNAME (no `*.log` filter, so `.keep` counts) | `es2_healthy_start_zero_every_crash_point` |
+| M-SEG0-ORDER (WR-1 removed) | `es2_segment_zero_created_first` |
+
+None survives.
+
+### The moved-digest set and its reason (RESULT items 3–4)
+
+The 10k BASE baseline of record is
+`X-5c-F4-F1-F1-F3-F2-F1-F2.acc.campaign.json`, sha256
+`41c307a470ba51e1eae7911fa7b1b7e7146e810f191ccb348bd0713a19601cd2`.
+The Acceptance's comparator line reads **`DIGESTS_MOVED 18
+FAILING_ROUNDS 19 MONITOR 0`** with `NEW_FAILING 0`, `HEALED 0` and
+`MPA_CLASS base 10 tip 10`, and its 18 moved seeds are exactly
+`[53, 199, 1609, 2098, 2224, 2433, 3829, 4535, 5152, 5570, 6590,
+7013, 7373, 7692, 7776, 8132, 9215, 9674]` — the verification's 37
+minus its 19 `nested`-only seeds. Why 18 and not 37: the
+verification's probe added `exists` yields at every start-0 open,
+moving 19 seeds' `nested` draw alone; the other 18 are the same seeds
+in both runs (P infers they come from the publish record's 9 extra
+bytes and the refusals, and did not trace each one). The refusal
+counts the Acceptance greps from the run's stderr: **R1 = 0** (E4-R1
+never fired in the 10k; its evidence is the directed tests) and
+**R2 = 2**. The attempt's hygiene probe over `0..200` (ulimit
+`-v 25165824`, output under `es1-scratch/`) read `E4 SEEDS=200` with
+the same two failing rounds as the baseline (8 r0, 178 r1), moved
+digests `{53, 199}` — both in the 18 — and `R1=0 R2=0`.
+
+No existing test or literal moved: all 301 crate tests at the Base
+passed unchanged beside the 9 new ones (310 total), and
+`Tuning::FINAL` still equals `Tuning::BASE`
+(`x5_r37_final_equals_base_at_this_tip`, untouched — as are the
+oracle, the model, the fault and taint model, K, R, D17's R6 cells,
+every 5.6 quota, `Q4I_REQUIRED`, X5-R51–R53, the comparator and
+`Tuning::MP_PRESSURE`).
+
+### RESULT (card E4-SILENT-1)
+
+card: E4-SILENT-1   branch: card/v3-E4-SILENT-1   commit: (step 3's;
+the chain 70934c1b → 033fb23b → here)
+
+1. **The mutant table** is above; each row was applied on its own
+   scratch export and shown failing its named test; none survives.
+2. **The two rules and WR-1, and the CONFLICT note**, are above.
+3. **No existing test or X5-R37 literal moved, and FINAL still equals
+   BASE** (the section above).
+4. **The baseline's sha256, the `DIGESTS_MOVED` line, and the R1 and
+   R2 refusal counts** are above, as the Acceptance's lines pin them.
+5. **Post-data amendments: none.** The Acceptance's reading is the
+   runner's.
+
 
 
 
