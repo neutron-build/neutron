@@ -213,6 +213,7 @@ export async function loader({ request }) {
 | `@neutron-build/cache-redis` | Distributed Redis/Dragonfly cache |
 | `@neutron-build/ops` | Health checks, request tracing, logging |
 | `@neutron-build/otel` | OpenTelemetry integration |
+| `@neutron-build/cms` | Optional CMS: posts, pages, lists and click-to-edit at `/n-admin`, on one SQLite file (directory: `packages/neutron-cms`) |
 
 ## Documentation
 
