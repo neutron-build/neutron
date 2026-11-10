@@ -4,7 +4,7 @@ A small CMS for Neutron sites: posts, photo galleries, events and any other list
 
 It stores everything in one SQLite file and one folder, needs no database server, and sends visitors no JavaScript. Content can be edited by clicking it on the page. Layout stays in your code, so there is no page builder.
 
-Requires Node 22.16 or newer. Run the site with `neutron-ts start`, because the `docker` preset drops the route type this uses (Neutron 0.5.3).
+Requires Node 22.16 or newer. Run the site with `neutron-ts start`, because the `docker` preset drops the route type this uses (as of Neutron 0.5.4).
 
 ## Set up
 
