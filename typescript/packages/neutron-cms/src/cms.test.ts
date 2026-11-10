@@ -10,11 +10,11 @@ import {
 } from "./auth.js";
 import {
   allPosts, backupTo, closeDb, contentCount, createPost, db, trashPost, getPost, isLive, listItems,
-  listRevision, livePostBySlug, livePosts, replaceItems, restoreSave, saveEdits, savePost, saves, setTexts, slugify, sortByDate, upcoming,
+  imageUses, inCurrentUse, listRevision, livePostBySlug, livePosts, replaceItems, restoreSave, saveEdits, savePost, saves, setTexts, slugify, sortByDate, upcoming,
 } from "./store.js";
 import { isPhotoList } from "./config.js";
 import { imageSize, photoAttributes, thumbUrl } from "./images.js";
-import { saveImage, serveImage, sniffImage } from "./media.js";
+import { deleteImage, isImageName, listImages, saveImage, serveImage, sniffImage } from "./media.js";
 import { firstImage, renderMarkdown, summarize } from "./markdown.js";
 
 let directory: string;
@@ -288,4 +288,36 @@ test("a text that was never saved goes back to never saved", () => {
 test("the history table is added after the existing migrations", () => {
   const version = (db().prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
   assert.equal(version, 6);
+});
+
+test("image uses are found by file name in every place, with a thumbnail counting as its image", () => {
+  const a = `${"a".repeat(32)}-1600x900.webp`;
+  const b = `${"b".repeat(32)}.jpg`;
+  const c = `${"c".repeat(32)}-900x900.png`;
+  createPost({ title: "T", body: `![](https://cdn.example/n-admin/media/${a.replace(".webp", "-t.webp")}) and /wp-content/uploads/x.jpg` });
+  replaceItems("gallery", [{ image: `/n-admin/media/${b}` }]);
+  db().prepare("INSERT INTO saves (saved_at, before) VALUES ('2020-01-01T00:00:00.000Z', ?)").run(JSON.stringify({ texts: {}, lists: { gallery: [{ image: `/n-admin/media/${c}` }] } }));
+  db().prepare("INSERT INTO posts_old (post_id, title, body, saved_at) VALUES (0, '', ?, '2020-01-01T00:00:00.000Z')").run(`x${"f".repeat(40)}.png`);
+  const uses = imageUses();
+  assert.deepEqual([...uses.keys()].sort(), [a, b, c].sort(), "nothing else, not even a longer run of hex");
+  assert.equal([...uses.get(a)!.posts.values()][0].title, "T");
+  assert.ok(uses.get(b)!.lists.has("gallery"));
+  assert.ok(inCurrentUse(uses.get(a)) && inCurrentUse(uses.get(b)));
+  assert.ok(!inCurrentUse(uses.get(c)) && uses.get(c)!.kept.has("history"));
+  assert.equal(db().prepare("SELECT count(*) AS n FROM posts").get()!.n, 1);
+});
+
+test("stored images are listed without their thumbnails and deleted with them", () => {
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7]);
+  const thumb = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 8]);
+  const name = saveImage(png, { width: 2000, height: 1000, thumb })!;
+  const listed = listImages().find((image) => image.name === name)!;
+  assert.deepEqual([listed.width, listed.height, listed.bytes], [2000, 1000, 9]);
+  assert.ok(!listImages().some((image) => image.name.includes("-t.")));
+  assert.equal(isImageName(name.replace(".png", "-t.png")), false);
+  assert.equal(isImageName(`../${name}`), false);
+  assert.equal(deleteImage(name.replace(".png", "-t.png")), false);
+  assert.equal(deleteImage(name), true);
+  assert.deepEqual(readdirSync(join(directory, "media")).filter((file) => file.startsWith(name.slice(0, 32))), []);
+  assert.equal(deleteImage(name), false);
 });

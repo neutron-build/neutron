@@ -9,10 +9,10 @@ import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { isSafeUrl } from "./safe-url.js";
-import { MAX_UPLOAD_BYTES, saveImage, serveImage } from "./media.js";
-import { Document, EditorPage, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
+import { deleteImage, isImageName, listImages, MAX_UPLOAD_BYTES, saveImage, serveImage, type StoredImage } from "./media.js";
+import { Document, EditorPage, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
+  allPosts, allTexts, createPost, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
   sortByDate, trashCount, trashed, trashPost, valuesNow, versionsOf, type Item, type Post, type Save, type Snapshot,
 } from "./store.js";
 
@@ -410,6 +410,82 @@ export function createHandler(config: ResolvedConfig) {
     return page("History", <HistoryPage config={config} entries={entries} selected={selected} only={only} restored={restored} />);
   }
 
+  // Media
+
+  const MEDIA_PAGE = 60;
+  /** An image added this recently may be in work not saved yet, so "Delete all unused" leaves it. */
+  const FRESH_MS = 86_400_000;
+  const KEPT_WORDS = { trash: "a post in the Trash", versions: "an old version of a post", history: "list and text history" } as const;
+  const mediaUrl = (name: string) => `${admin}/media/${name}`;
+
+  /** Where each image is used, in words with links. */
+  function describeImages(images: StoredImage[]): MediaEntry[] {
+    const uses = imageUses();
+    const listHref = (key: string) => {
+      const list = Object.hasOwn(config.lists, key) ? config.lists[key] : undefined;
+      if (!list) return undefined;
+      return list.ownPage || !config.onPage.includes(key) ? `${admin}/lists/${key}` : `${admin}/edit`;
+    };
+    return images.map((image) => {
+      const use = uses.get(image.name);
+      const places = [
+        ...[...(use?.posts.values() ?? [])].map((post) => ({ label: `In the ${post.kind} ${post.title || "Untitled"}`, href: `${admin}/posts/${post.id}` })),
+        ...[...(use?.lists ?? [])].map((key) => ({
+          label: `In ${Object.hasOwn(config.lists, key) ? config.lists[key].label : `${key} (no longer on the site)`}`,
+          href: listHref(key),
+        })),
+        ...[...(use?.texts ?? [])].map((key) => ({
+          label: `In the text ${Object.hasOwn(config.texts, key) ? config.texts[key].label : key}`,
+          href: Object.hasOwn(config.texts, key) ? (config.onPage.includes(TEXT) ? `${admin}/edit` : `${admin}/lists/${TEXT}`) : undefined,
+        })),
+      ];
+      const kept = places.length ? [] : [...(use?.kept ?? [])].map((reason) => KEPT_WORDS[reason]);
+      return { ...image, url: mediaUrl(image.name), thumb: thumbUrl(mediaUrl(image.name)), places, kept };
+    });
+  }
+
+  const deletableNow = (entries: MediaEntry[], at = Date.now()) =>
+    entries.filter((entry) => !entry.places.length && !entry.kept.length && at - Date.parse(entry.added) > FRESH_MS);
+
+  function mediaPage(request: Request, error?: string, status = 200) {
+    const search = new URL(request.url).searchParams;
+    const unused = search.has("unused");
+    const all = describeImages(listImages());
+    const shown = unused ? all.filter((entry) => !entry.places.length) : all;
+    const pages = Math.max(1, Math.ceil(shown.length / MEDIA_PAGE));
+    const at = Math.min(pages, Math.max(1, Math.floor(Number(search.get("page")) || 1)));
+    const deleted = Number(search.get("deleted")) || 0;
+    const added = Number(search.get("added")) || 0;
+    const notice = deleted ? `${deleted === 1 ? "1 image" : `${deleted} images`} deleted.` : added ? `${added === 1 ? "1 image" : `${added} images`} added.` : undefined;
+    return page("Media", (
+      <MediaPage
+        config={config} images={shown.slice((at - 1) * MEDIA_PAGE, at * MEDIA_PAGE)} total={all.length} unusedCount={all.filter((entry) => !entry.places.length).length}
+        unused={unused} page={at} pages={pages} deletable={deletableNow(all).length} notice={notice} error={error}
+      />
+    ), status);
+  }
+
+  /** The newest images, for choosing one in an editor. */
+  const recentImages = () =>
+    Response.json({ images: listImages().slice(0, 30).map((image) => ({ url: mediaUrl(image.name), thumb: thumbUrl(mediaUrl(image.name)) })) });
+
+  async function mediaDelete(request: Request) {
+    const form = await request.formData();
+    const name = String(form.get("name") ?? "");
+    const back = form.get("unused") ? "&unused=1" : "";
+    if (!isImageName(name)) return notFound();
+    // Checked again here, not trusted from the page: it may have been put to use since.
+    if (inCurrentUse(imageUses().get(name))) return mediaPage(request, "That image is in use, so it was not deleted. Take it out of the places listed first.", 409);
+    if (!deleteImage(name)) return notFound();
+    return redirect(`${admin}/media?deleted=1${back}`);
+  }
+
+  function mediaDeleteUnused() {
+    const going = deletableNow(describeImages(listImages()));
+    for (const entry of going) deleteImage(entry.name);
+    return redirect(`${admin}/media?unused=1&deleted=${going.length}`);
+  }
+
   /** Everything the editor needs. Only signed-in requests reach it. */
   function editData() {
     return Response.json({
@@ -483,6 +559,9 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "trash" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0 && post) return trashAction(request, Number(second));
     if (first === "lists" && second && rest.length === 0) return list(request, second);
     if (first === "history" && !second && !post) return history(request);
+    if (first === "media" && !second && !post) return isScript(request) ? recentImages() : mediaPage(request);
+    if (first === "media" && second === "delete" && rest.length === 0 && post) return mediaDelete(request);
+    if (first === "media" && second === "delete-unused" && rest.length === 0 && post) return mediaDeleteUnused();
     if (first === "history" && second && /^\d+$/.test(second) && rest.length === 0 && post) return history(request, Number(second));
     return notFound();
   }

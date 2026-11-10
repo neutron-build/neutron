@@ -163,21 +163,30 @@ function start(body) {
 
   // Images: shown at once from the file, saved into the text once uploaded.
 
+  // An image already uploaded, chosen from the ones here.
+  body.addEventListener("cms:image-url", (event) => {
+    if (view) placeImage(view, event.detail, null);
+  });
+
+  function placeImage(v, src, at) {
+    const image = nodes.image.create({ src, alt: "" });
+    const { state: s } = v;
+    let tr = s.tr;
+    const $at = at == null ? s.selection.$from : s.doc.resolve(at);
+    const parent = $at.parent;
+    if (parent.type === nodes.paragraph && parent.content.size === 0 && $at.depth > 0) {
+      tr = tr.replaceWith($at.before(), $at.after(), nodes.paragraph.create(null, image));
+    } else {
+      const after = $at.depth > 0 ? $at.after(1) : $at.pos;
+      tr = tr.insert(after, nodes.paragraph.create(null, image));
+    }
+    v.dispatch(tr.scrollIntoView());
+  }
+
   function insertImages(v, files, at) {
     for (const file of files) {
       const local = URL.createObjectURL(file);
-      const image = nodes.image.create({ src: local, alt: "" });
-      const { state: s } = v;
-      let tr = s.tr;
-      const $at = at == null ? s.selection.$from : s.doc.resolve(at);
-      const parent = $at.parent;
-      if (parent.type === nodes.paragraph && parent.content.size === 0 && $at.depth > 0) {
-        tr = tr.replaceWith($at.before(), $at.after(), nodes.paragraph.create(null, image));
-      } else {
-        const after = $at.depth > 0 ? $at.after(1) : $at.pos;
-        tr = tr.insert(after, nodes.paragraph.create(null, image));
-      }
-      v.dispatch(tr.scrollIntoView());
+      placeImage(v, local, at);
       uploading += 1;
       countUploads();
       window.cmsUpload(file).then(

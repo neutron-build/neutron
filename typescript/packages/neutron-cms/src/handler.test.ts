@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import { hashPassword } from "./auth.js";
 import { defineCms } from "./index.js";
-import { closeDb, createPost, db, listRevision, replaceItems, restoreVersion, saveEdits, saves, setTexts, type Item } from "./store.js";
+import { closeDb, createPost, db, listRevision, replaceItems, restoreVersion, saveEdits, saves, setTexts, trashPost, type Item } from "./store.js";
 
 const SITE = "https://site.test";
 const PASSWORD = "a-long-enough-test-password";
@@ -836,4 +836,163 @@ test("History needs a login, writes need the site's origin, and its links show o
   assert.match(await (await call("/n-admin/edit", { cookie })).text(), /<a class="button quiet" href="\/n-admin\/history" data-edit-history="true">/);
   db().exec("DELETE FROM saves");
   assert.match(await (await call("/n-admin/edit", { cookie })).text(), /data-edit-history="true" hidden/);
+});
+
+// Media
+
+const hex = (n: number) => n.toString(16).padStart(32, "0");
+/** An upload as media.ts writes it, added `days` ago; a wide one gets its thumbnail. */
+function stored(n: number, { days = 2, sized = true } = {}) {
+  const media = join(directory, "media");
+  mkdirSync(media, { recursive: true });
+  const name = sized ? `${hex(n)}-2000x1000.png` : `${hex(n)}.png`;
+  const at = new Date(Date.now() - days * 86_400_000 - n * 1000);
+  for (const file of sized ? [name, name.replace(".png", "-t.png")] : [name]) {
+    writeFileSync(join(media, file), png(n));
+    utimesSync(join(media, file), at, at);
+  }
+  return name;
+}
+const exists = (name: string) => existsSync(join(directory, "media", name));
+function freshMedia() {
+  rmSync(join(directory, "media"), { recursive: true, force: true });
+  db().exec("DELETE FROM posts_trash");
+}
+
+test("Media lists every upload newest first, with its size and where it is used", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  const [inPost, inPage, inList, inText, thumbOnly, inTrash, inVersion, inHistory, unused] = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => stored(n));
+  const old = stored(10, { sized: false });
+  const url = (name: string) => `/n-admin/media/${name}`;
+
+  const post = createPost({ title: "My Stack", body: `Hi ![](${url(inPost)})` });
+  createPost({ title: "About", kind: "page", body: `<img src="https://site.test${url(inPage)}">` });
+  replaceItems("gallery", [{ image: url(inList), caption: "" }]);
+  setTexts({ tagline: `See ${url(inText)}` });
+  createPost({ title: "Small", body: `![](${url(thumbOnly.replace(".png", "-t.png"))})` });
+  trashPost(createPost({ title: "Gone", body: `![](${url(inTrash)})` }));
+  const versioned = createPost({ title: "V", body: `![](${url(inVersion)})`, published_at: "2020-01-01T00:00:00.000Z" });
+  db().prepare("UPDATE posts SET body = 'new' WHERE id = ?").run(versioned);
+  replaceItems("events", [{ title: "Show", date: "2030-01-01", url: url(inHistory) }]);
+  replaceItems("events", []);
+
+  const html = await (await call("/n-admin/media", { cookie })).text();
+  assert.match(html, />Media<\/a>/, "in the menu");
+  const order = [...html.matchAll(/name="name" value="([^"]+)"|data-copy="\/n-admin\/media\/([^"]+)"/g)].map((m) => m[1] ?? m[2]);
+  assert.deepEqual([...new Set(order)], [inPost, inPage, inList, inText, thumbOnly, inTrash, inVersion, inHistory, unused, old]);
+  assert.doesNotMatch(html, /-t\.png" data-copy|data-copy="[^"]*-t\.png/, "thumbnails are not listed apart");
+  assert.match(html, /2000 × 1000, 1 KB/);
+  assert.match(html, new RegExp(`<a href="/n-admin/posts/${post}">In the post My Stack</a>`));
+  assert.match(html, /In the page About<\/a>/);
+  assert.match(html, /<a href="\/n-admin\/lists\/gallery">In Gallery<\/a>/);
+  assert.match(html, /<a href="\/n-admin\/edit">In the text Tagline<\/a>/, "texts edited on the page link there");
+  assert.match(html, /In the post Small<\/a>/, "a thumbnail counts as its image");
+  assert.match(html, /Kept for undo in a post in the Trash\./);
+  assert.match(html, /Kept for undo in an old version of a post\./);
+  assert.match(html, /Kept for undo in list and text history\./);
+  // Only images not in use can be deleted.
+  const deletable = [...html.matchAll(/name="name" value="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(deletable, [inTrash, inVersion, inHistory, unused, old]);
+  assert.match(html, /only kept for undo in a post in the Trash, so restoring that would show a broken image/);
+
+  const filtered = await (await call("/n-admin/media?unused=1", { cookie })).text();
+  assert.match(filtered, /Unused \(5\)/);
+  assert.doesNotMatch(filtered, new RegExp(inPost));
+  assert.match(filtered, /Delete all unused \(2\)/, "kept-for-undo images are left out");
+  assert.match(filtered, /Delete 2 unused images for good\?/);
+});
+
+test("the image chooser gets the newest images, and an empty library shows nothing to choose", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  assert.deepEqual(await (await call("/n-admin/media", { cookie, headers: { "x-cms": "1" } })).json(), { images: [] });
+  const name = stored(1);
+  const { images } = await (await call("/n-admin/media", { cookie, headers: { "x-cms": "1" } })).json();
+  assert.deepEqual(images, [{ url: `/n-admin/media/${name}`, thumb: `/n-admin/media/${name.replace(".png", "-t.png")}` }]);
+});
+
+test("Media pages through many images, 60 at a time", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  for (let n = 1; n <= 61; n++) stored(n, { sized: false });
+  const first = await (await call("/n-admin/media", { cookie })).text();
+  assert.equal(first.match(/data-copy=/g)?.length, 60);
+  assert.match(first, /Page 1 of 2/);
+  assert.match(first, /href="\/n-admin\/media\?page=2">Older/);
+  const second = await (await call("/n-admin/media?page=2", { cookie })).text();
+  assert.equal(second.match(/data-copy=/g)?.length, 1);
+  assert.match(second, new RegExp(hex(61)));
+});
+
+test("deleting an image takes its thumbnail, and an image in use is never deleted", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  const used = stored(1);
+  const kept = stored(2);
+  const spare = stored(3);
+  replaceItems("gallery", [{ image: `/n-admin/media/${used}`, caption: "" }]);
+  trashPost(createPost({ title: "Gone", body: `![](/n-admin/media/${kept})` }));
+  const remove = (name: string) => call("/n-admin/media/delete", { method: "POST", cookie, body: form({ name }) });
+
+  const refused = await remove(used);
+  assert.equal(refused.status, 409);
+  assert.match(await refused.text(), /That image is in use/);
+  assert.ok(exists(used) && exists(used.replace(".png", "-t.png")));
+
+  const done = await remove(spare);
+  assert.equal(done.status, 303);
+  assert.equal(done.headers.get("location"), "/n-admin/media?deleted=1");
+  assert.ok(!exists(spare) && !exists(spare.replace(".png", "-t.png")), "the thumbnail goes too");
+  assert.match(await (await call("/n-admin/media?deleted=1", { cookie })).text(), /1 image deleted\./);
+
+  assert.equal((await remove(kept)).status, 303, "kept only for undo can go, after its warning");
+  assert.ok(!exists(kept));
+  assert.equal((await remove(kept)).status, 404, "already gone");
+});
+
+test("Delete all unused leaves images in use, kept for undo, or added in the last day", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  const used = stored(1);
+  const kept = stored(2);
+  const fresh = stored(3, { days: 0 });
+  const unused = [stored(4), stored(5, { sized: false })];
+  createPost({ title: "Live", body: `![](/n-admin/media/${used})` });
+  db().prepare("INSERT INTO posts_old (post_id, title, body, saved_at) VALUES (0, 'x', ?, '2020-01-01T00:00:00.000Z')").run(`![](/n-admin/media/${kept})`);
+
+  const response = await call("/n-admin/media/delete-unused", { method: "POST", cookie, body: form({}) });
+  assert.equal(response.headers.get("location"), "/n-admin/media?unused=1&deleted=2");
+  assert.ok(exists(used) && exists(kept) && exists(fresh));
+  for (const name of unused) assert.ok(!exists(name));
+  assert.deepEqual(readdirSync(join(directory, "media")).sort(), [used, used.replace(".png", "-t.png"), kept, kept.replace(".png", "-t.png"), fresh, fresh.replace(".png", "-t.png")].sort());
+});
+
+test("only names media.ts could have written are deleted; nothing else in the data folder is reachable", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  const name = stored(1);
+  writeFileSync(join(directory, "media", "notes.txt"), "x");
+  for (const bad of ["../site.db", "..%2Fsite.db", "/etc/passwd", `../media/${name}`, `${name}/..`, name.replace(".png", "-t.png"), name.toUpperCase(), `${hex(1)}.svg`, "notes.txt", "", `${name}\0`]) {
+    const response = await call("/n-admin/media/delete", { method: "POST", cookie, body: form({ name: bad }) });
+    assert.equal(response.status, 404, bad);
+  }
+  assert.ok(existsSync(join(directory, "site.db")));
+  assert.ok(exists(name) && exists(name.replace(".png", "-t.png")) && exists("notes.txt"));
+  assert.doesNotMatch(await (await call("/n-admin/media", { cookie })).text(), /notes\.txt/, "only uploads are listed");
+});
+
+test("Media needs a login, and its writes need the site's origin", async () => {
+  freshMedia();
+  const name = stored(1);
+  assert.equal((await call("/n-admin/media")).status, 303);
+  assert.equal((await call("/n-admin/media", { headers: { "x-cms": "1" } })).status, 401);
+  assert.equal((await call("/n-admin/media/delete", { method: "POST", body: form({ name }) })).status, 303);
+  assert.equal((await call("/n-admin/media/delete-unused", { method: "POST", body: form({}) })).status, 303);
+  const cookie = await logIn();
+  assert.equal((await call("/n-admin/media/delete", { method: "POST", cookie, origin: "https://evil.test", body: form({ name }) })).status, 403);
+  assert.equal((await call("/n-admin/media/delete-unused", { method: "POST", cookie, origin: null, body: form({}) })).status, 403);
+  assert.equal((await call("/n-admin/media/delete")).status, 404, "a GET only ever serves an image");
+  assert.ok(exists(name));
+  assert.equal((await call(`/n-admin/media/${name}`)).status, 200, "images stay public");
 });

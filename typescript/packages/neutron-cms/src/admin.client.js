@@ -56,14 +56,65 @@ function pickImages(multiple = false) {
   return new Promise((resolve) => {
     const input = Object.assign(document.createElement("input"), { type: "file", accept: "image/*", multiple });
     input.addEventListener("change", () => resolve([...input.files]));
+    input.addEventListener("cancel", () => resolve([]));
     input.click();
   });
 }
 
 const imageFiles = (list) => [...list].filter((file) => file.type.startsWith("image/"));
 
+// Choosing an image: Upload first, then the newest ones already here. With none yet, straight to the files.
+// The list is fetched ahead, so a click can still open the file picker at once.
+
+let recent = [];
+if ($("[data-add-image], [data-row=add-photos], [data-edit-frame], .image-field") || $$("template").some((t) => t.content.querySelector(".image-field"))) {
+  fetch(`${ADMIN}/media`, { headers: { "x-cms": "1" } }).then((r) => (r.ok ? r.json() : { images: [] })).then((data) => { recent = data.images; }, () => {});
+}
+
+/** Resolves to { files }, to { url, thumb } for an image already here, or null. */
+function chooseImage(multiple = false) {
+  if (!recent.length) return pickImages(multiple).then((files) => (files.length ? { files } : null));
+  return new Promise((resolve) => {
+    const dialog = Object.assign(document.createElement("dialog"), { className: "chooser" });
+    dialog.setAttribute("aria-label", "Add image");
+    dialog.innerHTML = `<div class="chooser-head"><button class="button primary" type="button" autofocus>Upload</button><button class="link" type="button">Cancel</button></div><p class="muted">Or use one already here</p><div class="chooser-grid"></div>`;
+    const [upload, cancel] = $$("button", dialog);
+    let result = null;
+    const done = (value) => {
+      result = value;
+      dialog.close();
+    };
+    for (const image of recent) {
+      const pick = Object.assign(document.createElement("button"), { type: "button" });
+      pick.setAttribute("aria-label", "Use this image");
+      pick.append(Object.assign(document.createElement("img"), { src: image.thumb, alt: "", loading: "lazy" }));
+      pick.addEventListener("click", () => done(image));
+      $(".chooser-grid", dialog).append(pick);
+    }
+    upload.addEventListener("click", () => {
+      // The file picker opens inside this click; the dialog waits for its answer.
+      upload.disabled = true;
+      pickImages(multiple).then((files) => done(files.length ? { files } : null));
+    });
+    cancel.addEventListener("click", () => done(null));
+    dialog.addEventListener("click", (event) => { if (event.target === dialog) done(null); });
+    dialog.addEventListener("close", () => {
+      dialog.replaceWith();
+      resolve(result);
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+async function uploadAndRemember(file) {
+  const uploaded = await uploadImage(file);
+  recent = [uploaded, ...recent.filter((image) => image.url !== uploaded.url)].slice(0, 30);
+  return uploaded;
+}
+
 // The visual editor uploads through the same pipeline.
-window.cmsUpload = uploadImage;
+window.cmsUpload = uploadAndRemember;
 
 const editor = $("[data-editor]");
 if (editor) startEditor(editor);
@@ -361,7 +412,7 @@ function startEditor(form) {
         if (at >= 0) body.setRangeText(text, at, at + target.length, "preserve");
       };
       try {
-        const { url } = await uploadImage(file);
+        const { url } = await uploadAndRemember(file);
         swap(`![](${url})`);
       } catch (error) {
         swap("", true);
@@ -402,7 +453,14 @@ function startEditor(form) {
   });
 
   $("[data-add-image]").addEventListener("click", async () => {
-    addImages(await pickImages());
+    const choice = await chooseImage();
+    if (choice?.files) addImages(choice.files);
+    else if (choice && body.dataset.visual) body.dispatchEvent(new CustomEvent("cms:image-url", { detail: choice.url }));
+    else if (choice) {
+      const lead = body.selectionStart > 0 && body.value[body.selectionStart - 1] !== "\n" ? "\n\n" : "";
+      insert(`${lead}![](${choice.url})\n\n`);
+      fit(body);
+    }
   });
 
   title.addEventListener("keydown", (event) => {
@@ -512,7 +570,7 @@ $$("[data-list]").forEach((form) => {
     show();
     queue = queue.then(async () => {
       try {
-        const { url, thumb } = await uploadImage(file);
+        const { url, thumb } = await uploadAndRemember(file);
         input.value = url;
         image.src = thumb;
         $("button", field).textContent = "Replace";
@@ -528,6 +586,13 @@ $$("[data-list]").forEach((form) => {
       pending -= 1;
       show();
     });
+  }
+
+  function useImage(field, { url, thumb }) {
+    $("input", field).value = url;
+    $("img", field).src = thumb;
+    $("button", field).textContent = "Replace";
+    changed();
   }
 
   const addPhotos = (files) => files.forEach((file) => {
@@ -547,10 +612,15 @@ $$("[data-list]").forEach((form) => {
     if (action === "down" && row.nextElementSibling) row.nextElementSibling.after(row);
     if (action === "remove") row.remove();
     if (action === "add") $("input:not([type=hidden]), textarea", addRow())?.focus();
-    if (action === "add-photos") addPhotos(await pickImages(true));
+    if (action === "add-photos") {
+      const choice = await chooseImage(true);
+      if (choice?.files) addPhotos(choice.files);
+      else if (choice) useImage($(".image-field", addRow()), choice);
+    }
     if (action === "upload") {
-      const [file] = await pickImages();
-      if (file) upload(button.closest(".image-field"), file);
+      const choice = await chooseImage();
+      if (choice?.files) upload(button.closest(".image-field"), choice.files[0]);
+      else if (choice) useImage(button.closest(".image-field"), choice);
     }
     if (["up", "down", "remove", "add"].includes(action)) changed();
   });
@@ -617,3 +687,59 @@ $$("[data-list]").forEach((form) => {
     });
   }
 });
+
+// Media
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-copy]");
+  if (!button) return;
+  const address = new URL(button.dataset.copy, location.origin).href;
+  try {
+    await navigator.clipboard.writeText(address);
+    button.textContent = "Copied";
+    setTimeout(() => { button.textContent = "Copy address"; }, 1500);
+  } catch {
+    prompt("Copy this address", address);
+  }
+});
+
+const media = $("[data-media]");
+if (media) {
+  const state = $("[data-state]", media);
+  let left = 0;
+  let added = 0;
+  let failed = "";
+  let queue = Promise.resolve();
+  // One at a time, as on list pages. The page reloads once they are all in.
+  const add = (files) => files.forEach((file) => {
+    left += 1;
+    state.textContent = `Uploading, ${left} left`;
+    queue = queue.then(async () => {
+      try {
+        await uploadImage(file);
+        added += 1;
+      } catch (error) {
+        failed = `${file.name}: ${error.message}`;
+      }
+      left -= 1;
+      state.textContent = left ? `Uploading, ${left} left` : failed;
+      state.classList.toggle("error", Boolean(failed));
+      if (!left && !failed) location.assign(`${ADMIN}/media?added=${added}`);
+    });
+  });
+  $("[data-media-upload]").addEventListener("click", async () => add(await pickImages(true)));
+  addEventListener("beforeunload", (event) => { if (left) event.preventDefault(); });
+  const hasFiles = (event) => event.dataTransfer.types.includes("Files");
+  addEventListener("dragover", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    media.classList.add("dropping");
+  });
+  addEventListener("dragleave", (event) => { if (!event.relatedTarget) media.classList.remove("dropping"); });
+  addEventListener("drop", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    media.classList.remove("dropping");
+    add(imageFiles(event.dataTransfer.files));
+  });
+}

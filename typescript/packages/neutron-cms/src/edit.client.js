@@ -1,5 +1,5 @@
 // Runs in the admin page and reaches into the framed site, so visitors never receive any of it.
-// Uses `$`, `cms`, `uploadImage` and `pickImages` from admin.client.js.
+// Uses `$`, `cms`, `uploadImage` and `chooseImage` from admin.client.js.
 
 const frame = $("[data-edit-frame]");
 const tools = $("[data-edit-tools]");
@@ -71,7 +71,7 @@ async function replaceImage(file, onDone, el) {
   pending += 1;
   changed();
   try {
-    const { url, thumb } = await uploadImage(file);
+    const { url, thumb } = await uploadAndRemember(file);
     if (el) el.src = thumb;
     onDone(url);
     pending -= 1;
@@ -84,15 +84,28 @@ async function replaceImage(file, onDone, el) {
   if (preview) URL.revokeObjectURL(preview);
 }
 
+/** A new upload, or an image already here. */
+async function chooseFor(write, el) {
+  const choice = await chooseImage();
+  if (choice?.files) return replaceImage(choice.files[0], write, el);
+  if (!choice) return;
+  if (el) {
+    el.removeAttribute("srcset");
+    el.removeAttribute("sizes");
+    el.src = choice.thumb;
+  }
+  write(choice.url);
+  changed();
+}
+
 /** A field on the page: words are typed in place, an image is clicked. */
 function bindField(el, field, write) {
   el.setAttribute("data-cms-field", "");
   if (field.type === "image") {
     el.title = `Click to replace this ${field.label.toLowerCase()}`;
-    el.addEventListener("click", async (event) => {
+    el.addEventListener("click", (event) => {
       event.preventDefault();
-      const [file] = await pickImages();
-      if (file) replaceImage(file, write, el);
+      chooseFor(write, el);
     });
     return;
   }
@@ -221,14 +234,11 @@ function drawTools() {
   for (const [name, field] of Object.entries(list.fields)) {
     if (shown.has(name) && isInline(field)) continue;
     if (field.type === "image") {
-      tools.append(button(`Change ${field.label.toLowerCase()}`, field.label, async () => {
-        const [file] = await pickImages();
-        if (file) {
-          replaceImage(file, (url) => {
-            item[name] = url;
-            touchedLists.add(key);
-          });
-        }
+      tools.append(button(`Change ${field.label.toLowerCase()}`, field.label, () => {
+        chooseFor((url) => {
+          item[name] = url;
+          touchedLists.add(key);
+        });
       }));
       continue;
     }

@@ -528,6 +528,44 @@ export function restoreSave(id: number, declared: { texts: string[]; lists: stri
   });
 }
 
+// Where uploaded images are used
+
+export interface ImageUse {
+  posts: Map<number, Pick<Post, "id" | "title" | "kind">>;
+  lists: Set<string>;
+  texts: Set<string>;
+  /** Only in what an undo could bring back. */
+  kept: Set<"trash" | "versions" | "history">;
+}
+
+// An upload's file name, wherever it sits in an address. A thumbnail counts as its image.
+const IMAGE_NAME = /(?<![a-f0-9])([a-f0-9]{32}(?:-\d{1,5}x\d{1,5})?)(?:-t)?\.(jpg|png|webp|gif)/g;
+
+/** Every image named in the content, by file name: six queries, however many images there are. */
+export function imageUses(): Map<string, ImageUse> {
+  const uses = new Map<string, ImageUse>();
+  const scan = (text: string, record: (use: ImageUse) => void) => {
+    for (const match of text.matchAll(IMAGE_NAME)) {
+      const name = `${match[1]}.${match[2]}`;
+      let use = uses.get(name);
+      if (!use) uses.set(name, (use = { posts: new Map(), lists: new Set(), texts: new Set(), kept: new Set() }));
+      record(use);
+    }
+  };
+  const rows = <T>(sql: string) => db().prepare(sql).all() as unknown as T[];
+  for (const post of rows<Pick<Post, "id" | "title" | "kind" | "body" | "description">>("SELECT id, title, kind, body, description FROM posts")) {
+    scan(`${post.body}\n${post.description}`, (use) => use.posts.set(post.id, { id: post.id, title: post.title, kind: post.kind }));
+  }
+  for (const item of rows<{ list: string; data: string }>("SELECT list, data FROM items")) scan(item.data, (use) => use.lists.add(item.list));
+  for (const text of rows<{ key: string; value: string }>("SELECT key, value FROM texts")) scan(text.value, (use) => use.texts.add(text.key));
+  for (const row of rows<{ body: string; description: string }>("SELECT body, description FROM posts_trash")) scan(`${row.body}\n${row.description}`, (use) => use.kept.add("trash"));
+  for (const row of rows<{ body: string }>("SELECT body FROM posts_old")) scan(row.body, (use) => use.kept.add("versions"));
+  for (const row of rows<{ before: string }>("SELECT before FROM saves")) scan(row.before, (use) => use.kept.add("history"));
+  return uses;
+}
+
+export const inCurrentUse = (use: ImageUse | undefined) => Boolean(use && (use.posts.size || use.lists.size || use.texts.size));
+
 // Health and backup
 
 export function contentCount(): number {

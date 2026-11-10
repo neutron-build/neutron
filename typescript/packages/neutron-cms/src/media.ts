@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { Readable } from "node:stream";
 import { join } from "node:path";
 import { dataDir } from "./store.js";
-import { THUMB_WIDTH } from "./images.js";
+import { imageSize, THUMB_WIDTH } from "./images.js";
 
 export const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
 
@@ -18,6 +18,12 @@ const TYPES = {
 type Extension = keyof typeof TYPES;
 
 const NAME = /^[a-f0-9]{32}(-\d{1,5}x\d{1,5}(-t)?)?\.(jpg|png|webp|gif)$/;
+
+/** Only a name `saveImage` could have written, and never its thumbnail, which goes with it. */
+export const isImageName = (name: string) => NAME.test(name) && !name.endsWith(`-t.${name.split(".")[1]}`);
+
+/** The thumbnail's name, for an image that has one. */
+const thumbName = (name: string) => name.replace(/(-\d+x\d+)(\.\w+)$/, "$1-t$2");
 
 /** By content, never by what the client claims. SVG is excluded because it can carry script. */
 export function sniffImage(bytes: Uint8Array): Extension | null {
@@ -87,4 +93,43 @@ export async function serveImage(name: string): Promise<Response> {
   } catch {
     return new Response("Not found", { status: 404 });
   }
+}
+
+export interface StoredImage {
+  name: string;
+  width?: number;
+  height?: number;
+  bytes: number;
+  added: string;
+}
+
+/** Every uploaded image, newest first, from one read of the folder. Thumbnails go with their image. */
+export function listImages(): StoredImage[] {
+  const directory = join(dataDir(), "media");
+  let names: string[];
+  try {
+    names = readdirSync(directory);
+  } catch {
+    return [];
+  }
+  const images: (StoredImage & { at: number })[] = [];
+  for (const name of names) {
+    if (!isImageName(name)) continue;
+    try {
+      const { size, mtimeMs } = statSync(join(directory, name));
+      images.push({ name, ...imageSize(name), bytes: size, added: new Date(mtimeMs).toISOString(), at: mtimeMs });
+    } catch {}
+  }
+  images.sort((a, b) => b.at - a.at || a.name.localeCompare(b.name));
+  return images.map(({ at, ...image }) => image);
+}
+
+/** Removes an image and its thumbnail. False for a name `saveImage` could not have written, or one not there. */
+export function deleteImage(name: string): boolean {
+  if (!isImageName(name)) return false;
+  const directory = join(dataDir(), "media");
+  if (!existsSync(join(directory, name))) return false;
+  rmSync(join(directory, thumbName(name)), { force: true });
+  rmSync(join(directory, name), { force: true });
+  return true;
 }

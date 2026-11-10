@@ -70,6 +70,8 @@ export default function Page({ data }) {
 
 Post bodies are Markdown, written in a visual editor: headings, lists, links and images show as they will look, a toolbar appears over selected text, typed Markdown such as `## ` or `**bold**` turns into formatting, and clicking an image asks for its description. The editor reads with the same parser the site renders with and refuses any round trip that would change the page, so HTML and anything else it can't draw stays as an editable source block; a post it can't show exactly opens as Markdown. Settings has a switch to write in Markdown instead. `renderMarkdown`, `summarize` and `firstImage` are exported for showing them; links and images that could run code (`javascript:` and the like) lose their link, and `renderMarkdown(text, { html: false })` shows raw HTML as text, for Markdown you don't control. Your site chooses the post URLs, so post pages, feeds and sitemaps are ordinary routes.
 
+Uploaded images live in `media/` and are served at `/n-admin/media/`. **Media** in the admin shows them all, newest first, with where each is used, a filter for unused ones, upload by drop, Copy address and Delete. An image in a post, page, list or text can't be deleted; one only in the Trash, an old version or list history can, with a warning. "Add image" in the editor, and image fields, offer the newest images to reuse as well as Upload. Images that aren't uploads, such as files in your `public/` folder, aren't listed.
+
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 
 ## Click to edit
@@ -156,7 +158,7 @@ The admin trusts your public site. Any script running on the site's own address,
 
 - One account with one password.
 - Uploads are limited to 2000px on the long side, and the original is not kept.
-- Photos removed from a list stay in `media/`.
+- Images are not deleted when content stops using them. Delete them from Media; "Delete all unused" leaves those kept for undo and any added in the last day.
 - If you disallow `/n-admin` in `robots.txt`, add `Allow: /n-admin/media/` so search engines can see your images.
 - Set `SITE_URL` to the address people actually use, or every save is refused.
 

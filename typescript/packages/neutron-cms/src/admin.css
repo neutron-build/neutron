@@ -313,7 +313,7 @@ textarea.input { display: block; min-height: 72px; resize: vertical; }
 .photos .image-field { display: block; position: relative; }
 .photos .image-field img { display: block; width: 100%; height: auto; aspect-ratio: 1; }
 .photos .image-field button { position: absolute; right: 8px; bottom: 8px; height: 28px; padding: 0 8px; background: var(--bg); font-size: 13px; opacity: 0; }
-.photos .item:hover .image-field button, .photos .image-field button:focus-visible { opacity: 1; }
+.photos .item:hover .image-field button, .photos .item:focus-within .image-field button { opacity: 1; }
 .photos .item-tools { min-height: 20px; }
 .rows.photos:empty { display: block; }
 .rows.photos:empty::before { content: "Drop photos here, or use Add photos."; display: block; padding: 64px 24px; background: var(--surface); border: 1px dashed var(--field); border-radius: 8px; text-align: center; }
@@ -336,7 +336,8 @@ body:has(.edit-frame) .top { position: static; flex: none; }
 .edit-tools .button { height: 32px; padding: 0 10px; font-size: 13px; }
 a.button { color: inherit; text-decoration: none; }
 
-@media (hover: none) {
+/* A touch screen has no hover, even on a laptop that also has a mouse. */
+@media (hover: none), (any-pointer: coarse) {
   .photos .image-field button { opacity: 1; }
 }
 
@@ -422,3 +423,39 @@ a.button { color: inherit; text-decoration: none; }
   .history { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .history-list { max-height: 220px; overflow-y: auto; padding-bottom: 8px; border-bottom: 1px solid var(--rule); }
 }
+
+/* Media */
+[data-media].dropping { outline: 2px dashed var(--accent); outline-offset: -4px; border-radius: 8px; }
+.media-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; min-height: 36px; margin-bottom: 16px; }
+.media-bar .spacer { flex: 1; }
+.media-bar [data-state] { font-size: 13px; }
+.media-filter { display: flex; gap: 4px; }
+.media-filter a { padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+.media-filter a:hover { color: var(--strong); }
+.media-filter a[aria-current] { background: var(--surface); color: var(--strong); font-weight: 600; }
+.media-note { margin: -8px 0 16px; font-size: 13px; }
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 24px 16px; margin: 0; padding: 0; list-style: none; }
+.media-grid > li { display: grid; align-content: start; gap: 4px; min-width: 0; }
+.media-thumb img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--surface); border-radius: 6px; }
+.media-size { margin-top: 4px; color: var(--strong); font-size: 13px; font-variant-numeric: tabular-nums; }
+.media-uses { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; font-size: 13px; overflow-wrap: anywhere; }
+.media-uses a { color: var(--ink); }
+.media-actions { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 4px; }
+.media-actions .link { min-height: 24px; color: var(--muted); font-size: 13px; }
+.media-actions .link:hover { color: var(--strong); }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--rule); font-size: 13px; }
+@media (max-width: 560px) {
+  .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 12px; }
+}
+
+/* Choosing an image */
+.chooser { width: min(560px, calc(100vw - 32px)); max-height: min(640px, calc(100dvh - 32px)); padding: 16px; background: var(--bg); color: var(--ink); border: 1px solid var(--rule); border-radius: 10px; box-shadow: 0 16px 48px rgb(0 0 0 / .3); }
+.chooser::backdrop { background: rgb(0 0 0 / .4); }
+.chooser[open] { display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 12px; }
+.chooser-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.chooser-head .link { color: var(--muted); }
+.chooser > p { font-size: 13px; }
+.chooser-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; overflow-y: auto; min-height: 0; }
+.chooser-grid button { padding: 0; background: var(--surface); border: 0; border-radius: 6px; }
+.chooser-grid button:hover img { opacity: .85; }
+.chooser-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }

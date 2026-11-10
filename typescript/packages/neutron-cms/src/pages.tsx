@@ -3,6 +3,7 @@ import { assetUrl } from "./assets.js";
 import { isPhotoList, TEXT, type ResolvedConfig, type ResolvedField, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { isSafeUrl } from "./safe-url.js";
+import type { StoredImage } from "./media.js";
 import type { Item, Post, Save, Snapshot, Trashed, Version } from "./store.js";
 
 export const STATUS_LABEL = { draft: "Draft", live: "Live", scheduled: "Scheduled" } as const;
@@ -48,6 +49,7 @@ function Shell(props: { config: ResolvedConfig; active?: string; children: Compo
           <a key={key} href={`${admin}/lists/${key}`} aria-current={current(key)}>{list.label}</a>
         ))}
         {Object.keys(config.texts).length && !config.onPage.includes(TEXT) ? <a href={`${admin}/lists/${TEXT}`} aria-current={current(TEXT)}>Text</a> : null}
+        <a href={`${admin}/media`} aria-current={current("media")}>Media</a>
         <span class="spacer" />
         <a href="/" target="_blank" rel="noreferrer">View site</a>
         <form method="post" action={`${admin}/logout`}>
@@ -595,6 +597,98 @@ export function HistoryPage(props: { config: ResolvedConfig; entries: HistoryEnt
             </div>
           </div>
         )}
+      </main>
+    </Shell>
+  );
+}
+
+export interface MediaEntry extends StoredImage {
+  url: string;
+  thumb: string;
+  /** Where it is used now, in words, with a link where there is one. */
+  places: { label: string; href?: string }[];
+  /** When it is not used now: what an undo could bring it back in. */
+  kept: string[];
+}
+
+const fileSize = (bytes: number) => (bytes < 1_000_000 ? `${Math.max(1, Math.round(bytes / 1000))} KB` : `${(bytes / 1_000_000).toFixed(1)} MB`);
+
+export function MediaPage(props: {
+  config: ResolvedConfig;
+  images: MediaEntry[];
+  total: number;
+  unusedCount: number;
+  unused: boolean;
+  page: number;
+  pages: number;
+  /** How many "Delete all unused" would remove. */
+  deletable: number;
+  notice?: string;
+  error?: string;
+}) {
+  const { config, images, unused, page, pages } = props;
+  const admin = config.path;
+  const here = (at: number) => `${admin}/media${[unused ? "unused=1" : "", at > 1 ? `page=${at}` : ""].filter(Boolean).join("&").replace(/^./, "?$&")}`;
+  return (
+    <Shell config={config} active="media">
+      <main class="page" data-media>
+        <div class="page-head">
+          <h1>Media</h1>
+          <button class="button primary" type="button" data-media-upload>Upload</button>
+        </div>
+        {props.notice ? <p class="undo" role="status">{props.notice}</p> : null}
+        {props.error ? <p class="notice error" role="alert">{props.error}</p> : null}
+        <div class="media-bar">
+          <nav class="media-filter" aria-label="Show">
+            <a href={`${admin}/media`} aria-current={unused ? undefined : "page"}>All ({props.total})</a>
+            <a href={`${admin}/media?unused=1`} aria-current={unused ? "page" : undefined}>Unused ({props.unusedCount})</a>
+          </nav>
+          <span class="muted" data-state role="status">Or drop images on this page</span>
+          <span class="spacer" />
+          {unused && props.deletable ? (
+            <form method="post" action={`${admin}/media/delete-unused`}>
+              <button class="button" type="submit" data-confirm={`Delete ${props.deletable === 1 ? "1 unused image" : `${props.deletable} unused images`} for good? Images kept for undo, and any added in the last day, stay. This can't be undone.`}>
+                Delete all unused ({props.deletable})
+              </button>
+            </form>
+          ) : null}
+        </div>
+        {unused && props.unusedCount > props.deletable ? <p class="muted media-note">"Delete all unused" leaves images kept for undo, and any added in the last day, in case they are in work not saved yet.</p> : null}
+        {images.length === 0 ? (
+          <p class="muted">{unused ? "No unused images." : "No images yet. Upload some, or drop them on this page."}</p>
+        ) : (
+          <ul class="media-grid">
+            {images.map((image) => (
+              <li key={image.name}>
+                <a class="media-thumb" href={image.url} target="_blank" rel="noreferrer"><img src={image.thumb} alt="" loading="lazy" /></a>
+                <p class="media-size">{image.width ? `${image.width} \u00d7 ${image.height}, ` : ""}{fileSize(image.bytes)}</p>
+                <ul class="media-uses">
+                  {image.places.map((place) => <li key={place.label}>{place.href ? <a href={place.href}>{place.label}</a> : place.label}</li>)}
+                  {!image.places.length ? <li class="muted">{image.kept.length ? `Not used. Kept for undo in ${image.kept.join(" and ")}.` : "Not used"}</li> : null}
+                </ul>
+                <div class="media-actions">
+                  <button class="link" type="button" data-copy={image.url}>Copy address</button>
+                  {image.places.length ? null : (
+                    <form method="post" action={`${admin}/media/delete`}>
+                      <input type="hidden" name="name" value={image.name} />
+                      {unused ? <input type="hidden" name="unused" value="1" /> : null}
+                      <button class="link" type="submit" data-confirm={image.kept.length
+                        ? `Delete this image for good? It is only kept for undo in ${image.kept.join(" and ")}, so restoring that would show a broken image. This can't be undone.`
+                        : "Delete this image for good? This can't be undone."}>Delete</button>
+                    </form>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {pages > 1 ? (
+          <nav class="pager" aria-label="Pages">
+            {page > 1 ? <a href={here(page - 1)}>Newer</a> : <span />}
+            <span class="muted">Page {page} of {pages}</span>
+            {page < pages ? <a href={here(page + 1)}>Older</a> : <span />}
+          </nav>
+        ) : null}
       </main>
     </Shell>
   );
