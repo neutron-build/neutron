@@ -225,8 +225,10 @@ pub fn main(args: &[String]) -> i32 {
 
 fn usage() {
     eprintln!(
-        "usage: e4-campaign run --seeds A..B --threads N --out results/campaign.json\n\
-         \x20      e4-campaign verify --results results/campaign.json [--threads N]\n\
+        "usage: e4-campaign run [--set main|held-out|mp-pressure] [--threads N] --out results/campaign.json\n\
+         \x20      e4-campaign run --seeds A..B --threads N --out results/campaign.json   (a probe: below 10000 only)\n\
+         \x20      e4-campaign run --probe mp-pressure --threads N --out results/campaign.json\n\
+         \x20      e4-campaign verify [--set main|held-out|mp-pressure] --results results/campaign.json [--threads N]\n\
          \x20      e4-campaign mutants --seeds A..B --out results/mutants.json\n\
          \x20      e4-campaign mutants --check results/mutants.json\n\
          \x20      e4-campaign seeded-faults --seeds A..B --threads N --out results/seeded.json"
