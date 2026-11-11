@@ -18,7 +18,7 @@ import { setTimeout as delay } from "node:timers/promises";
  * temporary projects, so the working tree is left as it was found.
  */
 
-const TEMPLATES = ["basic", "marketing", "app", "full", "docs"];
+const TEMPLATES = ["basic", "marketing", "app", "full", "docs", "blog"];
 const BOOT_TEMPLATE = "basic";
 const PORT = 3141;
 const ORIGIN = `http://127.0.0.1:${PORT}`;

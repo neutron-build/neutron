@@ -4,9 +4,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export type RuntimeMode = "preact" | "react-compat";
-export type TemplateName = "basic" | "marketing" | "app" | "full" | "docs";
+export type TemplateName = "basic" | "marketing" | "app" | "full" | "docs" | "blog";
 
-export const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full", "docs"];
+export const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full", "docs", "blog"];
 
 export interface ScaffoldOptions {
   targetDir: string;
@@ -44,6 +44,7 @@ export async function scaffoldProject(options: ScaffoldOptions): Promise<Scaffol
     HOOKS_IMPORT: options.runtime === "react-compat" ? "react" : "preact/hooks",
     NEUTRON_VERSION: dependencyVersions.neutron,
     NEUTRON_CLI_VERSION: dependencyVersions.neutronCli,
+    NEUTRON_CMS_VERSION: dependencyVersions.neutronCms,
   });
 
   if (options.runtime === "react-compat") {
@@ -198,11 +199,13 @@ export function isTemplateName(value: string): value is TemplateName {
 const PINNED_DEPENDENCY_VERSIONS = {
   neutron: "^0.5.0",
   neutronCli: "^0.5.0",
+  neutronCms: "^0.1.0",
 };
 
 function resolveDependencyVersions(targetDir: string): {
   neutron: string;
   neutronCli: string;
+  neutronCms: string;
 } {
   const workspaceRoot = findWorkspaceRoot(path.dirname(targetDir));
   if (!workspaceRoot) {
@@ -212,6 +215,7 @@ function resolveDependencyVersions(targetDir: string): {
   return {
     neutron: "workspace:*",
     neutronCli: "workspace:*",
+    neutronCms: "workspace:*",
   };
 }
 

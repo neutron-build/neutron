@@ -16,9 +16,9 @@ import { scaffoldProject } from "./scaffold.js";
 // ---------------------------------------------------------------------------
 
 type RuntimeMode = "preact" | "react-compat";
-type TemplateName = "basic" | "marketing" | "app" | "full" | "docs";
+type TemplateName = "basic" | "marketing" | "app" | "full" | "docs" | "blog";
 
-const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full", "docs"];
+const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full", "docs", "blog"];
 
 interface CliOptions {
   targetDir: string;
@@ -166,12 +166,13 @@ function findWorkspaceRoot(startDir: string): string | null {
 function resolveDependencyVersions(targetDir: string): {
   neutron: string;
   neutronCli: string;
+  neutronCms: string;
 } {
   const workspaceRoot = findWorkspaceRoot(path.dirname(targetDir));
   if (!workspaceRoot) {
-    return { neutron: "^0.5.0", neutronCli: "^0.5.0" };
+    return { neutron: "^0.5.0", neutronCli: "^0.5.0", neutronCms: "^0.1.0" };
   }
-  return { neutron: "workspace:*", neutronCli: "workspace:*" };
+  return { neutron: "workspace:*", neutronCli: "workspace:*", neutronCms: "workspace:*" };
 }
 
 // =========================================================================
@@ -505,6 +506,7 @@ describe("resolveDependencyVersions", () => {
       const result = resolveDependencyVersions(targetDir);
       assert.match(result.neutron, /^\^/);
       assert.match(result.neutronCli, /^\^/);
+      assert.match(result.neutronCms, /^\^/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -522,6 +524,7 @@ describe("resolveDependencyVersions", () => {
       const result = resolveDependencyVersions(targetDir);
       assert.equal(result.neutron, "workspace:*");
       assert.equal(result.neutronCli, "workspace:*");
+      assert.equal(result.neutronCms, "workspace:*");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -533,16 +536,17 @@ describe("resolveDependencyVersions", () => {
 // ---------------------------------------------------------------------------
 
 describe("TEMPLATE_NAMES", () => {
-  it("contains exactly 5 templates", () => {
-    assert.equal(TEMPLATE_NAMES.length, 5);
+  it("contains exactly 6 templates", () => {
+    assert.equal(TEMPLATE_NAMES.length, 6);
   });
 
-  it("includes basic, marketing, app, full, and docs", () => {
+  it("includes basic, marketing, app, full, docs, and blog", () => {
     assert.ok(TEMPLATE_NAMES.includes("basic"));
     assert.ok(TEMPLATE_NAMES.includes("marketing"));
     assert.ok(TEMPLATE_NAMES.includes("app"));
     assert.ok(TEMPLATE_NAMES.includes("full"));
     assert.ok(TEMPLATE_NAMES.includes("docs"));
+    assert.ok(TEMPLATE_NAMES.includes("blog"));
   });
 });
 
@@ -835,7 +839,7 @@ describe("scaffoldProject (real export)", () => {
   });
 
   it("scaffolds every template with the runtime token applied", async () => {
-    for (const template of ["marketing", "app", "full", "docs"] as const) {
+    for (const template of ["marketing", "app", "full", "docs", "blog"] as const) {
       const targetDir = scratchPath(template);
       try {
         const result = await scaffoldProject({
@@ -853,6 +857,32 @@ describe("scaffoldProject (real export)", () => {
       } finally {
         fs.rmSync(targetDir, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("scaffolds the blog template with the CMS wired in", async () => {
+    const targetDir = scratchPath("blog");
+    try {
+      await scaffoldProject({ targetDir, template: "blog", runtime: "preact" });
+      const pkg = JSON.parse(fs.readFileSync(path.join(targetDir, "package.json"), "utf8"));
+      assert.equal(pkg.dependencies["@neutron-build/cms"], "workspace:*");
+
+      // The admin is two route files handing GET and POST to the CMS.
+      for (const file of ["index.ts", "[...path].ts"]) {
+        const src = fs.readFileSync(path.join(targetDir, "src", "routes", "n-admin", file), "utf8");
+        assert.match(src, /export const \{ GET, POST \} = cms;/, `n-admin/${file}`);
+      }
+      const health = fs.readFileSync(path.join(targetDir, "src", "routes", "health.ts"), "utf8");
+      assert.match(health, /cms\.ready\(\)/);
+
+      // The content database and the password hash must never be committed.
+      const ignored = fs.readFileSync(path.join(targetDir, ".gitignore"), "utf8").split("\n");
+      assert.ok(ignored.includes("data"), "blog .gitignore must ignore data/");
+      assert.ok(ignored.includes(".env"), "blog .gitignore must ignore .env");
+      assert.ok(fs.existsSync(path.join(targetDir, ".env.example")));
+      assertNoRawTokens(targetDir, "blog");
+    } finally {
+      fs.rmSync(targetDir, { recursive: true, force: true });
     }
   });
 
@@ -894,6 +924,18 @@ describe("scaffoldProject (real export)", () => {
       assert.notEqual(pkg.dependencies["@neutron-build/cli"], "latest");
       assert.match(pkg.dependencies["@neutron-build/core"], /^\^/);
       assert.match(pkg.dependencies["@neutron-build/cli"], /^\^/);
+    } finally {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("pins the released CMS when scaffolding the blog outside a workspace", async () => {
+    const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "cn-external-blog-"));
+    try {
+      await scaffoldProject({ targetDir, template: "blog", runtime: "preact" });
+      const pkg = JSON.parse(fs.readFileSync(path.join(targetDir, "package.json"), "utf8"));
+      assert.match(pkg.dependencies["@neutron-build/cms"], /^\^/);
+      assert.match(pkg.dependencies["@neutron-build/core"], /^\^/);
     } finally {
       fs.rmSync(targetDir, { recursive: true, force: true });
     }
@@ -964,6 +1006,7 @@ describe("scaffold typecheck (runtime-derived jsxImportSource)", () => {
       ["node_modules/preact", path.join(neutronPkgDir, "node_modules", "preact")],
       ["node_modules/@types/react", path.join(neutronPkgDir, "node_modules", "@types", "react")],
       ["node_modules/vite", path.join(neutronPkgDir, "node_modules", "vite")],
+      ["node_modules/@neutron-build/cms", path.resolve(neutronPkgDir, "..", "neutron-cms")],
     ];
     for (const [linkPath, target] of links) {
       const abs = path.join(targetDir, path.dirname(linkPath));
@@ -1031,7 +1074,7 @@ describe("scaffold typecheck (runtime-derived jsxImportSource)", () => {
           `@neutron-build/core dist not built (${coreDist}); run pnpm build at the typescript/ workspace root first`,
         );
       }
-      for (const template of ["basic", "marketing", "app", "full"] as const) {
+      for (const template of ["basic", "marketing", "app", "full", "blog"] as const) {
         for (const runtime of ["preact", "react-compat"] as const) {
           const targetDir = scratchPath(`tsc-${template}-${runtime}`);
           try {

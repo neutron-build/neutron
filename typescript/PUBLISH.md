@@ -19,7 +19,7 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/agents` | 0.3.0 |
 | `@neutron-build/core` | 0.5.4 |
 | `@neutron-build/cli` | 0.5.4 |
-| `@neutron-build/create` | 0.1.12 |
+| `@neutron-build/create` | 0.1.13 |
 | `@neutron-build/auth` | 0.1.7 |
 | `@neutron-build/cache-redis` | 0.2.1 |
 | `@neutron-build/security` | 0.1.6 |
@@ -28,6 +28,7 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/workflow` | 0.1.2 |
 | `@neutron-build/ops` | 0.1.5 |
 | `@neutron-build/otel` | 0.1.5 |
+| `@neutron-build/cms` | 0.1.0 |
 
 `@neutron-build/mail` is at 0.2.0.
 What changed in each package is in `CHANGELOG.md`. Check the registry for what is

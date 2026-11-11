@@ -1,0 +1,27 @@
+{
+  "name": "__PACKAGE_NAME__",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "start": "neutron-ts start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@neutron-build/cli": "__NEUTRON_CLI_VERSION__",
+    "@neutron-build/cms": "__NEUTRON_CMS_VERSION__",
+    "@neutron-build/core": "__NEUTRON_VERSION__",
+    "preact": "^10.25.4",
+    "preact-render-to-string": "^6.5.0"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.4",
+    "typescript": "^5.7.2",
+    "vite": "^8.3.3"
+  }
+}

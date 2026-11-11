@@ -47,7 +47,7 @@ async function main() {
 Usage:
   neutron-ts init    Scaffold a new project (from create-neutron templates)
     [project-name]
-    --template basic|marketing|app|full|docs
+    --template basic|marketing|app|full|docs|blog
     --runtime preact|react-compat
   neutron-ts dev      Start development server
   neutron-ts build    Build for production

@@ -4,7 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-cms 0.1.0 (not yet published).
+create 0.1.13 (not yet published).
+
+### Added
+
+- **`blog` template in `@neutron-build/create`**
+  (`npm create @neutron-build@latest my-blog -- --template blog`, also
+  `neutron-ts init --template blog`). A small server-rendered blog with
+  `@neutron-build/cms` mounted at `/n-admin`: a post list, post pages, a 404
+  page and a `/health` route on `cms.ready()`. It boots on an empty database
+  and sends visitors no JavaScript. Outside the workspace it pins
+  `@neutron-build/cms` to `^0.1.0`, inside it to `workspace:*`, like the
+  core/cli pair.
+
+## 2026-11-10
+
+cms 0.1.0.
 
 ### Added
 
