@@ -11863,7 +11863,7 @@ worktree never held a mutant, `git status` clean after every step):
 | OWN-W7-START-EARLY (`yields` for `yields + 1` at `h:dropwalk`) | **no observable effect at this tip**: the pin PASSES under it — measured 78 w7 rounds, all 78 `q7_drop_walk ∧ fired`, 0 anomalies (0 of 78 picks move, verdict `ec9f84a6` §6). The gate re-applies it; a catch is welcome, never a rework |
 | M-CWIN-W7-NONE (the reader's two new arms reverted) | `cwin_round_trips_every_window_label` — FAILED at the `w7` label (`left: Some(None), right: Some(Some("w7"))`) |
 | OWN-SZI-NOFOLD (`szi` drops the `ckpt_closed_dirty ≥ 4·F` conjunct) | **UNCAUGHT — equivalent at BASE over the whole seed range; ESCALATE (below)**. The card's Work 3 STOP rule fired: no round in `0..10000` distinguishes it, so no pin exists and P rules on it |
-| OWN-TUNING-ARM (`TuningId::MpPressure` resolves to `&Tuning::FINAL`) | `x5_r44_mp_pressure_runs_its_own_tuning` — FAILED at the ptr::eq assertion |
+| OWN-TUNING-ARM (`TuningId::MpPressure` resolves to `&Tuning::FINAL`) | `x5_r44_mp_pressure_runs_its_own_tuning` — FAILED at the value assertion (the mutant serves FINAL's fields: `ckpt_every` 8/5, `gc_sweeps` 2/3, `w11`/`w12` 100/100, `w7_share` 200 … where MP_PRESSURE reads 4/5, 12/1, 200/200, 0) |
 | M-SEEDS-SKIPPED (the old skip: a `--seeds` value with no `..` reads as absent) | `x5_r44_malformed_seeds_refuse_in_every_run_form` — FAILED at the pure assertion (`--seeds "5" must refuse`), before any command-level case could run |
 | OWN-GUARD-WAIT-IGNORED (`wait_load` returns `ok` at once) | `x5_guard.sh --self-test`, `wait-injectable-timeout` (a fixture load above 2 with step 0 and cap 0 reads `wait=timeout` after one check, no sleep) |
 | OWN-GUARD-NO-STEAL (busy drops `/proc/stat` field 9, steal) | `x5_guard.sh --self-test`, `busy-in-nice-irq-softirq-steal` (the fixture pair's busy sits entirely in nice, irq, softirq and steal; the mutant reads busy 75.000 and foreign -25.00) |
@@ -11927,7 +11927,16 @@ every previously-refused one still refuses.
 
 **7. Post-data amendments: none.** The pin's literal readings (78
 picks, the sweep's 141/58/58, the two-pub matrix's 30 refusing cells
-of 96) were measured once and recorded as measured.
+of 96) were measured once and recorded as measured. One test-only
+rework after the gate's first run: the OWN-TUNING-ARM pin compared
+constant addresses (`std::ptr::eq`), which is not build-stable — the
+test binary and the library each promote `&Tuning::MP_PRESSURE` to
+their own static, the gate's `--workspace` build does not merge them,
+and the real code failed the pin there (`STEP test EXIT=101`) while
+the `-p e4-recovery` build passed it. The pin now compares the tuning
+**values** (`assert_eq!(*tuning(), Tuning::MP_PRESSURE)`), pins the
+same rule, fails the mutant in both builds (shown above), and was the
+card's own suggestion only in its mechanism, not its rule.
 
 ### ESCALATE (X-5c-PINS-2)
 
