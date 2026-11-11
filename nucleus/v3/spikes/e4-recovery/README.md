@@ -11606,3 +11606,32 @@ before the first of them). Every number is a **probe, not evidence**:
   1000, SZC 1000, SZC-MW 50, SZI 300. Q7 50 < 200: the ladder runs.
   Probe, not evidence.
 
+- **ladder B rung B.1** (FINAL's `w7_share` 100, nothing else):
+  `GUARD wait=ok load_at_start=4.77 7.15 8.51 wall_s=283.938
+  cpu_s=3458.285 busy_s=4051.350 foreign_pct=17.15 verdict=VOID`
+  (foreign load arrived during the run; the wall rule reads the
+  number — load can only lengthen it); `PROBE_WALL raw_s=283.9
+  min_per_10k=47.3 load_at_start=1.83 5.88 7.99` (≤ 50, passes);
+  `PROBE_CPU user_sys_s=3458.2`; **Q7 200** (raw 20 — exactly the
+  required 200, under the 250 margin). Changed rows vs B.0: Q7
+  50→200, Q5a 230→340 (up: a walk is a shorter window than the W11
+  picks it displaced), Q8 340→330, Q5b 6920→6830, Q5c 5420→5330, Q6a
+  2160→2140, Q6b 1210→1220, Q9 10220→10160, Q11 450→420, Q16
+  6770→6730, Q17 10420→10340, SZC 2390→2350, SIZING 7110→7160. All
+  rows (per10k): Q1 7990 (hooks unchanged from B.0: Before0 840,
+  After0 740, Mid2 810, After1 780, After2 680, After3 820, Mid6 900,
+  After4 770, After5 810, After6 840 — the targeted half never
+  moves), Q2 4370, Q3 1310, Q4 1670, Q4-I 2160, Q5a 340, Q5b 6830,
+  Q5c 5330, Q6a 2140, Q6b 1220, **Q7 200**, Q8 330, Q9 10160, Q10 460
+  (not held), Q11 420, Q12 270, Q13a 890, Q13b 960, Q13c 970, Q14
+  400, Q15 1280, Q16 6730, Q17 10340, Q18 4290, SIZING 7160 misses,
+  SZC 2350, SZC-MP 0 (this file), SZC-MW 140, SZI 810. Fails: none in
+  0..1000. Hold set: Q4 1670 ≥ 1500 ✓, Q4-I 2160 ≥ 1500 ✓, Q5a
+  (watched) 340 ≥ 200 ✓, every B.0-met row at or above its minimum ✓
+  (Q2 4370, Q3 1310, Q5b 6830, Q5c 5330, Q6a 2140, Q6b 1220, Q8 330,
+  Q9 10160, Q11 420, Q12 270, Q13a/b/c 890/960/970, Q14 400, Q15
+  1280, Q16 6730, Q17 10340, Q18 4290, SZC 2350, SZC-MW 140, SZI 810;
+  every Q1 hook 680–900). Wall passes. **Q7 200 < 250 (margin) — not
+  stop-and-keep; `thin` candidate (reaches required 200 with hold and
+  wall passing); the walk continues to B.2.** Probe, not evidence.
+
