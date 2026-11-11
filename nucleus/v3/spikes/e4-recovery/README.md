@@ -11335,3 +11335,182 @@ STOP, and a pin is required before E4 is judged. This card adds
 literal pins at **both** seeds, at FINAL, with G5-R48-TREADS-KEPT as
 their must-fail mutant.
 
+## Card X-5c-F4-F5 (X5-R55 the round-0 fill, X5-R56 the drop-walk
+## window; ladders A on SZC-MP and B on Q7)
+
+Base: `card/v3-X-5c-F4-F4` (tip `18d2530f`; its verdict's 10k file of
+record is `~/.cache/nv3-review/runlogs/X-5c-F4-F4.main.json`, sha256
+`549495c5c59aa0c6f605164aec6683f26363165a3b78a641cb470045f229e330`).
+Class: experiment. Every count this card produces is a **probe, not
+evidence**; the final run's own `verify` is the only quota evidence.
+
+### X-5c-F4-F5 rules and ladders
+
+Pre-registered at step 0, before any measurement (card Work 0). Copied
+from the card: the owner decisions, Goal items 1–2 (X5-R55 and X5-R56
+as rules), Limit 4, the wall rule, the stop rule, the new-classes
+rule, and both ladder tables with their hold sets. No rung, knob,
+ladder, margin or stop rule is added or changed after any probe.
+
+**Owner decisions (2026-11-10, QUEUE "OWNER 2026-11-10 (F4-F3 ESCALATE
+2c041aae)").**
+
+- **(2) Fix SZC-MP's cause in E4 now,** confined to the MP-pressure
+  set, so the main baseline stays.
+- **(3) Try a targeted Q7 change that keeps Q4 ≥ 1,500,** as `r41` did
+  for Q4, with a pre-registered ladder. Q7 is a stated gap only if
+  that fails.
+- **No threshold moves.** A ladder that fails returns to the owner
+  with every rung's numbers.
+
+**X5-R55 — the round-0 fill (a 5.2 amendment, owner decision (2)).**
+
+- Knobs: `r0_fill_txns` (0–3) and `r0_fill_ops` (0, or 300–1,500). **0
+  in BASE and FINAL.** Only `Tuning::MP_PRESSURE` ever sets them, so
+  only the MP-pressure set and `--probe mp-pressure` run a fill.
+- What runs: in **round 0 only**, task 0 runs `r0_fill_txns` sync-on
+  chunked transactions of `r0_fill_ops` Puts each, directly after its
+  setup commit and before its other ops.
+  - Each transaction has unique `(tree, key)` pairs. Trees are uniform
+    over the round's write range `2..=write_max`. Keys are uniform
+    over `0..keyspace`. Every value is `value_hi` bytes of one
+    constant.
+  - Each transaction stays inside 5.2's chunked range (300–1,500 ops)
+    and the 8–400 B values. Its amendment is only that round 0 may
+    hold more than one chunked transaction.
+- Draws: all of them come from a new stream tag that no other stream
+  uses, through a pure function that returns `None` **without
+  constructing the stream** when `r0_fill_txns == 0` or
+  `round != 0`. So the rest of every script, and every FINAL and BASE
+  script, is bit-for-bit unchanged.
+
+**X5-R56 — the drop-walk window (a 5.5 amendment, owner decision (3)).**
+
+- Knob: `w7_share` (permille; 0 or 50–300; with
+  `w7_share + w11_share + w12_share` ≤ 1000). It is 0 in BASE and set
+  explicitly to **0 in `MP_PRESSURE`**, which does not follow FINAL
+  here. Only FINAL's ladder sets it.
+- The window: the counting pass records the scheduler-yield indices at
+  which a DropTree walk is in flight
+  (`harness::WorkloadObs::drop_walk_yields`). This is a diagnostic,
+  never a digest input.
+- The pick:
+  - It applies only in a **uniform-mode round with `knobs.drop_tree`**
+    and `w7_share > 0`. One draw from a **new stream tag** selects the
+    round with probability `w7_share` permille, and then the crash
+    point is uniform over that list. The label is `w7`.
+  - An empty list falls back to the plain uniform point, labelled
+    `w7-`.
+  - An unselected round, a targeted round and a non-drop round make no
+    such draw. Their point is exactly X5-R38's `window_crash_point`,
+    with its `S_CWIN` draw unchanged.
+  - The label rides the existing window-pick field. It is a digest
+    input only when it is `Some`, so only selected rounds move.
+- `r41` rounds are targeted-mode and have no drop, so this change
+  cannot reach them.
+
+**Limit 4 — the ranges.** Every Limit 4 range of X-5c-F4-F3 still
+holds (committers 2–4, trees 2–4, keys ≤ 3,000, values 8–400 B,
+commits 1–20 ops, SyncOff from {0, 3, 7} tenths, chunked 300–1,500
+ops, `bulk_load_one_in` 4, each of `w11_share`/`w12_share` 0 or in
+[50, 200]), and also:
+
+- `r0_fill_txns` ≤ 3;
+- `r0_fill_ops` is 0 or in [300, 1,500];
+- `w7_share` is 0 or in [50, 300];
+- `w7_share + w11_share + w12_share` ≤ 1000.
+
+**The wall rule, for both ladders.**
+
+- **Load can only lengthen wall.** A rung passes its wall limit if
+  `PROBE_WALL` is at or under it, whether the `GUARD` verdict is
+  `CLEAN` or `VOID`.
+- A `VOID` reading over the limit is undecided. Re-run that probe once
+  after the guard's wait, before committing its row. The counts must
+  be identical, and a difference is a STOP.
+- If the second reading is still `VOID` and over the limit, the row
+  says `wall undecided`, and the walk treats the rung as over the
+  limit. P's gate re-reads it on an idle host.
+- A `CLEAN` reading over the limit is over.
+
+**The stop rule, for both ladders** (X-5c-F4-F3's shape; the 1.25 is a
+stopping margin for a sampled probe, not a threshold):
+
+- **Stop-and-keep** at the first rung that reaches **required × 1.25**
+  and passes the hold set and the wall limit.
+- **Else keep `thin`:** the highest rung that reaches the required
+  count and passes the hold set and wall limit.
+- **Rung order is by rising cost.** A rung over its wall limit ends
+  the walk.
+- **If no rung reaches the required count: ESCALATE with the
+  numbers.**
+  - The ladder keeps the rung, or the anchor, with the highest count
+    that passes the hold set and wall limit. A tie goes to the earlier
+    one.
+  - The later steps still run, so the owner gets every row.
+
+**New classes (X5-R16).** The fill changes MP's round 0, and new
+failure shapes are possible. **STOP** on any of these:
+
+- a failing round outside REFRESH 6's and 8's named classes;
+- an MP round whose shape is not one of the known O-1(a) or O-3(e) MP
+  shapes;
+- a class C round with an O-1 failure and no `XX001`.
+
+On a STOP, the row is committed and the attempt ends with an ESCALATE
+naming the seed and round. Workers do not triage.
+
+**Ladder A — `SZC-MP` ≥ 100 per 2,000** (raw ≥ 10 on the 200-seed
+probe; margin 125, so raw ≥ 13). Rungs A.0–A.2 (A.3–A.4 only if the
+stop rule has not ended the ladder). Each rung is set in
+`Tuning::MP_PRESSURE` only, cumulative, over X-5c-F4-F4's MP_PRESSURE
+(9.1's fields over FINAL 7.3).
+
+- **Hold set:** none. The MP-pressure set has no other exit row. The
+  main set is untouched by construction, held by
+  `x5f5_final_digests_unmoved` and the Acceptance.
+- **Wall limit:** `min_per_2000` ≤ 40. That is the MP set's own box,
+  which X5-R54 does not change.
+
+| Rung | Change |
+|---|---|
+| A.0 | none: the anchor (MP_PRESSURE as X-5c-F4-F4 left it; its `value_lo` is now 280) |
+| A.1 | `r0_fill_txns` 1, `r0_fill_ops` 1,000 |
+| A.2 | `r0_fill_txns` 2, `r0_fill_ops` 1,500 |
+| A.3 | `r0_fill_txns` 3, `r0_fill_ops` 1,500 |
+| A.4 | A.3 and `ckpt_every` 12–19 (`ckpt_every_lo` 12, `ckpt_every_span` 8), the k2 interval width of rung 9.3 |
+
+**Ladder B — Q7 ≥ 200 per 10k** (margin 250). Rungs B.0–B.2 (B.3 only
+if the stop rule has not ended the ladder). Each rung is set in
+`Tuning::FINAL`'s `w7_share` only.
+
+- **Hold set:**
+  - Q4 ≥ 1,500 and Q4-I ≥ 1,500 (the owner's bars);
+  - every row that met its minimum at B.0 stays at or above that
+    minimum. This covers each Q1 hook, Q5a, Q8, Q10 if met, Q11, Q12,
+    Q18, SZC, SZC-MW and SZI.
+- **Wall limit:** `min_per_10k` ≤ 50 (X5-R54).
+- **B.0 must equal X-5c-F4-F3's rung 7.3 probe row** count for count.
+  It is the same FINAL, and counts are deterministic. A difference is
+  a STOP.
+- **Watch Q5a.** The whole 10k at 7.3 reads 210 against its 200 row,
+  and a crash point moved into a walk is one taken from Q5a's windows.
+
+| Rung | Change |
+|---|---|
+| B.0 | none: the anchor (FINAL = 7.3 at this tip) |
+| B.1 | `w7_share` 100 |
+| B.2 | `w7_share` 200 |
+| B.3 | `w7_share` 300 |
+
+**The outcome commits.** Ladder A's outcome commit sets MP_PRESSURE to
+the kept rung (or states that the last rung tried is kept); its
+subject begins exactly `nucleus v3: X-5c-F4-F5 A-end - `. At that
+commit FINAL is X-5c-F4-F4's, field for field, and no X5-R56 code
+exists: the Acceptance builds the main set from it and requires
+`DIGESTS_MOVED 0` against X-5c-F4-F4's 10k. Ladder B's outcome commit
+sets FINAL to the kept rung; its subject begins exactly
+`nucleus v3: X-5c-F4-F5 B-end - `. X5-R56 moves main digests **by
+design** whenever ladder B keeps a non-zero `w7_share` — limited to
+uniform-mode seeds, which the pins hold.
+
