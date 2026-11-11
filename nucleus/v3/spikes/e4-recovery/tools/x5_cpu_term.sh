@@ -102,15 +102,32 @@ in_band() {
 # columns only** (the inputs the measuring form holds at that point):
 # the FINAL column is present among the pass-1 inputs and must not
 # enter the decision — the self-test's band case pins that
-# (G-CPU-BAND-FROM-FINAL). Sets BAND_TERM to the pass-1 S1 term; echo
-# 3 or 1; return 2 when pass 1 measured no BASE cpu.
+# (G-CPU-BAND-FROM-FINAL). X-5c-PINS-2 item 3 (c): the answer is set
+# in globals, never echoed — the old `np=$(band_passes)` capture ran
+# this function in a subshell, so BAND_TERM never reached the parent
+# and the BAND line logged an empty term. Sets BAND_TERM (the pass-1
+# S1 term) and BAND_PASSES (3 or 1); returns 2 when pass 1 measured no
+# BASE cpu.
 band_passes() {
   BAND_TERM=$(pct "${EVAL_S1_CPU[1]}" "${EVAL_BASE_CPU[1]}")
   if [ "$BAND_TERM" = ERR ]; then
     echo "x5_cpu_term: pass 1 measured no BASE cpu" >&2
     return 2
   fi
-  if in_band "$BAND_TERM"; then echo 3; else echo 1; fi
+  if in_band "$BAND_TERM"; then BAND_PASSES=3; else BAND_PASSES=1; fi
+}
+
+# The decision's shared call site (X-5c-PINS-2 item 3 (c)): run the
+# band decision and, when three passes are owed, print the BAND line
+# the measuring form logs — emitted in this one place, so the
+# self-test drives exactly what the measuring form logs, term included
+# (M-BAND-SUBSHELL's subshell capture loses BAND_TERM to a subshell
+# and the line logs an empty field).
+band_decide() {
+  band_passes || return 2
+  if [ "$BAND_PASSES" -eq 3 ]; then
+    echo "BAND pass1_term=$BAND_TERM inside +55..+65: three passes, the median rules"
+  fi
 }
 
 cpu_term_eval() {
@@ -197,6 +214,7 @@ self_test() {
     EVAL_PASSES=1 EVAL_VOID_WAIT=0
     EVAL_BASE_CPU=() EVAL_S1_CPU=() EVAL_FIN_CPU=()
     EVAL_BASE_WALL=() EVAL_FIN_WALL=() EVAL_BUSY=()
+    BAND_TERM= BAND_PASSES=
   }
 
   # Case A — the term from the S1 column (and CPU_WHOLE_FINAL from the
@@ -280,16 +298,35 @@ self_test() {
   # is set to a value that would flip the answer if it were read. S1
   # at +50 with FINAL at +60 takes one pass; S1 at +58 with FINAL at
   # +70 takes three. (G-CPU-BAND-FROM-FINAL reverts this and fails.)
+  # X-5c-PINS-2 item 3 (c): the answer now arrives in BAND_PASSES, not
+  # an echo.
   reset
   EVAL_BASE_CPU[1]=1000 EVAL_S1_CPU[1]=1500 EVAL_FIN_CPU[1]=1600
-  if [ "$(band_passes)" != 1 ]; then
-    echo "self-test FAIL band-decision-one-pass (S1 +50, FINAL +60 must take one pass)" >&2
+  band_passes
+  if [ "$BAND_PASSES" != 1 ]; then
+    echo "self-test FAIL band-decision-one-pass (S1 +50, FINAL +60 must take one pass; BAND_PASSES=$BAND_PASSES)" >&2
     fails=$((fails + 1))
   fi
   reset
   EVAL_BASE_CPU[1]=1000 EVAL_S1_CPU[1]=1580 EVAL_FIN_CPU[1]=1700
-  if [ "$(band_passes)" != 3 ]; then
-    echo "self-test FAIL band-decision-three-passes (S1 +58, FINAL +70 must take three)" >&2
+  band_passes
+  if [ "$BAND_PASSES" != 3 ]; then
+    echo "self-test FAIL band-decision-three-passes (S1 +58, FINAL +70 must take three; BAND_PASSES=$BAND_PASSES)" >&2
+    fails=$((fails + 1))
+  fi
+
+  # Case I (X-5c-PINS-2 item 3 (c)) — the value the measuring form
+  # logs: at the same fixture pass-1 columns (BASE 1000, S1 1580; term
+  # +58.00, inside the band) the BAND line carries 58.00, not an empty
+  # field. The old `np=$(band_passes)` site ran the decision in a
+  # subshell, so BAND_TERM never reached the parent and this line
+  # logged empty (M-BAND-SUBSHELL reverts this and fails this case).
+  reset
+  EVAL_BASE_CPU[1]=1000 EVAL_S1_CPU[1]=1580 EVAL_FIN_CPU[1]=1700
+  local band_out
+  band_out=$(band_decide)
+  if [ "$band_out" != "BAND pass1_term=58.00 inside +55..+65: three passes, the median rules" ]; then
+    echo "self-test FAIL band-logged-term (got: $band_out)" >&2
     fails=$((fails + 1))
   fi
 
@@ -538,13 +575,14 @@ measure() {
     EVAL_FIN_WALL[$pass]=${PASS_WALL[FINAL]}
     EVAL_BUSY[$pass]=${PASS_BUSY[$pass]}
     if [ "$pass" -eq 1 ] && [ "$passes" -eq 1 ]; then
-      # The band decision, shared with the self-test: a function of
-      # the S1 and BASE pass-1 columns only (band_passes).
-      local np
-      np=$(band_passes) || return 2
-      if [ "$np" -eq 3 ]; then
+      # The band decision, shared with the self-test (X-5c-PINS-2 item
+      # 3 (c)): a function of the S1 and BASE pass-1 columns only, run
+      # in this shell — no `$(…)` capture, so BAND_TERM and BAND_PASSES
+      # reach the parent and the BAND line logs the term it decided on
+      # (the old np=$(band_passes) site lost BAND_TERM to a subshell).
+      band_decide || return 2
+      if [ "$BAND_PASSES" -eq 3 ]; then
         passes=3
-        echo "BAND pass1_term=$BAND_TERM inside +55..+65: three passes, the median rules"
       fi
     fi
   done
