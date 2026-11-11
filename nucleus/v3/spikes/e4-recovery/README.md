@@ -11577,3 +11577,32 @@ before the first of them). Every number is a **probe, not evidence**:
   (raw 19 on the 200-seed probe) against required 100, margin 125.
   Probe, not evidence.
 
+- **ladder B rung B.0 — the anchor** (FINAL = 7.3 at this tip, with
+  X5-R55's and X5-R56's knobs all 0; no constant changes at this
+  rung): `GUARD wait=ok load_at_start=6.67 4.34 8.30 wall_s=245.322
+  cpu_s=3265.218 busy_s=3245.740 foreign_pct=-0.60 verdict=CLEAN` (the
+  benign negative again: /proc/stat busy undercounting against the
+  process's own CPU); `PROBE_WALL raw_s=245.3 min_per_10k=40.9
+  load_at_start=1.98 3.39 7.63` (≤ 50, X5-R54's box); `PROBE_CPU
+  user_sys_s=3265.2`. **The B.0 STOP check passes: this row equals
+  X-5c-F4-F3's rung 7.3 probe row count for count** — Q7 50, Q5a 230,
+  Q4 1670, Q4-I 2160, Q18 4290, SZC 2390, SZC-MW 140, SZI 810, Q10
+  460, and every other row below — the same FINAL with X5-R55 (0
+  everywhere) and X5-R56 (0 everywhere) on top, deterministic. All
+  rows (per10k): Q1 7990 (hooks, per hook: Before0 840, After0 740,
+  Mid2 810, After1 780, After2 680, After3 820, Mid6 900, After4 770,
+  After5 810, After6 840), Q2 4370, Q3 1310, Q4 1670, Q4-I 2160, Q5a
+  230, Q5b 6920, Q5c 5420, Q6a 2160, Q6b 1210, **Q7 50** (the
+  ladder's row: 50 < 200 required), Q8 340, Q9 10220, Q10 460 (< 500
+  — **not met at B.0**, so "Q10 if met" does not hold it), Q11 450,
+  Q12 270, Q13a 890, Q13b 960, Q13c 970, Q14 400, Q15 1280, Q16 6770,
+  Q17 10420, Q18 4290, SIZING 7110 misses, SZC 2390, SZC-MP 0 (this
+  file), SZC-MW 140, SZI 810. Fails: none in 0..1000 (F3's 7.3 row
+  read the same). Rows met at B.0 (the hold set's floors, each the
+  row's own minimum): every Q1 hook 300, Q2 2000, Q3 200, Q4
+  1000/owner 1500, Q4-I 1000/owner 1500, Q5a 200 (watched), Q5b 200,
+  Q5c 200, Q6a 200, Q6b 200, Q8 100, Q9 500, Q11 100, Q12 100, Q13a
+  300, Q13b 300, Q13c 300, Q14 50, Q15 300, Q16 5000, Q17 100, Q18
+  1000, SZC 1000, SZC-MW 50, SZI 300. Q7 50 < 200: the ladder runs.
+  Probe, not evidence.
+
