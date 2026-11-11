@@ -4557,44 +4557,60 @@ fn x5r56_w7_not_drawn_at_zero() {
 /// **X5-R56 (card step 5): an unselected round keeps its point.** In
 /// a uniform-mode drop round whose `S_W7` draw does not select, the
 /// armed point and its label are exactly X5-R38's
-/// `window_crash_point` — with the `S_CWIN` draw unchanged. Seed 30's
-/// round 0 is uniform-mode and a drop round, and its share-300
-/// selection draw reads `Some(false)` (the pure half); the run then
-/// holds round 0's crash point and pick label identical to the same
-/// seed at share 0, where no `S_W7` stream is ever constructed.
-/// **M-W7-SHARED-STREAM** (the selection drawn from `S_CWIN`) breaks
-/// the equality: the selection's draw would consume the `S_CWIN`
-/// stream `window_crash_point` is about to draw from, and the point
-/// lands elsewhere.
+/// `window_crash_point` — with the `S_CWIN` draw unchanged. Two
+/// literal seeds, both uniform-mode round-0 drop rounds whose
+/// share-300 selection draw reads `Some(false)` (the pure half):
+///
+/// - **seed 30**, whose plain FINAL point is the plain uniform one
+///   (`cwin == None`) — the pin's base case;
+/// - **seed 111**, whose plain FINAL point is a **W12 pick**
+///   (`cwin == Some("w12")`, so its `S_CWIN` first draw is < 100 permille,
+///   far under the 300 share) — the discriminating case for
+///   **M-W7-SHARED-STREAM** (the selection drawn from `S_CWIN`): the
+///   shared stream's first draw is that same sub-100 value, so the
+///   mutant *selects* where the real `S_W7` draw does not, and the
+///   crash moves into the walk. On seed 30 alone the mutant is
+///   equivalent (that seed's `S_CWIN` draw is ≥ 300), which the
+///   rework measured; the second seed closes it.
+///
+/// The run then holds each seed's round-0 crash point and pick label
+/// identical to the same seed at share 0, where no `S_W7` stream is
+/// ever constructed.
 #[test]
 fn x5r56_unselected_round_keeps_its_point() {
     let mut t300 = workload::Tuning::FINAL;
     t300.w7_share = 300;
     let mut t0 = workload::Tuning::FINAL;
     t0.w7_share = 0;
-    let knobs = Knobs::derive(30, 0, &workload::Tuning::FINAL);
-    assert!(
-        (30u64 / 10) % 2 == 1 && knobs.drop_tree,
-        "seed 30 round 0 must be a uniform-mode drop round"
-    );
-    assert_eq!(
-        workload::w7_pick(30, 0, &t300, true, true),
-        Some(false),
-        "seed 30 round 0's share-300 draw must not select (the pin's premise)"
-    );
-    let a = workload::run_seed_with(30, None, &t300);
-    let b = workload::run_seed_with(30, None, &t0);
-    let ra = a.rounds.first().expect("seed 30 runs round 0");
-    let rb = b.rounds.first().expect("seed 30 runs round 0");
-    assert_eq!(
-        ra.crash, rb.crash,
-        "an unselected round's crash point must equal X5-R38's own (M-W7-SHARED-STREAM \
-         reverts this)"
-    );
-    assert_eq!(
-        ra.cwin, rb.cwin,
-        "an unselected round's pick label must equal X5-R38's own"
-    );
+    for (seed, want_plain) in [(30u64, None), (111, Some("w12"))] {
+        let knobs = Knobs::derive(seed, 0, &workload::Tuning::FINAL);
+        assert!(
+            (seed / 10) % 2 == 1 && knobs.drop_tree,
+            "seed {seed} round 0 must be a uniform-mode drop round"
+        );
+        assert_eq!(
+            workload::w7_pick(seed, 0, &t300, true, true),
+            Some(false),
+            "seed {seed} round 0's share-300 draw must not select (the pin's premise)"
+        );
+        let a = workload::run_seed_with(seed, None, &t300);
+        let b = workload::run_seed_with(seed, None, &t0);
+        let ra = a.rounds.first().expect("round 0 runs");
+        let rb = b.rounds.first().expect("round 0 runs");
+        assert_eq!(
+            rb.cwin, want_plain,
+            "seed {seed}: the share-0 point must be the plain {want_plain:?} one at FINAL"
+        );
+        assert_eq!(
+            ra.crash, rb.crash,
+            "seed {seed}: an unselected round's crash point must equal X5-R38's own \
+             (M-W7-SHARED-STREAM reverts this)"
+        );
+        assert_eq!(
+            ra.cwin, rb.cwin,
+            "seed {seed}: an unselected round's pick label must equal X5-R38's own"
+        );
+    }
 }
 
 /// **X5-R56 (card step 5): the pick lands in the walk.** The literal
