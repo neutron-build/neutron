@@ -3365,6 +3365,57 @@ fn es1_script(crash: Option<CrashSpec>, extra: Vec<Op>) -> Script {
     }
 }
 
+/// **The two-publication script (card X-5c-PINS-2 item 7):** setup and
+/// a logged commit, a checkpoint (meta 1, publication A's dependency
+/// context), bulk load A on tree 5 with its forced checkpoint (meta 2)
+/// and its publication (`RequireCkpt{2}`), then bulk load B on tree 6
+/// with its forced checkpoint (meta 3) and its publication
+/// (`RequireCkpt{3}`), then yields. Exactly three script-driven
+/// checkpoints run (ids 1, 2, 3) over the initial meta 0, with the
+/// round-end harness checkpoint as meta 4 — so a crash after B's
+/// publication and before the round's end leaves **B's own checkpoint
+/// as the newest durable meta (kmax == 3)**, and a fault on it reverts
+/// the slot to the meta before, leaving the open at meta 2: A's
+/// dependency satisfied, B's violated.
+fn es1_script_two_pub(crash: Option<CrashSpec>) -> Script {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..8u64).map(|i| put(i, 1)).collect(),
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::BulkLoad {
+            tree: 5,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::BulkLoad {
+            tree: 6,
+            entries: (20..40u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 8]))
+                .collect(),
+        },
+        ScriptOp::Yields(4),
+    ];
+    Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash,
+        nested: Vec::new(),
+    }
+}
+
 /// The newest durable meta write of a crashed disk, as one directed
 /// `Lost` fault (the d10 pattern, generalized over the ckpt_id: the
 /// highest valid meta the faultless round made durable, its last write
@@ -3590,6 +3641,140 @@ fn es1_over_refusals_pinned() {
             out.served
         );
     }
+}
+
+/// The newest durable meta write of a crashed disk, as `(ckpt_id,
+/// fault)` — or `None` when the disk holds no durable meta write (a
+/// round whose crash never fired; the family's [`es1_newest_meta_lost`]
+/// expects one and is only used on rounds that crashed).
+fn es1p_newest_meta(base: &harness::RoundOutcome) -> Option<(u64, e4_recovery::sim::MediaFault)> {
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("es: the page file");
+    let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
+    for w in base.crashed_disk.dwrites_of(pf).iter() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
+        {
+            best = Some((
+                m.ckpt_id,
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: w.off,
+                    len: 4096,
+                    bytes: w.bytes.clone(),
+                    pre: w.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Lost,
+                },
+            ));
+        }
+    }
+    best
+}
+
+/// **E4-R1 (card X-5c-PINS-2 item 7; E4-SILENT-1's verdict `8d679ccd`
+/// finding 5, Follow-ups F1): every publication is checked — a
+/// two-publication round.** The script (gate case `g8`'s shape, seeds
+/// 4242 and 91, `TaskYield(1, n)` over `n` in `0..16`, the newest meta
+/// faulted `Lost`, `Torn` and `Misdirected`): setup and a logged
+/// commit, a checkpoint (meta 1), bulk load A on tree 5 with its forced
+/// checkpoint (meta 2) and publication A (`RequireCkpt{2}`), then bulk
+/// load B on tree 6 with its forced checkpoint (meta 3) and publication
+/// B (`RequireCkpt{3}`). The script drives exactly three checkpoints —
+/// ids 1 (the explicit one), 2 (A's forced), 3 (B's forced) — over the
+/// initial meta 0, with the round-end harness checkpoint as meta 4.
+/// When the newest durable meta is **B's own checkpoint (kmax == 3**,
+/// measured: `n` 6 at both seeds, all three fault kinds), a fault on it
+/// reverts the slot to the meta before, the open falls back to meta 2,
+/// A's dependency is satisfied, **B's is violated, and the open must
+/// refuse on B** — a detection at `open`, no image opened
+/// (`E4_SILENT_REFUSE rule=R1 opened=2 need=3`). The check that stops
+/// at the first `RequireCkpt` op (gate mutant **OWN-FIRSTONLY**) checks
+/// A's satisfied op, stops, and serves B's tree from an image older
+/// than B's dependency — silent wrong data, an `O-3(d)` round — which
+/// the no-silent-Ok assertion forbids. Measured per `n` at this tip:
+/// `n` 1–3 (kmax 0), `n` 5 (kmax 2, refused on A) and `n` 6 (kmax 3,
+/// refused on B) refuse at `open`; `n` 4 (kmax 1) opens meta 0 and
+/// passes; `n` 0 and 7–15 (kmax 4, the harness checkpoint newest) open
+/// meta 3 and pass — 30 refusing cells of 96, `served` false on every
+/// faulted cell (recorded, never asserted).
+#[test]
+fn es1_two_publications_each_checked() {
+    let mut refusals = 0u32;
+    for seed in [4242u64, 91] {
+        for n in 0u64..16 {
+            let script = es1_script_two_pub(Some(CrashSpec::TaskYield(1, n)));
+            let base = run(seed, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+            assert!(
+                base.pass && base.opened_ckpt_id.is_some(),
+                "es1 two-pub seed {seed} n={n}: the faultless round passes with an \
+                 opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+                base.pass,
+                base.opened_ckpt_id,
+                base.o1,
+                base.o3_fail,
+                base.task_error
+            );
+            let Some((kmax, lost)) = es1p_newest_meta(&base) else {
+                continue;
+            };
+            for kind in [
+                e4_recovery::sim::MediaKind::Lost,
+                e4_recovery::sim::MediaKind::Torn {
+                    // The meta's fields and CRC all live in [0, 512);
+                    // a sector in the zero tail reverts zeros to zeros
+                    // and the meta stays valid — so fault the meta's
+                    // own sector (the torn/misdirected kinds of
+                    // es1_torn_or_misdirected_forced_header_refused).
+                    sectors: vec![lost.off],
+                },
+                e4_recovery::sim::MediaKind::Misdirected {
+                    to_off: lost.off + 100 * 4096,
+                },
+            ] {
+                let fault = e4_recovery::sim::MediaFault {
+                    kind,
+                    ..lost.clone()
+                };
+                let out = es1_fault_round(seed, &script, fault);
+                let silent_ok = out
+                    .o3_fail
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("O-3(d)"));
+                assert!(
+                    !silent_ok,
+                    "es1 two-pub seed {seed} n={n} kmax={kmax}: a faulted round must \
+                     never read O-3(d) silent Ok (OWN-FIRSTONLY stops at A's op and \
+                     serves B over an older image; o3={:?}, o1={:?}, opened={:?})",
+                    out.o3_fail, out.o1, out.opened_ckpt_id
+                );
+                if kmax == 3 {
+                    assert!(
+                        out.opened_ckpt_id.is_none() && out.detections.contains(&"open"),
+                        "es1 two-pub seed {seed} n={n}: the newest meta is publication \
+                         B's own checkpoint (kmax 3), so the open must refuse on B — a \
+                         detection at open (opened={:?}, det={:?}, pass={}, o1={:?})",
+                        out.opened_ckpt_id,
+                        out.detections,
+                        out.pass,
+                        out.o1
+                    );
+                    refusals += 1;
+                }
+                // `served` is recorded per n, never asserted (the es1
+                // family's refused_old_page shape may keep it true).
+                let _ = out.served;
+            }
+        }
+    }
+    assert!(
+        refusals > 0,
+        "the matrix must hold refusals (the newest meta = B's own checkpoint, \
+         faulted Lost/Torn/Misdirected)"
+    );
 }
 
 /// **E4-R1's healthy-store proof:** the faultless class C round at
