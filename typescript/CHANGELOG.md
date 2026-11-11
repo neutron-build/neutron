@@ -4,9 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-create 0.1.13 (not yet published).
+cms 0.1.1 (not yet published).
 
 ### Added
+
+- **Files in the CMS's Media.** `@neutron-build/cms` 0.1.1: Media takes PDF,
+  archives, audio, video, text and office files up to 100 MB, uploaded in
+  4 MB parts so the server's request limit stays as it is. "Add file" in the
+  post editor links to one. Files are served as downloads only, with byte
+  ranges for players, and a link to one renders as
+  `<a class="file" download>`.
 
 - **`blog` template in `@neutron-build/create`**
   (`npm create @neutron-build@latest my-blog -- --template blog`, also

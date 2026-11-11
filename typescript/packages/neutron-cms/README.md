@@ -84,6 +84,8 @@ Posts and Pages offer a search, by title and text, once there are more than ten,
 
 Uploaded images live in `media/` and are served at `/n-admin/media/`. **Media** in the admin shows them all, newest first, with where each is used, a filter for unused ones, upload by drop, Copy address and Delete. An image in a post, page, list or text can't be deleted; one only in the Trash, an old version or list history can, with a warning. "Add image" in the editor, and image fields, offer the newest images to reuse as well as Upload. Images that aren't uploads, such as files in your `public/` folder, aren't listed.
 
+**Files.** Media also takes PDF, ZIP, 7z, gz and tar, audio (MP3, M4A, WAV, OGG, FLAC), video (MP4, WebM, MOV), text, CSV, JSON, EPUB, Word, Excel and PowerPoint files, up to 100 MB each. They upload in small parts, so no server limit needs raising. "Add file" in the editor uploads one, or picks one already there, and links the selected words to it (or adds a link under the file's name). A file is always served as a download, never opened as a page of your site. On the site the link is `<a class="file" download>`, so your CSS can show it as a button: style `.file`.
+
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 
 ## Click to edit

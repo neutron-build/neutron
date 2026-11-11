@@ -1,13 +1,17 @@
 import { Marked, type Token, type Tokens } from "marked";
 import { photoAttributes } from "./images.js";
 import { isSafeUrl } from "./safe-url.js";
+import { fileLabel } from "./files.js";
 
 const attribute = (value: string) => value.replace(/&(?!\w+;|#\d+;)/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 
 const renderer = {
   // A link that could run code keeps its words and loses the link.
-  link(this: { parser: { parseInline(tokens: Token[]): string } }, { href, tokens }: Tokens.Link) {
-    return isSafeUrl(href) ? false : this.parser.parseInline(tokens);
+  link(this: { parser: { parseInline(tokens: Token[]): string } }, { href, title, tokens }: Tokens.Link) {
+    if (!isSafeUrl(href)) return this.parser.parseInline(tokens);
+    // A link to a file in Media says so, so a site can show it as a download button.
+    if (!fileLabel(href.split(/[?#]/)[0])) return false;
+    return `<a class="file" href="${attribute(href)}"${title ? ` title="${attribute(title)}"` : ""} download>${this.parser.parseInline(tokens)}</a>`;
   },
   image({ href, title, text }: Tokens.Image) {
     if (!isSafeUrl(href)) return attribute(text);

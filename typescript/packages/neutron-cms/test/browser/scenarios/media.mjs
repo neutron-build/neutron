@@ -1,10 +1,11 @@
-import { existsSync, utimesSync } from "node:fs";
+import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
-import { listImages, saveImage } from "../../../dist/media.js";
+import { listImages, listMedia, saveImage } from "../../../dist/media.js";
 import { createPost, dataDir, getPost, listItems, savePost, trashPost } from "../../../dist/store.js";
 import { imageFile, png } from "../fixture.mjs";
 import { pickFiles, scenario } from "../harness.mjs";
-import { markdown, newPost, VISUAL } from "./editor.mjs";
+import { caretAtEnd, markdown, newPost, selectText, VISUAL } from "./editor.mjs";
 
 const cards = (page) => page.locator(".media-grid > li");
 const card = (page, name) => page.locator(".media-grid > li", { has: page.locator(`a[href$="${name}"]`) });
@@ -33,7 +34,7 @@ scenario("media: listing, where used, upload, unused, delete rules and copy", as
   const files = [imageFile(t.fixture.files, "media-1.png"), imageFile(t.fixture.files, "media-2.png")];
   await pickFiles(page, () => page.getByRole("button", { name: "Upload" }).click(), files);
   await page.waitForURL(/added=2/);
-  await t.seeText(page.getByRole("status").first(), "2 images added.");
+  await t.seeText(page.getByRole("status").first(), "2 files added.");
   t.equal(listImages().length, total + 2, "both are stored");
   const [newest, second] = listImages();
 
@@ -135,4 +136,44 @@ scenario("media: the image chooser from the post editor and from a list field", 
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await page.waitForURL(/saved=1/);
   t.equal(listItems("team")[0].photo, chosen, "and saves it");
+});
+
+scenario("media: a file uploads in parts, links from the editor and downloads from the site", async (t) => {
+  const page = await t.page();
+  // Three parts' worth, so the pieces have to join up.
+  const bytes = randomBytes(9 * 1024 * 1024);
+  const path = join(t.fixture.files, "Game Build v2.zip");
+  writeFileSync(path, bytes);
+  await t.go(page, "/n-admin/media");
+  await pickFiles(page, () => page.getByRole("button", { name: "Upload" }).click(), [path]);
+  await page.waitForURL(/added=1/, { timeout: 30000 });
+  const file = listMedia().find((entry) => entry.file === "game-build-v2.zip");
+  t.check(Boolean(file), "the file is in Media under its own name");
+  t.equal(file.bytes, bytes.length, "every byte arrived");
+  t.check(readFileSync(join(dataDir(), "media", file.name)).equals(bytes), "and in order");
+  await t.seeText(card(page, file.name).locator(".media-name"), "game-build-v2.zip");
+  await t.fits(page, "Media with a file");
+
+  // Link the selected words to it from the editor.
+  await newPost(t, page);
+  await page.locator(VISUAL).click();
+  await page.keyboard.type("Get the build here");
+  await selectText(page, "build");
+  await page.getByRole("button", { name: "Add file" }).click();
+  const chooser = page.locator("dialog.chooser[open]");
+  await t.visible(chooser.getByRole("button", { name: "Upload" }), "Add file offers an upload");
+  await chooser.getByRole("button", { name: /game-build-v2\.zip/ }).click();
+  await t.eventually(async () => (await markdown(page)) === `Get the [build](/n-admin/media/${file.name}) here`, "the selected words link to the file");
+
+  // With nothing selected, a new upload goes in under its own name.
+  await caretAtEnd(page);
+  const notes = join(t.fixture.files, "notes.txt");
+  writeFileSync(notes, "hello");
+  await pickFiles(page, () => page.getByRole("button", { name: "Add file" }).click().then(() => page.locator("dialog.chooser[open]").getByRole("button", { name: "Upload" }).click()), [notes]);
+  await t.eventually(async () => /\[notes\.txt\]\(\/n-admin\/media\/[a-f0-9]{32}-notes\.txt\)/.test(await markdown(page)), "an uploaded file is linked by name");
+
+  // A visitor gets a download, not a page.
+  const response = await page.request.get(new URL(`/n-admin/media/${file.name}`, page.url()).href);
+  t.equal(response.status(), 200, "the file is served");
+  t.equal(response.headers()["content-disposition"], 'attachment; filename="game-build-v2.zip"', "as a download");
 });

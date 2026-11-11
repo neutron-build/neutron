@@ -390,6 +390,7 @@ export function EditorPage(props: {
         <span class="state" data-state aria-live="polite">{saved ? "Saved" : ""}</span>
         <span class="spacer" />
         <button class="button quiet wide-add" type="button" data-add-image>Add image</button>
+        <button class="button quiet wide-add" type="button" data-add-file>Add file</button>
         <button class="button quiet wide-add" type="button" data-add-embed>Embed</button>
         <button class="button quiet phone-add" type="button" data-add-menu>Add</button>
         <button class="button quiet" type="button" data-toggle-meta aria-expanded={error ? "true" : "false"} aria-controls="post-settings">Settings</button>
@@ -807,24 +808,29 @@ export function MediaPage(props: {
             <a href={`${admin}/media`} aria-current={unused ? undefined : "page"}>All ({props.total})</a>
             <a href={`${admin}/media?unused=1`} aria-current={unused ? "page" : undefined}>Unused ({props.unusedCount})</a>
           </nav>
-          <span class="muted" data-state role="status">Or drop images on this page</span>
+          <span class="muted" data-state role="status">Or drop images and files on this page</span>
           <span class="spacer" />
           {unused && props.deletable ? (
             <form method="post" action={`${admin}/media/delete-unused`}>
-              <button class="button" type="submit" data-confirm={`Delete ${props.deletable === 1 ? "1 unused image" : `${props.deletable} unused images`} for good? Images kept for undo, and any added in the last day, stay. This can't be undone.`}>
+              <button class="button" type="submit" data-confirm={`Delete ${props.deletable === 1 ? "1 unused file" : `${props.deletable} unused files`} for good? Those kept for undo, and any added in the last day, stay. This can't be undone.`}>
                 Delete all unused ({props.deletable})
               </button>
             </form>
           ) : null}
         </div>
-        {unused && props.unusedCount > props.deletable ? <p class="muted media-note">"Delete all unused" leaves images kept for undo, and any added in the last day, in case they are in work not saved yet.</p> : null}
+        {unused && props.unusedCount > props.deletable ? <p class="muted media-note">"Delete all unused" leaves anything kept for undo, and any added in the last day, in case they are in work not saved yet.</p> : null}
         {images.length === 0 ? (
-          <p class="empty-state">{unused ? "No unused images." : "No images yet. Upload some, or drop them on this page."}</p>
+          <p class="empty-state">{unused ? "Nothing unused." : "Nothing here yet. Upload images or files, or drop them on this page."}</p>
         ) : (
           <ul class="media-grid">
             {images.map((image) => (
               <li key={image.name}>
-                <a class="media-thumb" href={image.url} target="_blank" rel="noreferrer"><img src={image.thumb} alt="" loading="lazy" /></a>
+                {image.file ? (
+                  <a class="media-thumb media-file" href={image.url}><span>{image.file.slice(image.file.lastIndexOf(".") + 1)}</span></a>
+                ) : (
+                  <a class="media-thumb" href={image.url} target="_blank" rel="noreferrer"><img src={image.thumb} alt="" loading="lazy" /></a>
+                )}
+                {image.file ? <p class="media-name">{image.file}</p> : null}
                 <p class="media-size">{image.width ? `${image.width} \u00d7 ${image.height}, ` : ""}{fileSize(image.bytes)}</p>
                 <ul class="media-uses">
                   {image.places.map((place) => <li key={place.label}>{place.href ? <a href={place.href}>{place.label}</a> : place.label}</li>)}
@@ -837,8 +843,8 @@ export function MediaPage(props: {
                       <input type="hidden" name="name" value={image.name} />
                       {unused ? <input type="hidden" name="unused" value="1" /> : null}
                       <button class="link danger" type="submit" data-confirm={image.kept.length
-                        ? `Delete this image for good? It is only kept for undo in ${image.kept.join(" and ")}, so restoring that would show a broken image. This can't be undone.`
-                        : "Delete this image for good? This can't be undone."}>Delete</button>
+                        ? `Delete this ${image.file ? "file" : "image"} for good? It is only kept for undo in ${image.kept.join(" and ")}, so restoring that would show a broken ${image.file ? "link" : "image"}. This can't be undone.`
+                        : `Delete this ${image.file ? "file" : "image"} for good? This can't be undone.`}>Delete</button>
                     </form>
                   )}
                 </div>
