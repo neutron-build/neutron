@@ -296,6 +296,27 @@ pub struct HarnessState {
     /// the world crashed (the task unwinds inside the walk and never
     /// clears this).
     pub drop_walk: Option<u64>,
+    /// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment): the walk now in
+    /// flight's first crashable yield** — the scheduler's yield count
+    /// `+ 1`, read at `h:dropwalk` when the walk opens. The set runs
+    /// between two yield events, so `current + 1` is the first index a
+    /// `CrashSpec::Yield(k)` can fire on with the walk in flight (the
+    /// same convention as W11/W12's recorded indices). Cleared at
+    /// `h:dropdone`, when the range it spans is folded into
+    /// [`Self::drop_walk_yields`].
+    pub drop_walk_start: Option<u64>,
+    /// **X5-R56:** every scheduler-yield index at which a DropTree walk
+    /// was in flight during this pass — for each walk, the whole range
+    /// from its first crashable yield (`drop_walk_start`) through the
+    /// last yield that fired before `h:dropdone` closed it (the walk
+    /// holds the baton away and back across its gated steps, so yields
+    /// of other tasks inside the range also find it in flight: the flag
+    /// is world-global and only the walking task clears it). A crash at
+    /// any index in the list leaves `drop_walk` set — Q7's observable.
+    /// A diagnostic only, never a digest input and never a quota input;
+    /// the w7 pick's window list (snapshotted into
+    /// [`WorkloadObs::drop_walk_yields`]).
+    pub drop_walk_yields: Vec<u64>,
     /// Card Work 5.6's Q18 observable: a GC sweep ran with a watermark
     /// above the previous `gc_w` while a checkpoint window was open.
     pub gc_adv_in_window: bool,
@@ -751,6 +772,11 @@ pub fn commit_txn_req(
             };
             cx.with("h:dropwalk", |c| {
                 c.h().drop_walk = Some(tree);
+                // X5-R56: the walk's first crashable yield index —
+                // read before the harness borrow (the same convention
+                // as `wal_recycle:rebind`'s `current + 1`).
+                let y = c.sched_mut().yields + 1;
+                c.h().drop_walk_start = Some(y);
                 Ok(())
             })?;
         }
@@ -760,6 +786,17 @@ pub fn commit_txn_req(
         if is_drop {
             cx.with("h:dropdone", |c| {
                 c.h().drop_walk = None;
+                // X5-R56: fold the walk's whole yield range into the
+                // pass's list — every index from the first crashable
+                // one (recorded at `h:dropwalk`) through the last
+                // yield that fired before this close. An empty range
+                // (nothing fired between open and close) records
+                // nothing, because no crash address lies inside it.
+                let last = c.sched_mut().yields;
+                let start = c.h().drop_walk_start.take().filter(|s| *s <= last);
+                if let Some(s0) = start {
+                    c.h().drop_walk_yields.extend(s0..=last);
+                }
                 Ok(())
             })?;
         }
@@ -2312,6 +2349,19 @@ pub struct WorkloadObs {
     pub load_phases: Vec<(u64, LoadPhase)>,
     /// A DropTree walk was in flight (Q7).
     pub drop_walk: Option<u64>,
+    /// **X5-R56 (card X-5c-F4-F5): every scheduler-yield index at
+    /// which a DropTree walk was in flight during the pass** — for
+    /// each walk, the whole range from its first crashable yield
+    /// (`yields + 1` when `h:dropwalk` opened it) through the last
+    /// yield that fired before `h:dropdone` closed it. A crash at any
+    /// listed index leaves `drop_walk` set — Q7's observable — because
+    /// the crash's deterministic unwind means the walking task never
+    /// reaches the clear. A diagnostic only, never a digest input and
+    /// never a quota input: the w7 pick's window list, read from the
+    /// counting pass (which runs the identical script from the
+    /// identical start under the identical scheduler seed, so the
+    /// walk's yields sit at the same indices as the real round's).
+    pub drop_walk_yields: Vec<u64>,
     /// A GC sweep advanced past the previous `gc_w` inside an open
     /// checkpoint window (Q18).
     pub gc_adv_in_window: bool,
@@ -2653,6 +2703,7 @@ pub fn run_round(
             open_chunks,
             load_phases: g.h.load_phase.iter().map(|(t, p)| (*t, *p)).collect(),
             drop_walk: g.h.drop_walk,
+            drop_walk_yields: g.h.drop_walk_yields.clone(),
             gc_adv_in_window: g.h.gc_adv_in_window,
             ckpt_step: g.h.ckpt_step,
             ckpt_hooks_hit: g.h.ckpt_hooks_hit.clone(),

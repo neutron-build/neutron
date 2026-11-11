@@ -10,7 +10,7 @@
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
 use e4_recovery::campaign;
-use e4_recovery::harness::ScriptOp;
+use e4_recovery::harness::{ScriptOp, WorkloadObs};
 use e4_recovery::workload::{self, Knobs};
 
 /// Seeds 0..16 run mechanically clean: no DEADLOCK, no PANIC, no S-BATON
@@ -341,6 +341,22 @@ fn x5_r37_final_stays_in_card_ranges() {
             t.r0_fill_txns,
             t.r0_fill_ops
         );
+        // **X-5c-F4-F5 Limit 4 (X5-R56):** the drop-walk window share —
+        // 0 (off) or 50–300 permille, with the three uniform-window
+        // shares together at most 1000 (they are sequential gates over
+        // the same uniform draw, so their sum cannot exceed the whole).
+        assert!(
+            t.w7_share == 0 || (50..=300).contains(&t.w7_share),
+            "{name}: w7_share must be 0 or in 50..=300 permille (got {})",
+            t.w7_share
+        );
+        assert!(
+            t.w7_share as u64 + t.w11_share as u64 + t.w12_share as u64 <= 1000,
+            "{name}: w7_share + w11_share + w12_share must be <= 1000 (got {} + {} + {})",
+            t.w7_share,
+            t.w11_share,
+            t.w12_share
+        );
     }
     in_card_ranges(&workload::Tuning::FINAL, "Tuning::FINAL");
     in_card_ranges(&workload::Tuning::MP_PRESSURE, "Tuning::MP_PRESSURE");
@@ -422,6 +438,16 @@ fn x5_r37_mp_pressure_differs_only_in_ladder_fields() {
     same!(drop_one_in);
     same!(r41_share);
     same!(r41p_share);
+    // **X-5c-F4-F5 step 5 (X5-R56): `w7_share` is the one field this
+    // test asserts is NOT FINAL's** — MP_PRESSURE sets it to 0
+    // explicitly so ladder B's FINAL share can never reach the
+    // MP-pressure set (the card's Goal 2). **M-W7-IN-MP** (making it
+    // follow FINAL) also fails `x5_r37_final_is_the_kept_setting`'s
+    // MP literal; this is the differs-only half of the same rule.
+    assert_eq!(
+        mp.w7_share, 0,
+        "MP_PRESSURE's w7_share is 0, never FINAL's (M-W7-IN-MP reverts this)"
+    );
 }
 
 /// **X-5c-F4-F4 step 1 (folding X-5c-F4-F3-F1): FINAL is the kept
@@ -479,6 +505,7 @@ fn x5_r37_final_is_the_kept_setting() {
         r41p_share: 500,
         r0_fill_txns: 0,
         r0_fill_ops: 0,
+        w7_share: 0,
     };
     assert_eq!(
         workload::Tuning::FINAL,
@@ -501,6 +528,7 @@ fn x5_r37_final_is_the_kept_setting() {
         w12_share: 200,
         r0_fill_txns: 0,
         r0_fill_ops: 0,
+        w7_share: 0,
         committers_lo: 2,
         committers_span: 3,
         trees_lo: 2,
@@ -4465,4 +4493,171 @@ fn x5r55_fill_leaves_the_rest_of_the_script() {
             }
         }
     }
+}
+
+/// **X5-R56 (card X-5c-F4-F5 step 5): the draw-count pin.**
+/// [`workload::w7_pick`] returns `None` — the `S_W7` stream is never
+/// constructed, no stream state consumed — at share 0 (BASE, and any
+/// share-0 tuning), and at a non-zero share for every targeted round
+/// (`uniform == false`) and every non-drop round (`drop == false`),
+/// the card's Goal 2 "no such draw" rule. **M-W7-NONDROP** (the pick
+/// drawn in non-drop rounds) and **M-W7-TARGETED** (the pick applied
+/// in targeted rounds) each return `Some` from one of the `None`
+/// cases here and fail; the run-level half (a targeted seed's digest
+/// cannot move at any share, because no round of it draws) pins the
+/// call site's arguments with the same shape.
+#[test]
+fn x5r56_w7_not_drawn_at_zero() {
+    let mut t0 = workload::Tuning::FINAL;
+    t0.w7_share = 0;
+    for seed in 0..32u64 {
+        for round in 0..3u32 {
+            assert!(
+                workload::w7_pick(seed, round, &workload::Tuning::BASE, true, true).is_none(),
+                "seed {seed} round {round}: BASE (w7_share 0) must draw nothing"
+            );
+            assert!(
+                workload::w7_pick(seed, round, &t0, true, true).is_none(),
+                "seed {seed} round {round}: share 0 must draw nothing"
+            );
+        }
+    }
+    let mut t300 = workload::Tuning::FINAL;
+    t300.w7_share = 300;
+    for seed in 0..40u64 {
+        let uniform = (seed / 10) % 2 == 1;
+        let knobs = Knobs::derive(seed, 0, &workload::Tuning::FINAL);
+        assert!(
+            workload::w7_pick(seed, 0, &t300, false, knobs.drop_tree).is_none(),
+            "seed {seed}: a targeted round must draw nothing at share 300 (M-W7-TARGETED)"
+        );
+        assert!(
+            workload::w7_pick(seed, 0, &t300, uniform, false).is_none(),
+            "seed {seed}: a non-drop round must draw nothing at share 300 (M-W7-NONDROP)"
+        );
+        if uniform && knobs.drop_tree {
+            assert!(
+                workload::w7_pick(seed, 0, &t300, true, true).is_some(),
+                "seed {seed}: a uniform drop round draws at a non-zero share"
+            );
+        }
+    }
+    // The run-level half: seed 7 is targeted-mode in every round, so
+    // no share can move its script or crash point — its digest at
+    // share 300 equals its share-0 digest (which `x5f5`'s FINAL pin
+    // also holds against X-5c-F4-F4's file of record).
+    let a = workload::run_seed_with(7, None, &t300);
+    let b = workload::run_seed_with(7, None, &t0);
+    assert_eq!(
+        a.digest, b.digest,
+        "seed 7 (targeted-mode): a w7 share that no round draws on must not move the digest"
+    );
+}
+
+/// **X5-R56 (card step 5): an unselected round keeps its point.** In
+/// a uniform-mode drop round whose `S_W7` draw does not select, the
+/// armed point and its label are exactly X5-R38's
+/// `window_crash_point` — with the `S_CWIN` draw unchanged. Seed 30's
+/// round 0 is uniform-mode and a drop round, and its share-300
+/// selection draw reads `Some(false)` (the pure half); the run then
+/// holds round 0's crash point and pick label identical to the same
+/// seed at share 0, where no `S_W7` stream is ever constructed.
+/// **M-W7-SHARED-STREAM** (the selection drawn from `S_CWIN`) breaks
+/// the equality: the selection's draw would consume the `S_CWIN`
+/// stream `window_crash_point` is about to draw from, and the point
+/// lands elsewhere.
+#[test]
+fn x5r56_unselected_round_keeps_its_point() {
+    let mut t300 = workload::Tuning::FINAL;
+    t300.w7_share = 300;
+    let mut t0 = workload::Tuning::FINAL;
+    t0.w7_share = 0;
+    let knobs = Knobs::derive(30, 0, &workload::Tuning::FINAL);
+    assert!(
+        (30u64 / 10) % 2 == 1 && knobs.drop_tree,
+        "seed 30 round 0 must be a uniform-mode drop round"
+    );
+    assert_eq!(
+        workload::w7_pick(30, 0, &t300, true, true),
+        Some(false),
+        "seed 30 round 0's share-300 draw must not select (the pin's premise)"
+    );
+    let a = workload::run_seed_with(30, None, &t300);
+    let b = workload::run_seed_with(30, None, &t0);
+    let ra = a.rounds.first().expect("seed 30 runs round 0");
+    let rb = b.rounds.first().expect("seed 30 runs round 0");
+    assert_eq!(
+        ra.crash, rb.crash,
+        "an unselected round's crash point must equal X5-R38's own (M-W7-SHARED-STREAM \
+         reverts this)"
+    );
+    assert_eq!(
+        ra.cwin, rb.cwin,
+        "an unselected round's pick label must equal X5-R38's own"
+    );
+}
+
+/// **X5-R56 (card step 5): the pick lands in the walk.** The literal
+/// seed is **the lowest seed in `0..200` with `(s / 10) % 2 == 1`
+/// whose round 0 is a drop round with a non-empty `drop_walk_yields`
+/// at FINAL** (measured: seed 18 — seeds 10–16 are not round-0 drop
+/// rounds; 18's list is non-empty, which the label shows). That rule
+/// is fixed by the card, so the seed is not a luck scan. Run at the
+/// test-local tuning `Tuning { w7_share: 1000, w11_share: 0,
+/// w12_share: 0, ..Tuning::FINAL }` — share 1000 selects every
+/// uniform drop round, and the zeroed W11/W12 shares isolate the w7
+/// path from X5-R38's; outside Limit 4 on purpose and never in `src/`.
+/// Round 0's pick label is `w7` and `q7_drop_walk` is true — the
+/// crash really fell inside the DropTree walk, Q7's observable.
+/// **M-W7-W11-LIST** (the pick from `w11_yields`) lands the crash in
+/// a WAL-sync window instead, `q7_drop_walk` reads false, and this
+/// pin fails.
+#[test]
+fn x5r56_w7_pick_lands_in_the_walk() {
+    let tun = workload::Tuning {
+        w7_share: 1000,
+        w11_share: 0,
+        w12_share: 0,
+        ..workload::Tuning::FINAL
+    };
+    let rec = workload::run_seed_with(18, None, &tun);
+    assert!(rec.defect.is_none(), "seed 18: {:?}", rec.defect);
+    let r0 = rec.rounds.first().expect("seed 18 runs round 0");
+    assert_eq!(
+        r0.cwin,
+        Some("w7"),
+        "seed 18 round 0 (the lowest uniform drop seed in 0..200 with a non-empty \
+         drop_walk_yields) must pick the w7 window at share 1000"
+    );
+    assert!(
+        r0.q7_drop_walk,
+        "the picked point must fall inside the DropTree walk (M-W7-W11-LIST reverts this): \
+         crash {}",
+        r0.crash
+    );
+    assert!(r0.fired, "the round's crash must fire");
+}
+
+/// **X5-R56 (card step 5): an empty list falls back to the plain
+/// uniform point, labelled `w7-`** — the card's Goal 2 fallback. The
+/// point is exactly [`workload::uniform_yield_point`]'s (the same
+/// stream and count the plain uniform draw uses).
+#[test]
+fn x5r56_w7_empty_falls_back() {
+    let obs = WorkloadObs::default();
+    assert!(
+        obs.drop_walk_yields.is_empty(),
+        "a default obs holds no walk yields (the pin's premise)"
+    );
+    let (k, label) = workload::w7_drop_walk_point(18, 0, &obs, 500);
+    assert_eq!(
+        label,
+        Some("w7-"),
+        "an empty walk list labels the fallback w7-"
+    );
+    assert_eq!(
+        k,
+        workload::uniform_yield_point(18, 0, 500),
+        "the fallback point is the plain uniform point"
+    );
 }

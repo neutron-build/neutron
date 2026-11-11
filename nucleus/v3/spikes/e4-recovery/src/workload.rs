@@ -88,6 +88,17 @@ const S_R41PC: u64 = 17;
 /// on it and their scripts are bit-for-bit the generator's.
 /// Independent of every other tag.
 const S_R55F: u64 = 18;
+/// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment, owner decision
+/// 2026-11-10 (3)): the drop-walk window pick's stream.** Drawn only
+/// inside `w7_pick` (the selection draw) and `w7_drop_walk_point` (the
+/// index draw, from the same construction so the two draws are one
+/// sequence), and only in a uniform-mode round with a drop at
+/// `w7_share > 0` — never drawn (and never constructed) elsewhere, so
+/// BASE, FINAL at share 0, every targeted round and every non-drop
+/// round consume no stream state on it and their scripts and crash
+/// points are bit-for-bit X5-R38's. Independent of every other tag
+/// (in particular of `S_CWIN`).
+const S_W7: u64 = 19;
 /// **X5-R55:** the one constant byte of every fill value ("every value
 /// is `value_hi` bytes of one constant"). Fixed, never drawn, so the
 /// fill's only stream consumption is its `(tree, key)` draws.
@@ -247,6 +258,20 @@ pub struct Tuning {
     /// `Tuning::MP_PRESSURE` ever sets it (ladder A). Range: 0, or
     /// 300–1,500 (Limit 4).
     pub r0_fill_ops: u64,
+    /// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment, owner decision
+    /// 2026-11-10 (3)): the drop-walk window share** (permille). In a
+    /// uniform-mode round with `knobs.drop_tree` and a non-zero share,
+    /// one draw from the round's own `S_W7` stream selects the round
+    /// with this probability, and the selected round's crash point is
+    /// uniform over the counting pass's `drop_walk_yields` list (the
+    /// scheduler-yield indices at which a DropTree walk is in flight)
+    /// — the way X5-R38 moves the uniform point into the W11 and W12
+    /// windows. An empty list falls back to the plain uniform point
+    /// (label `w7-`). 0 in BASE; **0 in FINAL until ladder B sets it**;
+    /// **0 explicitly in `MP_PRESSURE`, which does not follow FINAL
+    /// here**. Range: 0 or 50–300, with
+    /// `w7_share + w11_share + w12_share` ≤ 1000 (Limit 4).
+    pub w7_share: u32,
 }
 
 impl Tuning {
@@ -289,6 +314,7 @@ impl Tuning {
         r41p_share: 0,
         r0_fill_txns: 0,
         r0_fill_ops: 0,
+        w7_share: 0,
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
@@ -346,6 +372,7 @@ impl Tuning {
         r41p_share: 500,
         r0_fill_txns: 0,
         r0_fill_ops: 0,
+        w7_share: 0,
     };
 
     /// **X5-R44 (card X-5c-F4-F2 step 2; REFRESH 9; owner decision
@@ -374,6 +401,13 @@ impl Tuning {
     /// A.1–A.4) is the only writer of them, still pinned by
     /// `x5_r37_mp_pressure_differs_only_in_ladder_fields` and
     /// `x5_r37_final_is_the_kept_setting`.
+    ///
+    /// **X-5c-F4-F5 step 5 (X5-R56): `w7_share` is also an explicit 0**
+    /// — the MP-pressure set never runs the drop-walk window, whatever
+    /// ladder B keeps in FINAL (the card's Goal 2). Pinned by
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`'s zero
+    /// assertion and by `x5_r37_final_is_the_kept_setting`
+    /// (**M-W7-IN-MP** reverts this).
     pub const MP_PRESSURE: Tuning = Tuning {
         ckpt_every_lo: 4,
         ckpt_every_span: 5,
@@ -392,6 +426,12 @@ impl Tuning {
         // and ladder A (rungs A.1–A.4) is the only writer of it.
         r0_fill_txns: 0,
         r0_fill_ops: 0,
+        // **X5-R56 (card X-5c-F4-F5 step 5): explicit 0 too — this
+        // constant does not follow FINAL here** (the card's Goal 2:
+        // "set explicitly to 0 in `MP_PRESSURE`"), so ladder B's
+        // `w7_share` in FINAL can never reach the MP-pressure set.
+        // Ladder A holds no `w7` rung, so nothing ever writes it.
+        w7_share: 0,
         ..Tuning::FINAL
     };
 }
@@ -1282,6 +1322,52 @@ pub fn window_crash_point(
     }
 }
 
+/// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment, owner decision
+/// 2026-11-10 (3)): the drop-walk window's selection.** One draw from
+/// the round's own `S_W7` stream, true with probability `w7_share`
+/// permille. Returns `None` — **no draw made, the stream never
+/// constructed** — when `w7_share == 0` (BASE, and FINAL until ladder
+/// B), when the round is targeted-mode (`uniform == false`: an `r41`
+/// round is targeted and has no drop, so the change cannot reach it),
+/// or when the round has no drop (`drop == false`: there is no walk to
+/// crash inside). The `None`/`Some` split is the draw-count contract
+/// (`x5r56_w7_not_drawn_at_zero`); an unselected round's point is
+/// exactly [`window_crash_point`]'s, its `S_CWIN` draw unchanged
+/// (`x5r56_unselected_round_keeps_its_point`).
+pub fn w7_pick(seed: u64, round: u32, tun: &Tuning, uniform: bool, drop: bool) -> Option<bool> {
+    if tun.w7_share == 0 || !uniform || !drop {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_W7));
+    Some(r.below(1000) < tun.w7_share as u64)
+}
+
+/// **X5-R56: a selected round's crash point** — uniform over the
+/// counting pass's `drop_walk_yields` list, labelled `w7`; an empty
+/// list falls back to the plain uniform point, labelled `w7-` (the
+/// card's Goal 2 fallback). The index draw comes from the **same
+/// `S_W7` construction** [`w7_pick`] drew the selection from — the
+/// stream is a pure function of `(seed, round)`, so re-deriving it
+/// replays the identical sequence; the first `below(1000)` here is
+/// that already-made selection draw (burned, its outcome known), and
+/// the `below(len)` after it is the index. Never called unless
+/// `w7_pick` returned `Some(true)`.
+pub fn w7_drop_walk_point(
+    seed: u64,
+    round: u32,
+    obs: &harness::WorkloadObs,
+    counted: u64,
+) -> (u64, Option<&'static str>) {
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_W7));
+    let _selection = r.below(1000);
+    let list = &obs.drop_walk_yields;
+    if list.is_empty() {
+        return (uniform_yield_point(seed, round, counted), Some("w7-"));
+    }
+    let k = list[r.below(list.len() as u64) as usize];
+    (k, Some("w7"))
+}
+
 /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1): the alignment selection.**
 /// One draw from the round's own `S_R41` stream, true with probability
 /// `r41_share` permille. Returns `None` — **no draw made** — when
@@ -2076,7 +2162,19 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
             // that picks a W11/W12 window yield list recorded by the
             // counting pass. BASE (shares 0) draws nothing here: the
             // plain uniform point stands and no digest moves.
-            let (k, cwin) = window_crash_point(seed, round, &out.obs, tun, out.sched_yields.max(1));
+            //
+            // **X5-R56 (card X-5c-F4-F5) sits in front of it:** in a
+            // uniform-mode drop round at `w7_share > 0`, one S_W7
+            // draw may select the round, and a selected round's point
+            // is uniform over the counting pass's `drop_walk_yields`
+            // (label `w7`; empty list → the plain uniform point,
+            // `w7-`). Every other round — share 0, targeted-mode,
+            // unselected, no drop — runs exactly X5-R38's
+            // `window_crash_point` with its S_CWIN draw unchanged.
+            let (k, cwin) = match w7_pick(seed, round, tun, uniform, knobs.drop_tree) {
+                Some(true) => w7_drop_walk_point(seed, round, &out.obs, out.sched_yields.max(1)),
+                _ => window_crash_point(seed, round, &out.obs, tun, out.sched_yields.max(1)),
+            };
             cwin_pick = cwin;
             script_twin = Script {
                 crash: Some(CrashSpec::Yield(k)),
