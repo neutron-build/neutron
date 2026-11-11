@@ -4677,3 +4677,86 @@ fn x5r56_w7_empty_falls_back() {
         "the fallback point is the plain uniform point"
     );
 }
+
+/// **X5-R56 (card X-5c-PINS-2 item 1; verdict `ec9f84a6` §6 and its
+/// Follow-ups F1): the walk window's edges hold.** At the test-local
+/// tuning `Tuning { w7_share: 1000, w11_share: 0, w12_share: 0,
+/// ..Tuning::FINAL }` (share 1000 selects every uniform drop round, the
+/// zeroed W11/W12 shares isolate the w7 path — never in `src/`), run
+/// the uniform-mode seeds of `0..400` (`(s/10) % 2 == 1`, the verdict's
+/// own scan range): every round labelled `w7` must have its crash
+/// inside the DropTree walk — `q7_drop_walk` set, the harness's real
+/// `drop_walk` flag at the crash, not the label — and fired. Measured
+/// at this tip: **78 `w7` rounds** (the verdict's scan read 78 picks)
+/// and **0 `w7-` fallback rounds**; a `w7-` round (the empty-list
+/// fallback) is asserted on only for firing, never for `q7_drop_walk`
+/// (its point is the plain uniform one). The two window-edge mutants
+/// this pin exists for: **OWN-W7-END-LATE** (the fold runs one yield
+/// past `h:dropdone`: 1 of these 78 picks then lands after the walk,
+/// the flag false — caught here) and **OWN-W7-START-EARLY** (`yields`
+/// for `yields + 1` at `h:dropwalk`: no observable effect at this tip,
+/// 0 of 78 picks move).
+#[test]
+fn x5r56_w7_window_edges_hold() {
+    let tun = workload::Tuning {
+        w7_share: 1000,
+        w11_share: 0,
+        w12_share: 0,
+        ..workload::Tuning::FINAL
+    };
+    let seeds: Vec<u64> = (0..400u64).filter(|s| (s / 10) % 2 == 1).collect();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(seeds.len());
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let stats = std::sync::Mutex::new((0u64, 0u64));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(&seed) = seeds.get(i as usize) else {
+                        return;
+                    };
+                    let rec = workload::run_seed_with(seed, None, &tun);
+                    let mut w7 = 0u64;
+                    let mut w7_empty = 0u64;
+                    for r in &rec.rounds {
+                        match r.cwin {
+                            Some("w7") => {
+                                w7 += 1;
+                                assert!(
+                                    r.q7_drop_walk,
+                                    "seed {seed}: a w7 pick must land inside the DropTree walk \
+                                 (the window's end edge — OWN-W7-END-LATE runs one yield \
+                                 past h:dropdone): crash {}",
+                                    r.crash
+                                );
+                                assert!(r.fired, "seed {seed}: a w7 round's crash must fire");
+                            }
+                            Some("w7-") => {
+                                w7_empty += 1;
+                                assert!(
+                                    r.fired,
+                                    "seed {seed}: a w7- fallback round's crash must fire"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Ok(mut g) = stats.lock() {
+                        g.0 += w7;
+                        g.1 += w7_empty;
+                    }
+                }
+            });
+        }
+    });
+    let (w7, w7_empty) = *stats.lock().unwrap();
+    assert!(
+        w7 >= 1,
+        "the scan must hold at least one w7 round (measured {w7} w7 and {w7_empty} \
+         w7- rounds at this tip; the verdict's own scan read 78 picks)"
+    );
+}
