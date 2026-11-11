@@ -4073,6 +4073,46 @@ fn x5_r44_tuning_id_is_mp_pressure_for_that_set_only() {
     // FINAL is pinned by the differs-only test.
 }
 
+/// **Card X-5c-PINS-2 item 5, second half (verdict `9f96f31e` finding 5
+/// and Follow-ups F2): the mp-pressure set runs its own tuning.**
+/// [`CampaignSet::tuning`] resolves `MpPressure` to
+/// `&workload::Tuning::MP_PRESSURE` and both other sets to
+/// `&workload::Tuning::FINAL` — pinned on the constants (`std::ptr::eq`,
+/// no behaviour to run), which discriminates only because at this Base
+/// `MP_PRESSURE != FINAL` (X-5c-F4-F3/-F4/-F5; already pinned field for
+/// field by `x5_r37_mp_pressure_differs_only_in_ladder_fields`). At
+/// X-5c-F4-F2's tip the constants were equal, so **OWN-TUNING-ARM**
+/// (`TuningId::MpPressure` resolves to `&Tuning::FINAL`) was
+/// unobservable; here it fails this pin. `cmd_run`'s `RunForm::ProbeMp`
+/// arm reads the same `Tuning::MP_PRESSURE` constant and stays pinned by
+/// reading — its route, the probe seeds of `30000..31000`, may never
+/// run here (Limit 7: no seed at or above 10000).
+#[test]
+fn x5_r44_mp_pressure_runs_its_own_tuning() {
+    assert!(
+        std::ptr::eq(
+            CampaignSet::MpPressure.tuning(),
+            &workload::Tuning::MP_PRESSURE
+        ),
+        "the mp-pressure set runs Tuning::MP_PRESSURE (OWN-TUNING-ARM reverts this)"
+    );
+    assert!(std::ptr::eq(
+        CampaignSet::Main.tuning(),
+        &workload::Tuning::FINAL
+    ));
+    assert!(std::ptr::eq(
+        CampaignSet::HeldOut.tuning(),
+        &workload::Tuning::FINAL
+    ));
+    // The precondition that makes the pin discriminate at this Base.
+    assert_ne!(
+        workload::Tuning::MP_PRESSURE,
+        workload::Tuning::FINAL,
+        "at this Base MP_PRESSURE differs from FINAL (X-5c-F4-F3/-F4/-F5); \
+         an equal reading would make the ptr::eq half vacuous"
+    );
+}
+
 /// **X5-R46 pin: `MP_REFUSAL` on a literal record set with mixed
 /// classes** — class MP only: two MP rounds, one refused, beside C and
 /// MW rounds whose `rfs` never counts. **M-REFUSAL-ALL** (every class
