@@ -467,6 +467,13 @@ body:has(.edit-frame) .top { position: static; flex: none; }
 .media-grid > li { display: grid; align-content: start; gap: 2px; min-width: 0; }
 .media-thumb { display: block; margin-bottom: var(--s2); border-radius: var(--radius-lg); }
 .media-thumb img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--surface); border-radius: var(--radius-lg); outline: 1px solid rgb(128 128 128 / .15); outline-offset: -1px; }
+.media-file { display: grid; place-items: center; aspect-ratio: 1; background: var(--surface); outline: 1px solid rgb(128 128 128 / .15); outline-offset: -1px; color: var(--muted); font-size: var(--t-sm); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; text-decoration: none; }
+.media-file:hover { color: var(--strong); }
+.media-name { font-size: var(--t-sm); overflow-wrap: anywhere; }
+.chooser-files { display: grid; gap: 2px; overflow-y: auto; min-height: 0; margin: 0; padding: 0; list-style: none; }
+.chooser-files button { display: flex; justify-content: space-between; gap: var(--s3); width: 100%; padding: var(--s2) var(--s3); background: none; border: 0; border-radius: var(--radius); color: var(--ink); font: inherit; font-size: var(--t-sm); text-align: left; overflow-wrap: anywhere; }
+.chooser-files button:hover { background: var(--surface); }
+.chooser-files small { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
 .media-size { color: var(--muted); font-size: var(--t-xs); font-variant-numeric: tabular-nums; }
 .media-uses { display: grid; margin: 0; padding: 0; list-style: none; font-size: var(--t-sm); overflow-wrap: anywhere; }
 .media-uses a { color: var(--ink); text-decoration: none; }

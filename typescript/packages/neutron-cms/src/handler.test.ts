@@ -923,7 +923,7 @@ test("Media lists every upload newest first, with its size and where it is used"
   assert.match(filtered, /Unused \(5\)/);
   assert.doesNotMatch(filtered, new RegExp(inPost));
   assert.match(filtered, /Delete all unused \(2\)/, "kept-for-undo images are left out");
-  assert.match(filtered, /Delete 2 unused images for good\?/);
+  assert.match(filtered, /Delete 2 unused files for good\?/);
 });
 
 test("the image chooser gets the newest images, and an empty library shows nothing to choose", async () => {
@@ -960,14 +960,14 @@ test("deleting an image takes its thumbnail, and an image in use is never delete
 
   const refused = await remove(used);
   assert.equal(refused.status, 409);
-  assert.match(await refused.text(), /That image is in use/);
+  assert.match(await refused.text(), /That file is in use/);
   assert.ok(exists(used) && exists(used.replace(".png", "-t.png")));
 
   const done = await remove(spare);
   assert.equal(done.status, 303);
   assert.equal(done.headers.get("location"), "/n-admin/media?deleted=1");
   assert.ok(!exists(spare) && !exists(spare.replace(".png", "-t.png")), "the thumbnail goes too");
-  assert.match(await (await call("/n-admin/media?deleted=1", { cookie })).text(), /1 image deleted\./);
+  assert.match(await (await call("/n-admin/media?deleted=1", { cookie })).text(), /1 file deleted\./);
 
   assert.equal((await remove(kept)).status, 303, "kept only for undo can go, after its warning");
   assert.ok(!exists(kept));
@@ -1385,4 +1385,85 @@ test("restoring a save writes only the fields the list declares now", async () =
   assert.equal((await call(`/n-admin/history/${id}`, { method: "POST", cookie, body: form({}) })).status, 303);
   assert.deepEqual(cms.list("links"), [{ label: "Old", url: "https://old.test" }, { label: "No url", url: "" }]);
   assert.doesNotMatch(await (await call(`/n-admin/history?s=${id}`, { cookie })).text(), />Restore<\/button>/, "restored as the list declares it, there is nothing left to restore");
+});
+
+// Files in Media
+
+const part = (cookie: string | undefined, query: Record<string, string>, bytes: Uint8Array) =>
+  call(`/n-admin/upload-file?${new URLSearchParams(query)}`, { method: "POST", cookie, body: bytes as BodyInit, headers: { "x-cms": "1" } });
+const PART_ID = "ab".repeat(16);
+
+test("a file goes up in parts, lands in Media under its own name and downloads, never opens", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  const first = new TextEncoder().encode("%PDF-1.7 first ");
+  const second = new TextEncoder().encode("second");
+  assert.deepEqual(await (await part(cookie, { id: PART_ID, at: "0", name: "My Résumé (2026).PDF" }, first)).json(), { size: first.length });
+  assert.equal((await part(cookie, { id: PART_ID, at: "3", name: "My Résumé (2026).PDF" }, second)).status, 409, "a part out of place is refused");
+  const done = await (await part(cookie, { id: PART_ID, at: String(first.length), name: "My Résumé (2026).PDF", last: "1" }, second)).json() as { url: string; label: string };
+  assert.match(done.url, /^\/n-admin\/media\/[a-f0-9]{32}-my-resume-2026\.pdf$/);
+  assert.equal(done.label, "my-resume-2026.pdf");
+  assert.deepEqual(readdirSync(join(directory, "media")), [done.url.replace("/n-admin/media/", "")], "no part is left behind");
+
+  const served = await call(done.url);
+  assert.equal(served.status, 200);
+  assert.equal(served.headers.get("content-disposition"), 'attachment; filename="my-resume-2026.pdf"');
+  assert.equal(served.headers.get("content-type"), "application/pdf");
+  assert.equal(served.headers.get("x-content-type-options"), "nosniff");
+  assert.match(served.headers.get("content-security-policy")!, /sandbox/);
+  assert.equal(await served.text(), "%PDF-1.7 first second");
+  const ranged = await call(done.url, { headers: { range: "bytes=9-13" } });
+  assert.equal(ranged.status, 206);
+  assert.equal(ranged.headers.get("content-range"), "bytes 9-13/21");
+  assert.equal(await ranged.text(), "first");
+
+  const page = await (await call("/n-admin/media", { cookie })).text();
+  assert.match(page, /class="media-thumb media-file"[^>]*><span>pdf<\/span>/);
+  assert.match(page, /my-resume-2026\.pdf/);
+  const files = await (await call("/n-admin/media?files=1", { cookie, headers: { "x-cms": "1" } })).json() as { files: { url: string; label: string; bytes: number }[] };
+  assert.deepEqual(files.files, [{ url: done.url, label: "my-resume-2026.pdf", bytes: 21 }]);
+  const images = await (await call("/n-admin/media", { cookie, headers: { "x-cms": "1" } })).json() as { images: unknown[] };
+  assert.deepEqual(images.images, [], "a file is not offered as an image");
+});
+
+test("a file in use is kept, and one not in use can be deleted", async () => {
+  freshMedia();
+  const cookie = await logIn();
+  const { url } = await (await part(cookie, { id: PART_ID, at: "0", name: "build.zip", last: "1" }, new Uint8Array([0x50, 0x4b, 3, 4]))).json() as { url: string };
+  const name = url.replace("/n-admin/media/", "");
+  const post = createPost({ title: "Game", body: `[Download](${url})` });
+  assert.match(await (await call("/n-admin/media", { cookie })).text(), /In the post Game/);
+  assert.equal((await call("/n-admin/media/delete", { method: "POST", cookie, body: form({ name }) })).status, 409);
+  db().prepare("DELETE FROM posts WHERE id = ?").run(post);
+  db().exec("DELETE FROM posts_old");
+  assert.equal((await call("/n-admin/media/delete", { method: "POST", cookie, body: form({ name }) })).status, 303);
+  assert.equal(exists(name), false);
+});
+
+test("file uploads need a login, take only listed kinds and stop at 100 MB", async () => {
+  freshMedia();
+  assert.equal((await part(undefined, { id: PART_ID, at: "0", name: "a.pdf", last: "1" }, png(1))).status, 401);
+  const cookie = await logIn();
+  for (const name of ["page.html", "pic.svg", "run.exe", "script.js", "noextension", "a.pdf.php", ""]) {
+    assert.equal((await part(cookie, { id: PART_ID, at: "0", name, last: "1" }, png(1))).status, 415, name);
+  }
+  for (const id of ["../../site", "AB".repeat(16), "ab", ""]) {
+    assert.equal((await part(cookie, { id, at: "0", name: "a.pdf", last: "1" }, png(1))).status, 409, id);
+  }
+  assert.equal((await part(cookie, { id: PART_ID, at: "0", name: "a.pdf", last: "1" }, new Uint8Array(0))).status, 400);
+  // Just under the limit already, as if earlier parts had brought it there.
+  writeFileSync(join(directory, "media", `.part-${PART_ID}`), "");
+  const { truncateSync } = await import("node:fs");
+  truncateSync(join(directory, "media", `.part-${PART_ID}`), 100 * 1024 * 1024 - 4);
+  assert.equal((await part(cookie, { id: PART_ID, at: String(100 * 1024 * 1024 - 4), name: "a.zip", last: "1" }, png(1))).status, 413);
+  assert.equal(exists(`.part-${PART_ID}`), false, "what had arrived is thrown away");
+  assert.equal((await call(`/n-admin/media/.part-${PART_ID}`)).status, 404);
+  assert.ok(existsSync(join(directory, "site.db")));
+});
+
+test("a link to a file in Media is marked as a download; other links are left alone", async () => {
+  const { renderMarkdown } = await import("./markdown.js");
+  const file = `/n-admin/media/${hex(1)}-build.zip`;
+  assert.equal(renderMarkdown(`[Get it](${file})`).trim(), `<p><a class="file" href="${file}" download>Get it</a></p>`);
+  assert.equal(renderMarkdown("[Site](https://x.test/a.zip)").trim(), '<p><a href="https://x.test/a.zip">Site</a></p>');
 });

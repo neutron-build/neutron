@@ -145,6 +145,17 @@ function start(body) {
     if (body.dataset.visual && !showVisual()) showMarkdown(UNREADABLE);
   });
 
+  body.addEventListener("cms:file-link", (event) => {
+    if (!view) return;
+    const { state } = view;
+    const mark = marks.link.create({ href: event.detail.url });
+    const tr = state.selection.empty
+      ? state.tr.replaceSelectionWith(state.schema.text(event.detail.label, [mark]), false)
+      : state.tr.addMark(state.selection.from, state.selection.to, mark);
+    view.dispatch(tr.scrollIntoView());
+    view.focus();
+  });
+
   body.addEventListener("cms:images", (event) => {
     if (view) insertImages(view, event.detail, null);
   });
@@ -223,13 +234,14 @@ function start(body) {
   // On a phone one Add button stands for both, to keep the bar on one line.
   document.querySelector("[data-add-menu]")?.addEventListener("click", async () => {
     const choice = await ask("Add", (form, done) => {
-      form.innerHTML = '<div class="ask-choices"><button class="button" type="button" value="image">Image</button><button class="button" type="button" value="embed">Embed</button></div><div class="chooser-head"><span></span><button class="link" type="button">Cancel</button></div>';
+      form.innerHTML = '<div class="ask-choices"><button class="button" type="button" value="image">Image</button><button class="button" type="button" value="file">File</button><button class="button" type="button" value="embed">Embed</button></div><div class="chooser-head"><span></span><button class="link" type="button">Cancel</button></div>';
       form.addEventListener("click", (event) => {
         const button = event.target.closest("button");
         if (!button) return;
         done(button.value || null);
         // Still inside the tap, so the file picker may open.
         if (button.value === "image") document.querySelector("[data-add-image]").click();
+        if (button.value === "file") document.querySelector("[data-add-file]").click();
       });
     });
     if (choice === "embed") addEmbed();

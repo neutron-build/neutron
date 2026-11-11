@@ -68,9 +68,41 @@ async function uploadImage(picked, again = true) {
   return response.json();
 }
 
-function pickImages(multiple = false) {
+// Other files go up in parts, so a large one needs no large request.
+
+const FILE_PART = 4 * 1024 * 1024;
+const FILE_ACCEPT = ".pdf,.zip,.7z,.gz,.tar,.mp3,.m4a,.wav,.ogg,.flac,.mp4,.webm,.mov,.txt,.csv,.json,.epub,.docx,.xlsx,.pptx";
+
+async function uploadFile(file, progress = () => {}) {
+  const id = [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  for (let at = 0; ; at += FILE_PART) {
+    const last = at + FILE_PART >= file.size;
+    const query = new URLSearchParams({ id, at: String(at), name: file.name });
+    if (last) query.set("last", "1");
+    let response;
+    // A dropped connection gets the same part again; the server only takes a part where the last one ended.
+    for (let tries = 0; ; tries += 1) {
+      try {
+        response = await cms(`upload-file?${query}`, file.slice(at, at + FILE_PART));
+        break;
+      } catch (error) {
+        if (tries === 2) throw new Error("The connection dropped. Try again.");
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+    if (response.status === 401) throw new Error("Signed out. Log in again in another tab, then retry.");
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error ?? "Upload failed");
+    progress(Math.min(1, (at + FILE_PART) / file.size));
+    if (last) return result;
+  }
+}
+
+const uploadAny = (file) => (file.type.startsWith("image/") ? uploadImage(file) : uploadFile(file));
+
+function pickImages(multiple = false, accept = "image/*") {
   return new Promise((resolve) => {
-    const input = Object.assign(document.createElement("input"), { type: "file", accept: "image/*", multiple });
+    const input = Object.assign(document.createElement("input"), { type: "file", accept, multiple });
     input.addEventListener("change", () => resolve([...input.files]));
     input.addEventListener("cancel", () => resolve([]));
     input.click();
@@ -85,6 +117,50 @@ const imageFiles = (list) => [...list].filter((file) => file.type.startsWith("im
 let recent = [];
 if ($("[data-add-image], [data-row=add-photos], [data-edit-frame], .image-field") || $$("template").some((t) => t.content.querySelector(".image-field"))) {
   fetch(`${ADMIN}/media`, { headers: { "x-cms": "1" } }).then((r) => (r.ok ? r.json() : { images: [] })).then((data) => { recent = data.images; }, () => {});
+}
+
+let recentFiles = [];
+if ($("[data-add-file]")) {
+  fetch(`${ADMIN}/media?files=1`, { headers: { "x-cms": "1" } }).then((r) => (r.ok ? r.json() : { files: [] })).then((data) => { recentFiles = data.files; }, () => {});
+}
+
+const fileSize = (bytes) => (bytes < 1_000_000 ? `${Math.max(1, Math.round(bytes / 1000))} KB` : `${(bytes / 1_000_000).toFixed(1)} MB`);
+
+/** Resolves to { file } to upload, to { url, label } for a file already here, or null. */
+function chooseFile() {
+  const pick = () => pickImages(false, FILE_ACCEPT).then((files) => (files.length ? { file: files[0] } : null));
+  if (!recentFiles.length) return pick();
+  return new Promise((resolve) => {
+    const dialog = Object.assign(document.createElement("dialog"), { className: "chooser" });
+    dialog.setAttribute("aria-label", "Add file");
+    dialog.innerHTML = `<div class="chooser-head"><button class="button primary" type="button" autofocus>Upload</button><button class="link" type="button">Cancel</button></div><p class="muted">Or link to one already here</p><ul class="chooser-files"></ul>`;
+    const [upload, cancel] = $$("button", dialog);
+    let result = null;
+    const done = (value) => {
+      result = value;
+      dialog.close();
+    };
+    for (const file of recentFiles) {
+      const button = Object.assign(document.createElement("button"), { type: "button" });
+      button.append(Object.assign(document.createElement("span"), { textContent: file.label }), Object.assign(document.createElement("small"), { textContent: fileSize(file.bytes) }));
+      button.addEventListener("click", () => done(file));
+      const item = document.createElement("li");
+      item.append(button);
+      $(".chooser-files", dialog).append(item);
+    }
+    upload.addEventListener("click", () => {
+      upload.disabled = true;
+      pick().then(done);
+    });
+    cancel.addEventListener("click", () => done(null));
+    dialog.addEventListener("click", (event) => { if (outside(dialog, event)) done(null); });
+    dialog.addEventListener("close", () => {
+      dialog.replaceWith();
+      resolve(result);
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
 }
 
 /** A click on a dialog's backdrop. Its own padding is the dialog too, so the target alone can't tell. */
@@ -487,6 +563,28 @@ function startEditor(form) {
     }
   });
 
+  // A file becomes a link to it: over the selected words, or under its own name.
+  $("[data-add-file]").addEventListener("click", async () => {
+    let choice = await chooseFile();
+    if (choice?.file) {
+      const { file } = choice;
+      uploading += 1;
+      try {
+        choice = await uploadFile(file, (done) => show(`Uploading ${file.name}, ${Math.round(done * 100)}%`));
+        recentFiles = [{ ...choice, bytes: file.size }, ...recentFiles.filter((other) => other.url !== choice.url)].slice(0, 30);
+        show("");
+      } catch (error) {
+        choice = null;
+        show(error.message, true);
+      }
+      uploading -= 1;
+    }
+    if (!choice) return;
+    if (body.dataset.visual) return body.dispatchEvent(new CustomEvent("cms:file-link", { detail: choice }));
+    const { selectionStart: start, selectionEnd: end } = body;
+    insert(`[${start === end ? choice.label : body.value.slice(start, end)}](${choice.url})`, start, end);
+  });
+
   title.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -774,7 +872,7 @@ if (media) {
     state.textContent = `Uploading, ${left} left`;
     queue = queue.then(async () => {
       try {
-        await uploadImage(file);
+        await uploadAny(file);
         added += 1;
       } catch (error) {
         failed = `${file.name}: ${error.message}`;
@@ -785,7 +883,7 @@ if (media) {
       if (!left && !failed) location.assign(`${ADMIN}/media?added=${added}`);
     });
   });
-  $("[data-media-upload]").addEventListener("click", async () => add(await pickImages(true)));
+  $("[data-media-upload]").addEventListener("click", async () => add(await pickImages(true, `image/*,${FILE_ACCEPT}`)));
   addEventListener("beforeunload", (event) => { if (left) event.preventDefault(); });
   const hasFiles = (event) => event.dataTransfer.types.includes("Files");
   addEventListener("dragover", (event) => {
@@ -798,6 +896,6 @@ if (media) {
     if (!hasFiles(event)) return;
     event.preventDefault();
     media.classList.remove("dropping");
-    add(imageFiles(event.dataTransfer.files));
+    add([...event.dataTransfer.files]);
   });
 }

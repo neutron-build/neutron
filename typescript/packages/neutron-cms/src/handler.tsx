@@ -11,7 +11,8 @@ import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { isSafeUrl } from "./safe-url.js";
-import { deleteImage, isImageName, listImages, MAX_UPLOAD_BYTES, saveImage, serveImage, type StoredImage } from "./media.js";
+import { appendPart, deleteImage, finishFile, isMediaName, listImages, listMedia, MAX_UPLOAD_BYTES, saveImage, serveMedia, type StoredImage } from "./media.js";
+import { FILE_KINDS, fileExtension, fileLabel } from "./files.js";
 import { AccountPage, Document, EditorPage, PeoplePage, Viewer, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
   allPosts, allTexts, createPost, findPosts, postCount, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
@@ -289,6 +290,22 @@ export function createHandler(config: ResolvedConfig) {
     return Response.json({ url, thumb: thumbUrl(url) });
   }
 
+  /** One part of a file that is not an image. The last part names it and puts it in Media. */
+  async function uploadFile(request: Request) {
+    const search = new URL(request.url).searchParams;
+    const original = search.get("name") ?? "";
+    const extension = fileExtension(original);
+    if (!extension) return Response.json({ error: `Media takes images and these files: ${FILE_KINDS}.` }, { status: 415 });
+    const size = appendPart(search.get("id") ?? "", Number(search.get("at")), new Uint8Array(await request.arrayBuffer()));
+    if (size === "too-large") return Response.json({ error: "That file is over 100 MB." }, { status: 413 });
+    if (size === "bad") return Response.json({ error: "The upload was interrupted. Try again." }, { status: 409 });
+    if (!search.has("last")) return Response.json({ size });
+    if (size === 0) return Response.json({ error: "That file is empty." }, { status: 400 });
+    const name = await finishFile(search.get("id")!, original, extension);
+    if (!name) return Response.json({ error: "The upload was interrupted. Try again." }, { status: 409 });
+    return Response.json({ url: `${admin}/media/${name}`, label: fileLabel(name) });
+  }
+
   /** A post's text as a whole page, for a frame in the admin. */
   function previewDocument(request: Request, rawTitle: string, markdown: string) {
     const title = escapeHtml(rawTitle);
@@ -534,7 +551,7 @@ export function createHandler(config: ResolvedConfig) {
         })),
       ];
       const kept = places.length ? [] : [...(use?.kept ?? [])].map((reason) => KEPT_WORDS[reason]);
-      return { ...image, url: mediaUrl(image.name), thumb: thumbUrl(mediaUrl(image.name)), places, kept };
+      return { ...image, url: mediaUrl(image.name), thumb: image.file ? "" : thumbUrl(mediaUrl(image.name)), places, kept };
     });
   }
 
@@ -544,13 +561,13 @@ export function createHandler(config: ResolvedConfig) {
   function mediaPage(request: Request, error?: string, status = 200) {
     const search = new URL(request.url).searchParams;
     const unused = search.has("unused");
-    const all = describeImages(listImages());
+    const all = describeImages(listMedia());
     const shown = unused ? all.filter((entry) => !entry.places.length) : all;
     const pages = Math.max(1, Math.ceil(shown.length / MEDIA_PAGE));
     const at = Math.min(pages, Math.max(1, Math.floor(Number(search.get("page")) || 1)));
     const deleted = Number(search.get("deleted")) || 0;
     const added = Number(search.get("added")) || 0;
-    const notice = deleted ? `${deleted === 1 ? "1 image" : `${deleted} images`} deleted.` : added ? `${added === 1 ? "1 image" : `${added} images`} added.` : undefined;
+    const notice = deleted ? `${deleted === 1 ? "1 file" : `${deleted} files`} deleted.` : added ? `${added === 1 ? "1 file" : `${added} files`} added.` : undefined;
     return page("Media", (
       <MediaPage
         config={config} images={shown.slice((at - 1) * MEDIA_PAGE, at * MEDIA_PAGE)} total={all.length} unusedCount={all.filter((entry) => !entry.places.length).length}
@@ -563,19 +580,23 @@ export function createHandler(config: ResolvedConfig) {
   const recentImages = () =>
     Response.json({ images: listImages().slice(0, 30).map((image) => ({ url: mediaUrl(image.name), thumb: thumbUrl(mediaUrl(image.name)) })) });
 
+  /** The newest files that are not images, for linking to one in an editor. */
+  const recentFiles = () =>
+    Response.json({ files: listMedia().filter((entry) => entry.file).slice(0, 30).map((entry) => ({ url: mediaUrl(entry.name), label: entry.file, bytes: entry.bytes })) });
+
   async function mediaDelete(request: Request) {
     const form = await request.formData();
     const name = String(form.get("name") ?? "");
     const back = form.get("unused") ? "&unused=1" : "";
-    if (!isImageName(name)) return notFound();
+    if (!isMediaName(name)) return notFound();
     // Checked again here, not trusted from the page: it may have been put to use since.
-    if (inCurrentUse(imageUses().get(name))) return mediaPage(request, "That image is in use, so it was not deleted. Take it out of the places listed first.", 409);
+    if (inCurrentUse(imageUses().get(name))) return mediaPage(request, "That file is in use, so it was not deleted. Take it out of the places listed first.", 409);
     if (!deleteImage(name)) return notFound();
     return redirect(`${admin}/media?deleted=1${back}`);
   }
 
   function mediaDeleteUnused() {
-    const going = deletableNow(describeImages(listImages()));
+    const going = deletableNow(describeImages(listMedia()));
     for (const entry of going) deleteImage(entry.name);
     return redirect(`${admin}/media?unused=1&deleted=${going.length}`);
   }
@@ -645,6 +666,7 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "edit" && second === "data" && rest.length === 0 && !post) return editData();
     if (first === "edit" && second === "save" && rest.length === 0 && post) return editSave(request);
     if (first === "upload" && !second && post) return upload(request);
+    if (first === "upload-file" && !second && post) return uploadFile(request);
     if (first === "preview" && !second && post) return preview(request);
     if (first === "pages" && config.pages && !second) return post ? redirect(`${admin}/posts/${createPost({ kind: "page" })}`) : postsPage(request, "page");
     if (first === "posts" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0) return editor(request, Number(second));
@@ -653,7 +675,7 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "trash" && (config.posts || config.pages) && second && /^\d+$/.test(second) && rest.length === 0 && post) return trashAction(request, Number(second));
     if (first === "lists" && second && rest.length === 0) return list(request, second);
     if (first === "history" && !second && !post) return history(request);
-    if (first === "media" && !second && !post) return isScript(request) ? recentImages() : mediaPage(request);
+    if (first === "media" && !second && !post) return isScript(request) ? (new URL(request.url).searchParams.has("files") ? recentFiles() : recentImages()) : mediaPage(request);
     if (first === "media" && second === "delete" && rest.length === 0 && post) return mediaDelete(request);
     if (first === "media" && second === "delete-unused" && rest.length === 0 && post) return mediaDeleteUnused();
     if (first === "history" && second && /^\d+$/.test(second) && rest.length === 0 && post) return history(request, Number(second));
@@ -668,7 +690,7 @@ export function createHandler(config: ResolvedConfig) {
     const unsafe = request.method !== "GET" && request.method !== "HEAD";
 
     // The only things a visitor may fetch.
-    if (!unsafe && segments[0] === "media" && segments.length === 2) return serveImage(segments[1]);
+    if (!unsafe && segments[0] === "media" && segments.length === 2) return serveMedia(segments[1], request);
     if (!unsafe && segments[0] === "admin.css" && segments.length === 1) return serveAsset("admin.css", request);
 
     if (unsafe && !isSameOrigin(request)) return new Response("Forbidden", { status: 403 });

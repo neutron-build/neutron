@@ -315,6 +315,7 @@ scenario("editor: phone bar fits and Add offers image and embed", async (t) => {
   await page.getByRole("button", { name: "Add", exact: true }).click();
   const menu = page.locator("dialog[open]");
   await t.visible(menu.getByRole("button", { name: "Image" }), "Add offers Image");
+  await t.visible(menu.getByRole("button", { name: "File" }), "File");
   await t.visible(menu.getByRole("button", { name: "Embed" }), "and Embed");
   await t.fits(page, "phone Add menu");
   await page.keyboard.press("Escape");

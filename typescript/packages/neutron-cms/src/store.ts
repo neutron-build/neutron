@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { FILE_NAME_IN_TEXT } from "./files.js";
 
 export type Kind = "post" | "page";
 
@@ -587,7 +588,7 @@ const IMAGE_NAME = /(?<![a-f0-9])([a-f0-9]{32}(?:-\d{1,5}x\d{1,5})?)(?:-t)?\.(jp
 export function imageUses(): Map<string, ImageUse> {
   const uses = new Map<string, ImageUse>();
   const scan = (text: string, record: (use: ImageUse) => void) => {
-    for (const match of text.matchAll(IMAGE_NAME)) {
+    for (const match of [...text.matchAll(IMAGE_NAME), ...text.matchAll(FILE_NAME_IN_TEXT)]) {
       const name = `${match[1]}.${match[2]}`;
       let use = uses.get(name);
       if (!use) uses.set(name, (use = { posts: new Map(), lists: new Set(), texts: new Set(), kept: new Set() }));
