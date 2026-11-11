@@ -3999,6 +3999,52 @@ fn x5_r45_the_recorded_set_gates_verify() {
     assert_eq!(set, None);
 }
 
+/// **Card X-5c-PINS-2 item 2 (verdict `ec9f84a6` §7, Follow-ups F2):
+/// every window label round-trips through the campaign file.** One
+/// record per label — X5-R38's `w11`, `w12`, `w11-`, `w12-` and
+/// X5-R56's `w7`, `w7-` (the `cwin_is_a_digest_input_only_when_set`
+/// manner) — emitted through [`campaign::emit_campaign_for`] and parsed
+/// back through [`campaign::parse_campaign_with_set`]: each label reads
+/// back `Some(<label>)`, and a `None` round (the writer's `"u"`) still
+/// reads back `None`. Before this card the reader mapped `"w7"` and
+/// `"w7-"` to `None`, so a parsed file silently lost X5-R56's labels —
+/// cosmetic only (display: `verify` compares digests, `q4i`, `szq`,
+/// `szi` and `rfs`, never `cwin`; the writer is label-agnostic; the
+/// Python comparator never reads it). **M-CWIN-W7-NONE** (the two `w7`
+/// arms reverted) fails this pin on both `w7` labels.
+#[test]
+fn cwin_round_trips_every_window_label() {
+    use e4_recovery::workload::{RoundRec, SeedRec};
+    let rec_of = |cwin: Option<&'static str>| SeedRec {
+        seed: 12,
+        class: "C".to_owned(),
+        knobs: 99,
+        rounds: vec![RoundRec {
+            cwin,
+            ..RoundRec::default()
+        }],
+        ..SeedRec::default()
+    };
+    for label in ["w11", "w12", "w11-", "w12-", "w7", "w7-"] {
+        let json = campaign::emit_campaign_for(&[rec_of(Some(label))], Some(&CampaignSet::Main));
+        let (_, back) = campaign::parse_campaign_with_set(&json).expect("parse");
+        assert_eq!(
+            back.first().and_then(|r| r.rounds.first()).map(|x| x.cwin),
+            Some(Some(label)),
+            "the {label} label must survive its own emit/parse round trip \
+             (M-CWIN-W7-NONE reverts the w7 arms)"
+        );
+    }
+    // A None round still reads back None.
+    let json = campaign::emit_campaign_for(&[rec_of(None)], Some(&CampaignSet::Main));
+    let (_, back) = campaign::parse_campaign_with_set(&json).expect("parse");
+    assert_eq!(
+        back.first().and_then(|r| r.rounds.first()).map(|x| x.cwin),
+        Some(None),
+        "an unset cwin (the writer's \"u\") must still parse back to None"
+    );
+}
+
 /// **X5-R44 pin: `tuning_id()` is `MpPressure` for that set only.**
 /// **M-MP-TUNING** (`mp-pressure` selects `TuningId::Final`) fails the
 /// id half. X-5c-F4-F3 step 1 makes FINAL = S1, so the `FINAL == BASE`

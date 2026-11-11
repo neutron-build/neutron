@@ -2826,12 +2826,17 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             }
             "cwin" => {
                 // X5-R38: the window pick of record ("u" = the plain
-                // uniform point / a targeted round).
+                // uniform point / a targeted round). X5-R56's `w7`/`w7-`
+                // labels read back too (card X-5c-PINS-2 item 2; verdict
+                // `ec9f84a6` §7): display-only — never a digest input,
+                // never a `verify` comparison, never a comparator input.
                 x.cwin = match j.string()?.as_str() {
                     "w11" => Some("w11"),
                     "w12" => Some("w12"),
                     "w11-" => Some("w11-"),
                     "w12-" => Some("w12-"),
+                    "w7" => Some("w7"),
+                    "w7-" => Some("w7-"),
                     _ => None,
                 };
             }
