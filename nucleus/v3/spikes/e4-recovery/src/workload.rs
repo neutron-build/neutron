@@ -80,6 +80,18 @@ const S_R41P: u64 = 16;
 /// A and without it). Drawn only inside an eligible selected round at
 /// `r41p_share > 0`.
 const S_R41PC: u64 = 17;
+/// **X5-R55 (card X-5c-F4-F5; a 5.2 amendment, owner decision
+/// 2026-11-10 (2)): the round-0 fill's content stream.** Drawn only
+/// inside `r0_fill_block`, which returns `None` — never constructing
+/// the stream — when `r0_fill_txns == 0` or `round != 0`, so BASE,
+/// FINAL and every MP round other than round 0 consume no stream state
+/// on it and their scripts are bit-for-bit the generator's.
+/// Independent of every other tag.
+const S_R55F: u64 = 18;
+/// **X5-R55:** the one constant byte of every fill value ("every value
+/// is `value_hi` bytes of one constant"). Fixed, never drawn, so the
+/// fill's only stream consumption is its `(tree, key)` draws.
+const R55_FILL_BYTE: u8 = 0x37;
 
 /// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
 /// frozen tuning.** Every generator constant the X-5c-F4 retune may
@@ -215,6 +227,26 @@ pub struct Tuning {
     /// setting of verdict `2e8d1b13` — no other value without a new
     /// ruling)**.
     pub r41p_share: u64,
+    /// **X5-R55 (card X-5c-F4-F5; a 5.2 amendment, owner decision
+    /// 2026-11-10 (2)): the round-0 fill's transaction count.** In
+    /// round 0 only, task 0 runs this many extra sync-on chunked
+    /// transactions of `r0_fill_ops` Puts each, directly after its
+    /// setup commit and before its other ops — so round 0 can dirty
+    /// enough distinct LPIDs to cut a ≥ 4·F interval before its crash
+    /// (the SZC-MP cause, verdict `2c041aae` §4: MP seeds rarely get
+    /// past round 0, and the plain round-0 workload stays well under
+    /// 4·F). 0 in BASE and FINAL; **only `Tuning::MP_PRESSURE` ever
+    /// sets it** (ladder A), so only the MP-pressure set and
+    /// `--probe mp-pressure` run a fill. Range: 0–3 (Limit 4).
+    pub r0_fill_txns: u64,
+    /// **X5-R55:** the fill's ops per transaction (each transaction
+    /// stays inside 5.2's chunked range 300–1,500, with unique
+    /// `(tree, key)` pairs, trees uniform over the round's write
+    /// range, keys uniform over the keyspace, every value `value_hi`
+    /// bytes of one constant). 0 in BASE and FINAL; only
+    /// `Tuning::MP_PRESSURE` ever sets it (ladder A). Range: 0, or
+    /// 300–1,500 (Limit 4).
+    pub r0_fill_ops: u64,
 }
 
 impl Tuning {
@@ -255,6 +287,8 @@ impl Tuning {
         w12_share: 0,
         r41_share: 0,
         r41p_share: 0,
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
@@ -310,6 +344,8 @@ impl Tuning {
         w12_share: 100,
         r41_share: 1000,
         r41p_share: 500,
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
     };
 
     /// **X5-R44 (card X-5c-F4-F2 step 2; REFRESH 9; owner decision
@@ -330,6 +366,14 @@ impl Tuning {
     /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`; the two
     /// `r41` knobs come from FINAL (S1),
     /// `x5_r37_mp_pressure_r41_equals_final`.
+    ///
+    /// **X-5c-F4-F5 step 2 (X5-R55): the fill's two knobs are also MP
+    /// ladder fields** — explicit `0`s over FINAL's own `0`s here, so
+    /// the constant does not silently follow a later FINAL that sets
+    /// them (Limit 2: a fill in FINAL is banned); ladder A (rungs
+    /// A.1–A.4) is the only writer of them, still pinned by
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields` and
+    /// `x5_r37_final_is_the_kept_setting`.
     pub const MP_PRESSURE: Tuning = Tuning {
         ckpt_every_lo: 4,
         ckpt_every_span: 5,
@@ -343,6 +387,11 @@ impl Tuning {
         burst_gc_loops: 8,
         w11_share: 200,
         w12_share: 200,
+        // **X5-R55 (card X-5c-F4-F5 step 2): explicit 0, not FINAL's
+        // to follow** — the fill knob lives in this constant alone,
+        // and ladder A (rungs A.1–A.4) is the only writer of it.
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
         ..Tuning::FINAL
     };
 }
@@ -613,6 +662,18 @@ pub fn build_round(
             sync_on: true,
             ops: setup,
         });
+    }
+    // **X5-R55 (card X-5c-F4-F5): the round-0 fill** — task 0's extra
+    // sync-on chunked transactions, directly after its setup commit
+    // and before its other ops. `None` (and no draw) everywhere the
+    // fill is off: BASE, FINAL, every round other than round 0, and
+    // every MP_PRESSURE round before ladder A sets the knobs — so
+    // every such script is bit-for-bit the pre-X5-R55 generator's.
+    // Round 0 always has a setup commit (it starts from an empty
+    // model, so `setup` always holds the trees' `CreateTree`s), which
+    // is what "directly after its setup commit" names.
+    if let Some(fill) = r0_fill_block(seed, round, tun, knobs, write_max) {
+        committers[0].extend(fill);
     }
     // The chunked transaction (5.2): one large chunked txn per round, on
     // a seeded committer, spanning ≥ 2 segments by value sizing.
@@ -1259,6 +1320,70 @@ pub fn r41p_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
     }
     let mut r = Rng::new(derive(seed * 100 + round as u64, S_R41P));
     Some(r.below(1000) < tun.r41p_share)
+}
+
+/// **X5-R55 (card X-5c-F4-F5; a 5.2 amendment, owner decision
+/// 2026-11-10 (2)): the round-0 fill.** `r0_fill_txns` sync-on
+/// chunked transactions of `r0_fill_ops` Puts each, for task 0,
+/// directly after its setup commit and before its other ops — round 0
+/// starts from empty trees, and its whole plain workload (chunked
+/// 900–1,200 ops plus 20–31 small commits under `MP_PRESSURE`) dirties
+/// well under 4·F distinct LPIDs (verdict `2c041aae` §4), so the fill
+/// is what puts the ≥ 4·F condition into round 0, before the crash.
+///
+/// Each transaction: unique `(tree, key)` pairs (one op per entry key
+/// per transaction, I-ENTRY-UNIQUE's shape, like every other
+/// transaction the generator builds); trees uniform over the round's
+/// write range `2..=write_max` (`2 + below(write_max - 1)`); keys
+/// uniform over `0..keyspace`; every value `tun.value_hi` bytes of
+/// the one constant [`R55_FILL_BYTE`]. Each transaction stays inside
+/// 5.2's chunked range (300–1,500 ops) and the 8–400 B values; the
+/// amendment is only that round 0 may hold more than one chunked
+/// transaction.
+///
+/// Returns `None` — **no draw made, the stream never constructed** —
+/// when `r0_fill_txns == 0` or `round != 0` (the card's draw-count
+/// contract, `x5r55_fill_not_drawn_at_zero`): BASE, FINAL and every
+/// round other than round 0 consume no stream state on `S_R55F` and
+/// their scripts are bit-for-bit the pre-X5-R55 generator's. All
+/// content draws come from `S_R55F` alone, so no other stream's order
+/// moves (`x5r55_fill_leaves_the_rest_of_the_script`). Pure in
+/// `(seed, round, tun, knobs, write_max)` (W-DET).
+pub fn r0_fill_block(
+    seed: u64,
+    round: u32,
+    tun: &Tuning,
+    knobs: &Knobs,
+    write_max: u64,
+) -> Option<Vec<ScriptOp>> {
+    if tun.r0_fill_txns == 0 || round != 0 {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_R55F));
+    let n = tun.r0_fill_ops as usize;
+    let v = vec![R55_FILL_BYTE; tun.value_hi as usize];
+    let mut ops = Vec::new();
+    for _ in 0..tun.r0_fill_txns {
+        let mut seen: BTreeSet<(u64, Vec<u8>)> = BTreeSet::new();
+        let mut puts: Vec<Op> = Vec::new();
+        while puts.len() < n {
+            let tree = 2 + r.below(write_max - 1);
+            let key = to_be64(r.below(knobs.keyspace));
+            if !seen.insert((tree, key.clone())) {
+                continue;
+            }
+            puts.push(Op::Put {
+                tree,
+                key,
+                value: v.clone(),
+            });
+        }
+        ops.push(ScriptOp::Chunked {
+            sync_on: true,
+            ops: puts,
+        });
+    }
+    Some(ops)
 }
 
 /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): `q4i_raw`** — did the

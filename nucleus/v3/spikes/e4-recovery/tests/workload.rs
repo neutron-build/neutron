@@ -321,6 +321,26 @@ fn x5_r37_final_stays_in_card_ranges() {
                 "{name}: {name_of} must be 0 or in 50..=200 permille (got {share})"
             );
         }
+        // **X-5c-F4-F5 Limit 4 (X5-R55):** the round-0 fill's knobs —
+        // at most 3 transactions, each 0 (off) or 300–1,500 ops (5.2's
+        // chunked range). 0 in BASE and FINAL, so the fill never runs
+        // outside `Tuning::MP_PRESSURE`'s ladder A.
+        assert!(
+            t.r0_fill_txns <= 3,
+            "{name}: r0_fill_txns must be <= 3 (got {})",
+            t.r0_fill_txns
+        );
+        assert!(
+            t.r0_fill_ops == 0 || (300..=1500).contains(&t.r0_fill_ops),
+            "{name}: r0_fill_ops must be 0 or in 300..=1500 (got {})",
+            t.r0_fill_ops
+        );
+        assert!(
+            t.r0_fill_txns == 0 || t.r0_fill_ops >= 300,
+            "{name}: a fill with {} transactions needs its ops set (got {})",
+            t.r0_fill_txns,
+            t.r0_fill_ops
+        );
     }
     in_card_ranges(&workload::Tuning::FINAL, "Tuning::FINAL");
     in_card_ranges(&workload::Tuning::MP_PRESSURE, "Tuning::MP_PRESSURE");
@@ -357,6 +377,12 @@ fn x5_r37_mp_pressure_r41_equals_final() {
 /// and fails here. The two `r41` fields are also pinned by
 /// `x5_r37_mp_pressure_r41_equals_final`; they appear here again so
 /// this one test carries the whole non-ladder field list.
+/// **X-5c-F4-F5 step 2 (X5-R55): `r0_fill_txns` and `r0_fill_ops` are
+/// MP ladder fields too** (ladder A's), written explicitly over
+/// FINAL's own `0`s so a later FINAL cannot leak a fill into the main
+/// set — they are outside the `same!` list by design, and their zeros
+/// are pinned by `x5_r37_final_is_the_kept_setting`
+/// (**M-FILL-IN-FINAL** and **M-MP-FILL-OFF** both fail there).
 #[test]
 fn x5_r37_mp_pressure_differs_only_in_ladder_fields() {
     let mp = &workload::Tuning::MP_PRESSURE;
@@ -451,6 +477,8 @@ fn x5_r37_final_is_the_kept_setting() {
         w12_share: 100,
         r41_share: 1000,
         r41p_share: 500,
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
     };
     assert_eq!(
         workload::Tuning::FINAL,
@@ -471,6 +499,8 @@ fn x5_r37_final_is_the_kept_setting() {
         burst_gc_loops: 8,
         w11_share: 200,
         w12_share: 200,
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
         committers_lo: 2,
         committers_span: 3,
         trees_lo: 2,
@@ -4195,5 +4225,244 @@ fn x5f5_final_digests_unmoved() {
             "seed {seed}: X5-R55 (fill 0 in FINAL) and X5-R56 (every pinned seed is \
              targeted-mode) must not move FINAL's digest"
         );
+    }
+}
+
+/// The write range of a round's knobs — `build_round`'s own rule
+/// (`2..=write_max`): a drop round retires the highest tree, so the
+/// writers stop one short of it.
+fn write_max_of(knobs: &Knobs) -> u64 {
+    if knobs.drop_tree {
+        knobs.trees
+    } else {
+        knobs.trees + 1
+    }
+}
+
+/// **X5-R55 (card X-5c-F4-F5 step 2): the draw-count pin.**
+/// [`workload::r0_fill_block`] returns `None` — the `S_R55F` stream is
+/// never constructed, no stream state consumed (the card's Goal 1
+/// "Draws" rule) — for every round under `Tuning::BASE` and
+/// `Tuning::FINAL` (`r0_fill_txns` 0 in both), and for every round
+/// other than round 0 even at a fill tuning. The FINAL-digest half of
+/// the pin is `x5f5_final_digests_unmoved` (a fill drawn in FINAL
+/// would move one: **M-FILL-IN-FINAL**; **M-FILL-EVERY-ROUND**, the
+/// `round == 0` condition dropped, reverts the round-1 half here).
+#[test]
+fn x5r55_fill_not_drawn_at_zero() {
+    for seed in [7u64, 17, 1069] {
+        let knobs = Knobs::derive(seed, 0, &workload::Tuning::MP_PRESSURE);
+        let write_max = write_max_of(&knobs);
+        for round in 0..3u32 {
+            let rk = Knobs::derive(seed, round, &workload::Tuning::MP_PRESSURE);
+            assert!(
+                workload::r0_fill_block(seed, round, &workload::Tuning::BASE, &rk, write_max)
+                    .is_none(),
+                "seed {seed} round {round}: BASE (r0_fill_txns 0) must draw nothing"
+            );
+            assert!(
+                workload::r0_fill_block(seed, round, &workload::Tuning::FINAL, &rk, write_max)
+                    .is_none(),
+                "seed {seed} round {round}: FINAL (r0_fill_txns 0) must draw nothing"
+            );
+        }
+    }
+    // A fill tuning draws in round 0 — exactly `r0_fill_txns` chunked
+    // transactions — and nothing in any later round.
+    let mut tun = workload::Tuning::MP_PRESSURE;
+    tun.r0_fill_txns = 2;
+    tun.r0_fill_ops = 1000;
+    let knobs = Knobs::derive(7, 0, &tun);
+    let write_max = write_max_of(&knobs);
+    let fill = workload::r0_fill_block(7, 0, &tun, &knobs, write_max);
+    assert_eq!(
+        fill.as_ref().map_or(0, Vec::len),
+        2,
+        "a fill tuning draws one chunked transaction per r0_fill_txns"
+    );
+    assert!(
+        fill.is_some_and(|ops| ops.iter().all(|o| matches!(o, ScriptOp::Chunked { .. }))),
+        "every fill op is a chunked transaction"
+    );
+    let knobs1 = Knobs::derive(7, 1, &tun);
+    assert!(
+        workload::r0_fill_block(7, 1, &tun, &knobs1, write_max).is_none(),
+        "round 1 must draw nothing even at a fill tuning (M-FILL-EVERY-ROUND reverts this)"
+    );
+}
+
+/// **X5-R55 (card step 2): the fill's shape, on the card's literal
+/// seed.** At `Tuning { r0_fill_txns: 2, r0_fill_ops: 1000,
+/// ..Tuning::MP_PRESSURE }`, seed **7 round 0** has exactly two
+/// `Chunked` ops on task 0, right after its setup commit (the main
+/// chunked transaction of that round landed on another task — its
+/// task choice is drawn before the fill and from `S_GEN`, which the
+/// fill never touches). Each fill transaction has 1,000 Puts, sync-on,
+/// unique `(tree, key)` pairs, trees in the write range
+/// `2..=write_max`, keys under the keyspace, and values of `value_hi`
+/// bytes of the one constant byte `0x37`. **M-FILL-DUP-KEY** (a
+/// transaction may repeat a `(tree, key)`) fails the uniqueness count,
+/// and **M-FILL-LATE** (the fill appended at the end of task 0) fails
+/// the position: op 1 after the setup commit must already be the
+/// first fill transaction.
+#[test]
+fn x5r55_fill_shape() {
+    use e4_recovery::model::Op;
+    let mut tun = workload::Tuning::MP_PRESSURE;
+    tun.r0_fill_txns = 2;
+    tun.r0_fill_ops = 1000;
+    let knobs = Knobs::derive(7, 0, &tun);
+    let write_max = write_max_of(&knobs);
+    let (script, _desc, _hook) =
+        workload::build_round(7, 0, &tun, &knobs, &e4_recovery::model::Model::new(), 0);
+    let t0 = &script.tasks[0].ops;
+    // Round 0 always opens with its setup commit (an empty model):
+    // the fill sits directly after it.
+    assert!(
+        matches!(t0.first(), Some(ScriptOp::Commit { sync_on: true, .. })),
+        "round 0's task 0 must open with its setup commit"
+    );
+    let chunked: Vec<usize> = t0
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| matches!(o, ScriptOp::Chunked { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        chunked,
+        vec![1, 2],
+        "seed 7 round 0: exactly two Chunked ops on task 0, directly after the setup \
+         commit (M-FILL-LATE, appended at the end, reverts this)"
+    );
+    for i in chunked {
+        let ScriptOp::Chunked { sync_on, ops } = &t0[i] else {
+            unreachable!("the indices above are Chunked ops");
+        };
+        assert!(*sync_on, "fill transaction {i} must be sync-on");
+        assert_eq!(
+            ops.len(),
+            1000,
+            "fill transaction {i} must hold r0_fill_ops Puts"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut n_puts = 0usize;
+        for op in ops {
+            let Op::Put { tree, key, value } = op else {
+                continue;
+            };
+            n_puts += 1;
+            assert!(
+                (2..=write_max).contains(tree),
+                "fill op's tree {tree} outside the write range 2..={write_max}"
+            );
+            assert_eq!(key.len(), 8, "a fill key is a keyspace draw's be64 image");
+            let k = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+            assert!(k < knobs.keyspace, "fill key {k} not under the keyspace");
+            assert!(
+                value.len() == tun.value_hi as usize,
+                "fill value must be value_hi ({} B, got {})",
+                tun.value_hi,
+                value.len()
+            );
+            assert!(
+                value.iter().all(|b| *b == 0x37),
+                "fill values are value_hi bytes of the one constant 0x37"
+            );
+            assert!(
+                seen.insert((*tree, key.clone())),
+                "fill transaction {i} repeated a (tree, key) pair (M-FILL-DUP-KEY)"
+            );
+        }
+        assert_eq!(n_puts, 1000, "every fill op is a Put");
+        assert_eq!(
+            seen.len(),
+            1000,
+            "all (tree, key) pairs of transaction {i} unique"
+        );
+    }
+}
+
+/// **X5-R55 (card step 2): the fill leaves the rest of the script
+/// bit-for-bit.** For seeds 7, 8 and 17, round 0's tasks at a fill
+/// tuning — with the fill ops removed — equal the tasks at the same
+/// tuning with `r0_fill_txns` 0: the fill's draws all come from
+/// `S_R55F` alone, so no other stream's order moves (`S_GEN` above
+/// all: the chunked task choice, the ops, the small commits and the
+/// DDL block are identical). **M-FILL-MAIN-STREAM** (fill content
+/// drawn from the round's `S_GEN` stream) breaks the equality twice —
+/// the fill ops themselves differ, and the `S_GEN` draws after the
+/// fill insertion point shift.
+#[test]
+fn x5r55_fill_leaves_the_rest_of_the_script() {
+    let mut tun_fill = workload::Tuning::MP_PRESSURE;
+    tun_fill.r0_fill_txns = 2;
+    tun_fill.r0_fill_ops = 1000;
+    let tun_zero = workload::Tuning {
+        r0_fill_txns: 0,
+        ..tun_fill
+    };
+    for seed in [7u64, 8, 17] {
+        let knobs = Knobs::derive(seed, 0, &tun_fill);
+        let write_max = write_max_of(&knobs);
+        let fill = workload::r0_fill_block(seed, 0, &tun_fill, &knobs, write_max)
+            .expect("a fill tuning draws in round 0");
+        let with = workload::build_round(
+            seed,
+            0,
+            &tun_fill,
+            &knobs,
+            &e4_recovery::model::Model::new(),
+            0,
+        )
+        .0;
+        let without = workload::build_round(
+            seed,
+            0,
+            &tun_zero,
+            &Knobs::derive(seed, 0, &tun_zero),
+            &e4_recovery::model::Model::new(),
+            0,
+        )
+        .0;
+        assert_eq!(
+            with.tasks.len(),
+            without.tasks.len(),
+            "seed {seed}: task count"
+        );
+        for (ti, (a, b)) in with.tasks.iter().zip(without.tasks.iter()).enumerate() {
+            let a_ops: Vec<String> = a.ops.iter().map(|o| format!("{o:?}")).collect();
+            let b_ops: Vec<String> = b.ops.iter().map(|o| format!("{o:?}")).collect();
+            if ti == 0 {
+                // Task 0: [setup commit, fill.., rest..] vs [setup
+                // commit, rest..] — the prefix is the setup commit,
+                // the fill ops are exactly `r0_fill_block`'s, and the
+                // tail is bit-for-bit the no-fill task's tail.
+                let n = fill.len();
+                assert_eq!(a_ops[0], b_ops[0], "seed {seed}: the setup commit");
+                for (k, f) in fill.iter().enumerate() {
+                    assert_eq!(
+                        a_ops[1 + k],
+                        format!("{f:?}"),
+                        "seed {seed}: task 0 op {} must be fill op {k}",
+                        1 + k
+                    );
+                }
+                assert!(
+                    n < a_ops.len(),
+                    "seed {seed}: task 0 must hold more than the fill"
+                );
+                assert_eq!(
+                    &a_ops[1 + n..],
+                    &b_ops[1..],
+                    "seed {seed}: the rest of task 0 must be bit-for-bit the no-fill \
+                     script's (M-FILL-MAIN-STREAM reverts this)"
+                );
+            } else {
+                assert_eq!(
+                    a_ops, b_ops,
+                    "seed {seed}: task {ti} must be bit-for-bit the no-fill script's"
+                );
+            }
+        }
     }
 }
