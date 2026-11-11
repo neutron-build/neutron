@@ -229,6 +229,20 @@ export function cleanTags(typed: string): string {
 export const tagsOf = (post: Pick<Post, "tags">): Tag[] =>
   post.tags ? post.tags.split(", ").map((name) => ({ name, slug: slugify(name) })) : [];
 
+/** Every tag on any post, draft or not, most used first: what the editor offers to pick from. */
+export function knownTags(): string[] {
+  const tags = new Map<string, { name: string; count: number }>();
+  const rows = db().prepare("SELECT tags FROM posts WHERE kind = 'post' AND tags <> '' ORDER BY updated_at DESC").all() as unknown as Pick<Post, "tags">[];
+  for (const row of rows) {
+    for (const tag of tagsOf(row)) {
+      const known = tags.get(tag.slug);
+      if (known) known.count += 1;
+      else tags.set(tag.slug, { name: tag.name, count: 1 });
+    }
+  }
+  return [...tags.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).map((tag) => tag.name);
+}
+
 /** Every tag on a published post, most used first, under the spelling used most recently. */
 export function liveTags(): (Tag & { count: number })[] {
   const tags = new Map<string, Tag & { count: number }>();

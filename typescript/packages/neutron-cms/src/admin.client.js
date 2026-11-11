@@ -606,6 +606,98 @@ function startEditor(form) {
     }
   });
 
+  // Tags: the ones on this post as chips, the others in use one click away, a new one typed.
+  const tagField = $("[name=tags]", form);
+  if (tagField) {
+    const slug = (name) => name.normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    const known = JSON.parse(tagField.dataset.tags || "[]");
+    let chosen = tagField.value.split(",").map((name) => name.trim()).filter(Boolean);
+    const box = Object.assign(document.createElement("div"), { className: "tag-box" });
+    const entry = Object.assign(document.createElement("input"), { className: "tag-entry", type: "text", autocapitalize: "off", enterKeyHint: "done" });
+    entry.setAttribute("aria-label", "Add a tag");
+    const more = Object.assign(document.createElement("div"), { className: "tag-more" });
+    more.setAttribute("aria-label", "Tags in use");
+    more.setAttribute("role", "group");
+    box.append(entry);
+    tagField.hidden = true;
+    tagField.after(box, more);
+    const has = (name) => chosen.some((one) => slug(one) === slug(name));
+
+    function draw() {
+      for (const chip of $$(".tag", box)) chip.remove();
+      for (const name of chosen) {
+        const remove = Object.assign(document.createElement("button"), { type: "button", textContent: "\u00d7" });
+        remove.setAttribute("aria-label", `Remove ${name}`);
+        remove.addEventListener("click", (event) => {
+          // The button is gone by the time the click reaches the page, which would take it for a click outside the settings.
+          event.stopPropagation();
+          set(chosen.filter((one) => one !== name));
+          entry.focus();
+        });
+        const chip = Object.assign(document.createElement("span"), { className: "tag", textContent: name });
+        chip.append(remove);
+        entry.before(chip);
+      }
+      entry.placeholder = chosen.length ? "" : "Add a tag";
+      // What is typed narrows the ones offered.
+      const typed = entry.value.trim().toLowerCase();
+      more.textContent = "";
+      for (const name of known.filter((one) => !has(one) && one.toLowerCase().includes(typed)).slice(0, 12)) {
+        const pick = Object.assign(document.createElement("button"), { type: "button", className: "tag-pick", textContent: name });
+        pick.setAttribute("aria-label", `Add ${name}`);
+        pick.addEventListener("click", (event) => {
+          event.stopPropagation();
+          entry.value = "";
+          set([...chosen, name]);
+          entry.focus();
+        });
+        more.append(pick);
+      }
+      more.hidden = !more.childElementCount;
+    }
+
+    function set(next) {
+      chosen = next;
+      tagField.value = chosen.join(", ");
+      draw();
+      changed();
+    }
+
+    function addTyped() {
+      const next = [...chosen];
+      for (const part of entry.value.split(",")) {
+        const name = part.replace(/\s+/g, " ").trim().slice(0, 40).trim();
+        if (!slug(name) || next.some((one) => slug(one) === slug(name)) || next.length === 20) continue;
+        // One already in use keeps the spelling it has.
+        next.push(known.find((one) => slug(one) === slug(name)) ?? name);
+      }
+      entry.value = "";
+      if (next.length !== chosen.length) set(next);
+      else draw();
+    }
+
+    entry.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === ",") {
+        event.preventDefault();
+        addTyped();
+      } else if (event.key === "Backspace" && !entry.value && chosen.length) {
+        set(chosen.slice(0, -1));
+      }
+    });
+    // The form's own listener must not take typing here for a change to the post.
+    entry.addEventListener("input", (event) => {
+      event.stopPropagation();
+      if (entry.value.includes(",")) addTyped();
+      else draw();
+    });
+    // Typed and then straight to Publish: the tag is kept.
+    entry.addEventListener("blur", () => { if (entry.value.trim()) addTyped(); });
+    // A click on one offered must not blur the box first and add the half-typed word.
+    more.addEventListener("mousedown", (event) => event.preventDefault());
+    box.addEventListener("click", (event) => { if (event.target === box) entry.focus(); });
+    draw();
+  }
+
   // A file becomes a link to it: over the selected words, or under its own name.
   $("[data-add-file]").addEventListener("click", async () => {
     let choice = null;

@@ -379,6 +379,8 @@ export function EditorPage(props: {
   revision?: string;
   /** How many earlier versions there are to go back to. */
   versions?: number;
+  /** Every tag in use, to pick from. */
+  tags?: string[];
 }) {
   const { config, post, status, saved, error } = props;
   const values = { ...post, ...props.fields };
@@ -449,11 +451,11 @@ export function EditorPage(props: {
             <input class="input" name="label" value={values.label} placeholder="Defaults to the title" />
           </label>
           {post.kind === "post" ? (
-            <label class="field">
+            <div class="field" role="group" aria-label="Tags">
               <span>Tags</span>
-              <input class="input" name="tags" value={values.tags} placeholder="Games, Music" autocapitalize="off" />
-              <small>Separate with commas.</small>
-            </label>
+              {/* The script turns this into tags to click; without it, names are typed with commas between them. */}
+              <input class="input" name="tags" value={values.tags} placeholder="Games, Music" autocapitalize="off" aria-label="Tags, separated by commas" data-tags={JSON.stringify(props.tags ?? [])} />
+            </div>
           ) : null}
           <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>
           <footer>
