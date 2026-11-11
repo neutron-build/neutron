@@ -11563,3 +11563,17 @@ before the first of them). Every number is a **probe, not evidence**:
   first rung reached the margin). The fill knobs stay 0 in every
   tuning. Probe, not evidence.
 
+- **Ladder A outcome: stop-and-keep at A.0 (the anchor).** The anchor
+  reaches the margin on its own (SZC-MP raw 19 ≥ 13), the hold set is
+  empty and the wall passes, so per the stop rule the walk ends at the
+  first rung: rungs A.1–A.4 never run, `MP_PRESSURE` keeps exactly
+  X-5c-F4-F4's fields (the 9.1 fields over FINAL 7.3) with both fill
+  knobs 0, and FINAL is X-5c-F4-F4's, field for field — the state
+  this commit's tree already holds (the A-end constants are the
+  anchor's own: no rung changed a constant). No X5-R56 code exists at
+  this commit; the Acceptance builds the main 10k from it and requires
+  `DIGESTS_MOVED 0` against X-5c-F4-F4's file of record. The row
+  returns to the owner with the anchor's table: SZC-MP 190 per 2,000
+  (raw 19 on the 200-seed probe) against required 100, margin 125.
+  Probe, not evidence.
+
