@@ -42,7 +42,7 @@ The worker again ran banned work inside its attempts. Nothing from it was commit
 
 ### 1. Scope: exactly the four constants
 
-- `card/v3-X-5c-F4-F3..HEAD` changes exactly the five Touch-only files: `src/workload.rs` +22/−9, `tests/workload.rs`, `tools/x5_cpu_term.sh`, `tools/x5_guard.sh` and `README.md`.
+- `card/v3-X-5c-F4-F3..HEAD` changes exactly the five Touch-only files: `src/workload.rs` +20/−11, `tests/workload.rs`, `tools/x5_cpu_term.sh`, `tools/x5_guard.sh` and `README.md`.
 - The `src/` diff is `ckpt_every_lo` 4→8, `chunked_ops_lo` 320→700, `chunked_ops_span` 381→201 and `value_lo` 8→280, plus FINAL's doc comment. No other line changed. `BASE` and `MP_PRESSURE`'s explicit fields are untouched.
 - `git diff db572b5f HEAD -- src/` over the `pub const FINAL` block differs in doc lines only. FINAL equals rung 7.3 field for field. The rest of the diff is MP_PRESSURE's 9.1 fields, which come from the Base and not from this card.
 - The test diff adds three tests and changes no existing one. `x5_r37_final_r41_is_s1`, `x5_r37_final_stays_in_card_ranges`, `x5_r37_mp_pressure_r41_equals_final` and `x5_r37_mp_pressure_differs_only_in_ladder_fields` are unchanged and pass.
