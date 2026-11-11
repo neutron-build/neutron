@@ -20,7 +20,7 @@ create-neutron my-app --template basic --runtime preact
 ## Options
 
 - `--template basic`: Starter app template.
-- `--template basic|marketing|app|full`: Starter shape.
+- `--template basic|marketing|app|full|docs|blog`: Starter shape.
 - `--runtime preact|react-compat`: Runtime mode written into `neutron.config.ts`.
 
 ## Generated Project
@@ -31,6 +31,8 @@ Templates:
 - `marketing`: static-first site with optional islands and static blog routes.
 - `app`: SaaS-style app routes (`loader`/`action`/auth-ready examples).
 - `full`: mixed static + app + islands + route groups example.
+- `docs`: documentation site with content collections, sidebar and search.
+- `blog`: server-rendered blog with `@neutron-build/cms` at `/n-admin`.
 
 Every template includes:
 

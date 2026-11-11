@@ -467,6 +467,24 @@ export default function HomePage() {
                   </p>
                 </div>
               </a>
+              <a
+                href="/docs/content/cms"
+                class="products__card products__card--cms"
+                data-animate
+                style="--animate-delay: 0.58s"
+              >
+                <div class="products__inner">
+                  <div class="products__header">
+                    <span class="products__name">CMS</span>
+                    <span class="products__badge products__badge--available">
+                      Available
+                    </span>
+                  </div>
+                  <p class="products__desc">
+                    Posts, pages and lists, edited at /n-admin. One SQLite file.
+                  </p>
+                </div>
+              </a>
               <div
                 class="products__card products__card--platform"
                 data-animate

@@ -10,11 +10,21 @@ It is built for sites where a developer owns the layout and someone else owns th
 Requirements:
 
 - Node 22.16 or newer.
-- Run the site with `neutron-ts start`. The `docker` preset drops the route type the admin uses (as of Neutron 0.5.3).
+- Run the site with `neutron-ts start`. The `docker` preset drops the route type the admin uses (as of Neutron 0.5.4).
+
+## Start a new site
+
+The `blog` template is a small blog with the CMS already set up: a post list, post pages, the admin at `/n-admin` and a health route.
+
+```bash
+npm create @neutron-build@latest my-blog -- --template blog
+```
+
+Its README covers the password, where the data lives and how to deploy it. To add the CMS to an existing site, follow the steps below.
 
 ## Set up
 
-Install the package (0.1.0 is not on npm yet; this is the command once it is published) and generate the owner's password:
+Install the package and generate the owner's password:
 
 ```bash
 npm install @neutron-build/cms
