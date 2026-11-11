@@ -4,11 +4,12 @@ import { stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { Readable } from "node:stream";
 import { join } from "node:path";
-import { dataDir } from "./store.js";
+import { dataDir, mediaTitle, setMediaTitle } from "./store.js";
 import { imageSize, THUMB_WIDTH } from "./images.js";
 import { FILE_TYPES, MAX_FILE_BYTES, fileLabel, fileSlug, isFileName, type FileExtension } from "./files.js";
 
-export const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
+// One request, and the server takes none over 10 MB: this leaves room for the form around the image.
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 - 64 * 1024;
 
 const TYPES = {
   jpg: "image/jpeg",
@@ -79,6 +80,12 @@ export function saveImage(bytes: Uint8Array, resized?: Resized): string | null {
   return `${stem}.${extension}`;
 }
 
+/** What a file downloads as: the name it was given in Media, or the one it was uploaded under. */
+export function downloadName(name: string): string {
+  const title = mediaTitle(name);
+  return title ? `${fileSlug(title)}.${name.slice(name.lastIndexOf(".") + 1)}` : fileLabel(name)!;
+}
+
 const NOT_FOUND = () => new Response("Not found", { status: 404 });
 
 /** One byte range, as audio and video players ask for. Anything else gets the whole file. */
@@ -107,7 +114,7 @@ export async function serveMedia(name: string, request?: Request): Promise<Respo
     };
     if (!image) {
       // A file is only ever downloaded or played, never opened as a page of this site.
-      headers["Content-Disposition"] = `attachment; filename="${fileLabel(name)}"`;
+      headers["Content-Disposition"] = `attachment; filename="${downloadName(name)}"`;
       headers["Content-Security-Policy"] = "default-src 'none'; sandbox";
       headers["Accept-Ranges"] = "bytes";
       if (range) headers["Content-Range"] = `bytes ${range.start}-${range.end}/${size}`;
@@ -200,6 +207,8 @@ export function listMedia(): StoredImage[] {
   return images.map(({ at, ...image }) => image);
 }
 
+export const mediaExists = (name: string) => isMediaName(name) && existsSync(join(dataDir(), "media", name));
+
 /** Removes an image and its thumbnail, or a file. False for a name Media could not have written, or one not there. */
 export function deleteImage(name: string): boolean {
   if (!isMediaName(name)) return false;
@@ -207,5 +216,6 @@ export function deleteImage(name: string): boolean {
   if (!existsSync(join(directory, name))) return false;
   if (!isFileName(name)) rmSync(join(directory, thumbName(name)), { force: true });
   rmSync(join(directory, name), { force: true });
+  setMediaTitle(name, "");
   return true;
 }

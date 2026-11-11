@@ -222,6 +222,7 @@ export function PeoplePage(props: {
 export interface PostRow {
   id: number;
   title: string;
+  tags?: string[];
   date: string;
   status: Status;
 }
@@ -273,7 +274,10 @@ export function PostsPage(props: {
             <tbody>
               {props.posts.map((post) => (
                 <tr key={post.id}>
-                  <td><a href={`${admin}/posts/${post.id}`}>{post.title || "Untitled"}</a></td>
+                  <td>
+                    <a href={`${admin}/posts/${post.id}`}>{post.title || "Untitled"}</a>
+                    {post.tags?.length ? <span class="post-tags">{post.tags.map((tag) => <a key={tag} href={`${base}?q=${encodeURIComponent(tag)}`}>{tag}</a>)}</span> : null}
+                  </td>
                   <td class={`status ${post.status}`}>{post.status}</td>
                   <td class="date"><time dateTime={post.date}>{listDate(props.config, post.date)}</time></td>
                 </tr>
@@ -444,6 +448,13 @@ export function EditorPage(props: {
             <span>Short label</span>
             <input class="input" name="label" value={values.label} placeholder="Defaults to the title" />
           </label>
+          {post.kind === "post" ? (
+            <label class="field">
+              <span>Tags</span>
+              <input class="input" name="tags" value={values.tags} placeholder="Games, Music" autocapitalize="off" />
+              <small>Separate with commas.</small>
+            </label>
+          ) : null}
           <button class="button" type="button" data-toggle-markdown>Edit as Markdown</button>
           <footer>
             {live && post.slug ? <a href={url(post.slug)} target="_blank" rel="noreferrer">{post.kind === "page" ? "View page" : "View post"}</a> : null}
@@ -474,13 +485,21 @@ function Input(props: { name: string; field: ResolvedField; value?: string }) {
       </div>
     );
   }
+  if (field.type === "file") {
+    return (
+      <div class="file-field">
+        <input class="input" name={name} inputMode="url" value={value} placeholder="Upload, or paste a link" aria-label={field.label} spellcheck={false} />
+        <button class="button" type="button" data-row="file">Upload</button>
+      </div>
+    );
+  }
   return <input class="input" name={name} inputMode={field.type === "url" ? "url" : undefined} value={value} placeholder={field.label} aria-label={field.label} />;
 }
 
-/** A field with its name. An image field isn't a label: that would name its button after the field and send clicks on the picture to it. */
+/** A field with its name. An image or file field isn't a label: that would name its button after the field and send clicks on the picture to it. */
 function Labelled(props: { field: ResolvedField; children: ComponentChildren }) {
   const { field } = props;
-  return field.type === "image"
+  return field.type === "image" || field.type === "file"
     ? <div class="field" role="group" aria-label={field.label}><span>{field.label}</span>{props.children}</div>
     : <label class="field"><span>{field.label}</span>{props.children}</label>;
 }
@@ -768,6 +787,8 @@ export function HistoryPage(props: { config: ResolvedConfig; entries: HistoryEnt
 }
 
 export interface MediaEntry extends StoredImage {
+  /** A name the owner gave it. */
+  title?: string;
   url: string;
   thumb: string;
   /** Where it is used now, in words, with a link where there is one. */
@@ -784,6 +805,8 @@ export function MediaPage(props: {
   total: number;
   unusedCount: number;
   unused: boolean;
+  /** What was searched for, if anything. */
+  query?: string;
   page: number;
   pages: number;
   /** How many "Delete all unused" would remove. */
@@ -793,7 +816,9 @@ export function MediaPage(props: {
 }) {
   const { config, images, unused, page, pages } = props;
   const admin = config.path;
-  const here = (at: number) => `${admin}/media${[unused ? "unused=1" : "", at > 1 ? `page=${at}` : ""].filter(Boolean).join("&").replace(/^./, "?$&")}`;
+  const query = props.query ?? "";
+  const where = [unused ? "unused=1" : "", query ? `q=${encodeURIComponent(query)}` : ""].filter(Boolean).join("&");
+  const here = (at: number) => `${admin}/media${[where, at > 1 ? `page=${at}` : ""].filter(Boolean).join("&").replace(/^./, "?$&")}`;
   return (
     <Shell config={config} active="media">
       <main class="page" data-media>
@@ -810,6 +835,13 @@ export function MediaPage(props: {
           </nav>
           <span class="muted" data-state role="status">Or drop images and files on this page</span>
           <span class="spacer" />
+          {props.total > 12 || query ? (
+            <form class="search" method="get" action={`${admin}/media`} role="search">
+              {unused ? <input type="hidden" name="unused" value="1" /> : null}
+              <input class="input" type="search" name="q" value={query} placeholder="Find by name or where used" aria-label="Find in Media" />
+              <button class="button" type="submit">Find</button>
+            </form>
+          ) : null}
           {unused && props.deletable ? (
             <form method="post" action={`${admin}/media/delete-unused`}>
               <button class="button" type="submit" data-confirm={`Delete ${props.deletable === 1 ? "1 unused file" : `${props.deletable} unused files`} for good? Those kept for undo, and any added in the last day, stay. This can't be undone.`}>
@@ -820,7 +852,7 @@ export function MediaPage(props: {
         </div>
         {unused && props.unusedCount > props.deletable ? <p class="muted media-note">"Delete all unused" leaves anything kept for undo, and any added in the last day, in case they are in work not saved yet.</p> : null}
         {images.length === 0 ? (
-          <p class="empty-state">{unused ? "Nothing unused." : "Nothing here yet. Upload images or files, or drop them on this page."}</p>
+          <p class="empty-state">{query ? `Nothing matches "${query}".` : unused ? "Nothing unused." : "Nothing here yet. Upload images or files, or drop them on this page."}</p>
         ) : (
           <ul class="media-grid">
             {images.map((image) => (
@@ -830,7 +862,7 @@ export function MediaPage(props: {
                 ) : (
                   <a class="media-thumb" href={image.url} target="_blank" rel="noreferrer"><img src={image.thumb} alt="" loading="lazy" /></a>
                 )}
-                {image.file ? <p class="media-name">{image.file}</p> : null}
+                {image.title || image.file ? <p class="media-name">{image.title || image.file}</p> : null}
                 <p class="media-size">{image.width ? `${image.width} \u00d7 ${image.height}, ` : ""}{fileSize(image.bytes)}</p>
                 <ul class="media-uses">
                   {image.places.map((place) => <li key={place.label}>{place.href ? <a href={place.href}>{place.label}</a> : place.label}</li>)}
@@ -838,6 +870,12 @@ export function MediaPage(props: {
                 </ul>
                 <div class="media-actions">
                   <button class="link" type="button" data-copy={image.url}>Copy address</button>
+                  <form method="post" action={`${admin}/media/rename`}>
+                    <input type="hidden" name="name" value={image.name} />
+                    <input type="hidden" name="back" value={[where, page > 1 ? `page=${page}` : ""].filter(Boolean).join("&")} />
+                    <input type="hidden" name="title" value={image.title ?? ""} />
+                    <button class="link" type="submit" data-rename={image.title || image.file?.replace(/\.\w+$/, "") || ""}>{image.title ? "Rename" : "Name"}</button>
+                  </form>
                   {image.places.length ? null : (
                     <form method="post" action={`${admin}/media/delete`}>
                       <input type="hidden" name="name" value={image.name} />

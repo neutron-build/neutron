@@ -288,7 +288,7 @@ test("a text that was never saved goes back to never saved", () => {
 
 test("people are added after the existing migrations, and the previous release still reads and writes sessions", async () => {
   const version = (db().prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
-  assert.equal(version, 7);
+  assert.equal(version, 8);
   // The statements the previous release runs, against the new schema, during a deploy.
   const hash = await hashPassword("old release");
   process.env.CMS_PASSWORD_HASH = hash;

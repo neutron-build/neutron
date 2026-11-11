@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import { createHash } from "node:crypto";
 import { hashPassword, isPreview, previewToken } from "./auth.js";
-import { defineCms } from "./index.js";
-import { closeDb, createPost, db, listRevision, replaceItems, restoreVersion, saveEdits, saves, setTexts, trashPost, type Item } from "./store.js";
+import { defineCms, tagsOf } from "./index.js";
+import { closeDb, createPost, db, getPost, listRevision, mediaTitles, replaceItems, restoreFromTrash, restoreVersion, saveEdits, savePost, saves, setTexts, trashPost, type Item } from "./store.js";
 
 const SITE = "https://site.test";
 const PASSWORD = "a-long-enough-test-password";
@@ -226,7 +226,7 @@ test("SVG, HTML and oversized uploads are refused", async () => {
   const cookie = await logIn();
   assert.equal((await send(cookie, new TextEncoder().encode("<svg onload=alert(1)>"))).status, 415);
   assert.equal((await send(cookie, new TextEncoder().encode("<html>"))).status, 415);
-  assert.equal((await send(cookie, new Uint8Array(13 * 1024 * 1024))).status, 413);
+  assert.equal((await send(cookie, new Uint8Array(10 * 1024 * 1024))).status, 413);
   for (const name of ["..%2Fsite.db", "site.db", "../site.db"]) assert.equal((await call(`/n-admin/media/${name}`)).status === 200, false, name);
 });
 
@@ -915,7 +915,7 @@ test("Media lists every upload newest first, with its size and where it is used"
   assert.match(html, /Kept for undo in an old version of a post\./);
   assert.match(html, /Kept for undo in list and text history\./);
   // Only images not in use can be deleted.
-  const deletable = [...html.matchAll(/name="name" value="([^"]+)"/g)].map((m) => m[1]);
+  const deletable = [...html.matchAll(/media\/delete"><input type="hidden" name="name" value="([^"]+)"/g)].map((m) => m[1]);
   assert.deepEqual(deletable, [inTrash, inVersion, inHistory, unused, old]);
   assert.match(html, /only kept for undo in a post in the Trash, so restoring that would show a broken image/);
 
@@ -1466,4 +1466,113 @@ test("a link to a file in Media is marked as a download; other links are left al
   const file = `/n-admin/media/${hex(1)}-build.zip`;
   assert.equal(renderMarkdown(`[Get it](${file})`).trim(), `<p><a class="file" href="${file}" download>Get it</a></p>`);
   assert.equal(renderMarkdown("[Site](https://x.test/a.zip)").trim(), '<p><a href="https://x.test/a.zip">Site</a></p>');
+});
+
+// Tags
+
+test("a post's tags are tidied on save, group posts on the site and survive the Trash", async () => {
+  db().exec("DELETE FROM posts");
+  const cookie = await logIn();
+  const make = async (title: string, tags: string, publish = true) => {
+    const path = (await call("/n-admin", { method: "POST", cookie })).headers.get("location")!;
+    const revision = revisionOf(await (await call(path, { cookie })).text());
+    assert.equal((await call(path, { method: "POST", cookie, body: form({ title, body: "Text", tags, revision, intent: publish ? "publish" : "save" }) })).status, 303);
+    return path;
+  };
+  const first = await make("One", "  Web  Dev, games,web dev ,, GAMES, ---");
+  await make("Two", "Games");
+  await make("Draft", "Secret", false);
+
+  assert.equal(cms.post("one")?.tags, "Web Dev, games");
+  assert.deepEqual(tagsOf(cms.post("one")!), [{ name: "Web Dev", slug: "web-dev" }, { name: "games", slug: "games" }]);
+  assert.deepEqual(cms.tags(), [{ name: "Games", slug: "games", count: 2 }, { name: "Web Dev", slug: "web-dev", count: 1 }], "a draft's tags are not shown, and the newest spelling names the tag");
+  assert.deepEqual(cms.posts({ tag: "games" }).map((post) => post.title).sort(), ["One", "Two"]);
+  assert.deepEqual(cms.posts({ tag: "Web Dev" }).map((post) => post.title), ["One"], "by name or by address");
+  assert.deepEqual(cms.posts({ tag: "nothing" }), []);
+  assert.equal(cms.posts().length, 2);
+
+  const editor = await (await call(first, { cookie })).text();
+  assert.match(editor, /name="tags" value="Web Dev, games"/);
+  const list = await (await call("/n-admin", { cookie })).text();
+  assert.match(list, /class="post-tags"><a href="\/n-admin\?q=Web%20Dev">Web Dev<\/a>/);
+  const found = await (await call("/n-admin?q=secret", { cookie })).text();
+  assert.match(found, />Draft<\/a>/);
+  assert.doesNotMatch(found, />Two<\/a>/);
+
+  // An autosave that sends no tags leaves them alone; to the Trash and back keeps them.
+  const id = Number(first.split("/").at(-1));
+  assert.equal(savePost(id, { title: "One", description: "", body: "New", slug: "one", published_at: getPost(id)!.published_at }, getPost(id)!.updated_at).ok, true);
+  assert.equal(getPost(id)!.tags, "Web Dev, games");
+  const back = restoreFromTrash(trashPost(id)!)!;
+  assert.equal(getPost(back.id)!.tags, "Web Dev, games");
+});
+
+test("pages have no tags", async () => {
+  const cookie = await logIn();
+  const path = (await call("/n-admin/pages", { method: "POST", cookie })).headers.get("location")!;
+  const html = await (await call(path, { cookie })).text();
+  assert.doesNotMatch(html, /name="tags"/);
+  assert.equal((await call(path, { method: "POST", cookie, body: form({ title: "P", body: "", tags: "x", revision: revisionOf(html), intent: "save" }) })).status, 303);
+  assert.equal(getPost(Number(path.split("/").at(-1)))!.tags, "");
+});
+
+// File fields
+
+test("a file field takes an upload's address or a pasted link, and refuses anything else", async () => {
+  const site = defineCms({ texts: { manual: "file" }, lists: { downloads: { fields: { name: { type: "text", required: true }, file: { type: "file", required: true } } } } });
+  const cookie = await logIn();
+  const on = (path: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers);
+    headers.set("cookie", cookie);
+    if (init.method === "POST") headers.set("origin", SITE);
+    return (init.method === "POST" ? site.POST : site.GET)({ request: new Request(`${SITE}/n-admin/${path}`, { ...init, headers }), params: { path } });
+  };
+  const page = await (await on("lists/downloads")).text();
+  assert.match(page, /class="file-field"><input class="input" name="f\.file"[^>]*\/><button class="button" type="button" data-row="file">Upload<\/button>/);
+  const revision = page.match(/name="revision" value="([^"]+)"/)![1];
+  const save = (file: string, rev = revision) => on("lists/downloads", { method: "POST", body: form({ revision: rev, "f.name": "Build", "f.file": file }) });
+  assert.match(await (await save("javascript:alert(1)")).text(), /isn&#39;t a file&#39;s address|isn't a file's address/);
+  assert.equal((await save(`/n-admin/media/${hex(1)}-build.zip`)).status, 303);
+  assert.deepEqual(site.list("downloads"), [{ name: "Build", file: `/n-admin/media/${hex(1)}-build.zip` }]);
+  assert.match(await (await on("lists/text")).text(), /data-row="file"/, "a text can be a file too");
+  replaceItems("downloads", []);
+});
+
+// Finding and naming uploads
+
+test("Media finds uploads by name or by where they are used, and a given name is what a file downloads as", async () => {
+  freshMedia();
+  db().exec("DELETE FROM posts; DELETE FROM media_titles");
+  const cookie = await logIn();
+  const { url } = await (await part(cookie, { id: PART_ID, at: "0", name: "v2-final.zip", last: "1" }, new Uint8Array([0x50, 0x4b, 3, 4]))).json() as { url: string };
+  const file = url.replace("/n-admin/media/", "");
+  const image = stored(1);
+  const other = stored(2);
+  createPost({ title: "Holiday", body: `![](/n-admin/media/${image})` });
+  const shown = async (query: string) => {
+    const html = await (await call(`/n-admin/media?q=${encodeURIComponent(query)}`, { cookie })).text();
+    return [file, image, other].filter((name) => html.includes(`value="${name}"`));
+  };
+  assert.deepEqual(await shown("FINAL"), [file], "by the name it was uploaded under");
+  assert.deepEqual(await shown("holiday"), [image], "by where it is used");
+  assert.deepEqual(await shown("zzz"), []);
+  assert.match(await (await call("/n-admin/media?q=zzz", { cookie })).text(), /Nothing matches &quot;zzz&quot;|Nothing matches "zzz"/);
+
+  const rename = (name: string, title: string) => call("/n-admin/media/rename", { method: "POST", cookie, body: form({ name, title, back: "q=x" }) });
+  const renamed = await rename(file, "  Skate Game  (Mac) ");
+  assert.equal(renamed.headers.get("location"), "/n-admin/media?q=x&renamed=1");
+  assert.equal((await rename(other, "Sunset")).status, 303);
+  assert.deepEqual(await shown("skate game"), [file]);
+  assert.deepEqual(await shown("sunset"), [other], "an image can be named too");
+  assert.equal((await call(url)).headers.get("content-disposition"), 'attachment; filename="skate-game-mac.zip"');
+  const files = await (await call("/n-admin/media?files=1", { cookie, headers: { "x-cms": "1" } })).json() as { files: { label: string }[] };
+  assert.equal(files.files[0].label, "Skate Game (Mac)");
+
+  assert.equal((await rename(file, "")).status, 303, "an empty name takes it away");
+  assert.equal((await call(url)).headers.get("content-disposition"), 'attachment; filename="v2-final.zip"');
+  for (const bad of ["../site.db", `${hex(9)}.png`, ""]) assert.equal((await rename(bad, "x")).status, 404, bad);
+  assert.equal((await call("/n-admin/media/rename", { method: "POST", body: form({ name: other, title: "x" }) })).status, 303, "signed out goes to the login");
+  assert.equal(mediaTitles().get(other), "Sunset");
+  assert.equal((await call("/n-admin/media/delete", { method: "POST", cookie, body: form({ name: other }) })).status, 303);
+  assert.equal(mediaTitles().has(other), false, "a deleted upload's name goes with it");
 });

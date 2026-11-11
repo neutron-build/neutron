@@ -16,12 +16,14 @@ export interface Post {
   /** A design's key when the page has its own design, otherwise empty. */
   layout: string;
   body: string;
+  /** As typed: names separated by commas. `tagsOf` gives each with its address. */
+  tags: string;
   published_at: string | null;
   updated_at: string;
 }
 
 export type Item = Record<string, string>;
-export type PostFields = Pick<Post, "title" | "description" | "body" | "slug" | "published_at"> & { label?: string; kind?: Kind };
+export type PostFields = Pick<Post, "title" | "description" | "body" | "slug" | "published_at"> & { label?: string; tags?: string; kind?: Kind };
 export type SaveResult =
   | { ok: true; post: Post }
   | { ok: false; error: "stale" | "slug-taken" | "slug-reserved" | "missing" };
@@ -122,6 +124,10 @@ const MIGRATIONS = [
      set_at TEXT NOT NULL
    );
    CREATE TABLE auth_keys (name TEXT PRIMARY KEY, value TEXT NOT NULL);`,
+  // A post's tags as typed, names separated by commas. A name given to an upload in Media.
+  `ALTER TABLE posts ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+   ALTER TABLE posts_trash ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+   CREATE TABLE media_titles (name TEXT PRIMARY KEY, title TEXT NOT NULL);`,
 ];
 
 const store = globalThis as typeof globalThis & { __cmsDb?: DatabaseSync };
@@ -198,16 +204,54 @@ export const allPosts = (kind: Kind = "post") =>
 export const livePosts = (kind: Kind = "post") =>
   db().prepare("SELECT * FROM posts WHERE kind = ? AND published_at <= ? ORDER BY published_at DESC").all(kind, now()) as unknown as Post[];
 
+// Tags
+
+export interface Tag {
+  name: string;
+  /** The tag in an address: "Web Dev" is "web-dev". Two spellings with one slug are one tag. */
+  slug: string;
+}
+
+/** Tags as they are stored: trimmed, one of each, in the order typed. */
+export function cleanTags(typed: string): string {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const part of typed.split(/[,\n]/)) {
+    const name = part.replace(/\s+/g, " ").trim().slice(0, 40).trim();
+    const slug = slugify(name);
+    if (!slug || seen.has(slug) || names.length === 20) continue;
+    seen.add(slug);
+    names.push(name);
+  }
+  return names.join(", ");
+}
+
+export const tagsOf = (post: Pick<Post, "tags">): Tag[] =>
+  post.tags ? post.tags.split(", ").map((name) => ({ name, slug: slugify(name) })) : [];
+
+/** Every tag on a published post, most used first, under the spelling used most recently. */
+export function liveTags(): (Tag & { count: number })[] {
+  const tags = new Map<string, Tag & { count: number }>();
+  for (const post of livePosts()) {
+    for (const tag of tagsOf(post)) {
+      const known = tags.get(tag.slug);
+      if (known) known.count += 1;
+      else tags.set(tag.slug, { ...tag, count: 1 });
+    }
+  }
+  return [...tags.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
 /** Posts or pages whose title or text contains `query`, in the order of allPosts, without their text. */
 export function findPosts(kind: Kind, query = ""): Omit<Post, "body">[] {
-  const columns = "id, slug, title, description, label, kind, layout, published_at, updated_at";
+  const columns = "id, slug, title, description, label, kind, layout, tags, published_at, updated_at";
   const order = "ORDER BY published_at IS NOT NULL, published_at DESC, updated_at DESC";
   if (!query) return db().prepare(`SELECT ${columns} FROM posts WHERE kind = ? ${order}`).all(kind) as unknown as Omit<Post, "body">[];
   // Typed % and _ are looked for as themselves.
   const like = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
   return db()
-    .prepare(`SELECT ${columns} FROM posts WHERE kind = ? AND (title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\') ${order}`)
-    .all(kind, like, like) as unknown as Omit<Post, "body">[];
+    .prepare(`SELECT ${columns} FROM posts WHERE kind = ? AND (title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\') ${order}`)
+    .all(kind, like, like, like) as unknown as Omit<Post, "body">[];
 }
 
 export const postCount = (kind: Kind = "post") => (db().prepare("SELECT count(*) AS n FROM posts WHERE kind = ?").get(kind) as { n: number }).n;
@@ -267,8 +311,8 @@ export function removeAbandonedDrafts(): void {
 
 export function createPost(fields: Partial<PostFields> & { updated_at?: string } = {}): number {
   const result = db()
-    .prepare("INSERT INTO posts (slug, title, description, label, body, published_at, updated_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-    .run(fields.slug ?? null, fields.title ?? "", fields.description ?? "", fields.label ?? "", fields.body ?? "", fields.published_at ?? null, fields.updated_at ?? now(), fields.kind ?? "post");
+    .prepare("INSERT INTO posts (slug, title, description, label, tags, body, published_at, updated_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(fields.slug ?? null, fields.title ?? "", fields.description ?? "", fields.label ?? "", cleanTags(fields.tags ?? ""), fields.body ?? "", fields.published_at ?? null, fields.updated_at ?? now(), fields.kind ?? "post");
   return Number(result.lastInsertRowid);
 }
 
@@ -314,8 +358,8 @@ export function savePost(id: number, fields: PostFields, revision: string, reser
     if (slug && taken(slug)) return { ok: false, error: "slug-taken" };
 
     db()
-      .prepare("UPDATE posts SET slug = ?, title = ?, description = ?, label = ?, body = ?, published_at = ?, updated_at = ? WHERE id = ?")
-      .run(slug, fields.title, fields.description, fields.label ?? current.label, fields.body.replace(/\r\n?/g, "\n"), fields.published_at, after(current.updated_at), id);
+      .prepare("UPDATE posts SET slug = ?, title = ?, description = ?, label = ?, tags = ?, body = ?, published_at = ?, updated_at = ? WHERE id = ?")
+      .run(slug, fields.title, fields.description, fields.label ?? current.label, fields.tags === undefined ? current.tags : cleanTags(fields.tags), fields.body.replace(/\r\n?/g, "\n"), fields.published_at, after(current.updated_at), id);
     return { ok: true, post: getPost(id)! };
   });
 }
@@ -367,8 +411,8 @@ export function trashPost(id: number): number | null {
   return transaction(() => {
     if (!getPost(id)) return null;
     const trashed = db().prepare(
-      `INSERT INTO posts_trash (slug, title, description, label, kind, layout, body, published_at, updated_at, deleted_at)
-       SELECT slug, title, description, label, kind, layout, body, published_at, updated_at, ? FROM posts WHERE id = ?`,
+      `INSERT INTO posts_trash (slug, title, description, label, tags, kind, layout, body, published_at, updated_at, deleted_at)
+       SELECT slug, title, description, label, tags, kind, layout, body, published_at, updated_at, ? FROM posts WHERE id = ?`,
     ).run(now(), id);
     const trashId = Number(trashed.lastInsertRowid);
     db().prepare("DELETE FROM posts WHERE id = ?").run(id);
@@ -396,8 +440,8 @@ export function restoreFromTrash(trashId: number, reservedSlugs: string[] = []):
     const row = db().prepare("SELECT * FROM posts_trash WHERE id = ?").get(trashId) as (Post & { deleted_at: string }) | undefined;
     if (!row) return null;
     const addressLost = row.slug !== null && (reservedSlugs.includes(row.slug) || Boolean(db().prepare("SELECT 1 FROM posts WHERE slug = ?").get(row.slug)));
-    const restored = db().prepare("INSERT INTO posts (slug, title, description, label, kind, layout, body, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-      addressLost ? null : row.slug, row.title, row.description, row.label, row.kind, row.layout, row.body, addressLost ? null : row.published_at, row.updated_at,
+    const restored = db().prepare("INSERT INTO posts (slug, title, description, label, tags, kind, layout, body, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      addressLost ? null : row.slug, row.title, row.description, row.label, row.tags, row.kind, row.layout, row.body, addressLost ? null : row.published_at, row.updated_at,
     );
     const id = Number(restored.lastInsertRowid);
     db().prepare("UPDATE posts_old SET post_id = ? WHERE post_id = ?").run(id, -trashId);
@@ -605,6 +649,21 @@ export function imageUses(): Map<string, ImageUse> {
   for (const row of rows<{ body: string }>("SELECT body FROM posts_old")) scan(row.body, (use) => use.kept.add("versions"));
   for (const row of rows<{ before: string }>("SELECT before FROM saves")) scan(row.before, (use) => use.kept.add("history"));
   return uses;
+}
+
+// Names given to uploads
+
+export const mediaTitles = () =>
+  new Map((db().prepare("SELECT name, title FROM media_titles").all() as unknown as { name: string; title: string }[]).map((row) => [row.name, row.title]));
+
+export const mediaTitle = (name: string) =>
+  (db().prepare("SELECT title FROM media_titles WHERE name = ?").get(name) as { title: string } | undefined)?.title;
+
+/** An empty title takes the name away. */
+export function setMediaTitle(name: string, typed: string): void {
+  const title = typed.replace(/\s+/g, " ").trim().slice(0, 120);
+  if (title) db().prepare("INSERT INTO media_titles (name, title) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET title = excluded.title").run(name, title);
+  else db().prepare("DELETE FROM media_titles WHERE name = ?").run(name);
 }
 
 export const inCurrentUse = (use: ImageUse | undefined) => Boolean(use && (use.posts.size || use.lists.size || use.texts.size));

@@ -199,7 +199,7 @@ export function isTemplateName(value: string): value is TemplateName {
 const PINNED_DEPENDENCY_VERSIONS = {
   neutron: "^0.5.0",
   neutronCli: "^0.5.0",
-  neutronCms: "^0.1.0",
+  neutronCms: "^0.1.2",
 };
 
 function resolveDependencyVersions(targetDir: string): {

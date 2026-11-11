@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/cms",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A small CMS for Neutron sites: posts, photo galleries, events and any list, edited at /n-admin. No database server and no JavaScript for visitors.",
   "author": "Tyler",
   "license": "MIT",
