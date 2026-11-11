@@ -11514,3 +11514,52 @@ sets FINAL to the kept rung; its subject begins exactly
 design** whenever ladder B keeps a non-zero `w7_share` — limited to
 uniform-mode seeds, which the pins hold.
 
+### X-5c-F4-F5 probe rows
+
+One row per rung tried, in walk order (the ladders above committed
+before the first of them). Every number is a **probe, not evidence**:
+`per10k` = raw × 10 over the 0..1000 sample (for `--mp`, the
+200-seed judged MP set, `per10k` = the 2,000-seed set's count).
+
+- **ladder A rung A.0 — the anchor** (`MP_PRESSURE` exactly as
+  X-5c-F4-F4 left it: the 9.1 fields over FINAL 7.3, so its
+  `value_lo` is 280 by following FINAL — recorded, not tuned; no
+  constant changes at this rung): `GUARD wait=ok load_at_start=9.76
+  12.97 14.86 wall_s=41.374 cpu_s=530.811 busy_s=522.410
+  foreign_pct=-1.58 verdict=CLEAN` (the negative foreign share is the
+  host's /proc/stat busy undercounting against the process's own CPU;
+  the verdict rule reads it CLEAN and the wall is the number either
+  way); `PROBE_WALL raw_s=41.3 min_per_2000=6.9 load_at_start=1.84
+  8.90 13.10`; `PROBE_CPU user_sys_s=530.8`; **SZC-MP raw 19,
+  per10k 190**. `MP_REFUSAL rounds=232 refused=159 rate=0.6853`
+  (computed from the probe JSON with the same fold `verify`'s line
+  uses — the attempt never runs `verify`). Round-index table (the
+  fill's premise check — round 0 now carries the condition at the
+  anchor, before any fill):
+
+  | round | rounds | refused | szc | szq |
+  |---|---|---|---|---|
+  | 0 | 200 | 137 | 40 | 17 |
+  | 1 | 29 | 21 | 7 | 2 |
+  | 2 | 3 | 1 | 0 | 0 |
+
+  All rows (per10k = raw × 10, the 2,000-seed set's count): Q1 1150
+  (hooks, per hook: Before0 110, After0 110, Mid2 100, After1 110,
+  After2 110, After3 120, Mid6 110, After4 110, After5 140, After6
+  130), Q2 310, Q3 90, Q4 250, Q4-I 130, Q5a 130, Q5b 1080, Q5c 660,
+  Q6a 300, Q6b 180, Q7 10, Q8 0 (class C only), Q9 1780, Q10 100,
+  Q11 60, Q12 70, Q13a 1020, Q13b 1120, Q13c 870, Q14 520, Q15 0 (MW
+  only), Q16 970, Q17 1310, Q18 370, SIZING 1330 misses, SZC 190,
+  **SZC-MP 190**, SZC-MW 0, SZI 30. Fails: MP ×3 (30037 r0, 30337 r0,
+  30837 r0 — all `O-1(a) … published {} != model {…}`, the known
+  O-1(a) MP shape; new classes: none). **Stop-and-keep at A.0:** raw
+  19 ≥ 13 (required 100 per 2,000 × 1.25 = 125 = raw 12.5 → 13), the
+  hold set is empty by pre-registration, and the wall passes (6.9 ≤
+  40). The anchor's own reading — FINAL 7.3's `value_lo` 280 flowing
+  into MP_PRESSURE — already puts the ≥ 4·F condition into round 0
+  (17 of the 19 szq rounds are round 0), which is what the card's
+  "its `value_lo` is now 280 … re-anchors MP on it" anticipated; the
+  fill rungs A.1–A.4 never run (rung order is by rising cost, and the
+  first rung reached the margin). The fill knobs stay 0 in every
+  tuning. Probe, not evidence.
+
