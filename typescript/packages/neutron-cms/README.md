@@ -67,7 +67,8 @@ export default function Page({ data }) {
 
 | Call | Returns |
 |---|---|
-| `cms.posts()` | Published posts, newest first |
+| `cms.posts()` | Published posts, newest first. `cms.posts({ tag })` for the posts under one tag |
+| `cms.tags()` | Every tag on a published post, as `{ name, slug, count }`, most used first |
 | `cms.post(slug)` | One published post |
 | `cms.pages()`, `cms.page(slug, request?)` | Published pages; with the request, a designed draft opened from the admin too |
 | `cms.design(key, request?)` | The page of a design with a fixed address, such as a homepage; undefined while unpublished, so answer 404 |
@@ -84,7 +85,13 @@ Posts and Pages offer a search, by title and text, once there are more than ten,
 
 Uploaded images live in `media/` and are served at `/n-admin/media/`. **Media** in the admin shows them all, newest first, with where each is used, a filter for unused ones, upload by drop, Copy address and Delete. An image in a post, page, list or text can't be deleted; one only in the Trash, an old version or list history can, with a warning. "Add image" in the editor, and image fields, offer the newest images to reuse as well as Upload. Images that aren't uploads, such as files in your `public/` folder, aren't listed.
 
+With more than a dozen uploads, Media has a search: it finds an upload by the name you gave it, the name it was uploaded under, or where it is used. "Name" on an upload gives it a name of your own. Its address does not change, so nothing that links to it breaks, and a file downloads under the new name.
+
 **Files.** Media also takes PDF, ZIP, 7z, gz and tar, audio (MP3, M4A, WAV, OGG, FLAC), video (MP4, WebM, MOV), text, CSV, JSON, EPUB, Word, Excel and PowerPoint files, up to 100 MB each. They upload in small parts, so no server limit needs raising. "Add file" in the editor uploads one, or picks one already there, and links the selected words to it (or adds a link under the file's name). A file is always served as a download, never opened as a page of your site. On the site the link is `<a class="file" download>`, so your CSS can show it as a button: style `.file`.
+
+A `file` field is a link field with an Upload button: the button puts a file in Media, or picks one already there, and fills in its address. A pasted link to a file elsewhere works too. On the site it is an address like any other: `<a href={item.file} download>`.
+
+**Tags.** Posts have tags, typed in a post's Settings with commas between them. `post.tags` is the text as typed and `tagsOf(post)` gives each as `{ name, slug }`; `cms.tags()` lists every tag on a published post with its `count`, most used first; `cms.posts({ tag })` gives the posts under one, by name or slug. Two spellings with the same slug, such as "Web Dev" and "web dev", are one tag. Pages have no tags.
 
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 
@@ -127,7 +134,7 @@ defineCms({
 
 ## Fields and lists
 
-Field types are `text`, `textarea`, `url`, `image` and `date`. A field is a type, or `{ type, label, required }` when it needs more. Labels default to the key.
+Field types are `text`, `textarea`, `url`, `image`, `file` and `date`. A field is a type, or `{ type, label, required }` when it needs more. Labels default to the key.
 
 - **Photo lists:** a list with an image and at most one other field is a grid. Drop files anywhere on the page and drag to reorder.
 - **Dated lists:** `sortBy` keeps a list in date order. `cms.upcoming` keeps an item up through its own day, using `timeZone`.
@@ -183,7 +190,7 @@ The admin trusts your public site. Any script running on the site's own address,
 
 - Two kinds of account: the owner, and people who can edit everything but not manage people.
 - Draft preview links from Edit site last two hours, and end when any password changes or a person is removed.
-- Uploads are limited to 2000px on the long side, and the original is not kept.
+- Images are limited to 2000px on the long side and 10 MB, and the original is not kept.
 - Images are not deleted when content stops using them. Delete them from Media; "Delete all unused" leaves those kept for undo and any added in the last day.
 - If you disallow `/n-admin` in `robots.txt`, add `Allow: /n-admin/media/` so search engines can see your images.
 - Set `SITE_URL` to the address people actually use, or every save is refused.

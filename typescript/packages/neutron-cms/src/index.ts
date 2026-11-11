@@ -1,10 +1,11 @@
 import { resolveConfig, type CmsConfig, type ListDefinition } from "./config.js";
 import { createHandler, type RouteArgs } from "./handler.js";
 import { isPreview } from "./auth.js";
-import { allTexts, contentCount, designPage, ensureDesigns, isLive, listItems, livePostBySlug, livePosts, postBySlug, today, upcoming, type Item, type Post } from "./store.js";
+import { allTexts, contentCount, designPage, ensureDesigns, isLive, listItems, livePostBySlug, livePosts, liveTags, postBySlug, slugify, tagsOf, today, upcoming, type Item, type Post, type Tag } from "./store.js";
 
 export type { CmsConfig, Design, Field, FieldType, ListDefinition } from "./config.js";
-export type { Item, Post } from "./store.js";
+export type { Item, Post, Tag } from "./store.js";
+export { tagsOf } from "./store.js";
 export { firstImage, renderMarkdown, summarize } from "./markdown.js";
 
 /**
@@ -26,8 +27,13 @@ export function defineCms<Lists extends Record<string, ListDefinition> = Record<
     GET: (args: RouteArgs) => handle(args),
     POST: (args: RouteArgs) => handle(args),
 
-    /** Published posts, newest first. */
-    posts: (): Post[] => livePosts(),
+    /** Published posts, newest first. Pass a tag, by name or as it is in an address, for only the posts that have it. */
+    posts: (only: { tag?: string } = {}): Post[] => {
+      const tag = only.tag === undefined ? undefined : slugify(only.tag);
+      return tag === undefined ? livePosts() : livePosts().filter((post) => tagsOf(post).some((one) => one.slug === tag));
+    },
+    /** Every tag on a published post with how many posts have it, most used first. */
+    tags: (): (Tag & { count: number })[] => liveTags(),
     /** One published post, or undefined. */
     post: (slug: string): Post | undefined => livePostBySlug(slug),
     /** Published pages at their own slugs, newest first. Designs with a fixed address are left out; ask `design(key)` for those. */

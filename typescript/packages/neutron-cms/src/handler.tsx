@@ -11,11 +11,11 @@ import { TEXT, type ResolvedConfig, type ResolvedList } from "./config.js";
 import { thumbUrl } from "./images.js";
 import { renderMarkdown } from "./markdown.js";
 import { isSafeUrl } from "./safe-url.js";
-import { appendPart, deleteImage, finishFile, isMediaName, listImages, listMedia, MAX_UPLOAD_BYTES, saveImage, serveMedia, type StoredImage } from "./media.js";
+import { appendPart, deleteImage, finishFile, isMediaName, listImages, listMedia, mediaExists, MAX_UPLOAD_BYTES, saveImage, serveMedia, type StoredImage } from "./media.js";
 import { FILE_KINDS, fileExtension, fileLabel } from "./files.js";
 import { AccountPage, Document, EditorPage, PeoplePage, Viewer, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, findPosts, postCount, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, saveCount, saveEdits, savePost, saves, setTexts,
+  allPosts, allTexts, createPost, findPosts, postCount, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, mediaTitles, saveCount, saveEdits, savePost, saves, setMediaTitle, setTexts, tagsOf,
   sortByDate, trashCount, trashed, trashPost, valuesNow, versionsOf, type Item, type Post, type Save, type Snapshot,
 } from "./store.js";
 
@@ -75,7 +75,7 @@ const isLinkTarget = (value: string) => /^(https?:\/\/[^\s/]+\S*|mailto:\S+|tel:
 function problemWith(list: ResolvedList, items: Item[]): string | null {
   const fields = Object.entries(list.fields);
   for (const item of items) {
-    for (const [key, field] of fields) if (field.type === "url" && item[key]) item[key] = completeUrl(item[key]);
+    for (const [key, field] of fields) if ((field.type === "url" || field.type === "file") && item[key]) item[key] = completeUrl(item[key]);
   }
   for (const [index, item] of items.entries()) {
     const row = items.length > 1 ? `Row ${index + 1}: ` : "";
@@ -85,6 +85,7 @@ function problemWith(list: ResolvedList, items: Item[]): string | null {
       const value = item[key];
       if (!value) continue;
       if (field.type === "date" && !isDate(value)) return `${row}${field.label} must be a real date.`;
+      if (field.type === "file" && !isLinkTarget(value)) return `${row}"${value}" isn't a file's address. Upload one, or paste a link to it.`;
       if (field.type === "url" && !isLinkTarget(value)) return `${row}"${value}" isn't a link. Use a web address such as https://example.com, or a path such as /about/.`;
       if (field.type === "image" && !isSafeUrl(value)) return `${row}${field.label} isn't an image address.`;
     }
@@ -147,6 +148,7 @@ export function createHandler(config: ResolvedConfig) {
     const posts = found.slice((current - 1) * POSTS_PAGE, current * POSTS_PAGE).map((post) => ({
       id: post.id,
       title: post.title,
+      tags: tagsOf(post).map((tag) => tag.name),
       date: post.published_at ?? post.updated_at,
       status: statusOf(post, at),
     }));
@@ -270,7 +272,7 @@ export function createHandler(config: ResolvedConfig) {
   }
 
   async function upload(request: Request) {
-    const tooLarge = () => Response.json({ error: "That image is over 12 MB." }, { status: 413 });
+    const tooLarge = () => Response.json({ error: "That image is over 10 MB." }, { status: 413 });
     if (Number(request.headers.get("content-length") ?? 0) > MAX_UPLOAD_BYTES + 4096) return tooLarge();
     const form = await request.formData();
     const file = form.get("file");
@@ -386,7 +388,7 @@ export function createHandler(config: ResolvedConfig) {
     // A designed page is only published or unpublished from its bar; everything else stays as it is.
     const fields = design
       ? { title: post.title, description: post.description, label: post.label, body: post.body, slug: post.slug ?? "", published_at }
-      : { title: read("title").trim(), description: read("description").trim(), label: read("label").trim(), body: read("body"), slug: read("slug"), published_at };
+      : { title: read("title").trim(), description: read("description").trim(), label: read("label").trim(), tags: post.kind === "post" ? read("tags") : undefined, body: read("body"), slug: read("slug"), published_at };
 
     if (intent === "publish" && !design && !fields.title) {
       return editorPage(post, { error: "Add a title before publishing.", fields, revision: read("revision") });
@@ -532,6 +534,7 @@ export function createHandler(config: ResolvedConfig) {
   /** Where each image is used, in words with links. */
   function describeImages(images: StoredImage[]): MediaEntry[] {
     const uses = imageUses();
+    const titles = mediaTitles();
     const listHref = (key: string) => {
       const list = Object.hasOwn(config.lists, key) ? config.lists[key] : undefined;
       if (!list) return undefined;
@@ -551,7 +554,7 @@ export function createHandler(config: ResolvedConfig) {
         })),
       ];
       const kept = places.length ? [] : [...(use?.kept ?? [])].map((reason) => KEPT_WORDS[reason]);
-      return { ...image, url: mediaUrl(image.name), thumb: image.file ? "" : thumbUrl(mediaUrl(image.name)), places, kept };
+      return { ...image, title: titles.get(image.name), url: mediaUrl(image.name), thumb: image.file ? "" : thumbUrl(mediaUrl(image.name)), places, kept };
     });
   }
 
@@ -562,16 +565,21 @@ export function createHandler(config: ResolvedConfig) {
     const search = new URL(request.url).searchParams;
     const unused = search.has("unused");
     const all = describeImages(listMedia());
-    const shown = unused ? all.filter((entry) => !entry.places.length) : all;
+    const query = (search.get("q") ?? "").trim().slice(0, 200);
+    const wanted = query.toLowerCase();
+    // By the name it was given, the name it was uploaded under, or where it is used.
+    const matches = (entry: MediaEntry) =>
+      [entry.title, entry.file, ...entry.places.map((place) => place.label)].some((text) => text?.toLowerCase().includes(wanted));
+    const shown = (unused ? all.filter((entry) => !entry.places.length) : all).filter((entry) => !wanted || matches(entry));
     const pages = Math.max(1, Math.ceil(shown.length / MEDIA_PAGE));
     const at = Math.min(pages, Math.max(1, Math.floor(Number(search.get("page")) || 1)));
     const deleted = Number(search.get("deleted")) || 0;
     const added = Number(search.get("added")) || 0;
-    const notice = deleted ? `${deleted === 1 ? "1 file" : `${deleted} files`} deleted.` : added ? `${added === 1 ? "1 file" : `${added} files`} added.` : undefined;
+    const notice = deleted ? `${deleted === 1 ? "1 file" : `${deleted} files`} deleted.` : added ? `${added === 1 ? "1 file" : `${added} files`} added.` : search.has("renamed") ? "Renamed." : undefined;
     return page("Media", (
       <MediaPage
         config={config} images={shown.slice((at - 1) * MEDIA_PAGE, at * MEDIA_PAGE)} total={all.length} unusedCount={all.filter((entry) => !entry.places.length).length}
-        unused={unused} page={at} pages={pages} deletable={deletableNow(all).length} notice={notice} error={error}
+        unused={unused} query={query} page={at} pages={pages} deletable={deletableNow(all).length} notice={notice} error={error}
       />
     ), status);
   }
@@ -582,7 +590,7 @@ export function createHandler(config: ResolvedConfig) {
 
   /** The newest files that are not images, for linking to one in an editor. */
   const recentFiles = () =>
-    Response.json({ files: listMedia().filter((entry) => entry.file).slice(0, 30).map((entry) => ({ url: mediaUrl(entry.name), label: entry.file, bytes: entry.bytes })) });
+    Response.json({ files: listMedia().filter((entry) => entry.file).slice(0, 30).map((entry) => ({ url: mediaUrl(entry.name), label: mediaTitles().get(entry.name) ?? entry.file, bytes: entry.bytes })) });
 
   async function mediaDelete(request: Request) {
     const form = await request.formData();
@@ -593,6 +601,17 @@ export function createHandler(config: ResolvedConfig) {
     if (inCurrentUse(imageUses().get(name))) return mediaPage(request, "That file is in use, so it was not deleted. Take it out of the places listed first.", 409);
     if (!deleteImage(name)) return notFound();
     return redirect(`${admin}/media?deleted=1${back}`);
+  }
+
+  /** A name of the owner's own for an upload, to find it by. A file downloads under it; its address stays. */
+  async function mediaRename(request: Request) {
+    const form = await request.formData();
+    const name = String(form.get("name") ?? "");
+    if (!mediaExists(name)) return notFound();
+    setMediaTitle(name, String(form.get("title") ?? ""));
+    const back = new URLSearchParams(String(form.get("back") ?? ""));
+    back.set("renamed", "1");
+    return redirect(`${admin}/media?${back}`);
   }
 
   function mediaDeleteUnused() {
@@ -677,6 +696,7 @@ export function createHandler(config: ResolvedConfig) {
     if (first === "history" && !second && !post) return history(request);
     if (first === "media" && !second && !post) return isScript(request) ? (new URL(request.url).searchParams.has("files") ? recentFiles() : recentImages()) : mediaPage(request);
     if (first === "media" && second === "delete" && rest.length === 0 && post) return mediaDelete(request);
+    if (first === "media" && second === "rename" && rest.length === 0 && post) return mediaRename(request);
     if (first === "media" && second === "delete-unused" && rest.length === 0 && post) return mediaDeleteUnused();
     if (first === "history" && second && /^\d+$/.test(second) && rest.length === 0 && post) return history(request, Number(second));
     if (first === "account" && !second) return account(request);

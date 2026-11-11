@@ -113,6 +113,8 @@ export class Run {
       // Confirms are answered by the scenario through `page.answer`; otherwise they are accepted.
       const answer = page.answers?.shift();
       if (answer === undefined) return dialog.accept();
+      // A string is typed into a prompt.
+      if (typeof answer === "string") return dialog.accept(answer);
       return answer ? dialog.accept() : dialog.dismiss();
     });
     page.answers = [];

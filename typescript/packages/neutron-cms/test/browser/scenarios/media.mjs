@@ -2,10 +2,10 @@ import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { listImages, listMedia, saveImage } from "../../../dist/media.js";
-import { createPost, dataDir, getPost, listItems, savePost, trashPost } from "../../../dist/store.js";
-import { imageFile, png } from "../fixture.mjs";
+import { createPost, dataDir, getPost, listItems, replaceItems, savePost, trashPost } from "../../../dist/store.js";
+import { cms, imageFile, png } from "../fixture.mjs";
 import { pickFiles, scenario } from "../harness.mjs";
-import { caretAtEnd, markdown, newPost, selectText, VISUAL } from "./editor.mjs";
+import { caretAtEnd, markdown, newPost, openSettings, selectText, VISUAL } from "./editor.mjs";
 
 const cards = (page) => page.locator(".media-grid > li");
 const card = (page, name) => page.locator(".media-grid > li", { has: page.locator(`a[href$="${name}"]`) });
@@ -153,6 +153,7 @@ scenario("media: a file uploads in parts, links from the editor and downloads fr
   t.check(readFileSync(join(dataDir(), "media", file.name)).equals(bytes), "and in order");
   await t.seeText(card(page, file.name).locator(".media-name"), "game-build-v2.zip");
   await t.fits(page, "Media with a file");
+  if (t.browserName === "chrome") await t.shot(page, "media-file-desktop-light");
 
   // Link the selected words to it from the editor.
   await newPost(t, page);
@@ -176,4 +177,116 @@ scenario("media: a file uploads in parts, links from the editor and downloads fr
   const response = await page.request.get(new URL(`/n-admin/media/${file.name}`, page.url()).href);
   t.equal(response.status(), 200, "the file is served");
   t.equal(response.headers()["content-disposition"], 'attachment; filename="game-build-v2.zip"', "as a download");
+});
+
+scenario("media: a file field in a list and on the site, filled from Media", async (t) => {
+  const page = await t.page();
+  const file = listMedia().find((entry) => entry.file === "game-build-v2.zip");
+  const address = `/n-admin/media/${file.name}`;
+
+  // On the list's own page: Upload offers the files already here.
+  await t.go(page, "/n-admin/lists/downloads");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  const row = page.locator(".item").last();
+  await row.getByLabel("Name").fill("Mac build");
+  await row.getByRole("button", { name: "Upload" }).click();
+  await page.locator("dialog.chooser[open]").getByRole("button", { name: /game-build-v2\.zip/ }).click();
+  await t.eventually(async () => (await row.getByRole("textbox", { name: "File" }).inputValue()) === address, "the field holds the file's address");
+  await t.seeText(page.locator("[data-state]"), "Unsaved changes");
+  await t.fits(page, "a list with a file field");
+  if (t.browserName === "chrome") await t.shot(page, "list-file-field-desktop-light");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.waitForURL(/saved=1/);
+  t.equal(listItems("downloads")[0]?.file, address, "the list saves it");
+
+  // A new upload from the same button.
+  const manual = join(t.fixture.files, "manual.pdf");
+  writeFileSync(manual, "%PDF-1.7 manual");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  const second = page.locator(".item").last();
+  await second.getByLabel("Name").fill("Manual");
+  await pickFiles(page, () => second.getByRole("button", { name: "Upload" }).click().then(() => page.locator("dialog.chooser[open]").getByRole("button", { name: "Upload" }).click()), [manual]);
+  await t.eventually(async () => /-manual\.pdf$/.test(await second.getByRole("textbox", { name: "File" }).inputValue()), "an uploaded file fills the field");
+  await second.getByRole("textbox", { name: "File" }).fill("https://example.com/elsewhere.zip");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.waitForURL(/saved=1/);
+  t.equal(listItems("downloads")[1]?.file, "https://example.com/elsewhere.zip", "a pasted link is kept as it is");
+
+  // On the site: the bar has the field and its Upload.
+  if (!listItems("press").length) replaceItems("press", [{ outlet: "The Wire", link: "", kit: "" }]);
+  await t.go(page, "/n-admin/edit");
+  await t.eventually(async () => (await page.frameLocator("[data-edit-frame]").locator("[data-cms-field]").count()) > 0, "the framed site becomes editable", 8000);
+  await page.frameLocator("[data-edit-frame]").locator("[data-cms-item='press.0'] [data-cms=outlet]").click({ force: true });
+  const tools = page.locator("[data-edit-tools]");
+  await tools.getByRole("button", { name: "Upload kit" }).click();
+  await page.locator("dialog.chooser[open]").getByRole("button", { name: /game-build-v2\.zip/ }).click();
+  await t.eventually(async () => (await tools.getByRole("textbox", { name: "Kit" }).inputValue()) === address, "the bar's field holds the address");
+  await page.locator("[data-edit-save]").click();
+  await t.seeText(page.locator("[data-edit-state]"), "Saved");
+  t.equal(listItems("press")[0]?.kit, address, "Edit site saves it");
+});
+
+scenario("media: find by name or use, and give an upload a name", async (t) => {
+  const page = await t.page();
+  const file = listMedia().find((entry) => entry.file === "game-build-v2.zip");
+  await t.go(page, "/n-admin/media");
+  const find = page.getByRole("search");
+  await find.getByLabel("Find in Media").fill("game-build");
+  await find.getByRole("button", { name: "Find" }).click();
+  await page.waitForURL(/q=game-build/);
+  t.equal(await cards(page).count(), 1, "one upload has that name");
+  await t.seeText(card(page, file.name).locator(".media-uses"), "In Downloads", "it says where it is used");
+
+  page.answers.push("Skate Game (Mac)");
+  await card(page, file.name).getByRole("button", { name: "Name" }).click();
+  await page.waitForURL(/renamed=1/);
+  await t.seeText(page.getByRole("status").first(), "Renamed.");
+  await t.seeText(card(page, file.name).locator(".media-name"), "Skate Game (Mac)", "the name it was uploaded under still finds it");
+
+  await find.getByLabel("Find in Media").fill("skate");
+  await find.getByRole("button", { name: "Find" }).click();
+  await page.waitForURL(/q=skate/);
+  await t.seeText(card(page, file.name).locator(".media-name"), "Skate Game (Mac)");
+  const response = await page.request.get(new URL(`/n-admin/media/${file.name}`, page.url()).href);
+  t.equal(response.headers()["content-disposition"], 'attachment; filename="skate-game-mac.zip"', "it downloads under the new name");
+
+  page.answers.push(false);
+  await card(page, file.name).getByRole("button", { name: "Rename" }).click();
+  await t.seeText(card(page, file.name).locator(".media-name"), "Skate Game (Mac)", "Cancel changes nothing");
+
+  await find.getByLabel("Find in Media").fill("downloads");
+  await find.getByRole("button", { name: "Find" }).click();
+  await page.waitForURL(/q=downloads/);
+  t.check((await cards(page).count()) >= 1, "finds by where it is used");
+  await find.getByLabel("Find in Media").fill("no such thing");
+  await find.getByRole("button", { name: "Find" }).click();
+  await t.seeText(page.locator(".empty-state"), 'Nothing matches "no such thing".');
+  await t.fits(page, "Media with a search");
+  if (t.browserName === "chrome") await t.shot(page, "media-search-desktop-light");
+});
+
+scenario("posts: tags from Settings show in the list and find the post", async (t) => {
+  const page = await t.page();
+  await newPost(t, page);
+  await page.getByLabel("Title").fill("Tagged post");
+  await page.locator(VISUAL).click();
+  await page.keyboard.type("Words.");
+  await openSettings(page);
+  await page.getByLabel("Tags").fill("Games,  web dev, games");
+  await t.fits(page, "editor settings with tags");
+  if (t.browserName === "chrome") await t.shot(page, "editor-tags-desktop-light");
+  await page.getByRole("button", { name: "Publish" }).click();
+  await page.waitForURL(/saved=1/);
+  t.equal(await page.getByLabel("Tags").inputValue(), "Games, web dev", "tags are tidied");
+  t.check(cms.tags().some((tag) => tag.slug === "web-dev"), "the site sees the tag");
+  t.equal(cms.posts({ tag: "games" })[0]?.title, "Tagged post", "and the post under it");
+
+  await t.go(page, "/n-admin");
+  const row = page.locator(".posts tr", { hasText: "Tagged post" });
+  await t.visible(row.getByRole("link", { name: "web dev" }), "the list shows the tags");
+  await row.getByRole("link", { name: "web dev" }).click();
+  await page.waitForURL(/q=web/);
+  t.equal(await page.locator(".posts tr").count(), 1, "a tag finds its posts");
+  await t.fits(page, "posts with tags");
+  if (t.browserName === "chrome") await t.shot(page, "posts-tags-desktop-light");
 });

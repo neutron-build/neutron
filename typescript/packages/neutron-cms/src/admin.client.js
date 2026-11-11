@@ -60,6 +60,8 @@ async function uploadImage(picked, again = true) {
   for (const [key, value] of Object.entries(prepared)) if (value) form.set(key, value);
   const response = await cms("upload", form);
   if (response.status === 401) throw new Error("Signed out. Log in again in another tab, then retry.");
+  // The server turns away a request this large before the admin sees it, so it has no message of its own.
+  if (response.status === 413) throw new Error("That image is over 10 MB.");
   if (!response.ok) {
     const result = await response.json().catch(() => ({}));
     if (result.empty && again) return uploadImage(picked, false);
@@ -120,7 +122,7 @@ if ($("[data-add-image], [data-row=add-photos], [data-edit-frame], .image-field"
 }
 
 let recentFiles = [];
-if ($("[data-add-file]")) {
+if ($("[data-add-file], [data-edit-frame], .file-field") || $$("template").some((t) => t.content.querySelector(".file-field"))) {
   fetch(`${ADMIN}/media?files=1`, { headers: { "x-cms": "1" } }).then((r) => (r.ok ? r.json() : { files: [] })).then((data) => { recentFiles = data.files; }, () => {});
 }
 
@@ -162,6 +164,47 @@ function chooseFile() {
     dialog.showModal();
   });
 }
+
+/** Choosing a file and, for a new one, uploading it. Resolves to { url, label }, or null. Throws what went wrong. */
+async function addFile(progress = () => {}) {
+  const choice = await chooseFile();
+  if (!choice?.file) return choice;
+  const { file } = choice;
+  progress(0);
+  const added = await uploadFile(file, progress);
+  recentFiles = [{ ...added, bytes: file.size }, ...recentFiles.filter((other) => other.url !== added.url)].slice(0, 30);
+  return added;
+}
+
+// A file field is a link field with an Upload button: the button fills in the address of a file in Media.
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-row=file]");
+  if (!button) return;
+  const input = $("input", button.closest(".file-field"));
+  const state = $("[data-state]", button.closest("form"));
+  button.disabled = true;
+  try {
+    const choice = await addFile((done) => { button.textContent = `${Math.round(done * 100)}%`; });
+    if (choice) {
+      input.value = choice.url;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  } catch (error) {
+    state.classList.add("bad", "error");
+    state.textContent = error.message;
+  }
+  button.textContent = "Upload";
+  button.disabled = false;
+});
+
+// Naming an upload: asked here, saved by its form.
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-rename]");
+  if (!button) return;
+  const title = prompt("A name to find this by. A file downloads under it.", button.dataset.rename);
+  if (title === null) return event.preventDefault();
+  button.form.elements.title.value = title;
+});
 
 /** A click on a dialog's backdrop. Its own padding is the dialog too, so the target alone can't tell. */
 function outside(dialog, event) {
@@ -565,20 +608,19 @@ function startEditor(form) {
 
   // A file becomes a link to it: over the selected words, or under its own name.
   $("[data-add-file]").addEventListener("click", async () => {
-    let choice = await chooseFile();
-    if (choice?.file) {
-      const { file } = choice;
-      uploading += 1;
-      try {
-        choice = await uploadFile(file, (done) => show(`Uploading ${file.name}, ${Math.round(done * 100)}%`));
-        recentFiles = [{ ...choice, bytes: file.size }, ...recentFiles.filter((other) => other.url !== choice.url)].slice(0, 30);
-        show("");
-      } catch (error) {
-        choice = null;
-        show(error.message, true);
-      }
-      uploading -= 1;
+    let choice = null;
+    let began = false;
+    try {
+      choice = await addFile((done) => {
+        if (!began) uploading += 1;
+        began = true;
+        show(`Uploading, ${Math.round(done * 100)}%`);
+      });
+      if (began) show("");
+    } catch (error) {
+      show(error.message, true);
     }
+    if (began) uploading -= 1;
     if (!choice) return;
     if (body.dataset.visual) return body.dispatchEvent(new CustomEvent("cms:file-link", { detail: choice }));
     const { selectionStart: start, selectionEnd: end } = body;

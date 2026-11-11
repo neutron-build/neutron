@@ -22,7 +22,8 @@ export const cms = defineCms({
     gallery: { fields: { image: { type: "image", required: true }, caption: "text" } },
     events: { sortBy: "date", fields: { title: { type: "text", required: true }, date: { type: "date", required: true } } },
     team: { fields: { name: "text", photo: "image", site: "url" } },
-    press: { fields: { outlet: "text", link: "url" } },
+    press: { fields: { outlet: "text", link: "url", kit: "file" } },
+    downloads: { fields: { name: "text", file: "file" } },
     shots: { fields: { image: "image", caption: "text" } },
   },
 });

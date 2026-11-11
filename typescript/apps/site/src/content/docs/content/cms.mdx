@@ -109,7 +109,8 @@ export default function Home(props: { data?: Data }) {
 
 The object returned by `defineCms` has these reads:
 
-- `cms.posts()`: published posts, newest first.
+- `cms.posts()`: published posts, newest first. `cms.posts({ tag })` gives the posts under one tag.
+- `cms.tags()`: every tag on a published post, as `{ name, slug, count }`, most used first.
 - `cms.post(slug)`: one published post, or `undefined`.
 - `cms.pages()`: published standalone pages, newest first. Designed pages with a fixed address are left out.
 - `cms.page(slug, request?)`: one published page. Pass the request and a draft opened from the admin's Edit site shows too.
@@ -164,7 +165,7 @@ Uploaded images are stored in `media/` under the data directory and served at `/
 
 ## Fields and lists
 
-A field type is one of `text`, `textarea`, `url`, `image` or `date`. A field is either a type or an object `{ type, label, required }`. Labels default to the key, capitalized.
+A field type is one of `text`, `textarea`, `url`, `image`, `file` or `date`. A field is either a type or an object `{ type, label, required }`. Labels default to the key, capitalized.
 
 ```ts
 defineCms({
@@ -284,6 +285,9 @@ Posts and pages have a "Publish on" date. Leaving it empty publishes now; a futu
 - **Editor.** Post and page bodies are Markdown, written in a visual editor: headings, lists, links and images show as they will look, a toolbar appears over selected text, and typed Markdown such as `## ` or `**bold**` turns into formatting. Clicking an image asks for its description. The editor reads with the same parser the site renders with and refuses any round trip that would change the page, so HTML and anything else it cannot draw stays as an editable source block; a post it cannot show exactly opens as Markdown. Settings has a switch to write in Markdown instead. Set `previewCss` to your post styles as a string so the admin's preview matches the site.
 - **Images and media library.** Uploads are scaled to at most 2000px on the long side, with a thumbnail. **Media** shows every upload, newest first, with where each is used, a filter for unused ones, upload by drop, Copy address and Delete. An image used in a post, page, list or text cannot be deleted. "Add image" in the editor, and image fields, offer recent uploads to reuse.
 - **Files.** Media also takes PDF, ZIP, 7z, gz and tar, audio (MP3, M4A, WAV, OGG, FLAC), video (MP4, WebM, MOV), text, CSV, JSON, EPUB, Word, Excel and PowerPoint files, up to 100 MB each. They upload in small parts, so no server limit needs raising. "Add file" in the editor uploads one, or picks one already there, and links the selected words to it (or adds a link under the file's name). A file is always served as a download, never opened as a page of your site. On the site the link is `<a class="file" download>`, so your CSS can show it as a button: style `.file`.
+- **File fields.** A `file` field is a link field with an Upload button: the button puts a file in Media, or picks one already there, and fills in its address. A pasted link to a file elsewhere works too. On the site it is an address like any other: `<a href={item.file} download>`.
+- **Tags.** Posts have tags, typed in a post's Settings with commas between them. `post.tags` is the text as typed and `tagsOf(post)` gives each as `{ name, slug }`; `cms.tags()` lists every tag on a published post with its `count`, most used first; `cms.posts({ tag })` gives the posts under one, by name or slug. Two spellings with the same slug, such as "Web Dev" and "web dev", are one tag. Pages have no tags.
+- **Finding and naming uploads.** With more than a dozen uploads, Media has a search: it finds an upload by the name you gave it, the name it was uploaded under, or where it is used. "Name" on an upload gives it a name of your own. Its address does not change, so nothing that links to it breaks, and a file downloads under the new name.
 - **Embeds.** **Embed** in the editor takes a YouTube, Vimeo or Spotify link, or an `<iframe>` from any https site, and shows the player in the post. A player link pasted alone on an empty line becomes one too, with Keep as link to undo it. It is stored as plain iframe HTML.
 - **Versions.** Each post keeps its last 50 versions, restorable from Settings, Versions: every update of a published post, and one every ten minutes while a draft is written.
 - **Trash.** Deleting moves a post to the Trash, with an Undo, for 30 days.
@@ -352,7 +356,7 @@ Other notes:
 ## Limits
 
 - Two kinds of account: the owner, and people who can edit everything but not manage people.
-- Uploads are limited to 2000px on the long side, and the original is not kept.
+- Images are limited to 2000px on the long side and 10 MB, and the original is not kept.
 - Images are not deleted when content stops using them. Delete them from Media; "Delete all unused" leaves those kept for undo and any added in the last day.
 - Images that are not uploads, such as files in your `public/` folder, are not listed in Media.
 - It edits content, not layout.

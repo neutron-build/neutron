@@ -1,5 +1,5 @@
 // Runs in the admin page and reaches into the framed site, so visitors never receive any of it.
-// Uses `$`, `cms`, `uploadImage` and `chooseImage` from admin.client.js.
+// Uses `$`, `cms`, `uploadImage`, `chooseImage` and `addFile` from admin.client.js.
 
 const frame = $("[data-edit-frame]");
 const tools = $("[data-edit-tools]");
@@ -269,6 +269,22 @@ function drawTools() {
     const label = Object.assign(document.createElement("label"), { className: "edit-field" });
     label.append(field.label, input);
     tools.append(label);
+    if (field.type === "file") {
+      const upload = button("Upload", `Upload ${field.label.toLowerCase()}`, async () => {
+        upload.disabled = true;
+        try {
+          const choice = await addFile((done) => say(`Uploading, ${Math.round(done * 100)}%`));
+          if (choice) {
+            input.value = choice.url;
+            input.dispatchEvent(new Event("input"));
+          }
+        } catch (error) {
+          say(error.message, true);
+        }
+        upload.disabled = false;
+      });
+      tools.append(upload);
+    }
   }
 
   if (list.arrangeable) tools.append(...arrangeTools(key, list));

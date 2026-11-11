@@ -4,7 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-cms 0.1.1 (not yet published).
+cms 0.1.2, create 0.1.14 (not yet published).
+
+### Added
+
+- **`@neutron-build/cms` 0.1.2.**
+  - A `file` field type for lists and texts: a link field with an Upload
+    button that fills in the address of a file in Media.
+  - Tags on posts: typed in Settings, read with `tagsOf(post)`,
+    `cms.tags()` and `cms.posts({ tag })`.
+  - Media search, by name or by where an upload is used, and a name of your
+    own for any upload. A named file downloads under that name; its address
+    stays the same.
+- **`@neutron-build/create` 0.1.14.** The `blog` template shows links to
+  Media files as download buttons and pins `@neutron-build/cms` to `^0.1.2`.
+
+### Fixed
+
+- **cms: the image limit is 10 MB, as the server enforces.** It said 12 MB,
+  but the framework turns away any request over 10 MB first, so a larger
+  image failed with "Upload failed". The limit and its message now agree.
+
+## 2026-11-11 (cms 0.1.1, create 0.1.13)
 
 ### Added
 
