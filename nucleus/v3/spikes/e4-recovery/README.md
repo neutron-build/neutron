@@ -11635,3 +11635,40 @@ before the first of them). Every number is a **probe, not evidence**:
   stop-and-keep; `thin` candidate (reaches required 200 with hold and
   wall passing); the walk continues to B.2.** Probe, not evidence.
 
+- **ladder B rung B.2** (FINAL's `w7_share` 200, nothing else):
+  `GUARD wait=ok load_at_start=6.88 12.36 10.84 wall_s=239.711
+  cpu_s=3194.415 busy_s=3168.000 foreign_pct=-0.83 verdict=CLEAN`;
+  `PROBE_WALL raw_s=239.6 min_per_10k=39.9 load_at_start=1.89 9.47
+  9.95` (≤ 50); `PROBE_CPU user_sys_s=3194.3`; **Q7 410** (raw 41 —
+  ≥ 250, the margin). Changed rows vs B.1: Q7 200→410, Q5a 340→470
+  (up again), Q8 330→310, Q11 420→390, Q12 270→260, Q5b 6830→6770,
+  Q5c 5330→5270, Q9 10160→10120, Q13a 890→880, Q14 400→420, Q16
+  6730→6690, Q17 10340→10250, SZC 2350→2320, Q10 460→450 (not held),
+  SIZING 7160→7190. All rows (per10k): Q1 7990 (hooks unchanged:
+  Before0 840, After0 740, Mid2 810, After1 780, After2 680, After3
+  820, Mid6 900, After4 770, After5 810, After6 840), Q2 4380, Q3
+  1310, Q4 1670, Q4-I 2160, Q5a 470, Q5b 6770, Q5c 5270, Q6a 2140,
+  Q6b 1220, **Q7 410**, Q8 310, Q9 10120, Q10 450 (not held), Q11
+  390, Q12 260, Q13a 880, Q13b 960, Q13c 970, Q14 420, Q15 1280, Q16
+  6690, Q17 10250, Q18 4290, SIZING 7190 misses, SZC 2320, SZC-MP 0
+  (this file), SZC-MW 140, SZI 810. Fails: none in 0..1000. Hold set:
+  Q4 1670 ≥ 1500 ✓, Q4-I 2160 ≥ 1500 ✓, Q5a (watched) 470 ≥ 200 ✓,
+  every B.0-met row at or above its minimum ✓ (Q2 4380, Q3 1310, Q5b
+  6770, Q5c 5270, Q6a 2140, Q6b 1220, Q8 310, Q9 10120, Q11 390, Q12
+  260, Q13a/b/c 880/960/970, Q14 420, Q15 1280, Q16 6690, Q17 10250,
+  Q18 4290, SZC 2320, SZC-MW 140, SZI 810; every Q1 hook 680–900).
+  Wall passes, CLEAN. **Stop-and-keep at B.2: Q7 410 ≥ 250 (required
+  200 × 1.25), the hold set passes and the wall passes — the walk
+  ends here; rung B.3 never runs.** Probe, not evidence.
+
+- **Ladder B outcome: stop-and-keep at B.2.** FINAL keeps
+  `w7_share` 200 — the first rung to reach the margin (410 ≥ 250)
+  with the hold set and the wall limit passing. B.1 read Q7 exactly
+  200 (a `thin` candidate, under the margin); B.2's 410 clears it
+  with the owner's Q4 bar intact (1670 ≥ 1,500) and Q5a watched
+  upward (470 ≥ 200). No ESCALATE: the ladder met its row. The main
+  digests move by design at this setting (every moved seed is
+  uniform-mode — the pins at 7, 8, 27, 28, 1069 and 3669 are
+  targeted-mode and cannot move; P's gate reads the whole-10k
+  moves). Probe, not evidence.
+

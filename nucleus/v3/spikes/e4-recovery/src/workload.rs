@@ -372,9 +372,9 @@ impl Tuning {
         r41p_share: 500,
         r0_fill_txns: 0,
         r0_fill_ops: 0,
-        // **Ladder B rung B.1:** the drop-walk window share, 100
+        // **Ladder B rung B.2:** the drop-walk window share, 200
         // permille of the uniform-mode drop rounds.
-        w7_share: 100,
+        w7_share: 200,
     };
 
     /// **X5-R44 (card X-5c-F4-F2 step 2; REFRESH 9; owner decision

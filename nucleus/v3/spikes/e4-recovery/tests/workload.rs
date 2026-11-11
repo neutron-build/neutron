@@ -505,7 +505,7 @@ fn x5_r37_final_is_the_kept_setting() {
         r41p_share: 500,
         r0_fill_txns: 0,
         r0_fill_ops: 0,
-        w7_share: 100,
+        w7_share: 200,
     };
     assert_eq!(
         workload::Tuning::FINAL,
