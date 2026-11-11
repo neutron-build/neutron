@@ -4163,3 +4163,37 @@ fn x5f2s3_joint_arm_census_line() {
         "JOINT_ARM_CENSUS set=held-out seeds=0 arm_rounds=0 stale_reads=0 arm_seeds=[]"
     );
 }
+
+// ---- card X-5c-F4-F5: X5-R55 (round-0 fill) and X5-R56 (drop-walk
+// ---- window), their ladders and their pins ----
+
+/// **X-5c-F4-F5 step 1: the FINAL-digest pin.** Measured at the Base
+/// (`card/v3-X-5c-F4-F4`, tip `18d2530f`) before any `src/` change of
+/// this card, and byte-identical to the digests in X-5c-F4-F4's 10k
+/// file of record (`runlogs/X-5c-F4-F4.main.json`, sha256
+/// `549495c5…`): seeds 7, 8, 27, 28 are MP class, 1069 and 3669 are
+/// MW class and the live-arm seeds of the census. Every one is
+/// **targeted-mode** (`(s / 10) % 2 == 0`), so X5-R56 cannot move
+/// them at any `w7_share` (its pick draws only in uniform-mode drop
+/// rounds), and X5-R55 is 0 in FINAL by construction. A moved digest
+/// here means one of the two amendments leaked into FINAL's scripts
+/// (**M-FILL-IN-FINAL**, FINAL's `r0_fill_txns` 1, reverts this).
+#[test]
+fn x5f5_final_digests_unmoved() {
+    const WANT: &[(u64, u64)] = &[
+        (7, 4105656712),
+        (8, 2853715358),
+        (27, 3658974780),
+        (28, 2116323439),
+        (1069, 1368123406),
+        (3669, 2239733510),
+    ];
+    for (seed, want) in WANT {
+        let rec = workload::run_seed_with(*seed, None, &workload::Tuning::FINAL);
+        assert_eq!(
+            rec.digest, *want,
+            "seed {seed}: X5-R55 (fill 0 in FINAL) and X5-R56 (every pinned seed is \
+             targeted-mode) must not move FINAL's digest"
+        );
+    }
+}
