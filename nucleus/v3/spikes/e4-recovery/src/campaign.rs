@@ -256,22 +256,39 @@ fn parse_seeds(args: &[String], default: u64) -> (u64, u64) {
     (lo, hi)
 }
 
-/// **Card X-5c-F4-F2 step 2:** parse `--seeds A..B` when the flag is
-/// present (`None` when absent — the forms' dispatch needs the
-/// distinction: a `run` with neither `--seeds` nor `--set` means
-/// `main`, never a default range).
-fn parse_seeds_opt(args: &[String]) -> Option<(u64, u64)> {
+/// **Card X-5c-PINS-2 item 6 (verdict `9f96f31e` finding 3, Follow-ups
+/// F3): parse `--seeds A..B` when the flag is present, refusing a
+/// malformed value.** `Ok(None)` when absent (the forms' dispatch needs
+/// the distinction: a `run` with neither `--seeds` nor `--set` means
+/// `main`, never a default range); `Ok(Some((lo, hi)))` when the value
+/// reads `A..B` with both halves non-negative integers; `Err` — exit 2
+/// at the command level, before anything runs, exactly like
+/// [`run_form`]'s refusals — when it does not (`--seeds 5`,
+/// `--seeds abc`, `--seeds a..b` all refuse). The old reader skipped a
+/// value with no `..`, so `run --seeds 5` silently became a full
+/// `main` run and `--set mp-pressure --seeds 5` was accepted despite
+/// "always refused"; **M-SEEDS-SKIPPED** reverts to that skip and fails
+/// the pure pin. [`parse_seeds`] (the sweep/mutants default parser) and
+/// `verify`'s parsing do not change. Pub for the card's pure pin.
+pub fn parse_seeds_opt(args: &[String]) -> Result<Option<(u64, u64)>, String> {
     let mut i = 0usize;
     while i + 1 < args.len() {
-        if args[i] == "--seeds"
-            && let Some(v) = args.get(i + 1)
-            && let Some((a, b)) = v.split_once("..")
-        {
-            return Some((a.parse().unwrap_or(0), b.parse().unwrap_or(0)));
+        if args[i] == "--seeds" {
+            let v = &args[i + 1];
+            let bad = || {
+                format!(
+                    "--seeds {v:?} is not a range: it must read A..B \
+                     (both halves non-negative integers)"
+                )
+            };
+            let (a, b) = v.split_once("..").ok_or_else(bad)?;
+            let lo = a.parse::<u64>().map_err(|_| bad())?;
+            let hi = b.parse::<u64>().map_err(|_| bad())?;
+            return Ok(Some((lo, hi)));
         }
         i += 1;
     }
-    None
+    Ok(None)
 }
 
 /// **Card step 2:** parse a value flag (`--set <name>`,
@@ -667,11 +684,20 @@ fn cmd_run(args: &[String]) -> i32 {
     // **Card X-5c-F4-F2 step 2 (REFRESH 9): the run forms.** `--set`
     // determines the seeds and the tuning and records the set in the
     // file; the probe forms record no set. Every refusal (exit 2) is
-    // decided by [`run_form`] before anything runs.
+    // decided by [`run_form`] before anything runs — and, card
+    // X-5c-PINS-2 item 6, a malformed `--seeds` value refuses one step
+    // earlier still, so no `run` form can fall through to a run.
+    let seeds_flag = match parse_seeds_opt(args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("e4-campaign run: {e}");
+            return 2;
+        }
+    };
     let form = match run_form(
         parse_flag(args, "--set").as_deref(),
         parse_flag(args, "--probe").as_deref(),
-        parse_seeds_opt(args),
+        seeds_flag,
     ) {
         Ok(f) => f,
         Err(e) => {

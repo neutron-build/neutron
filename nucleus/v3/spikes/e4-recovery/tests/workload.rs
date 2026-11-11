@@ -4241,6 +4241,54 @@ fn x5_r44_probe_forms_seed_lists_and_refusals() {
     }
 }
 
+/// **Card X-5c-PINS-2 item 6 (verdict `9f96f31e` finding 3, Follow-ups
+/// F3): a malformed `--seeds` value refuses in every `run` form.**
+/// [`campaign::parse_seeds_opt`] refuses a present `--seeds` whose
+/// value is not `A..B` with both halves non-negative integers — pure,
+/// decided before anything runs — and `cmd_run` prints the refusal and
+/// exits 2 one step before [`run_form`]'s own refusals, so no `run`
+/// form can fall through to a run: the old reader's skip (a value with
+/// no `..` read as absent) turned `run --seeds 5` into a full `main`
+/// run and accepted `--set mp-pressure --seeds 5` despite "always
+/// refused". **M-SEEDS-SKIPPED** (the old skip) fails the pure half
+/// first — which is also why the command-level loop below can never
+/// start a run under it: the pure assertion aborts the test before it.
+#[test]
+fn x5_r44_malformed_seeds_refuse_in_every_run_form() {
+    let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // The pure reader: each malformed value refuses.
+    for v in ["5", "abc", "a..b", "1..", "..7", "-1..5", "1..2x"] {
+        assert!(
+            campaign::parse_seeds_opt(&a(&["--seeds", v])).is_err(),
+            "--seeds {v:?} must refuse (M-SEEDS-SKIPPED reads it as absent)"
+        );
+    }
+    // The well-formed and absent cases keep their readings.
+    assert_eq!(
+        campaign::parse_seeds_opt(&a(&["--seeds", "0..200"])),
+        Ok(Some((0, 200)))
+    );
+    assert_eq!(campaign::parse_seeds_opt(&a(&[])), Ok(None));
+    // Command level: a malformed --seeds refuses (exit 2) in every
+    // combination — --set main, --set mp-pressure, --probe mp-pressure,
+    // and alone (never a silent fall-through to main).
+    let out = "/tmp/opencode/x5pins2-seeds-refusal.json";
+    for args in [
+        a(&["--seeds", "5", "--out", out]),
+        a(&["--set", "main", "--seeds", "5", "--out", out]),
+        a(&["--set", "mp-pressure", "--seeds", "abc", "--out", out]),
+        a(&["--probe", "mp-pressure", "--seeds", "5", "--out", out]),
+    ] {
+        let mut full = vec!["run".to_string()];
+        full.extend(args.iter().cloned());
+        assert_eq!(
+            campaign::main(&full),
+            2,
+            "the malformed --seeds refusal exits 2 before anything runs: {args:?}"
+        );
+    }
+}
+
 // ---- card X-5c-F4-F2 step 3: the JOINT_ARM_CENSUS (P ruling G5-CENSUS (c)) ----
 
 /// A record with per-round census fields (`twin_joint_arm`,
