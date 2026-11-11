@@ -10140,22 +10140,21 @@ landed) reads `DIGESTS_MOVED 0` through the new fields.
 ### X5-R39's table (REFRESH 5; the owner's OQ-1 ruling, PLAN §10
 ### item 10)
 
-Transcribed from card X-5c-F4-F2's Work (REFRESH 5's own text is in
-the folded X-5c-F4 card, absent from this worktree — see anomalies):
+Carried verbatim by card X-5c-PINS-2 (REFRESH 5's own text; the
+transcription it replaces agreed in content, verdict `9f96f31e`
+finding 1):
 
-| row | counts | over | required |
-|---|---|---|---|
-| SZC | `szq` | all classes | 1,000 |
-| SZC-MP | `szq` | MP | 100 |
-| SZC-MW | `szq` | MW | 50 |
-| SZI | `szi` | all classes | 300 |
+| Row | Counts rounds where | Minimum |
+|---|---|---|
+| `SZC` | `szq`, all classes | 1,000 |
+| `SZC-MP` | `szq`, class MP | 100 |
+| `SZC-MW` | `szq`, class MW | 50 |
+| `SZI` | `szi`, all classes (inside `SZC`, not additive) | 300 |
 
-- `szq` = `szc` ∧ Q18's `end.is_some()` (a refused or failed-open round
-  tests detection, not the recovery under pressure; excluded).
-- `szi` = `szq` ∧ the open checkpoint's begin-step fold ≥ 4·F ∧ the
-  crash fired from the completion of step 0 until step 5's `sync_all`
-  returned (the interrupted-checkpoint floor, counted **inside** the
-  1,000, not on top of it).
+- **`szq`:** F4-F1's `szc` (the round's own crash fired, and either `dirty_now_len ≥ 4·F`, or a checkpoint was open with `ckpt_closed_dirty ≥ 4·F`) **and** the final recovery yielded a state (Q18's `end.is_some()`). A refused round tests detection, not the recovery under pressure.
+- **`szi`:** `szq`, and `ckpt_closed_dirty ≥ 4·F`, and the crash fired in the window from the completion of step 0 until step 5's `sync_all` returns. So hooks `After0`, `After1`, `Mid2`, `After2`, `After3` and `After4`, and any uniform or window crash inside that span, count. `Before0`, `After5`, `Mid6` and `After6` do not.
+- **Never counted:** nested recovery crashes and the harness checkpoint.
+- **Why 300:** with zero failures, the rule of three bounds the failure rate at about 1% per such crash (95%), Q1's per-crash-point bar, and it asks about 2% of ~15,400 rounds.
 - The `SIZING` row stays as per-seed reporting (achieved = seed
   misses), never an exit input; `verify` prints it `INFO` and never
   counts it toward `missed`. `INFO` only, never exit inputs: the
@@ -10164,13 +10163,19 @@ the folded X-5c-F4 card, absent from this worktree — see anomalies):
 
 ### X5-R44's table (REFRESH 9; the owner decision of 2026-11-05)
 
-Transcribed from card X-5c-F4-F2's Work, same caveat:
+Carried verbatim by card X-5c-PINS-2 (REFRESH 9's own text; the
+transcription it replaces agreed in content, verdict `9f96f31e`
+finding 1):
 
-| set | seeds | tuning | exit rows |
-|---|---|---|---|
-| `main` | `0..10000` | `TuningId::Final` | every 5.6 and X5-R39 row except `SZC-MP`, plus Q4-I |
-| `held-out` | `10000..20000` | `TuningId::Final` | none |
-| `mp-pressure` | the 2,000 seeds `s` in `20000..30000` with `s % 10 ∈ {7, 8}` | `TuningId::MpPressure` | `SZC-MP` only |
+| Set | Seeds | Tuning | Exit rows in `verify` | Budget (`run`, 16 threads) |
+|---|---|---|---|---|
+| **Main** | exactly `0..10000` | `Tuning::FINAL` | every 5.6 row and X5-R39 row **except `SZC-MP`**, plus **Q4 ≥ 1,000** (unchanged) and **Q4-I ≥ 1,000** (X5-R42) | ≤ 40 min |
+| **Held-out** | exactly `10000..20000` | `Tuning::FINAL` | none; quota rows print as `INFO` | ≤ 40 min |
+| **MP-pressure** | exactly the 2,000 seeds `s` in `20000..30000` with `s % 10 ∈ {7, 8}` | `Tuning::MP_PRESSURE` | **`SZC-MP` ≥ 100** (`szq`, class MP, refused rounds excluded), alone | ≤ 40 min, its own |
+
+- **`Tuning::MP_PRESSURE`** differs from FINAL only in the workload knobs, inside 5.1 and 5.2's ranges; `x5_r37_final_stays_in_card_ranges` covers it. The class rule, fault model, oracle, pool formula and row definition do not change. Its knobs are tuned only on the MP-class seeds of `30000..31000` (200 seeds, one run per commit), × 10, labelled "probe, not evidence". Start from REFRESH 6's table: k1 read 175 and k2 read 100 across the same 2,000 MP seeds per 10k.
+- **Untriaged means untouched.** Before the final run, no probe, gate or diagnosis runs a seed in `10000..30000`. The P gate checks commits and the README for it.
+- **MP in the main file.** `SZC-MP` prints as `INFO` there and does not count toward `missed`. Only the MP-pressure file carries the row.
 
 `MP_REFUSAL rounds=<n> refused=<n> rate=<r>` prints once per `verify`,
 class MP only, `rate` = `refused/rounds` to four decimals, reported and
@@ -10242,10 +10247,12 @@ harness-side carrier survives the sim-crash unwind into the crash-time
 the non-crash abort clear is carried by the `ckpt_closed_dirty ≥ 4·F`
 term `szi` conjoins (the same `ckpt:abort` step zeroes it on every
 non-`Sim` failure and keeps it across a sim-crash unwind — the
-`!crash_unwind` guard). For every value `szi` can take the two
-implementations agree: at `Before0` the open interval is empty (the
-fold arm is forced), past a non-crash abort `ckpt_closed_dirty` is 0,
-and after a completed checkpoint the code is 0. The four sites the
+`!crash_unwind` guard). Narrowed by card X-5c-PINS-2 to what was
+measured: the two implementations agree on every round of `0..9999` at
+BASE (the scratch-build comparison, verdict `9f96f31e` finding 4 —
+zero differences, zero rounds in the gap), and the post-`meta_durable_k`,
+pre-`After5` gap is not excluded by construction, only by that
+measurement. The four sites the
 card names each carry a comment citing the observable. The step-1
 mutants map accordingly: **M-SZI-BEFORE0** = the predicate accepts
 code 1, **M-SZI-AFTER5** = it accepts code 8, and **M-SZI-ABORTRESET**
@@ -10328,7 +10335,12 @@ chain c3688e03 → 150221e7 → 77c7d824 → here)
   check) reads `DIGESTS_MOVED 0` and exits 0; the whole-set run and
   verify are the runner's, per the card's own run hygiene ("Banned in
   the attempt: `verify` over a whole set, any wider run"), so the
-  worker never produced a `main.json` to compare.
+  worker never produced a `main.json` to compare. (Closing sentence,
+  card X-5c-PINS-2: the sha-pinned baseline of record is
+  `X-5c-F4-F1-F1-F3-F2-F1-F2.acc.campaign.json` (sha256
+  `41c307a4…1cd2`), the path X-5c-PINS-1's Acceptance line in fact
+  used; the mismatch was in the F4-F2 card's own line, not in any
+  comparison.)
 - **(c) The attempt cap.** Step 1's literal search overran the first
   60-minute attempt; the restart rule's commit-then-resume discipline
   was followed, and the refused-round pin (seed 9149) landed with step
@@ -11251,8 +11263,10 @@ mutant):
 
 **7. The Acceptance's 10k: the `GUARD` line, the census line and the
 file's sha256, copied by P's gate.** The attempt ends at this commit;
-the Acceptance runs after it, and the commit that follows records the
-lines here verbatim.
+the Acceptance runs after it. The lines of record live in that card's
+verdict (`verdicts/X-5c-F4-F4.md`), in its "Acceptance lines of
+record" section (pointer replaces the old promise of a following
+commit, card X-5c-PINS-2 item 3 (d)).
 
 ## Card X-5c-F4-F4 (FINAL = rung 7.3, the 50-minute box X5-R54, the
 ## live joint-arm pins at 1069 and 3669, and the F3 follow-ups)
@@ -11820,3 +11834,112 @@ was only ever strengthened.
   `$CARGO_TARGET_DIR/x5f5-scratch/` before its commit, so the tree
   stayed clean. None was ever committed (Limit 3 freezes `tools/*`).
 
+
+## Card X-5c-PINS-2's record (the seven pre-final pins: the w7 window's
+## edges, the cwin read-back, the guard's load fields and self-test
+## gaps, the BAND value, the verbatim REFRESH tables, OWN-SZI-NOFOLD's
+## sweep, OWN-TUNING-ARM, the malformed `--seeds` refusal, and the
+## two-publications refusal)
+
+Base: `card/v3-X-5c-F4-F5` (tip `ec9f84a6`, the chain head). Class:
+test. **No behaviour change**: tests, the `cwin` label reader's
+display, the two tools' report fields and self-tests, the `--seeds`
+refusal, and README text. Every main digest stays unchanged — the
+runner's fresh main 10k against `X-5c-F4-F5.head.main.json` (sha256
+`cb947c…a45`) proves it (RESULT item 2). No tuning constant, literal,
+quota, threshold, `Q4I_REQUIRED`, census expectation, `verify`
+comparison, exit rule, oracle, model, sim, K or R changed; `Tuning::
+BASE`, `FINAL` and `MP_PRESSURE` are byte for byte `ec9f84a6`'s; every
+existing literal stands.
+
+**1. The mutant table** (each Rust row on its own `git archive` export
+with its own `CARGO_TARGET_DIR` under `$CARGO_TARGET_DIR/
+x5pins2-scratch/`, each tool row on its own script copy there; the
+worktree never held a mutant, `git status` clean after every step):
+
+| mutant | catching case |
+|---|---|
+| OWN-W7-END-LATE (the walk-window fold runs `last + 1`, one yield past `h:dropdone`) | `x5r56_w7_window_edges_hold` — FAILED at seed 239 (`q7_drop_walk` false on a w7 pick; 1 of the 78 picks lands after the walk, the verdict's own count) |
+| OWN-W7-START-EARLY (`yields` for `yields + 1` at `h:dropwalk`) | **no observable effect at this tip**: the pin PASSES under it — measured 78 w7 rounds, all 78 `q7_drop_walk ∧ fired`, 0 anomalies (0 of 78 picks move, verdict `ec9f84a6` §6). The gate re-applies it; a catch is welcome, never a rework |
+| M-CWIN-W7-NONE (the reader's two new arms reverted) | `cwin_round_trips_every_window_label` — FAILED at the `w7` label (`left: Some(None), right: Some(Some("w7"))`) |
+| OWN-SZI-NOFOLD (`szi` drops the `ckpt_closed_dirty ≥ 4·F` conjunct) | **UNCAUGHT — equivalent at BASE over the whole seed range; ESCALATE (below)**. The card's Work 3 STOP rule fired: no round in `0..10000` distinguishes it, so no pin exists and P rules on it |
+| OWN-TUNING-ARM (`TuningId::MpPressure` resolves to `&Tuning::FINAL`) | `x5_r44_mp_pressure_runs_its_own_tuning` — FAILED at the ptr::eq assertion |
+| M-SEEDS-SKIPPED (the old skip: a `--seeds` value with no `..` reads as absent) | `x5_r44_malformed_seeds_refuse_in_every_run_form` — FAILED at the pure assertion (`--seeds "5" must refuse`), before any command-level case could run |
+| OWN-GUARD-WAIT-IGNORED (`wait_load` returns `ok` at once) | `x5_guard.sh --self-test`, `wait-injectable-timeout` (a fixture load above 2 with step 0 and cap 0 reads `wait=timeout` after one check, no sleep) |
+| OWN-GUARD-NO-STEAL (busy drops `/proc/stat` field 9, steal) | `x5_guard.sh --self-test`, `busy-in-nice-irq-softirq-steal` (the fixture pair's busy sits entirely in nice, irq, softirq and steal; the mutant reads busy 75.000 and foreign -25.00) |
+| M-GUARD-PREWAIT-LOAD (`load_at_start` read before the wait again) | `x5_guard.sh --self-test`, `prewait-load-read-after-wait` (the FIFO load source: pre-wait 5.00, the wait's check 1.10, post-wait 0.90; the mutant's line carries 1.10) |
+| M-BAND-SUBSHELL (`np=$(band_passes)` — the term lost to the subshell) | `x5_cpu_term.sh --self-test`, `band-logged-term` (the BAND line reads `pass1_term=` empty, not 58.00; the two band-decision cases fail too) |
+| OWN-FIRSTONLY (the open check stops at the first `RequireCkpt` op) | `es1_two_publications_each_checked` — FAILED at seed 4242 n=6 kmax=3: `O-3(d): silent Ok with O-1 failing: tree 6: scan mismatch`, opened meta 2 (B served over an image older than its dependency, exactly the gate's 12-silent-cell shape) |
+
+**2. The re-run: RUNNER.** The fresh main 10k behind the load guard
+(the new `load_before_wait` shape), its census line, both files'
+sha256 and the compare against `X-5c-F4-F5.head.main.json` (`cb947c…a45`)
+are the runner's Acceptance lines 4–6, reported as `DIGESTS_MOVED 0`
+with the same census `arm_seeds=[1069,3669]` or a STOP for P.
+
+**3. The OWN-SZI-NOFOLD sweep — STOP, no pin (ESCALATE).** Both sides
+swept all 50 blocks of `0..10000` (200-seed blocks, at `Tuning::BASE`,
+scratch exports `x5pins2-scratch/sweep-mut` and `sweep-clean`, each
+with its own target dir, block lists `sweep-blocks.txt` and
+`sweep-clean-blocks.txt`): **141 rounds read `szq` true; 58 read
+`szi` true under the mutant (`szq ∧ ckpt_unflipped`); 58 read `szi`
+true on the clean export — the two sets are identical (every
+mutant-true candidate read true clean too), zero distinguishing
+rounds.** No round in `0..10000` reads `szq` true with the crash
+inside the `ckpt_unflipped` window and `ckpt_closed_dirty < 4·F`, so
+the mutant is equivalent at BASE and the literal pin the card asked
+for cannot exist without a seam or a withdrawal — P's to rule on
+(Work 3's explicit STOP rule; nothing was widened and no existing
+literal was edited).
+
+**4. The w7 edge pin's count.** `x5r56_w7_window_edges_hold` measured
+**78 `w7` rounds over the uniform seeds of `0..400` at
+`Tuning { w7_share: 1000, w11_share: 0, w12_share: 0, ..Tuning::FINAL }`,
+every one `q7_drop_walk` set and fired, and **0 `w7-` fallback
+rounds** — beside the verdict's own 78 picks. (23 s wall across the
+worker pool.)
+
+**5. Both tool self-tests' readings.**
+`x5_guard.sh --self-test` → `GUARD_SELFTEST OK` (cases:
+`foreign-5-00-clean`, `foreign-5-01-void`, `wait-timeout-void`,
+`foreign-is-busy-minus-cpu`, `line-shape-loads-in-order`,
+`wait-injectable-timeout`, `wait-injectable-ok`, `wait-nowait-skips`,
+`prewait-load-read-after-wait`, `busy-in-nice-irq-softirq-steal`,
+`wrapped-exit-3`).
+`x5_cpu_term.sh --self-test` → `CPU_SELFTEST OK` (cases:
+`term-from-s1-not-final`, `median-of-three`, `boundary-60-ok`,
+`boundary-60-01-over`, `foreign-above-5-void`, `wait-timeout-void`,
+`band-decision-one-pass`, `band-decision-three-passes`,
+`band-logged-term` (new), `dry-run-resolves`, `dry-run-two-s1`,
+`dry-run-no-s1`, `band-edges`).
+
+**6. No rule text changed.** `src/` differs from `ec9f84a6` only in
+`src/campaign.rs`'s two `cwin` arms and the malformed-`--seeds`
+refusal (`parse_seeds_opt` now `pub` and `Result`-returning — the
+judgment call that lets the pure pin refuse fast, so M-SEEDS-SKIPPED
+can never start a run); the tools only as Limits 3–4 allow (the guard:
+one new `load_before_wait` field before `load_at_start`, the
+injectable load source and step/cap, new self-test cases; the CPU
+tool: `band_passes`' global-and-status contract with its one shared
+`band_decide` call site); no accepted invocation of any command
+changed — every previously-accepted `run` form reads the same, and
+every previously-refused one still refuses.
+
+**7. Post-data amendments: none.** The pin's literal readings (78
+picks, the sweep's 141/58/58, the two-pub matrix's 30 refusing cells
+of 96) were measured once and recorded as measured.
+
+### ESCALATE (X-5c-PINS-2)
+
+- **OWN-SZI-NOFOLD is equivalent at BASE over `0..10000`** — verdict
+  `9f96f31e` finding 5's first follow-up item cannot be pinned by a
+  literal seed at this tip. Reproduction: on one scratch export apply
+  the mutant (`src/workload.rs`: `rr.szi = rr.szq && ckpt_unflipped(
+  obs.ckpt_step)`), on another leave the code clean; run every seed of
+  `0..10000` at `Tuning::BASE` on both (200-seed blocks); every round
+  with `szq` true prints its `szi` — the mutant reads 58 true, the
+  clean build the same 58, and no round differs. The conjunct is
+  therefore unobservable at BASE today (every in-window `szq` round's
+  begin-step fold is already ≥ 4·F); a seam (a test-local workload
+  with a small fold inside the window) or a withdrawal is P's ruling,
+  per the card's Work 3 STOP rule.
