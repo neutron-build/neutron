@@ -5,7 +5,7 @@ import { listImages, listMedia, saveImage } from "../../../dist/media.js";
 import { createPost, dataDir, getPost, listItems, replaceItems, savePost, trashPost } from "../../../dist/store.js";
 import { cms, imageFile, png } from "../fixture.mjs";
 import { pickFiles, scenario } from "../harness.mjs";
-import { caretAtEnd, markdown, newPost, openSettings, selectText, VISUAL } from "./editor.mjs";
+import { caretAtEnd, markdown, newPost, openSettings, postId, selectText, VISUAL } from "./editor.mjs";
 
 const cards = (page) => page.locator(".media-grid > li");
 const card = (page, name) => page.locator(".media-grid > li", { has: page.locator(`a[href$="${name}"]`) });
@@ -265,28 +265,63 @@ scenario("media: find by name or use, and give an upload a name", async (t) => {
   if (t.browserName === "chrome") await t.shot(page, "media-search-desktop-light");
 });
 
-scenario("posts: tags from Settings show in the list and find the post", async (t) => {
+scenario("posts: tags are picked, typed and removed in Settings, show in the list and find the post", async (t) => {
   const page = await t.page();
   await newPost(t, page);
   await page.getByLabel("Title").fill("Tagged post");
   await page.locator(VISUAL).click();
   await page.keyboard.type("Words.");
   await openSettings(page);
-  await page.getByLabel("Tags").fill("Games,  web dev, games");
+  const tags = page.locator(".field:has([name=tags])");
+  const entry = tags.getByLabel("Add a tag");
+  const saved = () => page.locator("[name=tags]").inputValue();
+  await entry.fill("Games");
+  await entry.press("Enter");
+  await entry.pressSequentially("web dev,");
+  await entry.fill("games");
+  await entry.press("Enter");
+  t.equal(await saved(), "Games, web dev", "Enter and a comma add a tag; one already there is not added twice");
+  t.equal(await tags.locator(".tag").count(), 2, "each shows as its own tag");
+  await entry.fill("Oops");
+  await entry.press("Enter");
+  await tags.getByRole("button", { name: "Remove Oops" }).click();
+  t.equal(await saved(), "Games, web dev", "the x takes a tag off");
+  await entry.fill("Music");
+  await entry.press("Enter");
+  await entry.press("Backspace");
+  t.equal(await saved(), "Games, web dev", "Backspace in the empty box takes the last one off");
+  await entry.fill("Typed then published");
   await t.fits(page, "editor settings with tags");
   if (t.browserName === "chrome") await t.shot(page, "editor-tags-desktop-light");
   await page.getByRole("button", { name: "Publish" }).click();
   await page.waitForURL(/saved=1/);
-  t.equal(await page.getByLabel("Tags").inputValue(), "Games, web dev", "tags are tidied");
+  t.equal(await saved(), "Games, web dev, Typed then published", "a tag still in the box is kept on Publish");
   t.check(cms.tags().some((tag) => tag.slug === "web-dev"), "the site sees the tag");
   t.equal(cms.posts({ tag: "games" })[0]?.title, "Tagged post", "and the post under it");
 
+  // A second post is offered the tags already in use.
+  await newPost(t, page);
+  await page.getByLabel("Title").fill("Second tagged");
+  await openSettings(page);
+  const again = page.locator(".field:has([name=tags])");
+  await t.visible(again.getByRole("button", { name: "Add Games" }), "tags in use are offered");
+  await again.getByLabel("Add a tag").fill("web");
+  t.equal(await again.locator(".tag-pick").count(), 1, "typing narrows them");
+  await again.getByRole("button", { name: "Add web dev" }).click();
+  t.equal(await page.locator("[name=tags]").inputValue(), "web dev", "a click adds one");
+  t.equal(await again.getByRole("button", { name: "Add web dev" }).count(), 0, "and it is no longer offered");
+  await again.getByLabel("Add a tag").fill("GAMES");
+  await again.getByLabel("Add a tag").press("Enter");
+  t.equal(await page.locator("[name=tags]").inputValue(), "web dev, Games", "a typed tag takes the spelling already in use");
+  if (t.browserName === "chrome") await t.shot(page, "editor-tags-picked-desktop-light");
+  await t.eventually(async () => getPost(postId(page)).tags === "web dev, Games", "the draft saves itself with its tags");
+
   await t.go(page, "/n-admin");
-  const row = page.locator(".posts tr", { hasText: "Tagged post" });
+  const row = page.locator(".posts tr", { hasText: "Tagged post" }).first();
   await t.visible(row.getByRole("link", { name: "web dev" }), "the list shows the tags");
   await row.getByRole("link", { name: "web dev" }).click();
   await page.waitForURL(/q=web/);
-  t.equal(await page.locator(".posts tr").count(), 1, "a tag finds its posts");
+  t.equal(await page.locator(".posts tr").count(), 2, "a tag finds its posts");
   await t.fits(page, "posts with tags");
   if (t.browserName === "chrome") await t.shot(page, "posts-tags-desktop-light");
 });

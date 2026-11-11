@@ -91,7 +91,7 @@ With more than a dozen uploads, Media has a search: it finds an upload by the na
 
 A `file` field is a link field with an Upload button: the button puts a file in Media, or picks one already there, and fills in its address. A pasted link to a file elsewhere works too. On the site it is an address like any other: `<a href={item.file} download>`.
 
-**Tags.** Posts have tags, typed in a post's Settings with commas between them. `post.tags` is the text as typed and `tagsOf(post)` gives each as `{ name, slug }`; `cms.tags()` lists every tag on a published post with its `count`, most used first; `cms.posts({ tag })` gives the posts under one, by name or slug. Two spellings with the same slug, such as "Web Dev" and "web dev", are one tag. Pages have no tags.
+**Tags.** Posts have tags, set in a post's Settings: type one and press Enter, click one already in use to add it, and click its x to take it off. A tag exists for as long as a post has it, so there is no list of tags to keep. `post.tags` is the text as typed and `tagsOf(post)` gives each as `{ name, slug }`; `cms.tags()` lists every tag on a published post with its `count`, most used first; `cms.posts({ tag })` gives the posts under one, by name or slug. Two spellings with the same slug, such as "Web Dev" and "web dev", are one tag. Pages have no tags.
 
 `<Photo>` serves a thumbnail or the full image to suit the screen, reserves space so the page doesn't jump, and loads lazily. Set `height: auto` on it if your CSS sets its width.
 

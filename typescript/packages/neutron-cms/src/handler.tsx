@@ -15,7 +15,7 @@ import { appendPart, deleteImage, finishFile, isMediaName, listImages, listMedia
 import { FILE_KINDS, fileExtension, fileLabel } from "./files.js";
 import { AccountPage, Document, EditorPage, PeoplePage, Viewer, EditPage, type DesignedPage, HistoryPage, type HistoryEntry, ListPage, LoginPage, type MediaEntry, MediaPage, NotFoundPage, PostsPage, TextPage, TrashPage, VersionsPage, type Status } from "./pages.js";
 import {
-  allPosts, allTexts, createPost, findPosts, postCount, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, mediaTitles, saveCount, saveEdits, savePost, saves, setMediaTitle, setTexts, tagsOf,
+  allPosts, allTexts, createPost, findPosts, postCount, deleteForever, emptyOldTrash, ensureDesigns, imageUses, inCurrentUse, inTrash, removeAbandonedDrafts, getPost, isLive, listItems, listRevision, replaceItems, restoreFromTrash, restoreSave, restoreVersion, knownTags, mediaTitles, saveCount, saveEdits, savePost, saves, setMediaTitle, setTexts, tagsOf,
   sortByDate, trashCount, trashed, trashPost, valuesNow, versionsOf, type Item, type Post, type Save, type Snapshot,
 } from "./store.js";
 
@@ -351,7 +351,7 @@ export function createHandler(config: ResolvedConfig) {
   }
 
   const editorPage = (post: Post, rest: { saved?: boolean; error?: string; fields?: Partial<Post>; revision?: string } = {}) =>
-    page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={rest.saved ?? false} error={rest.error} fields={rest.fields} revision={rest.revision} versions={versionsOf(post).length} />);
+    page(post.title || "Untitled", <EditorPage config={config} post={post} status={statusOf(post)} saved={rest.saved ?? false} error={rest.error} fields={rest.fields} revision={rest.revision} versions={versionsOf(post).length} tags={post.kind === "post" ? knownTags() : []} />);
 
   const editable = (post: Post | undefined): post is Post => Boolean(post) && (post!.kind === "page" ? config.pages : config.posts);
 

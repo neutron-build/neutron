@@ -28,7 +28,7 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/workflow` | 0.1.2 |
 | `@neutron-build/ops` | 0.1.5 |
 | `@neutron-build/otel` | 0.1.5 |
-| `@neutron-build/cms` | 0.1.2 |
+| `@neutron-build/cms` | 0.1.3 |
 
 `@neutron-build/mail` is at 0.2.0.
 What changed in each package is in `CHANGELOG.md`. Check the registry for what is

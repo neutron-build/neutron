@@ -4,7 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-cms 0.1.2, create 0.1.14 (not yet published).
+cms 0.1.3 (not yet published).
+
+### Added
+
+- **cms: a tag picker in a post's Settings.** Tags show as chips with an x,
+  the tags already in use are one click away and narrow as you type, and
+  Enter or a comma adds a new one. Without the script it is still a
+  comma-separated field.
+
+## 2026-11-11 (cms 0.1.2, create 0.1.14)
 
 ### Added
 
