@@ -11672,3 +11672,151 @@ before the first of them). Every number is a **probe, not evidence**:
   targeted-mode and cannot move; P's gate reads the whole-10k
   moves). Probe, not evidence.
 
+## Card X-5c-F4-F5's record
+
+card: X-5c-F4-F5   branch: card/v3-X-5c-F4-F5   commit: (step 8's;
+the chain step 0 `ccecb0cd` → step 1 `81e323ab` → step 2 `c29566f4`
+→ A.0 `fd9adddd` → A-end `632a9e93` → step 5 `06a9dc01` → B.0
+`7a6f9bfe` → B.1 `819f035e` → B.2 `e78db1fa` → B-end `7f64cad1` →
+the mutant-rework pin commit `0bc00c6a` → here)
+
+**1. Both ladders** (every number a probe over the 200-seed judged MP
+set × 10, or 0..1000 × 10 — never evidence; the GUARD lines, walls and
+CPUs are each rung's own, in the probe rows above):
+
+- **Ladder A (SZC-MP ≥ 100 per 2,000; margin 125 = raw ≥ 13):**
+  **A.0** (the anchor, fill knobs 0) — GUARD CLEAN (wall_s 41.374,
+  foreign −1.58%), SZC-MP **raw 19 / per10k 190**, wall 6.9 min/2,000,
+  cpu 530.8 s, MP refusal rate 0.6853, fails MP ×3 (the known O-1(a)
+  shape). Rungs A.1–A.4 never ran: the anchor reached the margin
+  (19 ≥ 13), the hold set is empty and the wall passed, so the walk
+  stopped at the first rung. **Kept: A.0 — the fill knobs stay 0 in
+  every tuning.** No `thin` row (the margin was reached). Round-index
+  table (A.0's, the only rung): r0 200 rounds / 137 refused / szc 40 /
+  szq 17; r1 29 / 21 / 7 / 2; r2 3 / 1 / 0 / 0 — round 0 alone carries
+  17 of the 19 szq rounds: FINAL 7.3's `value_lo` 280 flowing into
+  MP_PRESSURE already puts the ≥ 4·F condition into round 0, before
+  any fill, which is what the card's "re-anchors MP on it"
+  anticipated.
+- **Ladder B (Q7 ≥ 200 per 10k; margin 250):** **B.0** (the anchor,
+  w7 0) — GUARD CLEAN (wall_s 245.322, foreign −0.60%), Q7 **50**,
+  wall 40.9 min/10k, cpu 3265.2 s; the STOP check passed (equal to
+  F3's rung 7.3 row count for count). **B.1** (w7 100) — GUARD VOID
+  (foreign 17.15%), Q7 **200** (exactly required, under margin), wall
+  47.3 ≤ 50, cpu 3458.2 s: a `thin` candidate, walk continued.
+  **B.2** (w7 200) — GUARD CLEAN (wall_s 239.711, foreign −0.83%),
+  Q7 **410** ≥ 250, wall 39.9, cpu 3194.3 s: **stop-and-keep at
+  B.2**; rung B.3 never ran. FINAL keeps `w7_share` 200.
+
+**2. New classes (X5-R16): none.** Across all four probes' JSONs
+(A.0, B.0, B.1, B.2): A.0's three failing rounds are all class MP
+with the known O-1(a) shape (`published {} != model {…}`); B.0, B.1
+and B.2 read **zero** failing rounds in 0..1000. No class C round
+failed anywhere, and no MP round outside the two known shapes
+appeared. The fill never ran (ladder A stopped at the anchor), so the
+fill's new-failure-shape risk never materialized.
+
+**3. The final constants** (the kept-setting literal of
+`x5_r37_final_is_the_kept_setting`, field for field):
+
+- `Tuning::FINAL` = X-5c-F4-F4's 7.3 **plus `w7_share` 200 alone**:
+  committers 2/3, trees 2/3, keyspace 1200/1801, syncoff [3, 7, 7],
+  map_leaf_cap [8, 16, 254], freeset_leaf_bits [128, 512, 32_576],
+  r_epoch [1, 2, 4], keep_latest [100, 100, 300, 500, 700], tear
+  [100, 300, 500, 700, 900], rounds weights [1,1,1,1,1,2,2,2,3,3],
+  target_ckpt_span 3, ckpt_every 8/5, commit_budget 18/20,
+  commit_ops 1/20, chunked 700/201, value_lo 280, value_hi 400,
+  delete_one_in 4, gc_sweeps 2/3, bulk_load_one_in 4, drop_one_in 3,
+  burst_frac 0, burst_gc_loops 0, w11_share 100, w12_share 100,
+  r41_share 1000, r41p_share 500, **r0_fill_txns 0, r0_fill_ops 0,
+  w7_share 200**.
+- `Tuning::MP_PRESSURE` = X-5c-F4-F4's own, unchanged by ladder A:
+  the 9.1 fields over FINAL (ckpt_every 4/5, budget 20/12, chunked
+  900/301, gc_sweeps 12/1, burst 600/8, w11 200, w12 200) with
+  **r0_fill_txns 0, r0_fill_ops 0, w7_share 0 explicit** and every
+  other field FINAL's (so its value_lo is 280).
+
+**4. Per row against its minimum** (the kept rungs' probes):
+
+| row | kept reading | minimum | |
+|---|---|---|---|
+| SZC-MP (ladder A, per 2,000) | **190** (raw 19 on the 200-seed probe) | 100 (margin 125) | ✓ at the anchor |
+| MP refusal (A.0) | rounds 232, refused 159, rate 0.6853 | reported, never an exit input | — |
+| Q7 (ladder B, per 10k) | **410** (B.2) | 200 (margin 250) | ✓ |
+| Q4 (B.2) | 1670 | owner bar 1500 (row 1000) | ✓ |
+| Q4-I (B.2) | 2160 | owner bar 1500 (row 1500) | ✓ |
+| Q5a (B.2, watched) | 470 | 200 | ✓ (up from B.0's 230: a walk is a shorter window than the W11 picks it displaced) |
+| Q10 (B.2) | 450 | 500 | not met at B.0 (460), so "Q10 if met" does not hold it; the whole-10k read at 7.3 was 615 (F4-F4's record) |
+
+**5. The Acceptance's A-end 10k** (the `GUARD` line, census and
+compare lines): **RUNNER** — the A-end commit is `632a9e93`, whose
+FINAL is X-5c-F4-F4's field for field with both fill knobs 0 and no
+X5-R56 code; the Acceptance builds the main set from it and compares
+against `runlogs/X-5c-F4-F4.main.json` (sha256
+`549495c5…`), requiring `DIGESTS_MOVED 0` and the census's
+`arm_seeds=[1069,3669]`. The lines are the runner's to produce; this
+attempt ran none of the campaign forms (the card's Run hygiene bans
+them in the attempt). HEAD's own main digests move by design at
+`w7_share` 200 — limited to uniform-mode seeds; every moved seed the
+gate finds must be uniform-mode, and the pins at 7, 8, 27, 28, 1069
+and 3669 (all targeted-mode) cannot move.
+
+**6. The mutant table** (each row on its own scratch export under
+`$CARGO_TARGET_DIR/x5f5-scratch/mut-*/` — a `git archive` of HEAD
+from the worktree root, its own target dir, one python patch; the
+worktree never held a mutant):
+
+| mutant | catching test |
+|---|---|
+| M-FILL-IN-FINAL (FINAL's fill 1/1000) | `x5f5_final_digests_unmoved` — FAILED at seed 7 |
+| M-FILL-EVERY-ROUND (the `round == 0` condition dropped) | `x5r55_fill_not_drawn_at_zero` — FAILED at the round-1 half |
+| M-FILL-MAIN-STREAM (the fill drawn from the round's `S_GEN` stream, inline in `build_round`) | `x5r55_fill_leaves_the_rest_of_the_script` — FAILED ("task 0 op 1 must be fill op 0") |
+| M-FILL-DUP-KEY (a transaction may repeat a `(tree, key)`) | `x5r55_fill_shape` — FAILED at the uniqueness count |
+| M-FILL-LATE (the fill appended at task 0's end) | `x5r55_fill_shape` — FAILED ("exactly two Chunked ops … directly after the setup commit") |
+| M-MP-FILL-OFF (MP_PRESSURE's fill off) | **equivalent at the kept constants**: ladder A kept the anchor, so MP_PRESSURE's `r0_fill_txns` is already 0 — the mutant is a no-op (the card's own equivalent-mutant clause) |
+| M-W7-NONDROP (the pick drawn in non-drop rounds) | `x5r56_w7_not_drawn_at_zero` — FAILED |
+| M-W7-TARGETED (the pick applied in targeted rounds) | `x5r56_w7_not_drawn_at_zero` — FAILED |
+| M-W7-SHARED-STREAM (the selection drawn from `S_CWIN`) | `x5r56_unselected_round_keeps_its_point` — FAILED at seed 111 (after the rework below) |
+| M-W7-W11-LIST (the pick from `w11_yields`) | `x5r56_w7_pick_lands_in_the_walk` — FAILED ("must pick the w7 window") |
+| M-W7-IN-MP (MP_PRESSURE's `w7_share` follows FINAL) | `x5_r37_final_is_the_kept_setting` — FAILED |
+| M-BASE-EDIT (BASE's `r0_fill_txns` 1) | `x5_r37_base_tuning_reproduces_1b0ce54e` — FAILED at seed 0 |
+
+**7. ESCALATE: none.** Both ladders met their rows by the
+pre-registered stop rule (A at the anchor's 190 ≥ 125 per 2,000; B at
+B.2's 410 ≥ 250), with every hold-set row and wall limit passing.
+
+**8. Post-data amendments: none.** No rung, knob, ladder, margin or
+stop rule was added, reordered or re-tuned after any probe, and no
+probe row was re-run. One test-only rework happened after the
+mutants: `x5r56_unselected_round_keeps_its_point` gained seed 111
+(commit `0bc00c6a`) because its first literal (seed 30) is one where
+M-W7-SHARED-STREAM is equivalent (that seed's `S_CWIN` draw is ≥ 300);
+seed 111's plain FINAL point is a w12 pick, proving its `S_CWIN` draw
+< 100 < the share, and the mutant now selects there and fails. The
+card fixed no literal seed for this pin (unlike the lands-in-the-walk
+pin), so this closes a free choice, it does not retune one; the pin
+was only ever strengthened.
+
+**9. Anomalies.**
+
+- Both `GUARD` CLEAN lines of the A.0, B.0 and B.2 probes carry a
+  **negative `foreign_pct`** (−1.58, −0.60, −0.83): the host's
+  /proc/stat busy delta undercounted against the process's own
+  user+sys — foreign = busy − cpu goes negative. The verdict rule
+  (VOID iff > 5.00 or wait timeout) reads these CLEAN, and the wall
+  is the wall either way; recorded as measured, never adjusted.
+- B.1's guard read VOID (foreign 17.15%): load arrived during the
+  run. The wall rule reads the number (load can only lengthen it);
+  47.3 ≤ 50 passes without a re-read, because the rule's single
+  re-read applies only to a VOID reading **over** the limit.
+- Attempt 1 of this card was killed by the runner's 60-minute
+  watchdog mid-mutant-work (no campaign form was running in it); this
+  attempt resumed at the mutant rework per the restart rule, with the
+  tree clean at `7f64cad1`.
+- The known benign `packed-refs.lock: Read-only file system` line
+  appears on every commit (from the base chain); every commit lands.
+- Attempt 1 briefly created scratch measurement files under `tests/`
+  and the mutant-runner script under `tools/`; each was moved out to
+  `$CARGO_TARGET_DIR/x5f5-scratch/` before its commit, so the tree
+  stayed clean. None was ever committed (Limit 3 freezes `tools/*`).
+
