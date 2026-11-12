@@ -1035,6 +1035,33 @@ def self_test():
         expect("duplicate-seed", run([edited(page), edited(page)]), 2)
         expect("seeds-entry-not-object", run([7]), 2)
 
+        # --- Cannot check: an error nobody foresaw. No results file
+        # reaches the catch-all through a foreseen path (the one reader
+        # stops a wrongly shaped entry first), so the case swaps the
+        # classifier for one that raises. Exit 1 here would read as
+        # "unmatched", which is Python's own exit code for a traceback.
+        def unforeseen(*_args):
+            raise RuntimeError("forced by the self-test")
+
+        real_classify = globals()["classify"]
+        globals()["classify"] = unforeseen
+        try:
+            got = run([edited(page), edited(header)])
+        finally:
+            globals()["classify"] = real_classify
+        expect("internal-error-is-exit-2", got, 2)
+        check(
+            "internal-error-is-exit-2-line",
+            got[1] == ["E4_CLASS_CANNOT_CHECK internal error: RuntimeError: forced by the self-test"],
+            repr(got[1]),
+        )
+        expect("internal-error-classifier-restored", run([edited(page), edited(header)]), 0, counts(1, 1, 0, 0))
+        # A results file nested past the interpreter's depth is one such
+        # error on a real input (RecursionError is not a ValueError). It
+        # is exit 2 whichever handler takes it.
+        deep = b'{"seeds":' + b"[" * 200000 + b"]" * 200000 + b"}"
+        expect("internal-error-deep-json", run_match(write(fresh(".json"), deep), sha256_hex(deep), None, real_table, TABLE_SHA256), 2)
+
         # --- Cannot check: the files themselves.
         path, sha = results_file([edited(page)])
         wrong = "0" * 64
