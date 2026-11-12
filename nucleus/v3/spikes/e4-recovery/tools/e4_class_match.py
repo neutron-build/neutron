@@ -1004,6 +1004,14 @@ def self_test():
         # matches no class's round fields, and is still a cannot-check.
         expect("missing-twin-index-unmatched-round", run([edited(FIXTURE_C, c_fail, seed_edit={"class": "MP"})]), 2)
         expect("missing-twin-field-unmatched-round", run([{**edited(FIXTURE_C, c_fail, seed_edit={"class": "MP"}), "twin": [{"pass": True}]}]), 2)
+        # "At least one class": the seed conditions of every class are
+        # asked, not those of the first or the last. Under a table whose
+        # first (or last) class takes only MW seeds, an MP round is
+        # still one a class could take.
+        for name, n in (("first", 0), ("last", -1)):
+            one_mw, one_mw_sha = temp_table(lambda t, n=n: t["classes"][n]["seed"].update({"class": {"eq": "MW"}}))
+            got = run([edited(FIXTURE_C, c_fail, seed_edit={"class": "MP"})], table=one_mw, table_sha=one_mw_sha)
+            expect("missing-twin-index-%s-class-takes-mw" % name, got, 2)
         # A failing C round still needs every seed field and every
         # round field any class reads; only its twin entry is not read.
         bad = []
