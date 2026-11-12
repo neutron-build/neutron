@@ -45,7 +45,7 @@ The package imports as `neutron`. See the [Python quickstart](https://neutron.bu
 ### Web & app frameworks
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`typescript/`](./typescript) | TypeScript | UI framework — SSR, file-based routing, Preact, islands, signals |
+| [`typescript/`](./typescript) | TypeScript | UI framework — SSR, file-based routing, Preact, islands, signals. Includes [`@neutron-build/cms`](./typescript/packages/neutron-cms), a small admin for posts, pages and media ([docs](https://neutron.build/docs/content/cms)) |
 | [`rust/`](./rust) | Rust | Web framework — Hyper, trie routing, HTTP/1–2 (+HTTP/3 behind the `http3` feature), 19 composable crates |
 | [`go/`](./go) | Go | Backend framework — generics, OpenAPI 3.1, OAuth2, WebAuthn, jobs |
 | [`python/`](./python) | Python | AI app framework — Starlette + Pydantic, RAG, MCP integration |
