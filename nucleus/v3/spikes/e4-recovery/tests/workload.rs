@@ -3636,6 +3636,66 @@ fn x5_r39_after5_crash_never_sets_szi() {
     );
 }
 
+/// **X5-R39 pin (follow-up X-5c-PINS-2-F1): the fold conjunct — `szc`
+/// and `szq` true, the crash inside the `ckpt_unflipped` window, `szi`
+/// false.** Seed 249 round 1, under `Tuning::FINAL`: the crash
+/// (`After1@2`, position code 3) fired inside the window and the final
+/// recovery opened a store, but the open checkpoint's begin step had
+/// folded only 66 dirtied LPIDs, below 4·F = 176. `szc` is true through
+/// its other disjunct: the interval open at the crash had reached 197.
+/// So the only term of `szi` that is false here is its middle one,
+/// `obs.ckpt_closed_dirty >= four_f`, and this round pins it: the
+/// interrupted checkpoint itself must have closed a ≥ 4·F interval.
+/// (Measured on a scratch build that printed the three numbers; the
+/// record carries neither `ckpt_closed_dirty` nor 4·F, so they are not
+/// asserted here.)
+///
+/// **OWN-SZI-NOFOLD** (`rr.szi = rr.szq && ckpt_unflipped(..)`, the
+/// conjunct dropped) reads `szi` true on this round and fails the pin.
+/// `Tuning::BASE` could not hold it: over `0..10000` at BASE the mutant
+/// is equivalent (card X-5c-PINS-2's sweep: 141 `szq` rounds and 58
+/// `szi` rounds on both builds), because no BASE round has `szq` and a
+/// window crash with a fold below 4·F. FINAL's main set has 271 such
+/// rounds (verdict X-5c-PINS-2, finding 3), so the conjunct governs
+/// the judged SZI row there. Seed 286 round 1 and seed 301 round 2 are
+/// alternates of the same shape. If a later change to FINAL moves this
+/// round, that is a finding for P: do not re-pick the seed or loosen
+/// an assertion to pass.
+#[test]
+fn x5_r39_window_crash_without_a_4f_fold_is_not_szi() {
+    use e4_recovery::store::ckpt;
+    let rec = workload::run_seed_with(249, None, &workload::Tuning::FINAL);
+    assert!(rec.defect.is_none(), "seed 249: {:?}", rec.defect);
+    assert_eq!(rec.digest, 867_099_511, "seed 249: the pinned FINAL digest");
+    let r1 = rec
+        .rounds
+        .get(1)
+        .unwrap_or_else(|| panic!("seed 249: three rounds"));
+    assert_eq!(r1.crash, "After1@2", "seed 249 r1: the pinned hook crash");
+    assert_eq!(r1.hook, "After1", "seed 249 r1: the crash is a hook crash");
+    assert!(r1.fired, "seed 249 r1: the crash fired");
+    assert!(
+        ckpt::ckpt_unflipped(3),
+        "After1 (position code 3) is inside the ckpt_unflipped window"
+    );
+    assert!(
+        r1.szc,
+        "the crash cut a >= 4*F interval (the open one: 197 >= 176)"
+    );
+    assert!(r1.szq, "the final recovery opened a store");
+    assert!(
+        !r1.szi,
+        "the open checkpoint's fold was 66 < 4*F = 176: szq and a crash inside the \
+         ckpt_unflipped window are not enough, so szi must stay false \
+         (OWN-SZI-NOFOLD reverts this)"
+    );
+    assert!(
+        r1.pass,
+        "seed 249 r1: the round passes (o1={:?} o2={:?} o3={:?})",
+        r1.o1_fail, r1.o2_fail, r1.o3_fail
+    );
+}
+
 /// **X5-R39 pin: the refused round — `szc` true, `szq` false.** Seed
 /// 9149 round 2, under `Tuning::BASE`: the crash (`After5@1`) cut a
 /// checkpoint interval (the fold was 224 ≥ 4·F = 172) but the round's
