@@ -14,10 +14,11 @@ This script owns three invariants, and nothing else:
    stops with exit 2 and one `E4_CLASS_CANNOT_CHECK` line. So does a
    results file whose sha256 is not the one the caller named, and a
    failing round that two classes both take.
-3. `self-test` runs literal copies of three baseline records (seeds
-   1257, 2927 and 3988 of `cb947c19…ae45`) and a literal diagnostic
-   block through the same engine, one edit per named case, and exits
-   non-zero if any case reads differently.
+3. `self-test` runs literal copies of four baseline records (seeds
+   1257, 2927 and 3988 of `cb947c19…ae45`, one per class, and seed 0,
+   a class-C seed with no twin entries) and a literal diagnostic block
+   through the same engine, one edit per named case, and exits non-zero
+   if any case reads differently.
 
 What counts as failing: a `rounds` entry with `pass=false`, a `twin`
 entry with `pass=false`, and a seed with `deadlock`, `panic` or `baton`
@@ -27,6 +28,19 @@ condition of the class holds: its `seed` and `round` conditions (`eq`,
 type-strict; `ge`, an integer that is not a boolean; `re`, a string, in
 full), its `q` entries, `lost + mis + torn >= media_faults_min`, and its
 `twin_same_index` conditions on the twin entry at the round's index.
+
+The twin entry is read only where a class could take the round: on a
+failing round whose seed meets every `seed` condition of at least one
+class. There a missing twin entry, or a missing field of it, is exit 2
+whether or not the round's own fields match. A failing round no class
+could take is unmatched by its seed alone, exit 1, and the rest of the
+file is still classified and printed: the baseline's class-C seeds
+carry `"twin": []`, and "cannot check" on a failing C round would hide
+a new class behind a stop (card rework amendment, 2026-11-11). This
+gives nothing away: a round can match a class only if its seed meets
+that class's `seed` conditions, which is exactly when its twin entry
+is required, and the seed fields that decide it are required on every
+seed.
 
 A class with `needs_diag=true` (class 3, `amcheck_subtree_fallout`)
 carries a signature the JSON alone cannot separate from a real orphan,
@@ -306,8 +320,27 @@ def check_seed_shape(seed):
     return sid
 
 
-def check_failing_round_shape(seed, i, req):
-    """Every field any class reads, on one failing round and its twin."""
+def seed_mismatch(cls, seed):
+    """The first `seed` condition of `cls` the seed does not meet, as a
+    short name, or None when `cls` could take a round of this seed."""
+    for key in sorted(cls["seed"]):
+        if not cond_holds(cls["seed"][key], require(seed, key, "seed %d" % seed["seed"])):
+            return "seed." + key
+    return None
+
+
+def check_failing_round_shape(seed, i, req, classes):
+    """Every field any class reads, on one failing round, and on its
+    twin entry when a class could take the round.
+
+    The twin entry is required only if the seed meets every `seed`
+    condition of at least one class. No class takes a round of any
+    other seed, whatever its twin says, so the round is unmatched
+    (exit 1), not a cannot-check: a class-C seed has no twin entries at
+    all, and stopping there would hide a new class behind exit 2. The
+    seed fields this decision reads are required just above, so a
+    missing one still stops the run before the decision is made.
+    """
     where = "seed %d round %d" % (seed["seed"], i)
     for key in req["seed"]:
         require(seed, key, "seed %d" % seed["seed"])
@@ -321,6 +354,8 @@ def check_failing_round_shape(seed, i, req):
         q = require(rnd, "q", where)
         if not isinstance(q, list) or len(q) < req["q_len"]:
             raise CannotCheck("%s: q is not a list of at least %d" % (where, req["q_len"]))
+    if all(seed_mismatch(cls, seed) is not None for cls in classes):
+        return
     if i >= len(seed["twin"]):
         raise CannotCheck("%s: no twin entry at index %d" % (where, i))
     for key in req["twin"]:
@@ -338,9 +373,9 @@ def first_mismatch(cls, seed, i):
     sid = seed["seed"]
     rnd = seed["rounds"][i]
     where = "seed %d round %d" % (sid, i)
-    for key in sorted(cls["seed"]):
-        if not cond_holds(cls["seed"][key], require(seed, key, "seed %d" % sid)):
-            return "seed." + key
+    miss = seed_mismatch(cls, seed)
+    if miss is not None:
+        return miss
     for key in sorted(cls["round"]):
         if not cond_holds(cls["round"][key], require(rnd, key, where)):
             return "round." + key
@@ -492,7 +527,7 @@ def classify(seeds, classes, diag_dir):
         for i, rnd in enumerate(seed["rounds"]):
             if rnd["pass"]:
                 continue
-            check_failing_round_shape(seed, i, req)
+            check_failing_round_shape(seed, i, req, classes)
             why = [(cls, first_mismatch(cls, seed, i)) for cls in classes]
             took = [cls for cls, miss in why if miss is None]
             if len(took) > 1:
@@ -608,6 +643,22 @@ FIXTURE_FALLOUT = (
     '"q":[0,0,0,0,0,1,0,0,1,0,0,0,1,1,0,0,0,1,1,0,0]}],"twin":[{"pass":true,"o1":null}]}'
 )
 
+#: A literal copy of seed 0 of the same baseline: class C, one passing
+#: round, and `"twin": []`, as on all 7,000 class-C seeds of that file
+#: (only MP and MW seeds run a twin). A failing C round is made from it
+#: by edit, so the cases see the shape a real one would have.
+FIXTURE_C = (
+    '{"seed":0,"class":"C","knobs":3288673361,"digest":3681731733,"deadlock":false,"panic":false,'
+    '"baton":false,"stopped":false,"defect":null,"rounds":[{"crash":"Before0@2","hook":"Before0","fired":true,'
+    '"nested":0,"lost":0,"mis":0,"torn":0,"lo":26,"hi":26,"c":26,"frontier":26,"gcw":0,"o1":null,'
+    '"o1f":false,"o2":null,"o3":null,"served":false,"sk":true,"ackl":0,"ackls":0,"mrb":false,"rlen":0,'
+    '"o1dl":0,"r6":false,"r32":false,"skx":false,"smx":false,"pass_na":null,"ack_over":[],"cover_err":false,'
+    '"x33h":18,"x33a":26,"x33x":false,"reuse":false,"cxx":0,"pass":true,"dl":false,"ll":false,"lls":"",'
+    '"pa":false,"bt":false,"terr":false,"cwin":"u","szc":0,"szq":0,"szi":0,"rfs":0,"q4sp":0,"q4mg":0,'
+    '"q4ru":0,"imgsp":0,"imgmg":0,"imgru":0,"imgrupf":0,"q4ir":0,"q4i":0,'
+    '"q":[0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,1,0,0]}],"twin":[]}'
+)
+
 #: Seed 3988's `E4_MPE_DIAG` stderr, in the real shape: the twin's
 #: `class C` block first (with its own, empty, `R29 diag` line), then
 #: the round's `class Mp` block. Lines are the real run's; the 44
@@ -718,7 +769,8 @@ def self_test():
         seed = json.loads(fixture)
         seed["rounds"][0].update(round_edit or {})
         seed.update(seed_edit or {})
-        seed["twin"][0].update(twin_edit or {})
+        if twin_edit:
+            seed["twin"][0].update(twin_edit)
         return seed
 
     def without(lines, drop):
@@ -774,6 +826,37 @@ def self_test():
         expect("unmatched-round-beside-matched", run([edited(page, o3b), edited(header)]), 1, counts(0, 1, 0, 1))
         expect("unmatched-class-c-seed", run([edited(page, seed_edit={"class": "C"})]), 1, counts(0, 0, 0, 1))
         expect("unmatched-class-mw-seed", run([edited(header, seed_edit={"class": "MW"})]), 1, counts(0, 0, 0, 1))
+
+        # --- The real class-C shape: no twin entries at all. The case
+        # above relabels an MP record, which keeps its twin array and so
+        # never saw this. A failing C round is new (exit 1), not a
+        # cannot-check, and everything else in the file is still printed.
+        check("real-c-seed-has-no-twin", json.loads(FIXTURE_C)["twin"] == [] and json.loads(FIXTURE_C)["class"] == "C")
+        expect("real-c-seed-passes", run([edited(FIXTURE_C)]), 0, counts(0, 0, 0, 0))
+        c_fail = {"pass": False, **o3b}
+        c_line = (
+            "E4_CLASS_UNMATCHED 0 round 0 no-class refused_old_page:seed.class "
+            "refused_old_header:seed.class amcheck_subtree_fallout:seed.class"
+        )
+        expect("unmatched-real-c-seed", run([edited(FIXTURE_C, c_fail)]), 1, counts(0, 0, 0, 1), c_line)
+        # The round as the oracle left it, with only `pass` turned.
+        expect("unmatched-real-c-seed-pass-only", run([edited(FIXTURE_C, {"pass": False})]), 1, counts(0, 0, 0, 1), c_line)
+        full = [
+            c_line,
+            "E4_CLASS 1257 0 refused_old_page",
+            "E4_CLASS 2927 0 refused_old_header",
+            "E4_CLASS 3988 0 amcheck_subtree_fallout",
+            counts(1, 1, 1, 1),
+        ]
+        got = run([edited(fallout), edited(FIXTURE_C, c_fail), edited(header), edited(page)], diag=good_diag)
+        check("unmatched-real-c-seed-full-output", got == (1, full), "exit %d %r" % got)
+        # A bad seed is taken by no class either, so its failing round
+        # is not read for a twin: a run cut short may not have one. Two
+        # records, the seed and the round.
+        bad_seed = {**edited(page, seed_edit={"deadlock": True}), "twin": []}
+        expect("unmatched-bad-seed-no-twin", run([bad_seed]), 1, counts(0, 0, 0, 2), "E4_CLASS_UNMATCHED 1257 seed deadlock=true")
+        # An MW seed is taken by no class, with or without twin entries.
+        expect("unmatched-mw-seed-no-twin", run([{**edited(header, seed_edit={"class": "MW"}), "twin": []}]), 1, counts(0, 0, 0, 1))
 
         # --- A twin failure has no class. The failing twin sits beside a
         # passing round, so only the twin reading can see it.
@@ -916,6 +999,24 @@ def self_test():
                         bad.append("%s %s.%s%s exit %d" % (fixture_name, level, key, "" if table is None else " (reversed)", got_code))
         check("missing-each-field", not bad and tried == 3 * 2 * 41, "; ".join(bad) or "tried %d" % tried)
         expect("missing-twin-index", run([{**edited(page), "twin": []}]), 2)
+        # Where a class could take the seed, the twin entry is required
+        # before any class is tried: the failing C round relabelled MP
+        # matches no class's round fields, and is still a cannot-check.
+        expect("missing-twin-index-unmatched-round", run([edited(FIXTURE_C, c_fail, seed_edit={"class": "MP"})]), 2)
+        expect("missing-twin-field-unmatched-round", run([{**edited(FIXTURE_C, c_fail, seed_edit={"class": "MP"}), "twin": [{"pass": True}]}]), 2)
+        # A failing C round still needs every seed field and every
+        # round field any class reads; only its twin entry is not read.
+        bad = []
+        tried = 0
+        for table, table_sha in ((None, TABLE_SHA256), (reversed_table, reversed_sha)):
+            for level, key in [("seed", key) for key in ST_SEED_FIELDS] + [("round", key) for key in ST_ROUND_FIELDS]:
+                seed = edited(FIXTURE_C, c_fail)
+                del {"seed": seed, "round": seed["rounds"][0]}[level][key]
+                got_code, lines = run([seed], table=table, table_sha=table_sha)
+                tried += 1
+                if not (got_code == 2 and len(lines) == 1 and lines[0].startswith("E4_CLASS_CANNOT_CHECK ")):
+                    bad.append("%s.%s%s exit %d" % (level, key, "" if table is None else " (reversed)", got_code))
+        check("missing-each-field-real-c-seed", not bad and tried == 2 * 39, "; ".join(bad) or "tried %d" % tried)
         seed2 = edited(page)
         seed2["rounds"].append(copy.deepcopy(seed2["rounds"][0]))
         expect("missing-twin-index-second-round", run([seed2]), 2)
@@ -970,6 +1071,9 @@ def self_test():
         base = ["match", "--results", path, "--results-sha256", sha]
         expect("cli-match-with-diag", cli(base + ["--diag-dir", good_diag]), 0, counts(1, 0, 1, 0))
         expect("cli-match-no-diag", cli(base), 1, counts(1, 0, 0, 1))
+        path_c, sha_c = results_file([edited(FIXTURE_C, c_fail), edited(page), edited(header), edited(fallout)])
+        got = cli(["match", "--results", path_c, "--results-sha256", sha_c, "--diag-dir", good_diag])
+        check("cli-unmatched-real-c-seed-full-output", got == (1, full), "exit %d %r" % got)
         expect("cli-table-held-to-constant", cli(base + ["--table", widened]), 2)
         expect("cli-results-sha-mismatch", cli(["match", "--results", path, "--results-sha256", wrong]), 2)
     finally:
