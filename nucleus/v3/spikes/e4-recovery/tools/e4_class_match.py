@@ -288,19 +288,18 @@ def check_seed_shape(seed):
     if not is_int(sid):
         raise CannotCheck("a seeds entry's seed is not an integer")
     where = "seed %d" % sid
-    for key in SEED_FIELDS:
-        require(seed, key, where)
-    if not isinstance(seed["class"], str):
+    got = {key: require(seed, key, where) for key in SEED_FIELDS}
+    if not isinstance(got["class"], str):
         raise CannotCheck("%s: class is not a string" % where)
-    if not is_int(seed["digest"]):
+    if not is_int(got["digest"]):
         raise CannotCheck("%s: digest is not an integer" % where)
     for key in SEED_FLAGS:
-        if type(seed[key]) is not bool:
+        if type(got[key]) is not bool:
             raise CannotCheck("%s: %s is not a boolean" % (where, key))
     for key in ("rounds", "twin"):
-        if not isinstance(seed[key], list):
+        if not isinstance(got[key], list):
             raise CannotCheck("%s: %s is not a list" % (where, key))
-        for i, entry in enumerate(seed[key]):
+        for i, entry in enumerate(got[key]):
             entry_where = "%s %s[%d]" % (where, key, i)
             if type(require(entry, "pass", entry_where)) is not bool:
                 raise CannotCheck("%s: pass is not a boolean" % entry_where)
@@ -531,6 +530,8 @@ def run_match(results_path, results_sha256, diag_dir, table_path, table_sha256):
 
     Exit 2 carries exactly one line; nothing classified before the stop
     is printed, so a cannot-check run never looks like a partial pass.
+    An error this script did not foresee is a cannot-check too: Python's
+    own exit code for a traceback is 1, which here means "unmatched".
     """
     try:
         classes = load_table(table_path, table_sha256)
@@ -538,6 +539,8 @@ def run_match(results_path, results_sha256, diag_dir, table_path, table_sha256):
         lines, unmatched = classify(seeds, classes, diag_dir)
     except CannotCheck as e:
         return 2, ["E4_CLASS_CANNOT_CHECK %s" % e]
+    except Exception as e:  # noqa: BLE001 - fail closed on anything else
+        return 2, ["E4_CLASS_CANNOT_CHECK internal error: %s: %s" % (type(e).__name__, e)]
     return (1 if unmatched else 0), lines
 
 
