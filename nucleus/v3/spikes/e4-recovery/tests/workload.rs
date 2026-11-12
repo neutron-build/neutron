@@ -3655,12 +3655,13 @@ fn x5_r39_after5_crash_never_sets_szi() {
 /// `Tuning::BASE` could not hold it: over `0..10000` at BASE the mutant
 /// is equivalent (card X-5c-PINS-2's sweep: 141 `szq` rounds and 58
 /// `szi` rounds on both builds), because no BASE round has `szq` and a
-/// window crash with a fold below 4·F. FINAL's main set has 271 such
-/// rounds (verdict X-5c-PINS-2, finding 3), so the conjunct governs
-/// the judged SZI row there. Seed 286 round 1 and seed 301 round 2 are
-/// alternates of the same shape. If a later change to FINAL moves this
-/// round, that is a finding for P: do not re-pick the seed or loosen
-/// an assertion to pass.
+/// window crash with a fold below 4·F. FINAL's main set has 270 such
+/// rounds by position code (this follow-up's instrumented scratch run;
+/// verdict X-5c-PINS-2, finding 3, counts 271 by the record's `hook`
+/// field), so the conjunct governs the judged SZI row there. Seed 286
+/// round 1 and seed 301 round 2 are alternates of the same shape. If a
+/// later change to FINAL moves this round, that is a finding for P: do
+/// not re-pick the seed or loosen an assertion to pass.
 #[test]
 fn x5_r39_window_crash_without_a_4f_fold_is_not_szi() {
     use e4_recovery::store::ckpt;
