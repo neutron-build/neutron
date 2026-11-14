@@ -11952,3 +11952,69 @@ card's own suggestion only in its mechanism, not its rule.
   begin-step fold is already ≥ 4·F); a seam (a test-local workload
   with a small fold inside the window) or a withdrawal is P's ruling,
   per the card's Work 3 STOP rule.
+
+## Card X-5c-F4-F6's record (the held-out joint-arm pin: G5-CENSUS
+## (e) 2 at seed 10669, and the final run's three census lines)
+
+card: X-5c-F4-F6   branch: card/v3-X-5c-F4-F6   base: card/v3-X-5c-F4
+(tip `cb2aca0d`, the commit the final run judged)
+
+Class: test. **Test and README only** — no behaviour change, no digest
+moves: `src/` is byte for byte `cb2aca0d`'s; no tuning, literal, quota,
+threshold, class table, matcher, tool, existing assertion or existing
+literal changed (`Tuning::FINAL` and `MP_PRESSURE` untouched; every
+digest input identical, so no campaign re-runs).
+
+The final run's three census lines, verbatim from the run of record's
+own stdout (one line per set; the held-out line is what made the run's
+Acceptance fail — it expected `arm_rounds=0`):
+
+```
+JOINT_ARM_CENSUS set=main seeds=10000 arm_rounds=2 stale_reads=0 arm_seeds=[1069,3669]
+JOINT_ARM_CENSUS set=held-out seeds=10000 arm_rounds=3 stale_reads=0 arm_seeds=[10669,13469,16669]
+JOINT_ARM_CENSUS set=mp-pressure seeds=2000 arm_rounds=0 stale_reads=0 arm_seeds=[]
+```
+
+held-out's live joint arms (10669, 13469, 16669) read zero stale reads;
+G5-CENSUS (e) 2 discharged by `x5f4_joint_arm_live_at_10669_is_fresh`
+(X-5c-F4-F6). Main's arms (1069, 3669) were pinned the same way by
+X-5c-F4-F4; mp-pressure reads `arm_seeds=[]`, so it owes no pin.
+
+**1. The pin.** `x5f4_joint_arm_live_at_10669_is_fresh`
+(`tests/workload.rs`, right after `x5f4_joint_arm_live_at_3669_is_fresh`,
+in that pin's exact form): `workload::run_seed_with(10669, None,
+&workload::Tuning::FINAL)` — held-out's tuning is FINAL — asserting
+`twin_joint_arm.len() == rounds.len()`, `twin_joint_arm == [false,
+true]`, and every `twin_joint_stale_reads` entry zero. Measured
+literals: 2 rounds, `twin_joint_arm` `[false, true]`, stale `[0, 0]`,
+digest 3149242640 (the final run's own reading; the gate re-runs seed
+10669 alone at FINAL and confirms it — the pin itself needs no digest
+assertion, same as the 1069/3669 pins). PASSES at this tip (release,
+4.61 s). **No pin at 13469 or 16669** — the rule's minimum is 10669,
+and the test binary is already slow in debug. A failing pin is a
+**STOP for P, never an edit** (Limits 2, G5-CENSUS (f) at FINAL): no
+re-picking the seed, no retune, no loosened assertion.
+
+**2. G5-R48-TREADS-KEPT** — delete the one `treads.clear();`
+immediately before `joint_arm_ran = true;` (`src/workload.rs` about
+line 2661) — applied on a scratch export under
+`$CARGO_TARGET_DIR/x5f4f6-scratch/` (`git archive` of `nucleus/v2` +
+`nucleus/v3` from `cb2aca0d` plus this card's new
+`tests/workload.rs`, its own `CARGO_TARGET_DIR`, `cargo test -q
+--release -p e4-recovery x5f4_joint_arm_live_at`). The worktree never
+held the mutant; `git status` showed only the test edit throughout,
+and the worktree's `src/workload.rs` still has its `treads.clear();`.
+All three pins fail their stale-read assertion, exactly the card's
+predicted counts:
+
+- `x5f4_joint_arm_live_at_10669_is_fresh` — `seed 10669: every joint-arm re-run must start from a fresh supply — zero stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): [0, 24]`
+- `x5f4_joint_arm_live_at_1069_is_fresh` — `seed 1069: every joint-arm re-run must start from a fresh supply — zero stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): [0, 12]`
+- `x5f4_joint_arm_live_at_3669_is_fresh` — `seed 3669: every joint-arm re-run must start from a fresh supply — zero stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): [0, 56]`
+
+**3. No rule text changed; no `src/` change; post-data amendments:
+none.** The diff against `cb2aca0d` is exactly
+`spikes/e4-recovery/tests/workload.rs` (the one new pin and its doc
+comment) and this README section; the mutant and all scratch output
+stayed out of the worktree and out of the commit. Not closed by this
+card: E4 itself — the held-out and MP-pressure class-match readings
+(seeds 17948, 26018, 26958) stay with the owner.

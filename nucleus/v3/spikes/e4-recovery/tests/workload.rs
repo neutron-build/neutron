@@ -1965,6 +1965,46 @@ fn x5f4_joint_arm_live_at_3669_is_fresh() {
     );
 }
 
+/// **X-5c-F4-F6 (P ruling G5-CENSUS (e) 2, held-out; the final run's
+/// verdict `~/.cache/nv3-review/X-5c-F4.final.verdict.md` §9): the
+/// joint arm is live at FINAL on held-out seed 10669, and its supply
+/// is fresh.** The final run's held-out census read `JOINT_ARM_CENSUS
+/// set=held-out seeds=10000 arm_rounds=3 stale_reads=0
+/// arm_seeds=[10669,13469,16669]`; G5-CENSUS (e) 2 makes a live seed a
+/// required pin before E4 is judged, and this is that pin (the rule's
+/// minimum is 10669 — the card adds no pin at 13469 or 16669).
+/// Measured at this tip (the final run's own reading, at
+/// `Tuning::FINAL`, digest 3149242640): `rounds.len()` 2,
+/// `twin_joint_arm` `[false, true]`, `twin_joint_stale_reads`
+/// `[0, 0]` — the arm runs in round 1 alone, zero stale reads.
+///
+/// A failing pin is a **STOP for P, never an edit** (the card's
+/// Limits 2, G5-CENSUS (f)'s rule at FINAL): do not re-pick the seed,
+/// retune, or loosen the assertion. **G5-R48-TREADS-KEPT** (drop
+/// `treads.clear()`) must fail the stale-read assertion below with a
+/// non-zero count (`[0, 24]`).
+#[test]
+fn x5f4_joint_arm_live_at_10669_is_fresh() {
+    let rec = workload::run_seed_with(10669, None, &workload::Tuning::FINAL);
+    assert_eq!(
+        rec.twin_joint_arm.len(),
+        rec.rounds.len(),
+        "seed 10669: the joint-arm diagnostic must cover every executed round"
+    );
+    assert_eq!(
+        rec.twin_joint_arm,
+        [false, true],
+        "seed 10669: the arm must run at round 1 (the held-out census's measured \
+         round index, X-5c-F4-F6) and in no other round"
+    );
+    assert!(
+        rec.twin_joint_stale_reads.iter().all(|n| *n == 0),
+        "seed 10669: every joint-arm re-run must start from a fresh supply — zero \
+         stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): {:?}",
+        rec.twin_joint_stale_reads
+    );
+}
+
 /// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
 /// loud defect, never a hang.** The draft's `reachable_hook_spec`
 /// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with
