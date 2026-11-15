@@ -26,7 +26,7 @@ test-hooks = []
 
 [dependencies]
 thiserror = { workspace = true }
-rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 proptest = "1.12"
