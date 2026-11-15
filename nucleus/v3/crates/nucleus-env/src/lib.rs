@@ -70,7 +70,9 @@
 
 mod env;
 mod error;
+mod mem;
 mod path;
 
 pub use env::{Env, File, OpenMode};
 pub use error::EnvError;
+pub use mem::{MemEnv, MemFile};

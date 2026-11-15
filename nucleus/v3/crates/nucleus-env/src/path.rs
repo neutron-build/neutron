@@ -22,7 +22,10 @@ use crate::error::EnvError;
 /// `exists`, `list_dir`).
 pub(crate) fn check(path: &str) -> Result<(), EnvError> {
     if path.is_empty() {
-        return Err(invalid(path, "empty path: only sync_dir and list_dir accept the root"));
+        return Err(invalid(
+            path,
+            "empty path: only sync_dir and list_dir accept the root",
+        ));
     }
     check_non_root(path)
 }
@@ -42,7 +45,10 @@ pub(crate) fn check_dir(path: &str) -> Result<(), EnvError> {
 /// The clauses every non-root path must satisfy.
 fn check_non_root(path: &str) -> Result<(), EnvError> {
     if path.starts_with('/') {
-        return Err(invalid(path, "absolute path: paths are relative to the Env root"));
+        return Err(invalid(
+            path,
+            "absolute path: paths are relative to the Env root",
+        ));
     }
     for comp in path.split('/') {
         if comp.is_empty() {
@@ -52,7 +58,10 @@ fn check_non_root(path: &str) -> Result<(), EnvError> {
             return Err(invalid(path, "\".\" or \"..\" component"));
         }
         if comp.contains('\\') {
-            return Err(invalid(path, "backslash in component (\"/\" is the only separator)"));
+            return Err(invalid(
+                path,
+                "backslash in component (\"/\" is the only separator)",
+            ));
         }
         if comp.contains('\0') {
             return Err(invalid(path, "NUL in component"));
@@ -63,7 +72,10 @@ fn check_non_root(path: &str) -> Result<(), EnvError> {
 
 /// Builds the [`EnvError::InvalidPath`] for a violated clause.
 fn invalid(path: &str, why: &'static str) -> EnvError {
-    EnvError::InvalidPath { path: path.to_string(), why }
+    EnvError::InvalidPath {
+        path: path.to_string(),
+        why,
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +99,10 @@ mod tests {
     #[test]
     fn path_rejects_leading_slash() {
         assert!(matches!(check("/abs"), Err(EnvError::InvalidPath { .. })));
-        assert!(matches!(check_dir("/abs"), Err(EnvError::InvalidPath { .. })));
+        assert!(matches!(
+            check_dir("/abs"),
+            Err(EnvError::InvalidPath { .. })
+        ));
     }
 
     #[test]
@@ -99,12 +114,18 @@ mod tests {
     #[test]
     fn path_rejects_dotdot() {
         assert!(matches!(check("../x"), Err(EnvError::InvalidPath { .. })));
-        assert!(matches!(check("wal/../x"), Err(EnvError::InvalidPath { .. })));
+        assert!(matches!(
+            check("wal/../x"),
+            Err(EnvError::InvalidPath { .. })
+        ));
     }
 
     #[test]
     fn path_rejects_dot() {
-        assert!(matches!(check("wal/./x"), Err(EnvError::InvalidPath { .. })));
+        assert!(matches!(
+            check("wal/./x"),
+            Err(EnvError::InvalidPath { .. })
+        ));
         assert!(matches!(check("."), Err(EnvError::InvalidPath { .. })));
     }
 
