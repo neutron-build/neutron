@@ -55,6 +55,18 @@ function post(
   });
 }
 
+/** Write `raw` to a fresh socket and collect everything the server answers. */
+function rawExchange(port: number, raw: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const chunks: Buffer[] = [];
+    socket.on("data", (c) => chunks.push(c));
+    socket.on("error", reject);
+    socket.on("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    socket.end(raw);
+  });
+}
+
 describe("adapter request-body cap (TS-22)", () => {
   let running: NeutronServer | null = null;
   let root = "";
@@ -114,5 +126,36 @@ describe("adapter request-body cap (TS-22)", () => {
     // backstop behind it. Either way the handler must not see a 200.
     const res = await post(port, "x".repeat(2048), { "content-length": "10" });
     expect([400, 413]).toContain(res.status);
+  });
+
+  it("a declared length within the cap reaches the handler uncounted and intact", async () => {
+    const port = await boot(1024);
+    const res = await post(port, "x".repeat(1000), { "content-length": "1000" });
+    expect(res.status).toBe(200);
+    expect(res.text).toBe("received 1000");
+  });
+
+  it("a short declared length bounds what the handler reads, whatever follows on the socket", async () => {
+    const port = await boot(1024);
+    // 10 declared, 4096 sent. The parser hands the request exactly 10 bytes
+    // and reads the rest as a (malformed) next request, so no handler ever
+    // receives more than it was promised.
+    const answer = await rawExchange(
+      port,
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nConnection: close\r\n\r\n" + "x".repeat(4096),
+    );
+    expect(answer).not.toMatch(/received (?!10\b)\d+/);
+  });
+
+  it("a declared length alongside chunked framing is not trusted", async () => {
+    const port = await boot(1024);
+    const chunk = "x".repeat(4096);
+    const answer = await rawExchange(
+      port,
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+        `${chunk.length.toString(16)}\r\n${chunk}\r\n0\r\n\r\n`,
+    );
+    expect(answer).not.toContain("received 4096");
+    expect(answer).not.toMatch(/^HTTP\/1\.1 200/);
   });
 });

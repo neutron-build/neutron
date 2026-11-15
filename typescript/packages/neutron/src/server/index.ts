@@ -4,6 +4,7 @@ import { canonicalRequestPath, normalizePathname } from "../core/route-path.js";
 export { normalizePathname } from "../core/route-path.js";
 
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024;
+const DECLARED_LENGTH = /^\d+$/;
 import { beginCacheMutation, encodeCacheInvalidationPath } from "./cache-mutation.js";
 import { captureCacheBody } from "./cache-capture.js";
 import * as fs from "node:fs";
@@ -1679,6 +1680,14 @@ export async function createServer(
           status: 413,
           headers: { "Content-Type": "text/plain" },
         });
+      }
+      // A declared length within the cap needs no counting stream: Node's
+      // HTTP parser delivers exactly Content-Length bytes to a request and
+      // rejects one that also carries Transfer-Encoding, so the body cannot
+      // outgrow what the check above admitted. Only bodies of undeclared
+      // length (chunked) are counted as they are read.
+      if (declared !== null && DECLARED_LENGTH.test(declared) && !request.headers.has("transfer-encoding")) {
+        return app.fetch(request, env, executionCtx);
       }
       return app.fetch(capRequestBody(request, cap), env, executionCtx);
     };

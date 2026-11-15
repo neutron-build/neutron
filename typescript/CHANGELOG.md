@@ -20,6 +20,13 @@ core 0.5.5, cli 0.5.5, ai 0.1.4, cms 0.1.3 (not yet published).
 
 ### Fixed
 
+- **core: a request that declares its length is no longer read through the
+  body-cap counting stream.** The 10 MiB default cap added in 0.5.4 wrapped
+  every POST body in a second stream, which cost roughly 40% of throughput
+  on small POSTs in the CI smoke benchmark. Node delivers exactly
+  `Content-Length` bytes to a request and rejects one that also carries
+  `Transfer-Encoding`, so a declared length within the cap cannot be
+  exceeded; only bodies of undeclared length are still counted as read.
 - **cms: the undo banners put `role="status"` on the message, not the form.**
   `status` is not a valid role for a `form`.
 
