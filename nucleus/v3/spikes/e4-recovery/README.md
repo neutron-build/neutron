@@ -12018,3 +12018,154 @@ comment) and this README section; the mutant and all scratch output
 stayed out of the worktree and out of the commit. Not closed by this
 card: E4 itself — the held-out and MP-pressure class-match readings
 (seeds 17948, 26018, 26958) stay with the owner.
+
+## Card X-5c-F4-F7's record (the twin re-seed heal of the owner ruling
+## 2026-11-14, held-out 17948's pin and the five unmoved digests, and
+## MP-A's post-data amendment to any `rlen`)
+
+Class: experiment. **The two owner rulings of 2026-11-14** (delegated
+to the orchestrator: "go"), in substance verbatim from the card:
+
+1. **Held-out 17948, twin 2 is a harness defect** (P's Work 2.5 ruling,
+   `~/.cache/nv3-review/E4-final-diagnostics.md` §A.1): a twin rebuilt
+   from the real chain's disk inherits that chain's earlier media
+   damage, so it is not Work 2.5's twin ("the same seed, schedule and
+   F-CRASH resolutions, **with the media faults removed**, judged as
+   class C — from the same base the real round runs"). The harness is
+   fixed **now**, before E4 is judged, and re-checked under the fixed
+   harness: main must reproduce exactly; held-out must differ in seed
+   17948 only, with every twin of 17948 passing. No fresh final run:
+   the diagnostics replayed all 8,000 twin-bearing seeds and found no
+   false pass.
+2. **MP-pressure 26018 r0 and 26958 r0 are the refusals MP-A already
+   accepts** (diagnostics §B): the store refused to open, no caller
+   received data, and `rlen` is not causal (§B.3: across all 26
+   class-1/2 refusals no R slot was ever accepted, and the failing
+   page lies in R only when it happens to be untainted). **MP-A's
+   narrow form is extended to any `rlen`** — a post-data amendment to
+   the frozen class table, recorded as such.
+
+Not judged by this card: E4 itself. After this card's P gate, P
+re-runs the class match on all three sets and writes the E4 judgement.
+
+**The fix (P's §A.3), `src/sim/disk.rs` + `src/workload.rs`.**
+`SimDisk::heal_media()` — harness-only, the store never calls it —
+walks the clone's fault history (`disk.media`); for each fault's every
+damaged range (its own `[off, off+len)` and a MISDIRECTED's landing
+`[to_off, to_off+len)`) that is still live (`range_tainted`: the
+durable bytes differ from the last bytes the store issued there), it
+restores **the in-order composition of that file's durable writes over
+the range** (`dwrites_of`) — the bytes a run without media faults holds
+there. A range with no live damage is untouched, so **with no live
+range anywhere the heal is a no-op** (Limit 1): no seed without a
+damaged re-seed start runs different code — the 86 re-seeds of the
+final run that carried a fault history but no live damage write
+nothing. Both re-seed arms (`workload.rs`, the broken-chain re-seed and
+the directory re-seed) build the twin chain through
+`reseeded_twin_chain`, which heals the clone **after `ch.disk.clone()`
+and before the twin runs**; the real chain, the store, the oracle, the
+model, K, R, every tuning, quota and threshold are unchanged.
+
+**The self-check (§A.3 step 2; a violation is a seed defect, loud,
+never a pass).** After the heal, no media-fault range of the clone may
+still be `range_tainted` — `heal_media` re-checks every fault's ranges
+at the end, healed or not, because one range's heal can overlap
+another's — and the cloned store may not be poisoned (`ch.st.poisoned`).
+On violation `rec.defect` is set (the seed can never pass; the digest
+moves). Measured on all six damaged-start seeds: **the self-check never
+fired** (`defect: null` on 17948 and on the five below).
+
+**The `disk.media` choice: kept.** The heal acts on bytes, not on the
+bookkeeping list; the oracle paths that read `disk.media[..media_base]`
+(X5-R32 (a) 1's `prior_page_slots`) are class-MP arms a class-C twin
+never takes, `meta_slot_fault` needs the round's own faults (a twin has
+none), and P's data shows all 86 history-carrying damage-free re-seeds
+passed. Pinned by the unit pin's `disk.media.len() == 3` assertion
+below. The twin chain's own rounds apply no media faults
+(`MediaDraw::None`), so a healed chain stays healed through its carried
+rounds.
+
+**1. 17948 healed, and the five unmoved** (`tests/workload.rs`;
+`Tuning::FINAL`; measured at this tip, release).
+
+- `x5f4f7_twin_reseed_heals_17948`: seed 17948 (held-out MP, 3 rounds,
+  twin re-seeded at round 2 `dirs-differ`) reads **every twin passing**
+  — `[true, true, true]` — with the self-check clean. **The new digest
+  of record is 2541279735** (the unfixed harness read **2914550144**;
+  they differ, as the card requires). Unhealed, twin 2 is
+  `pass=false`, `o1 = "O-1(a) at c=25: published {} != model {2, 3, 4}"`
+  (the diagnostics' §A.1 record, reproduced by the mutant below).
+- `x5f4f7_damaged_start_digests_unmoved`: the five other damaged-start
+  seeds all reproduce their digests of record with every twin passing —
+  main 2399 → **642331466**, 5359 → **1958172881**; held-out 15249 →
+  **914096547**, 18119 → **3724720501**, 18689 → **4019746642** — P's
+  §A.3 prediction (the five twins never observed their damage) holds.
+
+**2. The unit pin** (`tests/directed.rs`,
+`x5f4f7_heal_media_restores_the_no_fault_bytes`): a synthetic page file
+with four twice-written slots and one LOST (slot 3), one TORN (slot 5)
+and one MISDIRECTED (slot 9's write, stray bytes landing on slot 7).
+Healing returns empty; the healed disk equals the no-fault clone **byte
+for byte** over the whole extent (durable and current view — no other
+byte touches); all four damaged ranges lose their taint; the fault
+history is kept (3 faults); and a damaged range that is **not live**
+(a synced rewrite after the fault) is untouched — the newer bytes
+survive, no revert to the faulted write or its pre-image.
+
+**3. M-TWIN-NO-HEAL** — skip the heal (`let still = disk.heal_media();`
+→ `let still: Vec<(usize, u64, u64)> = Vec::new();` in
+`reseeded_twin_chain`) — applied on a scratch `git archive` export
+under `$CARGO_TARGET_DIR/x5f4f7-scratch/m-no-heal/` (its own
+`CARGO_TARGET_DIR`, `cargo test -q --release -p e4-recovery --test
+workload x5f4f7_twin_reseed_heals_17948`). **Caught**, failing message
+verbatim:
+
+```
+seed 17948: every twin must pass under the heal (X-5c-F4-F7; twin 2 inherited slots 4/80/122 unhealed): [TwinRound { pass: true, o1_fail: None }, TwinRound { pass: true, o1_fail: None }, TwinRound { pass: false, o1_fail: Some("O-1(a) at c=25: published {} != model {2, 3, 4}") }]
+```
+
+The worktree never held the mutant; `git status` showed only this
+README uncommitted throughout, and the worktree's `src/workload.rs`
+still has its `disk.heal_media()` call.
+
+**4. The table amendment (Work 4)** — a **post-data amendment**, the
+card's one: `refused_old_page`'s `"rlen": {"eq": 0}` → `{"ge": 0}` and
+`refused_old_header`'s `"rlen": {"ge": 1}` → `{"ge": 0}`; class 3's
+`"rlen": {"eq": 0}` and every other byte unchanged. The table's
+sha256 moves from **`55ae4734…1158`** to
+**`a05534c7a34c1daa243eb2f2dc23f5f0776abe6c84af8c205af393d00e10fdea`**
+(measured, equals the card's constant). `e4_class_match.py` changes
+only `TABLE_SHA256`, the `unmatched-ge-below` literal (`rlen 0` →
+`rlen -1`, so M-GATE-GE-OFF1 `>= want - 1` is still caught) and two
+new cases pinning the amendment: `page-any-rlen` (the 1257 record with
+`rlen 1` reads class 1) and `header-any-rlen` (the 2927 record with
+`rlen 0` reads class 2). **self-test: 132 cases, 0 failed** (was 130).
+No matching logic changed. P's dry run on scratch copies (diagnostics
+§B.4) moved exactly 26018 into class 1 and 26958 into class 2 and
+nothing else in any of the three files; the runner's class match
+re-run settles it on the real files.
+
+**5. P's counts, for the record** (diagnostics §A.2, all 9,806 twin
+rounds replayed): **92 rebuilt twins** (every one `dirs-differ`;
+`broken-chain` never fired), **6 damaged starts** (main 2399, 5359;
+held-out 15249, 17948, 18119, 18689), of which **5 passed** and
+**17948 failed**; **0 false passes** (no passing twin ever observed
+inherited damage).
+
+**6. The runner's Acceptance lines 4–7 are `RUNNER`** (never run
+inside this attempt): the release build of `e4-campaign`; the main
+reproduction run (must stay byte-identical, `cb947c19…` — P predicts
+2399 and 5359 do not move; a failure is a STOP for P, not something to
+tune); the fresh held-out run (its JOINT_ARM_CENSUS line
+`arm_seeds=[10669,13469,16669]`; exactly seed
+17948's record may move, with every twin of 17948 passing — the fresh
+file becomes held-out's file of record for the class match once this
+card's gate passes, and the final run's `e655a61b…` stays as the record
+of what the unfixed harness produced); and the class-match comparison
+against the final run's held-out file. Line 8 is `scripts/gate.sh`,
+also the runner's.
+
+**7. Post-data amendments: one** — the class table's two `rlen`
+conditions (owner ruling 2026-11-14), item 4 above. Nothing else in
+this card is post-data: the heal implements P's pre-registered fix
+(§A.3) and the pins record what it measures.
