@@ -672,6 +672,17 @@ fn sim_segment_ack_substrate() {
                     // survives in every seed.
                     (_, Some(id)) => {
                         assert!(record_ok(&sim, id), "{case}: the acked record was lost");
+                        // A recycled segment leaves its old name behind
+                        // only when the rename was lost; with every
+                        // step taken the old name is gone (mutant
+                        // DIRSYNC-NOOP's stale directory ops would
+                        // re-bind it at the cut).
+                        if case == "rename" {
+                            assert!(
+                                old_id.is_none(),
+                                "{case}: the recycled old name is back beside the new"
+                            );
+                        }
                         let want_len = if arm == 2 { RECORD.len() as u64 } else { SEG };
                         if sim.disk().cur_len(id) != want_len {
                             len_bad += 1;
