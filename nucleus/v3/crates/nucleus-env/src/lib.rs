@@ -17,6 +17,16 @@
 //! - SimEnv (A-1b): MemEnv plus a seeded scheduler whose power cut
 //!   drops, tears, loses or misdirects unsynced writes.
 //!
+//! SimEnv (card A-1b, `--features sim`) is E4's simulator, copied with
+//! provenance from `spikes/e4-recovery` at commit `48ac9920` — the
+//! baton scheduler, `SimDisk` with its fault model, and the self-tests
+//! of card X-5's rework pins — behind this crate's [`Env`] and
+//! [`File`] traits (`sim::SimEnv`). The spike stays E4's evidence
+//! record. The feature is off by default: the simulator runs OS
+//! threads and keeps E4's opt-in diagnostic log, so no wasm32 or
+//! production build compiles it; tests enable it through the crate's
+//! self dev-dependency, as `test-hooks` does elsewhere.
+//!
 //! # The contract (card A-1a, Work 2)
 //!
 //! - **E-PATH** — a path is relative, with `/` separators; each
@@ -118,6 +128,10 @@ mod env;
 mod error;
 mod mem;
 mod path;
+#[cfg(feature = "sim")]
+pub mod rng;
+#[cfg(feature = "sim")]
+pub mod sim;
 #[cfg(unix)]
 mod std_env;
 
