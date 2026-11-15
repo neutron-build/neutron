@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -167,7 +168,7 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if again.SHA256Hex != doc.SHA256Hex {
-		t.Fatal("unchanged database drifted")
+		t.Fatalf("unchanged database drifted\n%s", canonicalDivergence(doc.Canonical, again.Canonical))
 	}
 	v2after, err := h.client.IntrospectV2(ctx)
 	if err != nil {
@@ -187,7 +188,7 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if hostileDoc.SHA256Hex != doc.SHA256Hex {
-		t.Fatal("hostile search_path redirected native metadata")
+		t.Fatalf("hostile search_path redirected native metadata\n%s", canonicalDivergence(doc.Canonical, hostileDoc.Canonical))
 	}
 	// Recreate a function: PostgreSQL assigns a new OID but the portable
 	// canonical identity/definition must remain exactly unchanged.
@@ -198,7 +199,7 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if recreated.SHA256Hex != doc.SHA256Hex {
-		t.Fatal("ephemeral object OID changed portable hash")
+		t.Fatalf("ephemeral object OID changed portable hash\n%s", canonicalDivergence(doc.Canonical, recreated.Canonical))
 	}
 }
 
@@ -210,4 +211,18 @@ func v3PartsOfKind(parts []V3InventoryPart, kind string) []V3InventoryPart {
 		}
 	}
 	return selected
+}
+
+// canonicalDivergence shows where two canonical documents first differ, so a
+// hash mismatch reports the metadata that moved rather than only that it did.
+func canonicalDivergence(want, got []byte) string {
+	limit := min(len(want), len(got))
+	at := 0
+	for at < limit && want[at] == got[at] {
+		at++
+	}
+	window := func(doc []byte) string {
+		return string(doc[max(0, at-200):min(len(doc), at+200)])
+	}
+	return fmt.Sprintf("first difference at byte %d (lengths %d and %d)\nbefore: %s\nafter:  %s", at, len(want), len(got), window(want), window(got))
 }
