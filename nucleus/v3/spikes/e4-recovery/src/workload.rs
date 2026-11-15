@@ -2044,6 +2044,63 @@ pub fn twin_dirs_differ(real: &StoreInner, twin: &StoreInner) -> bool {
     real.dir.keys().ne(twin.dir.keys())
 }
 
+/// **X-5c-F4-F7 (owner ruling 2026-11-14; P's Work 2.5 ruling,
+/// `E4-final-diagnostics.md` §A.1 and §A.3): the twin chain a re-seed
+/// runs from — the real round's own start, with the real chain's
+/// earlier media damage healed off the cloned disk.**
+///
+/// Both re-seed arms (the broken-chain re-seed and the directory
+/// re-seed below) rebuild the twin from `ch.disk.clone()`, and that
+/// clone carries every earlier real round's media fault that is still
+/// live on the real disk. Work 2.5's twin is "the same seed, schedule
+/// and F-CRASH resolutions, **with the media faults removed**, judged
+/// as class C — from the same base the real round runs", so a
+/// damaged clone is not that twin (held-out 17948 twin 2: the clone
+/// inherited three damaged page slots from rounds 0–1 and class C's
+/// rules failed the round on them — a false failure; the store had
+/// detected and refused exactly as its real round, which passes, does).
+///
+/// The heal ([`crate::sim::SimDisk::heal_media`], P's fix §A.3) acts
+/// **only on the clone**: the real chain, the store state, the model
+/// and the cut are untouched, and with no live damaged range the heal
+/// is a no-op — so no seed without a damaged re-seed start runs
+/// different code (card Limit 1).
+///
+/// The self-check (§A.3 step 2; a violation is a seed defect, loud,
+/// never a pass): after the heal no media-fault range of the clone may
+/// still be `range_tainted`, and the cloned store may not be poisoned.
+/// On violation `rec.defect` is set — the seed can never pass and the
+/// digest moves — the harness tells P, it never hides it.
+fn reseeded_twin_chain(ch: &Chain, rec: &mut SeedRec, round: u32) -> Chain {
+    let mut disk = ch.disk.clone();
+    // Step 1, the heal. `still` holds every damaged range that remains
+    // tainted after it (healed or not — one range's heal can overlap
+    // another's).
+    let still = disk.heal_media();
+    if !still.is_empty() && rec.defect.is_none() {
+        rec.defect = Some(format!(
+            "twin round {round}: re-seed heal left {} media-fault range(s) tainted: {:?}",
+            still.len(),
+            still
+        ));
+    }
+    // Step 2's other half: a poisoned cloned store is not the base
+    // Work 2.5 names — the twin would inherit a stopped store through
+    // no read of its own.
+    if ch.st.poisoned.is_some() && rec.defect.is_none() {
+        rec.defect = Some(format!(
+            "twin round {round}: re-seeded from a poisoned store: {:?}",
+            ch.st.poisoned
+        ));
+    }
+    Chain {
+        disk,
+        st: ch.st.clone(),
+        model: harness::clone_model(&ch.model),
+        cut: ch.cut,
+    }
+}
+
 /// Run one seed: create, then 1–3 rounds (each with its twin first for
 /// MP/MW), collecting the record. Pure in `(seed, mutant)` (W-DET).
 /// Runs `Tuning::FINAL` — the campaign's generator (X5-R37).
@@ -2230,13 +2287,11 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // from the real round's own start (Work 2.5: the twin is the
         // same script, crash and F-CRASH resolutions, faultless, judged
         // as class C — from the same base the real round runs).
+        // **X-5c-F4-F7:** the re-seeded clone is healed of the real
+        // chain's earlier media damage first (`reseeded_twin_chain`),
+        // or it is not faultless and not Work 2.5's twin.
         if twin_chain.is_none() && class != FaultClass::C {
-            twin_chain = Some(Chain {
-                disk: ch.disk.clone(),
-                st: ch.st.clone(),
-                model: harness::clone_model(&ch.model),
-                cut: ch.cut,
-            });
+            twin_chain = Some(reseeded_twin_chain(&ch, &mut rec, round));
         }
         // **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b); the directory
         // re-seed):** a real MW round whose WAL fault loses a DropTree
@@ -2255,17 +2310,14 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // seeds (class C never builds one), which is the ruling's "every
         // MP/MW round"; nothing else changes (the twin still runs class
         // C, faultless, at the same crash and resolutions, and no record
-        // field or digest input is added).
+        // field or digest input is added). **X-5c-F4-F7:** this clone is
+        // healed the same way (`reseeded_twin_chain`) — the real chain's
+        // earlier media damage must not ride the re-seed into the twin.
         if twin_chain
             .as_ref()
             .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
         {
-            twin_chain = Some(Chain {
-                disk: ch.disk.clone(),
-                st: ch.st.clone(),
-                model: harness::clone_model(&ch.model),
-                cut: ch.cut,
-            });
+            twin_chain = Some(reseeded_twin_chain(&ch, &mut rec, round));
         }
         // The targeted draw of a class C round retries on its own
         // (no twin exists); keep the round's start for the re-run. The

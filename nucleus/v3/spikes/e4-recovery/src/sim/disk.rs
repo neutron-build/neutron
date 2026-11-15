@@ -47,6 +47,15 @@
 //! (nothing to differ from); §3.3 still rejects stray bytes there
 //! because they cannot match a reference.
 //!
+//! X-5c-F4-F7 (owner ruling 2026-11-14): a re-seeded twin's cloned disk
+//! may carry the real chain's earlier media damage, which Work 2.5's
+//! twin ("with the media faults removed") forbids —
+//! [`SimDisk::heal_media`] is the harness-only heal. It restores, at
+//! every damaged range that is still live, the composition of the
+//! file's durable writes; it records no issued reference, no durable
+//! write and no fault, and is a no-op when no range is live, so no
+//! seed without a damaged re-seed start runs different code.
+//!
 //! Determinism: iteration is over `BTreeMap`s only; every random draw
 //! comes from the caller's [`Rng`] streams.
 
@@ -1195,6 +1204,90 @@ impl SimDisk {
             Some(i) => i.taint_of(off, len, &i.durable_view(off, len)),
             None => false,
         }
+    }
+
+    /// **X-5c-F4-F7 (owner ruling 2026-11-14; P's fix,
+    /// `E4-final-diagnostics.md` §A.3): heal a re-seeded twin's cloned
+    /// disk of the real chain's earlier media damage** — harness only;
+    /// the store never calls this. Work 2.5's twin is "the same seed,
+    /// schedule and F-CRASH resolutions, with the media faults removed,
+    /// judged as class C", and a clone of the real chain's disk carries
+    /// every earlier real round's media fault that is still live there,
+    /// so without the heal class C's rules judge media damage (held-out
+    /// 17948 twin 2: a false O-1(a)/O-3(b) failure on three inherited
+    /// slots).
+    ///
+    /// What it does, per fault in the clone's history ([`SimDisk::media`],
+    /// in application order): each range the fault damaged — its own
+    /// `[off, off+len)` and, for a MISDIRECTED, its landing
+    /// `[to_off, to_off+len)` — that is still live ([`SimDisk::range_tainted`]:
+    /// the durable bytes differ from the last bytes the store issued
+    /// there) is restored to **the in-order composition of that file's
+    /// durable writes over the range** ([`SimDisk::dwrites_of`]): the
+    /// bytes a run without media faults holds there. Bytes of the range
+    /// no durable write covers keep their current content — the
+    /// composition does not reach them. A range with no live damage is
+    /// untouched, so **with no live range anywhere the heal is a no-op**
+    /// (card Limit 1): the 86 re-seeds of the final run that carried a
+    /// fault history but no live damage write nothing and run no
+    /// different code.
+    ///
+    /// What it does not do: no issued reference, durable write or fault
+    /// is recorded (the heal is invisible to taint, candidates and
+    /// quotas); the fault history itself is **kept** (X-5c-F4-F7's
+    /// documented choice: the oracle paths that read
+    /// `disk.media[..media_base]` — X5-R32 (a) 1's `prior_page_slots` —
+    /// are class-MP arms a class-C twin never takes, and P's data shows
+    /// all 86 history-carrying damage-free re-seeds passed); the real
+    /// chain's disk is never touched (the caller heals a clone).
+    ///
+    /// Returns the damaged ranges **still tainted after the heal** —
+    /// every fault's ranges are re-checked at the end, healed or not,
+    /// because one range's heal overlaps another's. Empty means the
+    /// clone is clean; a non-empty return is the caller's self-check
+    /// tripwire (a seed defect, loud, never a pass).
+    pub fn heal_media(&mut self) -> Vec<(FileId, u64, u64)> {
+        let mut ranges: Vec<(FileId, u64, u64)> = Vec::new();
+        for f in self.media.iter() {
+            ranges.push((f.inode, f.off, f.len));
+            if let MediaKind::Misdirected { to_off } = &f.kind {
+                ranges.push((f.inode, *to_off, f.len));
+            }
+        }
+        for &(id, off, len) in ranges.iter() {
+            if !self.range_tainted(id, off, len) {
+                continue;
+            }
+            let end = off + len;
+            // Start from the current durable bytes (the parts no
+            // durable write covers keep their content), then apply the
+            // file's durable writes over the range in issue order.
+            let mut bytes = self.durable_read(id, off, len);
+            for w in self.dwrites_of(id).iter() {
+                let wend = w.off + w.bytes.len() as u64;
+                let s = w.off.max(off);
+                let e = wend.min(end);
+                if s >= e {
+                    continue;
+                }
+                let seg = w
+                    .bytes
+                    .get((s - w.off) as usize..(e - w.off) as usize)
+                    .map(|s| s.to_vec());
+                if let Some(src) = seg
+                    && let Some(dst) = bytes.get_mut((s - off) as usize..(e - off) as usize)
+                {
+                    dst.copy_from_slice(&src);
+                }
+            }
+            if let Some(inode) = self.inodes.get_mut(id) {
+                write_both(inode, off, &bytes);
+            }
+        }
+        ranges
+            .into_iter()
+            .filter(|&(id, off, len)| self.range_tainted(id, off, len))
+            .collect()
     }
 }
 
