@@ -2005,6 +2005,83 @@ fn x5f4_joint_arm_live_at_10669_is_fresh() {
     );
 }
 
+/// **X-5c-F4-F7 (owner ruling 2026-11-14; P's Work 2.5 ruling,
+/// `E4-final-diagnostics.md` §A.1–§A.4): the twin re-seed heal makes
+/// held-out 17948's every twin pass.** Seed 17948 round 2 re-seeded its
+/// twin from the real chain's disk (`dirs-differ`), which still carried
+/// the damage of rounds 0–1 (a LOST on page slot 4, a MISDIRECTED on
+/// slot 80 landing on slot 122) — not Work 2.5's faultless twin — and
+/// twin 2 failed O-1(a)/O-3(b) on the inherited slots (digest
+/// 2914550144, the unfixed harness's reading). The heal
+/// (`SimDisk::heal_media` at both re-seed arms) restores the no-fault
+/// bytes on the clone, so every twin now passes and the digest moves.
+/// P's census: 17948 is the only one of the 9,806 twin rounds whose
+/// twin observed inherited damage (one false failure, no false pass).
+///
+/// A failing pin is a **STOP for P, never an edit** (card Limit 3): do
+/// not re-pick the seed, retune, or loosen an assertion. The new digest
+/// is the healed harness's literal of record; **M-TWIN-NO-HEAL**
+/// (skip the heal) must fail the twin assertion below with twin 2's
+/// `pass=false` (`O-1(a) at c=25: published {} != model {2, 3, 4}`).
+#[test]
+fn x5f4f7_twin_reseed_heals_17948() {
+    let rec = workload::run_seed_with(17948, None, &workload::Tuning::FINAL);
+    assert_eq!(
+        rec.twin.len(),
+        rec.rounds.len(),
+        "seed 17948: every executed MP round must have its twin entry"
+    );
+    assert!(
+        rec.twin.iter().all(|t| t.pass),
+        "seed 17948: every twin must pass under the heal (X-5c-F4-F7; twin 2 inherited \
+         slots 4/80/122 unhealed): {:?}",
+        rec.twin
+    );
+    assert!(
+        rec.defect.is_none(),
+        "seed 17948: the re-seed self-check must be clean (no tainted range, no poisoned \
+         clone): {:?}",
+        rec.defect
+    );
+    assert_eq!(
+        rec.digest, 2541279735,
+        "seed 17948: the healed harness's digest of record (the unfixed harness read \
+         2914550144; it must differ)"
+    );
+}
+
+/// **X-5c-F4-F7's companion pin: the heal moves no digest but 17948's
+/// (card Limit 3, P's prediction §A.3).** The five other damaged-start
+/// seeds of the final run — main 2399 and 5359, held-out 15249, 18119
+/// and 18689, all re-seeded at round 2 with live inherited damage —
+/// never read, find or poison on their damage (taint at read time false
+/// in P's census), so healing their clones' bytes cannot change what
+/// their twins observe and the digests of record stand. Any digest here
+/// that moves, or any twin that stops passing, is a **STOP for P** (a
+/// main digest that moves fails the runner's main reproduction line;
+/// a held-out digest other than 17948's is equally fatal).
+#[test]
+fn x5f4f7_damaged_start_digests_unmoved() {
+    for (seed, digest) in [
+        (2399u64, 642331466u64),
+        (5359, 1958172881),
+        (15249, 914096547),
+        (18119, 3724720501),
+        (18689, 4019746642),
+    ] {
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::FINAL);
+        assert!(
+            rec.twin.iter().all(|t| t.pass),
+            "seed {seed}: every twin must still pass under the heal: {:?}",
+            rec.twin
+        );
+        assert_eq!(
+            rec.digest, digest,
+            "seed {seed}: the damaged-start digests are unmoved by the heal (X-5c-F4-F7)"
+        );
+    }
+}
+
 /// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
 /// loud defect, never a hang.** The draft's `reachable_hook_spec`
 /// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with
