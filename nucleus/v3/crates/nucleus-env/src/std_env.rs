@@ -2,13 +2,20 @@
 //! (PLAN-v3 §3.2; card A-1a Work 5).
 //!
 //! Invariants owned, on the real filesystem: **E-OPEN**, **E-IO**,
-//! **E-DURABLE**, **E-NAMESPACE**, **E-LOCK** and **E-CLOCK/RAND** as
-//! stated in the crate root. S-STORE §2 routes every store I/O here;
-//! §12.5's writer rule (the segment `sync_all` and its `wal/`
-//! directory entry synced) rests on [`StdEnv::sync_dir`] and
-//! [`crate::File::sync_all`]; §14.1's "No writer" rests on the flock
-//! modes of [`crate::File::lock_exclusive`] and
-//! [`crate::File::lock_shared`].
+//! **E-DURABLE**, **E-NAMESPACE**, **E-LOCK**, **E-HANDLE**, **E-KIND**
+//! and **E-CLOCK/RAND** as stated in the crate root. S-STORE §2 routes
+//! every store I/O here; §12.5's writer rule (the segment `sync_all`
+//! and its `wal/` directory entry synced) rests on [`StdEnv::sync_dir`]
+//! and [`crate::File::sync_all`]; §14.1's "No writer" rests on the
+//! flock modes of [`crate::File::lock_exclusive`] and
+//! [`crate::File::lock_shared`]. **E-HANDLE** is POSIX open-file
+//! semantics for free: a descriptor reaches its inode across a rename
+//! and after an unlink, and flock locks the inode, so a lock moves
+//! with a rename (card A-1b-0 Work 4's alignment of the backends).
+//! **E-KIND**'s refusals come from explicit metadata checks on the
+//! opened descriptor, never from a raw errno, so the
+//! `NotADirectory`-of-path-resolution mapping in [`map_io`] cannot
+//! hide them.
 //!
 //! **Unix only** (`#[cfg(unix)]` in `lib.rs`): the wasm32 target is not
 //! unix, so this file's platform calls never reach the browser build,
@@ -50,10 +57,14 @@ pub struct StdFile {
 /// Maps a platform error onto the [`EnvError`] surface (card A-1a
 /// Work 5: `NotFound`, `AlreadyExists`, `StorageFull` and
 /// `QuotaExceeded` map to their variants, the last two to `NoSpace`;
-/// everything else is `Io`).
+/// everything else is `Io`). `NotADirectory` from path resolution
+/// means a component of the path is a file, so the path names nothing:
+/// it maps to `NotFound` (E-KIND, card A-1b-0). E-KIND's target-kind
+/// refusals come from explicit metadata checks, never from this
+/// mapping.
 fn map_io(op: &'static str, path: &str, e: std::io::Error) -> EnvError {
     match e.kind() {
-        ErrorKind::NotFound => EnvError::NotFound {
+        ErrorKind::NotFound | ErrorKind::NotADirectory => EnvError::NotFound {
             path: path.to_string(),
         },
         ErrorKind::AlreadyExists => EnvError::AlreadyExists {
@@ -69,6 +80,28 @@ fn map_io(op: &'static str, path: &str, e: std::io::Error) -> EnvError {
             kind,
             detail: e.to_string(),
         },
+    }
+}
+
+/// The E-KIND refusal for an opened path that is a directory where a
+/// file is required.
+fn is_a_directory(op: &'static str, path: &str) -> EnvError {
+    EnvError::Io {
+        op,
+        path: path.to_string(),
+        kind: ErrorKind::IsADirectory,
+        detail: "is a directory".to_string(),
+    }
+}
+
+/// The E-KIND refusal for an opened path that is a file where a
+/// directory is required.
+fn not_a_directory(op: &'static str, path: &str) -> EnvError {
+    EnvError::Io {
+        op,
+        path: path.to_string(),
+        kind: ErrorKind::NotADirectory,
+        detail: "not a directory".to_string(),
     }
 }
 
@@ -134,11 +167,21 @@ impl Env for StdEnv {
                 .open(&full),
         };
         match file {
-            Ok(file) => Ok(StdFile {
-                file,
-                path: path.to_string(),
-                mode,
-            }),
+            Ok(file) => {
+                // E-KIND: check the opened descriptor's metadata in
+                // every mode, so a directory is refused the same way
+                // everywhere (a bare `Read` open of a directory would
+                // otherwise succeed on Linux).
+                let meta = file.metadata().map_err(|e| map_io("open", path, e))?;
+                if meta.is_dir() {
+                    return Err(is_a_directory("open", path));
+                }
+                Ok(StdFile {
+                    file,
+                    path: path.to_string(),
+                    mode,
+                })
+            }
             Err(e) => Err(map_io("open", path, e)),
         }
     }
@@ -154,6 +197,13 @@ impl Env for StdEnv {
         // directory's entries durable and nothing else (E-DURABLE;
         // S-STORE §12.5's "wal/ directory entry synced through Env").
         let dir = StdFsFile::open(self.full(path)).map_err(|e| map_io("open", path, e))?;
+        // E-KIND: a file here would fsync the file and return Ok, so
+        // the opened descriptor's metadata is checked first — a caller
+        // that passes `wal/<seg>.log` for `wal` is told (A-1a-F3).
+        let meta = dir.metadata().map_err(|e| map_io("metadata", path, e))?;
+        if !meta.is_dir() {
+            return Err(not_a_directory("sync_dir", path));
+        }
         dir.sync_all().map_err(|e| map_io("sync_dir", path, e))
     }
 
@@ -166,11 +216,22 @@ impl Env for StdEnv {
                 why: "cross-directory rename",
             });
         }
+        // E-KIND's order: the source first. A missing source, or one
+        // under a file, is `NotFound` naming the source (map_io maps
+        // path-resolution `NotADirectory` to `NotFound`); a directory
+        // source is refused, because `rename` moves a file. The check
+        // does not lean on a platform errno (macOS gives `EPERM` here).
+        match std::fs::symlink_metadata(self.full(from)) {
+            Ok(m) if m.is_dir() => return Err(is_a_directory("rename", from)),
+            Ok(_) => {}
+            Err(e) => return Err(map_io("stat", from, e)),
+        }
         // Refuse an existing target before renaming, so a store bug
         // surfaces as AlreadyExists instead of a silent replace
-        // (E-NAMESPACE). The check-then-rename race is excluded by
+        // (E-NAMESPACE). The check-then-act race is excluded by
         // N11's single owner: the renamer holds the file's exclusive
-        // lock, so no other handle can create the target between them.
+        // lock, so no other handle can create the target between the
+        // checks and the rename, for `remove` as well as `rename`.
         match std::fs::symlink_metadata(self.full(to)) {
             Ok(_) => {
                 return Err(EnvError::AlreadyExists {
@@ -180,11 +241,23 @@ impl Env for StdEnv {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(map_io("stat", to, e)),
         }
-        std::fs::rename(self.full(from), self.full(to)).map_err(|e| map_io("rename", from, e))
+        // A failure of the rename itself names both ends, the form the
+        // cross-directory `InvalidPath` already uses (A-1a-F3, nit 2).
+        let shown = format!("{from} -> {to}");
+        std::fs::rename(self.full(from), self.full(to)).map_err(|e| map_io("rename", &shown, e))
     }
 
     fn remove(&self, path: &str) -> Result<(), EnvError> {
         path::check(path)?;
+        // E-KIND: refuse a directory from the metadata, not from the
+        // platform's errno (Linux gives EISDIR but macOS gives EPERM).
+        // The check-then-remove race is excluded by N11's single
+        // owner, as for `rename` above.
+        match std::fs::symlink_metadata(self.full(path)) {
+            Ok(m) if m.is_dir() => return Err(is_a_directory("remove", path)),
+            Ok(_) => {}
+            Err(e) => return Err(map_io("stat", path, e)),
+        }
         std::fs::remove_file(self.full(path)).map_err(|e| map_io("remove", path, e))
     }
 
@@ -192,13 +265,28 @@ impl Env for StdEnv {
         path::check(path)?;
         match std::fs::symlink_metadata(self.full(path)) {
             Ok(_) => Ok(true),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            // E-NAMESPACE, E-KIND: a missing path — or a path under a
+            // file, which names nothing — is Ok(false), never an
+            // error.
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                Ok(false)
+            }
             Err(e) => Err(map_io("stat", path, e)),
         }
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<String>, EnvError> {
         path::check_dir(path)?;
+        // E-KIND: check the opened descriptor's metadata, so a file
+        // here is `Io { NotADirectory }` rather than `Ok` with nothing
+        // listed (A-1a-F3). The check-then-read race is excluded by
+        // N11's single owner, as for `rename` above.
+        let probe = StdFsFile::open(self.full(path)).map_err(|e| map_io("open", path, e))?;
+        let meta = probe.metadata().map_err(|e| map_io("metadata", path, e))?;
+        if !meta.is_dir() {
+            return Err(not_a_directory("list_dir", path));
+        }
+        drop(probe);
         let entries = std::fs::read_dir(self.full(path)).map_err(|e| map_io("open", path, e))?;
         let mut names = Vec::new();
         for entry in entries {
@@ -265,6 +353,12 @@ impl StdFile {
 
 impl File for StdFile {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, EnvError> {
+        // E-IO: an offset past `i64::MAX` is past every end-of-file
+        // (pread itself refuses it with InvalidInput), so it reads 0
+        // (A-1a-F3).
+        if off > i64::MAX as u64 {
+            return Ok(0);
+        }
         // One pread can return short (or Interrupted); loop until the
         // buffer is full or end-of-file, so the count is short only at
         // the end (E-IO).

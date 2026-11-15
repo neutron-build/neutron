@@ -883,6 +883,235 @@ pub fn handle_survives_remove_and_recreate<E: Env>(env: &E) -> Result<(), String
     Ok(())
 }
 
+/// **E-KIND.** File/directory mismatches agree on every backend: a
+/// directory where a file is required (`open`, `remove`, `rename`'s
+/// source) is `Io { IsADirectory }`; a file where a directory is
+/// required (`sync_dir`, `list_dir`) is `Io { NotADirectory }`; a path
+/// under a file names nothing (`exists` is `Ok(false)`, the rest
+/// `NotFound`); and `rename` checks its source before its target.
+/// Nothing in the namespace changes.
+pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let page = env
+        .open("page", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew page: {e:?}"))?;
+    page.write_at(0, b"p")
+        .map_err(|e| format!("write_at page: {e:?}"))?;
+    drop(page);
+    let seg = env
+        .open("wal/seg", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/seg: {e:?}"))?;
+    drop(seg);
+
+    // A directory as a file.
+    io_kind_is(
+        env.open("wal", OpenMode::Read).map(|_| ()),
+        std::io::ErrorKind::IsADirectory,
+        "open(wal, Read)",
+    )?;
+    io_kind_is(
+        env.open("wal", OpenMode::ReadWrite).map(|_| ()),
+        std::io::ErrorKind::IsADirectory,
+        "open(wal, ReadWrite)",
+    )?;
+    err_is(
+        env.open("wal", OpenMode::CreateNew).map(|_| ()),
+        Want::AlreadyExists,
+        "wal",
+        "CreateNew on a directory's taken name",
+    )?;
+    io_kind_is(
+        env.remove("wal"),
+        std::io::ErrorKind::IsADirectory,
+        "remove(wal)",
+    )?;
+    io_kind_is(
+        env.rename("wal", "wal2"),
+        std::io::ErrorKind::IsADirectory,
+        "rename(wal, wal2)",
+    )?;
+    for (path, want) in [("wal", true), ("wal2", false)] {
+        let got = env
+            .exists(path)
+            .map_err(|e| format!("exists {path}: {e:?}"))?;
+        if got != want {
+            return Err(format!("exists({path:?}) is {got}, wanted {want}"));
+        }
+    }
+
+    // A file as a directory.
+    io_kind_is(
+        env.sync_dir("page"),
+        std::io::ErrorKind::NotADirectory,
+        "sync_dir(page)",
+    )?;
+    io_kind_is(
+        env.sync_dir("wal/seg"),
+        std::io::ErrorKind::NotADirectory,
+        "sync_dir(wal/seg)",
+    )?;
+    io_kind_is(
+        env.list_dir("page").map(|_| ()),
+        std::io::ErrorKind::NotADirectory,
+        "list_dir(page)",
+    )?;
+    err_is(
+        env.create_dir("page"),
+        Want::AlreadyExists,
+        "page",
+        "create_dir over a file",
+    )?;
+
+    // A path under a file names nothing.
+    match env.exists("page/x") {
+        Ok(false) => {}
+        other => return Err(format!("exists(page/x) gave {other:?}, wanted Ok(false)")),
+    }
+    err_is(
+        env.open("page/x", OpenMode::Read).map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "Read under a file",
+    )?;
+    err_is(
+        env.open("page/x", OpenMode::ReadWrite).map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "ReadWrite under a file",
+    )?;
+    err_is(
+        env.open("page/x", OpenMode::CreateNew).map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "CreateNew under a file",
+    )?;
+    err_is(
+        env.create_dir("page/x"),
+        Want::NotFound,
+        "page/x",
+        "create_dir under a file",
+    )?;
+    err_is(
+        env.remove("page/x"),
+        Want::NotFound,
+        "page/x",
+        "remove under a file",
+    )?;
+    err_is(
+        env.rename("page/x", "page/y"),
+        Want::NotFound,
+        "page/x",
+        "rename from under a file",
+    )?;
+    err_is(
+        env.sync_dir("page/x"),
+        Want::NotFound,
+        "page/x",
+        "sync_dir under a file",
+    )?;
+    err_is(
+        env.list_dir("page/x").map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "list_dir under a file",
+    )?;
+
+    // Check order: the source is checked before the target, so a
+    // missing source is NotFound even when the target exists.
+    err_is(
+        env.rename("wal/ghost", "wal/seg"),
+        Want::NotFound,
+        "wal/ghost",
+        "rename from a missing source onto an existing target",
+    )?;
+
+    // Nothing changed.
+    let root = env
+        .list_dir("")
+        .map_err(|e| format!("list_dir '': {e:?}"))?;
+    if root != ["page", "wal"] {
+        return Err(format!(
+            "list_dir('') is {root:?}, wanted [\"page\", \"wal\"]"
+        ));
+    }
+    let wal = env
+        .list_dir("wal")
+        .map_err(|e| format!("list_dir wal: {e:?}"))?;
+    if wal != ["seg"] {
+        return Err(format!("list_dir(wal) is {wal:?}, wanted [\"seg\"]"));
+    }
+    let r = env
+        .open("page", OpenMode::Read)
+        .map_err(|e| format!("Read page: {e:?}"))?;
+    let mut buf = [0u8; 1];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at page: {e:?}"))?;
+    if n != 1 || buf != *b"p" {
+        return Err(format!("page reads {n} bytes {buf:?}, wanted b\"p\""));
+    }
+    Ok(())
+}
+
+/// **E-IO's edges.** A zero-length `write_at` changes nothing at any
+/// offset and returns `Ok` — after the `Read` handle's refusal, which
+/// still comes first; `read_at` returns 0 at offsets no platform file
+/// can reach, past `i64::MAX`.
+pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
+    let f = env
+        .open("page", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew page: {e:?}"))?;
+    f.write_at(0, b"abc")
+        .map_err(|e| format!("write_at page: {e:?}"))?;
+
+    // A zero-length write at any offset: no extension, Ok.
+    f.write_at(100, b"")
+        .map_err(|e| format!("write_at(100, b\"\"): {e:?}"))?;
+    f.write_at(3, b"")
+        .map_err(|e| format!("write_at(3, b\"\"): {e:?}"))?;
+    let len = f.len().map_err(|e| format!("len: {e:?}"))?;
+    if len != 3 {
+        return Err(format!("len after the empty writes is {len}, wanted 3"));
+    }
+
+    // Offsets no platform file can reach still read 0, not an error.
+    let mut buf = [0u8; 4];
+    for off in [1u64 << 63, u64::MAX] {
+        let n = f
+            .read_at(off, &mut buf)
+            .map_err(|e| format!("read_at({off}): {e:?}"))?;
+        if n != 0 {
+            return Err(format!("read_at({off}) gave {n}, wanted 0"));
+        }
+    }
+    drop(f);
+
+    // The refusal comes before the empty-write no-op.
+    let r = env
+        .open("page", OpenMode::Read)
+        .map_err(|e| format!("Read page: {e:?}"))?;
+    err_is(
+        r.write_at(0, b""),
+        Want::ReadOnly,
+        "page",
+        "write_at(b\"\") on a Read handle",
+    )?;
+    drop(r);
+
+    let r = env
+        .open("page", OpenMode::Read)
+        .map_err(|e| format!("Read page: {e:?}"))?;
+    let mut buf = [0u8; 3];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at page: {e:?}"))?;
+    if n != 3 || buf != *b"abc" {
+        return Err(format!("page reads {n} bytes {buf:?}, wanted b\"abc\""));
+    }
+    Ok(())
+}
+
 /// **E-CLOCK/RAND.** `now` never decreases; after `sleep(1 ms)`, `now`
 /// has grown by at least 1 ms; two `rand` calls differ.
 pub fn clock_and_rand<E: Env>(env: &E) -> Result<(), String> {

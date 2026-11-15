@@ -190,14 +190,25 @@ impl MemEnv {
         }
     }
 
-    /// An E-NAMESPACE refusal for a name that is a directory where a
-    /// file is required.
+    /// An E-KIND refusal for a name that is a directory where a file is
+    /// required.
     fn is_a_directory(op: &'static str, path: &str) -> EnvError {
         EnvError::Io {
             op,
             path: path.to_string(),
-            kind: std::io::ErrorKind::Other,
+            kind: std::io::ErrorKind::IsADirectory,
             detail: "is a directory".to_string(),
+        }
+    }
+
+    /// An E-KIND refusal for a name that is a file where a directory is
+    /// required.
+    fn not_a_directory(op: &'static str, path: &str) -> EnvError {
+        EnvError::Io {
+            op,
+            path: path.to_string(),
+            kind: std::io::ErrorKind::NotADirectory,
+            detail: "not a directory".to_string(),
         }
     }
 }
@@ -291,6 +302,10 @@ impl Env for MemEnv {
         let state = lock_state(&self.state, "sync_dir", path)?;
         if state.dirs.contains(path) {
             Ok(())
+        } else if state.names.contains_key(path) {
+            // E-KIND: a file where a directory is required, so a
+            // caller that passes `wal/<seg>.log` for `wal` is told.
+            Err(Self::not_a_directory("sync_dir", path))
         } else {
             Err(EnvError::NotFound {
                 path: path.to_string(),
@@ -370,8 +385,13 @@ impl Env for MemEnv {
         path::check_dir(path)?;
         let state = lock_state(&self.state, "list_dir", path)?;
         if !state.dirs.contains(path) {
-            return Err(EnvError::NotFound {
-                path: path.to_string(),
+            return Err(if state.names.contains_key(path) {
+                // E-KIND: a file where a directory is required.
+                Self::not_a_directory("list_dir", path)
+            } else {
+                EnvError::NotFound {
+                    path: path.to_string(),
+                }
             });
         }
         let mut names = BTreeSet::new();
@@ -449,7 +469,11 @@ impl MemFile {
 
 impl File for MemFile {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, EnvError> {
-        let off = offset_to_index(off, "read_at", &self.path)?;
+        // E-IO: an offset no `usize` can hold is past every
+        // end-of-file, so it reads 0 rather than failing (A-1a-F3;
+        // this only matters on 32-bit targets, where `usize::MAX` is
+        // still past any length).
+        let off = usize::try_from(off).unwrap_or(usize::MAX);
         let mut state = lock_state(&self.state, "read_at", &self.path)?;
         let data = &Self::file_data(&mut state, self.file_id, "read_at", &self.path)?.data;
         Ok(match data.get(off..) {
@@ -460,6 +484,11 @@ impl File for MemFile {
 
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError> {
         self.refuse_read_only()?;
+        // E-IO: a zero-length write changes nothing at any offset and
+        // returns Ok, before any offset conversion or resize (A-1a-F3).
+        if buf.is_empty() {
+            return Ok(());
+        }
         let off = offset_to_index(off, "write_at", &self.path)?;
         let end = off.checked_add(buf.len()).ok_or_else(|| EnvError::Io {
             op: "write_at",

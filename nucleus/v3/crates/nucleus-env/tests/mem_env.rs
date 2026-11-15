@@ -101,6 +101,18 @@ fn mem_handle_survives_remove_and_recreate() {
 }
 
 #[test]
+fn mem_kind_mismatches() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::kind_mismatches(&env), Ok(()));
+}
+
+#[test]
+fn mem_io_edges() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::io_edges(&env), Ok(()));
+}
+
+#[test]
 fn mem_clock_and_rand() {
     let env = MemEnv::new(1);
     assert_eq!(common::clock_and_rand(&env), Ok(()));

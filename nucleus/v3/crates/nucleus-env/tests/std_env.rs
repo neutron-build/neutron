@@ -83,6 +83,8 @@ std_test!(
     std_handle_survives_remove_and_recreate,
     handle_survives_remove_and_recreate
 );
+std_test!(std_kind_mismatches, kind_mismatches);
+std_test!(std_io_edges, io_edges);
 std_test!(std_clock_and_rand, clock_and_rand);
 
 /// StdEnv-only: the root must exist and be a directory. A missing path
