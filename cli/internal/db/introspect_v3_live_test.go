@@ -199,7 +199,7 @@ func TestV3NativeQualifiedRoutinesTypesAndReadOnlyRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if recreated.SHA256Hex != doc.SHA256Hex {
-		t.Fatal("ephemeral object OID changed portable hash")
+		t.Fatalf("ephemeral object OID changed portable hash\n%s", canonicalDivergence(doc.Canonical, recreated.Canonical))
 	}
 }
 
