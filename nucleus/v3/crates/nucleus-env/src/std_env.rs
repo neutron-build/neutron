@@ -32,7 +32,17 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+/// The lock mode a [`StdFile`] holds: none (0), shared (1) or
+/// exclusive (2) (A-1b-0-F3). Recorded by the handle so the
+/// same-handle rule is answered without calling flock: taking the held
+/// mode again is `Ok`, taking the other is `Locked`, and no flock
+/// conversion — not atomic, and on Linux a failed upgrade drops the
+/// shared lock — ever runs.
+const HELD_NONE: u8 = 0;
+const HELD_SHARED: u8 = 1;
+const HELD_EXCLUSIVE: u8 = 2;
 use std::time::{Duration, Instant};
 
 /// The real-filesystem backend: every validated path is joined to one
@@ -45,13 +55,19 @@ pub struct StdEnv {
 }
 
 /// An open file on the real filesystem: the descriptor, the validated
-/// path (for error context), and the open mode (E-OPEN's read-only
-/// refusals).
+/// path (for error context), the open mode (E-OPEN's read-only
+/// refusals), and the lock mode the handle holds (A-1b-0-F3).
 #[derive(Debug)]
 pub struct StdFile {
     file: StdFsFile,
     path: String,
     mode: OpenMode,
+    /// The held lock mode (`HELD_*`). Atomic only because `File`'s
+    /// methods take `&self`; the platform lock, not this field, is the
+    /// authority, so relaxed orderings suffice (a handle shared across
+    /// threads serialises on the flock itself, and the field at worst
+    /// lags a concurrent take by that same lock).
+    held: AtomicU8,
 }
 
 /// Maps a platform error onto the [`EnvError`] surface (card A-1a
@@ -180,6 +196,7 @@ impl Env for StdEnv {
                     file,
                     path: path.to_string(),
                     mode,
+                    held: AtomicU8::new(HELD_NONE),
                 })
             }
             Err(e) => Err(map_io("open", path, e)),
@@ -353,20 +370,27 @@ impl StdFile {
 
 impl File for StdFile {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, EnvError> {
-        // E-IO: an offset past `i64::MAX` is past every end-of-file
-        // (pread itself refuses it with InvalidInput), so it reads 0
-        // (A-1a-F3).
-        if off > i64::MAX as u64 {
+        // E-IO: an offset at or past `i64::MAX` is past every
+        // end-of-file (pread itself refuses it with InvalidInput), so
+        // it reads 0 (A-1a-F3). Linux `pread` is also EINVAL whenever
+        // `off + count` would overflow `loff_t`, so A-1b-0's guard
+        // alone still failed just below `i64::MAX`; the count is
+        // capped to keep `off + count` within it. A read capped there
+        // is still past every end-of-file, so the answer is 0 either
+        // way and no platform refusal can surface (A-1b-0-F1).
+        let cap = (i64::MAX as u64).saturating_sub(off);
+        if cap == 0 {
             return Ok(0);
         }
+        let want = buf.len().min(usize::try_from(cap).unwrap_or(usize::MAX));
         // One pread can return short (or Interrupted); loop until the
         // buffer is full or end-of-file, so the count is short only at
         // the end (E-IO).
         let mut total = 0;
-        while total < buf.len() {
-            let Some(tail) = buf.get_mut(total..) else {
-                // total < buf.len() held on entry, so this is
-                // unreachable; treated as end-of-file.
+        while total < want {
+            let Some(tail) = buf.get_mut(total..want) else {
+                // total < want held on entry, so this is unreachable;
+                // treated as end-of-file.
                 break;
             };
             match self.file.read_at(tail, off + (total as u64)) {
@@ -381,6 +405,25 @@ impl File for StdFile {
 
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError> {
         self.refuse_read_only()?;
+        // E-IO's zero-length write: no platform call, no extension.
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // E-IO's length bound (A-1b-0-F2), by code rather than by
+        // errno, so the rule holds on every platform: Linux already
+        // answers InvalidInput here, and the check names the opened
+        // path either way.
+        if off
+            .checked_add(buf.len() as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(EnvError::Io {
+                op: "write_at",
+                path: self.path.clone(),
+                kind: ErrorKind::InvalidInput,
+                detail: "offset plus length exceeds i64::MAX".to_string(),
+            });
+        }
         self.file
             .write_all_at(buf, off)
             .map_err(|e| map_io("write_at", &self.path, e))
@@ -413,24 +456,61 @@ impl File for StdFile {
 
     fn set_len(&self, len: u64) -> Result<(), EnvError> {
         self.refuse_read_only()?;
+        // E-IO's length bound (A-1b-0-F2), as in `write_at`: by code,
+        // so every platform refuses the same way.
+        if len > i64::MAX as u64 {
+            return Err(EnvError::Io {
+                op: "set_len",
+                path: self.path.clone(),
+                kind: ErrorKind::InvalidInput,
+                detail: "length exceeds i64::MAX".to_string(),
+            });
+        }
         self.file
             .set_len(len)
             .map_err(|e| map_io("set_len", &self.path, e))
     }
 
     fn lock_exclusive(&self) -> Result<(), EnvError> {
+        // E-LOCK's same-handle rule (A-1b-0-F3): the held mode again is
+        // Ok, the other mode is Locked, and neither calls flock — a
+        // flock conversion is not atomic, and on Linux a failed
+        // shared-to-exclusive upgrade drops the shared lock (verdict
+        // A-1b-0, finding 3).
+        match self.held.load(Ordering::Relaxed) {
+            HELD_EXCLUSIVE => return Ok(()),
+            HELD_SHARED => {
+                return Err(EnvError::Locked {
+                    path: self.path.clone(),
+                });
+            }
+            _ => {}
+        }
         // flock semantics: works on a read-only descriptor, and two
         // descriptors of one process conflict (the dry run of card
         // A-1a's author). Non-blocking: a conflict is Locked at once.
         self.file
             .try_lock()
-            .map_err(|e| Self::map_lock("lock_exclusive", &self.path, e))
+            .map_err(|e| Self::map_lock("lock_exclusive", &self.path, e))?;
+        self.held.store(HELD_EXCLUSIVE, Ordering::Relaxed);
+        Ok(())
     }
 
     fn lock_shared(&self) -> Result<(), EnvError> {
+        match self.held.load(Ordering::Relaxed) {
+            HELD_SHARED => return Ok(()),
+            HELD_EXCLUSIVE => {
+                return Err(EnvError::Locked {
+                    path: self.path.clone(),
+                });
+            }
+            _ => {}
+        }
         self.file
             .try_lock_shared()
-            .map_err(|e| Self::map_lock("lock_shared", &self.path, e))
+            .map_err(|e| Self::map_lock("lock_shared", &self.path, e))?;
+        self.held.store(HELD_SHARED, Ordering::Relaxed);
+        Ok(())
     }
 
     fn unlock(&self) -> Result<(), EnvError> {
@@ -439,6 +519,8 @@ impl File for StdFile {
         // platform, as E-LOCK requires).
         self.file
             .unlock()
-            .map_err(|e| map_io("unlock", &self.path, e))
+            .map_err(|e| map_io("unlock", &self.path, e))?;
+        self.held.store(HELD_NONE, Ordering::Relaxed);
+        Ok(())
     }
 }

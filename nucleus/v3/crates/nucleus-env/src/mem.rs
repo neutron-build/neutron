@@ -435,6 +435,23 @@ impl Env for MemEnv {
     }
 }
 
+/// E-IO's length bound (A-1b-0-F2): the end a write or `set_len`
+/// would reach, or `None` when `off + len` overflows u64. A `Some`
+/// past `i64::MAX` is `Io { kind: InvalidInput }`; the check runs
+/// before `lock_state`, so no length can panic with the state mutex
+/// held and poison the env.
+fn end_past_i64_max(op: &'static str, path: &str, end: Option<u64>) -> Result<u64, EnvError> {
+    match end {
+        Some(e) if e <= i64::MAX as u64 => Ok(e),
+        _ => Err(EnvError::Io {
+            op,
+            path: path.to_string(),
+            kind: std::io::ErrorKind::InvalidInput,
+            detail: "offset plus length exceeds i64::MAX".to_string(),
+        }),
+    }
+}
+
 impl MemFile {
     /// The file's mutable state by **file id** (E-HANDLE). A missing id
     /// is an internal invariant breach — a file with an open handle is
@@ -489,16 +506,25 @@ impl File for MemFile {
         if buf.is_empty() {
             return Ok(());
         }
+        // E-IO's length bound (A-1b-0-F2), before `lock_state` and any
+        // conversion or resize.
+        let end = end_past_i64_max("write_at", &self.path, off.checked_add(buf.len() as u64))?;
         let off = offset_to_index(off, "write_at", &self.path)?;
-        let end = off.checked_add(buf.len()).ok_or_else(|| EnvError::Io {
-            op: "write_at",
-            path: self.path.clone(),
-            kind: std::io::ErrorKind::Other,
-            detail: "offset plus length out of addressable range".to_string(),
-        })?;
+        let end = offset_to_index(end, "write_at", &self.path)?;
         let mut state = lock_state(&self.state, "write_at", &self.path)?;
         let data = &mut Self::file_data(&mut state, self.file_id, "write_at", &self.path)?.data;
         if data.len() < end {
+            // E-IO (A-1b-0-F2): reserve the growth first and map a
+            // failed allocation to OutOfMemory, so the `resize` below
+            // cannot reallocate — or abort the process — and no length
+            // panics with the state mutex held.
+            data.try_reserve(end - data.len())
+                .map_err(|_| EnvError::Io {
+                    op: "write_at",
+                    path: self.path.clone(),
+                    kind: std::io::ErrorKind::OutOfMemory,
+                    detail: "allocation for the extended length failed".to_string(),
+                })?;
             data.resize(end, 0);
         }
         if let Some(dst) = data.get_mut(off..end) {
@@ -525,10 +551,25 @@ impl File for MemFile {
 
     fn set_len(&self, len: u64) -> Result<(), EnvError> {
         self.refuse_read_only()?;
+        // E-IO's length bound (A-1b-0-F2), before `lock_state` and any
+        // conversion or resize.
+        end_past_i64_max("set_len", &self.path, Some(len))?;
         let len = offset_to_index(len, "set_len", &self.path)?;
         let mut state = lock_state(&self.state, "set_len", &self.path)?;
         let data = &mut Self::file_data(&mut state, self.file_id, "set_len", &self.path)?.data;
         if data.len() != len {
+            if len > data.len() {
+                // E-IO (A-1b-0-F2): reserve the growth first (see
+                // `write_at`), so the `resize` cannot reallocate and no
+                // length panics with the state mutex held.
+                data.try_reserve(len - data.len())
+                    .map_err(|_| EnvError::Io {
+                        op: "set_len",
+                        path: self.path.clone(),
+                        kind: std::io::ErrorKind::OutOfMemory,
+                        detail: "allocation for the extended length failed".to_string(),
+                    })?;
+            }
             data.resize(len, 0);
         }
         Ok(())
@@ -537,6 +578,11 @@ impl File for MemFile {
     fn lock_exclusive(&self) -> Result<(), EnvError> {
         let mut state = lock_state(&self.state, "lock_exclusive", &self.path)?;
         let file = Self::file_data(&mut state, self.file_id, "lock_exclusive", &self.path)?;
+        if file.exclusive == Some(self.id) {
+            // E-LOCK's same-handle rule (A-1b-0-F3): taking the mode
+            // the handle already holds again is Ok and changes nothing.
+            return Ok(());
+        }
         if file.exclusive.is_some() || !file.shared.is_empty() {
             return Err(EnvError::Locked {
                 path: self.path.clone(),

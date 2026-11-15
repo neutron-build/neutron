@@ -10,5 +10,13 @@ publish.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 
+[features]
+# SimEnv (card A-1b): the deterministic simulator. Off by default, so the
+# wasm32 build and every production build compile no simulator code.
+sim = []
+
+[dev-dependencies]
+nucleus-env = { path = ".", features = ["sim"] }
+
 [lints]
 workspace = true

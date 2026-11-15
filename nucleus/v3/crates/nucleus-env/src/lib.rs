@@ -17,6 +17,16 @@
 //! - SimEnv (A-1b): MemEnv plus a seeded scheduler whose power cut
 //!   drops, tears, loses or misdirects unsynced writes.
 //!
+//! SimEnv (card A-1b, `--features sim`) is E4's simulator, copied with
+//! provenance from `spikes/e4-recovery` at commit `48ac9920` — the
+//! baton scheduler, `SimDisk` with its fault model, and the self-tests
+//! of card X-5's rework pins — behind this crate's [`Env`] and
+//! [`File`] traits (`sim::SimEnv`). The spike stays E4's evidence
+//! record. The feature is off by default: the simulator runs OS
+//! threads and keeps E4's opt-in diagnostic log, so no wasm32 or
+//! production build compiles it; tests enable it through the crate's
+//! self dev-dependency, as `test-hooks` does elsewhere.
+//!
 //! # The contract (card A-1a, Work 2)
 //!
 //! - **E-PATH** — a path is relative, with `/` separators; each
@@ -38,6 +48,15 @@
 //!   `buf`, extending the file, and a zero-length write changes nothing
 //!   at any offset and returns `Ok` (after the `Read` refusal);
 //!   `set_len` truncates or zero-extends; `len` is the current length.
+//!   The length bound (A-1b-0-F2): a `write_at` whose `off + buf.len()`
+//!   exceeds `i64::MAX` — u64 overflow included — or a `set_len` whose
+//!   `len` exceeds it, is [`EnvError::Io`] `{ kind: InvalidInput }` on
+//!   every backend, checked before any I/O, after the `Read` refusal
+//!   and after the empty-write no-op, so an empty write stays `Ok` at
+//!   any offset. Below the bound, a backend that cannot hold the
+//!   length refuses with `Io`: `FileTooLarge` (a platform file-size
+//!   limit, or SimEnv's cap) or `OutOfMemory` (MemEnv's failed
+//!   allocation); no backend panics on a length.
 //! - **E-DURABLE** — written bytes are durable only after a `sync_data`
 //!   or `sync_all` of that file; a `set_len` change only after
 //!   `sync_all`; a `create_dir`, `CreateNew`, `rename` or `remove` only
@@ -89,7 +108,13 @@
 //!   several handles may hold the shared lock (flock semantics). Both
 //!   are non-blocking: a conflict is [`EnvError::Locked`] at once.
 //!   `lock_shared` works on a `Read` handle. `unlock` is `Ok` when the
-//!   handle holds none; dropping a handle releases its lock.
+//!   handle holds none; dropping a handle releases its lock. The
+//!   same-handle rule (A-1b-0-F3): on a handle that already holds a
+//!   lock, taking the mode it holds again is `Ok` and changes nothing;
+//!   taking the other mode is [`EnvError::Locked`], and the handle
+//!   keeps the lock it holds — no backend converts a lock, because
+//!   flock conversion is not atomic and a failed shared-to-exclusive
+//!   upgrade on Linux drops the shared lock.
 //! - **E-CLOCK/RAND** — `now` is monotonic since the backend was
 //!   created; `sleep(d)` returns once `now` has advanced by at least
 //!   `d`; `rand` is a 64-bit value, not cryptographic, for ids such as
@@ -103,6 +128,10 @@ mod env;
 mod error;
 mod mem;
 mod path;
+#[cfg(feature = "sim")]
+pub mod rng;
+#[cfg(feature = "sim")]
+pub mod sim;
 #[cfg(unix)]
 mod std_env;
 

@@ -80,6 +80,16 @@ pub trait File {
     /// [`Ok(())`][Ok] (E-IO). On a [`OpenMode::Read`] handle this is
     /// [`EnvError::ReadOnly`], before any I/O (E-OPEN: the refusal
     /// comes before the empty-write no-op).
+    ///
+    /// E-IO's length bound (A-1b-0-F2): a write whose `off + buf.len()`
+    /// exceeds `i64::MAX` — u64 overflow included — is
+    /// [`EnvError::Io`] with `kind: InvalidInput` on every backend. It
+    /// is checked before any I/O, after the `Read` refusal and after
+    /// the empty-write no-op, so an empty write stays `Ok` at any
+    /// offset. Below that bound, a backend that cannot hold the length
+    /// refuses with `Io`: `FileTooLarge` (a platform file-size limit,
+    /// or SimEnv's cap) or `OutOfMemory` (MemEnv's failed allocation).
+    /// No backend panics on a length.
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError>;
 
     /// Makes the file's written bytes durable (E-DURABLE: this is the
@@ -107,6 +117,14 @@ pub trait File {
     /// only after [`File::sync_all`] (E-DURABLE). On a
     /// [`OpenMode::Read`] handle this is [`EnvError::ReadOnly`], before
     /// any I/O.
+    ///
+    /// E-IO's length bound (A-1b-0-F2): a `set_len` whose `len`
+    /// exceeds `i64::MAX` is [`EnvError::Io`] with `kind:
+    /// InvalidInput` on every backend, checked before any I/O and
+    /// after the `Read` refusal. Below that bound, a backend that
+    /// cannot hold the length refuses with `Io`: `FileTooLarge` (a
+    /// platform limit, or SimEnv's cap) or `OutOfMemory` (MemEnv's
+    /// failed allocation). No backend panics on a length.
     fn set_len(&self, len: u64) -> Result<(), EnvError>;
 
     /// Takes the exclusive advisory lock on this file, non-blocking
@@ -120,6 +138,15 @@ pub trait File {
     /// moves with an [`Env::rename`] and is released by
     /// [`File::unlock`] or by dropping the holding handle, whatever
     /// name the file has by then.
+    ///
+    /// The same-handle rule (A-1b-0-F3): on a handle that already
+    /// holds a lock, taking the mode it holds again is `Ok` and
+    /// changes nothing; taking the other mode is
+    /// [`EnvError::Locked`], and the handle keeps the lock it holds.
+    /// No backend converts a lock: flock conversion is not atomic, and
+    /// on Linux a failed shared-to-exclusive upgrade drops the shared
+    /// lock (verdict A-1b-0, finding 3). S-STORE §14.1's reader lock
+    /// must not vanish on a refused upgrade.
     fn lock_exclusive(&self) -> Result<(), EnvError>;
 
     /// Takes the shared (read) advisory lock on this file, non-blocking
@@ -132,6 +159,12 @@ pub trait File {
     /// O_RDONLY descriptor can take a shared lock, which is what the
     /// read-only open needs. A conflict is [`EnvError::Locked`] at
     /// once. Taking a lock creates and writes no file.
+    ///
+    /// The same-handle rule (A-1b-0-F3, as [`File::lock_exclusive`]):
+    /// taking the shared mode a handle already holds again is `Ok`;
+    /// taking the exclusive mode while holding the shared one is
+    /// [`EnvError::Locked`], and the handle keeps its shared lock. No
+    /// backend converts a lock.
     fn lock_shared(&self) -> Result<(), EnvError>;
 
     /// Releases this handle's lock, of either mode, and is
