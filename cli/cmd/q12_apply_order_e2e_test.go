@@ -314,16 +314,6 @@ var q12Cases = []q12Case{
 			`CREATE TABLE app.b (id int PRIMARY KEY, y int DEFAULT nextval('app.a_id_seq'))`},
 		target: []string{`CREATE TABLE app.b (id int PRIMARY KEY)`},
 		data:   []string{`INSERT INTO app.a DEFAULT VALUES`, `INSERT INTO app.b (id) VALUES (1)`}},
-	// R2-5: a foreign table storing the row type does not block a type
-	// change (PostgreSQL does not check foreign tables).
-	{name: "foreign table storing the row type", noSnapshot: true, unmanaged: []string{"rep"},
-		live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, x int)`, `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
-			`CREATE SERVER q12_srv FOREIGN DATA WRAPPER postgres_fdw`, `CREATE SCHEMA rep`,
-			`CREATE FOREIGN TABLE rep.ft (id int, w app.t) SERVER q12_srv`},
-		target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, x bigint)`, `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
-			`CREATE SERVER q12_srv FOREIGN DATA WRAPPER postgres_fdw`, `CREATE SCHEMA rep`,
-			`CREATE FOREIGN TABLE rep.ft (id int, w app.t) SERVER q12_srv`},
-		data: []string{`INSERT INTO app.t VALUES (1, 2)`}},
 	// A table the plan drops has a foreign key onto a key the plan drops:
 	// the table drops before the key, and its down re-creates it after the
 	// key is back.
@@ -652,6 +642,14 @@ func TestQ12Refusals(t *testing.T) {
 			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
 			want: []string{`column app.t.keep (type changes) is used by materialized view rep.m, which the schema does not describe.`,
 				`the row type of table app.t (a column of it changes type) is used by column rep.u.x (it stores the row type of app.t)`}},
+		// R2-5: a foreign table storing the row type blocks a type change
+		// as a table does (PostgreSQL 17.12 checks foreign tables too).
+		{name: "foreign table storing the row type",
+			live: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep int)`, `CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
+				`CREATE SERVER q12_srv FOREIGN DATA WRAPPER postgres_fdw`, `CREATE SCHEMA rep`,
+				`CREATE FOREIGN TABLE rep.ft (id int, w app.t) SERVER q12_srv`},
+			target: []string{`CREATE TABLE app.t (id int PRIMARY KEY, keep bigint)`},
+			want:   []string{`the row type of table app.t (a column of it changes type) is used by column rep.ft.w (it stores the row type of app.t)`}},
 		// Shape 3 with a foreign key the plan does not manage onto the
 		// generated column.
 		{name: "type change under a referenced generated column",

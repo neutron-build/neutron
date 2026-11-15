@@ -111,19 +111,19 @@ func TestMigrationRunnerE2E(t *testing.T) {
 
 		var wg sync.WaitGroup
 		codes := make([]int, 2)
+		outs := make([]string, 2)
 		for i := range codes {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				code, _ := runCLI(t, dbURL, "migrate", "--dir", dir)
-				codes[i] = code
+				codes[i], outs[i] = runCLI(t, dbURL, "migrate", "--dir", dir)
 			}(i)
 		}
 		wg.Wait()
 
 		for i, code := range codes {
 			if code != 0 {
-				t.Fatalf("process %d exited %d; both must succeed (second reports up-to-date)", i+1, code)
+				t.Fatalf("process %d exited %d; both must succeed (second reports up-to-date)\n%s", i+1, code, outs[i])
 			}
 		}
 		if got := adminQuery(t, dbURL, "SELECT count(*) FROM solo"); got != "1" {
