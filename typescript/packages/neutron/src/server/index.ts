@@ -22,6 +22,8 @@ import {
 import * as path from "node:path";
 import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
+import { rememberBody, sendKnownBody } from "./direct-body.js";
 import { createStaticFileHandler } from "./static-files.js";
 import { negotiateContentEncoding, type ContentCoding } from "./content-encoding.js";
 import type { WebSocketServer } from "ws";
@@ -1693,8 +1695,17 @@ export async function createServer(
     };
   }
 
+  // A response built from bytes already in memory (a prebuilt page) is
+  // written to the socket here rather than read back through its stream.
+  const innerFetch = fetchFn;
+  const directFetch: typeof app.fetch = async (request, env, executionCtx) => {
+    const response = await innerFetch(request, env, executionCtx);
+    const outgoing = (env as { outgoing?: import("node:http").ServerResponse } | undefined)?.outgoing;
+    return sendKnownBody(response, outgoing) ? RESPONSE_ALREADY_SENT : response;
+  };
+
   const server = serve({
-    fetch: fetchFn,
+    fetch: directFetch,
     port,
     hostname: host,
     // Left on, @hono/node-server replaces globalThis.Response and Request with
@@ -2244,9 +2255,12 @@ function createStaticHtmlResponse(
     });
   }
 
-  return new Response(representation.body, {
-    headers,
-  });
+  return rememberBody(
+    new Response(representation.body, {
+      headers,
+    }),
+    representation.body
+  );
 }
 
 /** The page's identity response, after global middleware, re-sent encoded. */
@@ -2262,11 +2276,12 @@ function encodeStaticHtmlResponse(
   headers.set("Content-Encoding", encoding);
   headers.set("Content-Length", String(representation.body.byteLength));
   void response.body?.cancel();
-  return new Response(method === "HEAD" ? null : representation.body, {
+  const encoded = new Response(method === "HEAD" ? null : representation.body, {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+  return method === "HEAD" ? encoded : rememberBody(encoded, representation.body);
 }
 
 function loadStaticRouteHeaders(distDir: string): Map<string, Record<string, string>> {
