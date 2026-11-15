@@ -27,7 +27,7 @@ try:
             with urllib.request.urlopen(base + "/", timeout=2) as response:
                 body = response.read()
             break
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
             time.sleep(0.2)
     else:
         raise RuntimeError("installer container did not become reachable")
