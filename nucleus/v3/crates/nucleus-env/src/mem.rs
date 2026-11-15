@@ -69,12 +69,14 @@ pub struct MemFile {
     mode: OpenMode,
 }
 
-/// One splitmix64 step: advances `state` and returns the mixed value.
-/// The same function backs both backends' `rand`, so a seed means the
-/// same sequence everywhere (E-CLOCK/RAND; card A-1a Works 4–5).
-pub(crate) fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
+/// The splitmix64 gamma: the constant each `rand` state advances by.
+pub(crate) const SPLITMIX64_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The splitmix64 output function over an already-advanced state. The
+/// same function backs both backends' `rand`, so a seed means the same
+/// sequence everywhere (E-CLOCK/RAND; card A-1a Works 4–5).
+pub(crate) fn splitmix64_output(z: u64) -> u64 {
+    let mut z = z;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -336,7 +338,10 @@ impl Env for MemEnv {
 
     fn rand(&self) -> u64 {
         match self.state.lock() {
-            Ok(mut state) => splitmix64(&mut state.rand),
+            Ok(mut state) => {
+                state.rand = state.rand.wrapping_add(SPLITMIX64_GAMMA);
+                splitmix64_output(state.rand)
+            }
             Err(_) => 0,
         }
     }

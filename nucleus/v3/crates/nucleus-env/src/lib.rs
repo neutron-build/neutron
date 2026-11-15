@@ -72,7 +72,11 @@ mod env;
 mod error;
 mod mem;
 mod path;
+#[cfg(unix)]
+mod std_env;
 
 pub use env::{Env, File, OpenMode};
 pub use error::EnvError;
 pub use mem::{MemEnv, MemFile};
+#[cfg(unix)]
+pub use std_env::{StdEnv, StdFile};
