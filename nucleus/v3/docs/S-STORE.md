@@ -1101,6 +1101,26 @@ The double-crash test (A-7d) is the test that runs recovery twice. It is not a m
 
 Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §3.3, §8 phase A gate). The "Pinned by" column names the card that writes the test. These are P-written tests for the cards PLAN-v3 §7.1 lists (A-3, A-4, A-7, B-1, B-2). Mutant names taken from `verdicts/X-2.md` keep their meaning there.
 
+**Stand-ins.** A test runs on the card §15.1 names, in the form it states. Where a fixture or a pass condition names machinery that lands on a later card, the earlier card runs a stated stand-in form, and §15.1 names the card that runs the full form. Only these stand-ins are allowed:
+- **S1, the stand-in flip.** Before A-7c, "a flip" or "a flip pending" in a fixture is a test-only thread that takes the epoch gate exclusively (§13 step 0, item 1), sets `e := k+1` and releases the gate (item 3), without item 2. A test whose mutants all fail through a hook, the latch tracker, a deadlock or the step budget is judged in full under S1, because none of its mutants touches item 2.
+- **S2, the read-back.** Before its card has a meta (A-7c), recovery (A-7d) or amcheck (A-8), a pass condition that names amcheck, an image that "opens", or "a read at `T` after a crash" is judged by reading back directly through the `Env`:
+  - image `k`'s map from the slot step 2 records for its root;
+  - each page from the slot that map names, with its CRC checked and its content compared with the oracle's epoch-`k` content;
+  - for I-LPID-EXACT, the mapped LPIDs against the pages a test walk reaches from the roots;
+  - for I-WAL-COVER, meta `k`'s `wal_ckpt_end` against the valid end A-6b's walk finds (§12.5).
+- **S3, a test-only caller or input.** Where a store call's real caller, or an input the store reads, lands on a later card, the test makes the call or supplies the input as that caller will. The cases are:
+  - `write_guard`'s first touch, copy and install, which call the reserve's draw and claim (§5.6);
+  - settlers (a) and (c), `ROLLBACK TO` and replay, which call A-5's replace and delete (§6.7) or A-4e's cursor close (§6.6);
+  - the apply frontier `M` and `visible_ts` (C-T0 v8);
+  - GC's `gc_w_used` (§10.5);
+  - a bulk load's fence commit and unlogged inserts (§12.8);
+  - a drop-cleanup commit's record;
+  - a gated operation made to fail with XX001 (§9.2).
+- **S4, the test-only sweep step.** A step that names its tree's root through §6.8's root names, with the shape of one §10.4 sweep step. A-7b writes it, and A-7d's tests share it.
+- **S5, a second tree before A-7b.** A second root in the same pool, made by a test-only call. Directory and root-table behaviour stays A-7b's.
+
+A mutant counts where it is applied to the real code it names. Applied to a stand-in's own code it proves the fixture only, as ROOT-NAME-KEPT does on A-7d's stand-in. S2 replaces a check, not code, so a mutant of the owner's code that is judged under S2 counts at the owner, and the card that §15.1 names for the full form judges it again. A form that §15.1 names to a Phase B card is pinned by that card (PLAN-v3 §8, Phase A gate).
+
 | ID | Statement | Pinned by | Named mutants |
 |---|---|---|---|
 | I-ENC-ORDER | §7.2: entry-key order = (user key asc, ts desc); `upper(k)` separates groups | A-4a (port X-2's proptest + directed cases) | TS-ASC, ESCAPE-OFF |
