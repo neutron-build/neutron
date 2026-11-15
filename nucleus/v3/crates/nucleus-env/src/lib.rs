@@ -98,7 +98,13 @@
 //!   several handles may hold the shared lock (flock semantics). Both
 //!   are non-blocking: a conflict is [`EnvError::Locked`] at once.
 //!   `lock_shared` works on a `Read` handle. `unlock` is `Ok` when the
-//!   handle holds none; dropping a handle releases its lock.
+//!   handle holds none; dropping a handle releases its lock. The
+//!   same-handle rule (A-1b-0-F3): on a handle that already holds a
+//!   lock, taking the mode it holds again is `Ok` and changes nothing;
+//!   taking the other mode is [`EnvError::Locked`], and the handle
+//!   keeps the lock it holds — no backend converts a lock, because
+//!   flock conversion is not atomic and a failed shared-to-exclusive
+//!   upgrade on Linux drops the shared lock.
 //! - **E-CLOCK/RAND** — `now` is monotonic since the backend was
 //!   created; `sleep(d)` returns once `now` has advanced by at least
 //!   `d`; `rand` is a 64-bit value, not cryptographic, for ids such as

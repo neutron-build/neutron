@@ -578,6 +578,11 @@ impl File for MemFile {
     fn lock_exclusive(&self) -> Result<(), EnvError> {
         let mut state = lock_state(&self.state, "lock_exclusive", &self.path)?;
         let file = Self::file_data(&mut state, self.file_id, "lock_exclusive", &self.path)?;
+        if file.exclusive == Some(self.id) {
+            // E-LOCK's same-handle rule (A-1b-0-F3): taking the mode
+            // the handle already holds again is Ok and changes nothing.
+            return Ok(());
+        }
         if file.exclusive.is_some() || !file.shared.is_empty() {
             return Err(EnvError::Locked {
                 path: self.path.clone(),

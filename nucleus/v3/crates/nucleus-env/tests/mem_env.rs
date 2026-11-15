@@ -94,6 +94,15 @@ fn mem_lock_moves_with_rename_until_drop() {
     assert_eq!(common::lock_moves_with_rename_until_drop(&env), Ok(()));
 }
 
+/// **E-LOCK's same-handle rule** (A-1b-0-F3, Work 0c): the held mode
+/// again is `Ok`; the other mode is `Locked` and the handle keeps its
+/// lock.
+#[test]
+fn mem_lock_mode_on_same_handle() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::lock_mode_on_same_handle(&env), Ok(()));
+}
+
 #[test]
 fn mem_handle_survives_remove_and_recreate() {
     let env = MemEnv::new(1);

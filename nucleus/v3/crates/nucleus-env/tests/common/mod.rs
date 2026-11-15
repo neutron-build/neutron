@@ -1155,6 +1155,93 @@ pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
     Ok(())
 }
 
+/// **E-LOCK's same-handle rule (A-1b-0-F3).** On one handle: taking
+/// the mode it holds again is `Ok`; taking the other mode is `Locked`
+/// and the handle keeps the lock it holds (no backend converts a
+/// lock, so a refused upgrade must not drop the shared lock).
+pub fn lock_mode_on_same_handle<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let f = env
+        .open("wal/l", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/l: {e:?}"))?;
+    drop(f);
+    let h = env
+        .open("wal/l", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/l: {e:?}"))?;
+    let o = env
+        .open("wal/l", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/l: {e:?}"))?;
+    let w = env
+        .open("wal/l", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/l: {e:?}"))?;
+
+    // 1. The exclusive mode: again Ok; the shared mode on the same
+    //    handle is Locked, and another handle stays excluded, so the
+    //    exclusive lock is still held.
+    h.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive: {e:?}"))?;
+    h.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive again: {e:?}"))?;
+    err_is(
+        h.lock_shared(),
+        Want::Locked,
+        "wal/l",
+        "lock_shared on the exclusive holder",
+    )?;
+    err_is(
+        o.lock_shared(),
+        Want::Locked,
+        "wal/l",
+        "lock_shared beside the exclusive holder",
+    )?;
+    h.unlock().map_err(|e| format!("unlock: {e:?}"))?;
+
+    // 2. The shared mode: again Ok; the exclusive mode on the same
+    //    handle is Locked, and another handle stays excluded, so the
+    //    failed upgrade kept the shared lock.
+    h.lock_shared().map_err(|e| format!("lock_shared: {e:?}"))?;
+    h.lock_shared()
+        .map_err(|e| format!("lock_shared again: {e:?}"))?;
+    err_is(
+        h.lock_exclusive(),
+        Want::Locked,
+        "wal/l",
+        "lock_exclusive on the shared holder",
+    )?;
+    err_is(
+        w.lock_exclusive(),
+        Want::Locked,
+        "wal/l",
+        "lock_exclusive beside the shared holder",
+    )?;
+
+    // 3. Verdict A-1b-0 finding 3's sequence: on Linux, flock dropped
+    //    `h`'s shared lock at `h`'s refused upgrade, so `w`'s
+    //    `lock_exclusive` here succeeded.
+    o.lock_shared()
+        .map_err(|e| format!("second lock_shared: {e:?}"))?;
+    err_is(
+        h.lock_exclusive(),
+        Want::Locked,
+        "wal/l",
+        "lock_exclusive beside two shared holders",
+    )?;
+    o.unlock().map_err(|e| format!("unlock o: {e:?}"))?;
+    err_is(
+        w.lock_exclusive(),
+        Want::Locked,
+        "wal/l",
+        "lock_exclusive while the refused upgrader still holds shared",
+    )?;
+
+    // 4. Released at last.
+    h.unlock().map_err(|e| format!("unlock h: {e:?}"))?;
+    w.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive after every release: {e:?}"))?;
+    Ok(())
+}
+
 /// **E-CLOCK/RAND.** `now` never decreases; after `sleep(1 ms)`, `now`
 /// has grown by at least 1 ms; two `rand` calls differ.
 pub fn clock_and_rand<E: Env>(env: &E) -> Result<(), String> {

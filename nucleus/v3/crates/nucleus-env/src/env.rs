@@ -138,6 +138,15 @@ pub trait File {
     /// moves with an [`Env::rename`] and is released by
     /// [`File::unlock`] or by dropping the holding handle, whatever
     /// name the file has by then.
+    ///
+    /// The same-handle rule (A-1b-0-F3): on a handle that already
+    /// holds a lock, taking the mode it holds again is `Ok` and
+    /// changes nothing; taking the other mode is
+    /// [`EnvError::Locked`], and the handle keeps the lock it holds.
+    /// No backend converts a lock: flock conversion is not atomic, and
+    /// on Linux a failed shared-to-exclusive upgrade drops the shared
+    /// lock (verdict A-1b-0, finding 3). S-STORE §14.1's reader lock
+    /// must not vanish on a refused upgrade.
     fn lock_exclusive(&self) -> Result<(), EnvError>;
 
     /// Takes the shared (read) advisory lock on this file, non-blocking
@@ -150,6 +159,12 @@ pub trait File {
     /// O_RDONLY descriptor can take a shared lock, which is what the
     /// read-only open needs. A conflict is [`EnvError::Locked`] at
     /// once. Taking a lock creates and writes no file.
+    ///
+    /// The same-handle rule (A-1b-0-F3, as [`File::lock_exclusive`]):
+    /// taking the shared mode a handle already holds again is `Ok`;
+    /// taking the exclusive mode while holding the shared one is
+    /// [`EnvError::Locked`], and the handle keeps its shared lock. No
+    /// backend converts a lock.
     fn lock_shared(&self) -> Result<(), EnvError>;
 
     /// Releases this handle's lock, of either mode, and is

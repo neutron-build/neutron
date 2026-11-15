@@ -79,6 +79,7 @@ std_test!(
     std_lock_moves_with_rename_until_drop,
     lock_moves_with_rename_until_drop
 );
+std_test!(std_lock_mode_on_same_handle, lock_mode_on_same_handle);
 std_test!(
     std_handle_survives_remove_and_recreate,
     handle_survives_remove_and_recreate
