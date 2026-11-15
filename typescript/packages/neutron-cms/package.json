@@ -47,16 +47,16 @@
   },
   "dependencies": {
     "marked": "15.0.12",
-    "preact-render-to-string": "^6.5.0"
+    "preact-render-to-string": "^6.8.2"
   },
   "peerDependencies": {
-    "preact": "^10.25.4"
+    "preact": "^10.25.4 || ^11.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
     "esbuild": "^0.28.2",
     "playwright-core": "1.65.0",
-    "preact": "^10.25.4",
+    "preact": "^11.0.1",
     "prosemirror-commands": "^1.7.2",
     "prosemirror-dropcursor": "^1.8.4",
     "prosemirror-gapcursor": "^1.4.1",

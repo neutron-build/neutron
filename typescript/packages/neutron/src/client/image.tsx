@@ -1,5 +1,5 @@
 import { h } from "preact";
-import type { JSX } from "preact";
+import type { ComponentProps } from "preact";
 import type { AnyJsxElement } from "./jsx-agnostic.js";
 import { selectImageCandidates } from "../core/image-widths.js";
 
@@ -14,7 +14,7 @@ export type ImageLoader = (args: ImageLoaderArgs) => string;
 
 export interface ImageProps
   extends Omit<
-    JSX.HTMLAttributes<HTMLImageElement>,
+    ComponentProps<"img">,
     "src" | "srcSet" | "alt" | "width" | "height" | "loading" | "decoding"
   > {
   src: string;

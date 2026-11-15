@@ -17,13 +17,13 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/nucleus` | 0.3.1 |
 | `@neutron-build/data` | 0.3.1 |
 | `@neutron-build/agents` | 0.3.0 |
-| `@neutron-build/core` | 0.5.4 |
-| `@neutron-build/cli` | 0.5.4 |
+| `@neutron-build/core` | 0.5.5 |
+| `@neutron-build/cli` | 0.5.5 |
 | `@neutron-build/create` | 0.1.14 |
 | `@neutron-build/auth` | 0.1.7 |
 | `@neutron-build/cache-redis` | 0.2.1 |
 | `@neutron-build/security` | 0.1.6 |
-| `@neutron-build/ai` | 0.1.3 |
+| `@neutron-build/ai` | 0.1.4 |
 | `@neutron-build/mcp` | 0.1.2 |
 | `@neutron-build/workflow` | 0.1.2 |
 | `@neutron-build/ops` | 0.1.5 |
