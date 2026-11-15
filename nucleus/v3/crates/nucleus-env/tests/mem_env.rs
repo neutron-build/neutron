@@ -47,6 +47,12 @@ fn mem_sync_dir_root_and_subdir() {
 }
 
 #[test]
+fn mem_sync_on_writable_handles() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::sync_on_writable_handles(&env), Ok(()));
+}
+
+#[test]
 fn mem_locks_exclusive_excludes_all() {
     let env = MemEnv::new(1);
     assert_eq!(common::locks_exclusive_excludes_all(&env), Ok(()));
@@ -77,25 +83,67 @@ fn mem_lock_creates_no_file() {
 }
 
 #[test]
+fn mem_handle_survives_rename() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::handle_survives_rename(&env), Ok(()));
+}
+
+#[test]
+fn mem_lock_moves_with_rename_until_drop() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::lock_moves_with_rename_until_drop(&env), Ok(()));
+}
+
+#[test]
+fn mem_handle_survives_remove_and_recreate() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::handle_survives_remove_and_recreate(&env), Ok(()));
+}
+
+#[test]
+fn mem_kind_mismatches() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::kind_mismatches(&env), Ok(()));
+}
+
+#[test]
+fn mem_io_edges() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::io_edges(&env), Ok(()));
+}
+
+#[test]
 fn mem_clock_and_rand() {
     let env = MemEnv::new(1);
     assert_eq!(common::clock_and_rand(&env), Ok(()));
 }
 
-/// MemEnv-only: the same seed gives the same first 8 `rand` values,
-/// and seeds 1 and 2 differ (E-CLOCK/RAND; card A-1a Work 6).
+/// MemEnv-only: one `MemEnv` per seed draws eight `rand` values
+/// (E-CLOCK/RAND; card A-1a Work 6, strengthened in A-1b-0 Work 2):
+/// the same seed twice gives equal sequences, seeds 1 and 2 differ at
+/// every position, and one sequence's eight values are pairwise
+/// distinct.
 #[test]
 fn mem_rand_is_seeded() {
     let draw = |seed: u64| {
-        (0..8)
-            .map(|_| MemEnv::new(seed).rand())
-            .collect::<Vec<u64>>()
+        let env = MemEnv::new(seed);
+        (0..8).map(|_| env.rand()).collect::<Vec<u64>>()
     };
     let a = draw(1);
     let b = draw(1);
     let c = draw(2);
     assert_eq!(a, b, "the same seed must give the same sequence");
-    assert_ne!(a, c, "seeds 1 and 2 must differ");
+    for (i, (x, y)) in a.iter().zip(c.iter()).enumerate() {
+        assert_ne!(x, y, "seeds 1 and 2 agree at position {i}");
+    }
+    let mut distinct = a.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        a.len(),
+        "one sequence repeats a value: {a:?}"
+    );
 }
 
 /// MemEnv-only: the clock is virtual. `sleep(3600 s)` returns at once

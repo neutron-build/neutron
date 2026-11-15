@@ -1,5 +1,6 @@
 //! Backend-generic conformance checks for `nucleus-env` (card A-1a
-//! Work 6).
+//! Work 6; strengthened in card A-1b-0 Work 2 after verdict A-1a's
+//! finding 2: the expected error variant is part of every check).
 //!
 //! Each check runs on a fresh, empty namespace and uses only the root
 //! and one subdirectory named `wal` — S-STORE §2's layout — so A-1b's
@@ -16,16 +17,57 @@
 use nucleus_env::{Env, EnvError, File, OpenMode};
 use std::time::Duration;
 
-/// Requires `got` to be the named [`EnvError`] variant with `path`.
-fn err_is(got: Result<(), EnvError>, want_path: &str, line: &str) -> Result<(), String> {
+/// The path-carrying `EnvError` variants a check can require (A-1a-F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// [`EnvError::NotFound`].
+    NotFound,
+    /// [`EnvError::AlreadyExists`].
+    AlreadyExists,
+    /// [`EnvError::Locked`].
+    Locked,
+    /// [`EnvError::ReadOnly`].
+    ReadOnly,
+    /// [`EnvError::InvalidPath`].
+    InvalidPath,
+}
+
+/// Requires `got` to be `Err` of the wanted variant with `want_path`
+/// (A-1a-F2: the variant is part of the contract, not only the path).
+fn err_is(
+    got: Result<(), EnvError>,
+    want: Want,
+    want_path: &str,
+    line: &str,
+) -> Result<(), String> {
+    let matched = match &got {
+        Err(EnvError::NotFound { path }) if want == Want::NotFound => path == want_path,
+        Err(EnvError::AlreadyExists { path }) if want == Want::AlreadyExists => path == want_path,
+        Err(EnvError::Locked { path }) if want == Want::Locked => path == want_path,
+        Err(EnvError::ReadOnly { path }) if want == Want::ReadOnly => path == want_path,
+        Err(EnvError::InvalidPath { path, .. }) if want == Want::InvalidPath => path == want_path,
+        _ => false,
+    };
+    if matched {
+        Ok(())
+    } else {
+        Err(format!(
+            "{line}: expected {want:?} for {want_path:?}, got {got:?}"
+        ))
+    }
+}
+
+/// Requires `got` to be `Err(EnvError::Io { kind, .. })` with exactly
+/// `kind` (E-KIND's refusals; A-1a-F3).
+fn io_kind_is(
+    got: Result<(), EnvError>,
+    kind: std::io::ErrorKind,
+    line: &str,
+) -> Result<(), String> {
     match got {
-        Err(EnvError::NotFound { path }) if path == want_path => Ok(()),
-        Err(EnvError::AlreadyExists { path }) if path == want_path => Ok(()),
-        Err(EnvError::Locked { path }) if path == want_path => Ok(()),
-        Err(EnvError::ReadOnly { path }) if path == want_path => Ok(()),
-        Err(EnvError::InvalidPath { path, .. }) if path == want_path => Ok(()),
+        Err(EnvError::Io { kind: k, .. }) if k == kind => Ok(()),
         other => Err(format!(
-            "{line}: expected a path error for {want_path:?}, got {other:?}"
+            "{line}: expected Io {{ kind: {kind:?} }}, got {other:?}"
         )),
     }
 }
@@ -46,21 +88,25 @@ pub fn open_modes<E: Env>(env: &E) -> Result<(), String> {
     }
     err_is(
         env.open("page", OpenMode::CreateNew).map(|_| ()),
+        Want::AlreadyExists,
         "page",
         "CreateNew on an existing file",
     )?;
     err_is(
         env.open("missing", OpenMode::Read).map(|_| ()),
+        Want::NotFound,
         "missing",
         "Read on a missing file",
     )?;
     err_is(
         env.open("missing", OpenMode::ReadWrite).map(|_| ()),
+        Want::NotFound,
         "missing",
         "ReadWrite on a missing file",
     )?;
     err_is(
         env.open("wal/seg", OpenMode::CreateNew).map(|_| ()),
+        Want::NotFound,
         "wal/seg",
         "CreateNew under a missing wal/",
     )?;
@@ -172,10 +218,30 @@ pub fn read_handle_refuses_writes<E: Env>(env: &E) -> Result<(), String> {
     let r = env
         .open("page", OpenMode::Read)
         .map_err(|e| format!("Read page: {e:?}"))?;
-    err_is(r.write_at(0, b"x"), "page", "write_at on a Read handle")?;
-    err_is(r.set_len(0), "page", "set_len on a Read handle")?;
-    err_is(r.sync_data(), "page", "sync_data on a Read handle")?;
-    err_is(r.sync_all(), "page", "sync_all on a Read handle")?;
+    err_is(
+        r.write_at(0, b"x"),
+        Want::ReadOnly,
+        "page",
+        "write_at on a Read handle",
+    )?;
+    err_is(
+        r.set_len(0),
+        Want::ReadOnly,
+        "page",
+        "set_len on a Read handle",
+    )?;
+    err_is(
+        r.sync_data(),
+        Want::ReadOnly,
+        "page",
+        "sync_data on a Read handle",
+    )?;
+    err_is(
+        r.sync_all(),
+        Want::ReadOnly,
+        "page",
+        "sync_all on a Read handle",
+    )?;
     drop(r);
 
     let w = env
@@ -201,7 +267,12 @@ pub fn read_handle_refuses_writes<E: Env>(env: &E) -> Result<(), String> {
 pub fn namespace_ops<E: Env>(env: &E) -> Result<(), String> {
     env.create_dir("wal")
         .map_err(|e| format!("create_dir wal: {e:?}"))?;
-    err_is(env.create_dir("wal"), "wal", "create_dir twice")?;
+    err_is(
+        env.create_dir("wal"),
+        Want::AlreadyExists,
+        "wal",
+        "create_dir twice",
+    )?;
 
     let f = env
         .open("page", OpenMode::CreateNew)
@@ -261,6 +332,7 @@ pub fn namespace_ops<E: Env>(env: &E) -> Result<(), String> {
     }
     err_is(
         env.rename("wal/a", "wal/b"),
+        Want::AlreadyExists,
         "wal/b",
         "rename onto an existing name",
     )?;
@@ -291,6 +363,7 @@ pub fn namespace_ops<E: Env>(env: &E) -> Result<(), String> {
     // A missing source is NotFound.
     err_is(
         env.rename("wal/ghost", "wal/x"),
+        Want::NotFound,
         "wal/ghost",
         "rename from a missing source",
     )?;
@@ -363,9 +436,63 @@ pub fn sync_dir_root_and_subdir<E: Env>(env: &E) -> Result<(), String> {
         .map_err(|e| format!("sync_dir wal after a create and a rename: {e:?}"))?;
     err_is(
         env.sync_dir("missing"),
+        Want::NotFound,
         "missing",
         "sync_dir of a missing directory",
     )?;
+    Ok(())
+}
+
+/// **E-DURABLE's calls on writable handles** (A-1a-F2, mutant G4's
+/// substrate). `sync_data`, `sync_all` and `sync_dir` are `Ok` on a
+/// `CreateNew` and a `ReadWrite` handle, around a `set_len` and a
+/// further write. Their durability effect is A-1b's to test, because
+/// only SimEnv has a power cut; here the check is that they succeed.
+pub fn sync_on_writable_handles<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let f = env
+        .open("wal/seg", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/seg: {e:?}"))?;
+    f.write_at(0, b"abc")
+        .map_err(|e| format!("write_at wal/seg: {e:?}"))?;
+    f.sync_data()
+        .map_err(|e| format!("sync_data on a CreateNew handle: {e:?}"))?;
+    f.sync_all()
+        .map_err(|e| format!("sync_all on a CreateNew handle: {e:?}"))?;
+    f.set_len(8).map_err(|e| format!("set_len 8: {e:?}"))?;
+    f.sync_all()
+        .map_err(|e| format!("sync_all after set_len: {e:?}"))?;
+    drop(f);
+
+    let f = env
+        .open("wal/seg", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/seg: {e:?}"))?;
+    f.write_at(8, b"d")
+        .map_err(|e| format!("write_at 8: {e:?}"))?;
+    f.sync_data()
+        .map_err(|e| format!("sync_data on a ReadWrite handle: {e:?}"))?;
+    f.sync_all()
+        .map_err(|e| format!("sync_all on a ReadWrite handle: {e:?}"))?;
+    drop(f);
+
+    env.sync_dir("wal")
+        .map_err(|e| format!("sync_dir wal: {e:?}"))?;
+    env.sync_dir("")
+        .map_err(|e| format!("sync_dir root: {e:?}"))?;
+
+    let r = env
+        .open("wal/seg", OpenMode::Read)
+        .map_err(|e| format!("Read wal/seg: {e:?}"))?;
+    let mut buf = [0u8; 9];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at wal/seg: {e:?}"))?;
+    if n != 9 || buf != *b"abc\0\0\0\0\0d" {
+        return Err(format!(
+            "wal/seg reads {n} bytes {buf:?}, wanted b\"abc\\0\\0\\0\\0\\0d\""
+        ));
+    }
     Ok(())
 }
 
@@ -387,6 +514,7 @@ pub fn locks_exclusive_excludes_all<E: Env>(env: &E) -> Result<(), String> {
         .map_err(|e| format!("ReadWrite page: {e:?}"))?;
     err_is(
         w2.lock_exclusive(),
+        Want::Locked,
         "page",
         "lock_exclusive beside an exclusive holder",
     )?;
@@ -395,6 +523,7 @@ pub fn locks_exclusive_excludes_all<E: Env>(env: &E) -> Result<(), String> {
         .map_err(|e| format!("Read page: {e:?}"))?;
     err_is(
         r.lock_shared(),
+        Want::Locked,
         "page",
         "lock_shared beside an exclusive holder",
     )?;
@@ -442,18 +571,24 @@ pub fn locks_shared_excludes_writer<E: Env>(env: &E) -> Result<(), String> {
         .map_err(|e| format!("ReadWrite page: {e:?}"))?;
     err_is(
         w.lock_exclusive(),
+        Want::Locked,
         "page",
         "lock_exclusive beside a shared holder",
     )?;
-    // Released, the writer takes it; a new reader is then excluded.
-    drop(r);
+    // Released by `unlock` — not by dropping the reader (A-1a-F2: the
+    // unlock of a shared lock is the thing under test; `r` stays alive
+    // to the end of the check) — the writer takes it; a new reader is
+    // then excluded.
+    r.unlock()
+        .map_err(|e| format!("unlock of a shared lock: {e:?}"))?;
     w.lock_exclusive()
-        .map_err(|e| format!("lock_exclusive after the reader left: {e:?}"))?;
+        .map_err(|e| format!("lock_exclusive after the reader unlocked: {e:?}"))?;
     let r2 = env
         .open("page", OpenMode::Read)
         .map_err(|e| format!("Read page: {e:?}"))?;
     err_is(
         r2.lock_shared(),
+        Want::Locked,
         "page",
         "lock_shared beside an exclusive holder",
     )?;
@@ -544,6 +679,435 @@ pub fn lock_creates_no_file<E: Env>(env: &E) -> Result<(), String> {
         return Err(format!(
             "a lock changed the namespace: root {before_root:?} -> shared {after_shared_root:?} / exclusive {after_excl_root:?}; wal {before_wal:?} -> shared {after_shared_wal:?} / exclusive {after_excl_wal:?}"
         ));
+    }
+    Ok(())
+}
+
+/// **E-HANDLE.** A handle keeps reaching its file across a rename: the
+/// write after the rename is visible under the new name, the old name
+/// is free, and the directory lists only the new name.
+pub fn handle_survives_rename<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let h = env
+        .open("wal/a", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/a: {e:?}"))?;
+    h.write_at(0, b"AAA")
+        .map_err(|e| format!("write_at wal/a: {e:?}"))?;
+    env.rename("wal/a", "wal/b")
+        .map_err(|e| format!("rename wal/a -> wal/b: {e:?}"))?;
+
+    h.write_at(3, b"BBB")
+        .map_err(|e| format!("write_at through the renamed handle: {e:?}"))?;
+    let len = h.len().map_err(|e| format!("len: {e:?}"))?;
+    if len != 6 {
+        return Err(format!(
+            "len after the write past the old end is {len}, wanted 6"
+        ));
+    }
+    let mut buf = [0u8; 6];
+    let n = h
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at through the renamed handle: {e:?}"))?;
+    if n != 6 || buf != *b"AAABBB" {
+        return Err(format!(
+            "the renamed handle reads {n} bytes {buf:?}, wanted b\"AAABBB\""
+        ));
+    }
+    h.sync_data()
+        .map_err(|e| format!("sync_data through the renamed handle: {e:?}"))?;
+    drop(h);
+
+    let r = env
+        .open("wal/b", OpenMode::Read)
+        .map_err(|e| format!("Read wal/b: {e:?}"))?;
+    let mut buf = [0u8; 6];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at wal/b: {e:?}"))?;
+    if n != 6 || buf != *b"AAABBB" {
+        return Err(format!("wal/b reads {n} bytes {buf:?}, wanted b\"AAABBB\""));
+    }
+    drop(r);
+
+    if env
+        .exists("wal/a")
+        .map_err(|e| format!("exists wal/a: {e:?}"))?
+    {
+        return Err("wal/a still exists after the rename".to_string());
+    }
+    let wal = env
+        .list_dir("wal")
+        .map_err(|e| format!("list_dir wal: {e:?}"))?;
+    if wal != ["b"] {
+        return Err(format!("list_dir(wal) is {wal:?}, wanted [\"b\"]"));
+    }
+    Ok(())
+}
+
+/// **E-HANDLE and E-LOCK.** The lock moves with a rename and is
+/// released only by `unlock` or by dropping the holding handle,
+/// whatever name the file has by then (verdict A-1a's lock-leak case:
+/// a new handle on the new name is `Locked` until the old handle
+/// drops).
+pub fn lock_moves_with_rename_until_drop<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let f = env
+        .open("wal/a", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/a: {e:?}"))?;
+    drop(f);
+
+    let h = env
+        .open("wal/a", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/a: {e:?}"))?;
+    h.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive wal/a: {e:?}"))?;
+    env.rename("wal/a", "wal/b")
+        .map_err(|e| format!("rename wal/a -> wal/b: {e:?}"))?;
+
+    let x = env
+        .open("wal/b", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/b: {e:?}"))?;
+    err_is(
+        x.lock_exclusive(),
+        Want::Locked,
+        "wal/b",
+        "lock_exclusive beside the renamed holder",
+    )?;
+    let r = env
+        .open("wal/b", OpenMode::Read)
+        .map_err(|e| format!("Read wal/b: {e:?}"))?;
+    err_is(
+        r.lock_shared(),
+        Want::Locked,
+        "wal/b",
+        "lock_shared beside the renamed holder",
+    )?;
+    drop(r);
+    drop(x);
+
+    // Dropping the holder releases the lock, under the new name.
+    drop(h);
+    let w = env
+        .open("wal/b", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/b after the drop: {e:?}"))?;
+    w.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive after the holder dropped: {e:?}"))?;
+    Ok(())
+}
+
+/// **E-HANDLE.** After a remove and a recreate of the same name, the
+/// old handle still reaches the old, now unnamed file, and never the
+/// new one (verdict A-1a's silent cross-file write): their writes and
+/// their locks stay on two different files.
+pub fn handle_survives_remove_and_recreate<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let u = env
+        .open("wal/c", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/c: {e:?}"))?;
+    u.write_at(0, b"old")
+        .map_err(|e| format!("write_at wal/c: {e:?}"))?;
+
+    env.remove("wal/c")
+        .map_err(|e| format!("remove wal/c: {e:?}"))?;
+    if env
+        .exists("wal/c")
+        .map_err(|e| format!("exists wal/c: {e:?}"))?
+    {
+        return Err("wal/c still exists after remove".to_string());
+    }
+
+    // The removed file still reads and writes through its handle.
+    u.write_at(3, b"!")
+        .map_err(|e| format!("write_at through the removed handle: {e:?}"))?;
+    let mut buf = [0u8; 4];
+    let n = u
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at through the removed handle: {e:?}"))?;
+    let len = u.len().map_err(|e| format!("len: {e:?}"))?;
+    if n != 4 || buf != *b"old!" || len != 4 {
+        return Err(format!(
+            "the removed handle reads {n} bytes {buf:?} at len {len}, wanted b\"old!\" at 4"
+        ));
+    }
+
+    // A CreateNew of the same name makes a different file.
+    let new_handle = env
+        .open("wal/c", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/c again: {e:?}"))?;
+    new_handle
+        .write_at(0, b"new")
+        .map_err(|e| format!("write_at new wal/c: {e:?}"))?;
+    u.write_at(0, b"ZZZ")
+        .map_err(|e| format!("write_at through the old handle: {e:?}"))?;
+
+    let r = env
+        .open("wal/c", OpenMode::Read)
+        .map_err(|e| format!("Read wal/c: {e:?}"))?;
+    let mut buf = [0u8; 4];
+    let read = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at wal/c: {e:?}"))?;
+    let len = r.len().map_err(|e| format!("len wal/c: {e:?}"))?;
+    if read != 3 || len != 3 || buf[..3] != *b"new" {
+        return Err(format!(
+            "the new file reads {read} bytes {buf:?} at len {len}, wanted exactly b\"new\""
+        ));
+    }
+    drop(r);
+
+    let mut buf = [0u8; 4];
+    let n = u
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at through the old handle: {e:?}"))?;
+    if n != 4 || buf != *b"ZZZ!" {
+        return Err(format!(
+            "the old handle reads {n} bytes {buf:?}, wanted b\"ZZZ!\""
+        ));
+    }
+
+    // Two different files: both take the exclusive lock at once.
+    u.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive on the old handle: {e:?}"))?;
+    new_handle
+        .lock_exclusive()
+        .map_err(|e| format!("lock_exclusive on the new handle: {e:?}"))?;
+    let wal = env
+        .list_dir("wal")
+        .map_err(|e| format!("list_dir wal: {e:?}"))?;
+    if wal != ["c"] {
+        return Err(format!("list_dir(wal) is {wal:?}, wanted [\"c\"]"));
+    }
+    Ok(())
+}
+
+/// **E-KIND.** File/directory mismatches agree on every backend: a
+/// directory where a file is required (`open`, `remove`, `rename`'s
+/// source) is `Io { IsADirectory }`; a file where a directory is
+/// required (`sync_dir`, `list_dir`) is `Io { NotADirectory }`; a path
+/// under a file names nothing (`exists` is `Ok(false)`, the rest
+/// `NotFound`); and `rename` checks its source before its target.
+/// Nothing in the namespace changes.
+pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let page = env
+        .open("page", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew page: {e:?}"))?;
+    page.write_at(0, b"p")
+        .map_err(|e| format!("write_at page: {e:?}"))?;
+    drop(page);
+    let seg = env
+        .open("wal/seg", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/seg: {e:?}"))?;
+    drop(seg);
+
+    // A directory as a file.
+    io_kind_is(
+        env.open("wal", OpenMode::Read).map(|_| ()),
+        std::io::ErrorKind::IsADirectory,
+        "open(wal, Read)",
+    )?;
+    io_kind_is(
+        env.open("wal", OpenMode::ReadWrite).map(|_| ()),
+        std::io::ErrorKind::IsADirectory,
+        "open(wal, ReadWrite)",
+    )?;
+    err_is(
+        env.open("wal", OpenMode::CreateNew).map(|_| ()),
+        Want::AlreadyExists,
+        "wal",
+        "CreateNew on a directory's taken name",
+    )?;
+    io_kind_is(
+        env.remove("wal"),
+        std::io::ErrorKind::IsADirectory,
+        "remove(wal)",
+    )?;
+    io_kind_is(
+        env.rename("wal", "wal2"),
+        std::io::ErrorKind::IsADirectory,
+        "rename(wal, wal2)",
+    )?;
+    for (path, want) in [("wal", true), ("wal2", false)] {
+        let got = env
+            .exists(path)
+            .map_err(|e| format!("exists {path}: {e:?}"))?;
+        if got != want {
+            return Err(format!("exists({path:?}) is {got}, wanted {want}"));
+        }
+    }
+
+    // A file as a directory.
+    io_kind_is(
+        env.sync_dir("page"),
+        std::io::ErrorKind::NotADirectory,
+        "sync_dir(page)",
+    )?;
+    io_kind_is(
+        env.sync_dir("wal/seg"),
+        std::io::ErrorKind::NotADirectory,
+        "sync_dir(wal/seg)",
+    )?;
+    io_kind_is(
+        env.list_dir("page").map(|_| ()),
+        std::io::ErrorKind::NotADirectory,
+        "list_dir(page)",
+    )?;
+    err_is(
+        env.create_dir("page"),
+        Want::AlreadyExists,
+        "page",
+        "create_dir over a file",
+    )?;
+
+    // A path under a file names nothing.
+    match env.exists("page/x") {
+        Ok(false) => {}
+        other => return Err(format!("exists(page/x) gave {other:?}, wanted Ok(false)")),
+    }
+    err_is(
+        env.open("page/x", OpenMode::Read).map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "Read under a file",
+    )?;
+    err_is(
+        env.open("page/x", OpenMode::ReadWrite).map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "ReadWrite under a file",
+    )?;
+    err_is(
+        env.open("page/x", OpenMode::CreateNew).map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "CreateNew under a file",
+    )?;
+    err_is(
+        env.create_dir("page/x"),
+        Want::NotFound,
+        "page/x",
+        "create_dir under a file",
+    )?;
+    err_is(
+        env.remove("page/x"),
+        Want::NotFound,
+        "page/x",
+        "remove under a file",
+    )?;
+    err_is(
+        env.rename("page/x", "page/y"),
+        Want::NotFound,
+        "page/x",
+        "rename from under a file",
+    )?;
+    err_is(
+        env.sync_dir("page/x"),
+        Want::NotFound,
+        "page/x",
+        "sync_dir under a file",
+    )?;
+    err_is(
+        env.list_dir("page/x").map(|_| ()),
+        Want::NotFound,
+        "page/x",
+        "list_dir under a file",
+    )?;
+
+    // Check order: the source is checked before the target, so a
+    // missing source is NotFound even when the target exists.
+    err_is(
+        env.rename("wal/ghost", "wal/seg"),
+        Want::NotFound,
+        "wal/ghost",
+        "rename from a missing source onto an existing target",
+    )?;
+
+    // Nothing changed.
+    let root = env
+        .list_dir("")
+        .map_err(|e| format!("list_dir '': {e:?}"))?;
+    if root != ["page", "wal"] {
+        return Err(format!(
+            "list_dir('') is {root:?}, wanted [\"page\", \"wal\"]"
+        ));
+    }
+    let wal = env
+        .list_dir("wal")
+        .map_err(|e| format!("list_dir wal: {e:?}"))?;
+    if wal != ["seg"] {
+        return Err(format!("list_dir(wal) is {wal:?}, wanted [\"seg\"]"));
+    }
+    let r = env
+        .open("page", OpenMode::Read)
+        .map_err(|e| format!("Read page: {e:?}"))?;
+    let mut buf = [0u8; 1];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at page: {e:?}"))?;
+    if n != 1 || buf != *b"p" {
+        return Err(format!("page reads {n} bytes {buf:?}, wanted b\"p\""));
+    }
+    Ok(())
+}
+
+/// **E-IO's edges.** A zero-length `write_at` changes nothing at any
+/// offset and returns `Ok` — after the `Read` handle's refusal, which
+/// still comes first; `read_at` returns 0 at offsets no platform file
+/// can reach, past `i64::MAX`.
+pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
+    let f = env
+        .open("page", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew page: {e:?}"))?;
+    f.write_at(0, b"abc")
+        .map_err(|e| format!("write_at page: {e:?}"))?;
+
+    // A zero-length write at any offset: no extension, Ok.
+    f.write_at(100, b"")
+        .map_err(|e| format!("write_at(100, b\"\"): {e:?}"))?;
+    f.write_at(3, b"")
+        .map_err(|e| format!("write_at(3, b\"\"): {e:?}"))?;
+    let len = f.len().map_err(|e| format!("len: {e:?}"))?;
+    if len != 3 {
+        return Err(format!("len after the empty writes is {len}, wanted 3"));
+    }
+
+    // Offsets no platform file can reach still read 0, not an error.
+    let mut buf = [0u8; 4];
+    for off in [1u64 << 63, u64::MAX] {
+        let n = f
+            .read_at(off, &mut buf)
+            .map_err(|e| format!("read_at({off}): {e:?}"))?;
+        if n != 0 {
+            return Err(format!("read_at({off}) gave {n}, wanted 0"));
+        }
+    }
+    drop(f);
+
+    // The refusal comes before the empty-write no-op.
+    let r = env
+        .open("page", OpenMode::Read)
+        .map_err(|e| format!("Read page: {e:?}"))?;
+    err_is(
+        r.write_at(0, b""),
+        Want::ReadOnly,
+        "page",
+        "write_at(b\"\") on a Read handle",
+    )?;
+    drop(r);
+
+    let r = env
+        .open("page", OpenMode::Read)
+        .map_err(|e| format!("Read page: {e:?}"))?;
+    let mut buf = [0u8; 3];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at page: {e:?}"))?;
+    if n != 3 || buf != *b"abc" {
+        return Err(format!("page reads {n} bytes {buf:?}, wanted b\"abc\""));
     }
     Ok(())
 }

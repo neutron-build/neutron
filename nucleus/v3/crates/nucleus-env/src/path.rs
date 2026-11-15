@@ -18,8 +18,7 @@ use crate::error::EnvError;
 /// Rejects the empty path; accepts every well-formed relative path.
 ///
 /// This is the check for every [`crate::Env`] method that names one file
-/// or directory (`open`, `create_dir`, `sync_dir`, `rename`, `remove`,
-/// `exists`, `list_dir`).
+/// or directory (`open`, `create_dir`, `rename`, `remove` and `exists`).
 pub(crate) fn check(path: &str) -> Result<(), EnvError> {
     if path.is_empty() {
         return Err(invalid(

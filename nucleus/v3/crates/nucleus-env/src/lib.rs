@@ -32,8 +32,11 @@
 //!   `set_len`, `sync_data` and `sync_all` with [`EnvError::ReadOnly`],
 //!   before any I/O (S-STORE §14.1 "What it refuses").
 //! - **E-IO** — `read_at` is short only at end-of-file, 0 at or past
-//!   it, and never zero-fills past it (§12.5's short segment must be
-//!   visible); `write_at` writes all of `buf`, extending the file;
+//!   it — including offsets no platform file can reach, past `i64::MAX`
+//!   and past `usize` on a 32-bit target — and never zero-fills past it
+//!   (§12.5's short segment must be visible); `write_at` writes all of
+//!   `buf`, extending the file, and a zero-length write changes nothing
+//!   at any offset and returns `Ok` (after the `Read` refusal);
 //!   `set_len` truncates or zero-extends; `len` is the current length.
 //! - **E-DURABLE** — written bytes are durable only after a `sync_data`
 //!   or `sync_all` of that file; a `set_len` change only after
@@ -50,15 +53,43 @@
 //!   a file; `exists` is true for files and directories; `list_dir`
 //!   returns bytewise-sorted names; `create_dir` creates one directory
 //!   whose parent exists.
+//! - **E-HANDLE** — a handle names the file it opened, not the path it
+//!   opened it by. A `rename` rebinds the name; the handle keeps
+//!   reaching the file under its new name. A `remove` unbinds the name;
+//!   the handle keeps reaching the now-unnamed file, and every `File`
+//!   method works on it, until the handle is dropped. A later
+//!   `CreateNew` of the same name makes a different file, which the old
+//!   handle never reaches. A handle's errors name its open-time path,
+//!   for the message only. Why: E4's SimDisk `FileId` model and its
+//!   WAL recycling, which writes through the id it held before the
+//!   rename (S-STORE §12.1); E-LOCK's "on the file itself"; POSIX
+//!   open-file semantics, which StdEnv already has. S-STORE leaves the
+//!   case open. A future `OpfsEnv` meets this rule or names its
+//!   departure in its own card.
+//! - **E-KIND** — file/directory mismatches are one behaviour on every
+//!   backend. A file operation on a directory: `open` (`Read`,
+//!   `ReadWrite`) is [`EnvError::Io`] `{ kind: IsADirectory }`; `open`
+//!   (`CreateNew`) is [`EnvError::AlreadyExists`], because the name is
+//!   taken; `remove` and `rename`'s source are
+//!   `Io { kind: IsADirectory }`. A directory operation on a file:
+//!   `sync_dir` and `list_dir` are `Io { kind: NotADirectory }`;
+//!   `create_dir` of a file's name is `AlreadyExists`. A path under a
+//!   file names nothing: `exists` is `Ok(false)` and every other method
+//!   treats it as missing (`NotFound`). `rename` checks in order:
+//!   E-PATH, cross-directory, the source (`NotFound`, or
+//!   `IsADirectory`), then the target (`AlreadyExists`). Each refusal's
+//!   `path` names the path the refusal is about.
 //! - **E-LOCK** (N11; S-STORE §14.1 "No writer") — a lock belongs to an
 //!   open handle, is advisory, on the file itself, and taking it
-//!   creates and writes no file. `lock_exclusive` succeeds only if no
-//!   other handle holds any lock; `lock_shared` only if no other handle
-//!   holds the exclusive lock; several handles may hold the shared lock
-//!   (flock semantics). Both are non-blocking: a conflict is
-//!   [`EnvError::Locked`] at once. `lock_shared` works on a `Read`
-//!   handle. `unlock` is `Ok` when the handle holds none; dropping a
-//!   handle releases its lock.
+//!   creates and writes no file. The lock lives on the file: it moves
+//!   with a `rename` and is released by `unlock` or by dropping the
+//!   holding handle, whatever name the file has by then.
+//!   `lock_exclusive` succeeds only if no other handle holds any lock;
+//!   `lock_shared` only if no other handle holds the exclusive lock;
+//!   several handles may hold the shared lock (flock semantics). Both
+//!   are non-blocking: a conflict is [`EnvError::Locked`] at once.
+//!   `lock_shared` works on a `Read` handle. `unlock` is `Ok` when the
+//!   handle holds none; dropping a handle releases its lock.
 //! - **E-CLOCK/RAND** — `now` is monotonic since the backend was
 //!   created; `sleep(d)` returns once `now` has advanced by at least
 //!   `d`; `rand` is a 64-bit value, not cryptographic, for ids such as
