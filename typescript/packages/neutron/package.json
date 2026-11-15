@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/core",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "The unified TypeScript web framework. Static sites with zero JS, app routes with Preact SSR, one router, deploy anywhere.",
   "author": "Tyler",
   "license": "MIT",
@@ -84,7 +84,7 @@
     "gray-matter": "^4.0.3",
     "magic-string": "^0.30.21",
     "marked": "^15.0.12",
-    "preact-render-to-string": "^6.6.5",
+    "preact-render-to-string": "^6.8.2",
     "ws": "^8.18.0",
     "yaml": "^2.8.3",
     "zod": "^4.6.7"
@@ -98,13 +98,13 @@
     "sanitize-html": "^2.18.1",
     "vite": "^8.3.3",
     "vitest": "^4.1.11",
-    "preact": "^10.25.4"
+    "preact": "^11.0.1"
   },
   "peerDependencies": {
     "sanitize-html": ">=2.18.0",
     "sharp": ">=0.35.5",
     "shiki": ">=1.0.0",
-    "preact": "^10.25.4",
+    "preact": "^10.25.4 || ^11.0.0",
     "hono": "^4.13.11"
   },
   "peerDependenciesMeta": {

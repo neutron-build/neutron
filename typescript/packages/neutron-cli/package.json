@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/cli",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "CLI for the Neutron framework. Dev server, production builds, and deployment.",
   "author": "Tyler",
   "license": "MIT",
@@ -41,19 +41,19 @@
   "dependencies": {
     "@neutron-build/core": "workspace:^",
     "@neutron-build/create": "workspace:^",
-    "preact-render-to-string": "^6.5.11",
+    "preact-render-to-string": "^6.8.2",
     "vite": "^8.3.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2",
-    "preact": "^10.25.4"
+    "preact": "^11.0.1"
   },
   "publishConfig": {
     "access": "public"
   },
   "peerDependencies": {
-    "preact": "^10.25.4"
+    "preact": "^10.25.4 || ^11.0.0"
   },
   "engines": {
     "node": ">=22.12"

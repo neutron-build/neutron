@@ -4,7 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-cms 0.1.3 (not yet published).
+core 0.5.5, cli 0.5.5, ai 0.1.4, cms 0.1.3 (not yet published).
+
+### Changed
+
+- **Preact 11 is supported alongside Preact 10.** `@neutron-build/core`,
+  `cli` and `cms` accept `preact` `^10.25.4 || ^11.0.0`, and `ai` accepts
+  `^10.0.0 || ^11.0.0`. Their `preact-render-to-string` range moves to
+  `^6.8.2`, the line Preact 11 requires. The packages are built and tested
+  against Preact 11; the example apps and templates stay on Preact 10.
+- **core: `ImageProps` is typed from `ComponentProps<"img">`.** Preact 11
+  dropped `JSX.HTMLAttributes`, so the old spelling no longer compiled.
+- **cms: `Photo` no longer accepts `role`.** Preact 11 ties an image's role
+  to how it is named, which a pass-through prop cannot satisfy.
+
+### Fixed
+
+- **cms: the undo banners put `role="status"` on the message, not the form.**
+  `status` is not a valid role for a `form`.
 
 ### Added
 

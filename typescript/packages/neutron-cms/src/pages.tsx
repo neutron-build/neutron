@@ -255,8 +255,8 @@ export function PostsPage(props: {
           </form>
         </div>
         {props.deleted ? (
-          <form class="undo" method="post" action={`${admin}/trash/${props.deleted.id}`} role="status">
-            <span>"{props.deleted.title || "Untitled"}" moved to Trash.</span>
+          <form class="undo" method="post" action={`${admin}/trash/${props.deleted.id}`}>
+            <span role="status">"{props.deleted.title || "Untitled"}" moved to Trash.</span>
             <button class="button" type="submit">Undo</button>
           </form>
         ) : null}
@@ -748,8 +748,8 @@ export function HistoryPage(props: { config: ResolvedConfig; entries: HistoryEnt
           {only ? <a class="head-link" href={`${admin}/history`}>Show everything</a> : null}
         </div>
         {props.restored ? (
-          <form class="undo" method="post" action={`${admin}/history/${props.restored}${query("")}`} role="status">
-            <span>Restored.</span>
+          <form class="undo" method="post" action={`${admin}/history/${props.restored}${query("")}`}>
+            <span role="status">Restored.</span>
             <button class="button" type="submit">Undo</button>
           </form>
         ) : null}
