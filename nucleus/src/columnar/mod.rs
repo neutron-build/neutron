@@ -1880,8 +1880,8 @@ impl NullBitmap {
         let full_words = self.len / 64;
         let remainder = self.len % 64;
         let mut count: usize = 0;
-        for i in 0..full_words {
-            count += self.bits[i].count_ones() as usize;
+        for word in &self.bits[..full_words] {
+            count += word.count_ones() as usize;
         }
         if remainder > 0 {
             let mask = (1u64 << remainder) - 1;
