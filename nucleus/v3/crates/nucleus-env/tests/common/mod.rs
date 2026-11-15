@@ -58,16 +58,19 @@ fn err_is(
 }
 
 /// Requires `got` to be `Err(EnvError::Io { kind, .. })` with exactly
-/// `kind` (E-KIND's refusals; A-1a-F3).
+/// `kind`, whose `path` equals `want_path` (E-KIND's refusals;
+/// A-1a-F3; A-1b-0-F4: each refusal's `path` names the path the
+/// refusal is about).
 fn io_kind_is(
     got: Result<(), EnvError>,
     kind: std::io::ErrorKind,
+    want_path: &str,
     line: &str,
 ) -> Result<(), String> {
     match got {
-        Err(EnvError::Io { kind: k, .. }) if k == kind => Ok(()),
+        Err(EnvError::Io { kind: k, path, .. }) if k == kind && path == want_path => Ok(()),
         other => Err(format!(
-            "{line}: expected Io {{ kind: {kind:?} }}, got {other:?}"
+            "{line}: expected Io {{ kind: {kind:?} }} for {want_path:?}, got {other:?}"
         )),
     }
 }
@@ -749,7 +752,9 @@ pub fn handle_survives_rename<E: Env>(env: &E) -> Result<(), String> {
 /// released only by `unlock` or by dropping the holding handle,
 /// whatever name the file has by then (verdict A-1a's lock-leak case:
 /// a new handle on the new name is `Locked` until the old handle
-/// drops).
+/// drops). `unlock` releases it under the new name too (A-1b-0-F4,
+/// the gate's O1): a handle unlocked after the rename no longer
+/// excludes anyone.
 pub fn lock_moves_with_rename_until_drop<E: Env>(env: &E) -> Result<(), String> {
     env.create_dir("wal")
         .map_err(|e| format!("create_dir wal: {e:?}"))?;
@@ -786,6 +791,20 @@ pub fn lock_moves_with_rename_until_drop<E: Env>(env: &E) -> Result<(), String> 
     )?;
     drop(r);
     drop(x);
+
+    // A-1b-0-F4 (the gate's O1): `unlock` releases the lock under the
+    // renamed file's new name, so a fresh handle can take it; the old
+    // handle takes it back afterwards.
+    h.unlock()
+        .map_err(|e| format!("unlock after rename: {e:?}"))?;
+    let u = env
+        .open("wal/b", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/b again: {e:?}"))?;
+    u.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive after the unlock: {e:?}"))?;
+    drop(u);
+    h.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive retaken by the old handle: {e:?}"))?;
 
     // Dropping the holder releases the lock, under the new name.
     drop(h);
@@ -889,7 +908,10 @@ pub fn handle_survives_remove_and_recreate<E: Env>(env: &E) -> Result<(), String
 /// required (`sync_dir`, `list_dir`) is `Io { NotADirectory }`; a path
 /// under a file names nothing (`exists` is `Ok(false)`, the rest
 /// `NotFound`); and `rename` checks its source before its target.
-/// Nothing in the namespace changes.
+/// Nothing in the namespace changes. (StdEnv `remove`'s metadata check
+/// — the A-1b-0 gate's mutant O3 — is caught only where the platform's
+/// errno differs: Linux maps EISDIR to the same kind, macOS gives
+/// EPERM, which surfaces as `Io { Uncategorized }` naming `wal`.)
 pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
     env.create_dir("wal")
         .map_err(|e| format!("create_dir wal: {e:?}"))?;
@@ -908,11 +930,13 @@ pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
     io_kind_is(
         env.open("wal", OpenMode::Read).map(|_| ()),
         std::io::ErrorKind::IsADirectory,
+        "wal",
         "open(wal, Read)",
     )?;
     io_kind_is(
         env.open("wal", OpenMode::ReadWrite).map(|_| ()),
         std::io::ErrorKind::IsADirectory,
+        "wal",
         "open(wal, ReadWrite)",
     )?;
     err_is(
@@ -924,11 +948,13 @@ pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
     io_kind_is(
         env.remove("wal"),
         std::io::ErrorKind::IsADirectory,
+        "wal",
         "remove(wal)",
     )?;
     io_kind_is(
         env.rename("wal", "wal2"),
         std::io::ErrorKind::IsADirectory,
+        "wal",
         "rename(wal, wal2)",
     )?;
     for (path, want) in [("wal", true), ("wal2", false)] {
@@ -944,16 +970,19 @@ pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
     io_kind_is(
         env.sync_dir("page"),
         std::io::ErrorKind::NotADirectory,
+        "page",
         "sync_dir(page)",
     )?;
     io_kind_is(
         env.sync_dir("wal/seg"),
         std::io::ErrorKind::NotADirectory,
+        "wal/seg",
         "sync_dir(wal/seg)",
     )?;
     io_kind_is(
         env.list_dir("page").map(|_| ()),
         std::io::ErrorKind::NotADirectory,
+        "page",
         "list_dir(page)",
     )?;
     err_is(
@@ -1097,21 +1126,25 @@ pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
     io_kind_is(
         f.write_at(1u64 << 63, b"x"),
         std::io::ErrorKind::InvalidInput,
+        "page",
         "write_at(1<<63, b\"x\")",
     )?;
     io_kind_is(
         f.write_at(i64::MAX as u64, b"xy"),
         std::io::ErrorKind::InvalidInput,
+        "page",
         "write_at(i64::MAX, b\"xy\")",
     )?;
     io_kind_is(
         f.write_at(u64::MAX, b"x"),
         std::io::ErrorKind::InvalidInput,
+        "page",
         "write_at(u64::MAX, b\"x\")",
     )?;
     io_kind_is(
         f.set_len(1u64 << 63),
         std::io::ErrorKind::InvalidInput,
+        "page",
         "set_len(1<<63)",
     )?;
     // An empty write stays Ok at any offset, the bound included.
