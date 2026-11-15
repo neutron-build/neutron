@@ -683,6 +683,206 @@ pub fn lock_creates_no_file<E: Env>(env: &E) -> Result<(), String> {
     Ok(())
 }
 
+/// **E-HANDLE.** A handle keeps reaching its file across a rename: the
+/// write after the rename is visible under the new name, the old name
+/// is free, and the directory lists only the new name.
+pub fn handle_survives_rename<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let h = env
+        .open("wal/a", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/a: {e:?}"))?;
+    h.write_at(0, b"AAA")
+        .map_err(|e| format!("write_at wal/a: {e:?}"))?;
+    env.rename("wal/a", "wal/b")
+        .map_err(|e| format!("rename wal/a -> wal/b: {e:?}"))?;
+
+    h.write_at(3, b"BBB")
+        .map_err(|e| format!("write_at through the renamed handle: {e:?}"))?;
+    let len = h.len().map_err(|e| format!("len: {e:?}"))?;
+    if len != 6 {
+        return Err(format!(
+            "len after the write past the old end is {len}, wanted 6"
+        ));
+    }
+    let mut buf = [0u8; 6];
+    let n = h
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at through the renamed handle: {e:?}"))?;
+    if n != 6 || buf != *b"AAABBB" {
+        return Err(format!(
+            "the renamed handle reads {n} bytes {buf:?}, wanted b\"AAABBB\""
+        ));
+    }
+    h.sync_data()
+        .map_err(|e| format!("sync_data through the renamed handle: {e:?}"))?;
+    drop(h);
+
+    let r = env
+        .open("wal/b", OpenMode::Read)
+        .map_err(|e| format!("Read wal/b: {e:?}"))?;
+    let mut buf = [0u8; 6];
+    let n = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at wal/b: {e:?}"))?;
+    if n != 6 || buf != *b"AAABBB" {
+        return Err(format!("wal/b reads {n} bytes {buf:?}, wanted b\"AAABBB\""));
+    }
+    drop(r);
+
+    if env
+        .exists("wal/a")
+        .map_err(|e| format!("exists wal/a: {e:?}"))?
+    {
+        return Err("wal/a still exists after the rename".to_string());
+    }
+    let wal = env
+        .list_dir("wal")
+        .map_err(|e| format!("list_dir wal: {e:?}"))?;
+    if wal != ["b"] {
+        return Err(format!("list_dir(wal) is {wal:?}, wanted [\"b\"]"));
+    }
+    Ok(())
+}
+
+/// **E-HANDLE and E-LOCK.** The lock moves with a rename and is
+/// released only by `unlock` or by dropping the holding handle,
+/// whatever name the file has by then (verdict A-1a's lock-leak case:
+/// a new handle on the new name is `Locked` until the old handle
+/// drops).
+pub fn lock_moves_with_rename_until_drop<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let f = env
+        .open("wal/a", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/a: {e:?}"))?;
+    drop(f);
+
+    let h = env
+        .open("wal/a", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/a: {e:?}"))?;
+    h.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive wal/a: {e:?}"))?;
+    env.rename("wal/a", "wal/b")
+        .map_err(|e| format!("rename wal/a -> wal/b: {e:?}"))?;
+
+    let x = env
+        .open("wal/b", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/b: {e:?}"))?;
+    err_is(
+        x.lock_exclusive(),
+        Want::Locked,
+        "wal/b",
+        "lock_exclusive beside the renamed holder",
+    )?;
+    let r = env
+        .open("wal/b", OpenMode::Read)
+        .map_err(|e| format!("Read wal/b: {e:?}"))?;
+    err_is(
+        r.lock_shared(),
+        Want::Locked,
+        "wal/b",
+        "lock_shared beside the renamed holder",
+    )?;
+    drop(r);
+    drop(x);
+
+    // Dropping the holder releases the lock, under the new name.
+    drop(h);
+    let w = env
+        .open("wal/b", OpenMode::ReadWrite)
+        .map_err(|e| format!("ReadWrite wal/b after the drop: {e:?}"))?;
+    w.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive after the holder dropped: {e:?}"))?;
+    Ok(())
+}
+
+/// **E-HANDLE.** After a remove and a recreate of the same name, the
+/// old handle still reaches the old, now unnamed file, and never the
+/// new one (verdict A-1a's silent cross-file write): their writes and
+/// their locks stay on two different files.
+pub fn handle_survives_remove_and_recreate<E: Env>(env: &E) -> Result<(), String> {
+    env.create_dir("wal")
+        .map_err(|e| format!("create_dir wal: {e:?}"))?;
+    let u = env
+        .open("wal/c", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/c: {e:?}"))?;
+    u.write_at(0, b"old")
+        .map_err(|e| format!("write_at wal/c: {e:?}"))?;
+
+    env.remove("wal/c")
+        .map_err(|e| format!("remove wal/c: {e:?}"))?;
+    if env
+        .exists("wal/c")
+        .map_err(|e| format!("exists wal/c: {e:?}"))?
+    {
+        return Err("wal/c still exists after remove".to_string());
+    }
+
+    // The removed file still reads and writes through its handle.
+    u.write_at(3, b"!")
+        .map_err(|e| format!("write_at through the removed handle: {e:?}"))?;
+    let mut buf = [0u8; 4];
+    let n = u
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at through the removed handle: {e:?}"))?;
+    let len = u.len().map_err(|e| format!("len: {e:?}"))?;
+    if n != 4 || buf != *b"old!" || len != 4 {
+        return Err(format!(
+            "the removed handle reads {n} bytes {buf:?} at len {len}, wanted b\"old!\" at 4"
+        ));
+    }
+
+    // A CreateNew of the same name makes a different file.
+    let new_handle = env
+        .open("wal/c", OpenMode::CreateNew)
+        .map_err(|e| format!("CreateNew wal/c again: {e:?}"))?;
+    new_handle
+        .write_at(0, b"new")
+        .map_err(|e| format!("write_at new wal/c: {e:?}"))?;
+    u.write_at(0, b"ZZZ")
+        .map_err(|e| format!("write_at through the old handle: {e:?}"))?;
+
+    let r = env
+        .open("wal/c", OpenMode::Read)
+        .map_err(|e| format!("Read wal/c: {e:?}"))?;
+    let mut buf = [0u8; 4];
+    let read = r
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at wal/c: {e:?}"))?;
+    let len = r.len().map_err(|e| format!("len wal/c: {e:?}"))?;
+    if read != 3 || len != 3 || buf[..3] != *b"new" {
+        return Err(format!(
+            "the new file reads {read} bytes {buf:?} at len {len}, wanted exactly b\"new\""
+        ));
+    }
+    drop(r);
+
+    let mut buf = [0u8; 4];
+    let n = u
+        .read_at(0, &mut buf)
+        .map_err(|e| format!("read_at through the old handle: {e:?}"))?;
+    if n != 4 || buf != *b"ZZZ!" {
+        return Err(format!(
+            "the old handle reads {n} bytes {buf:?}, wanted b\"ZZZ!\""
+        ));
+    }
+
+    // Two different files: both take the exclusive lock at once.
+    u.lock_exclusive()
+        .map_err(|e| format!("lock_exclusive on the old handle: {e:?}"))?;
+    new_handle
+        .lock_exclusive()
+        .map_err(|e| format!("lock_exclusive on the new handle: {e:?}"))?;
+    let wal = env
+        .list_dir("wal")
+        .map_err(|e| format!("list_dir wal: {e:?}"))?;
+    if wal != ["c"] {
+        return Err(format!("list_dir(wal) is {wal:?}, wanted [\"c\"]"));
+    }
+    Ok(())
+}
+
 /// **E-CLOCK/RAND.** `now` never decreases; after `sleep(1 ms)`, `now`
 /// has grown by at least 1 ms; two `rand` calls differ.
 pub fn clock_and_rand<E: Env>(env: &E) -> Result<(), String> {

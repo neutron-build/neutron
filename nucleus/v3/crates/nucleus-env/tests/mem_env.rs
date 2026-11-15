@@ -83,6 +83,24 @@ fn mem_lock_creates_no_file() {
 }
 
 #[test]
+fn mem_handle_survives_rename() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::handle_survives_rename(&env), Ok(()));
+}
+
+#[test]
+fn mem_lock_moves_with_rename_until_drop() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::lock_moves_with_rename_until_drop(&env), Ok(()));
+}
+
+#[test]
+fn mem_handle_survives_remove_and_recreate() {
+    let env = MemEnv::new(1);
+    assert_eq!(common::handle_survives_remove_and_recreate(&env), Ok(()));
+}
+
+#[test]
 fn mem_clock_and_rand() {
     let env = MemEnv::new(1);
     assert_eq!(common::clock_and_rand(&env), Ok(()));

@@ -74,6 +74,15 @@ std_test!(
     lock_released_on_unlock_and_drop
 );
 std_test!(std_lock_creates_no_file, lock_creates_no_file);
+std_test!(std_handle_survives_rename, handle_survives_rename);
+std_test!(
+    std_lock_moves_with_rename_until_drop,
+    lock_moves_with_rename_until_drop
+);
+std_test!(
+    std_handle_survives_remove_and_recreate,
+    handle_survives_remove_and_recreate
+);
 std_test!(std_clock_and_rand, clock_and_rand);
 
 /// StdEnv-only: the root must exist and be a directory. A missing path
