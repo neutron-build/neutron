@@ -310,7 +310,9 @@ impl Env for MemEnv {
         }
         let mut names = BTreeSet::new();
         for name in state.files.keys().chain(state.dirs.iter()) {
-            if parent_of(name) == path {
+            // `name != path` keeps the root from listing itself: `""` is
+            // its own parent, and no other directory can be.
+            if name != path && parent_of(name) == path {
                 names.insert(basename_of(name).to_string());
             }
         }
