@@ -20,6 +20,13 @@ core 0.5.5, cli 0.5.5, ai 0.1.4, cms 0.1.3 (not yet published).
 
 ### Fixed
 
+- **core: a prebuilt page is written to the socket directly.** A native
+  `Response` is sent by reading its bytes back out of the body stream, which
+  the server already holds for a prebuilt page. `neutron start` now writes
+  those bytes itself; a middleware that replaces the response still takes the
+  ordinary path. Measured on one CI runner against the previous build, CPU
+  per request fell from 156 to 142 µs on `/` and from 158 to 137 µs on
+  `/login` in the playground app. Streamed pages are unchanged.
 - **core: a request that declares its length is no longer read through the
   body-cap counting stream.** The 10 MiB default cap added in 0.5.4 wrapped
   every POST body in a second stream, which cost roughly 40% of throughput
