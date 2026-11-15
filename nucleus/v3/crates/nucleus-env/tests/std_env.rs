@@ -56,6 +56,7 @@ std_test!(std_read_handle_refuses_writes, read_handle_refuses_writes);
 std_test!(std_namespace_ops, namespace_ops);
 std_test!(std_invalid_paths_rejected, invalid_paths_rejected);
 std_test!(std_sync_dir_root_and_subdir, sync_dir_root_and_subdir);
+std_test!(std_sync_on_writable_handles, sync_on_writable_handles);
 std_test!(
     std_locks_exclusive_excludes_all,
     locks_exclusive_excludes_all
