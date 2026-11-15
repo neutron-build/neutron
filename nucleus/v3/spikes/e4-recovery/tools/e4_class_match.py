@@ -90,7 +90,13 @@ import tempfile
 #: sha256 of `e4-class-table.json` (card E4-CLASS-1, Limit 1). The
 #: command-line path always checks the table against this constant; only
 #: the self-test passes another value, to make the check testable.
-TABLE_SHA256 = "55ae47347b77f610d51a51287259513d735e2aa92a20fec47889517481c61158"
+#: **X-5c-F4-F7 (owner ruling 2026-11-14, a post-data amendment,
+#: `E4-final-diagnostics.md` §B.4):** the two `rlen` conditions were
+#: widened (`refused_old_page` `eq 0` → `ge 0`, `refused_old_header`
+#: `ge 1` → `ge 0`) — `rlen` is not causal in either class — so the
+#: frozen hash moved from `55ae4734…1158` to this value. Every other
+#: byte of the table is unchanged, and no matching logic changed.
+TABLE_SHA256 = "a05534c7a34c1daa243eb2f2dc23f5f0776abe6c84af8c205af393d00e10fdea"
 
 #: The table's file name, next to this script unless `--table` names one.
 TABLE_NAME = "e4-class-table.json"
@@ -914,8 +920,14 @@ def self_test():
         expect("unmatched-float-is-not-int", run([edited(page, {"frontier": 0.0})]), 1, counts(0, 0, 0, 1))
         expect("unmatched-q15-true", run([edited(page, {"q": [True if n == 15 else v for n, v in enumerate(q_zero)]})]), 1, counts(0, 0, 0, 1))
         expect("unmatched-ack-over-not-empty", run([edited(page, {"ack_over": [3]})]), 1, counts(0, 0, 0, 1))
-        expect("unmatched-ge-below", run([edited(header, {"rlen": 0})]), 1, counts(0, 0, 0, 1))
+        # X-5c-F4-F7's post-data amendment (owner ruling 2026-11-14):
+        # classes 1 and 2 take any `rlen`, so the `ge` floor is probed
+        # below zero (`-1`), not at 0 — M-GATE-GE-OFF1 (`>= want - 1`)
+        # is still caught — and two cases pin the widening itself.
+        expect("unmatched-ge-below", run([edited(header, {"rlen": -1})]), 1, counts(0, 0, 0, 1))
         expect("ge-above", run([edited(header, {"rlen": 134})]), 0, counts(0, 1, 0, 0))
+        expect("page-any-rlen", run([edited(page, {"rlen": 1})]), 0, counts(1, 0, 0, 0))
+        expect("header-any-rlen", run([edited(header, {"rlen": 0})]), 0, counts(0, 1, 0, 0))
 
         # --- `re` is a full match: text around a valid value is new.
         o3 = json.loads(fallout)["rounds"][0]["o3"]
