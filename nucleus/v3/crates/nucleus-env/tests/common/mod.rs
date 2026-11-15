@@ -1057,7 +1057,9 @@ pub fn kind_mismatches<E: Env>(env: &E) -> Result<(), String> {
 /// **E-IO's edges.** A zero-length `write_at` changes nothing at any
 /// offset and returns `Ok` — after the `Read` handle's refusal, which
 /// still comes first; `read_at` returns 0 at offsets no platform file
-/// can reach, past `i64::MAX`.
+/// can reach, past `i64::MAX`; a write whose end passes `i64::MAX` —
+/// u64 overflow included — and a `set_len` past it, are
+/// `Io { InvalidInput }` on every backend (A-1b-0-F2).
 pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
     let f = env
         .open("page", OpenMode::CreateNew)
@@ -1086,6 +1088,45 @@ pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
         if n != 0 {
             return Err(format!("read_at({off}) gave {n}, wanted 0"));
         }
+    }
+
+    // E-IO's length bound (A-1b-0-F2): a write whose end passes
+    // `i64::MAX` — u64 overflow included — and a `set_len` past it, are
+    // `Io { InvalidInput }` on every backend, checked after the
+    // empty-write no-op.
+    io_kind_is(
+        f.write_at(1u64 << 63, b"x"),
+        std::io::ErrorKind::InvalidInput,
+        "write_at(1<<63, b\"x\")",
+    )?;
+    io_kind_is(
+        f.write_at(i64::MAX as u64, b"xy"),
+        std::io::ErrorKind::InvalidInput,
+        "write_at(i64::MAX, b\"xy\")",
+    )?;
+    io_kind_is(
+        f.write_at(u64::MAX, b"x"),
+        std::io::ErrorKind::InvalidInput,
+        "write_at(u64::MAX, b\"x\")",
+    )?;
+    io_kind_is(
+        f.set_len(1u64 << 63),
+        std::io::ErrorKind::InvalidInput,
+        "set_len(1<<63)",
+    )?;
+    // An empty write stays Ok at any offset, the bound included.
+    f.write_at(1u64 << 63, b"")
+        .map_err(|e| format!("write_at(1<<63, b\"\"): {e:?}"))?;
+    // Nothing changed, and the refusal poisoned no backend state.
+    let len = f.len().map_err(|e| format!("len: {e:?}"))?;
+    if len != 3 {
+        return Err(format!("len after the huge refusals is {len}, wanted 3"));
+    }
+    if !env
+        .exists("page")
+        .map_err(|e| format!("exists page: {e:?}"))?
+    {
+        return Err("page is gone after the huge refusals".to_string());
     }
     drop(f);
 

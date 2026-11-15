@@ -80,6 +80,16 @@ pub trait File {
     /// [`Ok(())`][Ok] (E-IO). On a [`OpenMode::Read`] handle this is
     /// [`EnvError::ReadOnly`], before any I/O (E-OPEN: the refusal
     /// comes before the empty-write no-op).
+    ///
+    /// E-IO's length bound (A-1b-0-F2): a write whose `off + buf.len()`
+    /// exceeds `i64::MAX` — u64 overflow included — is
+    /// [`EnvError::Io`] with `kind: InvalidInput` on every backend. It
+    /// is checked before any I/O, after the `Read` refusal and after
+    /// the empty-write no-op, so an empty write stays `Ok` at any
+    /// offset. Below that bound, a backend that cannot hold the length
+    /// refuses with `Io`: `FileTooLarge` (a platform file-size limit,
+    /// or SimEnv's cap) or `OutOfMemory` (MemEnv's failed allocation).
+    /// No backend panics on a length.
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError>;
 
     /// Makes the file's written bytes durable (E-DURABLE: this is the
@@ -107,6 +117,14 @@ pub trait File {
     /// only after [`File::sync_all`] (E-DURABLE). On a
     /// [`OpenMode::Read`] handle this is [`EnvError::ReadOnly`], before
     /// any I/O.
+    ///
+    /// E-IO's length bound (A-1b-0-F2): a `set_len` whose `len`
+    /// exceeds `i64::MAX` is [`EnvError::Io`] with `kind:
+    /// InvalidInput` on every backend, checked before any I/O and
+    /// after the `Read` refusal. Below that bound, a backend that
+    /// cannot hold the length refuses with `Io`: `FileTooLarge` (a
+    /// platform limit, or SimEnv's cap) or `OutOfMemory` (MemEnv's
+    /// failed allocation). No backend panics on a length.
     fn set_len(&self, len: u64) -> Result<(), EnvError>;
 
     /// Takes the exclusive advisory lock on this file, non-blocking

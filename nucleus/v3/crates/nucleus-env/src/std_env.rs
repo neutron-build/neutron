@@ -388,6 +388,25 @@ impl File for StdFile {
 
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError> {
         self.refuse_read_only()?;
+        // E-IO's zero-length write: no platform call, no extension.
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // E-IO's length bound (A-1b-0-F2), by code rather than by
+        // errno, so the rule holds on every platform: Linux already
+        // answers InvalidInput here, and the check names the opened
+        // path either way.
+        if off
+            .checked_add(buf.len() as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(EnvError::Io {
+                op: "write_at",
+                path: self.path.clone(),
+                kind: ErrorKind::InvalidInput,
+                detail: "offset plus length exceeds i64::MAX".to_string(),
+            });
+        }
         self.file
             .write_all_at(buf, off)
             .map_err(|e| map_io("write_at", &self.path, e))
@@ -420,6 +439,16 @@ impl File for StdFile {
 
     fn set_len(&self, len: u64) -> Result<(), EnvError> {
         self.refuse_read_only()?;
+        // E-IO's length bound (A-1b-0-F2), as in `write_at`: by code,
+        // so every platform refuses the same way.
+        if len > i64::MAX as u64 {
+            return Err(EnvError::Io {
+                op: "set_len",
+                path: self.path.clone(),
+                kind: ErrorKind::InvalidInput,
+                detail: "length exceeds i64::MAX".to_string(),
+            });
+        }
         self.file
             .set_len(len)
             .map_err(|e| map_io("set_len", &self.path, e))

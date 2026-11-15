@@ -38,6 +38,15 @@
 //!   `buf`, extending the file, and a zero-length write changes nothing
 //!   at any offset and returns `Ok` (after the `Read` refusal);
 //!   `set_len` truncates or zero-extends; `len` is the current length.
+//!   The length bound (A-1b-0-F2): a `write_at` whose `off + buf.len()`
+//!   exceeds `i64::MAX` — u64 overflow included — or a `set_len` whose
+//!   `len` exceeds it, is [`EnvError::Io`] `{ kind: InvalidInput }` on
+//!   every backend, checked before any I/O, after the `Read` refusal
+//!   and after the empty-write no-op, so an empty write stays `Ok` at
+//!   any offset. Below the bound, a backend that cannot hold the
+//!   length refuses with `Io`: `FileTooLarge` (a platform file-size
+//!   limit, or SimEnv's cap) or `OutOfMemory` (MemEnv's failed
+//!   allocation); no backend panics on a length.
 //! - **E-DURABLE** — written bytes are durable only after a `sync_data`
 //!   or `sync_all` of that file; a `set_len` change only after
 //!   `sync_all`; a `create_dir`, `CreateNew`, `rename` or `remove` only
