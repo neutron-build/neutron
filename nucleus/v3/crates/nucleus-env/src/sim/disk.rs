@@ -1038,7 +1038,9 @@ impl SimDisk {
         }
         let mut faults = Vec::new();
         for _ in 0..want {
-            let idx = if let Some(slot) = slot && rng.below(10) < 6 {
+            let idx = if let Some(slot) = slot
+                && rng.below(10) < 6
+            {
                 let pref: Vec<usize> = cands
                     .iter()
                     .enumerate()
