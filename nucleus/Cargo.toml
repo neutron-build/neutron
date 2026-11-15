@@ -65,7 +65,7 @@ comfy-table = { version = "7", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 urlencoding = { version = "2", optional = true }
-rusqlite = { version = "0.30", features = ["bundled"], optional = true }
+rusqlite = { version = "0.42", features = ["bundled"], optional = true }
 mongodb = { version = "3.8", optional = true }
 mysql_async = { version = "0.36", optional = true }
 clickhouse = { version = "0.11", optional = true }
