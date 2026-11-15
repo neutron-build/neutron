@@ -1075,9 +1075,11 @@ pub fn io_edges<E: Env>(env: &E) -> Result<(), String> {
         return Err(format!("len after the empty writes is {len}, wanted 3"));
     }
 
-    // Offsets no platform file can reach still read 0, not an error.
+    // Offsets no platform file can reach still read 0, not an error:
+    // at `i64::MAX - 1` and `i64::MAX` (where the count is capped,
+    // A-1b-0-F1), past `i64::MAX`, and past `usize` on any target.
     let mut buf = [0u8; 4];
-    for off in [1u64 << 63, u64::MAX] {
+    for off in [i64::MAX as u64 - 1, i64::MAX as u64, 1u64 << 63, u64::MAX] {
         let n = f
             .read_at(off, &mut buf)
             .map_err(|e| format!("read_at({off}): {e:?}"))?;

@@ -353,20 +353,27 @@ impl StdFile {
 
 impl File for StdFile {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, EnvError> {
-        // E-IO: an offset past `i64::MAX` is past every end-of-file
-        // (pread itself refuses it with InvalidInput), so it reads 0
-        // (A-1a-F3).
-        if off > i64::MAX as u64 {
+        // E-IO: an offset at or past `i64::MAX` is past every
+        // end-of-file (pread itself refuses it with InvalidInput), so
+        // it reads 0 (A-1a-F3). Linux `pread` is also EINVAL whenever
+        // `off + count` would overflow `loff_t`, so A-1b-0's guard
+        // alone still failed just below `i64::MAX`; the count is
+        // capped to keep `off + count` within it. A read capped there
+        // is still past every end-of-file, so the answer is 0 either
+        // way and no platform refusal can surface (A-1b-0-F1).
+        let cap = (i64::MAX as u64).saturating_sub(off);
+        if cap == 0 {
             return Ok(0);
         }
+        let want = buf.len().min(usize::try_from(cap).unwrap_or(usize::MAX));
         // One pread can return short (or Interrupted); loop until the
         // buffer is full or end-of-file, so the count is short only at
         // the end (E-IO).
         let mut total = 0;
-        while total < buf.len() {
-            let Some(tail) = buf.get_mut(total..) else {
-                // total < buf.len() held on entry, so this is
-                // unreachable; treated as end-of-file.
+        while total < want {
+            let Some(tail) = buf.get_mut(total..want) else {
+                // total < want held on entry, so this is unreachable;
+                // treated as end-of-file.
                 break;
             };
             match self.file.read_at(tail, off + (total as u64)) {
