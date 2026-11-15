@@ -79,10 +79,12 @@ SELECT DISTINCT deps.col, x.kind, x.nsp, x.name, x.display
 FROM deps CROSS JOIN LATERAL (` + classifySQL + `) x
 ORDER BY 5, 1`
 
-// rowTypeSQL lists the columns of tables, partitioned tables and
-// materialized views that store the row type of relation $1, directly or
-// through arrays, domains and composite types (PostgreSQL's
-// find_composite_type_dependencies; foreign tables are not checked).
+// rowTypeSQL lists the columns of tables, partitioned tables, materialized
+// views and foreign tables that store the row type of relation $1, directly
+// or through arrays, domains and composite types (PostgreSQL's
+// find_composite_type_dependencies). Foreign tables are included: PostgreSQL
+// 17.12 refuses the type change for them too, and on a server that still
+// allows it the refusal costs a manual drop, where a miss fails at apply.
 const rowTypeSQL = `
 WITH RECURSIVE types(oid, via) AS (
 	SELECT c.reltype, ''::text FROM pg_class c WHERE c.oid = to_regclass($1)
@@ -97,7 +99,7 @@ WITH RECURSIVE types(oid, via) AS (
 SELECT DISTINCT format('column %s.%I', a.attrelid::regclass, a.attname), types.via
 FROM types
 JOIN pg_attribute a ON a.atttypid = types.oid AND a.attnum > 0 AND NOT a.attisdropped
-JOIN pg_class c ON c.oid = a.attrelid AND c.relkind IN ('r', 'p', 'm')
+JOIN pg_class c ON c.oid = a.attrelid AND c.relkind IN ('r', 'p', 'm', 'f')
 ORDER BY 1`
 
 // viewDependentsSQL lists, for each view in $1 (qualified names), what
