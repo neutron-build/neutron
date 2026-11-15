@@ -2,9 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
-
-core 0.5.5, cli 0.5.5, ai 0.1.4, cms 0.1.3 (not yet published).
+## 2026-11-15 (core 0.5.5, cli 0.5.5, ai 0.1.4, cms 0.1.3)
 
 ### Changed
 
