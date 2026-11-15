@@ -1166,6 +1166,133 @@ A mutant counts where it is applied to the real code it names. Applied to a stan
 
 amcheck (A-8) checks I-TREE, I-ENC-ROUNDTRIP, I-TAG-RESERVED, I-LPID-EXACT, I-FREE-EXACT and I-INTEGRITY on a quiescent file. At open (§14 step 7) it runs before the boot job's walks start, or holds the gate exclusively, because a running walk is not quiescent: either way it reads a closed graph. A crash image's `dropping` tree gets no exemption (I-LINK-ATOMIC).
 
+### 15.1 Test ownership
+
+One row per card that runs a test or a form of it: *Needs* names the cards whose code the form uses besides its own, each, for a Phase A card, in that card's Depends closure (PLAN-v3 §9 A); *Form* is full, or the stand-ins it uses (S1–S5) and the variants it runs; *Mutants* are those judged on that card. The Phase B cards this table names are B-1a, B-1b, B-1c, B-1d, B-2b, B-2c, B-3, B-4d, B-6, B-7 and R-1.
+
+| Test | Row | Card | Needs | Form | Mutants judged here |
+|---|---|---|---|---|---|
+| — (row) | I-ENC-ORDER | A-4a | — | full | TS-ASC, ESCAPE-OFF |
+| — (row) | I-ENC-ROUNDTRIP | A-4a | A-2 | full, with fuzz | TOMBSTONE-AS-VALUE, DECODE-PANIC |
+| — (row) | I-TAG-RESERVED | A-4e | A-4a | full, seek and scan | RESERVED-AS-VALUE |
+| — (row) | I-PROV-READ | B-1d | — | full | ORDINARY-FIRST, DEAD-AS-LIVE |
+| — (row) | I-SEEK | A-4e | A-4a | full | TS-ASC, SEEK-NO-PREFIX-CHECK |
+| — (row) | I-NEWEST | B-1c | — | full | NEWEST-SKIPS-TOMB, UNIQUE-TOMB-LIVE |
+| — (row) | I-SCAN | A-4e | A-4a | full | SCAN-NO-SKIP, SCAN-HI-INCL, SCAN-TOMB-EMIT |
+| `t_cursor_park_equiv` | I-CURSOR | A-4e | A-4b | S3; main with coupled-delete packs and same-tree LPID reuse; mid-group and point read over ordinary versions, cases (i) and (ii); scroll; close by the store call, buffer hook | CURSOR-STALE-LPID, PARK-DROPS-CANDIDATE, SCROLL-RESUME-SKIP, BATCH-KEPT-AFTER-CLOSE |
+| `t_cursor_park_equiv` | I-CURSOR | B-3 | A-4e, A-7b | full main form: GC sweep; another tree dropped and recreated on reused LPIDs | CURSOR-STALE-LPID |
+| `t_cursor_park_equiv` | I-CURSOR | B-1d | A-4e | full mid-group and point-read forms: provisional head `Committed(c)`, finalize held back | PARK-DROPS-CANDIDATE |
+| `t_cursor_park_equiv` | I-CURSOR | B-2c | A-4e | full SER variant: recorded edges equal the oracle's | — |
+| `t_cursor_park_equiv` | I-CURSOR | R-1 | A-4e, B-2e | full close variant: `ROLLBACK TO`, R-1's per-session account | BATCH-KEPT-AFTER-CLOSE |
+| — (row) | I-TREE | A-4a | — | full (splits) | SPLIT-OFF-BY-ONE, SEP-NOT-UPDATED |
+| — (row) | I-TREE | A-4b | A-4a | full (splits and packs) | SPLIT-OFF-BY-ONE, SEP-NOT-UPDATED, PACK-SEP-STALE |
+| `t_root_latch_fair` | I-LATCH | A-3b | A-4c0 | full: reader stream, writer variant, latch-level variant | LATCH-READER-PREF, LATCH-WRITER-PREF, TRYLATCH-BYPASS |
+| `t_root_latch_fair` | I-LATCH | A-4a | A-3c, A-4c0 | S1; the cold variant | READER-IO-UNDER-LATCH |
+| `t_root_latch_fair` | I-LATCH | A-4e | A-4a, A-4c0 | S1; the cold variant with a cursor as the reader | READER-IO-UNDER-LATCH |
+| `t_freeset_lock_order` | I-LATCH | A-3c | A-3b, A-4c0 | full | FREESET-LOCK-IO, FREESET-LOCK-INVERT |
+| `t_latch_scope` | I-LATCH | A-4c | A-3c, A-4b, A-7a, A-4c0 | S1, S5; tracker, two-leaf fixture, map, checkpoint and floor variants | LATCH-ACROSS-YIELD, NESTED-READ-UNDER-LATCH, MAP-PARENT-UNDER-CHILD, MAP-DROP-BEFORE-REF, MAP-REF-SET-STALE, CKPT-WAIT-HOLDING-MAP, POOL-FLOOR-BLOCK |
+| `t_latch_scope` | I-LATCH | A-4e | A-4c, A-4b | S5; index scan with lookups, self-join behind a queued writer, two cursors, reverse variant across a pack; A-4c's tracker | CURSOR-LATCH-ACROSS-CALL, CURSOR-PIN-ACROSS-CALL, REVERSE-LATCH-LEFT, NESTED-READ-UNDER-LATCH |
+| — (row) | I-LATCH | A-4c | A-4a, A-4b, A-4c0 | full (loom/shuttle) | COUPLING-EARLY-RELEASE, PACK-RIGHT-FIRST |
+| `t_dir_root_no_stall` | I-LATCH | A-7b | A-5, A-4c0 | S4 for D's sweep step | DIR-LATCH-ON-READ (on Y's reader and writer; on S4, fixture only) |
+| `t_dir_root_no_stall` | I-LATCH | B-3 | A-7b, A-4c0 | full, with B-3's sweep step | DIR-LATCH-ON-READ (on B-3's sweep code) |
+| — (row) | I-ROOT-STABLE | A-4a | — | in process: root splits; descent from the original LPID | ROOT-MOVES |
+| — (row) | I-ROOT-STABLE | A-4b | A-4a | in process: root collapses | ROOT-MOVES |
+| — (row) | I-ROOT-STABLE | A-7d | A-7c | full: the reopen test | ROOT-MOVES |
+| — (row) | I-PACK | A-4b | A-4a | full | PACK-DROP-LAST, PACK-OVERFILL |
+| — (row) | I-ENTRY-UNIQUE / I-REPLAY-IDEM | A-7d | A-5, A-1b | full, the double crash included | REPLAY-DUP-CONFLICT, DUP-DIFFERENT-ACCEPTED, CHAIN-LPID-COMPARED |
+| — (row) | I-ENTRY-UNIQUE / I-REPLAY-IDEM | B-1c | — | full (apply) | REPLAY-DUP-CONFLICT, DUP-DIFFERENT-ACCEPTED, CHAIN-LPID-COMPARED |
+| — (row) | I-CHUNK-SUPERSEDE | A-7d | A-6d, A-1b | full | SUPERSEDE-AS-CONFLICT |
+| — (row) | I-CHUNK-SUPERSEDE | B-1d | — | full | SUPERSEDE-AS-CONFLICT |
+| — (row) | I-KEY-SIZE | A-2 | — | full (formula and values) | SIZE-CHECK-OFF |
+| — (row) | I-KEY-SIZE | B-1a | — | full (the write path calls the check) | SIZE-CHECK-OFF |
+| `t_gated_xx001_poisons` | I-FAIL-STOP | B-1c | A-6c | full, with the WAL variant | POISON-IGNORED, XX001-NOT-POISON, WAL-ERR-NOT-POISON, POISON-WAITER-PARKED, POISON-LOST-WAKEUP |
+| `t_gated_xx001_poisons` | I-FAIL-STOP | B-1b | B-2b | full lock-waiter variant | POISON-WAITER-PARKED, POISON-LOST-WAKEUP |
+| `t_client_read_xx001_no_poison` | I-FAIL-STOP | B-1c | A-7c | full | CLIENT-READ-POISONS |
+| `t_poison_before_unlatch` | I-FAIL-STOP | A-3c | A-4c0 | S3: a stand-in failing gated operation; the evictor's `try_latch` | POISON-AFTER-UNLATCH |
+| `t_poison_before_unlatch` | I-FAIL-STOP | A-4c | A-4a, A-4c0 | full: a reader against a split failing with XX001 | POISON-AFTER-UNLATCH |
+| `t_poison_wakeup_race` | I-FAIL-STOP | A-4c | A-3c, A-4c0 | full (latch and gate waits) | POISON-LOST-WAKEUP |
+| `t_poison_wakeup_race` | I-FAIL-STOP | B-1c | — | full (commit waits) | POISON-LOST-WAKEUP |
+| `t_sweep_step_shape` | I-GC-READEQ | B-3 | A-8, B-1d | full | SWEEP-CHAINS-UNDER-P, CHAIN-DELETE-BY-KEY, STEP-MUTATE-BEFORE-CHAINS |
+| — (row) | I-GC-READEQ | B-3 | — | full (G0 re-point at B-7) | GC-DROPS-VISIBLE, G-WATERMARK+1, G-RESURRECT |
+| — (row) | I-GC-READEQ | B-7 | B-3 | full (G0 re-pointed) | GC-DROPS-VISIBLE, G-WATERMARK+1, G-RESURRECT |
+| — (row) | I-GC-ORDER | B-3 | — | full | G-TOMB-FIRST, STEP-MUTATE-BEFORE-CHAINS |
+| — (row) | I-GC-COMPLETE | B-3 | — | full | GC-KEEPS-TOMB |
+| `t_prune_split_shape` | I-GC-LOCAL | B-3 | A-8 | full | PRUNE-FREES-CHAINS, PRUNE-ELIDES-OVER-CHAIN, PRUNE-EVICT-FREES-CHAIN |
+| — (row) | I-GC-LOCAL | B-3 | — | full | PRUNE-FIRST-ENTRY |
+| — (row) | I-SPACE | A-4b | A-4a | full (the bound, trees of height ≥ 4) | its own (the bound) |
+| — (row) | I-SPACE | B-3 | — | full (the W4-shape acceptance) | its own (the acceptance) |
+| — (row) | I-GCW | A-7c | — | S3: a test-set `gc_w_used` | GCW-NOT-RECORDED |
+| — (row) | I-GCW | B-3 | — | full (restart floor) | GCW-BOUND-SKIP |
+| — (row) | I-LPID-EXACT | A-4b | A-4a | S2: mapped LPIDs against a test walk after each pack | LEAK-ON-PACK |
+| — (row) | I-LPID-EXACT | A-8 | A-4b, A-7b | full (amcheck counts reachable pages) | LEAK-ON-PACK |
+| — (row) | I-LPID-EXACT | A-7d | A-8, A-7c | full: packs, drops and chains, every image through amcheck | LEAK-ON-PACK, DROP-ENTRY-SPLIT |
+| — (row) | I-LPID-EXACT | B-6 | A-8 | full | DROP-ENTRY-SPLIT |
+| `t_drop_every_cut` | I-LINK-ATOMIC | A-7d | A-7b, A-8, A-1b | S4 for the paused sweep | DROP-ENTRY-SPLIT, DROP-UNLINK-SPLIT, DROP-RESTART-MID-OP, DROP-RESTART-AFTER-REMOVE, UNLINK-RESTART-AFTER-UNLINK, DROP-SECOND-WALK (ROOT-NAME-KEPT on S4: fixture only) |
+| `t_drop_every_cut` | I-LINK-ATOMIC | B-6 | B-3, A-8 | full, with B-3's sweep | ROOT-NAME-KEPT (on B-3's sweep code), and its own |
+| `t_drop_step_shape` | I-LINK-ATOMIC | A-7d | A-7b | S4 | DROP-LEAF-CHAINS, DROP-FREE-BEFORE-REMOVE, DROP-LAST-STEP-PACKS |
+| `t_drop_step_shape` | I-LINK-ATOMIC | B-6 | B-3 | full, with B-3's sweep | DROP-LEAF-CHAINS, DROP-FREE-BEFORE-REMOVE, DROP-LAST-STEP-PACKS |
+| `t_split_reserve_order` | I-LINK-ATOMIC | A-4a | A-3c | S1 (full under S1's rule) | SPLIT-RESERVE-AFTER-PRUNE, ALLOC-READ-UNDER-P, SPLIT-RESERVE-ALWAYS |
+| `t_alloc_restart_progress` | I-LINK-ATOMIC | A-4a | A-3c | S2 for the race variant's image check | ALLOC-RETRY-LOWEST, ALLOC-NEW-MAPLEAF-IN-PLACE, MAPLEAF-CREATE-UNCONDITIONAL, MAPLEAF-FRAME-UNDER-INNER |
+| `t_alloc_restart_progress` | I-LINK-ATOMIC | A-7d | A-7c, A-8 | full race variant: every image through amcheck | MAPLEAF-CREATE-UNCONDITIONAL |
+| `t_replace_free_shape` | I-LINK-ATOMIC | A-5 | A-4a | S1, S2, S3 (each variant's caller) | REPLACE-FREE-UNDER-P, DELETE-FREE-UNDER-P, CHAIN-BUILD-UNDER-P |
+| `t_replace_free_shape` | I-LINK-ATOMIC | A-7d | A-7c, A-8 | full: images through amcheck; the replay variants through replay | REPLACE-FREE-UNDER-P, DELETE-FREE-UNDER-P, CHAIN-BUILD-UNDER-P |
+| `t_create_every_cut` | I-LINK-ATOMIC | B-6 | A-7b | full | CREATE-TREE-SPLIT |
+| `t_chain_every_cut` | I-LINK-ATOMIC | A-7d | A-5, A-8, A-1b | full | CHAIN-BUILD-SPLIT, CHAIN-FREE-SPLIT, CHAIN-NEXT-MAP-SPLIT, CHAIN-NEXT-FREE-SPLIT |
+| `t_load_every_cut` | I-LINK-ATOMIC | B-4d | A-8 | full | LOAD-PAGE-SPLIT |
+| `t_ro_open` | I-LINK-ATOMIC | A-7d | A-7b, A-1b | full (a replayed `DropTree`) | REPLAY-DROP-WALK |
+| `t_root_name_reuse` | I-LINK-ATOMIC | A-7b | A-4a, A-5, A-4c0 | full (case B's test-only mode is the test's own) | ROOT-NAME-UNVALIDATED, ROOT-UNPUBLISH-LATE, ROOT-PIN-UNMAPPED-FATAL, ROOT-DECODE-BEFORE-VALIDATE, ROOT-HEADER-MISMATCH-FATAL, ROOT-TABLE-GLOBAL-GEN, ROOT-PIN-UNMAPPED-SPIN |
+| — (row) | I-LINK-ATOMIC | A-8a | A-1b, A-7d, A-8 | full, on E4's harness | DROP-ENTRY-SPLIT |
+| — (row) | I-POOL-BOUND | A-3b | — | full | POOL-GROW |
+| — (row) | I-POOL-BOUND | A-3c | A-3b | full (E4 shape) | POOL-GROW, EVICT-SKIP-DIRTY |
+| — (row) | I-NO-INPLACE | A-3c | — | full: write hook on evictions | INPLACE-EVICT |
+| — (row) | I-NO-INPLACE | A-7b | A-3c | write hook on step 2's writes | INPLACE-EVICT |
+| — (row) | I-NO-INPLACE | A-7d | A-1b | full: SimEnv crash | INPLACE-EVICT |
+| — (row) | I-INTEGRITY | A-2 | — | full | CRC-SKIP, EPOCH-SKIP, ID-SKIP |
+| — (row) | I-INTEGRITY | A-7d | A-1b | full: SimEnv lost, misdirected, torn | CRC-SKIP, EPOCH-SKIP, ID-SKIP |
+| — (row) | I-META-SLOT | A-7d | A-1b | full: SimEnv misdirected meta | META-WRONG-SLOT |
+| — (row) | I-FREE-SAFE | A-3c | — | full (pending frees) | FREE-EARLY |
+| — (row) | I-FREE-SAFE | A-7c | — | full (step 6) | FREE-EARLY |
+| — (row) | I-FREE-EXACT | A-7b | — | full: FreeSet pages read back | BITMAP-OMITS-FREESET-PAGES |
+| — (row) | I-FREE-EXACT | A-8 | A-7b | full (fixture meta by A-2's codec, N2) | BITMAP-OMITS-FREESET-PAGES |
+| — (row) | I-META-ATOMIC | A-7c | A-1b, A-2 | full: a SimEnv crash at each step; every valid meta slot names only valid slots | META-BEFORE-SYNC |
+| `t_epoch_reserve_two_exhausters` | I-CKPT-AT-T | A-3c | A-4c0 | S1, S2, S3 (first touches by test-only callers of the reserve) | EXHAUST-DOUBLE-EVICT, EXHAUST-BLOCKING-CLAIM, CLAIM-LATCHES-MAP |
+| `t_epoch_reserve_two_exhausters` | I-CKPT-AT-T | A-7a | A-3c, A-4c0 | full: first touches through `write_guard`; S1, S2 | EXHAUST-DOUBLE-EVICT, EXHAUST-BLOCKING-CLAIM, CLAIM-LATCHES-MAP |
+| `t_step2_waits_for_claimed_copy` | I-CKPT-AT-T | A-3c | A-3b | S1, S2, S3; every variant | STEP2-NO-WAIT, IMAGE-RECORD-AFTER-RELEASE, IMAGE-SLOT-REUSED, MAP-PHASE-DROPS-CLAIMED-COPY, MAP-HOME-SLOT-REUSED, MAP-PHASE-SKIPS-VICTIM, MAP-SOURCE-UNCHECKED, MAP-POSITION-AS-LPID, ADOPT-LISTED-HOME, IMAGE-LIST-GROWS, MAP-COPY-NOT-DETACHED, RESERVE-DRAW-BLOCKS |
+| `t_step2_waits_for_claimed_copy` | I-CKPT-AT-T | A-7d | A-7a, A-7c, A-8, A-1b | full: crash at post-5, read at `T`, amcheck | the same twelve |
+| — (row) | I-CKPT-AT-T | A-7c | A-7a, A-4b, A-6c, A-1b | S2, S3: splits and packs across the flip; the async mix; the frontier provider | FLIP-NO-GATE, WAL-SYNC-T-ONLY, CKPT-T-VISIBLE |
+| — (row) | I-CKPT-AT-T | A-7d | A-7c, A-1b | full: the crash forms through recovery | WAL-SYNC-T-ONLY |
+| — (row) | I-CKPT-AT-T | B-1c | A-7c | full: the real `M` and `visible_ts` | CKPT-T-VISIBLE |
+| — (row) | I-CKPT-AT-T | B-1d | A-7c | full: a checkpoint during a finalize | its own |
+| — (row) | I-REDO-COMPLETE | A-6d | — | the replay start against open and marked chunks, checked directly | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK |
+| — (row) | I-REDO-COMPLETE | A-7d | A-6d, A-1b | full: crash and replay | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK |
+| `t_wal_loss_below_ckpt_end` | I-WAL-COVER | A-7d | A-6d, A-1b | full except S3 for the bulk-load variant's load | COVER-CHECK-SKIP, COVER-END-AT-T, COVER-AFTER-TRUNCATE, COVER-AT-EOF |
+| `t_wal_loss_below_ckpt_end` | I-WAL-COVER | B-4d | A-7d | full bulk-load variant | — |
+| `t_cover_ts_cross_check` | I-WAL-COVER | A-7d | A-7c | full | TS-HI-CHECK-SKIP, META-RANGE-SKIP |
+| `t_wal_splice` | I-WAL-CHAIN | A-6b | A-6a | the walk's splice error: both placements, same-id, same-start | PREV-CHECK-SKIP, PREV-CRC-UNCHECKED, PREV-MISMATCH-AS-END |
+| `t_wal_splice` | I-WAL-CHAIN | A-7d | A-6b | full: the open's XX001 and byte-identical files; read-only variant | PREV-CHECK-SKIP, PREV-CRC-UNCHECKED, PREV-MISMATCH-AS-END, SPLICE-SALVAGE-PAST-CUT |
+| `t_wal_chain_crash` | I-WAL-CHAIN | A-6b | A-1b | the `SegmentEnd` and exact-end hops under power cuts | PREV-HOP-WRONG |
+| `t_wal_chain_crash` | I-WAL-CHAIN | A-7d | A-7c, A-6d, A-1b | full (every other bullet) | PREV-FIRST-WRONG, WAL-START-PREV-WRONG, WAL-START-PREV-CRC-WRONG (on A-7c's code), PREV-HOP-WRONG |
+| `t_ro_open` | I-RO-OPEN | A-7d | A-6d, A-1b | full | RO-NO-REPLAY, RO-WRITES, REPLAY-DROP-WALK |
+| `t_ro_open_disk_full` | I-RO-OPEN | A-7d | A-1b | full; the full scan is a page walk | RO-LOCK-FILE, SHORT-SEG-ERROR |
+| `t_seg_ack_durable` | I-RO-OPEN | A-6b | A-1b | S3: acked = the writer's synced report; the walk reaches every acked record | SEG-ACK-BEFORE-DURABLE |
+| `t_seg_ack_durable` | I-RO-OPEN | A-7d | A-6c, A-1b | full: acks and replay | SEG-ACK-BEFORE-DURABLE |
+| `t_wal_loss_salvage` | I-RO-OPEN | A-7d | A-1b | S3: drop-cleanup record; the directory at `S` as the catalog; page-walk scan | SALVAGE-ABOVE-FRONTIER |
+| `t_wal_loss_salvage` | I-RO-OPEN | B-6 | A-7d | full: B-6's drop cleanup, B-4a's catalog | SALVAGE-ABOVE-FRONTIER |
+| `t_stale_boot_record` | I-WAL-STALE | A-6b | — | a crafted stream | BOOT-ID-STOP-SKIP |
+| `t_stale_boot_record` | I-WAL-STALE | A-7d | A-1b | full: a reverted step-5 truncation | BOOT-ID-STOP-SKIP |
+| `t_meta_rollback_crosses_boot` | I-WAL-STALE | A-7d | A-6c, A-1b | full | BOOT-ID-EQ-STOP |
+| `t_wal_exact_segment_end` | I-WAL-STALE | A-6b | A-1b | the walk's valid end; the writer's tail | SEG-EXACT-NO-HOP, SEG-TAIL-SHORT |
+| `t_wal_exact_segment_end` | I-WAL-STALE | A-7d | A-6c, A-1b | full: replay of acked `on` commits; the flip variant | SEG-EXACT-NO-HOP |
+| `t_boot_id_after_rollback` | I-WAL-STALE | A-7d | A-6d, A-1b | full, both variants | BOOT-ID-CKPT-ONLY, BOOT-ID-NO-META-FLOOR |
+| — (row) | I-WAL-STALE | A-6b | — | full (crafted stream) | LSN-CHECK-SKIP |
+| `t_ack_prefix` | I-ACK-PREFIX | A-6c | — | full (MemEnv: the pass condition is the ack) | ACK-OVER-HOLE |
+| `t_ckpt_sync_prefix` | I-ACK-PREFIX | A-7c | A-6c, A-6b, A-1b | S2: `wal_ckpt_end` against A-6b's valid end after a crash at post-5 | CKPT-SYNC-OVER-HOLE |
+| `t_ckpt_sync_prefix` | I-ACK-PREFIX | A-7d | A-1b | full: the class C open's XX001 | CKPT-SYNC-OVER-HOLE |
+| — (row) | I-ACK-PREFIX | B-1c | A-6c | full (visibility over the prefix) | its own |
+| — (row) | I-WAL-TS-ORDER | A-6c | — | full | TS-AFTER-APPEND |
+| — (row) | I-WAL-TS-ORDER | B-1c | — | full | TS-AFTER-APPEND |
+| — (row) | I-BULK-PUBLISH | B-4d | — | full | PUBLISH-BEFORE-META |
+
 ---
 
 ## 16. Measured evidence
