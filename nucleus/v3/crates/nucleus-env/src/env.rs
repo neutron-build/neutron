@@ -2,9 +2,9 @@
 //! every engine call goes through (PLAN-v3 §3.2; card A-1a Work 2).
 //!
 //! Invariants owned here: **E-OPEN**, **E-IO**, **E-DURABLE**,
-//! **E-NAMESPACE**, **E-LOCK** and **E-CLOCK/RAND**, stated per item
-//! below and restated in the crate root. E-PATH lives in
-//! [`crate::path`]. Every implementation — [`crate::MemEnv`],
+//! **E-NAMESPACE**, **E-LOCK**, **E-HANDLE**, **E-KIND** and
+//! **E-CLOCK/RAND**, stated per item below and restated in the crate
+//! root. E-PATH lives in [`crate::path`]. Every implementation — [`crate::MemEnv`],
 //! [`crate::StdEnv`], and A-1b's SimEnv — offers the same semantics, so
 //! engine code is written once and tested against each backend
 //! (S-STORE §2 "All I/O goes through nucleus-env"; §12.5's writer rule;
@@ -32,7 +32,9 @@ pub enum OpenMode {
     ReadWrite,
     /// Creates the file and opens it for reading and writing. An
     /// existing file is [`EnvError::AlreadyExists`], never truncated. A
-    /// missing parent directory is [`EnvError::NotFound`].
+    /// missing parent directory is [`EnvError::NotFound`]. On a name
+    /// whose old file an open handle still holds, this makes a
+    /// **different** file, which that handle never reaches (E-HANDLE).
     CreateNew,
 }
 
@@ -41,19 +43,43 @@ pub enum OpenMode {
 /// A handle has no file-position state: every read and write names its
 /// offset, so one handle is safely shared by sequential engine steps
 /// without seek/position hazards.
+///
+/// **E-HANDLE:** a handle names **the file it opened, not the path** it
+/// opened it by. After an [`Env::rename`] the handle still reaches that
+/// file, now under its new name. After an [`Env::remove`] it still
+/// reaches the file, which no name reaches any more, until the handle
+/// is dropped; every `File` method works on it. A later
+/// [`OpenMode::CreateNew`] of the same name makes a **different** file,
+/// which the old handle never reaches. A handle's errors name the path
+/// it was opened by, even after a rename: the path is for the message
+/// only — the handle never resolves it again.
+///
+/// Why identity, not refusal of a `rename`/`remove` under an open
+/// handle: E4's SimDisk keeps an inode table, and its `rename` and
+/// `unlink` change only the directory bindings, so a handle reaches its
+/// file across a rename and after an unlink; E4's WAL recycling writes
+/// through the `FileId` it held before the rename (S-STORE §12.1
+/// recycles segments the same way); E-LOCK's lock lives "on the file
+/// itself"; and StdEnv already has POSIX open-file semantics. S-STORE
+/// (§12.1, §12.5, §14.1) leaves the case open. A future `OpfsEnv`
+/// meets this rule or names its departure in its own card.
 pub trait File {
     /// Reads from `off` into `buf` and returns how many bytes were read.
     ///
     /// E-IO: the read is short only at end-of-file and counts only real
-    /// bytes; it returns 0 at or past end-of-file. It never zero-fills
-    /// past end-of-file: S-STORE §12.5's short segment must be visible
-    /// as a short read, not padded zeros.
+    /// bytes; it returns 0 at or past end-of-file — including offsets
+    /// no platform file can reach, past `i64::MAX` and past `usize` on
+    /// a 32-bit target. It never zero-fills past end-of-file: S-STORE
+    /// §12.5's short segment must be visible as a short read, not
+    /// padded zeros.
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, EnvError>;
 
     /// Writes all of `buf` at `off`, extending the file if needed. A gap
-    /// the write leaves below `off` reads back as zeros. On a
-    /// [`OpenMode::Read`] handle this is [`EnvError::ReadOnly`], before
-    /// any I/O (E-OPEN).
+    /// the write leaves below `off` reads back as zeros. A zero-length
+    /// write changes nothing at any offset — no extension — and returns
+    /// [`Ok(())`][Ok] (E-IO). On a [`OpenMode::Read`] handle this is
+    /// [`EnvError::ReadOnly`], before any I/O (E-OPEN: the refusal
+    /// comes before the empty-write no-op).
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError>;
 
     /// Makes the file's written bytes durable (E-DURABLE: this is the
@@ -90,7 +116,10 @@ pub trait File {
     /// conflict is [`EnvError::Locked`] at once — this never waits.
     /// Taking a lock creates and writes no file: it is an advisory lock
     /// on the file this handle already has open (S-STORE §14.1, mutant
-    /// RO-LOCK-FILE's substrate).
+    /// RO-LOCK-FILE's substrate). The lock lives on the file, so it
+    /// moves with an [`Env::rename`] and is released by
+    /// [`File::unlock`] or by dropping the holding handle, whatever
+    /// name the file has by then.
     fn lock_exclusive(&self) -> Result<(), EnvError>;
 
     /// Takes the shared (read) advisory lock on this file, non-blocking
@@ -119,19 +148,31 @@ pub trait File {
 /// file; `exists` covers files and directories; `list_dir` returns
 /// sorted names; `create_dir` creates one directory whose parent must
 /// exist.
+///
+/// E-KIND, stated once here and per item below: a file operation on a
+/// directory and a directory operation on a file are refused the same
+/// way on every backend — a directory where a file is required is
+/// [`EnvError::Io`] with `kind: IsADirectory`, and a file where a
+/// directory is required is `Io` with `kind: NotADirectory`. A path
+/// under a file names nothing: `exists` is `Ok(false)` and every other
+/// method treats it as missing ([`EnvError::NotFound`]). Each refusal's
+/// `path` names the path that refusal is about.
 pub trait Env {
     /// The handle type this backend hands out.
     type File: File;
 
-    /// Opens `path` per `mode` (E-OPEN). A missing file, or a missing
-    /// parent directory, is [`EnvError::NotFound`]. `CreateNew` on an
-    /// existing file is [`EnvError::AlreadyExists`].
+    /// Opens `path` per `mode` (E-OPEN). A missing file, a missing
+    /// parent directory, or a path under a file, is
+    /// [`EnvError::NotFound`]. `CreateNew` on an existing name — file
+    /// or directory — is [`EnvError::AlreadyExists`]. `Read` and
+    /// `ReadWrite` of a directory are `Io` with `kind: IsADirectory`
+    /// (E-KIND).
     fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File, EnvError>;
 
     /// Creates one directory whose parent exists (E-NAMESPACE; S-STORE
     /// §2: the `wal/` directory). An existing file or directory of that
-    /// name is [`EnvError::AlreadyExists`]; a missing parent is
-    /// [`EnvError::NotFound`].
+    /// name is [`EnvError::AlreadyExists`]; a missing parent, or a path
+    /// under a file, is [`EnvError::NotFound`] (E-KIND).
     fn create_dir(&self, path: &str) -> Result<(), EnvError>;
 
     /// Makes a directory's entries durable (E-DURABLE; S-STORE §12.5:
@@ -140,7 +181,11 @@ pub trait Env {
     /// A `create_dir`, a `CreateNew`, a `rename` or a `remove` is
     /// durable only after this returns for its parent directory, and
     /// `sync_dir` makes that directory's entries durable and nothing
-    /// else. `""` names the root.
+    /// else. `""` names the root. A file is refused with `Io` `kind:
+    /// NotADirectory`, and a path under a file with
+    /// [`EnvError::NotFound`] (E-KIND) — a caller that passes
+    /// `wal/<seg>.log` where it means `wal` is told so; it never gets
+    /// `Ok` with no directory sync.
     fn sync_dir(&self, path: &str) -> Result<(), EnvError>;
 
     /// Moves a file **within one directory** (E-NAMESPACE; S-STORE §12.1
@@ -149,21 +194,33 @@ pub trait Env {
     /// A rename across directories is [`EnvError::InvalidPath`]. An
     /// existing target is [`EnvError::AlreadyExists`], never replaced —
     /// a silent replace would hide a store bug that a refusal catches.
-    /// A missing source is [`EnvError::NotFound`].
+    /// The checks run in order (E-KIND): E-PATH, cross-directory, the
+    /// source — [`EnvError::NotFound`] if it is missing or under a
+    /// file, `Io` with `kind: IsADirectory` if it is a directory,
+    /// because `rename` moves a file — then the target. The file any
+    /// open handle holds moves with the rename: the handle keeps
+    /// reaching it under the new name, and its lock moves with it
+    /// (E-HANDLE, E-LOCK).
     fn rename(&self, from: &str, to: &str) -> Result<(), EnvError>;
 
     /// Deletes a file (E-NAMESPACE; C-T0 v8 §2.1's temp files are
     /// "deleted at open"). Removing a directory is not part of this
-    /// trait. A missing file is [`EnvError::NotFound`].
+    /// trait: it is `Io` with `kind: IsADirectory` (E-KIND). A missing
+    /// file, or a path under a file, is [`EnvError::NotFound`]. A
+    /// handle that holds the removed file keeps reaching it, unnamed,
+    /// until the handle is dropped (E-HANDLE).
     fn remove(&self, path: &str) -> Result<(), EnvError>;
 
-    /// Whether `path` names a file or a directory. A missing path is
-    /// `Ok(false)`, never an error (E-NAMESPACE).
+    /// Whether `path` names a file or a directory. A missing path — or
+    /// a path under a file, which names nothing — is `Ok(false)`, never
+    /// an error (E-NAMESPACE, E-KIND).
     fn exists(&self, path: &str) -> Result<bool, EnvError>;
 
     /// The names of the files and directories directly in `path`,
     /// sorted bytewise (E-NAMESPACE). `""` names the root. A missing
-    /// directory is [`EnvError::NotFound`].
+    /// directory is [`EnvError::NotFound`]. A file is `Io` with `kind:
+    /// NotADirectory`, and a path under a file is
+    /// [`EnvError::NotFound`] (E-KIND).
     fn list_dir(&self, path: &str) -> Result<Vec<String>, EnvError>;
 
     /// A monotonic duration since this `Env` was created (E-CLOCK/RAND).
