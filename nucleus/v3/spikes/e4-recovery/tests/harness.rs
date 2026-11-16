@@ -956,3 +956,77 @@ fn r13b_livelock_budget_trips_and_folds_into_deadlock() {
         out.sched_yields
     );
 }
+
+/// **X-5c-F3 pin, class C-XX's G3 family (a literal config: the fixture
+/// below, one nested crash point swept over the recovery's yield
+/// range).** A crash delivered at any single yield point inside
+/// recovery must surface as a nested recovery crash — F-CRASH resolves
+/// and the retry replays — never as corruption: open's G3 check read
+/// `env().open`'s error as "segment missing", and a delivered crash at
+/// that yield arrives as the same `Err(SimFail::Crashed)` as a missing
+/// file, so the nested crash was swallowed into `Corrupt("start
+/// segment … missing (G3)")` — an XX001 at Open in a faultless class C
+/// round (seed 1769's family: the twin failed O-1 (a) via the recovery
+/// `Err`, the media round failed O-3 (c) beside faults the twin never
+/// covered), with `nested` recorded as 0. The sweep crashes the
+/// recovery at every point `k` in `1..=120`; every round must pass.
+/// Reverting the fix (mutant M-CXXb: the G3 probe reading `open`'s
+/// error again) fails this pin at the `k` that lands on the probe's
+/// yield, with exactly `O-3(b): XX001 in class C at [Open]`.
+#[test]
+fn cxx_a_crash_at_any_recovery_yield_is_never_corruption() {
+    // The fixture: a checkpoint (T=2), then 18 single-op commits above
+    // T in the WAL, and the crash at task 1's 16th yield — inside the
+    // post-checkpoint commits (calibrated: earlier points crash before
+    // the checkpoint, so `wal_start_lsn` is 0 and open's G3 probe never
+    // runs; later points never fire).
+    for k in 1u64..=120 {
+        let mut ops = vec![
+            ScriptOp::Commit {
+                sync_on: true,
+                ops: vec![Op::CreateTree { tree: 2 }],
+            },
+            ScriptOp::Commit {
+                sync_on: true,
+                ops: (0..40).map(|i| op_put(i, 1)).collect(),
+            },
+            ScriptOp::Checkpoint,
+        ];
+        for i in 40..60 {
+            ops.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: vec![op_put(i, 1)],
+            });
+        }
+        let script = Script {
+            tasks: vec![ScriptTask { ops }],
+            writer: true,
+            evictor: true,
+            checkpointer_every: Some(100),
+            crash: Some(CrashSpec::TaskYield(1, 16)),
+            nested: vec![k],
+        };
+        let (disk, st) = harness::create_store(cfg(None), 5000 + k, 77).expect("create");
+        let out = harness::run_round(
+            5000 + k,
+            0,
+            &script,
+            &round_faults(),
+            cfg(None),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            None,
+        );
+        assert!(
+            out.obs.crash_fired,
+            "k={k}: the round's own crash never fired (calibrate the TaskYield point)"
+        );
+        assert!(
+            out.pass,
+            "k={k}: a crash at this recovery yield became a failure (not a nested retry): o1={:?} o2={:?} o3={:?}",
+            out.o1, out.o2_fail, out.o3_fail
+        );
+    }
+}

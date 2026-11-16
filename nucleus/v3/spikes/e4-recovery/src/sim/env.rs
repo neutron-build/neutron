@@ -41,6 +41,16 @@ pub trait E4Env {
     fn create(&mut self, path: &str) -> Result<FileId, SimFail>;
     /// Open an existing file.
     fn open(&mut self, path: &str) -> Result<FileId, SimFail>;
+    /// Whether `path` exists in the current view (card X-5c-F3, class
+    /// C-XX's G3 family). A yield point like every env call, so a
+    /// crash delivered at it surfaces as `Err(SimFail)`; a missing file
+    /// is `Ok(false)`, never an error. `open` cannot make this
+    /// distinction: a delivered crash at open's yield and a missing
+    /// file both arrive as `Err(SimFail::Crashed)`, so a caller that
+    /// reads `open`'s error as "does not exist" turns a crash into a
+    /// corruption report (the G3 check reported "start segment missing"
+    /// for a nested recovery crash delivered at its own yield).
+    fn exists(&mut self, path: &str) -> Result<bool, SimFail>;
     /// Rename a file within its directory.
     fn rename(&mut self, from: &str, to: &str) -> Result<(), SimFail>;
     /// Unlink a file.
@@ -115,6 +125,11 @@ impl<'a, H: SchedHost + HasDisk> E4Env for EnvRef<'a, H> {
     fn open(&mut self, path: &str) -> Result<FileId, SimFail> {
         self.sched.yield_baton_at(self.task, "env:open")?;
         self.step("env:open", |h| h.disk().open(path))
+    }
+
+    fn exists(&mut self, path: &str) -> Result<bool, SimFail> {
+        self.sched.yield_baton_at(self.task, "env:exists")?;
+        self.step("env:exists", |h| Ok(h.disk().stat(path).is_some()))
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<(), SimFail> {

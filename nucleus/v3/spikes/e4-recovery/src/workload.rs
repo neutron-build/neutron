@@ -1470,6 +1470,15 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 _ => true,
             });
 
+        // **G8 (X5-R16's conditional fill):** a poisoned store ended the
+        // workload — the crash was delivered at the poison point, and
+        // the crash desc of record is `poison` (never a NEVER-FIRED:
+        // `crash_fired` follows the world's `crashed` flag, which the
+        // poison delivery sets).
+        if out.obs.poison_crash {
+            crash_desc = "poison".to_owned();
+        }
+
         if let Some(d) = crash_fired_defect(&out, &crash_desc)
             && rec.defect.is_none()
         {

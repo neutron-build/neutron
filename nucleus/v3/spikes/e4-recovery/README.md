@@ -1,6 +1,30 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F2, **all steps 0–4 done** (amended by
+Status: **stage X-5c-F3, **all steps 0–8 done** — step 0 committed
+F2's Acceptance 10k as the triage file of record (b9dd5a9a:
+`E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41
+PANIC=0 O1F_FAIL=2723 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1070
+FAILING_ROUNDS=1015 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, sha256
+`56e47fb2…f34033`) and re-derived the class table; step 1 fixed two
+C-XX root causes with pins (ad82f7d5: the `next_lpid` shrink — a
+prototype deviation from §4.2/§4.3; open's G3 probe swallowing a
+delivered recovery crash — an env/store instrumentation defect) and
+escalated the O-3(c) cross-round inherited-damage family; step 2
+recorded C-DIV's evidence (an acked SyncOn commit lost through §12.5's
+replay stop — seed 21) and escalated it; step 3 applied G8 (89787d24:
+an XX001 inside a gated operation poisons the store, the poison ends
+the workload at the crash point `poison`); step 4 escalated all 7 MP-A
+rounds with the X5-R16/X5-R30 table; step 5 recorded MW-ORPHAN's
+five-round evidence (never fixed); step 6 classified the twins against
+the primary classes (no separate fix); step 7 recorded the other
+rounds with their families and escalated MP-E shape C unchanged; step
+8 wrote the F4 hand-off. The last class completed: **step 8 (the
+hand-off)**. The Acceptance 10k and its `verify --no-quotas` are the
+runner's (X5-R31): no campaign-class command ran in this card's
+attempts (single-seed and ≤ 200-seed runs only, under the backstop,
+output outside the worktree). The stage before it (X-5c-F2) is
+complete and merged (all its steps 0–4
+done, amended by
 nv3-X-5c-F2-amend-1, 2026-10-31) — step 0 corrected the
 digest-stability step-4 record (54 rows, from the X-5c-F1 gate's truth
 file); step 1 landed the harness hardening (a)–(e) with pins; step 2
@@ -11,8 +35,8 @@ took X5-R29's branch (c) — seed 4858's faultless twin holds the same
 two orphan map entries, so amcheck is unchanged and shape C is handed
 to F3 with the per-lpid evidence; step 4 is this stage record. The
 Acceptance 10k and its `verify --no-quotas` are the runner's (X5-R31):
-no campaign-class command ran in this card's attempts. The triage file
-of record stays P's c8e578b7 run:
+no campaign-class command ran in that card's attempts. Its triage file
+of record was P's c8e578b7 run:
 `E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
 PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
 FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
@@ -1433,6 +1457,378 @@ prov file); then `bash scripts/gate.sh`. X-5c-F3's step 0 commits
 that file after the provenance checks. No campaign-class command ran
 inside this card's attempts (only single-seed runs); the committed
 `results/campaign.json` stays P's c8e578b7 esc-2 file.
+
+## Stage X-5c-F3's record (this card)
+
+**Step 0 — F2's Acceptance 10k committed as the triage file of record
+(b9dd5a9a), and this card's class table re-derived from it.** The three
+provenance checks passed before the copy (the prov file's
+`commit=1f8e7c3f… status_lines=0 exit=0 verify_exit=0`; the JSON's sha256
+equal to its `json_sha256` `56e47fb2…f34033`; `git diff --quiet
+1f8e7c3f HEAD` over `src/`, `tests/`, `examples/`, `Cargo.toml` and
+`v3/Cargo.lock` exiting 0 — the merged tip 32dc3375 is F2's verdict
+commit on top of 1f8e7c3f, which touches only `nucleus/v3/verdicts/`).
+
+Final lines, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41 PANIC=0 O1F_FAIL=2723 MONITOR=0
+E4 FOLD FAILING_SEEDS=1070 FAILING_ROUNDS=1015 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0
+```
+
+**The class table, re-derived from the committed file (every count
+reproduces P's Goal re-derivation exactly).** Field definitions: a
+**failing** primary round has `pass=false` in the pass fold; a **failing
+twin** round has `pass=false` in the twin record (which carries only
+`pass` and the `o1` text). All counts are over primary rounds unless
+"twin" is in the name.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **C-XX** (class C) | 130 | class C failing round with `o2 != null` ("class C amcheck(i) not clean") or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 45, `AmcheckIi` 82, and 3 rounds with `o2` only (no O-3(b)); 98 carry both `o2` and O-3(b), 29 O-3(b) only, 8 have no `o1` at all | 221 (r0, `Open`), 66 (r0, `AmcheckIi`) |
+| **C-XX** (the same shape in MP/MW: O-3(c) with no damaged referenced slot) | 15 MP + 13 MW | MP/MW failing round with `o3` = `O-3(c): XX001 with every media fault on unread, unreferenced targets`; in MP 7 stand alone (907/1167/4167/7367/7748/8837/9508 r0–r1) and 8 sit inside MP-LIVELOCK rounds | MP 907 (r0; 528 now passes), MW 1769 (r0) |
+| **C-DIV** | 424 | class C failing round carrying an `o1` text, **excluding** rounds whose `o1` is an O-1(a) inside a C-XX round (46 of the 50 (a) rounds: 45 are the recovery-`Err` default `published {} != model {…}`, plus seed 8764 r1 whose genuine (a) sits beside its O-3(b)). Kinds: (b) 267 (266 "scan mismatch" + 1382 r0's "scan read failed", itself an O-2 round), (c) 95, (d) 58, (a) 4 (4004 r0, 7531 r1, 8480 r2, 8804 r1). By round index: r0 88/7,000 (1.3%), r1 70/3,424 (2.0%), r2 266/1,357 (19.6%) | 21 (r0, b), 46 (r1, b), 36 (r2, d), 10 (r2, c) |
+| **MP-LIVELOCK** | 41 | MP failing round with `ll` or `dl` set; livelock site `lls`: `h:writer` 19, `h:evictor` 15, `h:ckpt` 7; 38 at round 1, 3 at round 2; every one's previous round has `r6=true, pass=true, o1dl>0`; 8 also carry the C-XX O-3(c) text | 987 (r1, `h:ckpt`), 1108 (r1, `h:writer`), 1247 (r1, `h:evictor`) |
+| **MP-A** | 7 | MP failing round with `served=true`: 1897/2437/2927/4378/4718/7528/8728, all round 0, all `mrb=true`, all recovery-`Err` (Q14 meta-fault rounds) | 1897, 2437 |
+| **MW-ORPHAN** | 446 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` | 39 (r0), 59 (r0) |
+| **Other MW** | 26 | the MW failing rounds outside MW-ORPHAN: 13 O-3(c) (the C-XX shape above), 10 O-3(d) with O-1(a), 1 O-1(a) only (3399 r0), 2 O-1f only (2019 r2, 4049 r1) | 3399, 2019 |
+| **Other MP** | 4 | MP failing rounds outside every class above: 6028 r0, 7388 r1, 9548 r1 (O-1(b) scan mismatch) and 8788 r1 (O-1(c)); all recovery-`Ok`, no O-3 text | 6028 |
+| **MP-E shape C** (handed on by X5-R29 (c)) | 6 | MP failing round with `o3` starting `O-3(e): (ii)`; all `mrb=false, rlen=0`: 688/3718/4858/5238/5638/9717 (all r0) | 688, 4858, 9717 |
+| **The twins** | 103 | failing twin rounds: 44 MP over 43 seeds + 59 MW over 48 seeds; their `o1` texts: MP (b) 28, (a) 10, (c) 2, (d) 1, none 3; MW (b) 23, (a) 21, (c) 8, (d) 6, none 1 — the classes echo there (the twin is judged as class C) | 339 (MW r0, (c)), 849 (MW r1, (a)), 907 (MP r0, (b)) |
+
+Partition check: C 478 = 130 C-XX ∪ 424 C-DIV (overlap 76 rounds); MP 65
+= 41 LIVELOCK + 7 MP-A + 7 C-XX-alone + 6 shape C + 4 other (the 8
+C-XX-inside-LIVELOCK counted once, in LIVELOCK); MW 472 = 446 ORPHAN +
+26 other. Total failing rounds 1,015; failing seeds 1,070 (1,015 failing
+primary rounds + twin-only failures and seed-level flags).
+
+**Step 1 — C-XX: two root causes fixed, one sub-family escalated (commit
+ad82f7d5).**
+
+- **Sub-class A, the LPID allocator's highest-LPID shrink — root-caused
+  as a prototype deviation from S-STORE §4.2/§4.3 and fixed.** The cause
+  is `prims::free_lpid`'s `next_lpid -= 1` branch (present since the
+  X-5 attempt-2 draft, fabc1c0a): freeing the highest LPID decremented
+  the live counter while a flip-window free's `map.img` override keeps
+  the page's epoch-k content for the image being built, so the frozen
+  radix mapped an LPID the meta's own span `[1, next_lpid)` says does
+  not exist — amcheck (i)'s structural "next_lpid not above every
+  mapped lpid" in faultless class C rounds (seeds 221/66; the MP shape
+  907 — verified: `free_lpid 6 decrements next_lpid 7 → 6` in the
+  workload, the image k=1 radix mapping lpid 6 under `next_lpid: 6`),
+  and a recovery that re-freed the LPID hit `lpid N unmapped`
+  (`fetch_page`'s map miss — an XX001 at Open with no fault at all).
+  The fix: `free_lpid` always inserts into `free_lpids` (§4.2: "Reuse
+  is immediate, in memory" — through the free set; the counter is
+  monotone, which is why §4.3's bitmap is defined over `[1, next_lpid)`).
+  Pins: `cxx_highest_lpid_free_never_shrinks_next_lpid` (structural:
+  three allocations, the highest freed — monotonicity, the free-set
+  entry, immediate lowest-free reuse) and
+  `cxx_highest_lpid_free_never_shrinks_next_lpid_rounds` (221/66/907:
+  every round passes). Mutant M-CXXa (the decrement restored): the
+  structural pin fails "freeing the highest LPID shrank next_lpid"
+  (left 5, right 6); the seed pin fails on 221 with O-2 +
+  `O-3(b): XX001 in class C at [Open]`. Both revert demonstrations
+  run, then reverted clean.
+- **Sub-class B, open's G3 probe swallowed a delivered recovery crash —
+  root-caused as an instrumentation defect (sim env + store) and
+  fixed.** `EnvRef::step` maps both a missing file ("open: … does not
+  exist") and a crash delivered at the yield to
+  `Err(SimFail::Crashed)`, and the G3 check read `open`'s error as
+  "segment missing" — so a nested recovery crash landing on that yield
+  became `Corrupt("start segment … missing (G3)")`, the nested-crash
+  retry arm never fired (`nested` recorded 0), and the round failed
+  XX001-at-Open with no fault (seed 1769's family: the faultless twin
+  failed `O-1(a)` through the recovery Err, the MW round failed O-3(c)
+  beside faults the crashed twin never covered — the file's directory
+  listing even shows the segment present while `open` failed). The
+  replay walk's and `truncate_wal`'s segment opens had the same
+  swallow. The fix: `E4Env::exists` (a yield point; `Ok(false)` for a
+  missing file, `Err` only for a world failure) + the three sites use
+  it, so a crash propagates as `Fail::Sim` and only a genuinely
+  missing segment takes the missing-segment path. Pins:
+  `cxx_a_crash_at_any_recovery_yield_is_never_corruption` (a fixture
+  with a checkpoint then 18 commits above T; one nested crash point
+  swept over k=1..=120 — every round passes) and
+  `cxx_g3_probe_never_swallows_a_recovery_crash` (1769: the twin
+  passes, no O-3(c) text; the round's own remaining `O-1(c)`+`O-3(d)`
+  is its MW-ORPHAN shape, deliberately not judged). Mutant M-CXXb (the
+  G3 probe reading `open`'s error again): the sweep fails at k=8 with
+  exactly `O-3(b): XX001 in class C at [Open]`. Demonstrated, reverted
+  clean.
+- **Movement measured** (allowed runs, output outside the worktree):
+  seeds 0..200 — only 3 digests change (30, 66, 198; 30 and 198 pass
+  before and after, their allocation numbering shifted), seed 66's
+  round clears, failing rounds 22 → 21, `O2_FAIL` 1 → 0. Single-seed:
+  1769's twin passes and its O-3(c) is gone (the round keeps its
+  MW-ORPHAN `O-1(c)`+`O-3(d)`); 2149/4309/7469's primary O-3(c) rounds
+  clear (7469's two failing twins are F2-file failures, unchanged);
+  987/1108 (MP-LIVELOCK) and 688/4858/5238 (MP-E shape C) untouched,
+  as their classes require.
+- **Sub-class C, the remaining O-3(c) "unread, unreferenced" family —
+  ESCALATED to P (the oracle is frozen; no worker widens the twin
+  rule).** 7367/7748/8837/9508/1167/4167 (MP) and 1889/8399 (MW),
+  digest-identical to F2's file at the fixed tip: **cross-round
+  inherited damage**. Repro 7367 r1: round 0's LOST fault destroyed
+  page slot 6; round 0 recovered `Ok` and passed as the detection
+  round it is; the slot stays referenced and can never be rewritten
+  (unreadable ⇒ never dirty), so round 1's amcheck (i) correctly
+  reports slot 6 again (the plan's clause 3: detected, never served,
+  `served=false`), but the frozen O-3(c) twin rule attributes XX001s
+  only to the **same round's** fault targets (round 1's faults target
+  other slots, which the twin shows unread+unreferenced), so the
+  genuine detection is called a false positive and the round fails.
+  The store's behaviour is correct per clause 3; the question is
+  whether an MP/MW round inheriting prior-round damage passes O-3(c)
+  when its own faults are uncovered — P's to rule (X5-R30's gate is
+  the natural home). **Evidence**:
+  `$HOME/.cache/nv3-review/runlogs/X-5c-F3.cxx3.7367.{err,json}`
+  (E4_MPE_DIAG: round 0 `Lost inode 0 off 24576 (page slot 6)` →
+  amcheck (i) `§3.3 fail on mapped page slot 6`; round 1 `Misdirected
+  29→87, 44→73, Torn 90` → amcheck (i) slots {6, 29, 44, 73, 90}, slot
+  6 not a round-1 target; `kept K {}`; the class C twin passes).
+
+**Step 2 — C-DIV: evidence recorded, root cause ESCALATED to P (the
+budget valve, X5-R19).** The repros still reproduce at the fixed tip
+(21 r0, 46 r1, 36 r2, 10 r2 — digests unchanged; the class's
+round-index skew stands: r0 88, r1 70, r2 266 in F2's file). The
+deepest shape (seed 21 r0, class C, no fault) is an **acked
+`synchronous_commit=on` commit lost** — `I-REDO-COMPLETE` violated:
+
+- The model at verdict time: commits 1–13 written+acked, **ts=14
+  written=false acked=false**, **ts=15 written=true acked=true
+  (SyncOn)**, ts=16 written=true acked=false (SyncOff). `lo` = 15.
+- The recovered store's raw entries hold none of ts=14's keys (never
+  written — expected) **and none of ts=15's keys** (acked — the loss).
+  O-1 therefore fails at every candidate c ≥ 15.
+- The durable WAL (walked from lsn 0, the same `dec_record_with_lsn_check`
+  the store uses): a 300–1,500-op chunked txn (txn (1,3)) spanning
+  segments 0–3 (~200 KB of `Chunk` records), its `CommitMarker` at ts=5,
+  Commits ts=6–13 — **then the walk stops at lsn 225622** (ts=14's
+  position) on zero bytes; ts=15/16's records sit beyond the stop, never
+  replay, and G2's truncation then zeroes from the valid end — recovery
+  itself destroys them.
+- The open question for P: how ts=15's record can be derived
+  written+acked (its write returned, a sync returned after it) while
+  ts=14 — the **lower** LSN in the same segment — resolved to pre-write
+  zeros at the crash. Either the harness's write path lets a later
+  record's write+sync complete past an earlier unreturned write (a
+  prototype deviation in the writer's ordering), or
+  `derive_written_acked`'s sync-extent accounting marks a record acked
+  whose bytes were not durable (an instrumentation defect), or §12.5's
+  stop-at-first-bad-record rule legitimately loses a durable later
+  record when an earlier record's write was cut by the crash — a
+  §12.5/§14/I-REDO-COMPLETE question only P can rule on. **Evidence**:
+  `$HOME/.cache/nv3-review/runlogs/X-5c-F3.cdiv.21{c..n}.{err,json}`
+  (the per-key NOT-IN-RAW list with each key's commit ts/flags, the
+  bounds print, the full WAL record listing with the stop position and
+  its zero bytes). The other C-DIV kinds ((c) 95, (d) 58, (a) 4) were
+  not re-derived deeper in this attempt; the card's lead (cross-round
+  carry: the harness checkpoint, the carried model, X5-R10's sequencer
+  restart, G2 truncation) stands, and the r2 skew (19.6%) is consistent
+  with it.
+
+**Step 3 — MP-LIVELOCK: G8 applied (commit 89787d24).** The root cause
+is exactly X5-R16's lead, confirmed on 987/1108/1247 (round 1 each,
+every one directly after an R6 Ok-with-detected-loss round): the store
+poisoned only on `gc_w > T` at the meta write, so an XX001 raised by a
+gated operation's own read on an inherited unreadable page left the
+store usable, the failing task unwound as a client detection, and the
+rest parked forever behind the service spins (the budget tripped at
+`h:writer`/`h:evictor`/`h:ckpt`). G8 (P's reading of I-FAIL-STOP §9.2 —
+the condition holds): `fetch_page` marks the store poisoned when a read
+whose bytes fail §3.3 happens inside a gated operation
+(`inside_op=true`: apply, splits, packs, GC; a **read** op never
+poisons — the XX001 is the client's detection, the plan's clause 3);
+every later mutation refuses with `Fail::Poisoned` through the existing
+`alive()` gate; and the harness treats `Fail::Poisoned` as the end of
+the round's workload — the round's crash is delivered at once, the
+crash desc of record is `poison` (never a NEVER-FIRED: `crash_fired`
+follows the world's `crashed` flag), and the faults, recovery and
+oracle run as usual. Pin
+`g8_poison_ends_the_workload_instead_of_livelocking` (987/1108: no
+deadlock/livelock, `crash == "poison"`, fired, the round passes as the
+detection round it is). Mutants: **M-G8a** ("XX001 in apply does not
+poison" — the poison mark removed) → 987 r1 livelocks again at
+`h:ckpt`, FAILED; **M-G8b** (the harness `Poisoned` arm removed) → the
+crash desc stays `After6@0`, FAILED. Both demonstrated, reverted clean.
+Movement: 987/1108/1247 all now pass every round (`FAILING_SEEDS=0`
+each; r1's crash desc `poison`). The class's 41 rounds are this
+mechanism; the Acceptance 10k measures the total. G8 is listed for
+RESULT item 6 and S-STORE §9.2 by spec card S-1-F3 (P's).
+
+**Step 4 — MP-A: all 7 rounds ESCALATED to P with the evidence (X5-R16
++ X5-R30; no judgement here — a served corruption is never classified
+as a non-failure by a worker).** All 7 reproduce at the fixed tip,
+digest-identical to F2's file, all round 0, all `mrb=true`, all
+recovery-`Err`, all `served=true`, `O-3(a): served corruption`
+unchanged (X5-R30 (b)). Per-round table (the `served_k` and K halves
+from F2's instrumented runs; the `V_k` CRCs and the fault lists from
+this attempt's `E4_MPE_DIAG` runs at
+`$HOME/.cache/nv3-review/runlogs/X-5c-F3.mpa.<seed>.*`):
+
+| Seed | served slot | in K? | `served_k` | `V_k(s)` crc32c | the round's media faults |
+|---|---|---|---|---|---|
+| 1897 | 4 | K={4} | true | `9020a7cc` | MISDIR 10→8192, LOST 21, TORN 25 |
+| 2437 | 4 | K={4} | true | `9020a7cc` | LOST 2, TORN 10, MISDIR 12→57344 |
+| 4718 | 8 | K={8}, R={12,13} | true | `8ad5dcf1` | MISDIR 1→159744 |
+| 2927 | meta 1 (4096) | K={}, R={4} | false | — (a meta slot: K excludes 1/2) | TORN 117, LOST 127, MISDIR 2→12288 |
+| 4378 | meta 1 (4096) | K={}, R={4} | false | — | MISDIR 1→57344, MISDIR 2→110592 |
+| 7528 | meta 1 (4096) | K={}, R={4} | false | — | MISDIR 67→65536, MISDIR 6→8192, LOST 101 |
+| 8728 | meta 2 (8192) | K={}, R={11,13} | false | — | TORN 52, MISDIR 32→4096 |
+
+The read paths (F2's instrumented runs): the three `sk=true` rounds
+served a page through the map-reference fetch of the rolled-back
+image's stale reference (the bytes equal `V_k(s)` — §3.3 passes, which
+is why a correct store accepts them; the X5-R30 proxy-flaw candidates);
+the four `sk=false` rounds served **open's own meta read** of a tainted
+meta slot (the fault's source range is the meta slot; the accept hook
+records the serve — the second shape for P at X5-R30 (c)). `served_k`
+is vacuously true on nothing-served rounds; read it only on
+`served=true` rounds (all 7 here).
+
+**Step 5 — MW-ORPHAN: evidence only, never fixed (X5-R16's SPEC
+classification stands; P opens S-1-F3 on confirmation).** Five rounds'
+evidence at the fixed tip (record fields + the MPE diag's fault list;
+artifacts at `$HOME/.cache/nv3-review/runlogs/X-5c-F3.orph.<seed>.*`):
+
+| Seed/round | opened `T` (`lo`) | `hi` | frontier | orphan max ts (the O-1(c) text) | the damaged WAL record | later round reissues its ts? |
+|---|---|---|---|---|---|---|
+| 39 r0 | 8 | 8 | 5 | 7 | MISDIRECTED `/wal` inode 3 off 25724 len 22446 → 26112 | no later round (r0-only seed) |
+| 59 r0 | 7 | 8 | 4 | 6 | MISDIRECTED inode 4 off 58211 len 49 → 53760; TORN same inode | no later round |
+| 109 r0 | 11 | 14 | 4 | 5 | MISDIRECTED inode 4 off 25933 len 848 → 11776 | no later round |
+| 149 r0 | 6 | 6 | 4 | 5 | MISDIRECTED inode 3 off 55140 len 10396 → 8704 | no later round |
+| 209 r0 | 22 | 22 | 8 | 11 | MISDIRECTED inode 2 off 26151 len 1211 → 0; 47190 len 6463 → 37376 | no later round |
+
+In every round: the orphan's max ts is above the recovered frontier and
+≤ `hi` (P's own finding, on all 422 of the 437 in F2's file); the
+damaged record is a `/wal/` write (class MW destroys a record after its
+sync, by construction); `ackl=0` (no acked commit lost — these are not
+X5-R1 costs); amcheck is clean on both images (the faultless twin
+passes; no §3.3 finding — this is a prefix-state question, not a
+detection question); and the replay's stop is §12.5's first-invalid-
+record rule at the misdirected record's bytes (the same walk printed
+above for C-DIV's seed 21 shows the mechanism: the walk stops at the
+first undecodable record, and every entry of the commits whose records
+sit beyond the stop stays in the image as an orphan above the cut).
+X5-R10's sequencer restarts at frontier+1, inside the orphans' ts
+range (the I-ENTRY-UNIQUE hazard P recorded; the r0-only repro seeds
+cannot show a reissue — a multi-round confirmation needs P's triage of
+the Acceptance file). **No fix was made and none may be (X5-R16:
+"Any fix … is a mechanism beyond G1–G7").**
+
+**Step 6 — the twins: classified, no separate fix.** The 103 failing
+twin rounds (44 MP over 43 seeds + 59 MW over 48 seeds) are not a class
+of their own: the twins are faultless rounds judged as class C, and
+their `o1` texts echo the primary classes — (b) "scan mismatch" 51
+rounds (C-DIV's shape; 907's twin among them), (a) the recovery-`Err`
+default `published {} != model {…}` 31 rounds (the C-XX recovery-Err
+family — 1769's twin was exactly sub-class B and now passes), (c)
+"raw entry above the cut" 10 (MW-ORPHAN's echo in the faultless twin:
+the twin inherits the *image* state, not the WAL damage — the twin's
+own O-1(c) rounds are the inherited-orphan shape), (d) 7 (C-DIV), and
+4 with no `o1` text (O-1f/O-2 failures). The classes' fixes therefore
+move the twins with them (the Acceptance 10k measures the rest);
+nothing here is fixed separately.
+
+**Step 7 — the other MW and MP rounds, and MP-E shape C.**
+
+- **The 4 MP O-1 rounds** (6028 r0, 7388 r1, 9548 r1 — O-1(b) scan
+  mismatch; 8788 r1 — O-1(c)): recovery `Ok`, no O-3 text, no XX001 —
+  the C-DIV shape inside class MP (the same O-1 failure family, with
+  MP's detected-loss arm not applicable because the reads returned).
+  Recorded with C-DIV's escalation.
+- **The 10 MW O-3(d)+O-1(a) rounds** (published-set divergence with a
+  silent Ok): the MW-ORPHAN family under a different O-1 kind — the
+  store's published set at every legal cut differs from the model's
+  after the same §12.5 replay stop (a published tree's records sit
+  beyond the damaged record). Recorded with MW-ORPHAN's evidence;
+  P's S-1-F3 ruling covers both O-1 kinds.
+- **3399 r0** (`O-1(a)` only, `published {2} != model {2, 3}`): the
+  same published-set shape; **2019 r2 / 4049 r1** (O-1f only: the
+  frontier is not among the satisfying cuts): the frontier/orphan
+  interaction of §14's apply-frontier rule — with MW-ORPHAN for P.
+- **MP-E shape C (handed on by X5-R29 (c)): no amcheck change, no
+  fix.** F2's evidence stands (4858's faultless twin holds the same two
+  orphan map entries with no §3.3 failure anywhere — true orphans, an
+  I-LPID-EXACT store deviation; 9717's "separators out of order" +
+  "reachable more than once" is a third mechanism). The card's fork was
+  strict: the precision fix may be made **only** if F3 shows 4858 and
+  9717 to be something other than real image defects — they are real
+  (nothing in this attempt's evidence moves them: 688/4858/5238 still
+  fail O-3(e) (ii) at the fixed tip, digests unchanged) — and P rules
+  first. ESCALATED with F2's per-lpid table as the record.
+
+**Step 8 — the hand-off for X-5c-F4 (the retune and the final file).**
+
+- **What F4's retune must not disturb:** the five fixed classes' pins
+  and their repros — `cxx_highest_lpid_free_never_shrinks_next_lpid`
+  (structural), `cxx_highest_lpid_free_never_shrinks_next_lpid_rounds`
+  (221/66/907), `cxx_a_crash_at_any_recovery_yield_is_never_corruption`
+  (the sweep fixture), `cxx_g3_probe_never_swallows_a_recovery_crash`
+  (1769) and `g8_poison_ends_the_workload_instead_of_livelocking`
+  (987/1108, with the `poison` crash desc now a *legitimate* crash
+  point any coverage accounting must expect); the frozen surfaces (the
+  oracle as amended by X5-R28, `src/model.rs`, `taint_ranges` and the
+  fault/crash model, D17's two R6 cells, X5-R14's fix, X5-R28's K
+  computation); G8's semantics (a poisoned store ends the workload at
+  the `poison` crash point — the retune's targeted draws must tolerate
+  a round whose crash fires before its drawn hook; the fired-guard
+  already does, `crash_fired` follows the world's `crashed` flag); and
+  the never-touch rules (no harness walk may report ground truth as an
+  amcheck finding — X5-R23/X5-R28; MW-ORPHAN is never fixed; a served
+  corruption is never classified as a non-failure — X5-R30).
+- **The classes still open (F4 inherits them as P's queue, not as
+  work):** C-DIV (an acked SyncOn commit lost through §12.5's replay
+  stop — the seed-21 evidence above, an instrumentation-or-spec
+  question); the O-3(c) cross-round inherited-damage family; MW-ORPHAN
+  (SPEC — S-1-F3 is P's); MP-A (7 rounds, P rules at X5-R30 (c)); MP-E
+  shape C (real orphan map entries + 9717's third mechanism). F4 runs
+  no class work: its steps are the retune (X5-R17: SIZING, Q4, Q7,
+  Q11, Q12; the pool stays at §5.4's formula; ≤ 40 min wall at 16
+  threads), the final 10k with plain `verify`, and its README record.
+- **This card's Acceptance 10k** (the runner's, X5-R31) becomes F4's
+  step-0 triage file; its class counts re-derive with this README's
+  field definitions, and the deltas against F2's file measure the
+  three fixes' full-class movement (C-XX A and B clear the 221/66/907
+  family; G8 clears the 41 MP-LIVELOCK rounds as `poison`-crash
+  detection rounds; C-DIV, MW-ORPHAN, MP-A, shape C and the twins'
+  remainders stand as escalated).
+
+
+
+Final lines, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41 PANIC=0 O1F_FAIL=2723 MONITOR=0
+E4 FOLD FAILING_SEEDS=1070 FAILING_ROUNDS=1015 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0
+```
+
+**The class table, re-derived from the committed file (every count
+reproduces P's Goal re-derivation exactly).** Field definitions: a
+**failing** primary round has `pass=false` in the pass fold; a **failing
+twin** round has `pass=false` in the twin record (which carries only
+`pass` and the `o1` text). All counts are over primary rounds unless
+"twin" is in the name.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **C-XX** (class C) | 130 | class C failing round with `o2 != null` ("class C amcheck(i) not clean") or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 45, `AmcheckIi` 82, and 3 rounds with `o2` only (no O-3(b)); 98 carry both `o2` and O-3(b), 29 O-3(b) only, 8 have no `o1` at all | 221 (r0, `Open`), 66 (r0, `AmcheckIi`) |
+| **C-XX** (the same shape in MP/MW: O-3(c) with no damaged referenced slot) | 15 MP + 13 MW | MP/MW failing round with `o3` = `O-3(c): XX001 with every media fault on unread, unreferenced targets`; in MP 7 stand alone (907/1167/4167/7367/7748/8837/9508 r0–r1) and 8 sit inside MP-LIVELOCK rounds | MP 907 (r0; 528 now passes), MW 1769 (r0) |
+| **C-DIV** | 424 | class C failing round carrying an `o1` text, **excluding** rounds whose `o1` is an O-1(a) inside a C-XX round (46 of the 50 (a) rounds: 45 are the recovery-`Err` default `published {} != model {…}`, plus seed 8764 r1 whose genuine (a) sits beside its O-3(b)). Kinds: (b) 267 (266 "scan mismatch" + 1382 r0's "scan read failed", itself an O-2 round), (c) 95, (d) 58, (a) 4 (4004 r0, 7531 r1, 8480 r2, 8804 r1). By round index: r0 88/7,000 (1.3%), r1 70/3,424 (2.0%), r2 266/1,357 (19.6%) | 21 (r0, b), 46 (r1, b), 36 (r2, d), 10 (r2, c) |
+| **MP-LIVELOCK** | 41 | MP failing round with `ll` or `dl` set; livelock site `lls`: `h:writer` 19, `h:evictor` 15, `h:ckpt` 7; 38 at round 1, 3 at round 2; every one's previous round has `r6=true, pass=true, o1dl>0`; 8 also carry the C-XX O-3(c) text | 987 (r1, `h:ckpt`), 1108 (r1, `h:writer`), 1247 (r1, `h:evictor`) |
+| **MP-A** | 7 | MP failing round with `served=true`: 1897/2437/2927/4378/4718/7528/8728, all round 0, all `mrb=true`, all recovery-`Err` (Q14 meta-fault rounds) | 1897, 2437 |
+| **MW-ORPHAN** | 446 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` | 39 (r0), 59 (r0) |
+| **Other MW** | 26 | the MW failing rounds outside MW-ORPHAN: 13 O-3(c) (the C-XX shape above), 10 O-3(d) with O-1(a), 1 O-1(a) only (3399 r0), 2 O-1f only (2019 r2, 4049 r1) | 3399, 2019 |
+| **Other MP** | 4 | MP failing rounds outside every class above: 6028 r0, 7388 r1, 9548 r1 (O-1(b) scan mismatch) and 8788 r1 (O-1(c)); all recovery-`Ok`, no O-3 text | 6028 |
+| **MP-E shape C** (handed on by X5-R29 (c)) | 6 | MP failing round with `o3` starting `O-3(e): (ii)`; all `mrb=false, rlen=0`: 688/3718/4858/5238/5638/9717 (all r0) | 688, 4858, 9717 |
+| **The twins** | 103 | failing twin rounds: 44 MP over 43 seeds + 59 MW over 48 seeds; their `o1` texts: MP (b) 28, (a) 10, (c) 2, (d) 1, none 3; MW (b) 23, (a) 21, (c) 8, (d) 6, none 1 — the classes echo there (the twin is judged as class C) | 339 (MW r0, (c)), 849 (MW r1, (a)), 907 (MP r0, (b)) |
+
+Partition check: C 478 = 130 C-XX ∪ 424 C-DIV (overlap 76 rounds); MP 65
+= 41 LIVELOCK + 7 MP-A + 7 C-XX-alone + 6 shape C + 4 other (the 8
+C-XX-inside-LIVELOCK counted once, in LIVELOCK); MW 472 = 446 ORPHAN +
+26 other. Total failing rounds 1,015; failing seeds 1,070 (1,015 failing
+primary rounds + twin-only failures and seed-level flags).
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)

@@ -397,11 +397,24 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
             }
         }
         st.map.cur.remove(&lpid);
-        if lpid + 1 == st.meta.next_lpid && lpid > 0 {
-            st.meta.next_lpid -= 1;
-        } else {
-            st.slots.free_lpids.insert(lpid);
-        }
+        // S-STORE §4.2/§4.3 (card X-5c-F3, class C-XX): a freed LPID
+        // goes to the free set — `next_lpid` never shrinks. The
+        // draft's `next_lpid -= 1` on freeing the highest LPID let the
+        // allocator re-issue an LPID the image being built still maps
+        // (`map.img`'s override keeps the page's epoch-k content across
+        // a free inside a flip window, §4.2), so a checkpoint froze a
+        // radix whose entries reached `next_lpid` itself: the persisted
+        // image mapped an LPID its own meta's span `[1, next_lpid)`
+        // says does not exist (amcheck (i)'s "next_lpid not above every
+        // mapped lpid", a structural finding in faultless class C
+        // rounds — the repros 221/66/907), the LPID bitmap could not
+        // express it (I-FREE-EXACT's span), and a recovery that re-freed
+        // the LPID left a dangling inner reference ("lpid N unmapped",
+        // an XX001 at Open with no fault at all). §4.3's bitmap is
+        // defined over `[1, next_lpid)` precisely because `next_lpid`
+        // is monotone; immediate in-memory reuse goes through
+        // `free_lpids` ("Reuse is immediate, in memory", §4.2).
+        st.slots.free_lpids.insert(lpid);
         Ok(())
     })?;
     cx.w.wake(WaitKey::Pin);
@@ -573,9 +586,46 @@ pub fn fetch_page<H: StoreHost>(
                     .read_at(f, off, page::PAGE as u64)
                     .map_err(Fail::Sim)?;
                 let mutant = cx.with("fetch_page:mut", |c| Ok(c.store().cfg.mutant))?;
-                page::check(&bytes, &r, lpid, mutant).map_err(|()| {
-                    Fail::Corrupt(format!("integrity fail lpid {lpid} slot {}", r.slot))
-                })?;
+                let chk = page::check(&bytes, &r, lpid, mutant);
+                if chk.is_err() {
+                    // **G8 (P's reading of I-FAIL-STOP, X5-R16's
+                    // conditional fill):** a read that returns bytes
+                    // failing §3.3 is a failed physical read, and inside
+                    // a gated operation — apply, a split, a pack, GC, a
+                    // checkpoint's paths — §9.2's physical-failure rule
+                    // poisons the store ("An I/O error, 53100 or 53200
+                    // inside apply, eviction or a checkpoint poisons the
+                    // store"; the prototype had poison only for
+                    // `gc_w > T` at the meta write). The error itself is
+                    // unchanged (`Fail::Corrupt`, the XX001 the caller
+                    // reports); the poison mark makes every **later**
+                    // mutation refuse, and the harness ends the round's
+                    // workload at the poison instead of letting the rest
+                    // park forever behind the service spins (the
+                    // MP-LIVELOCK class: 41 rounds, every one directly
+                    // after an R6 detected-loss round whose image holds
+                    // an unreadable referenced page). A **read** op
+                    // (`inside_op = false`: scans, the raw walk) never
+                    // poisons — the XX001 is the client's detection, the
+                    // plan's clause 3.
+                    if inside_op {
+                        cx.with("fetch_page:poison", |c| {
+                            let st = c.store();
+                            if st.poisoned.is_none() {
+                                st.poisoned = Some(format!(
+                                    "XX001 in gated op: lpid {lpid} slot {} (G8, 9.2)",
+                                    r.slot
+                                ));
+                            }
+                            Ok(())
+                        })
+                        .ok();
+                    }
+                    return Err(Fail::Corrupt(format!(
+                        "integrity fail lpid {lpid} slot {}",
+                        r.slot
+                    )));
+                }
                 // Accept hook: a page passing §3.3 (card 1.4).
                 cx.env()
                     .accepted(f, off, page::PAGE as u64)

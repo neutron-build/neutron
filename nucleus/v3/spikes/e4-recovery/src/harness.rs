@@ -212,6 +212,11 @@ pub struct HarnessState {
     pub workload_done: bool,
     /// A forced checkpoint is pending (bulk load).
     pub force_ckpt: bool,
+    /// **G8 (X5-R16's conditional fill):** the round's workload ended
+    /// on a poisoned store — the crash was delivered at the poison
+    /// point and the crash desc is recorded as `poison` (never a
+    /// NEVER-FIRED: `crash_fired` follows the world's `crashed` flag).
+    pub poison_crash: bool,
     /// A DEADLOCK was observed.
     pub deadlock: bool,
     /// A livelock was observed (X5-R13 (b)): a world of this round
@@ -869,6 +874,34 @@ fn run_task(
             for op in task.ops.iter() {
                 yld!();
                 if let Err(e) = script_op(&cx, op) {
+                    // **G8's harness half (X5-R16's conditional fill):**
+                    // a poisoned store is the end of the round's
+                    // workload. The round's crash is delivered at once
+                    // (every task unwinds as `Crashed`, the world's
+                    // `crashed` flag makes `crash_fired` true — never a
+                    // NEVER-FIRED), the crash point is recorded as
+                    // `poison`, and the round continues to its faults,
+                    // recovery and the ruled oracle as usual.
+                    if matches!(e, Fail::Poisoned(_)) {
+                        let world_crashed0 = cx
+                            .with("h:poison", |c| {
+                                let crashed = c.sched_mut().crashed;
+                                if !crashed {
+                                    let h = c.h();
+                                    h.poison_crash = true;
+                                    h.workload_done = true;
+                                }
+                                Ok(crashed)
+                            })
+                            .unwrap_or(true);
+                        if !world_crashed0 {
+                            cx.w.wake(WaitKey::WalAcks);
+                            cx.w.wake(WaitKey::MetaDurable);
+                            cx.w.wake(WaitKey::Applied);
+                            cx.w.deliver_crash();
+                        }
+                        return Err(SimFail::Crashed);
+                    }
                     // A failed script op is a round failure, recorded
                     // and reported — never a silent early exit (the
                     // service tasks would spin on a workload that can
@@ -1692,6 +1725,11 @@ pub struct WorkloadObs {
     /// The scripted crash fired during the workload (false: the crash
     /// point was never reached — a degenerate end-of-workload F-CRASH).
     pub crash_fired: bool,
+    /// **G8:** the workload ended on a poisoned store; the round's crash
+    /// desc is recorded as `poison` (never a NEVER-FIRED: the poison
+    /// delivery sets the world's `crashed` flag, so `crash_fired`
+    /// reads true).
+    pub poison_crash: bool,
     /// Splits inside the open checkpoint window (Q4).
     pub splits: u64,
     /// Merges inside the open checkpoint window (Q4).
@@ -1828,6 +1866,7 @@ pub fn run_round(
             gc_adv_in_window: g.h.gc_adv_in_window,
             ckpt_step: g.h.ckpt_step,
             ckpt_hooks_hit: g.h.ckpt_hooks_hit.clone(),
+            poison_crash: g.h.poison_crash,
         };
         (
             g.disk.clone(),
