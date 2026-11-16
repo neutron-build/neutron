@@ -1,331 +1,188 @@
 Card: S-GAMMA
 Class: spec
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session 2543ceb9-7772-4b2d-b9a2-5501435b3b9e (fresh gate of the rework; this agent wrote neither the card, its edits, verdict 1 nor the rework)
+Gate-session: T3 review sub-agent, Claude Code session 62be307c-e089-4ce6-9eda-687ab3b44319 (fresh gate of the second rework; this agent wrote neither the card, its edits, verdicts 1 and 2 nor either rework)
 Date: 2026-11-15
 Gate-exit: GATE EXIT=0
-Commit: c1a9c5152f65561a30ca8170ddb41d5424d32e1a
-Mutants: spec text, none in code; each walked as text against its test on its owning rows at c1a9c515: START-LSN-SPLIT-READ -> t_flip_chunk_race (A-7d), both forms, caught on every build that RW-1 leaves conforming EXCEPT one whose store's append takes the I-WAL-TS-ORDER section around a Chunk's reservation (G1, G2 below; RW2-1 to RW2-3), WAL-START-PAIR-SPLIT-READ -> t_wal_chain_crash racing step (A-7d), chain-head-last form by the false self-pair, chain-head-first form by the hop form on a build that reserves a hop's SegmentEnd in an entry of its own (equivalent, as stated, where a hop is one entry), same exception as START-LSN-SPLIT-READ, APPEND-SECTION-IO -> t_append_section_leaf (A-6c: I/O form through the Env hook, wait form, however it waits, by not returning within the bound; A-7c: deadlock under shuttle), REPLAY-DROP-AT-TS -> t_drop_restart_floor (d), (e) exact check (A-7d; B-6), DROP-OP-W-ZERO -> t_drop_restart_floor codec form (A-6a) and (d), (e) (A-7d), W-FLOOR-META-ONLY -> t_drop_restart_floor (d) full form (B-6); gate's own: G1 the store's append takes the I-WAL-TS-ORDER section around every reservation, a Chunk's included, with START-LSN-SPLIT-READ's second form (the set entry after the reservation, both inside that hold) -> equivalent, and the test's synchronous hook deadlocks on step 0's hold of that section (RW2-1), G2 the same build with START-LSN-SPLIT-READ's step-0 form, both entries inside step 0's hold of that section -> equivalent, hook blocks (RW2-1), G3 the spin form of APPEND-SECTION-IO at A-6c -> caught by RW-6's bound, G4 CHUNK-SET-KEEPS-ENDED -> UNCAUGHT, rule now stated (RW-16), test rides (S-GAMMA-F1), G5 step 0's entry drops a member whose marker is above T -> caught by START-LSN-MARKED-CHUNK's test (A-6d direct, A-7d), G6 the mark raises to the published W in normal operation -> UNCAUGHT, safe (S-GAMMA-F4, optional)
-Followups: S-GAMMA-F1, S-GAMMA-F2, S-GAMMA-F3, S-GAMMA-F4, S-GAMMA-F5, S-GAMMA-F6
+Commit: c6d03599dc737fa997a2aca2cdb188cbf0137396
+Mutants: spec text, none in code; each walked as text against its test on its owning rows at c6d03599: START-LSN-SPLIT-READ -> t_flip_chunk_race (A-7d), both forms, caught on every conforming build whose first `Chunk` does not hop with its `SegmentEnd` in an entry of its own (G2 below; S-GAMMA-F7), verdict 2's Chunk-under-section builds now non-conforming (G3), WAL-START-PAIR-SPLIT-READ -> t_wal_chain_crash racing step (A-7d), chain-head-last form by the false self-pair, caught, chain-head-first form by the hop form, caught except on a build whose store's append takes the I-WAL-TS-ORDER section around a `Chunk`'s hop's separate `SegmentEnd` entry (G1; S-GAMMA-F7), equivalent where a hop is one entry (as stated), APPEND-SECTION-IO -> t_append_section_leaf (A-6c, A-7c), unchanged, caught, REPLAY-DROP-AT-TS -> t_drop_restart_floor (d), (e) (A-7d; B-6), unchanged, caught, DROP-OP-W-ZERO -> t_drop_restart_floor codec form (A-6a) and (d), (e) (A-7d), unchanged, caught, W-FLOOR-META-ONLY -> t_drop_restart_floor (d) full form (B-6), unchanged, caught; gate's own: G1 the store's append takes the I-WAL-TS-ORDER section around the separate `SegmentEnd` entry of a `Chunk`'s hop, with WAL-START-PAIR-SPLIT-READ's chain-head-first form reading both entries inside step 0's hold of that section -> UNCAUGHT at c6d03599 (equivalent; the hop hook blocks and a synchronous one deadlocks), caught once S-GAMMA-F7 lands, G2 the same build, `t_flip_chunk_race` with a fixture whose `X1` hops, START-LSN-SPLIT-READ's step-0 form inside that hold -> UNCAUGHT at c6d03599 (hook blocks on the `SegmentEnd` entry), caught once S-GAMMA-F7 lands, G3 verdict 2's G1/G2 (the section around a `Chunk`'s own reservation) -> caught (the build is non-conforming after RW2-1; residual 1 closed), G4 the store's append waits on the checkpoint's own exclusion for a `Chunk` -> UNCAUGHT, not a natural build, closed as an A-6c plan-card rule (below)
+Followups: S-GAMMA-F1, S-GAMMA-F2, S-GAMMA-F3, S-GAMMA-F4, S-GAMMA-F5, S-GAMMA-F6, S-GAMMA-F7
 
 ## Verdict in brief
 
-**REWORK**, one more mechanical pass: 4 exact blocks (RW2-1 to RW2-4, all in `docs/S-STORE.md`) and 5 Acceptance lines (AC-15 to AC-19). Everything else in the rework holds.
+**MERGE-WITH-FOLLOWUPS.** Rework 2 is exactly RW2-1 to RW2-4, and it closes verdict 2's residual 1 for a `Chunk`. The second-rework implementer's finding 1 is **real**: it is a fourth instance of the same gap, the `SegmentEnd` of a `Chunk`'s hop. The text counts that `SegmentEnd` as a reservation of its own kind, and RW2-1 never says "only". The fix is one phrase-level rule in one sentence of §12.4. It changes no other sentence, no test fixture, no mutant definition or placement and no count. It rides in S-DELTA as **S-GAMMA-F7** (exact block below). That is acceptable only under this binding condition:
 
-- The rework is exactly RW-1 to RW-18: my own script re-applies them to f6549849's files and reproduces c1a9c515 byte for byte; the card's 54 edit blocks reproduce f6549849 from 264d44b8 byte for byte. Scope is the card's Touch only plus this verdict file. No mutant, test or invariant name of 264d44b8 or f6549849 is lost. The card's 83 Acceptance lines pass at HEAD (82 run, `gate.sh` aside; checker `152 rows; 215 mutants; …; OK`), and AC-1 to AC-14 all fail at f6549849.
-- Verdict 1's rulings (i)–(iv) are true in the text and right in behaviour, with one gap in (i): **residual 1 is real.** Verdict 1 closed the gate side of "can the racing hook reserve inside step 0?" but not the I-WAL-TS-ORDER side. Nothing stops the store's own append from taking the I-WAL-TS-ORDER section around a `Chunk`'s reservation. On such a build, which is conforming at c1a9c515, both forms of START-LSN-SPLIT-READ and both orders of WAL-START-PAIR-SPLIT-READ can be built so they cannot fail, and the racing hooks, which the text has reserve "through the store's append", block on step 0's hold of that section. A synchronous hook deadlocks. This is the same class of defect as verdict 1's item 1, and the same one-sentence kind of rule closes it (RW2-1).
-- Residuals 2–4 are not blocking. They ride in S-DELTA as S-GAMMA-F5 and S-GAMMA-F6 (exact text below), or are card-only notes.
+> **No card that reads S-STORE §12.4, §12.6 or §13 step 0 is cut before S-DELTA merges.** A-6a and A-6c wait for S-DELTA, and so do A-6d, A-7c and A-7d.
+
+This gate's reservation × lock survey turns up nothing else in the spec text. The one theoretical case outside the text, an append that waits on the checkpoint's own exclusion (G4), is closed as an A-6c plan-card rule.
+
+- **Bytes.** My own script re-applies verdict 2's RW2-1 to RW2-4, parsed from `c5414fa6:nucleus/v3/verdicts/S-GAMMA.md`, to c1a9c515's `docs/S-STORE.md`. Each Old occurs once, and the result equals c6d03599's file byte for byte. C-T0 is byte-identical to c1a9c515. `git diff c5414fa6 c6d03599` touches only `docs/S-STORE.md` (+4/−4).
+- **Scope.** `git diff nucleus/v3-scaffold...HEAD`: `docs/C-T0-txn-protocol.md`, `docs/S-STORE.md`, `verdicts/S-GAMMA.md`. These are the card's Touch only plus this file.
+- **Names.** No token of the form `ABC-DEF…` or `t_…` is lost from either file at 264d44b8, f6549849 or c1a9c515.
+- **Acceptance.** The card's 88 commands: 87 run (`gate.sh` aside), 0 fail. The checker prints `152 rows; 215 mutants; 25 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`, `46 new since 7.10 (31 at 7.11, 11 at 7.12, 4 here), 46 of them judged on a Phase A row; 47 invariants, 47 tests`, `OK`.
 
 ## Gate run
 
-- Extract: shallow `--no-local` clone of `nucleus/v3-scaffold`, scaffold id `264d44b818903701ac52c647b2e18869394def13`; `fresh-gate.sh` and `git-env.sh` extracted, no `EXTRACT FAILED`.
-- `bash "$fg/fresh-gate.sh" c1a9c5152f65561a30ca8170ddb41d5424d32e1a`, from `~/Workspace/neutron-v3`, stdout and stderr captured separately:
-  - `fresh-gate: commit c1a9c5152f65561a30ca8170ddb41d5424d32e1a`
+- **Extract.** A shallow `--no-local` clone of `nucleus/v3-scaffold`, scaffold id `264d44b818903701ac52c647b2e18869394def13`. `fresh-gate.sh` and `git-env.sh` were extracted with no `EXTRACT FAILED`.
+- **Run.** `bash "$fg/fresh-gate.sh" c6d03599dc737fa997a2aca2cdb188cbf0137396`, from `~/Workspace/neutron-v3`, with stdout and stderr captured separately:
+  - `fresh-gate: commit c6d03599dc737fa997a2aca2cdb188cbf0137396`
   - `fresh-gate: base 264d44b818903701ac52c647b2e18869394def13`
-  - `fresh-gate: checks passed (4816 files hashed in 4.71 s)`
+  - `fresh-gate: checks passed (4816 files hashed in 1.54 s)`
   - `fresh-gate: 2 file(s) matched through their eol conversion`
-  - stderr empty; 883 `ok` lines, 56 `test result: ok`, every `STEP … EXIT=0` (test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests);
-  - literal last line: `GATE EXIT=0`.
-- `$fg` removed afterwards. The worktree was at c1a9c515 and clean before this verdict's commit.
+  - stderr empty; 883 `ok` lines, 56 `test result: ok`, every `STEP … EXIT=0` (test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests); exit 0; literal last line: `GATE EXIT=0`.
+- `$fg` was removed afterwards. The worktree was at c6d03599 and clean before this verdict's commit.
 
-## Scope and bytes (each by this gate's own script)
+## Residual 1 of verdict 2, for a `Chunk`: closed
 
-- Tip `c1a9c5152f65561a30ca8170ddb41d5424d32e1a`, worktree clean; history 264d44b8 → f217212e → f6549849 → 9abe5527 (verdict 1) → c1a9c515 (the rework, `docs/` only: S-STORE +13/−13, C-T0 +3/−3). The verdict file at c1a9c515 is 9abe5527's.
-- `git diff nucleus/v3-scaffold...HEAD --stat`: `docs/C-T0-txn-protocol.md`, `docs/S-STORE.md`, `verdicts/S-GAMMA.md`. Merge base is the scaffold tip 264d44b8.
-- The card's Edits, parsed by my script (54 Old/New pairs: 49 to S-STORE, 5 to C-T0), applied in order to 264d44b8's files with `<date>` = 2026-11-15: every Old occurs once at its turn, and both results equal f6549849's files.
-- Verdict 1's RW blocks, parsed from `git show 9abe5527:nucleus/v3/verdicts/S-GAMMA.md` (18 pairs, in its order RW-1…RW-12, RW-16…RW-18, RW-13…RW-15): every Old occurs once in f6549849's file before any is applied, and the result equals c1a9c515's two files.
-- Names: every token of the form `ABC-DEF…` or `t_…` in either file at 264d44b8 or f6549849 is still in the file at c1a9c515.
-- Acceptance: the card's 83 lines (AC-1 replaced, AC-2 to AC-14 added). At c1a9c515: 82 run, 0 fail. At f6549849 (a `git archive` tree, so the two git-dependent lines, the checker and the file list, cannot run there): lines 5 and 68–80, i.e. AC-1 to AC-14, all fail.
+§12.4 now says: "Nor does the store's append take the I-WAL-TS-ORDER critical section for a `Chunk` … a `Chunk` reserved through the store's append by a thread that holds neither the gate nor that section waits on neither, so it can fall between any two of step 0's entries to the append critical section, even where step 0 holds both around them." §12.6 "Why one entry" and §13 step 0 item 2 now say the same.
 
-**Is the card's state acceptable for the record?** Yes. The card's Edits are the record of f217212e and f6549849, verdict 1's RW-1 to RW-18 are the record of c1a9c515, and the two together reproduce HEAD byte for byte (checked both ways). The Acceptance is what checks the current text. The card should say so in one line under "Edits" ("HEAD = these blocks, then `verdicts/S-GAMMA.md`'s RW-1 to RW-18, then RW2-1 to RW2-4"), which the orchestrator can add when it applies this pass; the card is local and non-normative, so this is not a defect.
+Walked with the lock states:
+- **Step 0's locks.** Step 0 holds the checkpoint's exclusion (CX), the epoch gate exclusively (G) and the I-WAL-TS-ORDER section (S) around its entries to the append critical section (A).
+- **The hook.** The racing hook's thread holds nothing. For its `Chunk` it takes only A, so it enters A between any two of step 0's entries.
+- **START-LSN-SPLIT-READ, step-0 form inside S.** The set read is empty, the position read is `q + len(X1)`, and `wal_start_lsn` lies past `q`. Caught.
+- **Its second form.** The append cannot hold G or S around a `Chunk`'s two entries, so step 0's entry lands between them. Caught.
+- **WAL-START-PAIR-SPLIT-READ, chain head read last.** This gives the false self-pair. Caught.
+- **Correct build.** The hook falls before or after the one entry. The pair is consistent, and the test passes; nothing blocks.
 
-## Verdict 1's rulings, re-derived at c1a9c515
+Verdict 2's G1 and G2 builds are no longer conforming. One gap remains, below.
 
-### (i) A reservation is not a gated operation; the store's append takes no gate
+## Finding 1, the `SegmentEnd` of a `Chunk`'s hop: real
 
-**Consistency across the text.**
-- §5.6's list of gated operations names no WAL reservation, and "Each of these holds the gate from its first page mutation to its last" still fits.
-- §12.4 (RW-1) states it, with the reason (a `Chunk` may carry ops that change no page: `RequireCkpt`, §12.8; `CreateTree` and `Ddl`, C-T6-rehost §5.3 and §5.5).
-- §12.4's leaf rule ("A thread may enter it holding the epoch gate, frame latches (a build may reserve a `Chunk` inside a gated materialisation …)") agrees: a caller may hold the gate, but the append does not take it.
-- §12.6 "Why one entry" (RW-4) and §13 step 0 ("`Chunk` reservations need not be made inside the critical section") agree.
-- C-T0 §3.2 ("Each materialization is a gated operation") does not contradict it: the gate covers the materialisation's page mutations, and RW-1 explicitly allows the `Chunk`'s reservation inside it. See residual 2.
+**The text at c6d03599.**
+- §12.4 counts "every reservation, of every kind, `Chunk` and `SegmentEnd` included" as one entry to A.
+- §12.5 (WAL-START-PAIR-SPLIT-READ) and the racing step of `t_wal_chain_crash` name "a build that reserves a hop's `SegmentEnd` in an entry of its own (§12.4)".
+- RW2-1 rules S out "for a `Chunk`" only. It says the append "may take that section for a `Commit` or `CommitMarker`", never "only".
 
-**The walks, on a build the text allows after RW-1.**
-- *`t_flip_chunk_race`, correct build.* The hook thread holds nothing and reserves `X1` through the store's append. Just before step 0's one entry: `X1` is in the set the entry reads, `wal_start_lsn = q`, the pair is `X1`'s own `prev`; recovery replays `X1`…`Xn`, the read at the recovered frontier sees `k1`. Just after: `q` is the position the entry read, `wal_start_lsn = q`, the pair is the chain head. Pass.
-- *Under START-LSN-SPLIT-READ, step-0 form.* The hook falls between the set read and the position read. Step 0 holds the gate exclusively there, and the hook's reservation takes no gate, so it lands at `q`; the set read was empty, the position read is `q + len(X1)`, `wal_start_lsn` lies past `q`, and the open returns `Ok` without `k1`. Caught.
-- *Under its second form* (set entry after the reservation entry): step 0's entry falls between the hook's two entries, whatever the hook's caller would hold, since the hook calls the store's append directly. Caught.
-- *`t_wal_chain_crash`'s racing step, chain head read last:* `X1` at the append position `p` read with the empty set, so `wal_start_lsn = p` and the pair, read afterwards, is `X1` itself, while the walk's first record is `X1`, whose `prev` names `p`'s predecessor: a false splice, XX001. Caught. Correct build: the hook before or after the one entry gives a consistent pair. Pass.
-- *Chain head read first, hop form* (a build that reserves a hop's `SegmentEnd` in an entry of its own): the chain head read is `R`; the `SegmentEnd` entry lands at `s`, moving the position to the next segment's first LSN `n`; step 0 then reads position `n` and the empty set, so `wal_start_lsn = n` with the pair naming `R`; `X1`'s own entry follows at `n`, its `prev` the `SegmentEnd`. A splice on a healthy store. Caught. Correct build with the same hook ("otherwise just before step 0's one entry"): position `n`, chain head the `SegmentEnd`, `X1` at `n` with `prev` the `SegmentEnd`: consistent. Pass. Where a hop is one entry this order is equivalent, as RW-2 states.
+So a build whose store's append takes S for every reservation that is not a `Chunk` is conforming at c6d03599, and that includes the separate `SegmentEnd` entry of a `Chunk`'s hop. It is a natural reading of the rule as literally coded, and natural in another way too: a `Commit`'s hop's `SegmentEnd` already sits inside the `Commit`'s S. Call this build B.
 
-**The gap: the I-WAL-TS-ORDER section (residual 1, real).** Step 0 makes its one entry to the append section inside its hold of the I-WAL-TS-ORDER section ("the same read that gives `wal_ckpt_end`"; "Inside the commit path's I-WAL-TS-ORDER critical section, read `wal_ckpt_end`"). The text lets a `Chunk` be reserved inside that section ("need not be made inside", §13 step 0; the leaf rule lets a thread enter the append section holding it) and never says the store's append does not take it. And the store's append is a natural owner of that section: I-WAL-TS-ORDER is judged on A-6c's code (§15 row; §15.1 `— (row)` A-6c), so a build whose A-6c append takes the I-WAL-TS-ORDER section around every reservation and then enters the append section inside it is conforming. On that build:
-- START-LSN-SPLIT-READ's step-0 form, written with both entries inside step 0's hold of the I-WAL-TS-ORDER section (where the position read must be), cannot fail: no `Chunk` reservation can run between them (my G2). Its second form, the set entry after the reservation entry inside the append's own hold of that section, cannot fail either: step 0 cannot run between them (my G1). The same holds for WAL-START-PAIR-SPLIT-READ in both orders.
-- The tests' hooks reserve "through the store's append from a thread that holds no gate". Placed between those entries, or "just before" step 0's entry read as just before the append-section entry, such a hook blocks on step 0's hold; a synchronous hook deadlocks on a correct build too.
+**Walk 1: WAL-START-PAIR-SPLIT-READ, chain-head-first, on B (my G1).** The mutant reads the chain head in entry E1 and the position and set in entry E2. Both reads sit inside step 0's hold of S, which is where the position read must be ("the same read that gives `wal_ckpt_end`").
+- The hop form needs `X1`'s `SegmentEnd` entry between E1 and E2.
+- On B that entry takes S, which step 0 holds, so it cannot land there. The mutant is equivalent on B.
+- The text claims the opposite. It says this order fails "on a build that reserves a hop's `SegmentEnd` in an entry of its own".
+- The hook is told to place the `SegmentEnd` entry between E1 and E2. Its thread blocks on S. A synchronous hook leaves step 0 waiting for the hook and the hook waiting for step 0's S: deadlock.
+- An asynchronous hook lands after E2. The pair is then consistent, and the mutant is uncaught.
 
-That is verdict 1's item 1 again, with the I-WAL-TS-ORDER section in place of the gate, so it is closed the same way: **the store's append takes the I-WAL-TS-ORDER section, if at all, only for a `Commit` or `CommitMarker`; a caller may hold it around a `Chunk`'s reservation or not** (RW2-1, with RW2-2 and RW2-3 making §12.6 and §13 step 0 say the same, and RW2-4 recording it). The hook texts need no change: a hook thread holds neither, and their pointer (§12.4) now covers both. The rule costs nothing: no text puts a `Chunk` under the I-WAL-TS-ORDER section, `Chunk`s carry no ts, and C-T0's callers stay free to hold the section around a `Chunk` (C-T0 v8 §2.6 allows it: the sequencer section is only never held while acquiring a stripe, the gate or a latch).
+**Walk 2: the correct build B′ (B with one entry), same hop variant.**
+- The hook is "just before step 0's one entry". Read as just before A, which is inside step 0's hold of S, the hook's `SegmentEnd` entry blocks on S. A synchronous hook deadlocks on a correct build.
+- This is the reading verdict 2 refused for the `Chunk`, and it is the same here.
 
-**The converse danger: does anything rely on step 0's exclusive gate (or its I-WAL-TS-ORDER hold) excluding a `Chunk`'s reservation?** No.
-- *The apply frontier `T`:* apply inserts are gated, so no apply runs between items 1 and 3; reservations do not move `T`.
-- *I-WAL-TS-ORDER, `ts_ckpt_hi`, the first term:* only `Commit` and `CommitMarker`, which are inside the I-WAL-TS-ORDER section and so excluded by step 0's hold of it, not by the gate.
-- *`wal_ckpt_end` "may fall either side":* already written for a `Chunk` racing the read; a `Chunk` reserved during step 0 with no gate gets its provisional entry later, in a gated operation, so in epoch `k+1`; one reserved before has its bytes below `wal_ckpt_end`, synced by step 1. Provisional entries are dead after recovery in either case (C-T0 v8 §2.4).
-- *Step 0's "A record appended after the read has no entry in image `k`":* argued through apply inserts being gated, not reservations.
-- *The boot checkpoint:* no transaction, so no `Chunk`, before the boot meta is durable (C-T0 v8 §2.5); the set is empty at open.
-- *DropTree marks:* the mark is a gated directory change; the op and its `w` ride in the drop-cleanup `Commit`, whose reservation the mark does not depend on.
-- *Bulk load `RequireCkpt`:* its `Chunk` is written after the forced checkpoint's meta is durable (§12.8), an ordering the writer keeps, not the gate.
+**Walk 3: `t_flip_chunk_race` on B, if the fixture's `X1` hops (my G2).** Nothing in the fixture rules a hop out.
+- `X1`'s `SegmentEnd` entry must precede its `Chunk` entry.
+- Placed between step 0's set read and position read, both inside S, the hook blocks on the `SegmentEnd` entry, or it deadlocks.
+- The mutant's kill needs the `Chunk` entry there, behind the `SegmentEnd`.
 
-### (ii) The open-chunk set's leaving rule
+**Ruling.** The gap is real and of the same class as verdict 1's item 1 and verdict 2's residual 1. It is narrow: it needs B, a hop in the racing reservation, and a hook point inside step 0's hold of S. It is closed the same way, by one phrase:
 
-The text (RW-16 to RW-18) now says: removal is required (a markerless end leaves "in an entry of its own as it ends"; a flip's entry "drops" every member with marker `≤ T`); the set is empty at open; a flip before the leaving entry still counts the member. Re-walked:
-- *Abort, or commit with no ts:* no marker ever; before its leaving entry a flip counts it (retains more); after, its chunks may fall below `wal_start_lsn` and recovery ignores them anyway. Safe, and it leaves.
-- *Marker `≤ T`:* `T` is the apply frontier, and a large transaction's frontier passes `c` only after its finalize (§12.7, C-T0 v8 §3.5), every conversion gated and so before step 0: image `k` holds it whole as ordinary entries. Dropped, safe.
-- *Marker reserved between step 0's taking of `T` and its entry:* `c` is issued above every earlier ts, so `c > T`; the set records it in the marker's own entry; counted.
-- *Two consecutive flips:* a drop at flip `k′` needs `c ≤ T_k′ ≤ T_k`.
-- *A flip whose meta never becomes durable:* the drop affects only the in-memory set; meta `k−1` counted the member when it had to (it was in the set, or started after that entry, or had `c ≤ T_{k−1}`), and step 6 recycles only on a durable meta. After a crash the set restarts empty and the boot checkpoint's `T` is the recovered frontier `≥ c`.
-- *A member whose first `Chunk` hopped:* its own LSN, past the `SegmentEnd`, enters the set; the pair is its own `prev`, the `SegmentEnd`. With a separate `SegmentEnd` entry and step 0's entry between it and the `Chunk`'s, the position read is that LSN and the chunk lands there: counted by the position.
-- *For ever:* a member with a marker leaves at the first flip whose `T ≥ c`, which comes once its finalize advances `M`; a markerless end leaves as it ends; a crash empties the set. Only a transaction still open stays, which is the rule's intent.
+> The store's append takes S for neither a `Chunk` nor the `SegmentEnd` of a `Chunk`'s hop. It may take S only for a `Commit` or `CommitMarker` and the `SegmentEnd` of its hop.
 
-Nothing in an interleaving of a leaving entry with step 0's one entry drops a member whose chunks are still needed. The rule's mutant and test (CHUNK-SET-KEEPS-ENDED) are still S-GAMMA-F1.
+With that phrase, the three walks change:
+- **Walk 1.** The `SegmentEnd` entry waits on neither G nor S and lands between E1 and E2. The mutant is caught, as §12.5 claims.
+- **Walk 2.** The hook never blocks, wherever "just before" falls.
+- **Walk 3.** The fixture may hop freely.
 
-### (iii) `t_append_section_leaf`
+**(a) or (b): (b).** The fix:
+- changes one clause of one sentence (§12.4 "Append");
+- leaves every other sentence true as written: RW2-2's "takes neither for a `Chunk`", RW2-3's "does not take it for one", the 7.13 Changelog's "for no `Chunk`" and the hook texts' "a thread that holds no gate (§12.4)";
+- changes no test's fixture, no mutant's definition or placement, and no count (S-DELTA's checker passes with it; dry run below).
 
-- *A-6c* (RW-6 to RW-8): the creation is held until the hopping reservation has returned, and the test fails past a bound. A correct reservation does not wait for the segment, so it returns at once and the hook then releases the creation; the writer creates the segment outside the section. Under APPEND-SECTION-IO the I/O form trips the `Env` hook; the wait form, however it waits (tracked lock, untracked spin), never returns while the creation is held and fails the bound (my G3). In the cooperative mode (N10) the bound is on the reservation's return, before the thread goes on to write, so the form is unchanged.
-- *A-7c* (shuttle): unchanged, and sound: under the mutant the hop holds the section waiting on the held creation, step 0 waits on the section holding the gate, the gated operation waits on the gate and the hook on that operation; every schedule deadlocks. A correct build finishes.
+S-DELTA's author cannot get it wrong, because it is one byte-exact block. Hence MERGE-WITH-FOLLOWUPS with S-GAMMA-F7, under the binding condition above.
 
-### (iv) The DropTree `w` in C-T0
+**Finding 2 (wording): not a defect, no rider.**
+- The status line and the 7.13 Changelog say "The racing hooks of both tests reserve with no gate held". That is true.
+- The hook texts say "a thread that holds no gate (§12.4)". A test's hook thread holds no C-T0 sequencer section, and §12.4 (with F7) states that the append takes neither lock.
+- S-DELTA's 7.14 Changelog records F7 (text below).
 
-C-T0 §9.1 now says a logged DropTree's mark raises `gc_w_used` to the `w` its op carries (the published `W` the drop-cleanup job read) and an unlogged one's to the `W` published at its mutation; the status line and the 8.6 Changelog say "logged" and record the unlogged case "as before". That matches S-STORE §6.8 step 1 (G3) and §12.3, and C-T0 §3.7 step 3's "raised by every DropTree mark that pass 2 replays" covers only logged ones, as it should.
+**Finding 3: still open, confirmed.**
+- S-GAMMA-F5 (RW-F5-1) applies at c6d03599 and after all of S-DELTA's blocks.
+- S-GAMMA-F6 (RW-F6-1) applies to C-T0 8.6 at c6d03599.
+- S-DELTA carries neither yet (it carries F1 to F4 only).
 
-## The four residuals, ruled
+**Correction to verdict 2.** Verdict 2 says "all thirteen S-STORE blocks (F1 to F5)". F1 to F5 are **twelve** S-STORE blocks (3 + 1 + 2 + 5 + 1). The thirteenth block, F6, is in C-T0. This is not a defect.
 
-1. **Real; blocking; closed by RW2-1 to RW2-4** (above). The alternative, "state where the mutants are equivalent and how the test behaves there", would leave START-LSN-SPLIT-READ unkillable on a conforming build and a hook that deadlocks, which is what verdict 1 refused for the gate; one sentence of rule is smaller and makes every mutant killable on every build.
-2. **Not a defect; rides in S-DELTA as S-GAMMA-F6.** C-T0 §3.2's "Each materialization is a gated operation" is about the materialisation's page mutations, and S-STORE §12.4 (RW-1) explicitly allows the reservation inside it; nothing leads an implementer wrong, and the tests reserve through the store's append directly. A pointer is still worth having. S-DELTA must add `docs/C-T0-txn-protocol.md` to its Touch only (with a C-T0 draft 8.7 status line and Changelog entry) or hand the block to the next C-T0 card.
-3. **Wording; rides as S-GAMMA-F5.** After three cases (aborted, marker `≤ T`, committed with no ts), "Either" means the first and third; it is still true read as any of them, so nobody builds anything wrong.
-4. **Card prose: not a spec defect, no carrier needed.** "Never weakened" bullet 3, D1's "this split is equivalent (safe), and the mutant is narrowed", D-2's summary, "For the gate" item 2 and "69 lines / 70 commands" are superseded by verdict 1 (RW-2, RW-16) and are non-normative. The orchestrator may mark them superseded when it applies this pass (with the one-line Edits note above); the card is local and does not ship.
+## The reservation × lock survey (once and for all)
 
-## Rework: one list (RW2-1 to RW2-4), then the card's Acceptance
+**What is listed.**
+- **Reservation kinds.** §12.4's list and §12.2's kinds: `Commit`, `CommitMarker`, `Chunk` (a first one, which enters the open-chunk set, or a later one), and `SegmentEnd`, either in the hopping record's entry or in an entry of its own (of a `Commit`/`CommitMarker` hop or of a `Chunk` hop).
+- **Locks step 0 holds across its entry and its read of `T`.** These are CX (§13: "At most one checkpoint runs at a time"; the whole checkpoint), G (exclusive, item 1 to item 3, so across `T`'s read and the entry), S (around the entry: "Inside the commit path's I-WAL-TS-ORDER critical section …, read `wal_ckpt_end`"; whether `T`'s read is also inside S is the build's choice) and A (the entry itself).
+- **Locks step 0 is neither required nor forbidden to hold.** These are the snapshot registry (a build may read `M` under it, C-T0 §3.6), the SSI mutex (ranked before S, C-T0 §8.4; no text has step 0 take it), frame latches and the root table (recording the map's root), the free-set lock, the catalog lock, the image-record list (step 2, not step 0) and the live-txn registry (a leaf).
 
-Apply in this order to `docs/S-STORE.md` at c1a9c515 (S-STORE draft 7.13 after RW-1 to RW-18). Each Old occurs exactly once, before any block is applied, and no two Olds overlap (checked by script). C-T0 is untouched. The drafts stay 7.13 and 8.6, and the counts stay 152 rows, 215 mutants and 47 tests. Fences here are four tildes; the card may use three backticks.
+In the table, "append" means the store's append and "caller" means the thread that calls it.
 
-**Dry run** (scratch clone of the card branch, outside the repository, with the four blocks committed): the card's 83 Acceptance lines plus AC-15 to AC-19, 87 run (`gate.sh` aside), 0 fail; the checker prints `152 rows; 215 mutants; 25 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`, `46 new since 7.10 (31 at 7.11, 11 at 7.12, 4 here), 46 of them judged on a Phase A row; 47 invariants, 47 tests`, `OK`. AC-15 to AC-19 all fail at c1a9c515. Verdict 1's S-GAMMA-F1 to F4 blocks and S-GAMMA-F5 still apply after RW2-1 to RW2-4 (each Old once, no overlap), and S-GAMMA-F6 applies to C-T0 at c1a9c515. I re-read §12.4 "Append", §12.6 "When the terms are taken" and "Why one entry", and §13 step 0 item 2 whole with the blocks applied: the leaf rule ("A thread may enter it holding … the I-WAL-TS-ORDER critical section") stays true for the commit path and for a caller that holds the section around a `Chunk`; nothing else names who takes that section for a `Chunk`.
+| Reservation | G (gate) | S (I-WAL-TS-ORDER) | A (append section) | CX (checkpoint) | Other locks step 0 may hold | Tests and mutants that depend on it |
+|---|---|---|---|---|---|---|
+| `Commit`, `CommitMarker` | append: **forbidden** (RW-1); caller: allowed (C-T0 §2.6 ranks S after G) | **required**: the reservation's entry lies in S (I-WAL-TS-ORDER; §12.4 "contains its entry"), held by the caller (C-T0 §3.1/§3.2 step 1) or taken by the append ("may take that section") | **required**: it is the entry | not stated; no text has it taken | append: none taken (leaf rule; no reason); caller: SSI mutex **required** for SER (C-T0 §8.4); no stripe, gate or latch acquired while in S (C-T0 §2.6) | step 0's S excludes them: `ts_ckpt_hi`/`wal_ckpt_end` bound (I-WAL-COVER), TS-AFTER-APPEND; the racing fixtures exclude them ("no `Commit` or `CommitMarker` above `T`") |
+| `SegmentEnd` of a `Commit`/`CommitMarker` hop, separate entry | append: forbidden (RW-1) | allowed (inside the `Commit`'s S; not required: a record slipping in after the `SegmentEnd` lands in the next segment) | required | not stated | as above | none |
+| `Chunk` (first or later), its hop in one entry | append: **forbidden** (RW-1); caller: allowed (gated materialisation, C-T0 §3.2) | append: **forbidden** (RW2-1); caller: allowed (§13 step 0, RW2-3) | required; a first `Chunk`'s set entry is in it (§12.4) | not stated (G4) | append: none taken; caller: lock-table entries, a settle stripe, frame latches allowed (leaf rule; S-GAMMA-F2) | `t_flip_chunk_race` (START-LSN-SPLIT-READ), `t_wal_chain_crash` racing step (WAL-START-PAIR-SPLIT-READ): both need a hook thread whose append takes neither G nor S |
+| `SegmentEnd` of a `Chunk` hop, separate entry | append: **forbidden** (RW-1) | append: **allowed at c6d03599: the gap**; forbidden after **S-GAMMA-F7**; caller: allowed | required | not stated (G4) | as for `Chunk` | `t_wal_chain_crash`'s hop form (WAL-START-PAIR-SPLIT-READ chain-head-first, on separate-entry builds); `t_flip_chunk_race` if its `X1` hops |
 
-### RW2-1. S-STORE §12.4 "Append": the store's append takes no I-WAL-TS-ORDER section for a `Chunk`
+**Ops carried inside a `Commit` or `Chunk`.** I checked the implementer's survey independently, and it holds.
+- **`RequireCkpt`** (§12.8 item 3). Its `Chunk` is written after the forced checkpoint's meta is durable. That is an ordering kept by waiting before the reservation; no lock is held across it.
+- **`DropTree`.** Its `w` is read under the snapshot registry by the drop-cleanup job before the commit (C-T0 §9.1). Its mark is a separate gated directory change. Its `Commit` is an ordinary `Commit` row.
+- **`CreateTree`, `Ddl`** (C-T6-rehost §5.3, §5.5). The tree's creation is a gated directory change, and the `Chunk` may be reserved inside it or outside it (RW-1).
+- None of these gives the append a reason to take any lock that step 0 holds.
+
+**Locks other than G, S and A.**
+- The leaf rule forbids every ranked lock *under* A, and nothing in the text gives a reservation a reason to take one *before* A.
+- Step 0 holds no lock-table entry, settle stripe or txn wait, so a caller's holding of those cannot block step 0's entries or a hook.
+
+**G4, CX.** No text makes a reservation wait on the checkpoint's own exclusion, and none forbids it before A.
+- The text presupposes reservations while a checkpoint runs:
+  - §13 step 0 item 3 releases the gate, and step 0 item 1 calls the exclusive hold the generalisation of PLAN-v3's "pause commit-apply", the only pause;
+  - `t_flip_chunk_race`'s hook "just after step 0's one entry" must return, and `X`'s chunks and marker follow it.
+- A build whose append waited for the checkpoint to end would stall every commit through steps 1 to 6. It would also deadlock that synchronous hook. No natural build does this, so it needs no spec text.
+- To converge, it is bound where the code is judged. A-6c's card must state that the store's append, for a `Chunk` or the `SegmentEnd` of a `Chunk`'s hop, takes no lock but the append critical section itself (below).
+
+**Survey result.** The only spec-text gap is the separate-entry `SegmentEnd` of a `Chunk`'s hop × S. S-GAMMA-F7 closes it.
+
+## Dry runs
+
+All dry runs were done in scratch, outside the repository.
+- **F7 on c6d03599's S-STORE.**
+  - Its Old occurs once.
+  - With F7 committed in a scratch clone of the card branch, the card's 87 lines run with one failure: line 81 (AC-15). AC-15 greps RW2-1's old clause; F7 supersedes it, and S-DELTA's Acceptance replaces it (below).
+  - The checker's output is unchanged (152 rows, 215 mutants, 47 tests, `OK`).
+- **Verdict 2's F1 to F5, then F7, on c6d03599.** Each Old occurs once, with no overlap.
+- **S-DELTA as written** (its 109 Old/New pairs: the 11 riders RW-F1-1 to RW-F4-5, then E1 to E80's 98 pairs) applies to c6d03599's S-STORE. Every Old occurs once. S-DELTA was checked against c1a9c515, and RW2 spans none of its Olds.
+- **S-DELTA, then F5, then F7.** Each Old occurs once. Applying F7 first and then S-DELTA and F5 gives a byte-identical file, so the order does not matter.
+- **S-DELTA's own Acceptance on that file** (with C-T0 at c6d03599): 108 run, 107 pass. The checker (its line 107) passes. The one failure is its line 108, the file list, which cannot pass on a branch where S-GAMMA's C-T0 change is not yet in the scaffold. It is expected and unrelated to F7.
+- **F6** applies to C-T0 at c6d03599.
+
+## Follow-ups (all ride in S-DELTA)
+
+- **S-GAMMA-F1 to F4.** These are verdict 1's (9abe5527), repeated byte for byte in verdict 2 (c5414fa6, "Follow-ups"). S-DELTA already carries all four (its riders RW-F1-1 to RW-F4-5; F4 taken, its D-13). They apply at c6d03599 unchanged (dry run above).
+- **S-GAMMA-F5: §12.6's "Either"** (verdict 2, residual 3). This is wording and may land at any time. Block RW-F5-1 is repeated below. S-DELTA does not carry it yet.
+- **S-GAMMA-F6: C-T0 §3.2's pointer to S-STORE §12.4** (verdict 2, residual 2). It must land before A-6d is cut. Block RW-F6-1 is repeated below. S-DELTA does not carry it yet. Either S-DELTA adds `docs/C-T0-txn-protocol.md` to its Touch only (a C-T0 draft 8.7 status line and Changelog entry), or the next C-T0 card carries it, and A-6d waits for that card.
+- **S-GAMMA-F7: the `SegmentEnd` of a `Chunk`'s hop** (this verdict, finding 1). This is the only remaining instance of the "the store's append takes a lock step 0 holds" gap in the text, and it must land before A-6c, A-6d, A-7c or A-7d is cut. Rule: the store's append takes the I-WAL-TS-ORDER section for neither a `Chunk` nor the `SegmentEnd` of a `Chunk`'s hop, and may take it only for a `Commit` or `CommitMarker` and the `SegmentEnd` of its hop. Without it, on a conforming build:
+  - the chain-head-first hop form of WAL-START-PAIR-SPLIT-READ is equivalent although §12.5 says it fails;
+  - the hop hook of `t_wal_chain_crash`, and `t_flip_chunk_race`'s hook if `X1` hops, can deadlock, even on a correct build.
+
+  It is one block (RW-F7-1), plus two Acceptance lines for S-DELTA, plus one clause in S-DELTA's 7.14 Changelog bullet (all below).
+
+### RW-F7-1. S-STORE §12.4 "Append": the `SegmentEnd` of a `Chunk`'s hop
 File: docs/S-STORE.md
 
 Old:
 ~~~~text
-and the open-chunk set, not the gate, keeps §12.6's terms right. The section also keeps
+Nor does the store's append take the I-WAL-TS-ORDER critical section for a `Chunk`: it may take that section for a `Commit` or `CommitMarker` (below), and a caller may hold it around a `Chunk`'s reservation or not (§13 step 0), but a `Chunk` reserved through the store's append by a thread that holds neither the gate nor that section waits on neither,
 ~~~~
 New:
 ~~~~text
-and the open-chunk set, not the gate, keeps §12.6's terms right. Nor does the store's append take the I-WAL-TS-ORDER critical section for a `Chunk`: it may take that section for a `Commit` or `CommitMarker` (below), and a caller may hold it around a `Chunk`'s reservation or not (§13 step 0), but a `Chunk` reserved through the store's append by a thread that holds neither the gate nor that section waits on neither, so it can fall between any two of step 0's entries to the append critical section, even where step 0 holds both around them. The section also keeps
+Nor does the store's append take the I-WAL-TS-ORDER critical section for a `Chunk`, nor for the `SegmentEnd` of a `Chunk`'s hop where a build reserves it in an entry of its own: it may take that section only for a `Commit` or `CommitMarker` and the `SegmentEnd` of its hop (below), and a caller may hold it around a `Chunk`'s reservation or not (§13 step 0), but a `Chunk` reserved through the store's append by a thread that holds neither the gate nor that section, its hop's `SegmentEnd` included, waits on neither,
 ~~~~
 
-### RW2-2. S-STORE §12.6, "Why one entry": who can fall inside step 0
-File: docs/S-STORE.md
+**S-DELTA's Acceptance for F7.** Two lines, added next to its rider lines. Neither contains a backtick. Each fails at c6d03599 and passes after RW-F7-1. They supersede S-GAMMA's AC-15, which greps the replaced clause:
 
-Old:
 ~~~~text
-A `Chunk` reserved by a caller that holds the gate cannot fall inside step 0, but one reserved by a caller that holds none can.
-~~~~
-New:
-~~~~text
-A `Chunk` reserved by a caller that holds the gate, or the I-WAL-TS-ORDER section, cannot fall inside step 0's hold of it, but one reserved by a caller that holds neither can, since the store's append takes neither for a `Chunk` (§12.4).
+- `cd nucleus/v3 && grep -n 'nor for the .SegmentEnd. of a .Chunk..s hop where a build reserves it in an entry of its own: it may take that section only for a .Commit. or .CommitMarker. and the .SegmentEnd. of its hop (below)' docs/S-STORE.md`
+- `cd nucleus/v3 && ! grep -n 'critical section for a .Chunk.: it may take that section for a .Commit.' docs/S-STORE.md`
 ~~~~
 
-### RW2-3. S-STORE §13 step 0, item 2
-File: docs/S-STORE.md
+**S-DELTA's 7.14 Changelog, in its "S-GAMMA's follow-ups" bullet:** add the clause "§12.4 now also says that the store's append takes the I-WAL-TS-ORDER critical section for no `SegmentEnd` of a `Chunk`'s hop, and only for a `Commit` or `CommitMarker` and its hop (S-GAMMA-F7)". Name F5 and F6 there too, if S-DELTA takes them. The checker, the counts (S-DELTA's 158 rows, 225 mutants and 48 tests) and every E-block are unchanged.
 
-Old:
-~~~~text
-`Chunk` reservations need not be made inside the critical section: a chunk appended
-~~~~
-New:
-~~~~text
-`Chunk` reservations need not be made inside the critical section, and the store's append does not take it for one (§12.4): a chunk appended
-~~~~
-
-### RW2-4. S-STORE Changelog 7.13, first bullet
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-§12.4 now states that a reservation is not a gated operation.
-~~~~
-New:
-~~~~text
-§12.4 now states that a reservation is not a gated operation, and that the store's append takes the I-WAL-TS-ORDER critical section for no `Chunk`.
-~~~~
-
-### The card's Acceptance
-
-- **AC-15 to AC-19**, added just before the checker line (no backtick in any command; each fails at c1a9c515 and passes after RW2-1 to RW2-4):
-
-  ~~~~text
-  - `cd nucleus/v3 && grep -n 'Nor does the store.s append take the I-WAL-TS-ORDER critical section for a .Chunk.: it may take that section for a .Commit. or .CommitMarker. (below)' docs/S-STORE.md`
-  - `cd nucleus/v3 && grep -n 'cannot fall inside step 0.s hold of it, but one reserved by a caller that holds neither can, since the store.s append takes neither for a .Chunk. (§12\.4)\.' docs/S-STORE.md`
-  - `cd nucleus/v3 && grep -n '.Chunk. reservations need not be made inside the critical section, and the store.s append does not take it for one (§12\.4): a chunk appended' docs/S-STORE.md`
-  - `cd nucleus/v3 && grep -n 'and that the store.s append takes the I-WAL-TS-ORDER critical section for no .Chunk.\.' docs/S-STORE.md`
-  - `cd nucleus/v3 && ! grep -n 'cannot fall inside step 0, but one reserved by a caller that holds none can' docs/S-STORE.md`
-  ~~~~
-- The card's other 83 lines, the checker line, the file-list line and `gate.sh` are unchanged.
-
-## Follow-ups (ride in S-DELTA)
-
-S-GAMMA-F1 to F4 are verdict 1's, unchanged; their blocks are repeated below byte for byte (from 9abe5527) so that S-DELTA's author has every rider in one file. Each Old occurs once in 7.13 after RW-1 to RW-18 and RW2-1 to RW2-4, and all thirteen S-STORE blocks (F1 to F5) apply together; F6 applies to C-T0 8.6 (checked by script).
-
-- **S-GAMMA-F1: a mutant and a test for the leaving rule** (before A-6d is cut). RW-16 states the rule; nothing tests it. Mutant CHUNK-SET-KEEPS-ENDED, judged at A-7d by `t_flip_chunk_race`'s variant *ended*. Blocks RW-F1-1 to RW-F1-3.
-- **S-GAMMA-F2: the leaf rule's entry list** (before A-6c is cut): name the lock-table entries, the settle stripe and the SSI mutex. Block RW-F2-1.
-- **S-GAMMA-F3: B-6's second AS OF at the op's `w`** (before B-6). Blocks RW-F3-1, RW-F3-2.
-- **S-GAMMA-F4 (optional): pin the one value in normal operation** (before A-7c is cut; may be waived). Blocks RW-F4-1 to RW-F4-5.
-- **S-GAMMA-F5: §12.6's "Either"** (residual 3; wording, any time). After three listed cases, "Either" is meant to name the aborted transaction and the one that committed with no ts. Block RW-F5-1.
-- **S-GAMMA-F6: C-T0 §3.2's pointer to S-STORE §12.4** (residual 2; before A-6d is cut, since A-6d writes the chunk path). "Each materialization is a gated operation" reads naturally as the reservation being inside the gate; say that it may be either way and why. C-T0 is not in S-DELTA's Touch only as briefed: S-DELTA adds it with a C-T0 draft 8.7 status line and Changelog entry, or hands the block to the next C-T0 card. Block RW-F6-1.
-
-### RW-F1-1. S-STORE §14, START-LSN-SPLIT-READ's test: variant *ended* and its mutant
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-Under START-LSN-SPLIT-READ, meta `k`'s `wal_start_lsn` lies past `q`, pass 2 applies `X`'s later chunks at `c` without the first, and the open returns `Ok` without `k1`.
-~~~~
-New:
-~~~~text
-Under START-LSN-SPLIT-READ, meta `k`'s `wal_start_lsn` lies past `q`, pass 2 applies `X`'s later chunks at `c` without the first, and the open returns `Ok` without `k1`. Variant *ended*: with no `Commit` or `CommitMarker` above `T` and no other chunked transaction open, `X` reserves chunks and then aborts, or, in a second run, rolls back to a savepoint that leaves it no data and commits with no ts (C-T0 v8 §3.1 step 0); a flip after `X` has left the open-chunk set records the append position its entry reads as `wal_start_lsn`, past `X`'s chunks.
-- **CHUNK-SET-KEEPS-ENDED:** a transaction that ends with no marker never leaves the open-chunk set (§12.6), so every later flip's `wal_start_lsn` stays at its first `Chunk` and no segment from there on is ever recycled: safe, but one aborted large transaction stops the WAL from being recycled. Test `t_flip_chunk_race`, variant *ended* (A-7d).
-~~~~
-
-### RW-F1-2. S-STORE §15, I-REDO-COMPLETE's row
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-Test `t_flip_chunk_race` (a flip that races a new chunked transaction's first `Chunk`; §14) | A-6d, A-7d | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK, START-LSN-SPLIT-READ |
-~~~~
-New:
-~~~~text
-Test `t_flip_chunk_race` (a flip that races a new chunked transaction's first `Chunk`; §14); a transaction that ends with no marker leaves the set as it ends and stops holding `wal_start_lsn` back (its variant *ended*) | A-6d, A-7d | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK, START-LSN-SPLIT-READ, CHUNK-SET-KEEPS-ENDED |
-~~~~
-
-### RW-F1-3. S-STORE §15.1, `t_flip_chunk_race`'s row
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-the acked commit, a power cut and recovery from meta `k` | START-LSN-SPLIT-READ (on A-7c's step 0 and A-6d's chunk path) |
-~~~~
-New:
-~~~~text
-the acked commit, a power cut and recovery from meta `k`; variant *ended* | START-LSN-SPLIT-READ (on A-7c's step 0 and A-6d's chunk path), CHUNK-SET-KEEPS-ENDED (on A-6d's chunk path) |
-~~~~
-
-### RW-F2-1. S-STORE §12.4, the leaf rule: what a thread may hold on entry
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-A thread may enter it holding the epoch gate, frame latches (a build may reserve a `Chunk` inside a gated materialisation, C-T0 v8 §3.2) and the I-WAL-TS-ORDER critical section, with what C-T0 v8 §2.6 ranks before that section;
-~~~~
-New:
-~~~~text
-A thread may enter it holding any lock ranked before it: the lock-table entries that a writer holds logically and a settle stripe (C-T0 v8 §2.6), the epoch gate, frame latches (a build may reserve a `Chunk` inside a gated materialisation, C-T0 v8 §3.2), and the I-WAL-TS-ORDER critical section with the SSI mutex ranked before it (C-T0 v8 §2.6, §8.4);
-~~~~
-
-### RW-F3-1. S-STORE §10.5, `t_drop_restart_floor`: the second AS OF in (d) and (e)
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-one at the reopened `W`, which is `gc_w_used` as recovery leaves it (so `w` in (d) and (e)) and lies above `S_ddl`, succeeds
-~~~~
-New:
-~~~~text
-one at the reopened `W`, which is `gc_w_used` as recovery leaves it and lies above `S_ddl`, and which in (d) and (e) is taken at the op's `w` itself, the value a correct reopen publishes, so that a floor left above `w` refuses it, succeeds
-~~~~
-
-### RW-F3-2. S-STORE §15.1, `t_drop_restart_floor`'s B-6 row
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-and at the reopened `W` (served, without the tree) |
-~~~~
-New:
-~~~~text
-and at the reopened `W`, at the op's `w` in (d) and (e) (served, without the tree) |
-~~~~
-
-### RW-F4-1. S-STORE §10.5, `t_drop_restart_floor`: exact in (a)
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-After each reopen `gc_w_used` is at least `w` (in (d) and (e) exactly `w`, the larger of `w` and the opened meta's `gc_w`),
-~~~~
-New:
-~~~~text
-After each reopen `gc_w_used` is at least `w` (exactly `w` in (a), with `W` published above `w` before the mark, and in (d) and (e), the larger of `w` and the opened meta's `gc_w`),
-~~~~
-
-### RW-F4-2. S-STORE §10.5, the mutant
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-    - **DROP-OP-W-ZERO**: the op codec drops `w`, so a replayed op carries 0 and its mark raises nothing, which leaves REPLAY-DROP-NO-GCW's floor.
-~~~~
-New:
-~~~~text
-    - **DROP-OP-W-ZERO**: the op codec drops `w`, so a replayed op carries 0 and its mark raises nothing, which leaves REPLAY-DROP-NO-GCW's floor;
-    - **DROP-MARK-AT-PUBLISHED-W**: a logged DropTree's mark raises `gc_w_used` to the `W` published at its mutation, not to its op's `w`: safe, but an image that holds the mark then records a floor above `w`, and a restart from it refuses AS OF snapshots in `[w, W)` that a replay of the same drop would admit.
-~~~~
-
-### RW-F4-3. S-STORE §10.5, the kill
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-DROP-OP-W-ZERO fails (d) and (e) with the opened meta's `gc_w`, and DROP-GCW-AT-TS fails (f).
-~~~~
-New:
-~~~~text
-DROP-OP-W-ZERO fails (d) and (e) with the opened meta's `gc_w`, DROP-MARK-AT-PUBLISHED-W fails (a) with the `W` published at the mark, and DROP-GCW-AT-TS fails (f).
-~~~~
-
-### RW-F4-4. S-STORE §15.1, `t_drop_restart_floor`'s A-7c row
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-variant (a) through the flip, meta `k`'s `gc_w ≥ w`; variant (f), the meta write succeeds with `gc_w ≤ T` | DROP-NO-GCW, DROP-GCW-AT-WALK, DROP-GCW-AT-TS |
-~~~~
-New:
-~~~~text
-variant (a) through the flip, with S3's `W` above `w` at the mark, meta `k`'s `gc_w` exactly `w`; variant (f), the meta write succeeds with `gc_w ≤ T` | DROP-NO-GCW, DROP-GCW-AT-WALK, DROP-GCW-AT-TS, DROP-MARK-AT-PUBLISHED-W |
-~~~~
-
-### RW-F4-5. S-STORE §15, I-GCW's row
-
-File: docs/S-STORE.md
-
-Old:
-~~~~text
-DROP-GCW-AT-TS, REPLAY-DROP-NO-GCW, REPLAY-DROP-AT-TS, DROP-OP-W-ZERO |
-~~~~
-New:
-~~~~text
-DROP-GCW-AT-TS, REPLAY-DROP-NO-GCW, REPLAY-DROP-AT-TS, DROP-OP-W-ZERO, DROP-MARK-AT-PUBLISHED-W |
-~~~~
+### Verdict 2's F5 and F6 blocks, repeated byte for byte (from c5414fa6)
 
 ### RW-F5-1. S-STORE §12.6, the transactions that do not count: name the two
 
@@ -355,37 +212,70 @@ Each materialization is a gated operation, or a bounded batch of them. A checkpo
 
 ## Corrections of record (for the orchestrator; this gate edits neither)
 
-- Verdict 1's corrections stand (`verdicts/S-BETA.md` at 5cb70935's qualifier; QUEUE S-BETA-F1's CAUTION). Its ruling (C) is extended, not reversed: the race needs a first `Chunk` reserved with neither the gate nor step 0's I-WAL-TS-ORDER section in its way; after RW2-1 the store's append takes neither for a `Chunk`, so the tests can always force it.
-- QUEUE: S-GAMMA's row records REWORK (second) and this verdict's commit; S-GAMMA-F5 and F6 join F1 to F4 under S-DELTA.
+- **Verdict 2's ruling (C) extension stands, now complete.** The race needs a first `Chunk` reserved with none of step 0's locks in its way. After RW-1, RW2-1 and S-GAMMA-F7, the store's append takes none for a `Chunk` or its hop, so the tests can always force it.
+- **QUEUE.**
+  - S-GAMMA's row records MERGE-WITH-FOLLOWUPS at this verdict's commit.
+  - S-GAMMA-F5, F6 and F7 join F1 to F4 under S-DELTA. F6 goes there only if S-DELTA takes C-T0; otherwise it waits for the next C-T0 card, and A-6d waits for that card.
+  - The binding condition above goes on the S-DELTA row and on the A-6a, A-6c, A-6d, A-7c and A-7d rows.
+- **Verdict 2's "thirteen S-STORE blocks (F1 to F5)"** reads "twelve S-STORE blocks (F1 to F5) and one C-T0 block (F6)".
 
 ## What S-DELTA must change
 
-1. **Rebase onto 7.13 as it stands after RW2-1 to RW2-4.** Besides the card's "Rebase points" and verdict 1's list (RW-1 to RW-18), its Olds must not span: §12.4 "Append" from "and the open-chunk set, not the gate, keeps" to "The section also keeps" (RW2-1); §12.6 "Why one entry", its second sentence (RW2-2); §13 step 0 item 2, "`Chunk` reservations need not be made inside the critical section, …" (RW2-3); the end of the 7.13 Changelog's first bullet (RW2-4).
-2. **Carry S-GAMMA-F1, F2, F3 and F5**, and F4 unless it is waived, with the exact blocks above; **carry F6** by adding `docs/C-T0-txn-protocol.md` to its Touch only (C-T0 draft 8.7) or hand it to the next C-T0 card.
-3. **Its checker** starts from S-GAMMA's, unchanged by RW2. NG gains CHUNK-SET-KEEPS-ENDED (on A-7d) and, if F4 is taken, DROP-MARK-AT-PUBLISHED-W (on A-7c): 216 or 217 mutants. F1 and F4 change text that four of S-GAMMA's Acceptance greps match (the I-REDO-COMPLETE row, "After each reopen …", "REPLAY-DROP-AT-TS fails (d) and (e) …", the I-GCW row), and F5 changes no grepped text; S-DELTA's own Acceptance supersedes them.
+1. **Rebase onto c6d03599's 7.13.**
+   - Its 109 pairs apply unchanged (dry run above).
+   - Its "Rebase points" should cite c6d03599, not c1a9c515.
+   - Its Olds must not span RW2-1 to RW2-4's text (verdict 2, "What S-DELTA must change", item 1). None does.
+2. **Carry every rider.**
+   - **F1 to F4:** carried already.
+   - **F5:** RW-F5-1, above.
+   - **F6:** RW-F6-1, above, with `docs/C-T0-txn-protocol.md` added to the Touch only and a C-T0 draft 8.7 status line and Changelog entry; or hand it to the next C-T0 card, as above.
+   - **F7:** RW-F7-1, its two Acceptance lines and its Changelog clause.
+
+   Apply order: the riders first, as S-DELTA does now (F1 to F5, F7), then E1 to E80. Every order checked gives the same file.
+3. **Supersede S-GAMMA's AC-15** with F7's two lines. S-DELTA's checker is unchanged.
 
 ## What the plan card must change
 
-Verdict 1's list stands (A-6c, A-6d, A-7c, A-7d, B-6, C-T6-rehost §7.4, QUEUE), with one addition:
-- **A-6c:** the store's append takes no gate, and takes the I-WAL-TS-ORDER section, if at all, only for a `Commit` or `CommitMarker`, never for a `Chunk` (§12.4 after RW-1 and RW2-1). The leaf rule, `t_flip_chunk_race`'s hook and `t_wal_chain_crash`'s racing hook rely on it. A-6c's own I-WAL-TS-ORDER row (TS-AFTER-APPEND) is unaffected.
-- **A-6d:** C-T0's materialisation may hold the gate or the sequencer section around its `Chunk`'s reservation; the chunk path's first-`Chunk` set entry is in the store's append either way (S-GAMMA-F6 for C-T0's sentence).
+Verdict 1's list and verdict 2's additions stand (A-6c, A-6d, A-7c, A-7d, B-6, C-T6-rehost §7.4, QUEUE). Add:
+- **A-6a, A-6c, A-6d, A-7c and A-7d are cut only after S-DELTA merges.** This is binding: no card that reads S-STORE §12.4, §12.6 or §13 step 0 is cut before S-DELTA merges. A-6a also waits for the owner's final word on the 8-byte watermark (below).
+- **A-6c.** For a `Chunk`, and for the `SegmentEnd` of a `Chunk`'s hop, the store's append takes no lock but the append critical section itself:
+  - not the epoch gate (RW-1);
+  - not the I-WAL-TS-ORDER section (RW2-1, S-GAMMA-F7);
+  - and it never waits on the checkpoint's own exclusion (G4).
+
+  It may take the I-WAL-TS-ORDER section only for a `Commit` or `CommitMarker` and its hop. A-6c's card should test the append for this directly: a reservation, hopping and not, made from a thread with nothing held, while another thread holds the gate exclusively and the I-WAL-TS-ORDER section, returns within the bound that `t_append_section_leaf` already uses.
+- **A-7d.** `t_wal_chain_crash`'s hop form and `t_flip_chunk_race` may use a hopping first `Chunk` freely, once F7 lands.
 
 ## The owner's points, in plain words
 
-1. **The 8-byte watermark in the drop record (S-BETA-O1).** Unchanged from verdict 1, and this gate also finds it sound. *What users gain:* after a crash that follows a DROP or TRUNCATE's cleanup, time-travel (AS OF) queries in the window between "cleanup became allowed" and "cleanup ran" keep working; under 7.12 they were refused. *Cost:* 8 bytes per dropped table or index, in the cleanup commit only. **Timing: it must be final before A-6a is cut**, because A-6a fixes the log's byte format; after that, changing it is a format change (free until A-7e's compatibility verdict, a migration after). Recommendation: keep it.
-2. **The race this card fixes,** in one line: a crash could lose part of an acknowledged large transaction that began exactly as a checkpoint began, on some builds the old text allowed. The card fixes it on every build. Verdict 1 added "writing a log piece never takes the checkpoint's lock" so the tests can force the race; this pass adds the matching sentence for the other lock the checkpoint holds at that moment (the commit-ordering lock), for the same reason. Without it, a test could hang on a correct build or miss a regression.
-3. **Nothing else changes for users.** This pass is four sentences and five checks; no format, behaviour or test count changes.
+1. **The 8-byte watermark in the drop record (S-BETA-O1).** Unchanged from verdicts 1 and 2, and this gate finds it sound too.
+   - *What users gain:* after a crash that follows a DROP or TRUNCATE's cleanup, time-travel (AS OF) queries in the window between "cleanup became allowed" and "cleanup ran" keep working.
+   - *Cost:* 8 bytes per dropped table or index, in the cleanup commit only.
+   - **It must be final before A-6a is cut,** because A-6a fixes the log's byte format. After that, changing it is a format change: free until A-7e's compatibility verdict, a migration after.
+   - Recommendation: keep it.
+2. **The race this card fixes.** A crash could lose part of an acknowledged large transaction that began exactly as a checkpoint began. The card fixes it on every build. Three passes have made sure the tests can always provoke the race: writing a log piece never takes the checkpoint's lock (verdict 1), nor the commit-ordering lock (verdict 2), nor that lock for the filler record a log piece writes when it moves to a new log file (this verdict, S-GAMMA-F7). Without the last one, on some correct builds a test could hang, or miss a regression of this exact bug.
+3. **Why merge now, with F7 riding.** F7 is one clause, and the next spec card (S-DELTA) carries it with the other six riders. No implementation card can be cut from the text before S-DELTA merges. Nothing else changes for users: no format, behaviour or test-count change in this pass.
 
 ## History
 
-- **Verdict 1: REWORK, `9abe55276e3334c02ae880551db9458c96c75191` on `f654984997460c5218629d651d90c124b3fd71c5`** (gate P, claude-opus-5-5, session 099ee6b7-66d5-4dc5-b762-5419bc5a0a2b, GATE EXIT=0). It found the edit faithful (the card's 54 blocks reproduce f6549849) and ruled (C) on the race: drafts 7.8 to 7.12 left open whether a `Chunk` reservation holds the epoch gate, so the loss was real on a build whose first-`Chunk` reservation held no gate and impossible on one that reserved every `Chunk` inside a gated operation, where START-LSN-SPLIT-READ was equivalent and the racing hooks could not reserve. It asked for 18 blocks and 14 Acceptance lines:
-  - RW-1, RW-4: a reservation is not a gated operation and the store's append takes no gate (§12.4, §12.6);
-  - RW-2, RW-3, RW-12: WAL-START-PAIR-SPLIT-READ's chain-head-first order restored, with a hop form of the racing step on a build that reserves a hop's `SegmentEnd` in an entry of its own;
-  - RW-3, RW-5, RW-9: both racing hooks reserve through the store's append from a thread that holds no gate;
-  - RW-6 to RW-8: `t_append_section_leaf` at A-6c holds the creation until the hopping reservation returns, within a bound;
-  - RW-10, RW-11: the status line and Changelog name the builds on which the loss was real;
-  - RW-16 to RW-18: the open-chunk set's leaving rule (removal required, the set empty at open, "drops" not "may drop");
-  - RW-13 to RW-15: C-T0 §9.1's unlogged DropTree raise, and "logged" in its status line and 8.6 entry;
-  - follow-ups S-GAMMA-F1 to F4 for S-DELTA (repeated above).
-- **The rework, `c1a9c5152f65561a30ca8170ddb41d5424d32e1a`:** RW-1 to RW-18 applied by script (S-STORE +13/−13, C-T0 +3/−3), the card's Acceptance updated (AC-1 replaced, AC-2 to AC-14 added: 83 lines), its 54 edit blocks unchanged. Its implementer reported four residuals, ruled above.
-- **Verdict 2 (this one): REWORK** on c1a9c515, RW2-1 to RW2-4 and AC-15 to AC-19, for residual 1; residuals 2 and 3 ride as S-GAMMA-F6 and F5.
+- **Verdict 1: REWORK, `9abe55276e3334c02ae880551db9458c96c75191` on `f654984997460c5218629d651d90c124b3fd71c5`** (gate P, claude-opus-5-5, session 099ee6b7-66d5-4dc5-b762-5419bc5a0a2b, GATE EXIT=0).
+  - **Findings.** The edit was faithful: the card's 54 blocks reproduce f6549849. It ruled (C) on the race: drafts 7.8 to 7.12 left open whether a `Chunk` reservation holds the epoch gate, so the loss was real on a build whose first-`Chunk` reservation held no gate.
+  - **What it asked for:** 18 blocks and 14 Acceptance lines.
+    - RW-1, RW-4: a reservation is not a gated operation, and the store's append takes no gate;
+    - RW-2, RW-3, RW-12: WAL-START-PAIR-SPLIT-READ's chain-head-first order restored, with a hop form;
+    - RW-3, RW-5, RW-9: the racing hooks reserve from a thread that holds no gate;
+    - RW-6 to RW-8: `t_append_section_leaf` at A-6c within a bound;
+    - RW-10, RW-11: the status line and the Changelog;
+    - RW-16 to RW-18: the open-chunk set's leaving rule;
+    - RW-13 to RW-15: C-T0 §9.1's unlogged DropTree raise.
+  - **Follow-ups:** S-GAMMA-F1 to F4.
+- **Rework 1, `c1a9c5152f65561a30ca8170ddb41d5424d32e1a`.** RW-1 to RW-18 applied by script (S-STORE +13/−13, C-T0 +3/−3). Acceptance went to 83 lines (AC-1 replaced, AC-2 to AC-14 added).
+- **Verdict 2: REWORK, `c5414fa693ae61c4c3305ff71a08d8aee2203974` on `c1a9c5152f65561a30ca8170ddb41d5424d32e1a`** (gate P, claude-opus-5-5, session 2543ceb9-7772-4b2d-b9a2-5501435b3b9e, GATE EXIT=0).
+  - **Finding.** Residual 1 was real: nothing stopped the store's append from taking the I-WAL-TS-ORDER section around a `Chunk`'s reservation.
+  - **What it asked for:** RW2-1 to RW2-4 (S-STORE only), saying the append takes no such section for a `Chunk`, and AC-15 to AC-19.
+  - **Follow-ups:** S-GAMMA-F5 ("Either") and S-GAMMA-F6 (C-T0 §3.2's pointer).
+- **Rework 2, `c6d03599dc737fa997a2aca2cdb188cbf0137396`.** RW2-1 to RW2-4 applied byte for byte (S-STORE +4/−4; C-T0 unchanged). The card's Acceptance went to 88 commands. Its Edits line was updated, and four stale passages were marked superseded. Its implementer reported the `SegmentEnd` instance (finding 1), a wording point (finding 2) and the open F5 and F6.
+- **Verdict 3 (this one): MERGE-WITH-FOLLOWUPS on c6d03599.**
+  - Finding 1 is real and rides as S-GAMMA-F7.
+  - The survey found no further instance in the text; G4 is bound in A-6c's card.
+  - Binding condition: no card that reads §12.4, §12.6 or §13 step 0 is cut before S-DELTA merges.
