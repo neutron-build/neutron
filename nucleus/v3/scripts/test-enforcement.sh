@@ -5407,6 +5407,124 @@ r1_list() {
 }
 expect_ok "R1: the real SHORT_COMMIT_MERGES has 44 distinct full 40-hex ids, one per line with a card id" r1_list
 expect_ok "git state: none after the full-id rows" no_state
+# --- chain merges: CHAIN_MERGES (MERGE-CHAIN-1) -----------------------------
+# One listed card merge may ADD other cards' verdict files: its tip listed by
+# full id with its card ID, a P verdict on a P card, each carried file absent at
+# BASE and present at the tip; every other rule still runs. Tested against a
+# copy of the scripts whose marker block lists the test tips, as the L rows do
+# for SHORT_COMMIT_MERGES; the real file is never changed. Plain commits.
+# chain_copy ENTRY...: write $v3/scripts/.chain, its CHAIN_MERGES block holding
+# exactly the entries given ("<tip id> <ID>").
+chain_copy() {
+  local d=$v3/scripts/.chain e
+  rm -rf "$d"; mkdir -p "$d"; cp "$v3"/scripts/*.sh "$d"/
+  {
+    sed -n '1,/^# BEGIN CHAIN_MERGES (frozen)$/p' "$v3/scripts/enforce-lib.sh"
+    echo 'CHAIN_MERGES=('; for e in "$@"; do echo "  \"$e\""; done; echo ')'
+    sed -n '/^# END CHAIN_MERGES$/,$p' "$v3/scripts/enforce-lib.sh"
+  } >"$d/enforce-lib.sh"
+}
+# chain_premise ENTRY...: the copy differs from the real file only inside the
+# marker block, and the block lists exactly the entries given.
+chain_premise() {
+  local d=$v3/scripts/.chain want got
+  want=$(printf '%s\n' "$@"); got=$(bash -c '. "$1/enforce-lib.sh" && printf "%s\n" "${CHAIN_MERGES[@]}"' _ "$d")
+  cmp <(sed '/^# BEGIN CHAIN_MERGES (frozen)$/,/^# END CHAIN_MERGES$/d' "$v3/scripts/enforce-lib.sh") \
+    <(sed '/^# BEGIN CHAIN_MERGES (frozen)$/,/^# END CHAIN_MERGES$/d' "$d/enforce-lib.sh") && [ "$got" = "$want" ]
+}
+mc_chain() { (cd "$v3" && bash scripts/.chain/merge-card.sh "$1"); }
+audit_chain() { (cd "$v3" && bash scripts/.chain/audit-merges.sh "$1"); }
+audit_chain_ok() { local o rc=0; o=$(audit_chain "$1" 2>&1) || rc=$?; echo "$o"; [ "$rc" -eq 0 ] && grep -qE "^audit: ok \([0-9]+ commits\)$" <<<"$o"; }
+cm_chain() { (cd "$v3" && . scripts/.chain/core-paths-lib.sh && . scripts/.chain/enforce-lib.sh && check_merge "$@"); }
+# carry_line NAME: the refusal line for verdicts/NAME.md.
+carry_line() { echo "nucleus/v3/verdicts/$1.md: a card may change only its own verdict file"; }
+# chain_card ID GATE TIER CARDGATE OP NAME [OP NAME...]: card ID (Gate GATE,
+# Class standard) and card/v3-ID off the scaffold with one work commit that,
+# per pair, adds (add), appends to (edit) or removes (del) verdicts/NAME.md, or
+# adds docs/NAME.md (doc),
+# plus spikes/<id>.txt; then ID's verdict (Gate-tier TIER, Card-gate CARDGATE).
+chain_card() {
+  local id=$1 g=$2 tier=$3 cg=$4; shift 4
+  card "$id" "$g" standard
+  git -C "$r" checkout -q -b "card/v3-$id" nucleus/v3-scaffold
+  while [ $# -gt 0 ]; do
+    case $1 in
+      add) printf 'Card: %s\n' "$2" >"$v3/verdicts/$2.md" ;;
+      edit) echo "edited by $id" >>"$v3/verdicts/$2.md" ;;
+      del) rm "$v3/verdicts/$2.md" ;;
+      doc) echo "$id" >"$v3/docs/$2.md" ;;
+    esac
+    shift 2
+  done
+  echo "$id" >"$v3/spikes/${id,,}.txt"
+  git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: $id work"
+  verdict "$id" "$tier" MERGE standard "$cg"
+}
+chain_card CM P P P add CMA add CMB
+cm_tip=$(git -C "$r" rev-parse card/v3-CM)
+chain_card CMDOC P P P add CMDA doc cm
+chain_card CME P P P edit BOOT
+chain_card CMD P P P del BOOT
+chain_card CMS1 P S P add CMS1X
+chain_card CMS2 S P S add CMS2X
+# CM4b: a verdict file the merge base has, the branch deletes and the merge's
+# first parent (audit BASE) also lacks, so only the present-at-tip test refuses.
+git -C "$r" checkout -q -b cm4b-base nucleus/v3-scaffold && printf 'Card: CMZ\n' >"$v3/verdicts/CMZ.md" && git -C "$r" add -A && git -C "$r" commit -qm "cm4b: CMZ's verdict at the merge base"
+git -C "$r" checkout -q -b cm4b-p1 cm4b-base && git -C "$r" rm -q "$v3/verdicts/CMZ.md" && git -C "$r" commit -qm "cm4b: the first parent lacks CMZ's verdict"
+card CMX P standard
+git -C "$r" checkout -q -b card/v3-CMX cm4b-base && git -C "$r" rm -q "$v3/verdicts/CMZ.md" && echo CMX >"$v3/spikes/cmx.txt" && git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: CMX work"
+verdict CMX P MERGE standard P
+cmx_tip=$(git -C "$r" rev-parse card/v3-CMX)
+# CM6a: one more verdict commit on top of the listed tip (it changes only CM's
+# own verdict and names the listed tip as the commit under it). CM6b: the same
+# work and the same verdict text rebuilt as new commits. Both are built here,
+# before the copy exists, and swapped onto card/v3-CM by their rows.
+git -C "$r" checkout -q --detach "$cm_tip" && sed -i -e 's/^Date: .*/Date: 2026-10-18/' -e "s/^Commit: .*/Commit: $cm_tip/" "$v3/verdicts/CM.md" && git -C "$r" commit -qam "nucleus v3: CM verdict MERGE (re-committed)"
+cm6a_tip=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q --detach nucleus/v3-scaffold && git -C "$r" checkout -q "$cm_tip^" -- nucleus/v3 && GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' git -C "$r" commit -qm "nucleus v3: CM work (rebuilt)" && verdict CM P MERGE standard P
+cm6b_tip=$(git -C "$r" rev-parse HEAD)
+cm6_premise() { [ "$(git -C "$r" rev-parse "$cm6a_tip^")" = "$cm_tip" ] && [ "$(git -C "$r" diff-tree --no-commit-id --name-only -r "$cm6a_tip")" = nucleus/v3/verdicts/CM.md ] && [ "$cm6b_tip" != "$cm_tip" ] && [ "$(git -C "$r" rev-parse "$cm6b_tip^^{tree}")" = "$(git -C "$r" rev-parse "$cm_tip^^{tree}")" ]; }
+expect_ok "premise: CM6a sits one verdict commit on the listed tip; CM6b has the listed work's tree under a new tip id" cm6_premise
+cm4b_premise() { local m; m=$(git -C "$r" merge-base cm4b-p1 card/v3-CMX) && [ "$m" = "$(git -C "$r" rev-parse cm4b-base)" ] && git -C "$r" cat-file -e "$m:nucleus/v3/verdicts/CMZ.md" && ! git -C "$r" cat-file -e "cm4b-p1:nucleus/v3/verdicts/CMZ.md" 2>/dev/null && ! git -C "$r" cat-file -e "card/v3-CMX:nucleus/v3/verdicts/CMZ.md" 2>/dev/null; }
+expect_ok "premise: CM4b: CMZ's verdict is at the merge base, absent at the first parent and at CMX's tip" cm4b_premise
+chain_copy "$cm_tip CM" "$(git -C "$r" rev-parse card/v3-CMDOC) CMDOC" "$(git -C "$r" rev-parse card/v3-CME) CME" "$(git -C "$r" rev-parse card/v3-CMD) CMD" \
+  "$(git -C "$r" rev-parse card/v3-CMS1) CMS1" "$(git -C "$r" rev-parse card/v3-CMS2) CMS2" "$cmx_tip CMX"
+expect_ok "premise: the chain copy differs only in its marker block, listing the seven test tips" chain_premise "$cm_tip CM" "$(git -C "$r" rev-parse card/v3-CMDOC) CMDOC" "$(git -C "$r" rev-parse card/v3-CME) CME" "$(git -C "$r" rev-parse card/v3-CMD) CMD" \
+  "$(git -C "$r" rev-parse card/v3-CMS1) CMS1" "$(git -C "$r" rev-parse card/v3-CMS2) CMS2" "$cmx_tip CMX"
+scratch; expect_ok "CM1: the copy's merge-card merges CM's listed tip, carrying CMA's and CMB's new verdict files" mc_chain CM
+expect_ok "CM1: both carried files are on the pass" bash -c "git -C '$r' cat-file -e scratch/pass1:nucleus/v3/verdicts/CMA.md && git -C '$r' cat-file -e scratch/pass1:nucleus/v3/verdicts/CMB.md"
+expect_ok "CM1: the copy's audit accepts the chain merge" audit_chain_ok scratch/pass1
+cm1b() { local o rc=0; o=$(mc_chain CMDOC 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "nucleus/v3/docs/cm.md: docs/ changes need Class: spec and a P verdict" <<<"$o" && ! grep -qF "$(carry_line CMDA)" <<<"$o"; }
+scratch; expect_ok "CM1b: a listed tip still meets every other rule: CMDOC's docs/ change without Class: spec is refused, its carried file is not" cm1b
+scratch; expect_ok "CM2: merge-card with the real list refuses CM's branch, naming each carried file (every unlisted tip, as before)" out_has "$(carry_line CMA)" "$(carry_line CMB)" -- mc CM
+scratch; expect_ok "CM3: a listed tip whose range edits a verdict file present at the merge base is refused" out_has "$(carry_line BOOT)" -- mc_chain CME
+scratch; expect_ok "CM4a: a listed tip whose range deletes a verdict file present at the merge base is refused" out_has "$(carry_line BOOT)" -- mc_chain CMD
+expect_ok "CM4b: audit mode: a listed tip whose range deletes a verdict file its first parent also lacks is refused (absent at the tip)" out_has "$(carry_line CMZ)" -- cm_chain CMX cm4b-p1 card/v3-CMX audit "$(git -C "$r" rev-parse cm4b-p1)"
+scratch; expect_ok "CM5a: a listed tip with Gate-tier S is refused, naming its carried file" out_has "$(carry_line CMS1X)" "card needs a P gate; verdict tier is S" -- mc_chain CMS1
+scratch; expect_ok "CM5b: a listed tip with Card-gate S is refused, naming its carried file" out_has "$(carry_line CMS2X)" -- mc_chain CMS2
+# CM8 before CM6 and CM7, which move or alias CM's tip.
+git -C "$r" checkout -q -B scratch/cm8 nucleus/v3-scaffold && git -C "$r" merge -q --no-ff --no-commit card/v3-CM && echo edited-in-merge >>"$v3/spikes/cm.txt" && git -C "$r" add nucleus/v3/spikes/cm.txt && git -C "$r" commit -qm "nucleus v3: merge card/v3-CM (MERGE, gate P/test-model)"
+expect_ok "CM8: the copy's audit refuses a titled merge of the listed tip whose tree was edited inside the merge" out_has "audit: CM (" "the merge commit's tree differs from the clean merge of its parents (edited inside the merge)" -- audit_chain scratch/cm8
+git -C "$r" branch -q card/v3-CMO "$cm_tip"; card CMO P standard
+scratch; expect_ok "CM7: the listed tip reached as card/v3-CMO is refused (the ID is part of the key; CMO's own verdict is not at the tip)" out_has "no nucleus/v3/verdicts/CMO.md at the branch tip" -- mc_chain CMO
+git -C "$r" branch -q -f card/v3-CM "$cm6a_tip"
+scratch; expect_ok "CM6a: one commit on top of the listed tip is refused (the key is the exact tip id)" out_has "$(carry_line CMA)" "$(carry_line CMB)" -- mc_chain CM
+git -C "$r" branch -q -f card/v3-CM "$cm6b_tip"
+scratch; expect_ok "CM6b: the same work and verdict rebuilt on new commits is refused" out_has "$(carry_line CMA)" "$(carry_line CMB)" -- mc_chain CM
+rm -rf "$v3/scripts/.chain"
+expect_ok "the chain copy is removed" bash -c "[ ! -e '$v3/scripts/.chain' ]"
+# CM9: the real list, frozen: exactly one entry, E4-CHAIN-1's verdict commit by
+# its full 40-hex id, on its own line.
+cm9_list() {
+  local blk got
+  blk=$(sed -n '/^# BEGIN CHAIN_MERGES (frozen)$/,/^# END CHAIN_MERGES$/p' "$src/scripts/enforce-lib.sh" | sed '1,2d;$d' | sed '$d')
+  got=$(bash -c '. "$1/scripts/enforce-lib.sh" && echo "${#CHAIN_MERGES[@]}"; printf "%s\n" "${CHAIN_MERGES[@]}"' _ "$src")
+  echo "block: $blk"; echo "sourced: $got"
+  [ "$(command wc -l <<<"$blk")" -eq 1 ] && LC_ALL=C grep -qxE '  "[0123456789abcdef]{40} E4-CHAIN-1"' <<<"$blk" &&
+    [ "$(head -1 <<<"$got")" = 1 ] && LC_ALL=C grep -qxE '[0123456789abcdef]{40} E4-CHAIN-1' <<<"$(sed 1d <<<"$got")"
+}
+expect_ok "CM9: the real CHAIN_MERGES holds exactly one entry, a full 40-hex id with E4-CHAIN-1" cm9_list
+expect_ok "git state: none after the chain-merge rows" no_state
 # --- Step 3 self-test (X-6-F1-F2-F3-F1-F4) -----------------------------------
 # A throwaway script that sources nothing but the suite's own abort-trap block
 # (lifted verbatim between the markers above) and runs `false` under set -e:

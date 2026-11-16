@@ -53,3 +53,14 @@ frozen; its comment gives the command that re-derives it. A short-id merge made
 after it fails the audit, and merge mode never consults it. What remains is
 verdict authorship: whoever can bypass `merge-card.sh` can also commit a
 verdict naming an unreviewed commit's full id, which is the trust limit above.
+
+**One frozen exception: `CHAIN_MERGES` (MERGE-CHAIN-1).** A card may change
+only its own verdict file, except under `CHAIN_MERGES` in
+`scripts/enforce-lib.sh`. It lists, by the full 40-hex id of the card branch's
+tip (its verdict commit) and the card ID, the one card merge that may add
+other cards' verdict files: E4-CHAIN-1, the P gate over the stacked E4 chain
+(owner decision 2026-11-16, conditional; QUEUE). Each carried file must be
+absent at the merge base (in an audit, the merge's first parent) and present
+at the tip, so the merge only adds; the verdict must be P-tier on a P card, and
+its text rules on every file it carries. Every other rule applies unchanged.
+The list is frozen: another entry is a new P card under its own owner decision.

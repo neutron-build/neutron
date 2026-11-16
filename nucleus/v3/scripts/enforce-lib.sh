@@ -118,6 +118,51 @@ short_commit_grandfathered() {
   return 1
 }
 
+# CHAIN_MERGES: the card merges that may ADD other cards' verdict files (card
+# MERGE-CHAIN-1). The E4 chain, card/v3-X-5c-F1 to card/v3-X-5c-F4-F7, was built
+# and gated stacked, one card on another's branch, so its range carries
+# verdict files of cards that cannot merge one by one: four whose only verdict
+# is ESCALATE, three re-verdicts committed on another card's verdict, one Class
+# mismatch, and two P records that are not card verdicts (P ruling
+# ~/.cache/nv3-review/E4-chain-merge-ruling.md). Card E4-CHAIN-1 is one P gate
+# over that whole range, and its verdict rules on every file it carries. The
+# owner lifted the X-6/C5 tooling freeze for this one card, conditionally
+# (QUEUE, "# OWNER DECISION 2026-11-16").
+# Frozen, like SHORT_COMMIT_MERGES: nothing appends to it and no script writes
+# it; a second entry is a new P card under its own owner decision. An entry is
+# "<full 40-hex id of the card branch's tip, its verdict commit> <CARD-ID>".
+# That id pins the verdict blob, the commit under it and the whole range, so no
+# other branch, and no commit added on top, can use an entry. The check keys on
+# check_merge's own arguments and on git objects only, never on an environment
+# variable, a file or a marker: those are trusted state a worker could write.
+# A carried file must be absent at BASE (merge mode: the merge base; audit
+# mode: the merge's first parent) and present at HEAD, so a chain merge only
+# adds: it never edits or deletes a verdict already on the scaffold. It needs a
+# P verdict on a P card, and every other rule in check_merge still applies.
+# BEGIN CHAIN_MERGES (frozen)
+CHAIN_MERGES=(
+  "aa11ac2fc56c212cbda23fd65e6d57997d330e21 E4-CHAIN-1"
+)
+# END CHAIN_MERGES
+
+# chain_carry ID HEAD BASE PATH TIER VGATE: PATH, a verdict file other than
+# ID's own that BASE...HEAD changes, may be carried by this merge (status 0).
+# Only when HEAD's full commit id is listed in CHAIN_MERGES with ID, TIER (the
+# verdict's Gate-tier) and VGATE (its Card-gate) are both P, PATH is absent at
+# BASE and present at HEAD. A tree git cannot read is a "no", never "absent".
+# --literal-pathspecs: PATH is a name, never a pattern that could match another.
+chain_carry() {
+  local tip e hit='' o
+  [ "$5" = P ] && [ "$6" = P ] || return 1
+  tip=$(git rev-parse -q --verify "$2^{commit}") || return 1
+  for e in "${CHAIN_MERGES[@]}"; do if [ "$e" = "$tip $1" ]; then hit=1; fi; done
+  [ -n "$hit" ] || return 1
+  o=$(git --literal-pathspecs ls-tree --full-tree --name-only "$3" -- "$4") || return 1
+  [ -z "$o" ] || return 1 # present at BASE: an edit or a delete, never carried
+  o=$(git --literal-pathspecs ls-tree --full-tree --name-only "$2" -- "$4") || return 1
+  [ -n "$o" ] || return 1 # absent at HEAD: a delete
+}
+
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE | MERGE_SHA]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
 # Merge mode takes CARD_GATE CARD_CLASS QUEUE_FILE; audit mode takes MERGE_SHA,
@@ -276,7 +321,11 @@ check_merge() {
     case $rel in
       # The format description is P-tier infrastructure; other verdicts are off limits.
       verdicts/README.md) [ "$tier" = P ] || errs+=("$f needs a P verdict"); continue ;;
-      verdicts/*) errs+=("$f: a card may change only its own verdict file"); continue ;;
+      # Another card's verdict: refused, except a file a listed chain merge
+      # carries (CHAIN_MERGES above).
+      verdicts/*)
+        chain_carry "$id" "$head" "$base" "$f" "$tier" "$vgate" && continue
+        errs+=("$f: a card may change only its own verdict file"); continue ;;
       # The specs index is P-tier infrastructure; specs themselves need a spec card.
       docs/README.md) [ "$tier" = P ] || errs+=("$f needs a P verdict"); continue ;;
       docs/*) { [ "$tier" = P ] && [ "$vclass" = spec ]; } || errs+=("$f: docs/ changes need Class: spec and a P verdict") ;;
