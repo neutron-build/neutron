@@ -1393,7 +1393,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1433,6 +1433,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.x33h,
                 x.x33a,
                 x.x33x,
+                x.reuse_on_dropping,
                 x.client_xx001,
                 x.pass,
                 x.deadlock,
@@ -1860,6 +1861,7 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "x33h" => x.x33h = j.num()? as u64,
             "x33a" => x.x33a = j.num()? as u64,
             "x33x" => x.x33x = j.boolv()?,
+            "reuse" => x.reuse_on_dropping = j.boolv()?,
             "ack_over" => {
                 j.eat(b'[')?;
                 if !j.try_eat(b']') {

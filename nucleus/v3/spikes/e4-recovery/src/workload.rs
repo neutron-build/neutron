@@ -734,6 +734,15 @@ pub struct RoundRec {
     pub x33a: u64,
     /// **X5-R33 (e): `wal_loss_explained`.**
     pub x33x: bool,
+    /// **X5-R36 (e): `reuse_on_dropping`** — the opened image's
+    /// directory holds some tree `t` as `dropping` while the model
+    /// holds `CreateTree{t}` at a ts in `(T, frontier]` (the id-reuse
+    /// hazard; `harness::reuse_on_dropping` computes it from the opened
+    /// image's durable bytes and the model, never store memory). A
+    /// diagnostic the pass fold never reads and the digest never sees:
+    /// the round still runs the full oracle and counts by its outcome,
+    /// and any `true` is an ESCALATE to P with the round.
+    pub reuse_on_dropping: bool,
     /// X-5c: script ops that unwound on a client-visible XX001.
     pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
@@ -1657,6 +1666,7 @@ fn round_rec(
     rr.x33h = out.x33h;
     rr.x33a = out.x33a;
     rr.x33x = out.x33x;
+    rr.reuse_on_dropping = out.reuse_on_dropping;
     rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();

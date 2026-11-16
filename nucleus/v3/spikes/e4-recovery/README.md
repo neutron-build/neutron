@@ -908,6 +908,29 @@ splits out `served=true` rounds first (the oracle's `o3` text is
 last-writer-wins, so a serve can read as O-3(d), and an `O-3(a)` text can
 hide an O-3(e) failure).
 
+### Carried: X5-R36, verbatim (binding; pre-data; `verdicts/X-5c-F3-F3a-F2.md`; landed by X-5c-F3-F3a-F2-F1, committed as text by that card's step 0)
+
+**X5-R36 (the drop incarnation: what the model reads after `DropTree`).**
+- **Source.**
+  - S-STORE §6.8: DropTree frees the tree's pages and removes its directory entry, and CreateTree allocates a fresh root leaf.
+  - This verdict's ESCALATE ruling.
+  - The workload re-uses a dropped tree's id in the next round's setup commit. That is a prototype deviation from §6.8's "never reused", and it stands, because changing the workload would move every seed with a drop round.
+- **(a) The rule.**
+  - For a user tree `t` and a cut `c`, let `d(t, c)` be the largest ts `≤ c` of a model commit holding `DropTree{t}`, or 0 if there is none.
+  - `Model::scan_at(t, S, c)` is `Model::scan(t, S)` computed only over ops on `t` from commits with `d(t, c) < ts ≤ S`, and over loads of `t` with `d(t, c) < S_L ≤ S`. For `S ≤ d(t, c)` it is empty.
+  - `Model::scan(t, S)` becomes `scan_at(t, S, S)`.
+  - The catalog (tree 1) is never dropped. `published_at` is unchanged.
+- **(b) The wiring.**
+  - O-1(b) at candidate `c` compares against `scan_at(t, c, c)`.
+  - O-1(d) at sample `S` compares against `scan_at(t, S, c)`.
+  - Every harness call site that compares a store scan with the model at a read point `x` (`harness.rs` near 3286, 4516, 5123, and `o1_at_frontier_lines`) uses the cut that the compared store state recovered or read at.
+- **(c) What it does not touch.** `lo`, `hi`, the candidate set, `sample_points`, O-1(a)/(c), O-1f, O-2, O-3, K, R, X5-R1/R33/R34/R35, `trees_at`, the sim, the fault and crash models, and the workload stream.
+- **(d) It loosens nothing a correct store can satisfy.** It removes only the expectation of pre-drop content in a re-created tree, which §6.8 makes unservable. A store that serves pre-drop content in a re-created tree now fails O-1(b)/(d), where before it was required to.
+- **(e) The id-reuse hazard is surfaced, never excluded.** The round record gains `reuse_on_dropping`, computed from SimDisk/opened-image data and never from store memory. It is true when the opened image's directory holds `t` as `dropping` and the model holds `CreateTree{t}` at a ts in `(T, frontier]`.
+  - Such a round still runs the full oracle and counts by its outcome.
+  - Any `reuse_on_dropping = true` in F1's windows or in F4's 10k is an ESCALATE to P with the round.
+- **(f) Pre-data.** No run that judges by X5-R36 has been read. The gate's and the worker's 0..200 and single-seed runs are diagnosis, never judgement evidence.
+
 ## P ruling X5-R35, verbatim (the X-5c-F3-F3a rework gate, 2026-11-03;
 ## binding from the rework's first run; `verdicts/X-5c-F3-F3a.md` at
 ## 98313ae3 — committed before any run of the rework)
@@ -3882,15 +3905,23 @@ name tree 4's owner ts 4 with le_T at c=41"), reverted clean.
 
 **The folded Work 2 - the five MW repros at this card's tip** (each
 run twice, digests identical, `X-5c-F3-F3a-F2.f1w2.seed<N>.{a,b}.json`;
-fields from the round records and `E4_D_DIAG`):
+fields from the round records and `E4_D_DIAG`). **Relabelled by
+X-5c-F3-F3a-F2-F1 (verdict finding 4):** the `lo` this table copied is
+the round **record's** `lo` field — X5-R1's `model.lower_bound(c_prev)`,
+never the oracle's MW bound. In class MW the oracle judges by X5-R33's
+`max(c_prev, T, h, a)`, which the O-1 error text and the O1F line name;
+the new column carries it where a first-candidate text exists. The
+passing rounds (4139, 5839) print no first candidate and no O1F line at
+this tip, so their oracle `lo` is not in the record — read naively, "7359
+r2: frontier 12 < lo 14" was the mislabel finding 4 names.
 
-| Round | pass | o1 (first candidate) | frontier/lo/hi | x33h/x33a | lost/mis/torn | cover_err | digest |
-|---|---|---|---|---|---|---|---|
-| 1749 r2 | false | O-1(c) at c=40 (max ts 41) | 41/40/41 | 40/0 | 0/1/1 | false | 2987258781 |
-| 4139 r2 | **true** | none | 17/17/17 | 14/0 | 0/0/1 | false | 3227295539 |
-| 5549 r2 | false | O-1(c) at c=30 (max ts 32) | 32/32/33 | 30/21 | 1/1/0 | false | 2018609054 |
-| 5839 r2 | **true** | none | 50/50/50 | 43/0 | 1/0/0 | false | 2979793348 |
-| 7359 r2 | false | O-1(c) at c=11 (max ts 12) | 12/14/15 | 9/11 | 0/2/0 | false | 266568285 |
+| Round | pass | o1 (first candidate) | frontier/record `lo` (X5-R1)/hi | MW `lo` (X5-R33) | x33h/x33a | lost/mis/torn | cover_err | digest |
+|---|---|---|---|---|---|---|---|---|
+| 1749 r2 | false | O-1(c) at c=40 (max ts 41) | 41/40/41 | 40 | 40/0 | 0/1/1 | false | 2987258781 |
+| 4139 r2 | **true** | none | 17/17/17 | — | 14/0 | 0/0/1 | false | 3227295539 |
+| 5549 r2 | false | O-1(c) at c=30 (max ts 32) | 32/32/33 | 30 | 30/21 | 1/1/0 | false | 2018609054 |
+| 5839 r2 | **true** | none | 50/50/50 | — | 43/0 | 1/0/0 | false | 2979793348 |
+| 7359 r2 | false | O-1(c) at c=11 (max ts 12) | 12/14/15 | 11 | 9/11 | 0/2/0 | false | 266568285 |
 
 **The folded Work 3 - the cut, per round** (the frontier diagnostic's
 first divergent key with its owner ts, and this card's key-history
@@ -3916,6 +3947,129 @@ them.
   above, never a local fix; the five are **not** an MW-ORPHAN
   redesign failure (the gate's ruling (ii) stands: they count against
   C-DIV).
+
+## Stage X-5c-F3-F3a-F2-F1's record (this card; X5-R36 landed)
+
+Start **2026-11-04T03:41:43-07:00** (step 0's commit), stop
+**2026-11-04T04:14:54-07:00**. Step 0 committed the X5-R36 text
+verbatim (8e2f9813) before any run whose output was read; the ruling's
+code landed as one commit (5a41648b, subject naming X5-R36). Every
+command below is a single seed or the ≤ 200-seed window under the
+backstop, output outside the worktree (`/tmp/opencode/x5c-f2f1/`).
+
+**Work 2 - what the X5-R36 commit contains.**
+`Model::scan_at(t, S, c)` per (a) with `scan(t, S) = scan_at(t, S, S)`
+and a private `drop_floor(t, c)`; O-1(b) at `model.scan_at(t, c, c)`
+and O-1(d) at `model.scan_at(t, S, c)`; the three harness scan sites
+(`E4_O1_DIAG`'s diff, `key_history_trace` — which gained the `frontier`
+parameter — and `o1_at_frontier_lines`) compare at
+`model.scan_at(t, x, ex.frontier)`, the cut the recovered store
+recovered at; the round record's `reuse_on_dropping` (e) — computed on
+the recovery-`Ok` arm by `harness::reuse_on_dropping` over the opened
+image's directory read from durable bytes (`opened_dir_dropping`) and
+the model's `CreateTree{t}` window `(T, frontier]`, plumbed through
+`RoundOutcome`/`RoundRec` and serialized as `"reuse"` (not a digest
+input, like `x33h`). Pins: (i) `x5_r36_scan_at_reads_the_drop_incarnation`
+(`tests/oracle.rs`, the verdict's three cases), (ii)
+`x5_r36_seed112_r2_no_longer_fails_o1b_on_tree_3` (`tests/harness.rs`),
+(iii) `x5_r36_reuse_on_dropping_predicate`.
+
+**Work 3 - the repros, each run twice at the ruling's tip (digests
+identical, `r36.seed<N>.{a,b}.json`):**
+
+| Round | F2-tip digest | this tip (×2) | outcome |
+|---|---|---|---|
+| 112 r2 | 3610336029 | **2157138087** | **pass** — matched c=15, frontier 15 (was O-1(b) at c=15, tree 3) |
+| 63 r2 | 1693274365 | **2414083785** | **pass** — matched c=24, frontier 24 (was O-1(c) at c=23, tree 2) |
+| 104 r2 | 2884791556 | **3776021738** | **pass** — matched c=25, frontier 25 (was O-1(c) at c=23, tree 2) |
+| 1749 r2 | 2987258781 | **1584051239** | **pass** — matched c=41, frontier 41, lo 40/hi 41 (was O-1(c) at c=40) |
+| 5549 r2 | 2018609054 | **308297210** | **pass** — matched c=32, frontier 32 < hi 33, MW `lo` 30 (was O-1(c) at c=30) |
+| 7359 r2 | 266568285 | **670834677** | **pass** — matched c=12, frontier 12, record `lo` 14 (was O-1(c) at c=11) |
+
+All six of root cause B's rounds pass under X5-R36 — no remaining
+failure in the set, so no X5-R16 treatment on them. Every round
+records `reuse=false`.
+
+**Work 4 - the 0..200 window** (`run --seeds 0..200 --threads 16`,
+`r36.0200.json`), final line verbatim:
+
+```
+E4 SEEDS=200 O1_FAIL=45 O2_FAIL=0 O3_FAIL=2 DEADLOCK=0 PANIC=0 O1F_FAIL=45 MONITOR=0
+E4 FOLD FAILING_SEEDS=2 FAILING_ROUNDS=2 TWIN_FAILING_ROUNDS=0 DEFECT_SEEDS=0
+```
+
+`FAILING_ROUNDS=2`, both class MP, both the pre-existing O-3 (e)
+exactness family with byte-identical texts at F2's tip
+(`X-5c-F3-F3a-F2.s4.0200.json`): seed 8 r0 (crash `Before0@2`)
+`O-3(e): (ii) reported slot 7 that is neither tainted nor in R`, seed
+178 r1 (crash `uniform@y:37`) `O-3(e): (ii) reported slot 91 that is
+neither tainted nor in R`. Their X5-R16 treatment: O-1 is clean in both
+(`o1=null`, `o1dl=15` detected-loss comparisons), so `E4_KEY_DIAG` and
+`E4_O1_AT_FRONTIER` emit nothing (`r36.seed{8,178}.diag.err`);
+`E4_MPE_DIAG` shows the shape — a TORN slot 37 (seed 8) and a LOST +
+two MISDIRECTED (seed 178), K and R empty (`mrb=false`), and the (ii)
+amcheck naming "mapped lpid N unreachable" slots — the triage's class-2
+interplay, unchanged by this card and outside its Limits (no store
+change). At F2's tip the same window had 10 failing rounds + 1 twin:
+the seven C-DIV rounds (63/104/112/120/125/152/186 r2), 199 r2
+(`O-3(d)` silent Ok with `O-1(b) at c=26, tree 4`) and 199's twin r2
+all **pass** now, beside the two MP O-3(e) rounds that remain. The
+`reuse_on_dropping` count over the window's 305 rounds is **0** — no
+ESCALATE. Round totals: C 233, MP 45, MW 27; every failing round is
+classed above.
+
+**Work 5 - the frontier pin (commit 595887da).** The O1F line gains
+`T=` beside `le_T`, and the diagnostic now runs whenever wanted (armed
+or env), not only on an O-1 failure — X5-R36 removed the failures it
+was built to explain, and the pin must still read the frontier
+candidate of a passing round. Two consequences, measured and handled:
+
+- The diff's reads go through the store's read path, which touches the
+  pool, and the pool feeds the harness checkpoint and the next round's
+  start store: reading the judged world moved seed 1749's digest
+  (1584051239 → 2353463647 with `E4_O1_AT_FRONTIER=1`, before the
+  fix). The diff now runs on a **throwaway clone** of the recovered
+  world; digests verified identical with the env var on and off for
+  1749, 5549, 112 and 63 (`off.<N>.json` / `on.<N>.json`).
+- On a passing round nothing diverges, so a "first key" line would
+  print only owners at or below T — the exact weakness of finding 3.
+  The fallback pick is the key with the **newest owner** at `c`: 5549
+  r2's real MW line reads `lo=30 hi=33 frontier=32 T=29 c=32` with
+  `owner_ts=32 … le_T=false` (32 is above T 29 and at the frontier),
+  which is what makes LE-T-FROM-FRONTIER catchable at all.
+
+The 1749 pin (`o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2`)
+was reworked in the same commit: its old literals (tree 4's divergent
+owner ts 4, `le_T=true` at `c=41`) described root cause B's failure,
+which X5-R36 removes by design — the round now passes, matched at
+`c=41`. The pin asserts the same round's always-line: `lo` 40, `hi`
+41, `frontier` 41, `T` 38, `c=41`, and the `le_T` ≡ `owner_ts ≤ T`
+agreement on every line (checked by parsing the line itself). The new
+5549 pin (`x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2`)
+asserts `c=32` with `frontier 32 < hi 33` — the round where the clamp
+is not the identity on the hi side (1749's frontier equals its `hi`) —
+plus the same agreement and the `owner_ts=32/le_T=false` literal. Both
+F2-UNCAUGHT mutants of finding 3 are now caught (below).
+
+**Mutation evidence** (each applied to the real code, the named test
+failed, the edit reverted completely — `git diff` clean of the mutant
+after every revert):
+
+| Mutant | Catching test |
+|---|---|
+| R36-REVERT (`scan_at` ignores `d`) | pin (i) `x5_r36_scan_at_reads_the_drop_incarnation` **and** pin (ii) `x5_r36_seed112_r2_no_longer_fails_o1b_on_tree_3` |
+| R36-FLOOR-BY-S (`d` floored at `S`) | pin (i), the `S < d ≤ c` case ("S < d ≤ c must read empty: {k: v}") |
+| R36-FLOOR-IGNORES-CUT (`d` from every drop) | pin (i), the `c < d` case ("c < d must keep the pre-drop content") |
+| REUSE-FLAG-OFF (the flag always false) | pin (iii) `x5_r36_reuse_on_dropping_predicate` |
+| FRONTIER-AS-HI (`c = hi`) | Work 5's pin `x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2` |
+| LE-T-FROM-FRONTIER (`le_T` from the frontier) | Work 5's pin (the `owner_ts=32 … le_T=false` literal) |
+
+**Digest movement.** Every seed whose model holds a durable
+drop+re-create changes digest under X5-R36 (the record's `o1`/`c`
+fields change with the outcome); `reuse_on_dropping` is deliberately
+not a digest input (the `x33h` precedent), and the diagnostics moved
+nothing (verified on/off above). The repro table carries the six
+moved digests; the window's other digests are in `r36.0200.json`.
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)

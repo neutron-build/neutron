@@ -26,6 +26,13 @@
 //! are versions at their `S_L` — a later logged op on a loaded key wins
 //! above `S_L`, and the load shows between `S_L` and that op (gate
 //! REWORK item 3).
+//!
+//! X5-R36 (P ruling 2026-11-04, `verdicts/X-5c-F3-F3a-F2.md`; the README's
+//! "Carried: X5-R36" block is the verbatim text): after `DropTree{t}` the
+//! tree `t` the model reads is the **fresh incarnation** a later
+//! `CreateTree{t}` allocates (S-STORE §6.8), never the dropped one.
+//! [`Model::scan_at`] reads tree `t` at snapshot `S` in the incarnation
+//! the cut `c` defines; `scan(t, S)` is `scan_at(t, S, S)`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -162,25 +169,42 @@ impl Model {
         self.loads.retain(|l| l.s_l <= c);
     }
 
-    /// The scan of tree `t` at snapshot `S`: per user key the newest
-    /// version with `ts ≤ S` (a Delete reads as absent), where a load's
-    /// unlogged entries are **versions at their `S_L`** (card 2.1: "a
-    /// load's entries are part of the model of tree `t` at ts `S_L`").
-    /// Gate REWORK item 3: the load entry competes by timestamp like any
-    /// other version, so a Put or Delete at `ts > S_L` on a loaded key
-    /// is *not* overwritten by the loaded value — the run-1 code applied
-    /// load entries after every commit op, which agreed with a store
-    /// that silently lost post-load updates. Ties (`S_L` equal to a
-    /// commit ts on the same key, which real histories never produce —
-    /// a loaded tree has no logged ops before its publish at `ts >
-    /// S_L`) go to the commit. Loads are recorded in increasing `S_L`
-    /// order by the harness.
+    /// The scan of tree `t` at snapshot `S`: `scan_at(t, S, S)` — the
+    /// incarnation the cut `S` itself defines (X5-R36 (a)). Below that
+    /// ruling the commit ops and loads of every `ts ≤ S` counted,
+    /// `DropTree`/`CreateTree` were ignored, and a re-created tree id
+    /// kept its pre-drop content at every `S` — unservable by any store
+    /// that applied the drop (§6.8). See [`Model::scan_at`] for the
+    /// versioned-timestamps rule this keeps unchanged.
     pub fn scan(&self, t: u64, s: u64) -> Scan {
+        self.scan_at(t, s, s)
+    }
+
+    /// **X5-R36 (a):** the scan of tree `t` at snapshot `S`, in the
+    /// incarnation the cut `c` defines. Let `d(t, c)` be the largest ts
+    /// `≤ c` of a model commit holding `DropTree{t}` (0 when there is
+    /// none): the content is [`Model::scan`]'s, computed only over ops
+    /// on `t` from commits with `d(t, c) < ts ≤ S` and over loads of `t`
+    /// with `d(t, c) < S_L ≤ S`; for `S ≤ d(t, c)` it is empty (the
+    /// dropped incarnation serves nothing, and the fresh one holds no
+    /// version at or below the drop). The catalog (tree 1) is never
+    /// dropped, so its floor is always 0 and `published_at` (which reads
+    /// it) is unchanged.
+    ///
+    /// Loads still compete by timestamp exactly as `scan` has them
+    /// compete (gate REWORK item 3): a load of the fresh incarnation is
+    /// a version at its `S_L`, and a Put or Delete at `ts > S_L` on a
+    /// loaded key wins above `S_L`.
+    pub fn scan_at(&self, t: u64, s: u64, c: u64) -> Scan {
+        let d = self.drop_floor(t, c);
+        if s <= d {
+            return Scan::new();
+        }
         let mut out: Scan = BTreeMap::new();
         // The newest version ts per user key seen so far.
         let mut newest: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         for rec in self.commits.values() {
-            if rec.ts > s {
+            if rec.ts <= d || rec.ts > s {
                 continue;
             }
             for op in &rec.ops {
@@ -198,7 +222,7 @@ impl Model {
             }
         }
         for l in &self.loads {
-            if l.tree != t || l.s_l > s {
+            if l.tree != t || l.s_l <= d || l.s_l > s {
                 continue;
             }
             for (k, v) in &l.entries {
@@ -212,6 +236,22 @@ impl Model {
             }
         }
         out
+    }
+
+    /// X5-R36 (a): the drop floor `d(t, c)` — the largest ts `≤ c` of a
+    /// model commit holding `DropTree{t}`, or 0 when there is none. The
+    /// catalog (tree 1) is never dropped by any conformant history, so
+    /// its floor is 0 by construction.
+    fn drop_floor(&self, t: u64, c: u64) -> u64 {
+        self.commits
+            .range(..=c)
+            .rev()
+            .find(|(_, rec)| {
+                rec.ops
+                    .iter()
+                    .any(|op| matches!(op, Op::DropTree { tree } if *tree == t))
+            })
+            .map_or(0, |(ts, _)| *ts)
     }
 
     /// The published tree set at commit cut `c` (catalog rows holding
