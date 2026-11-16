@@ -1,15 +1,466 @@
 Card: S-EPSILON
 Class: spec
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session 33d36376-7eb7-4ef9-8157-8618ca79b5e4 (a fresh gate: this agent wrote neither the card, its commit, the S-DELTA appendix nor any earlier verdict)
+Gate-session: T3 review sub-agent, Claude Code session f0d75e06-8982-4200-af57-0ee5218e7e6d (gate 2, a narrow re-gate after rework 1: this agent wrote neither the card, its implementation 45e85d06, the rework 5b82d2ff, the S-DELTA appendix nor gate 1's verdict)
 Date: 2026-11-16
 Gate-exit: GATE EXIT=0
-Commit: 45e85d069f4b717568542aeaa7858095b179678e
-Mutants: spec text, none in code. The card's spec mutant, walked as text on its owning row (t_fallback, A-7d) at 45e85d06: ROLLBACK-REFUSES-READ-ERROR -> t_fallback read-error case, caught in its full form (rollback 55000, read-only 58030); its partial form that accepts the read error only in step 2 -> UNCAUGHT (no case reads image k's fault in pass 2; finding 3), caught after the rework by the pass-2 case. Gate's own: G1 a plain read-write open that falls back on its own on a pass-2 read error -> UNCAUGHT at 45e85d06, caught after the rework (the pass-2 case's first assertion and write hook); G2 a rollback that answers a read error with no previous image with XX001 -> the stated behaviour at 45e85d06 (finding 2), caught after the rework (the no-previous-meta variant); G3 a read-only salvage after a read error that omits the shortfall against meta k -> UNCAUGHT and not required at 45e85d06 (O-3), caught after the rework; G4 a fixture hook keyed on the page's LPID (so image k-1's copy fails too) or on its slot for ever -> a correct build fails the case at 45e85d06, excluded by the reworked fixture text. Text mutants on the tip, judged by the card's Acceptance: TM1 (ROLLBACK-REFUSES-READ-ERROR dropped from t_fallback's 15.1 row) -> lines 18, 19, 22, 23 (checker: not judged on A-7d, Phase-B-only set, 0 t_fallback rows); TM2 (a stray edit to 14.2's Otherwise row) -> lines 21, 22; TM3 (F4-2's read-error disjunct removed) -> lines 9, 10, 21, 22. All reverted; no mutant was applied in the worktree
-Followups: S-EPSILON-F1
+Commit: 5b82d2ff70fcd3622b0a6dbe4366648a9e3cc41d
+Mutants: spec text, none in code; walked as text on the reworked t_fallback (A-7d) at 5b82d2ff: ROLLBACK-REFUSES-READ-ERROR -> t_fallback read-error case, caught in the step-2 and pass-2 cases (rollback 55000, read-only 58030); its step-2-only form (RW-5) -> the pass-2 case, caught. Gate's own: G5 a read-only salvage after a read error that leaves the read error, or the values against meta k, out of its report -> the read-error case's read-only assertion, caught; G6 a rollback that answers XX001 when image k met a read error and meta k-1's free set failed an integrity check at step 2 -> UNCAUGHT (no stated case has that fixture; RW-3 states 58030; not a named mutant; rider F2-e pins it); G7 a plain read-write open that retires meta k before it fails with 58030 on a pass-2 read error -> the pass-2 case's write hook, caught. Text mutants on the tip, judged by the card's 34 non-gate Acceptance lines in both locales: each of RW-1 to RW-12 left out -> its own lines exactly as verdict 1 listed, plus 22, and 21 where the line count moves; TM-A RW-3's code back to XX001 -> 22, 28; TM-B RW-9's two rows swapped -> 16, 22; TM-C RW-9's third row without "or meeting a read error" -> 16, 22; TM-D RW-8 without the read error -> 22, 31; TM-E a stray edit to 14.2's Otherwise row -> 21, 22; TM-F I-FALLBACK without "on its own" -> 22, 33; TM-G ROLLBACK-REFUSES-READ-ERROR dropped from t_fallback's 15.1 row -> 18, 19, 22, 23. All in scratch clones; the worktree was never written
+Followups: S-EPSILON-F1, S-EPSILON-F2
+
+## Verdict in brief
+
+**MERGE-WITH-FOLLOWUPS.** The rework is exactly verdict 1's twelve blocks, the card now matches verdict 1's lists, and the reworked text keeps both recovery rules. Nothing found here blocks under this re-gate's standard. No point would mislead an implementer of the store into a wrong build, make a required test unpassable on a correct build, or leave a named mutant unkillable.
+
+- **Bytes.**
+  - My own parser took RW-1 to RW-12 from verdict 1 (3318f8b5) and applied them, in order, to 45e85d06's `docs/S-STORE.md`.
+  - Each Old occurs once at its turn, and the result is byte-identical to 5b82d2ff's file (sha256 `a1376c9491cda2aa987a2736825e313318246aa97fba126181b021731bfa700f`).
+  - Applied to d7d41677's 7.14, the card's own twelve blocks and then the RW blocks rebuild the same file.
+  - 5b82d2ff changes nothing else.
+- **The card.**
+  - Its Acceptance list is verdict 1's list exactly: 35 commands, with `gate.sh` last.
+  - Its prose follows verdict 1's "Card text the rework must update" item by item.
+  - The implementer's four further edits are accurate and needed.
+- **Runs.**
+  - The 34 non-gate commands pass under the default locale and under `LC_ALL=C`, and the checker prints its three lines ending `OK`.
+  - Leaving out any one RW block fails that block's own lines, and seven planted errors fail too.
+  - The scaffold's `fresh-gate.sh` gives `GATE EXIT=0`.
+- **Design.**
+  - No open serves data silently missing a commit acked under an honoured sync.
+  - No read-write open falls back on a read error by itself.
+  - I searched every restatement of each changed rule across the file. None states the opposite of the rule.
+- **The six reported points, and the four card edits.**
+  - (a) Gate 1 is right and the card's "Order" note is wrong (checked against R-1-SPEC). It is a card note for the orchestrator.
+  - (b) "The author's evidence" is a dated pre-rework record. It is also a card note.
+  - (c), (d) and (e) are wording or test-strength points. With one more found here (§18's R18), they become optional riders, S-EPSILON-F2.
+  - (f) needs no change.
+  - The four card edits are accepted.
+- **Follow-ups.** S-EPSILON-F1 is carried, re-checked on 5b82d2ff. S-EPSILON-F2 is new and optional.
+
+## Gate run
+
+- **Extract.** A shallow `--no-local` clone of `nucleus/v3-scaffold` gave scaffold id `d7d4167777fe24e38b55bb63983b3a9033e72822`. `fresh-gate.sh` and `git-env.sh` were extracted with no `EXTRACT FAILED`.
+- **Run.** The command was `bash "$fg/fresh-gate.sh" 5b82d2ff70fcd3622b0a6dbe4366648a9e3cc41d`, run from `~/Workspace/neutron-v3`.
+  - It ran with `CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate2-S-EPSILON`, with stdout and stderr captured to separate files.
+  - It printed:
+    - `fresh-gate: commit 5b82d2ff70fcd3622b0a6dbe4366648a9e3cc41d`
+    - `fresh-gate: base d7d4167777fe24e38b55bb63983b3a9033e72822`
+    - `fresh-gate: checks passed (4824 files hashed in 2.08 s)`
+    - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - Each of the eight steps printed `EXIT=0`: test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests and api-surface.
+  - The run exited 0 with stderr empty, and its literal last line was `GATE EXIT=0`.
+- **Cleanup.** `$fg` was removed afterwards.
+- **The worktree.** It was at `5b82d2ff70fcd3622b0a6dbe4366648a9e3cc41d` on `card/v3-S-EPSILON`, and clean. This gate wrote nothing in it before this verdict. Every Acceptance and planted-error run used two `--no-local` scratch clones under `~/.cache/nv3-review/gate2-S-EPSILON/`.
+- **Scope.** `git diff nucleus/v3-scaffold...HEAD --stat` at 5b82d2ff lists two files:
+  - `nucleus/v3/docs/S-STORE.md`, in Touch only (+22/−13);
+  - `nucleus/v3/verdicts/S-EPSILON.md`, the gate's own file.
+
+  5b82d2ff alone changes only `docs/S-STORE.md`, by +13/−10.
+- **The host.** In this gate's interactive tool shell, `grep` is a function that runs ugrep. The Acceptance commands ran through non-interactive `bash -c`, which uses GNU grep 3.11 (`/usr/bin/grep`), as the fresh gate does.
+
+## The rework against verdict 1's lists
+
+### The spec: RW-1 to RW-12, and nothing else
+- **Parsing.** The parser splits verdict 1's "The rework: 12 blocks" on its `### RW-n.` headings and takes each block's four-tilde Old and New.
+- **The RW blocks.** Applied to 45e85d06's file:
+  - each Old occurs exactly once at its turn;
+  - no replacing New was present beforehand;
+  - the result's sha256 is `a1376c94…700f`, byte-identical to the committed file.
+- **The whole chain.**
+  - F4-1 to F4-10, E1 and E2 are parsed from the card's Edits, with `<date>` set to 2026-11-16, the date the file carries.
+  - Applied to d7d41677's file (sha256 `6197762c…1c14`), they give 45e85d06's file (`7e2d901b…c481`).
+  - RW-1 to RW-12 then give 5b82d2ff's file.
+- **The numbers.** The diff from the scaffold is +22/−13, and its date-normalised hash is line 22's `8148bba2…1091`.
+
+### The card's Acceptance
+- **The list.** The card's Acceptance list, parsed, equals the backup's list with verdict 1's "Acceptance changes" applied:
+  - lines 11, 12, 16, 21 and 22 replaced;
+  - 10 lines inserted as lines 25–34;
+  - `gate.sh` as line 35.
+- **The runs.** I ran the list in a `--no-local` clone at 5b82d2ff, with a local `nucleus/v3-scaffold` at d7d41677 and 30860cf1 present.
+  - All 34 commands before `gate.sh` pass, under the default locale (`LANG=en_CA.UTF-8`) and under `LC_ALL=C`.
+  - Line 35 is `gate.sh`, which the fresh gate ran on a fresh checkout of the commit.
+  - The checker (line 23) prints:
+    - `158 rows; 226 mutants; 24 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`
+    - `57 new since 7.10 (31 at 7.11, 11 at 7.12, 4 at 7.13, 10 at 7.14, 1 here), 57 of them judged on a Phase A row; 47 invariants, 48 tests`
+    - `OK`
+- **Omitting each block.** I left out each RW block in turn, committed the result on the scaffold in a scratch clone, and ran all 34 lines in both locales.
+  - Every omission fails its own lines exactly as verdict 1 listed:
+
+    | Block left out | Its own lines that fail |
+    |---|---|
+    | RW-1 | 25, 26 |
+    | RW-2 | 26, 27 |
+    | RW-3 | 28 |
+    | RW-4 | 26, 29 |
+    | RW-5 | 11 |
+    | RW-6 | 12 |
+    | RW-7 | 26, 30 |
+    | RW-8 | 31 |
+    | RW-9 | 16 |
+    | RW-10 | 26, 32 |
+    | RW-11 | 26, 33 |
+    | RW-12 | 34 |
+
+  - Each omission also fails line 22.
+  - Each also fails line 21 where the line count moves, which is every block but RW-5, RW-6, RW-8 and RW-11.
+- **The runner.** The scaffold's `tools/run_card.py` (`parse_card` and `validate_card`, extracted with `ast`) reads the reworked card as `S-EPSILON`:
+  - Touch only `['nucleus/v3/docs/S-STORE.md']`;
+  - 35 commands and no container;
+  - `validate_card` returns `None`, and the last command is the gate.
+
+### The card's prose
+Every item of verdict 1's "Card text the rework must update" is applied:
+- **Goal, "The fix", "Never weakened", D-4.** They name the rework, record O-2 to O-4 as adopted, and say that RW-8 binds "each reports what it serves". "With the fix" also says what the salvage reports.
+- **The draft target.** It reads "22 lines added and 13 removed (13 and 7 before the rework)", and the counts are unchanged.
+- **Edits.** Its item 3 is "then RW-1 to RW-12".
+- **Limits 2–5.** They now go section by section, and Limit 5 is amended.
+- **Mutation evidence.** It names the step-2-only form and the pass-2 case, and D-2 is pinned in both cases.
+- **"For the gate".**
+  - Item 1: the fixture points are spec text, and the pass-2 case and the variant are walked.
+  - Item 5: the salvage reports against meta `k`.
+  - Item 6: RW-4 states it.
+  - Item 7: resolved.
+- **"For the plan card" item 3.** Updated as the list asks.
+- **"If the owner withdraws the yes".** It inverts RW-11 to RW-1 first, keeps RW-12 in the 7.15 entry, and then inverts F4-10 to F4-1.
+
+**The reverse, re-checked by script on 5b82d2ff's file.** I inverted RW-11 to RW-1 and then F4-10 to F4-1, and each New occurred once at its turn. The result is draft 7.14 byte for byte, outside line 3 and the 7.15 Changelog entry.
+
+## The changed sections, re-read as recovery design
+
+I re-read these sections in full:
+- §2.2's "One fall-back, and only one" (RW-1);
+- §4.4's I-TWO-GEN text (RW-2);
+- §14 step 4a: the preamble, items 1–5, the retire write, the explicit rollback, the mutants and `t_fallback`;
+- §14.1 and §14.2;
+- §15's I-RO-OPEN, I-FALLBACK and I-TWO-GEN rows, and §15.1's `t_fallback` and `t_two_gen` rows;
+- the 7.15 Changelog entry.
+
+### No open serves data silently missing a commit acked under an honoured sync
+- **The two opens that succeed where 7.14 refused.** They are the read-only salvage from meta `k−1` and the explicit rollback naming meta `k`. Each needs both of these:
+  - a previous image (§1: meta `k−1` valid and its free set read at step 2);
+  - a read error (58030) on a page read through image `k`'s references, in step 2 or in pass 2.
+- **Why image `k−1` and its WAL are intact.** Under honoured syncs, meta `k` is the newest synced meta.
+  - Every open since then protected image `k−1`'s slots at step 2 (I-TWO-GEN). It did so by that image's free set or, when that read failed, by every slot below its `slot_count` that image `k` does not reference.
+  - A refused read-write open writes only the fence, plus pass 2's evictions into slots that neither image references. The pass-2 case's write hook asserts this.
+  - A read-only open writes nothing.
+  - So image `k−1` and the WAL from meta `k−1`'s `wal_start_lsn` are intact.
+- **The proof holds.** I-ACK-PREFIX and I-REDO-COMPLETE ("for a walk from an older meta") put every acked `on` commit below the valid end, so item 3's proof holds. The rollback recovers the committed state that meta `k` would have given, and the read-only open serves it.
+- **The one honoured-sync divergence** is a publication naming checkpoint `k` (I-CKPT-DEP).
+  - The rollback is refused with XX001 at step 3b against meta `k−1`, before any write from meta `k−1`, since "a refused open retires nothing".
+  - The read-only open serves the dependency cut and reports it (§14.1).
+  - RW-9's first new row now says both.
+  - A salvage at a reported cut is the salvage contract that §14.1 already gives WAL loss and splices. It is not a silent loss.
+- **Dropped syncs** (outside the rule).
+  - The rollback reports what it abandons.
+  - The salvage now reports the read error, and the valid end and largest `commit_ts` against meta `k`'s `wal_ckpt_end` and `ts_ckpt_hi` (RW-8). The case's read-only assertion pins this (G5 caught).
+- **A rollback never abandons an image that reads.** It re-reads image `k` at its own open, and if every read succeeds it fails with 55000 (F4-2's "otherwise").
+- **A read error in image `k−1`** is 58030 in every open, with no salvage from meta `k−2` (RW-4). At this open, the other parity's places hold meta `k`, or zeros after the retire.
+- **A rollback with no previous image** fails with 58030 and writes nothing (RW-3). The step-2 case's no-previous-meta variant pins this.
+
+### No read-write open falls back on a read error by itself
+- **Every statement says so.**
+  - The §14 step 4a preamble: "Nothing else falls back on its own: … a read error (58030) …", and F4-1's next sentence.
+  - I-FALLBACK (RW-11): "on its own only when the newest image fails an integrity check at open".
+  - §2.2 (RW-1): after a read error, a fall-back happens only "by explicit rollback or in a read-only open's salvage".
+  - §14.2's F4-7 row: "58030, nothing written beyond the fence and step 4a's pass-2 evictions".
+- **A test pins it.** The read-error case's first assertion pins it, now in step 2 and in pass 2 (RW-6).
+  - A build that falls back on its own fails its 58030 and its write hook.
+  - So does a build that retires meta `k` and then fails (G7).
+- **The rollback does not fall back by itself.** It is the one read-write open that falls back on a read error, and three things must hold:
+  - it must be asked for;
+  - it names meta `k`;
+  - its own open must meet the read error.
+
+### Every restatement of a changed rule, searched
+- **The search.** Outside the Changelog, I listed every line containing any of these phrases, and read each hit in context:
+  - "fails at open", "falls back", "fall-back", "explicit rollback";
+  - "one generation", "integrity check at open", "previous image";
+  - "58030", "read error", "salvage".
+- **The sections the hits fall in.**
+  - The SQLSTATE table, §1, §2.2, §4.4, §4.5, §9.2 and §11.
+  - §12.4, §12.5 and §13 step 6.
+  - All of §14, including "Post-sync damage" and I-REDO-COMPLETE, and §14.1 and §14.2.
+  - Rows of §15 and §15.1.
+  - §18's R13, R15, R18, R19 and R23, and §19.
+- **The result.** No stale copy states the opposite of a changed rule.
+- **Three places are incomplete for the read-error case, without contradicting it.**
+  - §14.1's "What it refuses": point (d).
+  - Item 2's sentence on a failure after the retire write: point (e).
+  - §18's R18, found here. Its "spec says" cell describes the integrity fall-back only ("… otherwise the read-write open is refused and an explicit rollback can open it"). §18 is the record that a plan fix of PLAN-v3 §3.3 reads. The cell claims no exclusivity, and the plan side is already tracked (PL-13-F1 (f)).
+  - All three go to S-EPSILON-F2.
+- **Left on purpose.** §14 "Post-sync damage", "A page of the newest image" is about damage, as the card's "For the gate" item 9 says. Step 4a gives a plain open's refusal on a read error.
+
+### The reworked test, on a correct build
+I re-walked RW-6's case.
+- **The faulted slot.** Checkpoint `k` wrote it, so image `k−1`'s copy of that page lies in another slot and reads.
+- **When the fault clears.** It lasts until the slot is written.
+  - Before the retire, nothing writes the slot (I-NO-INPLACE: image `k` references it).
+  - After the retire, pass 2 or the boot checkpoint may write it, which clears the fault.
+- **The results.**
+  - **The step-2 case.** The plain open fails with 58030 and writes nothing. The read-only open serves every acked commit and reports. The rollback recovers every acked commit.
+  - **The pass-2 case.** The same, except that the plain open has also written the evictions pass 2 made before the read error, into slots that neither image references.
+  - **The no-previous-meta variant.** All three opens fail with 58030 and write nothing.
+- **The mutant.** ROLLBACK-REFUSES-READ-ERROR stays killable in both its forms.
+
+## The implementer's reported points: rulings
+
+- **(a) Notes, "Order": gate 1 is right and the card's sentence is wrong. Not blocking.**
+  - **Checked.** I applied R-1-SPEC's E1 and E25 to 7.14. S-EPSILON's two Olds then occur 0 times, because the other card's clause and entry take the head:
+    - E1's Old: `Status: draft 7.14 (card S-DELTA, `;
+    - E2's Old: `## Changelog`, a blank line, `- **Draft 7.14** (`.
+  - **Why it does not block.**
+    - No store build depends on it.
+    - Work 1 turns a missing Old into a stop, and Acceptance line 2 fails on a scaffold that moved.
+    - It matters only if another S-STORE card merges first, and it is moot once this card merges.
+  - **A card note for the orchestrator.** The sentence could read: "If another S-STORE card merges first, E1's and E2's Olds no longer occur (that card's clause and entry take the head), so they re-anchor on its head; each F4 and RW Old is re-checked (Work 1), and lines 2, 21 and 22 change with that card's text."
+- **(b) "The author's evidence": a dated record of the pre-rework run. Not blocking.**
+  - It records the first run: twelve blocks, 25 commands, 24 of 24. It is true as history.
+  - The reworked card's evidence is in verdict 1 and in this verdict. The card now has 35 commands, and 34 of 34 pass under both locales. The runner reads 35 commands, and `validate_card` returns `None`.
+  - **A card note.** Mark the section "(pre-rework; see `verdicts/S-EPSILON.md`)".
+- **(c) RW-9's third row against RW-3: consistent. Not blocking.**
+  - **Why it is consistent.** The row's first cell separates two cases:
+    - "no previous image (no previous meta, or its free set unread at step 2)";
+    - "image `k−1` failing or meeting a read error too".
+
+    Its "XX001 when image `k−1` fails" mirrors the second case. That case is item 2's integrity failure in image `k−1` (RW-4).
+  - **The free set.** A free set unread at step 2 leaves no previous image. So a rollback gets 58030 by RW-3, whether that read failed by an integrity failure or by a read error. §14.2's preamble makes §14 rule.
+  - **What stays open.** No stated case pins the free-set form of RW-3's "never XX001" (G6, UNCAUGHT; not a named mutant).
+  - **The riders.** F2-a makes "fails" explicit, and F2-e adds that form to the no-previous-meta variant.
+- **(d) §14.1 "What it refuses": incomplete, not contradicted. Not blocking.**
+  - **Where the 58030 comes from.** With no previous image, a read-only open's 58030 after a read error follows from four places:
+    - §14.1's opening rule: a read-only open recovers what a read-write open does, except in the listed salvage cases, and RW-7 lists this case only "when there is a previous image";
+    - F4-1's "when there is a previous image";
+    - RW-9's row;
+    - the no-previous-meta variant, which pins it.
+  - **At 7.14.** That bullet already left read errors to the general rule.
+  - **The rider.** F2-b.
+- **(e) Item 2's sentence on a failure after the retire write: derivable, not stated. Not blocking.**
+  - The retire write is durable, and nothing un-retires a meta. RW-4 gives the read error 58030 "for an explicit rollback".
+  - The next open selects meta `k−1`, with no previous meta. It meets the read error again, or, if the error does not recur, opens.
+  - This is verdict 1's residual (B2), which it ruled sufficient.
+  - **The rider.** F2-c.
+- **(f) §14.1 "What it replays", "the same fall-back (step 4a)": no change.**
+  - The phrase names step 4a's fall-back. That fall-back already differed between the two opens at 7.14: an unproven fall-back fails a read-write open, and a read-only open serves it as salvage.
+  - §14.1's opening sentence lists where a read-only open serves salvage instead, and RW-7 added this case there.
+  - A build that read "the same" as "only where a read-write open falls back" would be ROLLBACK-REFUSES-READ-ERROR's read-only half, and it fails the case.
+- **The four card edits beyond verdict 1's list: all accepted.** Each keeps the card true, and none touches spec text or Acceptance.
+  - **Limit 1 names RW-12.** Verdict 1's list put "Changelog RW-12" with the Limits, and Limit 1 is the Changelog's limit. RW-12 adds exactly one bullet to E2's entry.
+  - **"For the gate" item 9.** RW-1 now changes §2.2's summary, so the summary could not stay on the "Not changed on purpose" list. The new sentence says why it left.
+  - **The Open points preamble.** It states verdict 1's rulings exactly, and it labels the riders below it as first written. The rulings are:
+    - O-1 kept;
+    - O-2 as RW-3 (a), RW-9 (b, corrected and extended) and RW-4 (c);
+    - O-3 as RW-8;
+    - O-4 as RW-1.
+  - **The "Lines 21 and 22" note.** "Twelve blocks" would now be false. The note names all 24 blocks, and line 22's hash covers each of them, as the omission runs show.
+
+## Mutation evidence
+
+This is spec text, so there are no code mutants.
+- **Design mutants.** I walked each one as text against the reworked `t_fallback`.
+- **Text mutants.** I judged each one on the tip by the card's 34 non-gate Acceptance lines, in both locales.
+- **Where.** All ran in scratch clones, and none remains.
+
+| Mutant | Kind | Judged by | Result |
+|---|---|---|---|
+| ROLLBACK-REFUSES-READ-ERROR, full | card (F4-3) | `t_fallback` read-error case, step-2 and pass-2 cases: rollback 55000, read-only 58030 | caught |
+| ROLLBACK-REFUSES-READ-ERROR, step-2-only form | card (RW-5) | the pass-2 case | caught |
+| G5: the salvage's report leaves out the read error or the values against meta `k` | gate, design | the case's read-only assertion (RW-6, RW-8) | caught |
+| G6: a rollback answers XX001 when image `k` met a read error and meta `k−1`'s free set failed an integrity check at step 2 | gate, design | no stated case: the variant loses meta `k−1` instead | UNCAUGHT; not a named mutant; RW-3 states 58030; F2-e pins it |
+| G7: a plain read-write open retires meta `k`, then fails with 58030 on a pass-2 read error | gate, design | the pass-2 case's write hook | caught |
+| RW-1 … RW-12, each left out | text | its own lines (above), 22, and 21 where the count moves | caught |
+| TM-A: RW-3's "58030 too, never XX001" back to XX001 | gate, text | 22, 28 | caught |
+| TM-B: RW-9's two rows swapped | gate, text | 16, 22 | caught |
+| TM-C: RW-9's third row without "or meeting a read error" | gate, text | 16, 22 | caught |
+| TM-D: RW-8 without "and, when a read error stopped image `k`, that read error" | gate, text | 22, 31 | caught |
+| TM-E: a stray edit to §14.2's "Otherwise" row | gate, text | 21, 22 | caught |
+| TM-F: I-FALLBACK without "on its own" | gate, text | 22, 33 | caught |
+| TM-G: ROLLBACK-REFUSES-READ-ERROR dropped from `t_fallback`'s §15.1 row | gate, text | 18, 19, 22, 23; the checker prints its five expected errors | caught |
+
+## What the plan card must change at the merge
+
+This list replaces verdict 1's list, which was written for the REWORK state and is kept in History.
+- **QUEUE.**
+  - S-ALPHA-F4 and S-EPSILON close at the merge.
+  - S-EPSILON-F1 stays open.
+  - S-EPSILON-F2 needs a row (`- S-EPSILON-F2 | …`) before `merge-card.sh` runs, because it refuses a follow-up that is not a QUEUE entry.
+- **§9, row S-ALPHA-F4.**
+  - It names card S-EPSILON (S-STORE draft 7.15) and its merge. The card adopts the appendix's ten blocks and verdict 1's twelve rework blocks (this file, History).
+  - A-7d's Depends cell, "S-ALPHA-F4's spec card, only if the owner says "yes"", becomes "S-EPSILON (merged)".
+- **§9 A-7d.**
+  - `t_fallback`'s read-error case runs in step 2 and in pass 2, and once with no previous meta. It faults a slot that only image `k` references, until that slot is rewritten.
+  - ROLLBACK-REFUSES-READ-ERROR, with its step-2-only form, is judged here, and the count "34 rows" is unchanged.
+  - Step 2 goes on to read meta `k−1`'s free set after a read error on image `k`.
+  - The rollback's operator report says whether an integrity failure or a read error let it through. The salvage's report is spec (RW-8).
+  - Optionally, A-7d's test also crosses the case with a free set that fails an integrity check, where all three opens give 58030. §14 step 4a item 1 already says that, so A-7d need not wait for S-EPSILON-F2.
+- **§3.3's pointer** (PL-13-F1 (f)). The precondition includes a read error through the newest image's references.
+- **§10 item 22.**
+  - S-ALPHA-F4 is adopted by S-EPSILON (draft 7.15) on the owner's conditional reply.
+  - The reversal is the card's "If the owner withdraws the yes", checked on the merged text. It is cheap until A-7d is cut.
+  - O-1: whatever exposes the rollback should run or show the read-only open's report first (verdict 1, (B1) and (B2)).
+- **§10 item 15** stays open.
+- **The R-1 row.** S-EPSILON-F1 applies, and S-EPSILON-F2's riders may ride on it.
+
+## The record after this merge
+
+- **S-STORE.** It is draft 7.15 on the scaffold (sha256 `a1376c94…700f`). This card leaves C-T0 untouched.
+- **Open S-STORE items.**
+  - R-1-SPEC, as draft 7.16 on this draft (S-EPSILON-F1), before A-3b and A-7a.
+  - S-EPSILON-F2, which is optional. None of its riders is due before a card. The exception is F2-e, if it is taken as spec text rather than in A-7d's own test: then it should land before A-7d is cut.
+
+## Owner points, in plain words
+
+- **What users gain.**
+  - After one unreadable sector under the newest checkpoint, the database is no longer stuck.
+  - An operator can open it read-only and read or export everything, from the previous checkpoint plus the log.
+  - Or the operator can roll back one checkpoint and keep running read-write.
+  - With a disk that keeps what it says it saved, neither path loses an acknowledged commit.
+  - The normal automatic open still refuses, so nothing changes unless an operator asks.
+  - After this rework, the read-only view also shows what it lacks compared with the newest checkpoint.
+- **The risk** (unchanged by the rework).
+  - In rare cases with a second fault, a rollback can give up recent commits that a retry might have kept.
+  - In such cases it can also leave the store refusing to open until the disk is repaired or a backup is used.
+  - Neither is silent.
+  - Opening read-only first shows both beforehand. I recommend that whatever tool offers the rollback do that.
+- **The owner's reply.**
+  - On 2026-11-16 the owner replied, verbatim: "yes to all if thats all best long term for database overall in all ways". The reply is conditional.
+  - S-ALPHA-F4 is not among the items the orchestrator told the owner were trade-offs.
+  - This verdict does not judge whether the condition is met.
+  - If the orchestrator wants the owner's word on this item too, a plain question would be: "Does your yes also stand for the unreadable-sector item, given that in rare two-fault cases an operator's rollback can give up recent commits a retry might have kept (always reported, never silent, and avoidable by opening read-only first)?"
+- **Reversible.**
+  - Until A-7d is cut, withdrawing costs one spec card.
+  - The card's reverse section gives back 7.14 byte for byte outside the status line and the Changelog. I checked this by script on the merged text.
+  - After A-7d, withdrawing also costs A-7d's code and one test case.
+
+## Follow-ups
+
+- **S-EPSILON-F1: R-1-SPEC on S-EPSILON's 7.15** (carried from verdict 1, unchanged).
+  - **What.** R-1-SPEC becomes S-STORE draft 7.16. The changes are listed in History, under "What R-1-SPEC must change once this card merges (S-EPSILON-F1)":
+    - the number, in about fifteen places;
+    - "card S-EPSILON" for "card S-ALPHA-F4";
+    - line 545's E24 → E25;
+    - its status-chain Acceptance line;
+    - its checker's base or allowed set.
+  - **Re-checked on 5b82d2ff.** Its 25 S-STORE blocks (E1–E25) apply once each, in order, and no RW block touches a paragraph it edits.
+  - **When.** It must precede A-3b and A-7a, and it applies only if this card merges first.
+- **S-EPSILON-F2: optional riders for the read-error case** (new, low priority).
+  - **What.** Four wording riders and one test rider, for the next S-STORE card. R-1-SPEC's 7.16 can carry them, or any later S-STORE card.
+  - **What they change.** None changes an outcome, a count, a mutant or a byte format.
+  - **The riders.**
+    - F2-a: §14.2's third read-error row says "fails an integrity check" (point (c)).
+    - F2-b: §14.1's "What it refuses" covers a read error with no previous image (point (d)).
+    - F2-c: item 2's sentence on a failure after the retire write gains its read-error twin (point (e)).
+    - F2-d: §18's R18 names the read-error rollback and salvage.
+    - F2-e: `t_fallback`'s no-previous-image variant gains its free-set form (point (c); G6).
+  - **Checked.** Each Old below occurs exactly once in 5b82d2ff's file, in order, and still once after R-1-SPEC's E1–E25.
+  - **The carrying card.** It re-verifies the Olds and adds its own Acceptance lines. The orchestrator may also close F2 unapplied, at no cost to any build.
+
+### S-EPSILON-F2's riders (exact text)
+
+#### F2-a. §14.2, the read-error case's third row: "fails" means an integrity failure (point (c))
+
+Old:
+~~~~text
+an explicit rollback fails with 58030, or XX001 when image `k−1` fails | 58030, or XX001 when image `k−1` fails |
+~~~~
+New:
+~~~~text
+an explicit rollback fails with 58030, or XX001 when image `k−1` fails an integrity check (step 4a item 2) | 58030, or XX001 when image `k−1` fails an integrity check |
+~~~~
+
+#### F2-b. §14.1, "What it refuses": a read error with no previous image (point (d))
+
+Old:
+~~~~text
+**A corrupt meta**, and a newest image that fails at open with no previous image, fail as they do for a read-write open (XX001, or 58030 when the previous free set failed with a read error; §2.2, §3.3, §14 step 4a item 1).
+~~~~
+New:
+~~~~text
+**A corrupt meta**, and a newest image that fails at open, or that a read error stops, with no previous image, fail as they do for a read-write open (XX001, or 58030 when the previous free set failed with a read error or a read error stopped image `k`; §2.2, §3.3, §14 step 4a item 1).
+~~~~
+
+#### F2-c. §14 step 4a item 2: the read-error twin of the sentence on a failure after the retire write (point (e))
+
+Old:
+~~~~text
+An integrity failure in image `k−1` in pass 2, after the retire write (below), leaves meta `k` retired: the next open selects meta `k−1` and refuses as this one did.
+~~~~
+New:
+~~~~text
+An integrity failure or a read error in image `k−1` in pass 2, after the retire write (below), leaves meta `k` retired: the next open selects meta `k−1` and refuses as this one did, unless the read error does not recur.
+~~~~
+
+#### F2-d. §18, R18: the read-error rollback and salvage (found by this gate)
+
+Old:
+~~~~text
+and otherwise the read-write open is refused and an explicit rollback can open it (§2.2, §2.4, §14 step 4a; I-META-COPIES, I-FALLBACK)
+~~~~
+New:
+~~~~text
+and otherwise the read-write open is refused and an explicit rollback can open it, as it can a newest image that a read error (58030) stops at open, which a read-only open serves as salvage (§2.2, §2.4, §14 step 4a, §14.1; I-META-COPIES, I-FALLBACK)
+~~~~
+
+#### F2-e. §14 step 4a, `t_fallback`'s read-error case: the free-set form of the no-previous-image variant (point (c); G6)
+
+Old:
+~~~~text
+With both copies of meta `k−1` lost too, so that there is no previous meta, the step-2 case's three opens each fail with 58030 and write nothing.
+~~~~
+New:
+~~~~text
+With both copies of meta `k−1` lost too, so that there is no previous meta, the step-2 case's three opens each fail with 58030 and write nothing, and so they do when, instead, a hook corrupts the bytes of every read of meta `k−1`'s free set (an integrity failure), so that there is no previous image.
+~~~~
+
+## History
+
+- **Gate 1: REWORK, commit 3318f8b5c3c093321a3c7080626ee97ba473f4ff, on 45e85d069f4b717568542aeaa7858095b179678e.**
+  - **The gate.** A P gate in Claude Code session 33d36376-7eb7-4ef9-8157-8618ca79b5e4, with GATE EXIT=0.
+  - **Bytes.** It found the branch exactly the card's twelve blocks (sha256 `7e2d901b…c481`), with F4-1 to F4-10 the S-DELTA appendix's, byte for byte.
+  - **The design.** It found the design safe under honoured syncs.
+  - **Findings.** It ruled real:
+    - two exception lists that omitted the case (I-RO-OPEN, and §14.1's opening);
+    - XX001 for a rollback after a read error with no previous image;
+    - an unreported shortfall of the read-only salvage under dropped syncs (O-3);
+    - the untested pass-2 half;
+    - literal contradictions in I-FALLBACK, §2.2, §4.4 and two §14.2 rows;
+    - a fixture that admitted a slot both images share.
+  - **The fix.** It gave 12 exact blocks, RW-1 to RW-12, with 5 replaced and 10 added Acceptance lines and a dry-run sha256 `a1376c94…700f`. It named follow-up S-EPSILON-F1.
+- **The rework: commit 5b82d2ff70fcd3622b0a6dbe4366648a9e3cc41d.**
+  - **The spec.** It applied RW-1 to RW-12 to `docs/S-STORE.md`: +13/−10 on 45e85d06, with the result's sha256 equal to the dry run's. The draft stays 7.15.
+  - **The card.** It was updated in the main checkout (cards are local). Its pre-rework copy is at `~/.cache/nv3-review/S-EPSILON.card-backup-pre-rework.local.md`.
+  - **Reported.** It reported 35 of 35, `gate.sh` included. It also reported points (a)–(f), which it did not fix and which are ruled above.
+- **Gate 2 (this verdict): MERGE-WITH-FOLLOWUPS on 5b82d2ff.**
+
+**Gate 1's verdict, as committed at 3318f8b5, verbatim.**
+- **Where it is cited.**
+  - The card's Edits (step 3) and its reverse section cite it for the RW blocks.
+  - The card's "For the gate" item 1 cites its "Tests on A-7d's row, re-walked on the reworked text".
+  - S-STORE's 7.15 Changelog cites it as "this card's first gate".
+  - S-EPSILON-F1 rests on its "What R-1-SPEC must change once this card merges (S-EPSILON-F1)".
+- **How it is kept.**
+  - It is kept whole below, so that those citations still resolve to this file.
+  - Its header lines are indented, so that no tool reads them as this verdict's fields. Everything after them is unchanged, headings included.
+  - Where its "What the plan card must change" and its "Owner points" differ from the sections above, the sections above are current.
+- **Elsewhere.** The same text is at `git show 3318f8b5:nucleus/v3/verdicts/S-EPSILON.md`.
+
+<!-- gate 1's verdict (3318f8b5), verbatim, begins -->
+
+    Card: S-EPSILON
+    Class: spec
+    Card-gate: P
+    Verdict: REWORK
+    Gate-tier: P
+    Gate-model: claude-opus-5-5
+    Gate-session: T3 review sub-agent, Claude Code session 33d36376-7eb7-4ef9-8157-8618ca79b5e4 (a fresh gate: this agent wrote neither the card, its commit, the S-DELTA appendix nor any earlier verdict)
+    Date: 2026-11-16
+    Gate-exit: GATE EXIT=0
+    Commit: 45e85d069f4b717568542aeaa7858095b179678e
+    Mutants: spec text, none in code. The card's spec mutant, walked as text on its owning row (t_fallback, A-7d) at 45e85d06: ROLLBACK-REFUSES-READ-ERROR -> t_fallback read-error case, caught in its full form (rollback 55000, read-only 58030); its partial form that accepts the read error only in step 2 -> UNCAUGHT (no case reads image k's fault in pass 2; finding 3), caught after the rework by the pass-2 case. Gate's own: G1 a plain read-write open that falls back on its own on a pass-2 read error -> UNCAUGHT at 45e85d06, caught after the rework (the pass-2 case's first assertion and write hook); G2 a rollback that answers a read error with no previous image with XX001 -> the stated behaviour at 45e85d06 (finding 2), caught after the rework (the no-previous-meta variant); G3 a read-only salvage after a read error that omits the shortfall against meta k -> UNCAUGHT and not required at 45e85d06 (O-3), caught after the rework; G4 a fixture hook keyed on the page's LPID (so image k-1's copy fails too) or on its slot for ever -> a correct build fails the case at 45e85d06, excluded by the reworked fixture text. Text mutants on the tip, judged by the card's Acceptance: TM1 (ROLLBACK-REFUSES-READ-ERROR dropped from t_fallback's 15.1 row) -> lines 18, 19, 22, 23 (checker: not judged on A-7d, Phase-B-only set, 0 t_fallback rows); TM2 (a stray edit to 14.2's Otherwise row) -> lines 21, 22; TM3 (F4-2's read-error disjunct removed) -> lines 9, 10, 21, 22. All reverted; no mutant was applied in the worktree
+    Followups: S-EPSILON-F1
 
 ## Verdict in brief
 
@@ -460,3 +911,5 @@ If R-1-SPEC merges first instead, the mirror applies: this card becomes 7.16, E1
   - Must precede A-3b (and A-7a), R-1-SPEC's own due points, and applies only if this card merges first.
   - R-1-SPEC becomes S-STORE draft 7.16 with the changes listed above: the number in about fifteen places, "card S-EPSILON" for "card S-ALPHA-F4", line 545's E24 → E25, its status-chain Acceptance line, and its checker's base or allowed set.
   - No S-STORE anchor of R-1-SPEC collides with this card, before or after the rework.
+
+<!-- gate 1's verdict (3318f8b5), verbatim, ends -->
