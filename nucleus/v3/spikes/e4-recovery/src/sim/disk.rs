@@ -1141,6 +1141,18 @@ impl SimDisk {
         out
     }
 
+    /// **X5-R34 (b) 3** — the one read-only observer accessor this card
+    /// adds to `src/sim/`: the **durable** directory bindings of `dir`
+    /// (the name → inode map a `sync_dir` last made durable; a binding
+    /// made by a create or rename that no later `sync_dir` graduated is
+    /// absent, exactly as a crash would leave it). The harness's acked
+    /// derivation (`harness::derive_written_acked`) reads it at the end
+    /// of the workload pass; nothing else in `src/sim/` changes, and the
+    /// store never may call it.
+    pub fn durable_dir_bindings(&self, dir: &str) -> BTreeMap<String, FileId> {
+        self.durable_bindings.get(dir).cloned().unwrap_or_default()
+    }
+
     /// Look up a file id by path (observer view).
     pub fn stat(&self, path: &str) -> Option<FileId> {
         self.lookup(path)

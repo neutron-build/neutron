@@ -480,6 +480,10 @@ pub struct Meta {
     pub gc_w: u64,
     /// The epoch (low 32 bits).
     pub epoch: u32,
+    /// **S-1-F3 §2.2 (W1, gate edit 1; X-5c-F3-F3a step 4):** the boot
+    /// id of the session that wrote meta k (§14 step 8); 0 in meta 0,
+    /// written by the creating session (§2.3).
+    pub boot_id: u32,
     /// The page-map root ref.
     pub map_root: Ref,
     /// The free-set root ref.
@@ -505,19 +509,20 @@ pub fn build_meta(m: &Meta) -> Vec<u8> {
     wr_u64(&mut p, 20, m.t);
     wr_u64(&mut p, 28, m.gc_w);
     wr_u32(&mut p, 36, m.epoch);
-    wr_u64(&mut p, 40, m.map_root.slot);
-    wr_u32(&mut p, 48, m.map_root.epoch);
-    wr_u32(&mut p, 52, m.map_root.crc);
-    wr_u64(&mut p, 56, m.free_root.slot);
-    wr_u32(&mut p, 64, m.free_root.epoch);
-    wr_u32(&mut p, 68, m.free_root.crc);
-    wr_u64(&mut p, 72, m.dir_root);
-    wr_u64(&mut p, 80, m.next_lpid);
-    wr_u64(&mut p, 88, m.slot_count);
-    wr_u64(&mut p, 96, m.wal_start_lsn);
-    // The CRC covers the fields (12..104), not itself.
-    let crc = crc32c(0, p.get(12..104).unwrap_or(&[]));
-    wr_u32(&mut p, 104, crc);
+    wr_u32(&mut p, 40, m.boot_id);
+    wr_u64(&mut p, 44, m.map_root.slot);
+    wr_u32(&mut p, 52, m.map_root.epoch);
+    wr_u32(&mut p, 56, m.map_root.crc);
+    wr_u64(&mut p, 60, m.free_root.slot);
+    wr_u32(&mut p, 68, m.free_root.epoch);
+    wr_u32(&mut p, 72, m.free_root.crc);
+    wr_u64(&mut p, 76, m.dir_root);
+    wr_u64(&mut p, 84, m.next_lpid);
+    wr_u64(&mut p, 92, m.slot_count);
+    wr_u64(&mut p, 100, m.wal_start_lsn);
+    // The CRC covers the fields (12..108), not itself.
+    let crc = crc32c(0, p.get(12..108).unwrap_or(&[]));
+    wr_u32(&mut p, 108, crc);
     p
 }
 
@@ -526,8 +531,8 @@ pub fn parse_meta(p: &[u8]) -> Result<Meta, ()> {
     if p.len() != PAGE || p.get(0..8) != Some(META_MAGIC) {
         return Err(());
     }
-    let crc = rd_u32(p, 104)?;
-    if crc != crc32c(0, p.get(12..104).unwrap_or(&[])) {
+    let crc = rd_u32(p, 108)?;
+    if crc != crc32c(0, p.get(12..108).unwrap_or(&[])) {
         return Err(());
     }
     Ok(Meta {
@@ -535,20 +540,21 @@ pub fn parse_meta(p: &[u8]) -> Result<Meta, ()> {
         t: rd_u64(p, 20)?,
         gc_w: rd_u64(p, 28)?,
         epoch: rd_u32(p, 36)?,
+        boot_id: rd_u32(p, 40)?,
         map_root: Ref {
-            slot: rd_u64(p, 40)?,
-            epoch: rd_u32(p, 48)?,
-            crc: rd_u32(p, 52)?,
+            slot: rd_u64(p, 44)?,
+            epoch: rd_u32(p, 52)?,
+            crc: rd_u32(p, 56)?,
         },
         free_root: Ref {
-            slot: rd_u64(p, 56)?,
-            epoch: rd_u32(p, 64)?,
-            crc: rd_u32(p, 68)?,
+            slot: rd_u64(p, 60)?,
+            epoch: rd_u32(p, 68)?,
+            crc: rd_u32(p, 72)?,
         },
-        dir_root: rd_u64(p, 72)?,
-        next_lpid: rd_u64(p, 80)?,
-        slot_count: rd_u64(p, 88)?,
-        wal_start_lsn: rd_u64(p, 96)?,
+        dir_root: rd_u64(p, 76)?,
+        next_lpid: rd_u64(p, 84)?,
+        slot_count: rd_u64(p, 92)?,
+        wal_start_lsn: rd_u64(p, 100)?,
     })
 }
 

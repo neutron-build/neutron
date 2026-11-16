@@ -1,6 +1,39 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F1, steps 0–9 done — step 0 committed
+Status: **stage X-5c-F3-F3a reworked (the REWORK verdict at 98313ae3
+applied; first-run steps 0–7 below stand except where the rework
+changes them) — X5-R35 pre-registered verbatim before any run
+(3c8b038e); X5-R35 (a)/(b): E is the workload pass's events only,
+self-test (g) 6 demonstrated failing on 13da010b's derivation and
+reverted (93039525); Finding 1: wal_start_lsn holds back only the
+current boot's unmarked chunks, pinned with START-LSN-PREV-BOOT-CHUNK
+and the G1 first-record floor pinned (313a236b); X5-R35 (c): all 17
+named rounds left `frontier < lo`; Finding 3: the 37 re-run at the
+rework's tip — all pass, `ack_over` empty, no class-C
+`0 < frontier < lo` round named or new in 0..200; the full Acceptance
+(10k, verify, record check, gate.sh) re-run at the final tip (X5-R3):
+test 189/189, the 10k exit 0 (FAILING_ROUNDS 745), verify OK
+(--no-quotas; the six waived misses Q4/Q7/Q8/Q11/Q12/SIZING), the
+record check `ACK_OVER_ROUNDS 0` / `C_FRONTIER_BELOW_LO 0` (the first
+run's 117 all cleared), `GATE EXIT=0`.
+Step 0 committed F3-F1's Acceptance 10k as the triage file of record
+(929ade38), the X5-R33/X5-R34 rulings verbatim before any run
+(31effe00), F3-F1-F5's record fixes (97e85cab) and the class table
+re-derived (b68d948c); step 1 X5-R34 — I-ACK-PREFIX's `durable_end`
+from SimDisk history, the judged `ack_over` cross-check, the 37-round
+table holding P's prediction exactly (13da010b, b9d6824c); step 2 the
+exact-segment-end hop clearing all four boundary store losses
+(ce8f8bbc, 51947e16); step 3 I-ACK-PREFIX with two or more batches in
+flight, interval-set frontiers, the `writer:prewrite` pin (cbf0754c);
+step 4 per-boot ids — the three-way boot-id rule, W4 (i)'s ordered
+stop, the five pins and their five mutants, 186's shape gone and 405
+moved (8b71e560, 8e62b04b); step 5 the F3-F1-F3 pins — the r30 guard
+cases (5482edac) and mf29 (94254d12); step 6 the time-boxed C-XX/C-DIV
+remainder — both C-XX leads cleared, `E4_TXN_DIAG` clean on every
+repro, the per-key cut recorded, the remainder ESCALATED with evidence;
+step 7 this README. The Acceptance 10k (`X-5c-F3-F3a.acc.*`) is the
+runner's and becomes F3-F3b's triage file. The stage before it
+(X-5c-F3-F1) is complete: steps 0–9 done — step 0 committed
 F3's Acceptance 10k as the triage file of record (7b709ccb:
 `E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0
 PANIC=0 O1F_FAIL=2665 MONITOR=0` / `E4 FOLD FAILING_SEEDS=955
@@ -784,10 +817,200 @@ otherwise. 4. The WAL side is not ruled: no worker extends `D` to the WAL.
 X5-R30. It is empty in classes C and MW. Never satisfy O-3(c) by making a
 harness walk report ground truth as a store finding (X5-R23).
 
+## P rulings X5-R33 and X5-R34, verbatim (nv3-X-5c-F3-F3-write-1, 2026-11-03;
+## binding; pre-registered)
+
+Copied word for word from card X-5c-F3-F3a (its "Carried verbatim" section,
+itself verbatim from `verdicts/X-5c-F3-F3-pre.md`) before any `e4-campaign`
+command ran (X5-R33 (a), X5-R34 (a)) — beside X5-R28–R32 above.
+
+### Carried: X5-R34, verbatim (binding; post-data; `verdicts/X-5c-F3-F3-pre.md`)
+**X5-R34 (the acked-commit derivation: I-ACK-PREFIX's `durable_end` from SimDisk history; the client-ack cross-check is judged)**
+
+P (claude-opus-5-5, nv3-X-5c-F3-F3-write-1), 2026-11-03, from the S-1-F3 draft-2 gate's ruling (b) (`verdicts/S-1-F3-draft2-gate.md`, "Ruling on (b)"). **Post-data:** the 37 class-C `0 < frontier < lo` rounds of X-5c-F3-F1's Acceptance file (commit 62d4e739, json_sha256 `f3a1e605…a1af17`) were seen before it was made. It governs every run from the commit that lands it. RESULT item 6 records it as a post-data amendment of the harness's `lo` input. The oracle's text does not change.
+
+**(a) Scope.** It replaces the SyncOn `acked` half of `harness::derive_written_acked`: the per-inode `max`, where `durable_end[inode]` is the max over `SyncReturned` of the returned extent and `acked ⇔ durable_end[inode] ≥ end`. Unchanged:
+- `written` (the `hi` input);
+- SyncOff's `acked` (= written);
+- the `unparsed_written` report;
+- the oracle's `lo = max(c_{r−1}, max{ts : SyncOn ∧ acked})`;
+- X5-R1 (until X5-R33 lands).
+
+**(b) Inputs.** All are harness-side and none is store memory, except `p0`.
+1. **`E`:** the workload pass's `disk.events`, as `run_round` captures them. These are this round's events only, because `new_round` cleared the list.
+   - Index order is time order: every env op is one atomic sim step (`WriteIssued`+`WriteReturned` in one step, `SyncIssued`+`SyncReturned` in one step).
+   - Media faults are applied after `E` is captured, so `E` never contains them.
+2. **`p0`:** the WAL append position the round's workload started from, `start_store.wal.append`. That is the valid end of the recovery that produced the round's base; in round 0 it is the created store's append position.
+   - *Guard:* every record in `wal_commits` has `lsn ≥ p0`. A violation is a harness defect, and it fails the round loudly.
+3. **`B(n)`:** for a segment file name `n` (`{seg:016x}.log` in the sim directory `"/wal/"`), the inode that SimDisk's **durable** directory bindings map `n` to at the end of the workload pass, or none.
+   - That is `durable_bindings["/wal/"][n]`, the binding made by a create or rename that a later `sync_dir` made durable.
+   - It is read through one new read-only observer accessor on `SimDisk`. Nothing else in `src/sim/` changes.
+4. **`β(n)`:** the index in `E` of the last `DirOpIssued` whose `what` is `create /wal/n`, or ends with `-> /wal/n`, and which precedes the last `SyncDirReturned { dir: "/wal/" }` in `E`. It is none if no such event exists, meaning the binding predates the round.
+5. **`Rc`:** the segment names `n` for which `E` holds a `DirOpIssued` whose `what` is `rename /wal/n -> …`. These are the sources of step 6's recycling renames.
+
+For an LSN `x`: `seg(x) = x − (x mod WAL_SEG)`, `name(x) = {seg(x):016x}.log`, and `off(x) = x mod WAL_SEG`.
+
+**(c) Durable bytes.** A byte at LSN `x` is **durable** iff one of the following holds.
+- **(R) Recycled:** `name(x) ∈ Rc`. This is an exemption. A segment is recycled only once it lies wholly below a durable meta's `wal_start_lsn`, so `T` covers its commits.
+- **(W) Written and synced:** all of these hold:
+  - `i = B(name(x))` exists;
+  - the last `WriteIssued` in `E` to inode `i` whose range covers `off(x)` exists;
+  - that write's index is greater than `β(name(x))`, when `β` exists;
+  - a `SyncReturned { inode: i, .. }` (from `sync_data` or `sync_all`) follows it later in `E`.
+- **(S) Slack:** `x` lies after the end of a `SegmentEnd` record that starts at some LSN `q` with `seg(q) = seg(x)`, where:
+  - the `SegmentEnd`'s own bytes are durable by (W); and
+  - its last-issued bytes at `off(q)` in `B(name(q))` decode (`wal::dec_record`) as `K_SEGEND` with `lsn = q`.
+
+*Why the binding index.* A recycled file keeps its previous life's synced bytes at every offset its new life has not yet overwritten. Seed 20 r2 shows this:
+- inode f4 was synced as segment 0x60000 (EV 121);
+- it was renamed to 0xa0000 (EV 7309, dir-synced at EV 7310);
+- ts 64 was written at f4@5952 (EV 7837) and never synced.
+
+Only writes made after a name was bound to its inode belong to the stream at that name. Without the index, an unwritten record lying over stale synced bytes would count as acked.
+
+**(d) `D`.** `D` is the largest `L ≥ p0` such that every byte in `[p0, L)` is durable, scanning in LSN order. A segment boundary is crossed like any other position: an exact segment end, and `SegmentEnd` slack, both continue at the next segment's first LSN. `D` is computed over write intervals (per-inode interval maps, one pass over `E`), never with a per-byte loop over the WAL span.
+
+**(e) Acked.**
+- A SyncOn commit of this round is acked iff `lsn + len ≤ D`, or `name(lsn) ∈ Rc`. The commit is a `Commit`, or a chunked transaction's `CommitMarker`; `(lsn, len)` come from `wal_commits`.
+- A SyncOff commit is acked iff it is written (unchanged).
+- X5-R33's `a` uses this definition of acked.
+
+**(f) The judged cross-check (ACK-OVER-HOLE).** `HarnessState::client_acked` becomes a judged input. It holds every commit whose own `wal_wait_durable`/`wal_wait_written` returned before the crash.
+- **The failure.** Take every SyncOn `ts ∈ client_acked` with `lsn + len > D` and `name(lsn) ∉ Rc`. For each one, the round fails as a store failure, through the same path as X5-R10's guard (the round's task error, so the pass fold fails it), with the text `ACK-OVER-HOLE: client-acked SyncOn ts=<ts> ends at <lsn+len> above durable_end <D> (I-ACK-PREFIX, X5-R34)`.
+- **The record.** The round record gains `ack_over`: the list of such ts, empty when there are none. `run` writes it and `verify` parses it; the pass fold does not read it.
+- **Not a failure:** a commit acked by (e) but absent from `client_acked`, because its committer crashed in its wait. Its record is durable, and recovery must replay it.
+
+**(g) Self-tests** (literal event lists, in `tests/harness.rs`). Each must-fail case must also fail on the frozen derivation. That is shown by restoring the old function, recording the result, and reverting.
+1. **20 r2's shape:** an inode is synced in its life as segment A, renamed to B and dir-synced; then a SyncOn record is written at B's offset with no later sync. It must not be acked.
+2. **Contiguity:** batch 2 is written and synced while batch 1 below it is unwritten. Batch 2's SyncOn commit must not be acked, with batch 2 on the same inode and, as a variant, on the next segment's inode.
+3. **The directory:** a segment is created, or renamed into place, with no later `sync_dir("/wal/")`. Its records must not be acked, even though they are synced.
+4. **A forged early ack:** `client_acked` holds a ts whose record ends above `D`. The round must fail with the ACK-OVER-HOLE text.
+5. **Must pass:**
+   - a record written after its segment's durable binding and then synced, contiguous from `p0`, is acked;
+   - a record in an `Rc` segment is acked, and exempt from (f);
+   - a SyncOn record placed after an exact segment end, in a durably bound and synced next segment, is acked.
+
+**(h) The decision rule (pre-registered).**
+1. **At the commit that lands (a)–(g), before any store change of its card** (the store is still X-5c-F3-F1's), run single seeds for the 37 named rounds:
+   - 20 r2, 115 r1, 403 r1, 622 r0, 780 r2, 801 r1, 825 r2, 830 r1, 1001 r0, 1064 r1;
+   - 1585 r1, 1801 r1, 2183 r0, 2525 r2, 2730 r2, 2765 r0, 2812 r1, 3224 r1, 3806 r1, 4770 r2;
+   - 4930 r0, 5054 r1, 5601 r1, 5604 r0, 6154 r0, 6200 r2, 6263 r2, 6623 r0, 7405 r1, 7531 r0;
+   - 7803 r1, 7823 r1, 8220 r2, 8363 r0, 9200 r0, 9484 r2, 9594 r0.
+
+   Record frontier, `lo` before and after, pass, and `ack_over` per round. Then run 0..200 and record `ack_over` and the count of failing class-C rounds with `0 < frontier < lo`.
+   - **Prediction** (P's prototype of this text):
+     - 33 named rounds get `lo ≤ frontier`;
+     - 1064 r1, 4770 r2, 5054 r1 and 6263 r2 keep `frontier < lo`, with `lo` unchanged;
+     - `ack_over` is empty on all 37 and everywhere in 0..200;
+     - no new failing class-C `0 < frontier < lo` round appears in 0..200.
+   - A named round that then fails another clause is classed under that clause, and never re-ruled here.
+2. **The four exact-boundary rounds are store losses** until the §12.2/§12.5 exact-segment-end hop lands (S-1-F3 gate G2 and edit 2). They are class-C I-REDO-COMPLETE breaks with no media fault. After the hop they must leave the `frontier < lo` shape.
+3. **At the card's tip,** re-run the 37. Any **failing** class-C round that still has `0 < frontier < lo`, whether named or new in a ≤ 200-seed range, is escalated as a store loss with its trace: `D`, the reason `D`'s walk stopped, the record, and its events. It is never re-derived: (b)–(e) do not change, and no exemption is added.
+4. **Any non-empty `ack_over`** is an ACK-OVER-HOLE store failure: record it and ESCALATE. The cross-check is never relaxed.
+5. **From X-5c-F3-F3a's Acceptance file on,** every failing class-C `0 < frontier < lo` round is a store loss, for P's triage. A passing round with `frontier < lo` (O-1 matched at some `c ≥ lo`; e.g. 6851 r2 in F3-F1's file) is not a loss. RESULT item 6 lists X5-R34, with the 33 rounds it moved.
+6. **A round whose workload moved,** because a store fix in the same card shifted it, is recorded "moved by <commit>" with its new outcome. That is not a failure of this rule.
+
+**(i) What it does not touch:**
+- `written`/`hi`, and the oracle's text;
+- X5-R1, until X5-R33 replaces its MW bound;
+- X5-R5's R, and X5-R28's K;
+- `model.rs`, and the sim's fault model, crash model and `taint_ranges`.
+
+It never reads `wal.durable` or `wal.written`, which are store memory. A diagnostic may print them beside `D`.
+
+### Carried: X5-R33, verbatim (binding; pre-data; `verdicts/X-5c-F3-F3-pre.md`; implemented by X-5c-F3-F3b, committed as text by this card's step 0)
+**X5-R33 (X5-R1's MW lower bound, tightened; the WAL-loss `Err`; the `wal_ckpt_end` cross-check)**
+
+**Source.**
+- S-1-F3 draft 2, Implications (e), with the draft-2 gate's edits 4 and 5 applied (`verdicts/S-1-F3-draft2-gate.md`, 2026-11-03).
+- Its two open items are closed by P here, in (h) and (i).
+- Precision added by P: the truncation point in (b), the no-damage case of `a`, and the exact bounds form of the cross-check in (d).
+
+**Status.** It is **pre-data**: no run that judges by it has been read. It tightens X5-R1, which the X-5c card's "may tighten, may not loosen" allows. It is a P-commit to the frozen oracle and its self-tests, landed in one commit whose subject names X5-R33.
+
+**(a) When.**
+- This text is committed before the output of any run that judges rounds by it is read. X-5c-F3-F3a's step 0 commits the text.
+- X-5c-F3-F3b's code commit lands it before F3-F3b's ≤ 200-seed MW smoke.
+- A run whose output is read before that code commit is diagnostic-only, and cannot be cited as a pin or as evidence.
+
+**(b) The stream as it stood at a moment `m`.**
+- It is the records appended by the life writing at `m`, plus, for each earlier life, its records below the **lowest truncation point of every later life up to `m`**. A record that a later truncation superseded never belongs to it.
+- A life's truncation point is the LSN at which it began appending, which is the valid end its recovery found.
+- A recovery life that appends nothing truncates nothing under this definition. If its zeros survive, they stop the next life's walk, and that sets the next life's truncation point.
+
+**(c) The lower bound for an MW `Ok` recovery: `lo_MW := max(c_{r−1}, T, h, a)`.**
+- **`h`** is the largest ts whose `Commit`/`CommitMarker` record lies wholly below the opened meta's `wal_ckpt_end`, in the stream as it stood when the opened meta was written.
+- **`a`** is the largest ts that is SyncOn, acked by X5-R34, and has its record wholly below the round's **first damaged WAL byte**, in the stream as it stood at the round's crash.
+  - Damaged bytes are the MW fault targets and misdirect destinations. They map to LSN through the first LSN of the segment whose name was bound to the target inode at the crash.
+  - If the round damaged no WAL byte, `a` is the round's largest acked SyncOn ts.
+- **The derivation.** The harness derives both values from SimDisk history and the model's record positions. It reads `wal_ckpt_end` and `ts_ckpt_hi` from the meta bytes on SimDisk, never from store memory.
+
+**(d) The harness cross-check.**
+- **What is checked.** For every meta the store writes (every meta-slot `DWrite` whose bytes parse as a meta), with `w` = its `wal_ckpt_end`, `t_hi` = its `ts_ckpt_hi` and `T` = its `T`:
+  1. no `Commit`/`CommitMarker` record that the writing life had appended straddles `w`: each ends at or below `w`, or starts at or above it;
+  2. every such record with ts `≤ T` ends at or below `w`;
+  3. `w` is at or below that life's append position at its crash or end;
+  4. `t_hi` is the largest ts among that life's `Commit`/`CommitMarker` records ending at or below `w`, or, if there is none, the frontier the writing life started from.
+- **Why these bounds are exact.** This is the gate's bounds form, G4 (c). It is exact because step 0 reads both values in one step, inside the commit critical section (§13 step 0 as amended, W5 (i)). `Chunk` records are excluded: they may fall on either side of `w`.
+- **A mismatch** is a store failure of the round, with the text `X5-R33 cross-check: meta <ckpt_id> wal_ckpt_end <w> / ts_ckpt_hi <t_hi> vs <expected>`. It is not a harness error.
+- **What it catches.** A store that writes `wal_ckpt_end` too low (COVER-END-AT-T), without trusting store memory.
+- **Self-tests.** A forged low `wal_ckpt_end` fails it, and so does a forged `ts_ckpt_hi`.
+
+**(e) A recovery `Err` in class MW that is I-WAL-COVER's refusal.**
+- **What it is.** XX001 for WAL loss, identified by the store's typed error, never by its text. It is counted as detection under O-3 (b).
+- **The rule.** It passes iff it is **explained**: a fault of the round damaged a WAL byte in `[wal_start_lsn, wal_ckpt_end)` of the opened meta, in the stream as it stood when that meta was written. Otherwise O-3 (c) fails it as a false positive, with the text `O-3(c): WAL-loss XX001 with no fault in [wal_start_lsn, wal_ckpt_end) (X5-R33)`.
+- **What follows.**
+  - O-1 is not run on the `Err` open, as for an MP recovery `Err`.
+  - The seed ends at that round, as an MP `Err` round's does.
+  - Every other MW `Err` is judged as before, by the twin rule.
+
+**(f) Self-tests.**
+- **Must fail:**
+  - MW `Ok` with `c = h − 1`;
+  - MW `Ok` with `c = a − 1`;
+  - a MW WAL-loss `Err` where every fault lies outside `[wal_start_lsn, wal_ckpt_end)`;
+  - a record superseded by a later truncation counted into `h` (a fixture with a reissued ts below `wal_ckpt_end`);
+  - the cross-check with a forged low meta value, and with a forged `ts_ckpt_hi`.
+- **Must pass:**
+  - a MW WAL-loss `Err` that is explained;
+  - MW `Ok` with `max(h, a) ≤ c <` the max acked.
+
+**(g) Unchanged.**
+- "O-3 requires that no damaged record is replayed";
+- class C;
+- class MP's lower bound.
+
+**(h) Class MP.** This closes S-1-F3's "MP side effect for X5-R33 to rule". P, 2026-11-03, pre-data.
+- **MP rollback rounds** (X5-R5) keep MP's lower bound: the max acked SyncOn, acked by X5-R34. Nothing in X5-R33 excuses them.
+- **A WAL-loss `Err` in class MP** (for example a Q14 rollback to a meta whose WAL span the newer meta's step 6 recycled) is judged by MP's unchanged O-3 (b)/(c): the twin rule, with X5-R32. It is never judged by (e). The rollback's meta-slot fault lies on a slot that every recovery reads, so the twin rule does not call the detection a false positive.
+- **X5-R5's R and K** and amcheck (i) are computed as before, on the opened image.
+- **Counting.** The round record's `cover_err` field lets RESULT count such rounds per class.
+- **Class C.** Any WAL-loss `Err` fails O-3 (b), as every class-C XX001 does. Once the exact-segment-end hop exists, no class-C open fails the coverage check (S-1-F3 gate G5), so such a round is a store failure.
+
+**(i) Salvage.** This closes the conditional "if the prototype gains a read-only salvage open".
+- X-5c-F3-F3 adds no read-only open to the prototype. S-1-F3's salvage (W7) is A-7d's, so the conditional is not triggered.
+- The prototype models Q1 = A's read-write half only: XX001, and nothing written.
+- Any later card that adds a read-only open must first have P pre-register O-1 on it: the state equals the model at `c` = the frontier, with `max(c_{r−1}, T, a) ≤ c`.
+
 **The reporting rule (this card's step 0, standing):** every class table
 splits out `served=true` rounds first (the oracle's `o3` text is
 last-writer-wins, so a serve can read as O-3(d), and an `O-3(a)` text can
 hide an O-3(e) failure).
+
+## P ruling X5-R35, verbatim (the X-5c-F3-F3a rework gate, 2026-11-03;
+## binding from the rework's first run; `verdicts/X-5c-F3-F3a.md` at
+## 98313ae3 — committed before any run of the rework)
+
+- **(a)** X5-R34's `E` is the slice of `disk.events` from the workload pass's first event to its end. The recovery and the harness boot checkpoint that precede the workload in `run_round`'s capture are not in `E`. (b) 1–5, (c)–(f) and (i) are otherwise unchanged. `Rc` and β are read over this `E`.
+- **(b)** A new self-test (g) 6 must fail: a recovery truncation zero-write plus its sync covers an enqueued, never-written SyncOn record, which must not be acked. Show that it fails on 13da010b's derivation, then revert.
+- **(c)** The rule. At the rework's tip, each of the 17 named rounds must leave `frontier < lo` or be recorded as moved (X5-R34 (h) 6). Any that keeps it is an (h) 3 store loss.
+- **(d)** This raises no `lo` and tightens nothing else. It removes an unsatisfiable lower bound: a commit whose bytes never reached disk.
+
+*(README annotation, not part of the verbatim text: the ruling's post-data
+note — "the 17 rounds above were seen" — names the verdict's Finding 2
+rounds: 205 r2, 381 r1, 403 r1, 774 r2, 1174 r2, 1203 r1, 3805 r2,
+3883 r2, 4193 r1, 4601 r1, 4612 r2, 5030 r1, 7203 r2, 7803 r1, 8200 r2,
+8404 r1 and 8825 r2.)*
 
 ## Stage X-5c-F1's record (X-5c-F1)
 
@@ -2256,15 +2479,15 @@ oracle commit, its subject naming X5-R32).**
 
   | Seed/round | r32 | O-3 text | pass | Reading |
   |---|---|---|---|---|
-  | 1167 r1 | true | none | true | the ruled shape |
+  | 1167 r1 | true | none | true | the ruled shape (control: 1167 r1 still shows O-3 (c) at e6ebbdda) |
   | 4348 r1 | true | none | true | the ruled shape |
   | 6047 r1 | true | none | true | the ruled shape |
   | 7367 r1 | true | none | true | the ruled shape |
-  | 7 r1 | false | none | true | moved: the twin-rule shape is gone (no O-3 (c) text at all) |
-  | 3307 r1 | false | none | true | moved, as 7 |
-  | 8837 r1 | false | none | true | moved, as 7 |
-  | 7748 r1 | false | `O-3(e): (ii) reported slot 12 …` | false | moved to an O-3 (e) (ii) failure — classed under that clause, never re-ruled |
-  | 1628, 2047, 2307, 3887, 4707, 6767, 9168, 9508, 9928 | — | — | — | moved outright (the chain stops before the named round) |
+  | 7 r1 | false | none | true | moved by e6ebbdda (F3-F1 step 1): passes with no O-3 (the twin-rule shape is gone) |
+  | 3307 r1 | false | none | true | moved by e6ebbdda (F3-F1 step 1): passes with no O-3, as 7 |
+  | 8837 r1 | false | none | true | moved by e6ebbdda (F3-F1 step 1): passes with no O-3, as 7 |
+  | 7748 r1 | false | `O-3(e): (ii) reported slot 12 …` | false | moved by e6ebbdda (F3-F1 step 1): fails O-3 (e) (ii) — classed under that clause, never re-ruled |
+  | 1628, 2047, 2307, 3887, 4707, 6767, 9168, 9508, 9928 | — | — | — | moved by e6ebbdda (F3-F1 step 1): each loses the named round, because the chain stops after an r0/r1 recovery-`Err` detection |
 
   **No round keeps the twin-rule shape with `r32 = false`: no
   ESCALATE.** P's prediction ("all 17 have `r32 = true` and pass")
@@ -2379,8 +2602,8 @@ record).
   open candidate; the root cause sits in the replay/flip interaction
   and is **not** fixed within the budget. Evidence: the `E4_CXX_DIAG`
   artifacts at
-  `$HOME/.cache/nv3-review/runlogs/cxxd151*.err` and
-  `cxxfix151*.err` (the per-record replay findings, the directory keys,
+  `$HOME/.cache/nv3-review/runlogs/X-5c-F3-F1.7.cxxd151*.err` and
+  `X-5c-F3-F1.7.cxxfix151*.err` (the per-record replay findings, the directory keys,
   the post-recovery and post-checkpoint findings, before and after the
   dir fix). **150 r1 (XX001 at
   Open, two nested crashes) was not reached within the budget** —
@@ -2419,8 +2642,725 @@ X-5c-F4 step 0** (this stage's Acceptance file
 `X-5c-F3-F1.acc.campaign.json` — `E4 SEEDS=10000 O1_FAIL=2617
 O2_FAIL=54 O3_FAIL=542 DEADLOCK=0 PANIC=0 O1F_FAIL=2627 MONITOR=0` /
 `E4 FOLD FAILING_SEEDS=901 FAILING_ROUNDS=860 TWIN_FAILING_ROUNDS=68
-DEFECT_SEEDS=0`, sha256 `f3a1e605…a1af17`, prov `commit=a96620bd` — is
+DEFECT_SEEDS=0`, sha256 `f3a1e605…a1af17`, prov `commit=62d4e739`
+(code-identical to a96620bd: 62d4e739 adds 8 README lines; the same
+sha256 `f3a1e605…a1af17`) — is
 F4's triage input, per the card's Goal and Notes).
+
+## Stage X-5c-F3-F3a's record (this card)
+
+**Step 0 — the triage file, the rulings and the F3-F1-F5 record fixes.**
+
+- **(a) The provenance checks passed before the copy:** the prov file
+  shows `commit=62d4e7396f544c17d6d7c1f93875cd5b00275699`,
+  `status_lines=0`, `exit=0`, `verify_exit=0`; the JSON's sha256 equals
+  its `json_sha256` (`f3a1e6058fbccc5025b5be786280917cf1344aea301d9152842518025ea1af17`);
+  `git diff --quiet 62d4e739 HEAD` over `src`, `tests`, `examples`,
+  `Cargo.toml` and `v3/Cargo.lock` exits 0 (6db60b2b adds only
+  `verdicts/X-5c-F3-F1.md`).
+- **(b) The triage file:** committed at 929ade38
+  (`results/campaign.json` only), the message carrying the two E4 lines,
+  the quota table and the prov lines.
+- **(c) The rulings commit — before any `e4-campaign` command ran:**
+  **31effe00** ("P rulings X5-R33 and X5-R34, verbatim (nv3-X-5c-F3-F3-write-1,
+  2026-11-03; binding; pre-registered)", beside X5-R28–R32 above; the
+  two texts verified word for word against the card before the commit).
+- **(d) The F3-F1-F5 record fixes:** committed at 97e85cab (the
+  17-round table's 13 moved rounds each name e6ebbdda with the gate's
+  attribution; RESULT 5's prov commit is 62d4e739; the step-7/8 diag
+  artifacts copied to `X-5c-F3-F1.7.cxxd151*.err` /
+  `X-5c-F3-F1.7.cxxfix151*.err`, the README pointing at the copies).
+
+**(e) The class table, re-derived from `results/campaign.json` (the
+reporting rule: served rounds split out first), judged under X5-R30 (c)
+from the recorded fields — a served round passes iff
+`(skx ∨ smx) ∧ pass_na` (no re-run).** Field definitions as F3-F1's:
+a **failing** primary round has `pass=false` as amended; a **failing
+twin** round has `pass=false` in the twin record.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **Served (split out first)** | 7 MP, **all moved to pass** | MP/MW round with `served=true`: 1057, 1897, 2927, 4718, 7238, 7528, 8728 (all r0, all `mrb=true`, all carrying `O-3(a): served corruption` as recorded) — each passes the amendment: skx 1057/1897/4718, smx 2927/7238/7528/8728, all `pass_na=true`. **No failing served round remains.** | 1897 r0, 2927 r0 |
+| **C-XX** (class C) | 76 | class C failing round with `o2 != null` or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 22, `AmcheckIi` 54 (no `o2`-only round) | 150 (r1, `Open`), 151 (r1, `AmcheckIi`) |
+| **C-DIV** | 314 | class C failing round **outside C-XX** carrying an `o1` text. **37 carry `frontier < lo`** (36 (b) + 1 (a) — 5054 r1) — the X5-R34 set; the rest: (b) 115, (c) 99, (d) 62, (a) 1. By round index: r0 19, r1 28, **r2 267**. (F3-F1's wider definition — carrying an `o1`, excluding only an O-1(a) inside a C-XX round — gives **364**, overlapping C-XX in 50 rounds: 42 O-1(b) + 8 O-1(c); both counts recorded per the card's step 0 (e).) | 20 (r2, b, `frontier < lo`), 63 (r2, c), 273 (r2, d), 5054 (r1, a, `frontier < lo`) |
+| **MW-ORPHAN** | 445 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` — F3-F3b's (the `wal_ckpt_end`/I-WAL-COVER work), never fixed here | 19 (r0) |
+| **Other MW** | 8 | the MW failing rounds outside ORPHAN: 7 O-1(a)+O-3(d) (4399/4919/5619/7219/7979 r0, 8039/8649 r1), 1 O-1(d)+O-3(d) (6399 r2) — the ORPHAN published-set family | 4399, 6399 |
+| **MP O-3(e)(ii)** | 6 | MP failing round with `o3` starting `O-3(e): (ii)`: 4027, 4767, 6647, 6897, 9978 (r0) and 7748 (r1), each "reported slot N that is neither tainted nor in R" | 4027 r0, 7748 r1 |
+| **Other MP** | 4 | O-1(b) 3 (3607 r1, 4818 r0, 5227 r1), O-1(a) 1 (5928 r1) — no O-3 text, recovery `Ok` | 3607, 5928 |
+| **The twins** | 68 | failing twin rounds: 24 MP + 44 MW; `o1` kinds: MP (a) 3, (b) 16, (c) 4, (d) 1; MW (a) 12, (b) 16, (c) 8, (d) 7, (none) 1 | 339/849 family |
+
+Partition check: C 390 = 76 C-XX ∪ 314 C-DIV (disjoint by the
+definition above; 73 of the 76 C-XX rounds also carry an `o1` — 23
+O-1(a), 42 O-1(b), 8 O-1(c)); MP 10 = 6 +
+4; MW 453 = 445 + 8. Total failing rounds **853** (the recorded
+`FAILING_ROUNDS=860` minus the 7 served rounds X5-R30 (c) moves);
+failing seeds **894** (the recorded `FAILING_SEEDS=901` minus the same
+7 — 41 of the 901 fail only through their twin rounds);
+`TWIN_FAILING_ROUNDS=68`; 0 livelock/deadlock rounds, 0 defect seeds.
+**Every count equals the card's Goal table** (P's counts at F3-F1's
+gate); no deviation to record.
+
+**Step 1 — X5-R34, the acked-commit derivation from SimDisk history
+(commit 13da010b; the store unchanged).**
+
+- **(a) What landed:** the SimDisk observer accessor
+  `durable_dir_bindings` (the one permitted `src/sim/` change — the
+  durable `/wal/` name→inode map, exactly as a crash would leave it);
+  `derive_written_acked` takes `p0` (the round's starting append
+  position, with the (b) 2 guard: any `wal_commits` record below `p0`
+  fails the round loudly) and the bindings, and its **SyncOn acked
+  half** is now `D`, the durable prefix of X5-R34 (c)'s R/W/S byte
+  rules computed over per-inode interval maps in one pass over `E`
+  (never a per-byte loop) — `written`/`hi`, SyncOff's acked and the
+  `unparsed_written` report kept exactly. The round record gains
+  `ack_over` (the (f) cross-check's list: SyncOn ts's whose own §12.4
+  wait returned while their record ends above `D` outside `Rc`);
+  non-empty fails the round through the task-error path (X5-R10's
+  guard shape) with the ACK-OVER-HOLE text verbatim; `run` writes it,
+  `verify`'s parser reads it, the pass fold never reads it. The
+  `E4_ACK_DIAG` cross-check diagnostic stays; a new `E4_D_DIAG`
+  (stderr, default off) prints `D`, its stop reason, `Rc` and each
+  commit's verdict.
+- **(b) The frozen-derivation demonstration.** With the frozen per-inode
+  `max` acked half restored in place (and the cross-check removed with
+  it — both halves of the same ruling), `cargo test -q --release -p
+  e4-recovery --test harness x5r34` gives **exactly the four must-fail
+  cases red and the must-pass case green**:
+
+  ```
+  thread 'x5r34_contiguous_prefix_required_two_batches' panicked … (g) 2
+  thread 'x5r34_stale_bytes_of_a_renamed_segment_never_ack' panicked … (g) 1
+  thread 'x5r34_unsynced_directory_binding_blocks_acked' panicked … (g) 3
+  thread 'x5r34_forged_ack_over_hole_fails_loudly' panicked … (g) 4
+  test result: FAILED. 1 passed; 4 failed  (x5r34_genuine_durability_acks green)
+  ```
+
+  Reverted clean afterwards (`git diff` free of the demonstration; the
+  first test build had dummy record bytes that the frozen walk never
+  yields, which would have hidden cases 1–3 — the tests encode genuine
+  records so **both** derivations' walks yield them, and the recorded
+  demonstration above is with that fix in place).
+- **(c) (h) 1's decision rule, at 13da010b before any store change —
+  single-seed runs of the 37 named rounds (the D stop reason from
+  `E4_D_DIAG`):**
+
+  | Seed/round | lo before | lo after | frontier | pass | outcome | ack_over | D's stop reason |
+  |---|---|---|---|---|---|---|---|
+  | 20 r2 | 64 | 62 | 63 | **true** | none | [] | `00000000000a0000.log@5952`: no sync of inode 4 after the last covering write |
+  | 115 r1 | 25 | 24 | 24 | **true** | none | [] | `…060000.log@18207`: no sync of inode 4 after the last covering write |
+  | 403 r1 | 6 | 4 | 4 | **true** | none | [] | `…000000.log@5774`: no sync of inode 2 after the last covering write |
+  | 622 r0 | 14 | 12 | 13 | **true** | none | [] | `…030000.log@2316`: no sync of inode 2 after the last covering write |
+  | 780 r2 | 59 | 58 | 58 | **true** | none | [] | `…080000.log@22304`: no sync of inode 3 after the last covering write |
+  | 801 r1 | 30 | 29 | 29 | **true** | none | [] | `…060000.log@4665`: no sync of inode 4 after the last covering write |
+  | 825 r2 | 54 | 52 | 53 | **true** | none | [] | `…090000.log@44524`: no sync of inode 5 after the last covering write |
+  | 830 r1 | 30 | 28 | 29 | **true** | none | [] | `…060000.log@21552`: no sync of inode 4 after the last covering write |
+  | 1001 r0 | 12 | 11 | 11 | **true** | none | [] | `…030000.log@5740`: no sync of inode 2 after the last covering write |
+  | **1064 r1** | 17 | **17** | 14 | false | O-1(b) c=17 | [] | beyond the last bound or recycled segment (0x60000) |
+  | 1585 r1 | 18 | 17 | 17 | **true** | none | [] | `…060000.log@18843`: no sync of inode 4 after the last covering write |
+  | 1801 r1 | 36 | 35 | 35 | **true** | none | [] | `…070000.log@2762`: no sync of inode 5 after the last covering write |
+  | 2183 r0 | 18 | 13 | 17 | **true** | none | [] | `…030000.log@10881`: no sync of inode 2 after the last covering write |
+  | 2525 r2 | 76 | 75 | 75 | **true** | none | [] | `…0b0000.log@24886`: no sync of inode 5 after the last covering write |
+  | 2730 r2 | 44 | 43 | 43 | **true** | none | [] | `…0a0000.log@17970`: no sync of inode 8 after the last covering write |
+  | 2765 r0 | 13 | 12 | 12 | **true** | none | [] | `…030000.log@3102`: no sync of inode 2 after the last covering write |
+  | 2812 r1 | 9 | 8 | 8 | **true** | none | [] | `…020000.log@37250`: no sync of inode 4 after the last covering write |
+  | 3224 r1 | 7 | 5 | 5 | **true** | none | [] | `…000000.log@9093`: no sync of inode 2 after the last covering write |
+  | 3806 r1 | 30 | 29 | 29 | **true** | none | [] | `…060000.log@0`: no sync of inode 4 after the last covering write |
+  | **4770 r2** | 57 | **57** | 51 | false | O-1(b) c=57 | [] | `…090000.log@10655`: no issued write covers the offset |
+  | 4930 r0 | 28 | 26 | 27 | **true** | none | [] | `…030000.log@28447`: no sync of inode 2 after the last covering write |
+  | **5054 r1** | 23 | **23** | 20 | false | O-1(a) c=23 | [] | `…050000.log@34121`: no issued write covers the offset |
+  | 5601 r1 | 47 | 46 | 46 | **true** | none | [] | `…070000.log@3981`: no sync of inode 2 after the last covering write |
+  | 5604 r0 | 24 | 23 | 23 | **true** | none | [] | `…030000.log@9149`: no sync of inode 2 after the last covering write |
+  | 6154 r0 | 34 | 33 | 33 | **true** | none | [] | `…030000.log@13669`: no sync of inode 2 after the last covering write |
+  | 6200 r2 | 47 | 46 | 46 | **true** | none | [] | `…080000.log@8005`: no sync of inode 3 after the last covering write |
+  | **6263 r2** | 21 | **21** | 20 | false | O-1(b) c=21 | [] | `…060000.log@23222`: no issued write covers the offset |
+  | 6623 r0 | 15 | 14 | 14 | **true** | none | [] | `…030000.log@9179`: no sync of inode 2 after the last covering write |
+  | 7405 r1 | 36 | 35 | 35 | **true** | none | [] | `…070000.log@10370`: no sync of inode 5 after the last covering write |
+  | 7531 r0 | 37 | 36 | 36 | **true** | none | [] | `…030000.log@37339`: no sync of inode 2 after the last covering write |
+  | 7803 r1 | 5 | 4 | 4 | **true** | none | [] | `…000000.log@6103`: no sync of inode 2 after the last covering write |
+  | 7823 r1 | 28 | 27 | 27 | **true** | none | [] | `…060000.log@63292`: no sync of inode 8 after the last covering write |
+  | 8220 r2 | 56 | 55 | 55 | **true** | none | [] | `…070000.log@64072`: no sync of inode 2 after the last covering write |
+  | 8363 r0 | 15 | 14 | 14 | **true** | none | [] | `…030000.log@0`: no sync of inode 2 after the last covering write |
+  | 9200 r0 | 24 | 21 | 23 | **true** | none | [] | `…030000.log@13082`: no sync of inode 2 after the last covering write |
+  | 9484 r2 | 74 | 70 | 73 | **true** | none | [] | `…0b0000.log@4070`: no sync of inode 5 after the last covering write |
+  | 9594 r0 | 33 | 32 | 32 | **true** | none | [] | `…030000.log@30106`: no sync of inode 2 after the last covering write |
+
+  **P's prediction holds exactly:** 33 named rounds get `lo ≤ frontier`
+  (each now passing with no O-1 text); 1064 r1, 4770 r2, 5054 r1 and
+  6263 r2 keep `frontier < lo` with `lo` unchanged (17 / 57 / 23 / 21 —
+  the §12.2/§12.5 exact-boundary store losses, step 2's targets);
+  `ack_over` is empty on all 37. **No ESCALATE** (none of the four
+  boundary rounds is a new keep, no non-empty `ack_over`).
+- **(c) the 0..200 run at the tip** (`E4_D_DIAG=1`, head 13da010b):
+  **`ack_over` empty over every judged round (0 rounds)**; **failing
+  class-C rounds with `0 < frontier < lo`: 0** (F3-F1's tip had 2 in
+  0..200: 20 r2 and 115 r1 — both now pass); FAILING_ROUNDS 15 (was
+  17), C-XX 2, MW-ORPHAN 6, DEADLOCK 0, DEFECT_SEEDS 0 — **no new
+  failing class-C `0 < frontier < lo` round appeared**, exactly as
+  predicted.
+- **(d) Runtime:** the 0..200 run at the X5-R34 commit took **18 s**
+  wall against the step-0-tip baseline of **22 s** (timing-only run,
+  diagnostic: it judges by the old derivation and is never cited) —
+  no slowdown; the derivation is one extra pass over the round's
+  events. Well inside X5-R31's 60-min Acceptance limit.
+
+**Step 2 — the exact segment end (S-1-F3 gate G2, edit 2; commit
+ce8f8bbc).** The writer's `fits` rule is already the carried §12.2
+tail rule (its comment now cites the carried sentence); the reader
+(`ckpt::recover`'s walk) hops into the next segment after an accepted
+record that ends exactly at its segment's end (`off == WAL_SEG` after
+the advance → `valid_end = seg + WAL_SEG`, `lsn = seg + WAL_SEG`,
+`continue 'outer`), exactly as the `K_SEGEND` hop does; the loop's
+other exit (a tail shorter than a header at `off < WAL_SEG`) stays a
+stop at `off`.
+
+- **The pins** (literal configs, tests/store.rs):
+  `wal_exact_segment_end_hops` — four max-size records ending exactly
+  at LSN 65536, then two client-acked SyncOn commits in segment 1
+  (synced before the crash): recovery replays them (`frontier = 6` ≥
+  the max acked) and segment 1's record bytes are not zeroed; and
+  `wal_tail_short_never_placed` — an enqueue that would leave a tail
+  of exactly `REC_FIXED − 1` (44) bytes is placed at the next
+  segment's first LSN behind a `SegmentEnd` (the filler's magic sits
+  at the dead tail), and the SyncOn commit after it is acked
+  (`wal_wait_durable` returns) and recovered (`frontier = 5`).
+- **The mutants, demonstrated and reverted clean:**
+  **SEG-EXACT-NO-HOP** (the hop disabled) fails
+  `wal_exact_segment_end_hops` — "recovery replays the acked SyncOn
+  commits in segment 1 (frontier ≥ max acked)" (frontier stalls at 4
+  and `truncate_wal` zeroes segment 1); **SEG-TAIL-SHORT** (`fits`
+  relaxed to `probe ≤ room`) fails `wal_tail_short_never_placed` —
+  the record is placed at 65437 (the dead tail), not 65536.
+- **(e) Movement (X5-R34 (h) 2): single-seed 1064, 4770, 5054 and
+  6263 at ce8f8bbc — every named round leaves the `frontier < lo`
+  shape, with `lo` unchanged:**
+
+  | Seed/round | lo (before → after) | frontier | pass |
+  |---|---|---|---|
+  | 1064 r1 | 17 → 17 | 17 | **true** (was O-1(b) c=17) |
+  | 4770 r2 | 57 → 57 | 58 | **true** (was O-1(b) c=57) |
+  | 5054 r1 | 23 → 23 | 23 | **true** (was O-1(a) c=23) |
+  | 6263 r2 | 21 → 21 | 21 | **true** (was O-1(b) c=21) |
+
+  All four boundary store losses are cleared. One workload moved:
+  **5054 r2 now fails O-1(b) at c=29 (tree 5, scan mismatch,
+  `frontier == lo == 29`)** — moved by ce8f8bbc; not a `frontier < lo`
+  round, so it is C-DIV's remainder (step 6), never an X5-R34
+  escalation.
+
+**Step 3 — I-ACK-PREFIX with two or more batches in flight (S-1-F3
+W3; gate (b) item 4).**
+
+- **(a) The fix** (`src/store/wal.rs`): `wal_writer_step` takes a
+  batch whenever the buffer is non-empty — **no `Busy` park on another
+  task's batch** — and `WalState.in_flight` is the **set** of taken,
+  unfinished batches. The accounting is interval-set based:
+  `written_iv`/`synced_iv` hold completed write / synced batch
+  intervals; `written` advances while a completed write starts at
+  `written` (`absorb_interval`), `durable` while a synced batch starts
+  at `durable` (so at or below `written`); a batch counts synced once
+  its group `sync_data` of each touched segment completes after its
+  write returned. The invariant `durable ≤ written ≤ append` is
+  checked at every advance (`check_wal_inv`, a loud `Fail::Invalid`).
+  Every advance and every exit (error paths included) wakes `WalAcks`.
+  `wal_sync_through` credits `[durable, written)` as it stood when its
+  first sync started, capped below the lowest in-flight batch's start
+  — it never credits bytes above `written`, nor a held batch's bytes
+  (the accounting's units are each batch's **own** group sync:
+  "completed own-segment syncs"). The ack rules are unchanged: a
+  SyncOn wait returns iff `durable ≥` its record's end, SyncOff iff
+  `written ≥` it; a new `writer:prewrite` park point holds a taken
+  batch before its write.
+- **Judgment call (documented, the frozen pin's requirement):** the
+  *waiter's* helper take in `wal_wait_durable`/`wal_wait_written` fires
+  only when the buffer is non-empty **and no batch is in flight**
+  (`wal_writer_step` itself never parks, so the service writer and any
+  direct caller still overlap batches — the two-in-flight shape). Two
+  reasons, both recorded: (i) the unchanged
+  `cdiv_syncon_ack_never_crosses_an_unwritten_batch` pin holds task A
+  at `writer:presync` through a **shared park budget** — a committer
+  taking its own batch would pass the same park point and drain it,
+  deterministically breaking the pin's hold (measured: with an
+  unguarded waiter take, ts=9's ack returns and the pin fails); (ii)
+  the card's ack-rule clause — "a waiter whose record lies in another
+  task's in-flight batch parks on `WalAcks`" — reads the waiter's
+  *gap* through a held batch as exactly that case. "The rule below
+  holds however batches are scheduled": a conservative waiter is a
+  legal scheduling. Single-task worlds are unaffected (they never
+  observe another task's batch, so the helper take always fires
+  there).
+- **(b) The pins:** the unchanged
+  `cdiv_syncon_ack_never_crosses_an_unwritten_batch` passes (task B
+  parks on `WalAcks` over the held, written-unsynced batch; `durable`
+  never passes batch 1's start; recovery returns the ts-prefix
+  `frontier == 4`); D4 passes unchanged (step 1 waits; the writer's
+  own group sync after its park budget makes c1 durable — the mutant
+  arm still catches WAL-SYNC-T-ONLY); the new
+  **`ack_prefix_two_batches_in_flight`** (S-1-F3's `t_ack_prefix`
+  ported; a literal two-task config, both arms): task A takes batch 1
+  (a SyncOn commit at ts=n) and parks at `writer:prewrite`; task B
+  takes batch 2 (SyncOn, ts=n+1) above it, writes and syncs it.
+  Asserted: two batches were in flight at once (B's step took batch 2
+  while batch 1 was held); after B's write+sync, `written` and
+  `durable` both sit at or below batch 1's start and ts=n+1's wait has
+  not returned (it parks on `WalAcks`); after A is released, writes
+  and syncs, `durable ≥` batch 2's end and both waits return; and in
+  the crash arm (a crash before A's write) recovery is a ts-prefix
+  with no hole (`frontier == 4`, the WAL restarted at segment 1's
+  first LSN) and ts=n+1 was never client-acked.
+- **(c) The mutants, demonstrated and reverted clean:** **M-WALa**
+  (the concurrent take with `max` accounting restored) fails the
+  unchanged cdiv pin — "ts=9's wal_wait_durable returned before the
+  crash"; **WAL-ONE-IN-FLIGHT** (F3-F1's `Busy` park restored) fails
+  the new pin — "arm 0: two batches were never in flight at once
+  (12.4 / S-1-F3 W3)" (B's take is refused; its completed-interval
+  witness never appears); **ACK-OVER-HOLE** (the frontiers advanced
+  by `max` over completed batches) fails the new pin — "written/
+  durable advanced past batch 1's start over its unwritten bytes".
+  **One deviation from the card's mutant table, recorded:** under
+  ACK-OVER-HOLE the *unchanged* cdiv pin passes (not fails), because
+  the guarded waiter never takes a batch above a held one in that
+  scenario, so the mutant's `max` accounting never engages there; the
+  mutant is caught by the new pin. (The pin's arms are deterministic:
+  B itself releases A in the clean arm and arms the scheduler's
+  `crash_at_yield` one yield ahead in the crash arm — A's prewrite
+  spin trips it before its write — so no driver-side race exists; the
+  first version's park-budget hold was flaky under mutex starvation
+  and was rebuilt before commit.)
+- **(d) Movement (0..200 at the step-3 tip):** `ack_over` **empty
+  over every judged round** (no ESCALATE, X5-R34 (h) 4); **failing
+  class-C rounds with `0 < frontier < lo`: 0**; the counts beside
+  step 1's: FAILING_ROUNDS 18 (was 15), C-XX **0** (was 2 — both 150
+  r1 and 151 r1 moved), C-DIV 7, MW-ORPHAN 9, MP O-3(e)(ii) 2,
+  DEADLOCK 0, DEFECT_SEEDS 0.
+- **Seed-pin maintenance (the F3-F1-gate-accepted shape):** step 3's
+  store change moved the workloads wholesale; the MP-A seed pins of
+  `r30_skx_and_smx_record_fields` were re-pointed with their
+  assertions unchanged: the smx seeds **2927 r0, 7528 r0 and 8728 r0
+  still hold** (served, smx, `pass_na=true`), as does 6149 r1 (not
+  served, both predicates false, `pass_na` null); the skx seeds
+  **1897 r0 and 4718 r0 moved** (no longer served — they fail only at
+  the test's shape precondition, `assert!(r.served)`), re-pointed at
+  **537 r0 and 1887 r0** (found by ≤ 200-seed scans; each served with
+  `skx = true` and `pass_na = true`), assertions byte-identical.
+
+**Step 4 — per-boot ids (S-1-F3 D6, W1's `boot_id` row, W2, W4 (i)–(ii);
+gate edit 1; the (f′) three-way amendment).** The fix: **8b71e560**
+(step 4a); the pins and mutants: this commit (step 4 e–g).
+
+- **(a)–(d) What landed (8b71e560):** `page::Meta` gains `boot_id`
+  (u32, inside the CRC at offset 40 — `build_meta`/`parse_meta`, every
+  harness parser already going through `parse_meta`; meta 0 carries 0,
+  the creating session's, §2.2 W1); `StoreInner` gains the session's
+  `boot_id` (`src/store/mod.rs`, 0 at `create`); every record's `txn`
+  is `(boot_id, n)` with `n ≥ 1` dense per boot (`harness.rs`
+  `commit_txn` reads the store's session id — the harness's per-round
+  `txn_counter` is per boot, a boot being a round's life — and
+  `SegmentEnd` carries `(boot_id, 0)`, `wal.rs`'s filler in
+  `wal_enqueue`); the boot checkpoint's id per §14 step 8's **three-way
+  rule** — the newest, in serial-number order, of the `ckpt_id` the
+  boot checkpoint writes (low 32 bits), 1 + the opened meta's
+  `boot_id`, and 1 + the newest boot id among the records the recovery
+  walk accepted (`ckpt.rs` `recover`'s `recover:boot` block;
+  `newest_rec_boot` recorded by the walk) — with every meta of the
+  boot carrying it (`checkpoint_inner`'s meta literal); and `recover`'s
+  walk gains W4 (i)'s **ordered boot-id stop** (`ckpt.rs` walk,
+  `floor = last_boot.unwrap_or(meta.boot_id)`, `a` older than `b` iff
+  `(a − b) mod 2³² ≥ 2³¹`): a record of any kind, `SegmentEnd`
+  included, whose boot id is older stops the walk at its start; newer
+  ids are accepted (the walk crosses into newer boots, W4 (ii));
+  **never the equality rule**. The harness checkpoint after a recovery
+  (G4) is the §14 step 8 boot checkpoint and always writes a meta, so
+  (c)'s "can finish without writing a meta" case cannot arise (no
+  ESCALATE).
+- **Judgment call (D7's mutant arm, recorded):** 8b71e560 also updated
+  `tests/directed.rs` `d7_zombie_tail`'s round-2 arm to the designed
+  outcome: its zombie is round 1's record — an older boot's — so W4's
+  ordered stop refuses it even under TRUNCATE-LOGICAL-ONLY ("the stop
+  is by identity, not by zeroing"); the round now **passes** under the
+  mutant (the pre-W4 catcher described a same-boot zombie; this
+  fixture's is cross-boot by construction, each round's workload being
+  its own boot). **Consequence, escalated below:** TRUNCATE-LOGICAL-ONLY
+  is now caught by no failing assertion (its `directed_arms` row was
+  already display-only — `run_arm` encodes no arm for it); re-catching
+  it needs the §12.5 "Residual" shape (post-sync WAL damage **and** a
+  lost meta together), which is new fixture design, not this card's.
+- **(e) The pins** (literal configs, `tests/store.rs`; the
+  rollback fixtures fault through SimDisk's own API — a post-sync LOST
+  on the meta write (`apply_one_media_fault`, built from
+  `dwrites_of`), exactly "a post-sync LOST write on meta k+1's slot
+  reverts it"):
+  - `txn_ids_never_collide_across_lives` — P's finding: life 1 (a
+    recovery boot) leaves the unmarked chunks of txn `(id₁, 1)`, life 2
+    (a later boot, its id raised per §14 step 8) commits a chunked txn
+    with `n = 1` again; recovery attaches only life 2's chunks (key B
+    present, key A absent, frontier = the marker's ts).
+  - `stale_boot_record_stops_the_walk` (`t_stale_boot_record`) — a
+    boot-2 commit at LSN 0, then a complete boot-1 record at the next
+    position (the stale bytes a reverted truncation exposes; built
+    directly on the segment, the end state §12.5 describes — judgment
+    call, recorded: the card's prose builds it through a reverted
+    step-5 zero write, and the direct write produces the identical
+    walk input); the walk stops at its start (frontier 1, append =
+    its LSN, its key excluded).
+  - `meta_rollback_walk_crosses_into_newer_boot`
+    (`t_meta_rollback_crosses_boot`) — boot b−1 writes meta 1 and
+    crashes; boot b recovers, truncates at p_b, writes boot meta 2
+    through the harness checkpoint, then appends and acks a SyncOn
+    commit from p_b; a post-sync LOST reverts meta 2's slot (the open
+    then selects meta 1); the walk crosses into boot b's records and
+    the frontier is at or above the max acked. The fixture keeps
+    everything inside segment 0 (no recycling touches meta 1's WAL
+    span) and boot b's only page writes are its boot checkpoint's
+    image pages (off image 1's slots by the allocator's
+    `used_durable` rule).
+  - `boot_id_fresh_after_rollback` (`t_boot_id_after_rollback`) — two
+    successive rollbacks to meta 1 across boots b (id 2) and b+1 (id 3,
+    fresh through the walk's record term); b leaves the unmarked
+    chunks of `(2, 1)`, b+1 commits a chunked txn `(3, 1)`; recovery
+    from meta 1 never attaches b's chunks to b+1's marker (B1/B2
+    absent, C1/C2 present).
+  - `boot_id_after_rollback_raised_then_no_records` (the (f′) variant,
+    S-STORE §14 step 8's fixture at 7b3d3ac1): boots b and b+1 each
+    write meta 2, append and ack one commit, and lose the meta write;
+    boot b+2 crosses both boots' records (id 4), its meta 2 (`boot_id`
+    4, `wal_start_lsn` = the append position p) is durable and it
+    writes no record; boot b+3 opens meta 2, its walk from p accepts
+    nothing, writes meta 3, appends and acks from p, and crashes; a
+    LOST write on meta 3 leaves its slot holding meta 1. The open
+    selects meta 2 and replays b+3's acked commit (frontier 4 = max
+    acked; P1–P4 all present), and b+3's id is 5, newer than the
+    opened meta's `boot_id` 4.
+- **(f)/(f′) The mutants,** each applied to the real code, shown
+  failing its pin, and reverted (`git diff` clean of the mutant
+  afterwards; command: `cargo test -q --release -p e4-recovery --test
+  store <pin>`):
+  - **BOOT-ID-STOP-SKIP** (the ordered stop disabled) →
+    `stale_boot_record_stops_the_walk` FAILED — "the older boot's
+    record is not replayed (12.5 W4 (i)): left 2, right 1";
+  - **BOOT-ID-EQ-STOP** (stop at any id ≠ the opened meta's) →
+    `meta_rollback_walk_crosses_into_newer_boot` FAILED — "the frontier
+    is at or above the max acked (Z1, ts 3): left 2, right 3" (the walk
+    stopped at p_b);
+  - **BOOT-ID-CKPT-ONLY** (the id is the low 32 bits of `ckpt_id`
+    only) → `boot_id_fresh_after_rollback` FAILED — "boot b+1's id 2 is
+    newer than boot b's 2: left false, right true";
+  - **TXN-BOOT-CONST** (every recovery assigns one constant id, the
+    pre-card `(1, n)`) → `txn_ids_never_collide_across_lives` FAILED —
+    "life 2's boot id is one past life 1's: left 1, right 2";
+  - **BOOT-ID-NO-META-FLOOR** (the opened meta's `boot_id` term
+    omitted) → `boot_id_after_rollback_raised_then_no_records` FAILED —
+    "boot b+3's acked commit replays (the max acked; never a stop at
+    p): left 3, right 4", the exact harm §14 step 8's variant names
+    (an `Ok` open missing the acked commits).
+- **(g) Movement (P's prediction: 186 r2 and 405 r2 lose their C-DIV
+  shape).** Single-seed runs at the step-4 tip
+  (`X-5c-F3-F3a.s4.seed186/405.*`):
+  - **186 r2** — the outcome text is unchanged (O-1(c) at c=15, "raw
+    entry above the cut (max ts 16)", frontier 16 ≥ lo 15 — the same
+    text F3-F1's triage file records), but the shape is no longer
+    `frontier < lo` and the attach mechanism is gone: the failure is
+    the MW-orphan shape, not the cross-life chunk attach. Step 6's
+    `E4_TXN_DIAG` re-verifies the attach count directly (its
+    `0..200`-window check below is the judged evidence here).
+  - **405 — moved by 8b71e560** (X5-R34 (h) 6): the triage file's 405
+    r1 passed (frontier 7 = lo 7); at the step-4 tip 405 r1 now fails
+    **O-1(b) at c=7 with frontier 4 < lo 7** and the chain stops before
+    the named r2. Trace recorded (`E4_D_DIAG`,
+    `X-5c-F3-F3a.s4.seed405.ddiag.err`): p0=128515, **D=318537**, stop
+    = "byte at lsn 318537 (0000000000040000.log@56393): no sync of
+    inode 6 after the last covering write (ev 1866)", `rc={}`,
+    `ack_over=[]`. (h) 6 applies — the workload moved by this card's
+    own store fix, so it is not an (h) 3 escalation — but from the
+    Acceptance file on, (h) 5 makes every failing class-C
+    `0 < frontier < lo` round a store loss for P's triage, and this one
+    will be in it.
+- **(g) The 0..200 run at the step-4 tip** (`X-5c-F3-F3a.s4.0200.*`):
+  `ack_over` empty over every judged round (0); failing class-C rounds
+  with `0 < frontier < lo`: **0**; **C-XX 0, C-DIV 7 (b 3, c 4)** —
+  beside step 3's identical C-XX/C-DIV counts (step 3: FAILING_ROUNDS
+  18, C-XX 0, C-DIV 7; step 4: FAILING_ROUNDS 18, MW-ORPHAN 9, MP
+  O-3(e)(ii) 2, DEADLOCK 0, DEFECT_SEEDS 0).
+
+**Step 6 — the C-XX / C-DIV remainder pass (X5-R16's treatment,
+X5-R19's valve; time-boxed).** Start **2026-11-03T14:12:43−07:00**,
+stop **2026-11-03T14:19:31−07:00** (the evidence below was gathered
+inside the box; root-causing was not going to fit, and the Acceptance
+commands need the rest of the attempt).
+
+- **(b) Repros** (from the s4 0..200 run at the tip): **C-XX none**
+  (0 in the window); **C-DIV 7, all r2** — (b) 112, 120, 152; (c) 63,
+  104, 125, 186; (d) none in 0..200 (the class table's 62 (d) rounds
+  lie outside the window). Each confirmed twice with identical
+  digests (`X-5c-F3-F3a.s6.seed*.r{1,2}.json`).
+- **(c) `E4_TXN_DIAG`** (new, stderr, default off, `ckpt.rs`'s
+  recovery — per recovery, each marker's chunk count against the chunks
+  the walk attached to its txn): **no mismatch on any repro, no
+  unmarked-chunk line** — every marker's attached count equals its
+  chunk count (186 r2: `txn=(4, 3) ts=16 chunk_count=23 attached=23`
+  — P's finding measured 46 attached of 23 written; step 4 closed it).
+  **Step 4 is complete; no (c) escalation.**
+- **(d) P's leads:**
+  1. **C-XX 151 r1 (sub-shape 2)** — passes at the tip (frontier 16 ≥
+     lo 15): moved by step 4, exactly P's suspicion ("the chunked
+     superseding replay of a foreign txn's chunks is the same
+     mechanism") — with per-boot ids the foreign chunks never attach.
+     The `E4_CXX_DIAG` perturbation question is moot: no repro remains
+     in the window to re-confirm.
+  2. **C-XX 150 r1 (Open XX001, two nested crashes)** — passes at the
+     tip (`nested=2`, no XX001, no O-1/O-2/O-3 text).
+  3. **The per-key cut** (new `E4_O1_DIAG`, stderr, default off,
+     `harness.rs` after the oracle check — at the failing candidate,
+     the first divergent live key per published tree with its owning
+     model commit, and every raw entry above the cut):
+     - **(b) 112 r2** @ c=15, tree 3, key 17: **store=None,
+       model=Some**, owner ts=5 — `durable=false` (round-local: D
+       measures only this round's span from p0), `replayed=true`
+       (ts ≤ frontier 15), `le_T=true` (ts ≤ the opened meta's T);
+     - **(c) 63 r2** @ c=23, tree 5, key 3: the same live shape; every
+       raw-above entry is a **SyncOff** commit above lo (63: ts=24 ×15;
+       125: ts=34–40 ×73; 186: ts=16 ×451 — 186's ts-16 commit is the
+       23-chunk chunked txn);
+     - the pattern holds on every repro examined (112, 63, 125, 186,
+       104): **the recovered live scan misses an entry whose owning
+       commit sits at ts ≤ T and ≤ the recovery frontier at every
+       legal candidate** — one shared shape behind (b) and (c), with
+       (c)'s rounds additionally holding SyncOff entries above the cut
+       (the reported clause is whichever trips first per candidate).
+- **(e) Outcome:** **not root-caused within the budget — ESCALATE with
+  the evidence above** (X5-R16, X5-R19). Nothing points at the sim's
+  crash or fault model; nothing needed S-1-F3's coverage check (no
+  F3-F3b deferral). No fix, no pin, no test change in this step — the
+  two diagnostics above are the only code, committed disabled. The
+  `durable=false` flag is round-local and does not by itself prove the
+  owner's record was never durable on disk (a prior round's durability
+  is outside D's span) — the `le_T=true ∧ replayed=true ∧ missing`
+  triple is the reproducible core P's triage should start from.
+
+**Step 7 — the README (this section, the class table beside the
+0..200 counts, "How to reproduce" and the Status line) is this
+commit.** The 0..200 counts at each step's tip (all from
+`X-5c-F3-F3a.s*` artifacts; the s0 baseline judges by the old
+derivation and is timing-only, never cited):
+
+| Step tip | FAILING_ROUNDS | C-XX | C-DIV | MW-ORPHAN | ack_over | C `0<frontier<lo` |
+|---|---|---|---|---|---|---|
+| step 0 (F3-F1's store; s0baseline is timing-only — it judges by the old derivation, never cited) | 17 | 2 | 9 | 6 | 0 | 2 (20 r2, 115 r1) |
+| step 1 (X5-R34, 13da010b) | 15 | 2 | 7 | 6 | 0 | 0 |
+| step 2 (the hop, ce8f8bbc; four single seeds) | — | — | — | — | 0 (per-seed) | 0 (the four boundary rounds cleared) |
+| step 3 (two in flight, cbf0754c) | 18 | 0 | 7 | 9 | 0 | 0 |
+| step 4 (per-boot ids, 8b71e560) | 18 | 0 | 7 (b 3, c 4) | 9 | 0 | 0 |
+
+(C-DIV here is the class-table definition — a failing class-C round
+outside C-XX carrying an `o1` — counted from each run's JSON. No
+retune, no seed exclusion anywhere.)
+
+**The rework (the REWORK verdict at 98313ae3, applied 2026-11-03; its
+Findings 1/3, P ruling X5-R35 and Limits for the rework are binding).**
+Commits, in order: **3c8b038e** (X5-R35 verbatim, before any run),
+**93039525** (X5-R35 (a)/(b)), **313a236b** (Finding 1 + the two pins).
+
+- **Pre-registration order.** The rulings commit 3c8b038e (X5-R35,
+  beside X5-R33/X5-R34 above) precedes every `e4-campaign` command of
+  the rework: the first runs are the single seeds below, all after it.
+- **X5-R35 (a)/(b) — commit 93039525.** `E` is the workload pass's
+  slice of the capture (`harness::x5r34_workload_events`;
+  `pre_workload = start_disk.events.len()`, the recovery and harness
+  boot checkpoint of the *previous* round that `new_round`'s placement
+  leaves ahead of the workload in the capture); `derive_written_acked`,
+  `x5r34_durable_prefix` and the `E4_ACK_DIAG` reads use it, and every
+  other reader of the capture (Q12's rename fold, the monitors,
+  X5-R5's R, X5-R28's `K_ii`) keeps the full stream, exactly as (a)
+  scopes it. Self-test **(g) 6**
+  (`x5r34_recovery_truncation_zeros_never_ack`): a recovery truncation
+  zero-write plus its sync covering an enqueued, never-written SyncOn
+  record never acks it (`D` stops at `p0`). **Demonstrated on
+  13da010b's derivation** (the helper returned the whole capture in
+  place — what `run_round` fed the derivation at 13da010b), then
+  reverted:
+
+  ```
+  cargo test -q --release -p e4-recovery --test harness x5r34
+  x5r34_recovery_truncation_zeros_never_ack --- FAILED
+    'a SyncOn record the workload never wrote, covered only by the previous
+     round's synced truncation zeros, must not be acked (X5-R35 (a))'
+  test result: FAILED. 5 passed; 1 failed   (the (g) 1–5 tests green)
+  ```
+
+  The committed tip is the ruling's derivation (all six green).
+- **X5-R35 (c) — the 17 named rounds at the rework's tip** (single
+  seeds, `X-5c-F3-F3a.rw2.s<seed>.*`; `lo`/`frontier` from the round
+  records, `D` from `E4_D_DIAG`): **every one left `frontier < lo`.**
+  15 pass with no O-1 text; 2 (1174 r2, 4612 r2) now fail **O-1(d) at
+  `frontier == lo`** (a scan mismatch at the matched candidate — the
+  C-DIV remainder family, X-5c-F3-F3a-F2's; "a named round that then
+  fails another clause is classed under that clause", X5-R34 (h) 1).
+  No (h) 3 store loss; (d) holds — no `lo` was raised anywhere.
+
+  | Seed/round | lo | frontier | pass | outcome | ack_over |
+  |---|---|---|---|---|---|
+  | 205 r2 | 68 | 68 | true | none | [] |
+  | 381 r1 | 32 | 32 | true | none | [] |
+  | 403 r1 | 3 | 3 | true | none (was frontier 3 < lo 7) | [] |
+  | 774 r2 | 7 | 7 | true | none | [] |
+  | 1174 r2 | 40 | 40 | false | O-1(d) c=40 | [] |
+  | 1203 r1 | 41 | 42 | true | none | [] |
+  | 3805 r2 | 43 | 43 | true | none | [] |
+  | 3883 r2 | 56 | 56 | true | none | [] |
+  | 4193 r1 | 28 | 28 | true | none | [] |
+  | 4601 r1 | 27 | 27 | true | none | [] |
+  | 4612 r2 | 24 | 24 | false | O-1(d) c=24 | [] |
+  | 5030 r1 | 29 | 29 | true | none | [] |
+  | 7203 r2 | 48 | 48 | true | none | [] |
+  | 7803 r1 | 4 | 4 | true | none (was frontier 4 < lo 8) | [] |
+  | 8200 r2 | 52 | 52 | true | none | [] |
+  | 8404 r1 | 29 | 29 | true | none | [] |
+  | 8825 r2 | 10 | 10 | true | none | [] |
+- **Finding 1 — commit 313a236b** (`src/store/wal.rs`,
+  `wal_start_lsn`'s `None` arm + the shared `wal::boot_id_older`
+  comparison): the arm holds `wal_start_lsn` back only for unmarked
+  chunks of the **current** boot — S-STORE §14 step 8 as merged at the
+  base: "Chunks of the previous boot that have no marker belong to
+  transactions that ended without one …, all ended before this flip,
+  so they do not hold back `wal_start_lsn` (§12.6)". The pre-rework
+  arm pointed meta k+1's `wal_start_lsn` at the previous boot's chunk,
+  §12.5's first-record floor stopped the next walk at it, and every
+  acked commit of the new boot was lost (the 100 class-C
+  `frontier < lo` store losses of the first Acceptance file).
+  - **The pin** `wal_start_lsn_ignores_previous_boots_chunks`
+    (the verdict's fixture): boot b−1 leaves a cut-off chunked txn below p0; boot b's
+    boot checkpoint runs; b appends and acks two SyncOn commits and
+    crashes before its next checkpoint. Asserted: meta 2's
+    `wal_start_lsn` sits at p0 (decoded from the durable stream), and
+    recovery replays both acked commits (frontier = max acked 3, Q1/Q2
+    present, the old boot's unmarked chunks never applied).
+    **Mutant START-LSN-PREV-BOOT-CHUNK (the old arm) fails it**,
+    demonstrated and reverted:
+
+    ```
+    cargo test -q --release -p e4-recovery --test store \
+      wal_start_lsn_ignores_previous_boots_chunks
+    assertion `left == right` failed: meta 2's wal_start_lsn sits at p0 …
+      left: 79   right: 219      (79 = the previous boot's chunk, 219 = p0)
+    ```
+
+  - **The G1 pin** `first_record_older_than_opened_meta_stops_the_walk`
+    (§12.5's first-record floor, which nothing caught — the gate's own
+    floor-drop mutant passed the whole release suite at the first run's
+    tip): a meta whose `wal_start_lsn` is e1 with `boot_id` 2, and an
+    older boot's complete record at e1 (built directly on the segment,
+    the identical walk input a reverted truncation leaves — the
+    recorded precedent of `stale_boot_record_stops_the_walk`). The
+    walk stops at e1: frontier = T, the stale record's key absent.
+    **The gate's G1 mutant (`last_boot.unwrap_or(rec.txn.0)`) fails
+    it**, demonstrated and reverted:
+
+    ```
+    cargo test -q --release -p e4-recovery --test store \
+      first_record_older_than_opened_meta_stops_the_walk
+    assertion `left == right` failed: … never replays (12.5's first-record floor)
+      left: 2   right: 1        (2 = the stale record replayed)
+    ```
+
+    (Both demonstrations were reverted clean — `git diff` free of each
+    afterwards; the two pins pass at the tip.)
+  - **Movement (the five named repros)** — each left
+    `frontier < lo`; all five now **pass**:
+
+    | Seed/round | lo | frontier | pass | was (first run's tip) |
+    |---|---|---|---|---|
+    | 206 r1 | 7 | 9 | true | a first-record stop on a previous-boot K_CHUNK (Finding 1) |
+    | 296 r1 | 13 | 13 | true | same |
+    | 405 r1 | 7 | 7 | true | O-1(b) frontier 4 < lo 7 (moved by 8b71e560, now cleared) |
+    | 705 r1 | 8 | 8 | true | same |
+    | 9823 r1 | 6 | 8 | true | same |
+- **Finding 3 — the (h) 3 tip re-run (the 37 named rounds, single
+  seeds at 313a236b).** **All 37 pass with no O-1 text; `ack_over` is
+  empty on every round; no round keeps `0 < frontier < lo`.** The
+  verdict's two failing rounds both cleared: 403 r1 (frontier 3 =
+  lo 3, was 3 < 7) and 7803 r1 (4 = 4, was 4 < 8). Full table (lo,
+  frontier, pass — every row `frontier ≥ lo`, every `ack_over` empty):
+
+  | Seed/round | lo | frontier | | Seed/round | lo | frontier | | Seed/round | lo | frontier |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 20 r2 | 63 | 63 | | 1585 r1 | 17 | 17 | | 5604 r0 | 24 | 24 |
+  | 115 r1 | 13 | 13 | | 1801 r1 | 35 | 35 | | 6154 r0 | 9 | 10 |
+  | 403 r1 | 3 | 3 | | 2183 r0 | 13 | 16 | | 6200 r2 | 45 | 45 |
+  | 622 r0 | 15 | 15 | | 2525 r2 | 75 | 75 | | 6263 r2 | 21 | 21 |
+  | 780 r2 | 58 | 58 | | 2730 r2 | 49 | 49 | | 6623 r0 | 15 | 15 |
+  | 801 r1 | 28 | 28 | | 2765 r0 | 11 | 12 | | 7405 r1 | 34 | 34 |
+  | 825 r2 | 54 | 54 | | 2812 r1 | 15 | 15 | | 7531 r0 | 4 | 4 |
+  | 830 r1 | 4 | 4 | | 3224 r1 | 7 | 7 | | 7803 r1 | 4 | 4 |
+  | 1001 r0 | 12 | 12 | | 3806 r1 | 31 | 31 | | 7823 r1 | 30 | 30 |
+  | 1064 r1 | 18 | 18 | | 4770 r2 | 68 | 70 | | 8220 r2 | 55 | 55 |
+  | | | | | 4930 r0 | 32 | 33 | | 8363 r0 | 16 | 16 |
+  | | | | | 5054 r1 | 9 | 9 | | 9200 r0 | 21 | 23 |
+  | | | | | 5601 r1 | 46 | 46 | | 9484 r2 | 77 | 77 |
+  | | | | | | | | | 9594 r0 | 18 | 18 |
+
+  (1064 r1, 4770 r2, 5054 r1 and 6263 r2 — the four exact-boundary
+  rounds of (h) 2 — pass at every tip since ce8f8bbc.)
+- **The 0..200 window at the rework's tip**
+  (`X-5c-F3-F3a.rw2.0200.*`, 13.5 s wall): **`ack_over` empty over
+  every judged round; failing class-C rounds with
+  `0 < frontier < lo`: 0** — none named, none new (X5-R34 (h) 3's
+  escalation set is empty). FAILING_ROUNDS 17, C-XX **0**, C-DIV 7
+  (b 3: 112/120/152; c 4: 63/104/125/186 — the identical set and
+  sub-kinds as the first run's step-4 tip, all at
+  `frontier ≥ lo`, X-5c-F3-F3a-F2's family), MW-ORPHAN 8, MP
+  O-3(e)(ii) 2, DEADLOCK 0, DEFECT_SEEDS 0.
+- **Finding 4:** no other test's assertion changed. The whole release
+  suite passes at 313a236b with no re-pointing (the r30 seed pins
+  unmoved: the store fix moved no seeded MP/MW workload in the suite).
+- **The rework's Acceptance at the final tip 6fa80bb5 (X5-R3: a
+  prototype deviation is fixed and the entire 10k re-runs).**
+  - `cargo test -q --release -p e4-recovery`: **PASS** (189 tests:
+    14 + 25 + 24 + 49 + 28 + 26 + 23, 0 failed).
+  - The 10k (`X-5c-F3-F3a.acc.*`, prov `commit=6fa80bb5…`,
+    `status_lines=0`, `exit=0`, json sha256
+    `46297043f583ff9fc69ed8dc4ad58cc5f8b9d2fc63a6297869f52a3058a0c42c`,
+    17:44:50→18:03:07, ~18 min): `E4 SEEDS=10000 O1_FAIL=2510
+    O2_FAIL=34 O3_FAIL=488 DEADLOCK=0 PANIC=0 O1F_FAIL=2516 MONITOR=0`
+    / `E4 FOLD FAILING_SEEDS=766 FAILING_ROUNDS=745
+    TWIN_FAILING_ROUNDS=39 DEFECT_SEEDS=0`.
+  - `verify --no-quotas`: **PASS** — `VERIFY OK (--no-quotas)
+    seeds=10000 digests reproduce`; the six known waived misses (Q4,
+    Q7, **Q8 82/100**, Q11, Q12, SIZING — X-5c-F4's retune list, Q8
+    recorded beside them since the first run's verify). **Anomaly,
+    recorded:** the first verify attempt (prov `verify_start=
+    18:03:28`) was killed by the runner's 60-minute watchdog — the
+    host was co-scheduled with another agent's run (load 22 at the
+    10k's end; the card's Notes ask the orchestrator to keep E4
+    Acceptances off a loaded host). The re-run (quiet host) completed
+    in ~21 min; the killed attempt wrote no verify output and no
+    `verify_exit` line, and the re-run's lines follow it in the prov
+    (the last write wins, as "How to reproduce" records).
+  - The record check: **PASS** — `ACK_OVER_ROUNDS 0`,
+    `C_FRONTIER_BELOW_LO 0`, `MISSING_FIELDS 0`. **Zero failing
+    class-C `0 < frontier < lo` rounds in the whole 10k** (the first
+    run's Acceptance file held 117: the 100 Finding-1 store losses and
+    the 17 X5-R35 false losses — both sets cleared), and no
+    ACK-OVER-HOLE round anywhere.
+  - `bash scripts/gate.sh`: **PASS** — the literal last line
+    `GATE EXIT=0`.
+  - The rework's class table (the step-0 (e) definitions, served
+    rounds split first):
+
+    | Class | Rounds | Notes |
+    |---|---|---|
+    | **Served (split out first)** | 8, **all moved to pass** by X5-R30 (c) | 537, 1887, 2927, 4098, 7528, 8107, 8578, 8728 (all r0, MP, `O-3(a): served corruption`, each `(skx ∨ smx) ∧ pass_na`) |
+    | **C-XX** | 50 | sites within C as before (Open/AmcheckIi); 26 of the first run's 76 were the Finding-1 first-record XX001s, now gone |
+    | **C-DIV** | 256 | (b) 101, (c) 96, (d) 59, **(a) 0** — X-5c-F3-F3a-F2's family (the per-key `≤ T` cut), unchanged in shape |
+    | **MW-ORPHAN** | 406 | F3-F3b's (`wal_ckpt_end`/I-WAL-COVER) |
+    | Other MW** | 14 | the O-1(a)+O-3(d) published-set family (4399, 4919 …) |
+    | **MP O-3(e)(ii)** | 11 | 8 r0, 3 r1 — no O-1(b)/(a) MP round this time |
+    | **Twins** | 39 | 39 failing twin seeds |
+
+    (Primary failing rounds 737 = 745 − the 8 served; the fold's
+    `FAILING_SEEDS=766` counts 21 seeds that fail only through twins
+    or served-amendment accounting. Beside the first run's file: C 390
+    → 306, MW-ORPHAN 445 → 406, MP 10 → 11, twins 68 → 39 — the
+    rework's two derivations account for the C loss; F3-F3b's triage
+    step 0 re-derives the table from this file.)
 
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
@@ -3421,6 +4361,22 @@ only, under the backstop, output outside the worktree):
 class-table repros of this card's steps re-derive from a ≤ 200-seed run
 at the tip (the recorded commands live in the stage record above).
 
+**X-5c-F3-F3a's Acceptance** (this card's; the same X5-R31 discipline
+held — every in-attempt command was a single seed or a ≤ 200-seed run
+under the backstop with output outside the worktree):
+`$HOME/.cache/nv3-review/runlogs/X-5c-F3-F3a.acc.campaign.json` (the
+10k `run --seeds 0..10000 --threads 16`, `ulimit -v 25165824`), its prov
+in `X-5c-F3-F3a.acc.prov`, then `verify --no-quotas` of that file
+(`X-5c-F3-F3a.acc.verify.out`), then the record check (the `ack_over` /
+`C_FRONTIER_BELOW_LO` / `MISSING_FIELDS` python one-liner of the card's
+Acceptance) and `bash scripts/gate.sh`. **Its 10k becomes F3-F3b's
+step-0 triage file**, and from it on, X5-R34 (h) 5 makes every failing
+class-C `0 < frontier < lo` round a store loss for P's triage (405 r1,
+moved by 8b71e560, will be in it). This card's step-0 file
+(`results/campaign.json`, commit 929ade38) is F3-F1's Acceptance 10k —
+this card's own Acceptance 10k is **not committed** (F3-F3b's step 0
+commits it after its own provenance checks).
+
 **The X-5c-F2 Acceptance 10k is the runner's, never a worker's
 (X5-R31).** Inside an attempt no worker runs `e4-campaign run` over
 more than 200 contiguous seeds, `e4-campaign verify`, a stress loop,
@@ -3431,7 +4387,7 @@ Acceptance, at the card's final tip, is:
 
 ```bash
 cd nucleus/v3
-O=$HOME/.cache/nv3-review/runlogs/X-5c-F2.acc
+O=$HOME/.cache/nv3-review/runlogs/X-5c-F3-F3a.acc
 { echo commit=$(git rev-parse HEAD); echo status_lines=$(git status --porcelain -- spikes/e4-recovery Cargo.lock | wc -l); echo start=$(date -Iseconds); echo load_at_start=$(cut -d' ' -f1-3 /proc/loadavg); } > $O.prov
 (ulimit -v 25165824; cargo run -q --release -p e4-recovery --bin e4-campaign -- run --seeds 0..10000 --threads 16 --out $O.campaign.json > $O.campaign.out 2> $O.campaign.err)
 { echo exit=$?; echo end=$(date -Iseconds); echo load_at_end=$(cut -d' ' -f1-3 /proc/loadavg); echo json_sha256=$(sha256sum $O.campaign.json | cut -d' ' -f1); } >> $O.prov
@@ -3446,6 +4402,10 @@ and the lock only), start/end, load, exit, the JSON's sha256, and the
 verify head and exit; on a retried attempt the last write wins, at the
 then-current tip. The five known quota misses (Q4, Q7, Q11, Q12,
 SIZING) are expected and waived by `--no-quotas` — they are X-5c-F4's.
+X-5c-F3-F3a's own verify (at 4cefcb43) adds a sixth, Q8 (acked SyncOff
+commits lost, 80/100 — the store this card built acks fewer SyncOff
+losses): also waived by `--no-quotas`, also F4's to weigh. The rework's
+verify (at 6fa80bb5) keeps it waived at 82/100.
 X-5c-F3's step 0 commits `$O.campaign.json` after the provenance
 checks (the X5-R25 pattern). Single-seed diagnostics stay allowed
 inside attempts: `E4_MPE_DIAG=1 cargo run -q --release -p e4-recovery

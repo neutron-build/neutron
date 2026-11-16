@@ -359,6 +359,16 @@ pub struct StoreInner {
     pub k: u64,
     /// The current epoch e (starts at 1 after creation).
     pub e: u32,
+    /// **S-1-F3 §12.2 (W2; X-5c-F3-F3a step 4):** this session's boot
+    /// id — every record this boot appends carries it in its txn id
+    /// `(boot_id, n)`, `n ≥ 1` dense per boot (`SegmentEnd` carries
+    /// `(boot_id, 0)`). 0 at create; a recovery sets it per §14
+    /// step 8's three-way rule (the newest, in serial-number order, of
+    /// the ckpt_id its boot checkpoint writes (low 32 bits), 1 + the
+    /// opened meta's `boot_id`, and 1 + the newest boot id among the
+    /// records the recovery walk accepted) — S-STORE §14 step 8 as
+    /// merged (the card's (f′) binding amendment).
+    pub boot_id: u32,
     /// The opened meta.
     pub meta: page::Meta,
     /// The tree directory (id → entry).
@@ -485,6 +495,7 @@ impl StoreInner {
             page_file,
             k: 0,
             e: 1,
+            boot_id: 0,
             meta: page::Meta::default(),
             dir: BTreeMap::new(),
             map: MapState::default(),

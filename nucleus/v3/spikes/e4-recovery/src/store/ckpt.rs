@@ -180,6 +180,9 @@ pub fn create<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg, uuid: u128) -> Result
         t: 0,
         gc_w: 0,
         epoch: 0,
+        // Meta 0's boot id is 0 — the creating session's (§2.2 W1,
+        // gate edit 1; X-5c-F3-F3a step 4).
+        boot_id: 0,
         map_root,
         free_root,
         dir_root,
@@ -774,11 +777,15 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
     // `next_lpid` never shrinks below the live counter's floor for the
     // *current* epoch (allocations after the freeze stay above it).
     let dir_root = cx.with("ckpt:dirroot", |c| Ok(c.store().meta.dir_root))?;
+    let boot_id = cx.with("ckpt:boot", |c| Ok(c.store().boot_id))?;
     let meta = page::Meta {
         ckpt_id: k,
         t,
         gc_w,
         epoch: k as u32,
+        // Every meta of this boot carries its id (§2.2; X-5c-F3-F3a
+        // step 4).
+        boot_id,
         map_root,
         free_root,
         dir_root,
@@ -1314,12 +1321,23 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
     // Passes 1+2 (§14 steps 3–4): the walk collects records and markers
     // (pass 1), then applies in LSN order (pass 2). §12.5's stop rules:
     // bad magic/CRC, `lsn` ≠ expected, `len` past the segment end, and
-    // SegmentEnd hops.
+    // SegmentEnd hops — and, **S-1-F3 W4 (i) (X-5c-F3-F3a step 4): the
+    // ordered boot-id stop** — a record of any kind, `SegmentEnd`
+    // included, whose boot id is **older** than the last accepted
+    // record's (or, for the walk's first record, older than the opened
+    // meta's `boot_id`) stops the walk at that record's start. Boot ids
+    // are compared in serial-number order: `a` is older than `b` iff
+    // `(a − b) mod 2³² ≥ 2³¹`. A newer id is accepted (a walk may cross
+    // into newer boots, W4 (ii)); never the equality rule.
     let mut replay: Vec<wal::Rec> = Vec::new();
     let mut valid_end = meta.wal_start_lsn;
     let mut lsn = meta.wal_start_lsn;
     let mut markers: BTreeMap<(u32, u64), u64> = BTreeMap::new();
     let mutant = st.cfg.mutant;
+    let mut last_boot: Option<u32> = None;
+    // The newest boot id among the records the walk accepts (§14
+    // step 8's third term; recorded for the boot checkpoint).
+    let mut newest_rec_boot: Option<u32> = None;
     'outer: loop {
         let seg = wal::seg_of(lsn);
         let name = format!("/wal/{seg:016x}.log");
@@ -1339,6 +1357,24 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             let bytes = cx.env().read_at(fid, off, want).map_err(Fail::Sim)?;
             match wal::dec_record_with_lsn_check(&bytes, lsn, seg + WAL_SEG, mutant) {
                 Ok(Some(rec)) => {
+                    // **W4 (i): the ordered boot-id stop** — the walk
+                    // never accepts a record whose boot id went
+                    // backwards; the valid end is its start.
+                    let floor = last_boot.unwrap_or(meta.boot_id);
+                    if (rec.txn.0.wrapping_sub(floor)) >= 1u32 << 31 {
+                        break 'outer;
+                    }
+                    last_boot = Some(rec.txn.0);
+                    newest_rec_boot = Some(match newest_rec_boot {
+                        None => rec.txn.0,
+                        Some(nb) => {
+                            if (nb.wrapping_sub(rec.txn.0)) >= 1u32 << 31 {
+                                rec.txn.0
+                            } else {
+                                nb
+                            }
+                        }
+                    });
                     let len = rec.len();
                     // Accept the record the reader yields (card 1.4).
                     cx.env().accepted(fid, off, len).map_err(Fail::Sim)?;
@@ -1374,11 +1410,65 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     valid_end = lsn + len;
                     lsn += len;
                     off += len;
+                    if off == WAL_SEG {
+                        // **S-1-F3 §12.5, the hop (gate edit 2; X-5c-F3-
+                        // F3a step 2):** "after `SegmentEnd`, **or after
+                        // an accepted record that ends exactly at its
+                        // segment's end**, the reader moves on to the
+                        // next segment's first LSN, and the valid end is
+                        // then at least that LSN, even when that segment
+                        // is short or missing." §12.2's tail rule lets a
+                        // record end exactly at the boundary with no
+                        // room for a filler, so the hop is the reader's
+                        // only way on; without it the walk stopped at
+                        // `off == WAL_SEG` with the valid end at the
+                        // boundary, and G2's truncation then zeroed the
+                        // next segment's records — the four boundary
+                        // store losses (1064 r1, 4770 r2, 5054 r1, 6263
+                        // r2: class-C I-REDO-COMPLETE breaks, acked
+                        // SyncOn commits lost with no media fault).
+                        valid_end = seg + WAL_SEG;
+                        lsn = seg + WAL_SEG;
+                        continue 'outer;
+                    }
                 }
                 Ok(None) | Err(()) => break 'outer,
             }
         }
         break 'outer;
+    }
+    // X-5c-F3-F3a step 6 (c) (`E4_TXN_DIAG`, stderr only, default off,
+    // never a digest input): per recovery, each marker's recorded chunk
+    // count against the chunks this walk attached to its txn. A mismatch
+    // would mean step 4 is incomplete — per-boot txn ids still colliding
+    // across lives — and is escalated by the card, never hidden.
+    if std::env::var("E4_TXN_DIAG").is_ok() {
+        let mut attached: BTreeMap<(u32, u64), u64> = BTreeMap::new();
+        for rec in replay.iter() {
+            if rec.kind == K_CHUNK {
+                *attached.entry(rec.txn).or_insert(0) += 1;
+            }
+        }
+        for (txn, ts) in markers.iter() {
+            let marker = replay.iter().find(|r| r.kind == K_MARKER && r.txn == *txn);
+            let want = marker.and_then(|r| {
+                r.payload
+                    .get(..4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_le_bytes)
+                    .map(|n| n as u64)
+            });
+            let got = attached.get(txn).copied().unwrap_or(0);
+            eprintln!(
+                "TXN diag: marker txn={txn:?} ts={ts} chunk_count={want:?} attached={got}{}",
+                if Some(got) != want { " MISMATCH" } else { "" }
+            );
+        }
+        for (txn, got) in attached.iter() {
+            if !markers.contains_key(txn) {
+                eprintln!("TXN diag: unmarked chunks txn={txn:?} attached={got}");
+            }
+        }
     }
     // Pass 2: install the opened store, then apply in LSN order through
     // the gated insert path (§9.1's identical-entry no-op makes it
@@ -1552,6 +1642,38 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             .retain(|txn, _| markers.get(txn).map(|ts| *ts > t).unwrap_or(true));
         Ok(())
     })?;
+    // §14 step 8 (the (f′) binding amendment; X-5c-F3-F3a step 4): the
+    // boot id of this boot — the newest, in serial-number order (§12.5),
+    // of the ckpt_id its boot checkpoint writes (low 32 bits: k+1, the
+    // recovery's next id), 1 + the opened meta's `boot_id`, and 1 + the
+    // newest boot id among the records the walk accepted. After a meta
+    // rollback the walk can cross into a boot whose meta was lost, and
+    // whose `ckpt_id` this boot's checkpoint would otherwise repeat; the
+    // boot-id terms keep every boot's id fresh across rollbacks. A
+    // recovery life that appends nothing still carries the id forward:
+    // the harness checkpoint (G4, §14 step 8's boot checkpoint) writes
+    // its meta with it, and the next workload's records carry it.
+    {
+        let serial_max = |a: u32, b: u32| {
+            if (a.wrapping_sub(b)) >= 1u32 << 31 {
+                b
+            } else {
+                a
+            }
+        };
+        let nb1 = newest_rec_boot.map(|nb| nb.wrapping_add(1));
+        let opened_boot1 = meta.boot_id.wrapping_add(1);
+        cx.with("recover:boot", |c| {
+            let st = c.store();
+            let mut boot = (st.k + 1) as u32;
+            boot = serial_max(boot, opened_boot1);
+            if let Some(b) = nb1 {
+                boot = serial_max(boot, b);
+            }
+            st.boot_id = boot;
+            Ok(())
+        })?;
+    }
     // §14 step 6: resume `dropping` walks.
     tree::resume_drops(cx)?;
     let out = cx.with("recover:take", |c| Ok(c.store().clone()))?;

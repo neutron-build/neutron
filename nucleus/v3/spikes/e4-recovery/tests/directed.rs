@@ -764,12 +764,19 @@ fn d7_zombie_tail() {
         clean2.o3_fail,
         clean2.task_error
     );
-    // Mutant: the zombie lines up positionally and is replayed — the
-    // oracle fails on a commit round 2's model no longer has.
+    // Mutant: X-5c-F3-F3a step 4 (S-1-F3 W4 (i)) — the zombie is round
+    // 1's workload's record, an **older boot's** record, and the walk's
+    // ordered boot-id stop now refuses it even when
+    // TRUNCATE-LOGICAL-ONLY leaves its bytes in place with a matching
+    // lsn: the stop is by identity, not by zeroing. Round 2 therefore
+    // passes under the mutant too (the pre-W4 catcher — the zombie
+    // replaying and failing O-1 — described a same-boot zombie; this
+    // fixture's zombie is cross-boot by construction, each round's
+    // workload being its own boot).
     let m2 = round2(Some(Mutant::TruncateLogicalOnly));
     assert!(
-        !m2.pass && m2.o1.is_err(),
-        "D7 round-2 mutant: the lined-up zombie must be replayed and fail O-1 (o1={:?}, pass={})",
+        m2.pass && m2.o1.is_ok(),
+        "D7 round-2 mutant: the older boot's zombie is stopped by 12.5's ordered boot-id stop, never replayed (o1={:?}, pass={})",
         m2.o1,
         m2.pass
     );
