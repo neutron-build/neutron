@@ -22,7 +22,14 @@
 //! it covered; SyncOff commits are acked after the write. The commit
 //! critical section assigns the ts and enqueues the record at its LSN
 //! (I-WAL-TS-ORDER; the TS-AFTER-APPEND mutant ends the critical section
-//! between the two).
+//! between the two). **The writer is serialized (X-5c-F3-F1 step 1):**
+//! one batch is in flight at a time, and a commit is acked durable only
+//! through the contiguous written-and-synced prefix of the WAL — a
+//! helper that finds another task's batch in flight parks on
+//! `WalAcks` rather than taking its own batch (the draft's concurrent
+//! takes acked a later batch's SyncOn commit over an unwritten earlier
+//! batch, and §12.5's replay stop then lost the acked record:
+//! I-REDO-COMPLETE violated).
 //!
 //! G1: `sync_dir("/wal/")` after every segment create/rename and before
 //! any record in a created or renamed segment is counted durable or
@@ -319,6 +326,22 @@ pub struct WalState {
     pub durable: u64,
     /// The written-through LSN (advanced by the writer's writes).
     pub written: u64,
+    /// The in-flight batch's LSN range `(start, end)`, if any task holds
+    /// one (§12.4's serialized writer; X-5c-F3-F1 step 1). The store's
+    /// invariant: **one batch is in flight at a time**, and
+    /// [`WalState::written`]/[`WalState::durable`] advance only over the
+    /// **contiguous** prefix of the stream — "a commit is acked durable
+    /// only through the contiguous written-and-synced prefix of the WAL"
+    /// (the gate's S-1-F3 text for §12.4 / I-REDO-COMPLETE). The draft
+    /// let `wal_writer_step` run in two tasks at once (the writer task
+    /// and a committer helping from `wal_wait_durable`/
+    /// `wal_wait_written`), each taking its own batch and advancing the
+    /// counters with `max`, so a later batch's sync acked a SyncOn
+    /// commit **over an unwritten earlier batch** (seed 21 r0: ts=15
+    /// acked over ts=14's hole; §12.5's replay then stopped at the hole
+    /// and G2 zeroed the acked record — C-DIV's `frontier < lo`
+    /// signature, 93 of F3's 388 rounds).
+    pub in_flight: Option<(u64, u64)>,
     /// Per-segment created-but-unsynced-dir flags (G1 bookkeeping).
     pub seg_needs_dirsync: Vec<u64>,
     /// Chunked transactions: txn → first chunk LSN (§12.6). An entry
@@ -411,20 +434,77 @@ pub fn wal_enqueue<H: StoreHost>(
 /// the ack waiters. SyncOff acks arrive from `written`. G1: a directory
 /// sync after every create, before any record in the segment counts
 /// durable (RENAME-NO-DIRSYNC skips it).
+///
+/// **§12.4's serialized writer (X-5c-F3-F1 step 1):** one batch is in
+/// flight at a time, tracked in [`WalState::in_flight`]. A caller that
+/// finds another task's batch in flight parks on
+/// [`crate::sim::WaitKey::WalAcks`] — the existing "batch taken but not
+/// yet written" rule — and re-checks on wake, so it never spins. The
+/// holder clears the flag and wakes `WalAcks` on **every** exit, its
+/// error paths included, so no waiter is stranded. `written`/`durable`
+/// advance to the batch end only when the batch starts at the current
+/// `written` (the contiguous prefix); any other case is an invariant
+/// breach that returns [`Fail::Invalid`] loudly, never a silent `max`
+/// over a hole.
 pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
+    /// The take step's outcome.
+    enum Take {
+        /// This task holds the batch: its bytes and LSN range.
+        Batch(Vec<u8>, u64, u64),
+        /// Nothing enqueued.
+        Empty,
+        /// Another task's batch is in flight.
+        Busy,
+    }
     // Take the batch (one step).
-    let batch = cx.with("wal_writer:take", |c| {
+    let take = cx.with("wal_writer:take", |c| {
         let st = c.store();
+        if st.wal.in_flight.is_some() {
+            return Ok(Take::Busy);
+        }
         if st.wal.buf.is_empty() {
-            return Ok(None);
+            return Ok(Take::Empty);
         }
         let buf = std::mem::take(&mut st.wal.buf);
         let start = st.wal.append - buf.len() as u64;
-        Ok(Some((buf, start)))
+        let end = start + buf.len() as u64;
+        st.wal.in_flight = Some((start, end));
+        Ok(Take::Batch(buf, start, end))
     })?;
-    let Some((buf, mut lsn)) = batch else {
-        return Ok(());
+    let (buf, start, end) = match take {
+        Take::Empty => return Ok(()),
+        Take::Busy => {
+            // The serialized-writer park (§12.4): the holder wakes
+            // `WalAcks` at its written advance, its durable advance and
+            // every exit; this task re-checks afterwards.
+            cx.wait_for(crate::sim::WaitKey::WalAcks)?;
+            return Ok(());
+        }
+        Take::Batch(buf, start, end) => (buf, start, end),
     };
+    let res = wal_write_batch(cx, &buf, start, end);
+    // The holder clears the flag and wakes `WalAcks` on every exit —
+    // the error paths above included — so no waiter parked on the
+    // serialized-writer rule is ever stranded.
+    let _ = cx.with("wal_writer:release", |c| {
+        c.store().wal.in_flight = None;
+        Ok(())
+    });
+    cx.w.wake(crate::sim::WaitKey::WalAcks);
+    res
+}
+
+/// One in-flight batch's write-out: the segment loop, the `written`
+/// advance, the `writer:presync` park, the group sync and the `durable`
+/// advance. Called only by [`wal_writer_step`] with the batch's range
+/// recorded in [`WalState::in_flight`].
+fn wal_write_batch<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    buf: &[u8],
+    start: u64,
+    end: u64,
+) -> Result<(), Fail> {
+    let mut lsn = start;
     let mut touched: Vec<u64> = Vec::new();
     let mut i = 0usize;
     while i < buf.len() {
@@ -443,13 +523,13 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
             match existing {
                 Some(f) => f,
                 None => {
-                    // Create + preallocate + G1. Two tasks can reach
-                    // here for the same segment (the writer task and a
-                    // committer's help call, S-BATON interleaving at
-                    // every env call): the loser's create fails with
-                    // "exists" and falls back to opening the winner's
-                    // file, re-running the same bind and dirsync (G1 is
-                    // idempotent — a second sync_dir of "/wal/" is a
+                    // Create + preallocate + G1. The serialized writer
+                    // (X-5c-F3-F1 step 1) means no second task can be
+                    // in this loop for the same segment at the same
+                    // time; the "exists" fallback stays for a segment
+                    // file left bound by an earlier boot of the same
+                    // world (recovery rebinding), and is idempotent
+                    // either way (a second `sync_dir` of "/wal/" is a
                     // no-op ordering-wise, and durability of this
                     // segment's records is never counted before at
                     // least one completed dirsync).
@@ -494,7 +574,18 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     }
     cx.with("wal_writer:written", |c| {
         let st = c.store();
-        st.wal.written = st.wal.written.max(lsn);
+        // §12.4's contiguous prefix: this batch must start exactly at
+        // the current `written`. Anything else means the stream below
+        // the batch has a hole (a prior batch's bytes lost on an error
+        // path, or accounting that skipped ahead) — loud, never a
+        // `max` that silently papers over it.
+        if st.wal.written != start {
+            return Err(Fail::Invalid(format!(
+                "12.4 contiguous written: batch [{start}, {end}) starts at written {} — not the contiguous prefix",
+                st.wal.written
+            )));
+        }
+        st.wal.written = end;
         Ok(())
     })?;
     cx.w.wake(crate::sim::WaitKey::WalAcks);
@@ -514,7 +605,18 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     }
     cx.with("wal_writer:durable", |c| {
         let st = c.store();
-        st.wal.durable = st.wal.durable.max(lsn);
+        // Same contiguous-prefix rule for `durable`: it may already sit
+        // inside this batch (a waiter's `wal_sync_through` covered the
+        // written bytes while the holder was parked above — D4's own
+        // shape), but it must not sit below the batch start (the
+        // prefix below was never synced) nor past the batch end.
+        if st.wal.durable < start || st.wal.durable > end {
+            return Err(Fail::Invalid(format!(
+                "12.4 contiguous durable: batch [{start}, {end}) vs durable {}",
+                st.wal.durable
+            )));
+        }
+        st.wal.durable = end;
         Ok(())
     })?;
     cx.w.wake(crate::sim::WaitKey::WalAcks);
@@ -587,7 +689,10 @@ pub fn wal_wait_written<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fa
 /// one for the accounting). Only the segments the store has open are
 /// synced; a range the store never wrote cannot be made durable by
 /// syncing (G5: appending means enqueued, durable means synced where
-/// written).
+/// written). Under the serialized writer (X-5c-F3-F1 step 1) the
+/// advance stays contiguous by construction: `lsn ≤ written`, and
+/// `written` itself only ever moves over a completed batch that started
+/// at the old `written`, so this can never leap an in-flight batch.
 fn wal_sync_through<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fail> {
     let (d, w) = cx.with("wal_sync:range", |c| {
         let st = c.store();

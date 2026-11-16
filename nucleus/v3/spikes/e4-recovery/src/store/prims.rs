@@ -317,6 +317,14 @@ pub fn alloc_lpid<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
         let st = c.store();
         if let Some(l) = st.slots.free_lpids.iter().next().copied() {
             st.slots.free_lpids.remove(&l);
+            // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr only,
+            // never a digest input): a free-set reuse whose lpid the
+            // current map still references (P's lead (i): an allocation
+            // handing out an LPID still mapped — "reachable more than
+            // once").
+            if std::env::var("E4_CXX_DIAG").is_ok() && st.map.cur.contains_key(&l) {
+                eprintln!("CXX diag: alloc_lpid reused {l} still mapped in map.cur");
+            }
             Ok(l)
         } else {
             let l = st.meta.next_lpid.max(1);

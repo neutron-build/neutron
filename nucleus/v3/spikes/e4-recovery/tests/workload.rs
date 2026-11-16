@@ -713,7 +713,13 @@ fn r16_mpe_referenced_set_excludes_the_file_header() {
 /// `rlen` is 0 again and the exactness text reappears.
 #[test]
 fn r20_mpe_r_reads_the_issued_write_history() {
-    for seed in [38u64, 137] {
+    // X-5c-F3-F1 step 1 note: the WAL-serialization fix moved the
+    // uniform crash points, so the pin's literal configs were
+    // re-derived at the new tip (38/137 lost their rollback round;
+    // 48 r0 and 308 r0 carry the same shape-B rollback with |R| ≥ 1
+    // and every round passing). The assertions are unchanged, and the
+    // events-half revert was re-demonstrated on the new configs.
+    for seed in [48u64, 308] {
         let rec = workload::run_seed(seed, None);
         let exactness = rec
             .rounds
@@ -849,7 +855,13 @@ fn f1f2b_repairs_without_a_store_reseed_the_twin_chain() {
 /// mutant M-R28g) the completeness text returns and this pin fails.
 #[test]
 fn r28_residual_seeds_clear_via_k() {
-    for seed in [1787u64, 6157] {
+    // X-5c-F3-F1 step 1 note: 6157's round moved with the WAL fix (no
+    // rollback in it now; its twin fails O-1(c) — the inherited C-DIV
+    // echo). 5808 r0 carries the same residual shape at the new tip
+    // (K slot 53), so the pin's literal configs are [1787, 5808]; the
+    // assertions are unchanged and the M-R28g revert was
+    // re-demonstrated on both.
+    for seed in [1787u64, 5808] {
         let rec = workload::run_seed(seed, None);
         assert!(
             rec.rounds.iter().any(|r| r.meta_rollback),
@@ -990,7 +1002,15 @@ fn r20_mpe_no_opened_image_means_no_slotted_finding() {
 /// the same way (the poison is set but the workload never ends).
 #[test]
 fn g8_poison_ends_the_workload_instead_of_livelocking() {
-    for seed in [987u64, 1108] {
+    // X-5c-F3-F1 step 1 note: 1108's round 0 flipped to a recovery-Err
+    // detection round at the new tip (its chain stops; no r1 exists),
+    // so the pin's second literal config was re-derived: seed 7 round 1
+    // is the same MP-LIVELOCK shape (directly after an R6 round 0, the
+    // crash desc `poison`, no livelock, the round passes). The
+    // assertions are unchanged; M-G8a was re-demonstrated on both
+    // configs (987 r1 and 7 r1 livelock again with the poison mark
+    // removed).
+    for seed in [987u64, 7] {
         let rec = workload::run_seed(seed, None);
         let r1 = &rec.rounds[1];
         assert!(

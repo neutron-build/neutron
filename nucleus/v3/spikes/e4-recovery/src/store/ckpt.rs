@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::amcheck;
 use super::page::{self, Ref};
 use super::prims;
 use super::tree;
@@ -1342,6 +1343,27 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     // Accept the record the reader yields (card 1.4).
                     cx.env().accepted(fid, off, len).map_err(Fail::Sim)?;
                     if rec.kind == K_SEGEND {
+                        // §12.5 as written (X-5c-F3-F1 step 2): "after
+                        // `SegmentEnd`, the reader moves on to the next
+                        // segment's first LSN … The stopping point is
+                        // the valid end" — accepting the filler moves
+                        // the valid end past it. So a missing next
+                        // segment leaves the valid end **after** the
+                        // SegmentEnd (G2's truncation then starts at
+                        // the missing segment and zeroes nothing in
+                        // this one), and an invalid first record in the
+                        // next segment leaves it at that segment's
+                        // first LSN. The draft never advanced
+                        // `valid_end` over the filler, so `truncate_wal`
+                        // zeroed the very SegmentEnd the reader had
+                        // just accepted (seed 6149 r1: a nested crash
+                        // dropped the zeros before their sync, and
+                        // life 2 re-accepted the surviving SegmentEnd,
+                        // tainted against the dropped zeros — an MW
+                        // served corruption). The pending spec home is
+                        // S-1-F3 (P's card; this implements §12.5's
+                        // text as already written).
+                        valid_end = seg + WAL_SEG;
                         lsn = seg + WAL_SEG;
                         continue 'outer;
                     }
@@ -1377,6 +1399,25 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     Ok(())
                 })?;
                 frontier = frontier.max(rec.ts);
+                // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr
+                // only, never a digest input): the store's own amcheck
+                // after each replayed commit, naming the record whose
+                // apply first violates a tree invariant.
+                if std::env::var("E4_CXX_DIAG").is_ok() {
+                    let f = amcheck::amcheck(
+                        cx,
+                        &cx.with("recover:amchk", |c| Ok(c.store().cfg.clone()))?,
+                    );
+                    if !f.is_empty() {
+                        eprintln!(
+                            "CXX diag: replay K_COMMIT ts={} lsn={} ops={} first findings={:?}",
+                            rec.ts,
+                            rec.lsn,
+                            wal::rec_ops(rec).len(),
+                            f.get(..3).unwrap_or(&f)
+                        );
+                    }
+                }
             }
             K_CHUNK => {
                 if let Some(ts) = markers.get(&rec.txn).copied()
@@ -1390,6 +1431,58 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                         Ok(())
                     })?;
                     frontier = frontier.max(ts);
+                    // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`):
+                    // the chunked superseding replay is the prime
+                    // suspect for separator disorder (a replace below
+                    // newer versions).
+                    if std::env::var("E4_CXX_DIAG").is_ok() {
+                        let f = amcheck::amcheck(
+                            cx,
+                            &cx.with("recover:amchk2", |c| Ok(c.store().cfg.clone()))?,
+                        );
+                        if !f.is_empty() {
+                            eprintln!(
+                                "CXX diag: replay K_CHUNK txn={:?} ts={} lsn={} first findings={:?}",
+                                rec.txn,
+                                ts,
+                                rec.lsn,
+                                f.get(..3).unwrap_or(&f)
+                            );
+                            // The chunk's own ops, and the directory's
+                            // keys at the finding.
+                            eprintln!(
+                                "CXX diag:   ops of this chunk: {}",
+                                wal::rec_ops(rec)
+                                    .iter()
+                                    .map(|o| match o {
+                                        wal::WOp::CreateTree { tree } => format!("C{tree}"),
+                                        wal::WOp::DropTree { tree } => format!("D{tree}"),
+                                        wal::WOp::Put { tree, key, .. } => {
+                                            format!("P{tree}/{}", key.len())
+                                        }
+                                        wal::WOp::Delete { tree, key } => {
+                                            format!("X{tree}/{}", key.len())
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            let dir_root =
+                                cx.with("recover:dr", |c| Ok(c.store().meta.dir_root))?;
+                            let cells = tree::raw_cells(cx, dir_root, false)
+                                .map(|cs| {
+                                    cs.iter()
+                                        .map(|(k, _)| {
+                                            u64::from_be_bytes(
+                                                k.as_slice().try_into().unwrap_or([0; 8]),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            eprintln!("CXX diag:   dir keys now: {cells:?}");
+                        }
+                    }
                 }
             }
             _ => {}

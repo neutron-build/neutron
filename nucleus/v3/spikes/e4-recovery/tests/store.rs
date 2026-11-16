@@ -17,8 +17,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use e4_recovery::sim::{HARNESS, HasDisk, Sched, SchedCore, SchedHost, SimDisk, SimFail, TaskId};
+use e4_recovery::sim::{
+    E4Env, HARNESS, HasDisk, Sched, SchedCore, SchedHost, SimDisk, SimFail, TaskId,
+};
 use e4_recovery::store::ckpt::{self, CkptHook};
+use e4_recovery::store::wal;
 use e4_recovery::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims, tree};
 
 /// The test world: scheduling, disk and store slices plus a small shared
@@ -1077,5 +1080,694 @@ fn cxx_highest_lpid_free_never_shrinks_next_lpid() {
         sched.lock().st.meta.next_lpid,
         before,
         "the reuse must not move next_lpid"
+    );
+}
+
+/// **X-5c-F3-F1 step 1 pin (§12.4 / I-REDO-COMPLETE; a literal two-task
+/// config).** A SyncOn commit is acked durable only through the
+/// **contiguous written-and-synced prefix** of the WAL — the gate's
+/// S-STORE §12.4 text. The draft let `wal_writer_step` run in two tasks
+/// at once (the writer task and a committer helping from
+/// `wal_wait_durable`), each taking its own batch and advancing
+/// `written`/`durable` with `max`: a later batch's write+sync acked its
+/// SyncOn commit over an earlier batch's unsynced bytes, and §12.5's
+/// replay stop then lost the acked record at the crash (seed 21 r0:
+/// ts=15 acked over ts=14's hole; the `frontier < lo` signature, 93 of
+/// F3's 388 C-DIV rounds). The serialized writer fixes it: one batch in
+/// flight at a time (`WalState::in_flight`), a helper that finds one
+/// parks on `WalAcks`, and the counters advance only over the
+/// contiguous prefix.
+///
+/// The config: segment 0 holds four durable setup commits ending
+/// exactly at LSN 65536. Task A (the batch-1 holder) enqueues ts=5..8
+/// filling segment 1 exactly, takes batch 1, writes it, and is held at
+/// `writer:presync` (budget 900_000) — written, unsynced. Task B waits
+/// for exactly that hole state, then enqueues ts=9 (segment 2) and runs
+/// its §12.4 SyncOn ack wait. The driver crashes the world the moment B
+/// parks on `WalAcks` (the serialized-writer rule) or B's ack returns
+/// (the mutant). Asserted: ts=9's `wal_wait_durable` has not returned;
+/// `wal.durable` never passed batch 1's start; and after F-CRASH
+/// resolves (unsynced writes dropped) recovery returns the ts-prefix
+/// through the setup commits with the WAL restarted at the valid end.
+/// Reverting the fix (mutant M-WALa: the concurrent take with `max`
+/// accounting restored) fails this pin on both of the first two
+/// assertions — B's ack returns over batch 1's unsynced bytes and
+/// `durable` sits past batch 1's start.
+#[test]
+fn cdiv_syncon_ack_never_crosses_an_unwritten_batch() {
+    use e4_recovery::sim::WaitKey;
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    // §12.2's cap is on the whole record, so the max payload leaves
+    // room for the framing — and exactly four max records fill a
+    // 64-KiB segment (4 × REC_MAX = WAL_SEG).
+    let maxp = e4_recovery::store::wal::REC_MAX - fixed;
+    let seed = 4242u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- setup (single task): segment 0 filled exactly and durable ----
+    let (disk, st) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        for ts in 1..=4u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp as usize])
+                .expect("setup enqueue");
+        }
+        wal::wal_wait_durable(&cx, seg).expect("setup durable");
+        let g = sched.lock();
+        assert_eq!(
+            g.st.wal.append, seg,
+            "the setup must fill segment 0 exactly"
+        );
+        assert_eq!(g.st.wal.durable, seg);
+        (g.disk.clone(), g.st.clone())
+    };
+    // ---- the two-task world ----
+    let mut st = st;
+    st.parks.insert("writer:presync", 900_000);
+    let host = TestWorld {
+        sched: SchedCore::new(3, seed + 1),
+        disk,
+        st,
+        flags: BTreeMap::new(),
+    };
+    let sched = Arc::new(Sched::new(host));
+    fn sf(e: Fail) -> SimFail {
+        match e {
+            Fail::Sim(s) => s,
+            _ => SimFail::Internal("wal pin: a non-sim store failure"),
+        }
+    }
+    // Task A: enqueue ts=5..8 (segment 1 exactly), take batch 1, write
+    // it, and hold at `writer:presync` — written, unsynced.
+    let a_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        for ts in 5..=8u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp as usize])
+                .map_err(sf)?;
+        }
+        set_flag(sched, "a_enq");
+        wal::wal_writer_step(&cx).map_err(sf)?;
+        set_flag(sched, "a_done");
+        Ok(())
+    };
+    // Task B: wait for the hole state (batch 1 written, unsynced),
+    // then enqueue ts=9 (segment 2) and run its SyncOn ack wait.
+    let b_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        loop {
+            let hole = cx
+                .with("pin:b:gate", |c| {
+                    let st = c.store();
+                    Ok(st.wal.written == 2 * seg && st.wal.durable == seg)
+                })
+                .map_err(sf)?;
+            if hole {
+                break;
+            }
+            cx.yield_now("pin:b:poll").map_err(sf)?;
+        }
+        set_flag(sched, "b_go");
+        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 9), 9, &[7u8; 10]).map_err(sf)?;
+        set_flag(sched, "b_enq2");
+        let end9 = 2 * seg + fixed + 10;
+        let r = wal::wal_wait_durable(&cx, end9).map_err(sf);
+        if r.is_ok() {
+            set_flag(sched, "b_acked");
+        }
+        r
+    };
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (t, body) in [
+            (
+                1usize,
+                &a_body
+                    as &(dyn Fn(&Sched<TestWorld>, TaskId) -> Result<(), SimFail> + Send + Sync),
+            ),
+            (2, &b_body),
+        ] {
+            let sched = Arc::clone(&sched);
+            handles.push(scope.spawn(move || {
+                if let Err(SimFail::Baton(s)) = sched.yield_baton(t) {
+                    panic!("entry barrier refused: Baton at {s}");
+                }
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&sched, t)));
+                let is_panic = r.is_err();
+                sched.finish(t);
+                assert!(!is_panic, "task {t} panicked");
+            }));
+        }
+        // The harness thread hands the baton over and parks on Join.
+        let starter = Arc::clone(&sched);
+        let h0 = scope.spawn(move || starter.start());
+        // The driver: crash the world the moment B parks on WalAcks
+        // (the serialized-writer rule in force) or B's ack returns (the
+        // mutant's leap).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (b_parked, acked) = {
+                let g = sched.lock();
+                (
+                    g.sched.waiting.get(2) == Some(&Some(WaitKey::WalAcks)),
+                    g.flags.get("b_acked").copied().unwrap_or(false),
+                )
+            };
+            if b_parked || acked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "driver timeout: B neither parked on WalAcks nor acked (a_enq={}, a_done={}, b_go={}, b_enq2={})",
+                flag(&sched, "a_enq"),
+                flag(&sched, "a_done"),
+                flag(&sched, "b_go"),
+                flag(&sched, "b_enq2")
+            );
+        }
+        sched.deliver_crash();
+        let _ = h0.join();
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+    // ---- the assertions at the crash ----
+    let (acked, durable) = {
+        let g = sched.lock();
+        (
+            g.flags.get("b_acked").copied().unwrap_or(false),
+            g.st.wal.durable,
+        )
+    };
+    assert!(
+        !acked,
+        "ts=9's wal_wait_durable returned before the crash: the SyncOn ack crossed batch 1's unsynced bytes (12.4 / I-REDO-COMPLETE)"
+    );
+    assert!(
+        durable <= seg,
+        "wal.durable ({durable}) passed batch 1's start ({seg}) before batch 1's sync"
+    );
+    // ---- F-CRASH resolves (unsynced writes dropped), then recovery ----
+    let mut disk = {
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    let mut frng = e4_recovery::rng::Rng::new(0xABCD_1234);
+    disk.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    let world = pass_world(1, seed + 2, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("recover after the crash");
+    assert_eq!(
+        frontier, 4,
+        "the recovered state is the ts-prefix through the setup commits (no acked commit lost)"
+    );
+    assert_eq!(
+        rec_st.wal.append, seg,
+        "the WAL restarts at the valid end (segment 1's first LSN)"
+    );
+}
+
+/// **X-5c-F3-F1 step 2 pin (§12.5 / G2; a literal config).** §12.5 as
+/// written: "after `SegmentEnd`, the reader moves on to the next
+/// segment's first LSN … The stopping point is the valid end." The
+/// draft's `ckpt::recover` never advanced `valid_end` over an accepted
+/// `SegmentEnd`, so when the next segment was missing, G2's
+/// `truncate_wal` zeroed from the last commit's end — destroying the
+/// very SegmentEnd the reader had just accepted (seed 6149 r1: the
+/// nested crash dropped the zeros before their sync, and life 2
+/// re-accepted the surviving SegmentEnd, tainted against the dropped
+/// zeros — an MW served corruption).
+///
+/// The config: segment 0 holds one durable Commit (ts=1, LSN 0) and a
+/// durable `SegmentEnd` at [45, 90); **segment 1 does not exist**. A
+/// nested recovery crash is swept over every recovery yield `k` in
+/// `1..=120` (life 1 arms `crash_at_yield = k`, F-CRASH resolves with
+/// keep-latest 0 — every volatile write dropped — then life 2 recovers
+/// again, exactly the harness's nested-crash retry). Asserted for
+/// every `k`: no served range in any life; the SegmentEnd's bytes
+/// durable and byte-equal to the fixture; life 2's recovered
+/// `wal.append` is segment 1's first LSN. Under the fix,
+/// `truncate_wal` issues no write at all (its first probe is the
+/// missing segment), so every `k` passes. Reverting the fix (mutant
+/// M-SEGa: the `valid_end` advance removed) fails this pin at every
+/// `k` — the zeroing truncation either lands durably (the SegmentEnd's
+/// bytes destroyed, `append` below segment 1) or is cut by the crash
+/// between its write and its sync and life 2 then serves the tainted
+/// SegmentEnd (6149's exact mechanism).
+#[test]
+fn segend_valid_end_survives_a_missing_next_segment() {
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    let seed = 5150u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- the fixture: segment 0 = one Commit + one SegmentEnd, durable;
+    // segment 1 does not exist ----
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    let (disk, segend_bytes, seg0) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk,
+            st,
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let name = "/wal/0000000000000000.log";
+        let f = cx.env().create(name).expect("create segment 0");
+        cx.env().set_len(f, seg).expect("preallocate");
+        let rec1 = wal::enc_record(wal::K_COMMIT, (0, 1), 1, &[], 0);
+        let segend = wal::enc_record(wal::K_SEGEND, (0, 0), 0, &[], fixed);
+        assert_eq!(rec1.len() as u64, fixed, "the ts=1 record's length");
+        let mut both = rec1.clone();
+        both.extend_from_slice(&segend);
+        cx.env().write_at(f, 0, &both).expect("write fixture");
+        cx.env().sync_dir("/wal/").expect("G1 dirsync");
+        cx.env().sync_data(f).expect("G5 sync");
+        let g = sched.lock();
+        let durable = g.disk.durable_read(f, 0, 2 * fixed);
+        assert_eq!(durable, both, "the fixture must be durable");
+        (g.disk.clone(), segend, f)
+    };
+    // ---- the sweep: one nested crash point per recovery yield ----
+    for k in 1u64..=120 {
+        // Life 1: arm the nested crash at yield k and recover.
+        let mut d1 = disk.clone();
+        #[allow(clippy::type_complexity)]
+        let (life1, served1): (
+            Result<(e4_recovery::store::StoreInner, u64), Fail>,
+            Vec<(usize, u64, u64)>,
+        ) = {
+            let host = TestWorld {
+                sched: SchedCore::new(1, seed + k),
+                disk: d1.clone(),
+                st: StoreInner::empty(cfg.clone(), 0),
+                flags: BTreeMap::new(),
+            };
+            let world = Sched::new(host);
+            let cx = Cx {
+                w: &world,
+                t: HARNESS,
+            };
+            cx.with("pin2:arm", |c| {
+                c.sched_mut().crash_at_yield = Some(k);
+                Ok(())
+            })
+            .expect("arm");
+            let r = ckpt::recover(&cx, cfg.clone());
+            let s = world.lock().disk.served.clone();
+            (r, s)
+        };
+        // The invariants, checked wherever recovery finished.
+        let check = |bytes_now: &[u8], served: &[(usize, u64, u64)], append: u64, what: &str| {
+            assert_eq!(
+                bytes_now,
+                &segend_bytes[..],
+                "k={k} ({what}): the SegmentEnd's bytes were not left durable and unchanged (12.5/G2)"
+            );
+            assert!(
+                served.is_empty(),
+                "k={k} ({what}): a life served a corrupted range: {served:?}"
+            );
+            assert_eq!(
+                append, seg,
+                "k={k} ({what}): wal.append must be segment 1's first LSN"
+            );
+        };
+        match life1 {
+            Err(Fail::Sim(SimFail::Crashed)) => {
+                // The crash fired: resolve F-CRASH (every volatile write
+                // dropped), then life 2 recovers on the resolved disk —
+                // exactly the harness's nested-crash retry.
+                let mut frng = e4_recovery::rng::Rng::new(seed + k);
+                d1.apply_crash(
+                    &mut frng,
+                    &e4_recovery::sim::FaultKnobs {
+                        keep_latest_pm: 0,
+                        tear_pm: 0,
+                    },
+                );
+                let host = TestWorld {
+                    sched: SchedCore::new(1, seed + k + 1),
+                    disk: d1.clone(),
+                    st: StoreInner::empty(cfg.clone(), 0),
+                    flags: BTreeMap::new(),
+                };
+                let world = Sched::new(host);
+                let cx = Cx {
+                    w: &world,
+                    t: HARNESS,
+                };
+                let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone())
+                    .unwrap_or_else(|e| panic!("k={k}: life 2 recover: {e:?}"));
+                assert_eq!(frontier, 1, "k={k}: the ts=1 commit replays");
+                let (bytes_now, served2) = {
+                    let g = world.lock();
+                    (
+                        g.disk.durable_read(seg0, fixed, fixed),
+                        g.disk.served.clone(),
+                    )
+                };
+                check(&bytes_now, &served1, rec_st.wal.append, "life 2");
+                check(&bytes_now, &served2, rec_st.wal.append, "life 2");
+            }
+            Ok((st, frontier)) => {
+                // The point never fired (k is past this life's yield
+                // total): the same invariants hold on life 1's outcome.
+                assert_eq!(frontier, 1, "k={k}: the ts=1 commit replays");
+                let bytes_now = d1.durable_read(seg0, fixed, fixed);
+                check(&bytes_now, &served1, st.wal.append, "unfired life 1");
+            }
+            other => panic!("k={k}: life 1 must crash or finish clean, got {other:?}"),
+        }
+    }
+}
+
+/// **X-5c-F3-F1 step 3 pin, G-2 (the gate's exact patch at
+/// `fetch_page:poison`; §9.2 / G8).** The gate's S-1-F3 text for §9.2:
+/// "a read whose bytes fail §3.3 inside apply, a split, a pack, GC or a
+/// checkpoint poisons the store; a client read never poisons". The
+/// literal config: two trees, each a single leaf, checkpointed (both
+/// leaves durable and referenced); tree 2's leaf slot is then corrupted
+/// on the durable disk, so every read of it fails §3.3 against the
+/// image's reference CRC.
+/// - (i) A **client read** (`tree_scan`, `inside_op = false`) of tree 2
+///   gets XX001 (`Fail::Corrupt`) and the store stays usable: a
+///   following mutation of the untouched tree 3 succeeds.
+/// - (ii) A **gated op** that fetches the page (`tree_insert` into
+///   tree 2: apply, `inside_op = true`) gets XX001 and **poisons** the
+///   store: the next mutation — of tree 3, not touching the damaged
+///   page — returns [`Fail::Poisoned`].
+///
+/// G-2 (`if !inside_op {` at the poison mark) fails both halves — the
+/// scan poisons and the gated op does not — and M-G8a (the poison mark
+/// removed) fails (ii).
+#[test]
+fn g8_read_never_poisons_gated_op_does() {
+    let seed = 6161u64;
+    let cfg = tcfg(8, 8, 1);
+    // Two trees, one leaf each, durable and referenced by image 1.
+    let (disk, _st) = create_store(cfg.clone(), seed, Some(2));
+    let (disk, damaged_slot) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk,
+            st: _st,
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        tree::dir_create_tree(&cx, 3).expect("CreateTree 3");
+        let r2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let r3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        for i in 0..4u64 {
+            ins(&cx, 2, r2, &i.to_be_bytes(), 1, &val(i, 1));
+            ins(&cx, 3, r3, &i.to_be_bytes(), 1, &val(i, 1));
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        // Tree 2's root leaf slot, corrupted on the durable disk.
+        let (pf, slot) = {
+            let g = sched.lock();
+            let r = g.st.map.cur.get(&r2).copied().expect("tree 2 ref");
+            (g.st.page_file, r.slot)
+        };
+        let garbage = vec![0xAAu8; 4096];
+        cx.env()
+            .write_at(pf, slot * 4096, &garbage)
+            .expect("corrupt");
+        cx.env().sync_data(pf).expect("sync the corruption");
+        let g = sched.lock();
+        (g.disk.clone(), slot)
+    };
+    assert!(
+        damaged_slot > 5,
+        "the damaged slot must be a real page slot"
+    );
+    // ---- (i) a client read detects and never poisons ----
+    {
+        let world = pass_world(1, seed + 1, disk.clone(), StoreInner::empty(cfg.clone(), 0));
+        let cx = Cx {
+            w: &world,
+            t: HARNESS,
+        };
+        let (opened, _meta) = ckpt::open(&cx, cfg.clone()).expect("open");
+        cx.with("g2:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        let r2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let scan = tree::tree_scan(&cx, r2, 10);
+        assert!(
+            matches!(scan, Err(Fail::Corrupt(_))),
+            "(i): the client read must detect the damage (XX001), got {scan:?}"
+        );
+        let poisoned = world.lock().st.poisoned.is_some();
+        assert!(
+            !poisoned,
+            "(i): a client read must never poison the store (9.2/G8)"
+        );
+        // The store stays usable: a mutation that does not touch the
+        // damaged page succeeds.
+        let r3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        ins(&cx, 3, r3, &99u64.to_be_bytes(), 1, &val(99, 1));
+        let poisoned = world.lock().st.poisoned.is_some();
+        assert!(!poisoned, "(i): the store must stay usable after the read");
+    }
+    // ---- (ii) a gated op detects and poisons ----
+    {
+        let world = pass_world(1, seed + 2, disk.clone(), StoreInner::empty(cfg.clone(), 0));
+        let cx = Cx {
+            w: &world,
+            t: HARNESS,
+        };
+        let (opened, _meta) = ckpt::open(&cx, cfg.clone()).expect("open");
+        cx.with("g2:install2", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install2");
+        let r2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let ekey = tree::enc_ekey(&50u64.to_be_bytes(), 1);
+        let ins_r = tree::tree_insert(&cx, 2, r2, &ekey, &val(50, 1), false);
+        assert!(
+            matches!(ins_r, Err(Fail::Corrupt(_))),
+            "(ii): the gated op must detect the damage (XX001), got {ins_r:?}"
+        );
+        let poisoned = world.lock().st.poisoned.clone();
+        assert!(
+            poisoned.is_some(),
+            "(ii): a read whose bytes fail 3.3 inside a gated op must poison the store (9.2/G8)"
+        );
+        // The next mutation — of the untouched tree — refuses.
+        let r3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        let ekey3 = tree::enc_ekey(&98u64.to_be_bytes(), 1);
+        let next = tree::tree_insert(&cx, 3, r3, &ekey3, &val(98, 1), false);
+        assert!(
+            matches!(next, Err(Fail::Poisoned(_))),
+            "(ii): every later mutation must refuse with Poisoned, got {next:?}"
+        );
+        let _ = poisoned;
+    }
+}
+
+/// **X-5c-F3-F1 step 3 pin, G-1 (the gate's exact patch at the replay
+/// walk's segment probe; §12.5's crash propagation).** The durable WAL
+/// spans two segments with an acked SyncOn commit in segment ≥ 1
+/// (segment 0: ts=1..4; segment 1: ts=5, synced — acked). A nested
+/// recovery crash is swept over every recovery yield `k` in `1..=120`;
+/// each fired point must **propagate** as `Err(Sim(Crashed))` — the
+/// nested-crash arm's retry — never as corruption or a silent stop, and
+/// the retry (life 2, after F-CRASH resolves at keep-latest 0) must
+/// recover the acked commit (`frontier == 5`). An unfired point (k past
+/// the life's yield total) must finish clean with the same frontier.
+#[test]
+fn replay_walk_probe_never_swallows_a_recovery_crash() {
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    let maxp = e4_recovery::store::wal::REC_MAX - fixed;
+    let seed = 6262u64;
+    let cfg = tcfg(8, 8, 1);
+    // The fixture: segment 0 ends in a SegmentEnd filler (ts=1..4 sized
+    // so ts=5 cannot fit the tail and hops), and segment 1 holds ts=5 —
+    // all durable, so ts=5 is the acked SyncOn commit in segment >= 1.
+    // (A record ending exactly at the segment boundary is avoided on
+    // purpose: §12.2's enqueuer allows it, but §12.5's reader can only
+    // hop on a decodable filler, so a boundary-exact fill makes the
+    // next segment unreachable — a §12.2/§12.5 silence recorded for P
+    // in this card's README, not a shape to build on.)
+    let (disk, _st) = create_store(cfg.clone(), seed, None);
+    let disk = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk,
+            st: _st,
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let _ = maxp;
+        for (ts, payload) in [(1u64, 16310usize), (2, 16310), (3, 16310), (4, 16336)] {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; payload])
+                .expect("enqueue seg0");
+        }
+        wal::wal_wait_durable(&cx, 65446).expect("seg0 durable");
+        let (lsn5, len5) =
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 5), 5, &[9u8; 10]).expect("enqueue seg1");
+        assert_eq!(
+            lsn5, seg,
+            "ts=5 must land in segment 1 (the filler hopped it)"
+        );
+        wal::wal_wait_durable(&cx, lsn5 + len5).expect("seg1 durable (the ack)");
+        let g = sched.lock();
+        assert_eq!(
+            g.st.wal.durable,
+            seg + fixed + 10,
+            "ts=5 is durable (acked)"
+        );
+        g.disk.clone()
+    };
+    for k in 1u64..=120 {
+        let mut d1 = disk.clone();
+        let life1 = {
+            let host = TestWorld {
+                sched: SchedCore::new(1, seed + k),
+                disk: d1.clone(),
+                st: StoreInner::empty(cfg.clone(), 0),
+                flags: BTreeMap::new(),
+            };
+            let world = Sched::new(host);
+            let cx = Cx {
+                w: &world,
+                t: HARNESS,
+            };
+            cx.with("g1:arm", |c| {
+                c.sched_mut().crash_at_yield = Some(k);
+                Ok(())
+            })
+            .expect("arm");
+            ckpt::recover(&cx, cfg.clone())
+        };
+        match life1 {
+            Err(Fail::Sim(SimFail::Crashed)) => {
+                // Propagated: the nested-crash arm's retry (F-CRASH at
+                // keep-latest 0, then a fresh recovery) must recover the
+                // acked commit.
+                let mut frng = e4_recovery::rng::Rng::new(seed + k);
+                d1.apply_crash(
+                    &mut frng,
+                    &e4_recovery::sim::FaultKnobs {
+                        keep_latest_pm: 0,
+                        tear_pm: 0,
+                    },
+                );
+                let host = TestWorld {
+                    sched: SchedCore::new(1, seed + k + 1),
+                    disk: d1.clone(),
+                    st: StoreInner::empty(cfg.clone(), 0),
+                    flags: BTreeMap::new(),
+                };
+                let world = Sched::new(host);
+                let cx = Cx {
+                    w: &world,
+                    t: HARNESS,
+                };
+                let (_st, frontier) = ckpt::recover(&cx, cfg.clone())
+                    .unwrap_or_else(|e| panic!("k={k}: the retry must recover: {e:?}"));
+                assert_eq!(frontier, 5, "k={k}: the acked commit must be recovered");
+            }
+            Ok((_st, frontier)) => {
+                assert_eq!(
+                    frontier, 5,
+                    "k={k}: an unfired point finishes clean with the acked commit"
+                );
+            }
+            other => panic!("k={k}: the crash must propagate as Sim(Crashed), got {other:?}"),
+        }
+    }
+}
+
+/// **X-5c-F3-F1 step 7 pin, C-XX sub-shape 1: the directory's identical
+/// re-put never appends a duplicate (§6.8; the B5 `pos` vs `pos − 1`
+/// deviation on the unversioned dir path).** `dir_put_locked` located
+/// the equal entry at `pos` — the first strictly-greater position —
+/// but an existing copy sits at `pos − 1`, so a directory put for an
+/// id the durable leaf already held (with the in-memory directory
+/// missing it — an interrupted drop's entry-removal step never landed)
+/// appended a **duplicate**: seed 151 r1's directory keys were
+/// `[1, 2, 3, 4, 4]`, and amcheck (ii) reported "dir: leaf keys out of
+/// order" plus the two-roots cascade ("child lpid N unmapped",
+/// "separators out of order", "lpid 38 reachable more than once"). The
+/// literal config: a store with tree 2; the in-memory directory entry
+/// removed (the interrupted drop's state); `dir_create_tree(2)` again —
+/// the durable directory leaf must hold exactly one entry for 2 and
+/// amcheck must stay clean. Reverting the fix (mutant M-CXXc: the
+/// `pos − 1` check removed) appends the duplicate and fails the pin.
+#[test]
+fn cxx_dir_reput_never_appends_a_duplicate() {
+    let seed = 7070u64;
+    let cfg = tcfg(8, 8, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, Some(2));
+    let sched = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // The interrupted drop's state: the durable leaf holds tree 2, the
+    // in-memory directory does not.
+    cx.with("pin7:forget", |c| {
+        c.store().dir.remove(&2);
+        Ok(())
+    })
+    .expect("forget");
+    tree::dir_create_tree(&cx, 2).expect("re-create tree 2");
+    let root = {
+        let g = sched.lock();
+        g.st.meta.dir_root
+    };
+    let keys = tree::raw_cells(&cx, root, false).expect("dir cells");
+    let twos = keys
+        .iter()
+        .filter(|(k, _)| k.as_slice() == 2u64.to_be_bytes().as_slice())
+        .count();
+    assert_eq!(
+        twos, 1,
+        "the directory leaf must hold exactly one entry for tree 2"
+    );
+    let findings = amcheck::amcheck(&cx, &cfg);
+    assert!(
+        findings.is_empty(),
+        "a directory re-put must never disorder the leaf (6.8): {findings:?}"
     );
 }

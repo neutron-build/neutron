@@ -205,6 +205,15 @@ pub struct Extracted {
     /// same way as [`Extracted::kept_slots`] against the end image's
     /// own meta and the (ii) taint.
     pub kept_slots_ii: BTreeSet<u64>,
+    /// **X5-R32 (a) 2:** the real round's own recovery reads — exactly
+    /// the harness's `recovery_reads`: the reads of the recovery life
+    /// whose result the round judges, on the `Ok` arm and the final
+    /// `Err` arm alike. It is the real round's, **never the twin's**;
+    /// `(file, offset, len)`.
+    pub recovery_reads: Vec<(usize, u64, u64)>,
+    /// **X5-R32 (a) 2:** the page-file inode id (which of
+    /// [`Extracted::recovery_reads`] are page reads).
+    pub page_file: usize,
 }
 
 /// Reads the recovered state for the oracle: the harness implements this
@@ -251,6 +260,12 @@ pub struct OracleCfg {
     /// exception then honours `rollback_slots` in MP whenever
     /// `meta_rollback` holds; must turn must-fail 13 green.
     pub no_meta_slot_cond: bool,
+    /// Remove X5-R32's damaged-referenced arm (the O-3 (c) exception for
+    /// a round whose XX001 sites are all explained by damaged,
+    /// referenced, recovery-read slots from the fault history). Exists
+    /// only for the load-bearing demonstration (`no_r32` turns the
+    /// must-pass case mp8 red).
+    pub no_r32: bool,
 }
 
 /// The media faults of the round, mapped to page-file slots or WAL ranges
@@ -275,6 +290,17 @@ pub struct FaultTargets {
     /// Both leave slot 1–2 with non-issued or reverted bytes, which is
     /// the only way a media fault can force open onto an older meta.
     pub meta_slot_fault: bool,
+    /// **X5-R32 (a) 1:** the page-file slots of every media fault
+    /// applied to this round's disk **before this round's own draw**
+    /// (`disk.media[..media_base]` in `harness::run_round`) — the
+    /// SimDisk's own applied-fault list, which the real chain's disk
+    /// carries from round to round. Each prior fault maps by
+    /// [`FaultTargets::page_slots`]'s rule (`off / 4096`, plus
+    /// `to_off / 4096` for a MISDIRECTED), and only for faults whose
+    /// inode is the page file. It is empty in round 0, in classes C and
+    /// MW (no page faults), and in every twin round (which applies no
+    /// media faults).
+    pub prior_page_slots: BTreeSet<u64>,
 }
 
 impl FaultTargets {
@@ -324,7 +350,26 @@ impl FaultTargets {
             page_slots,
             wal_ranges,
             meta_slot_fault,
+            prior_page_slots: BTreeSet::new(),
         }
+    }
+
+    /// **X5-R32 (a) 1:** fold the prior rounds' applied page faults into
+    /// the target set — `prior` is `disk.media[..media_base]` in
+    /// `harness::run_round` (this round's disk's applied-fault list
+    /// before this round's own draw), mapped by `page_slots`'s rule.
+    /// Called where the round's own targets are collected.
+    pub fn with_prior(mut self, prior: &[MediaFault], page_file: usize) -> Self {
+        for f in prior {
+            if f.inode != page_file {
+                continue;
+            }
+            self.prior_page_slots.insert(f.off / 4096);
+            if let MediaKind::Misdirected { to_off } = &f.kind {
+                self.prior_page_slots.insert(*to_off / 4096);
+            }
+        }
+        self
     }
 }
 
@@ -351,6 +396,13 @@ pub struct RoundVerdict {
     /// X5-R6: O-1 comparisons at the matched `c` satisfied by a detected
     /// loss (class MP only; reported beside the rule in RESULT item 7).
     pub o1_detected_loss: u32,
+    /// **X5-R32 (b):** the damaged-referenced arm fired — the O-3 (c)
+    /// twin rule would have failed the round, but every XX001 site is
+    /// explained by a damaged (`H`), referenced, non-kept slot the real
+    /// recovery read (or, for AmcheckI/Read23, by `D ≠ ∅`; for
+    /// AmcheckIi, by `D_ii ≠ ∅`). A diagnostic: the pass fold does not
+    /// read it. `false` in every other case.
+    pub r32: bool,
 }
 
 /// Run Work 2's checks for one round.
@@ -458,6 +510,9 @@ pub fn check_round(
     // ---- O-3 ----
     let mut o3_fail: Option<String> = None;
     let mut detections: Vec<XxSite> = Vec::new();
+    // X5-R32 (b): set by the damaged-referenced arm below; a diagnostic
+    // the pass fold never reads.
+    let mut r32 = false;
     if !cfg.no_taint && ex.served {
         o3_fail = Some("O-3(a): served corruption".to_owned());
     }
@@ -520,10 +575,88 @@ pub fn check_round(
                     }
                 }
                 if any_fault && all_uncovered {
-                    o3_fail = Some(
-                        "O-3(c): XX001 with every media fault on unread, unreferenced targets"
-                            .to_owned(),
-                    );
+                    // **X5-R32 (b): the damaged-referenced arm.** The
+                    // twin's sets are a failed stand-in for the real
+                    // round's when the damage is inherited: a slot the
+                    // disk's fault history damaged in a prior round,
+                    // the opened image references, and the real
+                    // recovery read. The definitions (computed from
+                    // SimDisk-derived inputs only — the fault history,
+                    // the harness walk, and the real recovery's reads;
+                    // never store memory, §3.3 or amcheck output):
+                    // - `H = faults.page_slots ∪ faults.prior_page_slots`;
+                    // - `D = { s ∈ ex.tainted_image_slots : s ∉ {0,1,2},
+                    //     s ∈ H, s ∉ ex.kept_slots }`;
+                    // - `D_ii` the same against the (ii) sets (empty
+                    //     unless `ex.amcheck_ii_ran`);
+                    // - `D_read` iff some `s ∈ D` has a read in the real
+                    //     recovery's reads on the page file overlapping
+                    //     `[s·4096, (s+1)·4096)`;
+                    // - the sites are `ex.xx001`, plus `Read23` when
+                    //     `lost_at_match > 0`.
+                    // A site is explained when: `Open`/`Replay` by
+                    // `D_read`; `AmcheckI`/`Read23` by `D ≠ ∅`;
+                    // `AmcheckIi` by `D_ii ≠ ∅`. In class MP with the
+                    // arm armed (`!cfg.no_r32`), a non-empty site list
+                    // all of whose sites are explained does **not**
+                    // fail O-3 (c) (`r32 = true`, a diagnostic the pass
+                    // fold never reads). Everything else — the `None`
+                    // branch, the twin's own sets and per-fault
+                    // referenced/read test, the WAL ranges, class MW,
+                    // X5-R6's `explained` rule, every other clause — is
+                    // unchanged.
+                    let r32_h: BTreeSet<u64> = faults
+                        .page_slots
+                        .union(&faults.prior_page_slots)
+                        .copied()
+                        .collect();
+                    let r32_d: BTreeSet<u64> = ex
+                        .tainted_image_slots
+                        .iter()
+                        .filter(|s| {
+                            !matches!(s, 0..=2) && r32_h.contains(s) && !ex.kept_slots.contains(s)
+                        })
+                        .copied()
+                        .collect();
+                    let r32_d_ii: BTreeSet<u64> = if ex.amcheck_ii_ran {
+                        ex.tainted_image_slots_ii
+                            .iter()
+                            .filter(|s| {
+                                !matches!(s, 0..=2)
+                                    && r32_h.contains(s)
+                                    && !ex.kept_slots_ii.contains(s)
+                            })
+                            .copied()
+                            .collect()
+                    } else {
+                        BTreeSet::new()
+                    };
+                    let r32_d_read = r32_d.iter().any(|s| {
+                        ex.recovery_reads.iter().any(|(f, off, len)| {
+                            *f == ex.page_file && *off < (s + 1) * 4096 && off + len > s * 4096
+                        })
+                    });
+                    let mut r32_sites: Vec<XxSite> = ex.xx001.clone();
+                    if lost_at_match > 0 && !r32_sites.contains(&XxSite::Read23) {
+                        r32_sites.push(XxSite::Read23);
+                    }
+                    let r32_explained = |site: &XxSite| match site {
+                        XxSite::Open | XxSite::Replay => r32_d_read,
+                        XxSite::AmcheckI | XxSite::Read23 => !r32_d.is_empty(),
+                        XxSite::AmcheckIi => !r32_d_ii.is_empty(),
+                    };
+                    let r32_applies = class == FaultClass::Mp
+                        && !cfg.no_r32
+                        && !r32_sites.is_empty()
+                        && r32_sites.iter().all(r32_explained);
+                    if r32_applies {
+                        r32 = true;
+                    } else {
+                        o3_fail = Some(
+                            "O-3(c): XX001 with every media fault on unread, unreferenced targets"
+                                .to_owned(),
+                        );
+                    }
                 }
             }
             None => {
@@ -717,6 +850,7 @@ pub fn check_round(
         pass,
         acked_lost,
         o1_detected_loss: lost_at_match,
+        r32,
     }
 }
 
