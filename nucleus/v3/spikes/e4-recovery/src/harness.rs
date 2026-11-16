@@ -26,8 +26,8 @@ use crate::oracle::{
 };
 use crate::rng::{Rng, derive};
 use crate::sim::{
-    DiskEvent, FaultClass, FaultKnobs, HARNESS, MediaFault, Sched, SchedCore, SchedHost, SimDisk,
-    SimFail, TaskId, WaitKey,
+    DiskEvent, FaultClass, FaultKnobs, HARNESS, MediaFault, MediaKind, Sched, SchedCore, SchedHost,
+    SimDisk, SimFail, TaskId, WaitKey,
 };
 use crate::store::ckpt::{self, CkptHook};
 use crate::store::tree;
@@ -434,6 +434,9 @@ pub fn commit_txn(
     loop {
         let taken = cx.with("h:cs", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the mark is in the commit critical section
+            // wait's predicate (the park below holds one baton with it).
+            st.alive()?;
             if st.seq.commit_cs {
                 Ok(false)
             } else {
@@ -714,6 +717,8 @@ fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
     loop {
         let advanced = cx.with("h:vis", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the ts-order turn's wait carries the mark.
+            st.alive()?;
             let mut advanced = false;
             while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
                 st.seq.visible_ts += 1;
@@ -977,9 +982,12 @@ fn run_task(
                             Ok(())
                         })
                         .ok();
-                        cx.w.wake(WaitKey::WalAcks);
-                        cx.w.wake(WaitKey::MetaDurable);
-                        cx.w.wake(WaitKey::Applied);
+                        // **X-5c-F3-F3b step 3 (d):** the poisoner's
+                        // exit wakes **every** wait key with a parked
+                        // task (the G8 broadcast — the old three-key
+                        // wake left Pin/Tree/Gate waiters parked; the
+                        // mark in their predicates now returns them).
+                        store_poison_broadcast(&cx);
                     }
                     return Err(match e {
                         Fail::Sim(s) => s,
@@ -1144,12 +1152,62 @@ pub fn gc_sweep(cx: &Cx<'_, RoundWorld>, t: u64, w: Option<u64>) -> Result<(), F
         let Some(root) = root else {
             return Ok(());
         };
-        let next = tree::gc_step(cx, t, root, w, &resume)?;
+        let next = match tree::gc_step(cx, t, root, w, &resume) {
+            Ok(n) => n,
+            Err(e) => {
+                // **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3
+                // (a)):** a background store job's step — the GC sweep
+                // — poisons the store on a non-crash failure, marked
+                // before the sweep's remaining state unwinds (each
+                // `gc_step` releases its own latches on exit; a sim
+                // crash is never a poison), and the G8 (d) broadcast
+                // wakes every parked waiter once it has.
+                if !matches!(e, Fail::Sim(_)) {
+                    cx.with("h:gcpois", |c| {
+                        let st = c.store();
+                        if st.poisoned.is_none() {
+                            st.poisoned =
+                                Some(format!("gc sweep of tree {t} failed: {e} (9.2, G8)"));
+                        }
+                        Ok(())
+                    })
+                    .ok();
+                    store_poison_broadcast(cx);
+                }
+                return Err(e);
+            }
+        };
         if next.is_empty() {
             return Ok(());
         }
         resume = next;
         cx.yield_now("h:gcyield")?;
+    }
+}
+
+/// **X-5c-F3-F3b step 3 (d): the harness-side G8 broadcast** — wake
+/// every wait key that has a parked task (the fixed keys plus every
+/// held tree's), the same set [`crate::store::prims::poison_broadcast`]
+/// wakes, for the poison sites on harness paths (the GC sweep, the
+/// script-op error exit below).
+fn store_poison_broadcast(cx: &Cx<'_, RoundWorld>) {
+    let trees: Vec<u64> = cx
+        .with("h:bcast", |c| {
+            Ok(c.store().tree_mu.keys().copied().collect::<Vec<u64>>())
+        })
+        .unwrap_or_default();
+    for key in [
+        WaitKey::WalAcks,
+        WaitKey::Applied,
+        WaitKey::MetaDurable,
+        WaitKey::Pin,
+        WaitKey::GateShared,
+        WaitKey::GateFlip,
+    ] {
+        cx.w.wake(key);
+    }
+    for t in trees {
+        cx.w.wake(WaitKey::Tree(t));
     }
 }
 
@@ -1241,6 +1299,9 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
 fn wait_ckpt(cx: &Cx<'_, RoundWorld>) -> Result<(), Fail> {
     loop {
         let (pending, open) = cx.with("h:ckptw", |c| {
+            // G8 (9.2, W8): the bulk-load publication wait's predicate
+            // carries the mark.
+            c.store().alive()?;
             let h = c.h();
             Ok((h.force_ckpt, c.store().ckpt_open))
         })?;
@@ -1263,6 +1324,11 @@ fn writer_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
                 if c.sched_mut().crashed {
                     return Ok(false);
                 }
+                // G8 (9.2, W8 (e)): nothing is written after the mark —
+                // the writer checks `alive()` before each turn.
+                if c.store().poisoned.is_some() {
+                    return Ok(false);
+                }
                 Ok(!c.store().wal.buf.is_empty())
             })
             .map_err(fail_of)?;
@@ -1283,7 +1349,9 @@ fn writer_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
 fn evictor_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
     loop {
         let crashed = cx
-            .with("h:ev", |c| Ok(c.sched_mut().crashed))
+            .with("h:ev", |c| {
+                Ok(c.sched_mut().crashed || c.store().poisoned.is_some())
+            })
             .map_err(fail_of)?;
         if crashed {
             return Ok(());
@@ -1313,7 +1381,9 @@ fn checkpointer_body(
     loop {
         let (trigger, final_ckpt) = cx
             .with("h:ck", |c| {
-                if c.sched_mut().crashed {
+                if c.sched_mut().crashed || c.store().poisoned.is_some() {
+                    // G8 (9.2, W8 (e)): the checkpointer issues no step
+                    // after the mark.
                     return Ok((true, true));
                 }
                 let h = c.h();
@@ -1596,6 +1666,26 @@ pub struct RoundOutcome {
     /// diagnostic in the record (`run` writes it, `verify` parses it);
     /// the pass fold reads it only through the round's task error.
     pub ack_over: Vec<u64>,
+    /// **S-1-F3 §14 step 3a (W6 (ii); X-5c-F3-F3b step 2):** the
+    /// round's recovery `Err` is I-WAL-COVER's refusal — a typed match
+    /// on `Fail::WalLoss`, never a text match. The XX001 site stays
+    /// `Open` (X5-R11) and the seed ends at that round, as for any
+    /// recovery `Err`. A diagnostic in the record; the pass fold does
+    /// not read it.
+    pub cover_err: bool,
+    /// **X5-R33 (a):** the round's own life of the record stream — the
+    /// driver carries it into the next round's supply. `None` on twin
+    /// and probe rounds.
+    pub x33_life: Option<X33Life>,
+    /// **X5-R33 (c): `h`** — the opened meta's writing-life bound (the
+    /// record's `x33h` diagnostic; never an oracle input beyond
+    /// `Extracted::mw_h`).
+    pub x33h: u64,
+    /// **X5-R33 (c): `a`** — the round's largest X5-R34-acked SyncOn ts
+    /// below the first damaged WAL byte (the record's `x33a`).
+    pub x33a: u64,
+    /// **X5-R33 (e): `wal_loss_explained`** (the record's `x33x`).
+    pub x33x: bool,
 }
 
 impl Default for RoundOutcome {
@@ -1651,6 +1741,11 @@ impl Default for RoundOutcome {
             kept_slots: BTreeSet::new(),
             kept_slots_ii: BTreeSet::new(),
             ack_over: Vec::new(),
+            cover_err: false,
+            x33_life: None,
+            x33h: 0,
+            x33a: 0,
+            x33x: false,
         }
     }
 }
@@ -1836,9 +1931,223 @@ pub struct WorkloadObs {
     pub ckpt_hooks_hit: Vec<u16>,
 }
 
+// ---- X5-R33 (binding, pre-registered): the harness supply ----
+
+/// **X5-R33 (a)/(b):** one life of the per-seed record stream — the
+/// Commit/CommitMarker records `(lsn, len, ts)` one round's workload
+/// appended, beside the life's truncation point (`p0`, X5-R34's), its
+/// boot id, the frontier it started from, and its append position at
+/// the crash or end. Carried across rounds by the seed driver like the
+/// model; never store memory (the positions come from `wal_commits` and
+/// the store's append snapshot alone).
+#[derive(Debug, Clone, Default)]
+pub struct X33Life {
+    /// The life's truncation point (the LSN it began appending at).
+    pub p0: u64,
+    /// This life's own `Commit`/`CommitMarker` records.
+    pub records: Vec<(u64, u64, u64)>,
+    /// The boot id the life's metas carry.
+    pub boot: u32,
+    /// The frontier the life started from.
+    pub started_frontier: u64,
+    /// The append position at the life's crash or end.
+    pub append_end: u64,
+}
+
+/// **X5-R33 (b): the stream as it stood at a life's start** — for each
+/// earlier life, its records below the lowest truncation point of every
+/// later life up to it (`p0_i`); a record a later truncation superseded
+/// never belongs to it.
+pub fn x33_start_log(lives: &[X33Life], i: usize) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    let p0 = lives.get(i).map(|l| l.p0).unwrap_or(0);
+    for (j, l) in lives.iter().enumerate() {
+        if j >= i {
+            break;
+        }
+        // The lowest truncation point of every later life up to i:
+        // min(p0_{j+1} ..= p0_i).
+        let mut floor = p0;
+        for k in (j + 1)..=i {
+            if let Some(pk) = lives.get(k).map(|lk| lk.p0) {
+                floor = floor.min(pk);
+            }
+        }
+
+        for r in l.records.iter() {
+            if r.0 < floor {
+                out.push(*r);
+            }
+        }
+    }
+    out
+}
+
+/// **X5-R33 (c): `h`** — the largest ts whose Commit/CommitMarker record
+/// lies wholly below `w` (`lsn + len ≤ w`), in the stream as it stood
+/// when the meta carrying `w` was written: the writing life's start log
+/// plus its own records. 0 when none.
+pub fn x33_h_of(lives: &[X33Life], i: usize, w: u64) -> u64 {
+    let mut best = 0u64;
+    if let Some(l) = lives.get(i) {
+        for (lsn, len, ts) in l.records.iter() {
+            if lsn + len <= w {
+                best = best.max(*ts);
+            }
+        }
+    }
+    for (lsn, len, ts) in x33_start_log(lives, i).iter() {
+        if lsn + len <= w {
+            best = best.max(*ts);
+        }
+    }
+    best
+}
+
+/// **X5-R33 (c): the damaged WAL LSN ranges of the round** — this
+/// round's media faults (and MISDIRECTED stray destinations) on WAL
+/// inodes, mapped to absolute LSNs through the first LSN of the segment
+/// name bound to the target inode at the crash (the current view of the
+/// crashed disk). Empty when the round damaged no WAL byte.
+pub fn x33_damaged_ranges(
+    disk: &SimDisk,
+    round_media: &[MediaFault],
+    page_file: usize,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let wal_files = disk.list_dir(crate::sim::WAL_DIR);
+    for f in round_media.iter() {
+        if f.inode == page_file {
+            continue;
+        }
+        // The segment name bound to the target inode at the crash.
+        let Some(first) = wal_files.iter().find(|(_, fid)| *fid == f.inode) else {
+            continue;
+        };
+        let Ok(seg_first) = u64::from_str_radix(first.0.trim_end_matches(".log"), 16) else {
+            continue;
+        };
+        out.push((seg_first + f.off, seg_first + f.off + f.len));
+        if let MediaKind::Misdirected { to_off } = &f.kind {
+            out.push((seg_first + to_off, seg_first + to_off + f.len));
+        }
+    }
+    out
+}
+
+/// **X5-R33 (c): `a`** — the largest X5-R34-acked SyncOn ts whose
+/// record ends at or below the first damaged WAL byte; with no damaged
+/// WAL byte, the round's largest acked SyncOn ts.
+pub fn x33_a_of(
+    acked: &[u64],
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    damaged: &[(u64, u64)],
+) -> u64 {
+    let first_damaged = damaged.iter().map(|&(a, _)| a).min();
+    let mut best = 0u64;
+    for ts in acked.iter() {
+        let Some(&(sync_on, lsn, len)) = wal_commits.get(ts) else {
+            continue;
+        };
+        if !sync_on {
+            continue;
+        }
+        match first_damaged {
+            Some(d) if lsn + len > d => continue,
+            _ => {}
+        }
+        best = best.max(*ts);
+    }
+    best
+}
+
+/// **X5-R33 (e): `wal_loss_explained`** — some damaged WAL LSN lies in
+/// `[wal_start_lsn, wal_ckpt_end)` of the opened meta.
+pub fn x33_explained(damaged: &[(u64, u64)], start: u64, end: u64) -> bool {
+    damaged.iter().any(|&(a, b)| a < end && b > start)
+}
+
+/// **X5-R33 (d): the harness cross-check over one meta write.** Returns
+/// the mismatch text, or `None`. `expected` names the derived values in
+/// the failure text. The four bounds (the gate's G4 (c) form):
+/// 1. no Commit/CommitMarker record that the writing life appended
+///    straddles `w`;
+/// 2. every such record with ts `≤ T` ends at or below `w`;
+/// 3. `w` is at or below that life's append position at its crash or
+///    end;
+/// 4. `t_hi` is the largest ts among that life's records ending at or
+///    below `w`, or, if there is none, the frontier the writing life
+///    started from.
+pub fn x33_cross_check_meta(
+    ckpt_id: u64,
+    w: u64,
+    t_hi: u64,
+    t: u64,
+    life: &X33Life,
+    start_log: Vec<(u64, u64, u64)>,
+) -> Option<String> {
+    // The first violated bound is the reported one (deterministic).
+    let mut why = String::new();
+    let mut note = |w_: String| {
+        if why.is_empty() {
+            why = w_;
+        }
+    };
+    for (lsn, len, ts) in life.records.iter().chain(start_log.iter()) {
+        let end = lsn + len;
+        if *lsn < w && end > w {
+            note(format!("record [{lsn},{end}) straddles wal_ckpt_end"));
+        }
+        if *ts <= t && end > w {
+            note(format!(
+                "record ts {ts} <= T={t} ends at {end} above wal_ckpt_end"
+            ));
+        }
+    }
+    if w > life.append_end {
+        note(format!(
+            "wal_ckpt_end {w} above the life's append {}",
+            life.append_end
+        ));
+    }
+    let want_hi = life
+        .records
+        .iter()
+        .filter(|(lsn, len, _)| lsn + len <= w)
+        .map(|(_, _, ts)| *ts)
+        .max();
+    let expect_hi = want_hi.unwrap_or(life.started_frontier);
+    if t_hi != expect_hi {
+        note(format!("ts_ckpt_hi {t_hi} != expected {expect_hi}"));
+    }
+    if why.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "X5-R33 cross-check: meta {ckpt_id} wal_ckpt_end {w} / ts_ckpt_hi {t_hi} vs {why}"
+        ))
+    }
+}
+
 /// Run one round: workload → crash → faults → recovery (nested crashes)
 /// → extraction → oracle → monitors → the harness checkpoint. Returns
 /// the outcome; the end state feeds the next round.
+/// The X5-R33 supply a real round receives: the seed's earlier lives
+/// (immutable; the round's own life is returned through the outcome for
+/// the driver to carry), and the frontier this round's boot started
+/// from (the previous round's recovery frontier; 0 in round 0). Twin
+/// and probe rounds pass `None`.
+#[derive(Default)]
+pub struct X33In<'a> {
+    /// The seed's earlier lives, in round order.
+    pub lives: &'a [X33Life],
+    /// The current boot's starting frontier.
+    pub started_frontier: u64,
+}
+
+/// Run one round: workload → crash → faults → recovery (nested
+/// crashes) → extraction → oracle → monitors → the harness checkpoint.
+/// Returns the outcome; the end state feeds the next round.
 #[allow(clippy::too_many_arguments)]
 pub fn run_round(
     seed: u64,
@@ -1851,6 +2160,7 @@ pub fn run_round(
     model: &Model,
     c_prev: u64,
     mut twin: Option<&mut Vec<(usize, u64, u64)>>,
+    x33: Option<&X33In<'_>>,
 ) -> RoundOutcome {
     // ---- the workload pass ----
     // **X5-R35 (a):** the event count the incoming disk carries is the
@@ -1980,6 +2290,9 @@ pub fn run_round(
             g.h.client_acked.clone(),
         )
     };
+    // X5-R33 (a): the workload life's append position at its end
+    // (snapshotted with the workload's other observables).
+    let append_end = sched.lock().st.wal.append;
     if faults.probe_pass {
         // The counting pass (the uniform crash's address-space measure):
         // the workload's yield total and the crash-time observables are
@@ -2138,11 +2451,11 @@ pub fn run_round(
             eprintln!("ACK diag:   events[seg0]: {}", ev.unwrap_or_default());
         }
     }
-    for ts in written_ts {
-        model.mark_written(ts);
+    for ts in written_ts.iter() {
+        model.mark_written(*ts);
     }
-    for ts in acked_ts {
-        model.mark_acked(ts);
+    for ts in acked_ts.iter() {
+        model.mark_acked(*ts);
     }
     // The F1 loud half: a commit whose record bytes were written yet can
     // never parse is a harness/store defect (only an over-cap enqueue
@@ -2371,6 +2684,10 @@ pub fn run_round(
     // compare, and an "XX001 at Open" would claim a detection that never
     // happened. The round fails through the deadlock fold.
     let mut recovery_livelock: Option<&'static str> = None;
+    // X-5c-F3-F3b step 2 (c): set by the recovery loop's final Err arm
+    // (a typed match); read into the outcome below.
+    #[allow(unused_assignments)]
+    let mut cover_err_outcome = false;
     // Every exit of the loop below assigns this before it is read (the
     // Ok arm and the final Err arm both collect the attempt's reads);
     // the initializer only satisfies the borrow checker.
@@ -2466,6 +2783,9 @@ pub fn run_round(
                 continue;
             }
             Err(e) => {
+                // **X-5c-F3-F3b step 2 (c):** the round field is a typed
+                // match on I-WAL-COVER's refusal, never a text match.
+                cover_err_outcome = matches!(e, Fail::WalLoss { .. });
                 let g = world.lock();
                 if g.sched.livelock {
                     recovery_livelock = Some(g.sched.livelock_site);
@@ -2574,6 +2894,99 @@ pub fn run_round(
         if matches!(r5_anchor(&disk, pf, opened.ckpt_id, &events), Some((_, 0)))
             && r5_anchor0_defect(&events, pf).is_some());
 
+    // ---- X5-R33: the round's supply (SimDisk history and the model's
+    // record positions only; wal_ckpt_end/ts_ckpt_hi are read from the
+    // meta bytes on SimDisk, never from store memory) ----
+    let x33_damaged = x33_damaged_ranges(&disk, &round_media, pf0);
+    let x33_a = x33_a_of(&acked_ts, &wal_commits, &x33_damaged);
+    let x33_recovered_frontier = match &recovery {
+        Ok((_, f, _)) => Some(*f),
+        _ => None,
+    };
+    let mut x33_cross: Vec<String> = Vec::new();
+    if let Some(in33) = x33 {
+        // The round's own life (the driver appends it after this round).
+        let cur = X33Life {
+            p0,
+            records: wal_commits
+                .iter()
+                .map(|(ts, &(_, lsn, len))| (lsn, len, *ts))
+                .collect(),
+            boot: start_store.boot_id,
+            started_frontier: in33.started_frontier,
+            append_end,
+        };
+        let mut lives: Vec<X33Life> = in33.lives.to_vec();
+        lives.push(cur);
+        // The cross-check over every meta the store wrote on this
+        // round's disk (every meta-slot DWrite whose bytes parse).
+        let dw = disk.dwrites_of(pf);
+        let mut metas: Vec<(u32, u64, u64, u64, u64)> = Vec::new();
+        for w in dw.iter() {
+            if w.off != 4096 && w.off != 8192 {
+                continue;
+            }
+            if let Ok(m) = crate::store::page::parse_meta(&w.bytes) {
+                metas.push((m.boot_id, m.wal_ckpt_end, m.ts_ckpt_hi, m.t, m.ckpt_id));
+            }
+        }
+        // One check per distinct meta write (same bytes, same verdict).
+        metas.dedup();
+        let mut seen = std::collections::BTreeSet::new();
+        for (boot, w, t_hi, t, ckpt_id) in metas.iter() {
+            if !seen.insert((*boot, *w, *t_hi, *t)) {
+                continue;
+            }
+            // The writing life by boot id: this round's workload metas
+            // (the current boot), meta 0 (the create session's virtual
+            // life), a past life's metas, or — the Ok arm's harness
+            // checkpoint — the recovered boot, whose "life" begins at
+            // this meta's own wal_ckpt_end with no records and the
+            // recovered frontier (the same truncation point the next
+            // round starts from).
+            let writing: X33Life;
+            let widx: Option<usize>;
+            // Round 0's workload runs on the created store (boot 0), so
+            // the current-boot match comes first; a boot-0 meta that is
+            // not the current life's is the create session's own (meta
+            // 0, whose w = 0 passes every bound under either life).
+            if *boot == start_store.boot_id {
+                widx = Some(lives.len() - 1);
+                writing = lives.last().cloned().unwrap_or_default();
+            } else if let Some(i) = lives.iter().position(|l| l.boot == *boot) {
+                widx = Some(i);
+                writing = lives[i].clone();
+            } else if *boot == 0 {
+                widx = None;
+                writing = X33Life {
+                    p0: 0,
+                    records: Vec::new(),
+                    boot: 0,
+                    started_frontier: 0,
+                    append_end: 0,
+                };
+            } else {
+                // The recovered boot's harness checkpoint (the Ok arm's
+                // only other boot; unknown boots on faulted metas are
+                // skipped — their bytes were judged by open). Its life
+                // begins at this meta's own wal_ckpt_end with no
+                // records, and the frontier this round's recovery found.
+                widx = None;
+                writing = X33Life {
+                    p0: *w,
+                    records: Vec::new(),
+                    boot: *boot,
+                    started_frontier: x33_recovered_frontier.unwrap_or(*w),
+                    append_end: *w,
+                };
+            }
+            let start_log = widx.map(|i| x33_start_log(&lives, i)).unwrap_or_default();
+            if let Some(text) = x33_cross_check_meta(*ckpt_id, *w, *t_hi, *t, &writing, start_log) {
+                x33_cross.push(text);
+            }
+        }
+    }
+
     // ---- the extraction and the oracle ----
     let mut sample_rng = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
     // X5-R30 (a): served_k, set by the arms that judge the round (the
@@ -2594,6 +3007,12 @@ pub fn run_round(
     let mut smx_flag = false;
     #[allow(unused_assignments)]
     let mut pass_na_flag: Option<bool> = None;
+    // X5-R33 (c): the round's mw_h / wal_loss_explained, set by both
+    // verdict arms (the record's diagnostics).
+    #[allow(unused_assignments)]
+    let mut x33_h_of_outcome = 0u64;
+    #[allow(unused_assignments)]
+    let mut x33_explained_of_outcome = false;
     let mut outcome = RoundOutcome {
         class: faults.class,
         deadlock: flags.0,
@@ -2617,6 +3036,10 @@ pub fn run_round(
             outcome.livelock = true;
             outcome.livelock_site = site;
             outcome.o1 = Err(format!("recovery livelock at {site}"));
+            // X5-R33 (d): a cross-check mismatch is a store failure.
+            if !x33_cross.is_empty() && outcome.task_error.is_none() {
+                outcome.task_error = Some(x33_cross[0].clone());
+            }
             outcome.pass = fold_pass(
                 false,
                 outcome.task_error.as_deref(),
@@ -2779,6 +3202,49 @@ pub fn run_round(
                 },
             };
             let twin_ref = (twin.is_some() || faults.twin_supply.is_some()).then_some(&twin_info);
+            // **X5-R33 (c)/(e): the round's mw_h / wal_loss_explained**
+            // — read from the opened meta's bytes on SimDisk (never
+            // store memory), attributed to the writing life by boot id.
+            if let Some(in33) = x33 {
+                let mut lives: Vec<X33Life> = in33.lives.to_vec();
+                lives.push(X33Life {
+                    p0,
+                    records: wal_commits
+                        .iter()
+                        .map(|(ts, &(_, lsn, len))| (lsn, len, *ts))
+                        .collect(),
+                    boot: start_store.boot_id,
+                    started_frontier: in33.started_frontier,
+                    append_end,
+                });
+                if let Some(om) = &opened_meta {
+                    ex.mw_h = match lives.iter().position(|l| l.boot == om.boot_id) {
+                        Some(i) => x33_h_of(&lives, i, om.wal_ckpt_end),
+                        None => {
+                            // The harness checkpoint's own boot: no
+                            // records of its life exist yet; the stream
+                            // below its wal_ckpt_end is the start log of
+                            // the life that begins there (the recovered
+                            // frontier's life — the next round's).
+                            let start = lives.len();
+                            let mut with_next = lives.clone();
+                            with_next.push(X33Life {
+                                p0: om.wal_ckpt_end,
+                                records: Vec::new(),
+                                boot: om.boot_id,
+                                started_frontier: frontier,
+                                append_end: om.wal_ckpt_end,
+                            });
+                            x33_h_of(&with_next, start, om.wal_ckpt_end)
+                        }
+                    };
+                    ex.wal_loss_explained =
+                        x33_explained(&x33_damaged, om.wal_start_lsn, om.wal_ckpt_end);
+                }
+                ex.mw_a = x33_a;
+                x33_h_of_outcome = ex.mw_h;
+                x33_explained_of_outcome = ex.wal_loss_explained;
+            }
             // The oracle check on the recovered image (the card's Work
             // 13 order: extraction, oracle, harness checkpoint). The
             // (ii) fields are unset in this pass — G4's harness
@@ -3060,6 +3526,10 @@ pub fn run_round(
             // PANIC or an S-BATON violation is never a pass (card "Do
             // not"; the gate's minor finding: the draft ignored
             // `deadlock` and `panicked` here).
+            // X5-R33 (d): a cross-check mismatch is a store failure.
+            if !x33_cross.is_empty() && outcome.task_error.is_none() {
+                outcome.task_error = Some(x33_cross[0].clone());
+            }
             outcome.pass = fold_pass(
                 verdict.pass,
                 outcome.task_error.as_deref(),
@@ -3135,6 +3605,9 @@ pub fn run_round(
             }
             let mut ex = Extracted {
                 ok: false,
+                // X5-R33: the recovery Err is I-WAL-COVER's refusal
+                // (a typed match — the same predicate as cover_err).
+                wal_loss: cover_err_outcome,
                 xx001: vec![XxSite::Open],
                 served: !served_ranges.is_empty() || r_taint_err,
                 amcheck_i: amcheck_i.clone(),
@@ -3179,6 +3652,59 @@ pub fn run_round(
             };
             let twin_on =
                 faults.class != FaultClass::C && (twin.is_some() || faults.twin_supply.is_some());
+            // **X5-R33 (c)/(e) on the failed-recovery arm** — the opened
+            // meta read from the last recovery attempt's disk (the meta
+            // open tried to select), never store memory.
+            if let Some(in33) = x33 {
+                let mut lives: Vec<X33Life> = in33.lives.to_vec();
+                lives.push(X33Life {
+                    p0,
+                    records: wal_commits
+                        .iter()
+                        .map(|(ts, &(_, lsn, len))| (lsn, len, *ts))
+                        .collect(),
+                    boot: start_store.boot_id,
+                    started_frontier: in33.started_frontier,
+                    append_end,
+                });
+                let (om, _unused) = read_opened_meta(&recovery_disk);
+                if std::env::var("E4_X33_DIAG").is_ok() {
+                    eprintln!(
+                        "X33 diag: seed={seed} round={round} ERR arm: damaged={:?} om={:?}",
+                        x33_damaged,
+                        om.as_ref().map(|m| (
+                            m.ckpt_id,
+                            m.boot_id,
+                            m.wal_start_lsn,
+                            m.wal_ckpt_end,
+                            m.t,
+                            m.ts_ckpt_hi
+                        ))
+                    );
+                }
+                if let Some(om) = &om {
+                    ex.mw_h = match lives.iter().position(|l| l.boot == om.boot_id) {
+                        Some(i) => x33_h_of(&lives, i, om.wal_ckpt_end),
+                        None => {
+                            let start = lives.len();
+                            let mut with_next = lives.clone();
+                            with_next.push(X33Life {
+                                p0: om.wal_ckpt_end,
+                                records: Vec::new(),
+                                boot: om.boot_id,
+                                started_frontier: 0,
+                                append_end: om.wal_ckpt_end,
+                            });
+                            x33_h_of(&with_next, start, om.wal_ckpt_end)
+                        }
+                    };
+                    ex.wal_loss_explained =
+                        x33_explained(&x33_damaged, om.wal_start_lsn, om.wal_ckpt_end);
+                }
+                ex.mw_a = x33_a;
+                x33_h_of_outcome = ex.mw_h;
+                x33_explained_of_outcome = ex.wal_loss_explained;
+            }
             let verdict = check_round(
                 &model,
                 faults.class,
@@ -3224,6 +3750,10 @@ pub fn run_round(
             outcome.smx = smx_flag;
             outcome.pass_na = pass_na_flag;
             outcome.kept_slots = kept_slots.clone();
+            // X5-R33 (d): a cross-check mismatch is a store failure.
+            if !x33_cross.is_empty() && outcome.task_error.is_none() {
+                outcome.task_error = Some(x33_cross[0].clone());
+            }
             outcome.pass = fold_pass(
                 verdict.pass,
                 outcome.task_error.as_deref(),
@@ -3257,6 +3787,24 @@ pub fn run_round(
     // X5-R34 (f): the cross-check's record field (the task error above
     // already fails any non-empty list through the pass fold).
     outcome.ack_over = ack_over;
+    // X-5c-F3-F3b step 2 (c): I-WAL-COVER's refusal on the recovery Err
+    // arm (a typed match; the livelock arm leaves it false).
+    outcome.cover_err = cover_err_outcome;
+    // X5-R33 (a): the round's own life, for the driver to carry.
+    outcome.x33_life = x33.map(|in33| X33Life {
+        p0,
+        records: wal_commits
+            .iter()
+            .map(|(ts, &(_, lsn, len))| (lsn, len, *ts))
+            .collect(),
+        boot: start_store.boot_id,
+        started_frontier: in33.started_frontier,
+        append_end,
+    });
+    // X5-R33 (c): the record's diagnostics.
+    outcome.x33h = x33_h_of_outcome;
+    outcome.x33a = x33_a;
+    outcome.x33x = x33_explained_of_outcome;
     // ---- the monitors (3.10), from disk events and parsed WAL bytes ----
     {
         let g = sched.lock();

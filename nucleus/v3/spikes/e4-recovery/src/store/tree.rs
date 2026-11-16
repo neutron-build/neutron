@@ -225,6 +225,13 @@ pub fn tree_insert<H: StoreHost>(
     drop(pins);
     tree_unlock(cx, tree_mu);
     gate_release(cx);
+    // **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3 (d)):** on the
+    // error exit every latch, pin and the gate are released above — the
+    // poisoner broadcasts now (a no-op unless the failure marked the
+    // store; a read-path XX001 never does, G-2).
+    if r.is_err() {
+        super::prims::poison_broadcast(cx);
+    }
     r
 }
 
@@ -1341,7 +1348,23 @@ pub fn resume_drops<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Vec<u64>, Fail> {
             .collect())
     })?;
     for id in ids.iter().copied() {
-        dir_drop_tree(cx, id)?;
+        if let Err(e) = dir_drop_tree(cx, id) {
+            // **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3 (a)):**
+            // a background store job's step — the drop walk — poisons
+            // the store on a non-crash failure, marked here before the
+            // unwinding below releases anything the walk still holds
+            // (a sim crash is never a poison).
+            if !matches!(e, Fail::Sim(_)) {
+                let _ = cx.with("resume_drops:poison", |c| {
+                    let st = c.store();
+                    if st.poisoned.is_none() {
+                        st.poisoned = Some(format!("drop walk of tree {id} failed: {e} (9.2, G8)"));
+                    }
+                    Ok(())
+                });
+            }
+            return Err(e);
+        }
     }
     Ok(ids)
 }

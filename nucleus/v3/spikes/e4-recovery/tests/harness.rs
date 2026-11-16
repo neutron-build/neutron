@@ -17,6 +17,7 @@ fn cfg(mutant: Option<Mutant>) -> StoreCfg {
         pool_frames: 12,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn round_digest_is_deterministic() {
             &model,
             0,
             None,
+            None,
         );
         digests.push(outcome.digest);
     }
@@ -152,6 +154,7 @@ fn class_c_round_passes() {
         st,
         &model,
         0,
+        None,
         None,
     );
     assert!(
@@ -742,6 +745,7 @@ fn r11a_amcheck_reaches_a_torn_leaf_under_an_inner_page() {
         &Model::new(),
         0,
         None,
+        None,
     );
     assert!(
         base.pass,
@@ -945,6 +949,7 @@ fn r13b_livelock_budget_trips_and_folds_into_deadlock() {
         &Model::new(),
         0,
         None,
+        None,
     );
     assert!(out.livelock, "the round must record the livelock");
     assert!(
@@ -1024,6 +1029,7 @@ fn cxx_a_crash_at_any_recovery_yield_is_never_corruption() {
             &Model::new(),
             0,
             None,
+            None,
         );
         assert!(
             out.obs.crash_fired,
@@ -1087,15 +1093,22 @@ fn r30_skx_and_smx_record_fields() {
             "seed {seed} r0: the no-taint re-verdict"
         );
     }
-    // 6149 r1: not served after the SegmentEnd fix — both predicates
-    // false and `pass_na` null (recorded only when served).
+    // 6149: not served after the SegmentEnd fix — both predicates false
+    // and `pass_na` null (recorded only when served). **Seed-shape
+    // maintenance (F3-F1's accepted rule; X-5c-F3-F3b steps 1–2):** the
+    //Assertions are unchanged; the round index moved from 1 to 0 —
+    // step 1's meta-format change moved the workload, the round-0
+    // recovery now ends at I-WAL-COVER's refusal (`cover_err`, a
+    // passing detection), and the chain stops there, so the old r1
+    // index fails only at its shape precondition (an index out of
+    // bounds), exactly as the rule describes.
     let rec = e4_recovery::workload::run_seed(6149, None);
-    let r = &rec.rounds[1];
-    assert!(!r.served, "seed 6149 r1: the serve is gone after step 2");
-    assert!(!r.skx && !r.smx, "seed 6149 r1: skx = smx = false");
+    let r = &rec.rounds[0];
+    assert!(!r.served, "seed 6149 r0: the serve is gone after step 2");
+    assert!(!r.skx && !r.smx, "seed 6149 r0: skx = smx = false");
     assert!(
         r.pass_na.is_none(),
-        "seed 6149 r1: pass_na is null (not served)"
+        "seed 6149 r0: pass_na is null (not served)"
     );
 }
 
@@ -1616,4 +1629,206 @@ fn x5r34_recovery_truncation_zeros_never_ack() {
 /// Segment 1's name (a small readability helper for the test above).
 fn name1_of() -> String {
     e4_recovery::harness::x5r34_seg_name(65536)
+}
+
+/// **X-5c-F3-F3a-F3, the folded follow-up (S, test-only; F3-F3b's step
+/// 0′): X5-R35 (a)'s slicing rule held on a real seed, not only by the
+/// (g) 6 event fixture.** The seed driver runs seed 403 through round 1:
+/// round 1 enqueues a SyncOn commit at ts 7 whose record the workload
+/// never writes, over bytes the **previous** round's §14 G2 truncation
+/// zero-write left synced — the exact shape the slice exists to exclude.
+/// Asserted from round 1's record: `lo == 3 ≤ frontier` (the unsliced
+/// derivation raises `lo` to 7 by counting the synced zeros as the
+/// record's covering write), `hi == 3` and `ackl == 0` (ts 7 was never
+/// written and never acked — an acked ts 7 above the cut would appear in
+/// the acked-lost list and in `lo`), and `ack_over` empty (no
+/// ACK-OVER-HOLE store failure).
+///
+/// Reverting the slice breaks the pin either way: **RG1** (`pre_workload
+/// = 0` in `run_round`) and **RG2** (`derive_written_acked` fed the
+/// unsliced capture `&events`) both re-derive `lo = 7`; both
+/// demonstrations were applied, shown failing this test, and reverted
+/// clean.
+#[test]
+fn x5r35_seed403_slice_feeds_the_derivation() {
+    let rec = e4_recovery::workload::run_seed(403, None);
+    let create_failed = rec
+        .defect
+        .as_deref()
+        .is_some_and(|d| d.starts_with("create failed"));
+    assert!(!create_failed, "seed 403 must create: {:?}", rec.defect);
+    let rr = rec
+        .rounds
+        .get(1)
+        .expect("seed 403 must reach round 1 (the pin's subject)");
+    assert_eq!(
+        rr.lo, 3,
+        "round 1 derives lo = 3 (X5-R35 (a): the synced truncation zeros of\
+         \nround 0 never cover round 1's unwritten record)"
+    );
+    assert!(
+        rr.frontier >= rr.lo,
+        "lo must sit at or below the frontier (frontier = {})",
+        rr.frontier
+    );
+    assert_eq!(
+        rr.hi, 3,
+        "nothing above ts 3 was written this round — ts 7's record never\
+         \nreached the disk"
+    );
+    assert_eq!(
+        rr.acked_lost, 0,
+        "ts 7 (SyncOn, above the cut) was never acked — an acked commit\
+         \nabove the cut would be reported here"
+    );
+    assert!(
+        rr.ack_over.is_empty(),
+        "ack_over must be empty (no ACK-OVER-HOLE): {:?}",
+        rr.ack_over
+    );
+}
+
+/// **X5-R33 (f) self-test: a record superseded by a later truncation is
+/// not counted into `h`** (a fixture with a reissued ts below
+/// `wal_ckpt_end`). Life 0 appended a record `[(50, 60, ts 9)]`; life 1
+/// truncates at LSN 50 (the record is superseded — dropped from the
+/// stream) and reissues the slot with its own record `[(50, 60, ts 7)]`.
+/// The opened meta of life 1 carries `wal_ckpt_end = 110`: `h` is 7
+/// (life 1's own record, wholly below the bound), never 9.
+#[test]
+fn x33_superseded_record_not_counted_into_h() {
+    use e4_recovery::harness::{X33Life, x33_h_of, x33_start_log};
+    let lives = vec![
+        X33Life {
+            p0: 0,
+            records: vec![(50, 60, 9)],
+            boot: 1,
+            started_frontier: 0,
+            append_end: 110,
+        },
+        X33Life {
+            p0: 50,
+            records: vec![(50, 60, 7)],
+            boot: 2,
+            started_frontier: 5,
+            append_end: 110,
+        },
+    ];
+    let start_log = x33_start_log(&lives, 1);
+    assert!(
+        !start_log.contains(&(50, 60, 9)),
+        "the superseded record never belongs to life 1's stream: {start_log:?}"
+    );
+    assert_eq!(x33_h_of(&lives, 1, 110), 7, "h is the reissued ts, never 9");
+    // Control: without the truncation (life 1 starts at 0), life 0's
+    // record survives and h is 9.
+    let lives2 = vec![X33Life {
+        p0: 0,
+        records: vec![(50, 60, 9)],
+        boot: 1,
+        started_frontier: 0,
+        append_end: 110,
+    }];
+    assert_eq!(x33_h_of(&lives2, 0, 110), 9);
+}
+
+/// **X5-R33 (f) self-test: the cross-check fails a forged low
+/// `wal_ckpt_end` and a forged `ts_ckpt_hi`.** The true life appended
+/// `[(100, 60, ts 5)]` (ends at 160, wholly below the true bound 160,
+/// started from frontier 2); a meta forged with `wal_ckpt_end = 120`
+/// (the record straddles it) or with `ts_ckpt_hi = 4` (the true largest
+/// below the bound is 5) is a mismatch.
+#[test]
+fn x33_cross_check_fails_forged_meta_values() {
+    use e4_recovery::harness::{X33Life, x33_cross_check_meta};
+    let life = X33Life {
+        p0: 0,
+        records: vec![(100, 60, 5)],
+        boot: 1,
+        started_frontier: 2,
+        append_end: 160,
+    };
+    let start_log = vec![];
+    // The honest meta: no mismatch.
+    assert!(
+        x33_cross_check_meta(3, 160, 5, 5, &life, start_log.clone()).is_none(),
+        "the honest bounds pass"
+    );
+    // Forged low wal_ckpt_end: the record straddles it.
+    let forged = x33_cross_check_meta(3, 120, 5, 5, &life, start_log.clone());
+    assert!(
+        forged.as_deref().is_some_and(|t| {
+            t.starts_with("X5-R33 cross-check: meta 3 wal_ckpt_end 120 / ts_ckpt_hi 5")
+                && t.contains("straddles")
+        }),
+        "a forged low wal_ckpt_end fails: {forged:?}"
+    );
+    // Forged ts_ckpt_hi: the expected largest below the bound is 5.
+    let forged2 = x33_cross_check_meta(3, 160, 4, 5, &life, start_log);
+    assert!(
+        forged2
+            .as_deref()
+            .is_some_and(|t| t.contains("ts_ckpt_hi 4 != expected 5")),
+        "a forged ts_ckpt_hi fails: {forged2:?}"
+    );
+    // With no record below the bound, the started frontier is expected.
+    let empty = X33Life {
+        p0: 160,
+        records: vec![],
+        boot: 2,
+        started_frontier: 9,
+        append_end: 160,
+    };
+    assert!(x33_cross_check_meta(4, 160, 9, 0, &empty, vec![]).is_none());
+    let forged3 = x33_cross_check_meta(4, 160, 3, 0, &empty, vec![]);
+    assert!(
+        forged3
+            .as_deref()
+            .is_some_and(|t| t.contains("ts_ckpt_hi 3 != expected 9")),
+        "an empty life expects its started frontier: {forged3:?}"
+    );
+}
+
+/// **X5-R33 (f) self-test: damage is mapped through the segment's bound
+/// name.** Two WAL inodes sit in `/wal/` — `0x0` (inode 5) and `0x10000`
+/// (inode 6); the fault targets inode 6. The damaged LSNs map through
+/// **inode 6's** name (first LSN 65536), never inode 5's.
+#[test]
+fn x33_damage_maps_through_the_bound_name() {
+    use e4_recovery::harness::x33_damaged_ranges;
+    use e4_recovery::sim::SimDisk;
+    let mut disk = SimDisk::new();
+    let _f5 = disk.create("/wal/0000000000000000.log").expect("seg0");
+    let f6 = disk.create("/wal/0000000000010000.log").expect("seg1");
+    disk.sync_dir("/wal/").expect("dirsync");
+    let fault = e4_recovery::sim::MediaFault {
+        inode: f6,
+        off: 100,
+        len: 50,
+        bytes: vec![1u8; 50],
+        pre: vec![0u8; 50],
+        kind: e4_recovery::sim::MediaKind::Lost,
+    };
+    let ranges = x33_damaged_ranges(&disk, &[fault], 0);
+    assert_eq!(
+        ranges,
+        vec![(65536 + 100, 65536 + 150)],
+        "the damage maps through the bound name's first LSN: {ranges:?}"
+    );
+    // A MISDIRECTED fault adds its stray destination range on the same
+    // inode (mapped through the same bound name).
+    let mis = e4_recovery::sim::MediaFault {
+        inode: f6,
+        off: 100,
+        len: 50,
+        bytes: vec![1u8; 50],
+        pre: vec![0u8; 50],
+        kind: e4_recovery::sim::MediaKind::Misdirected { to_off: 512 },
+    };
+    let ranges2 = x33_damaged_ranges(&disk, &[mis], 0);
+    assert_eq!(
+        ranges2,
+        vec![(65536 + 100, 65536 + 150), (65536 + 512, 65536 + 562)],
+        "the destination range maps through the same bound name: {ranges2:?}"
+    );
 }

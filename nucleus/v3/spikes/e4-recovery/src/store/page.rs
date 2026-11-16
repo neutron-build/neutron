@@ -496,6 +496,15 @@ pub struct Meta {
     pub slot_count: u64,
     /// Replay start (§12.6).
     pub wal_start_lsn: u64,
+    /// **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** the WAL append position
+    /// read at the flip of checkpoint k (§13 step 0, W5 (i)); step 1
+    /// made every byte below it durable. 0 in meta 0 (the creating
+    /// session's append position).
+    pub wal_ckpt_end: u64,
+    /// **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** the commit_ts of the
+    /// last `Commit` or `CommitMarker` appended before that flip, or the
+    /// frontier the boot started from if none was; `≥ T`. 0 in meta 0.
+    pub ts_ckpt_hi: u64,
 }
 
 /// Serialize a meta into a page image (with its CRC).
@@ -520,9 +529,14 @@ pub fn build_meta(m: &Meta) -> Vec<u8> {
     wr_u64(&mut p, 84, m.next_lpid);
     wr_u64(&mut p, 92, m.slot_count);
     wr_u64(&mut p, 100, m.wal_start_lsn);
-    // The CRC covers the fields (12..108), not itself.
-    let crc = crc32c(0, p.get(12..108).unwrap_or(&[]));
-    wr_u32(&mut p, 108, crc);
+    // **S-1-F3 §2.2 (W1; X-5c-F3-F3b step 1):** the meta's WAL bound —
+    // `wal_ckpt_end` and `ts_ckpt_hi` — sits inside the CRC (a forged
+    // bound cannot present a valid CRC).
+    wr_u64(&mut p, 108, m.wal_ckpt_end);
+    wr_u64(&mut p, 116, m.ts_ckpt_hi);
+    // The CRC covers the fields (12..124), not itself.
+    let crc = crc32c(0, p.get(12..124).unwrap_or(&[]));
+    wr_u32(&mut p, 124, crc);
     p
 }
 
@@ -531,8 +545,8 @@ pub fn parse_meta(p: &[u8]) -> Result<Meta, ()> {
     if p.len() != PAGE || p.get(0..8) != Some(META_MAGIC) {
         return Err(());
     }
-    let crc = rd_u32(p, 108)?;
-    if crc != crc32c(0, p.get(12..108).unwrap_or(&[])) {
+    let crc = rd_u32(p, 124)?;
+    if crc != crc32c(0, p.get(12..124).unwrap_or(&[])) {
         return Err(());
     }
     Ok(Meta {
@@ -555,6 +569,8 @@ pub fn parse_meta(p: &[u8]) -> Result<Meta, ()> {
         next_lpid: rd_u64(p, 84)?,
         slot_count: rd_u64(p, 92)?,
         wal_start_lsn: rd_u64(p, 100)?,
+        wal_ckpt_end: rd_u64(p, 108)?,
+        ts_ckpt_hi: rd_u64(p, 116)?,
     })
 }
 

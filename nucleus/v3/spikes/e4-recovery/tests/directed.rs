@@ -21,6 +21,7 @@ fn cfg(mutant: Option<Mutant>) -> StoreCfg {
         pool_frames: 16,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     }
 }
 
@@ -124,7 +125,7 @@ fn script_with_crash(crash: Option<CrashSpec>) -> Script {
 fn run(seed: u64, script: &Script, f: &RoundFaults, m: Option<Mutant>) -> harness::RoundOutcome {
     let (disk, st) = harness::create_store(cfg(m), seed, 7).expect("create");
     let model = Model::new();
-    harness::run_round(seed, 0, script, f, cfg(m), disk, st, &model, 0, None)
+    harness::run_round(seed, 0, script, f, cfg(m), disk, st, &model, 0, None, None)
 }
 
 /// D1 (every boundary): one fixed workload; for each of the 10 hooks,
@@ -400,11 +401,32 @@ fn d4_wal_sync_t_only() {
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::WalSyncTOnly),
     );
+    // **X-5c-F3-F3b step 1 (judgment call, recorded):** the §13 step-4
+    // meta-bound fail-stop catches WAL-SYNC-T-ONLY **earlier** than the
+    // named catchers — the mutant's step 1 leaves `durable` below the
+    // flip's `wal_ckpt_end`, the meta write refuses (§9.2, the store
+    // poisoned, task_error "meta bound (13 step 4)"), and the round
+    // fails without ever losing c1. The arm keeps every original
+    // catcher beside the new one and still requires the round to fail —
+    // a widening of the catch, never a weakening (X5-R11 (e)'s shape).
+    let bound_caught = m
+        .task_error
+        .as_deref()
+        .is_some_and(|t| t.contains("meta bound (13 step 4)"));
     assert!(
-        m.o1.is_err() || m.o1.clone().unwrap_or(0) < 2 || m.monitors.contains(&"M-CKPT-T"),
-        "D4 mutant: c1 must be lost or M-CKPT-T must fire — the named catchers (o1={:?}, monitors={:?})",
+        !m.pass,
+        "D4 mutant: the round must fail (o1={:?}, te={:?})",
+        m.o1, m.task_error
+    );
+    assert!(
+        m.o1.is_err()
+            || m.o1.clone().unwrap_or(0) < 2
+            || m.monitors.contains(&"M-CKPT-T")
+            || bound_caught,
+        "D4 mutant: c1 must be lost, M-CKPT-T must fire, or the 13 step-4 bound must refuse the meta — the catchers (o1={:?}, monitors={:?}, te={:?})",
         m.o1,
-        m.monitors
+        m.monitors,
+        m.task_error
     );
 }
 
@@ -697,6 +719,7 @@ fn d7_zombie_tail() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     // Round 1: the valid end sits at tail 3 (torn), tail 4 intact past
@@ -751,6 +774,7 @@ fn d7_zombie_tail() {
             r1.end_store.clone().expect("D7 round-1 end store"),
             &r1.end_model,
             r1.cut,
+            None,
             None,
         )
     };
@@ -1002,6 +1026,7 @@ fn d10_lost_meta() {
         &Model::new(),
         0,
         Some(&mut twin),
+        None,
     );
     assert!(
         clean.detections.contains(&"open"),
@@ -1045,6 +1070,7 @@ fn d10_lost_meta() {
         &Model::new(),
         0,
         Some(&mut twin),
+        None,
     );
     assert!(
         !m.pass && m.o1.is_err(),
@@ -1175,6 +1201,7 @@ fn d10b_rollback_exception() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     let clean = mk(None, false);
@@ -1395,6 +1422,7 @@ fn r10_sequencer_restarts_at_the_frontier() {
             base.end_store.clone().expect("R10 end store"),
             &base.end_model,
             base.cut,
+            None,
             None,
         )
     };
@@ -1966,6 +1994,7 @@ fn freeset_growth_covers_its_own_slots() {
                     pool_frames: 16,
                     r_epoch,
                     mutant: None,
+                    wal_io_fail: None,
                 };
                 let (disk, st) = harness::create_store(c.clone(), seed, 7).expect("create");
                 let out = harness::run_round(
@@ -1978,6 +2007,7 @@ fn freeset_growth_covers_its_own_slots() {
                     st,
                     &Model::new(),
                     0,
+                    None,
                     None,
                 );
                 assert!(
@@ -2124,6 +2154,7 @@ fn d16_epoch_reserve() {
             pool_frames: 16,
             r_epoch: 1,
             mutant: m,
+            wal_io_fail: None,
         };
         let (disk, st) = harness::create_store(c16.clone(), 2015, 7).expect("create");
         let model = Model::new();
@@ -2137,6 +2168,7 @@ fn d16_epoch_reserve() {
             st,
             &model,
             0,
+            None,
             None,
         )
     };
@@ -2261,6 +2293,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
         pool_frames: 24,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     };
     // The faultless base supplies the crashed disk the plant is built
     // from (the same schedule prefix, so the same slots).
@@ -2276,6 +2309,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
             st,
             &Model::new(),
             0,
+            None,
             None,
         )
     };
@@ -2362,6 +2396,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     let r = run_r4(Some(Mutant::RefCrcSkip));
@@ -2423,6 +2458,7 @@ fn d17_integrity() {
         pool_frames: 16,
         r_epoch: 2,
         mutant,
+        wal_io_fail: None,
     };
     let ops = vec![
         ScriptOp::Commit {
@@ -2485,6 +2521,7 @@ fn d17_integrity() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     // A faultless crash round supplies the crashed disk the fault is
@@ -2502,6 +2539,7 @@ fn d17_integrity() {
             st,
             &Model::new(),
             0,
+            None,
             None,
         )
     };
@@ -2673,6 +2711,7 @@ fn d17_integrity() {
             &Model::new(),
             0,
             None,
+            None,
         )
     };
     assert!(base2.o1.is_ok(), "D17 REFCRC base: {:?}", base2.o1);
@@ -2766,6 +2805,7 @@ fn d17_integrity() {
             &Model::new(),
             0,
             Some(&mut twin),
+            None,
         )
     };
     // Clean: check (2) is the only discriminator — XX001 at open, never
@@ -2847,6 +2887,7 @@ fn d17_integrity() {
                     st,
                     &Model::new(),
                     0,
+                    None,
                     None,
                 );
                 let pf = b
@@ -3250,6 +3291,7 @@ fn twin_supply_carries_a_failed_recovery_reads() {
         &Model::new(),
         0,
         Some(&mut twin),
+        None,
     );
     // Sanity: this is a failed-recovery round (the recovery-Err branch
     // of the oracle judged it).

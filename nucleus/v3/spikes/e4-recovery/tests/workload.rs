@@ -395,6 +395,7 @@ fn setup_barrier_guards_the_wal_order() {
             &Model::new(),
             0,
             None,
+            None,
         )
     };
     let out_b = run3(&script_b);

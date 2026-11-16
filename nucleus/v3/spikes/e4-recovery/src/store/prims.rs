@@ -52,6 +52,43 @@ pub fn note_step_fail<H: StoreHost>(cx: &Cx<'_, H>, site: &'static str, e: Fail)
     }
 }
 
+/// **S-1-F3 §9.2 (W8, gate edit 3; X-5c-F3-F3b step 3 (d)): the poison
+/// broadcast.** After the poisoner has released its tree mutex, pins and
+/// the gate, it wakes every wait key that has a parked task: the fixed
+/// keys plus `Tree(t)` for every held tree ("every wait queue" includes
+/// each live transaction's waiter list; the prototype's per-tree sim
+/// mutexes are that list's stand-in). No waker holds a tree mutex or a
+/// pin while it wakes — the callers invoke this on their way out, after
+/// their `tree_unlock`/`PinGuard`/`gate_release`. Waking an empty queue
+/// is a no-op, so calling unconditionally on an error exit is safe. A
+/// woken waiter re-tests its own predicate in the same baton hold as its
+/// park; with the mark in that predicate (see every wait below), it
+/// returns `Fail::Poisoned` instead of re-parking.
+pub fn poison_broadcast<H: StoreHost>(cx: &Cx<'_, H>) {
+    let trees: Vec<u64> = match cx.with("poison:bcast", |c| {
+        Ok(c.store().tree_mu.keys().copied().collect::<Vec<u64>>())
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            note_step_fail(cx, "poison:bcast", e);
+            Vec::new()
+        }
+    };
+    for key in [
+        WaitKey::WalAcks,
+        WaitKey::Applied,
+        WaitKey::MetaDurable,
+        WaitKey::Pin,
+        WaitKey::GateShared,
+        WaitKey::GateFlip,
+    ] {
+        cx.w.wake(key);
+    }
+    for t in trees {
+        cx.w.wake(WaitKey::Tree(t));
+    }
+}
+
 /// The effective image-k entry of `lpid`: the override if frozen, else
 /// the current ref. `None` = the image leaves it unmapped.
 pub fn img_entry(st: &StoreInner, lpid: u64) -> Option<Ref> {
@@ -187,6 +224,10 @@ pub fn gate_shared<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
         cx.yield_now("gate_shared")?;
         let wait = cx.with("gate_shared", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the mark is in every wait's predicate,
+            // evaluated under the wait's own mutex (this with-step and
+            // the park below hold one baton).
+            st.alive()?;
             if st.gate.exclusive || st.gate.flip_pending {
                 Ok(true)
             } else {
@@ -245,7 +286,10 @@ pub fn gate_exclusive<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
         // without an intervening yield (the wakeup discipline of
         // `gate_shared`; a yield between check and park loses the wake).
         cx.yield_now("gate_exclusive")?;
-        let ready = cx.with("gate_exclusive:wait", |c| Ok(c.store().gate.holders == 0))?;
+        let ready = cx.with("gate_exclusive:wait", |c| {
+            c.store().alive()?;
+            Ok(c.store().gate.holders == 0)
+        })?;
         if ready {
             cx.with("gate_exclusive:take", |c| {
                 c.store().gate.exclusive = true;
@@ -280,6 +324,8 @@ pub fn tree_lock<H: StoreHost>(cx: &Cx<'_, H>, t: u64) -> Result<(), Fail> {
         cx.yield_now("tree_lock")?;
         let busy = cx.with("tree_lock", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the mark is in this wait's predicate too.
+            st.alive()?;
             let busy = st
                 .tree_mu
                 .get(&t)
@@ -719,6 +765,8 @@ pub fn store_page<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Re
     loop {
         let placed = cx.with("store_page:place", |c| {
             let st = c.store();
+            // G8 (9.2, W8): the Pin wait's predicate carries the mark.
+            st.alive()?;
             let e = st.e;
             let normal = st.normal_frames_mut();
             if normal.iter().any(|f| f.key == lpid && f.evicting) {

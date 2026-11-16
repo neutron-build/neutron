@@ -214,6 +214,24 @@ pub struct Extracted {
     /// **X5-R32 (a) 2:** the page-file inode id (which of
     /// [`Extracted::recovery_reads`] are page reads).
     pub page_file: usize,
+    /// **X5-R33 (c):** `h` — the largest ts whose Commit/CommitMarker
+    /// record lies wholly below the opened meta's `wal_ckpt_end`, in
+    /// the stream as it stood when that meta was written. Harness-
+    /// computed from SimDisk history and the meta bytes; an input to
+    /// the MW lower bound.
+    pub mw_h: u64,
+    /// **X5-R33 (c):** `a` — the largest X5-R34-acked SyncOn ts whose
+    /// record ends at or below the round's first damaged WAL byte (the
+    /// round's largest acked SyncOn ts with no damaged WAL byte).
+    pub mw_a: u64,
+    /// **X5-R33 (e):** the recovery `Err` is `Fail::WalLoss`
+    /// (I-WAL-COVER's refusal; the same typed predicate as the record's
+    /// `cover_err`).
+    pub wal_loss: bool,
+    /// **X5-R33 (e):** the WAL-loss `Err` is explained — a fault of the
+    /// round damaged a WAL byte in `[wal_start_lsn, wal_ckpt_end)` of
+    /// the opened meta.
+    pub wal_loss_explained: bool,
 }
 
 /// Reads the recovered state for the oracle: the harness implements this
@@ -266,6 +284,11 @@ pub struct OracleCfg {
     /// only for the load-bearing demonstration (`no_r32` turns the
     /// must-pass case mp8 red).
     pub no_r32: bool,
+    /// **X5-R33:** remove the X5-R33 arm — in class MW the lower bound
+    /// returns to X5-R1's `lo := T`, and a WAL-loss `Err` is judged by
+    /// the twin rule again. Exists only for the load-bearing
+    /// demonstration (`no_r33` turns mf30, mf31 and mf32 green).
+    pub no_r33: bool,
 }
 
 /// The media faults of the round, mapped to page-file slots or WAL ranges
@@ -434,7 +457,14 @@ pub fn check_round(
     let mut lo = model.lower_bound(c_prev);
     let hi = model.upper_bound(lo);
     if class == FaultClass::Mw {
-        lo = ex.opened_t;
+        // **X5-R33 (c):** in class MW the lower bound is
+        // `lo := max(c_{r−1}, T, h, a)`; with `no_r33` it is X5-R1's
+        // `lo := T`, as before. `hi` is unchanged.
+        lo = if cfg.no_r33 {
+            ex.opened_t
+        } else {
+            c_prev.max(ex.opened_t).max(ex.mw_h).max(ex.mw_a)
+        };
     }
 
     // ---- O-1: find the satisfying c's ----
@@ -550,7 +580,20 @@ pub fn check_round(
         // fails the round — the rule must never fail open (gate REWORK
         // item 5; same principle as the R structural guard: a harness
         // defect must never pass).
+        // **X5-R33 (e):** in class MW with `!ex.ok && ex.wal_loss` (and
+        // the arm on), the twin rule does not apply: the round fails
+        // O-3 (c) iff the refusal is unexplained. Every other MW `Err`
+        // is judged as before, by the twin rule.
+        let r33_cover =
+            class == FaultClass::Mw && !ex.ok && ex.wal_loss && !cfg.no_r33 && !cfg.no_twin_rule;
+        if r33_cover && !ex.wal_loss_explained {
+            o3_fail = Some(
+                "O-3(c): WAL-loss XX001 with no fault in [wal_start_lsn, wal_ckpt_end) (X5-R33)"
+                    .to_owned(),
+            );
+        }
         match twin {
+            Some(_) if r33_cover => {}
             Some(t) => {
                 let mut any_fault = false;
                 let mut all_uncovered = true;

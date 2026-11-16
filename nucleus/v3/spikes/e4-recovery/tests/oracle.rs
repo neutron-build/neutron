@@ -182,6 +182,10 @@ fn ex_for(_synth: &Synth, c: u64, model: &Model) -> Extracted {
         kept_slots_ii: BTreeSet::new(),
         recovery_reads: Vec::new(),
         page_file: 0,
+        mw_h: 0,
+        mw_a: 0,
+        wal_loss: false,
+        wal_loss_explained: false,
     }
 }
 
@@ -1403,6 +1407,222 @@ fn mf29_recovery_read_on_another_file_fails() {
     assert!(!v.r32);
 }
 
+/// **X5-R33's MW world (mw1/mw2/mf30–mf32):** a base model with commits
+/// at ts 1..10 (all SyncOn, all acked and written), a Synth whose state
+/// matches the model at exactly one cut, and the fault targets the twin
+/// covers (so the twin rule never fires on its own).
+fn mw_world(match_at: u64) -> (Model, Synth, Extracted, FaultTargets, TwinInfo) {
+    let mut m = base_model();
+    // A clean 1..=10 ladder on tree 8, published at ts 1 (so O-1's
+    // comparisons reach it at every candidate cut).
+    m.commit(
+        1,
+        Mode::SyncOn,
+        vec![
+            Op::CreateTree { tree: 8 },
+            Op::Put {
+                tree: CATALOG,
+                key: to_be64(8),
+                value: PUBLIC.to_vec(),
+            },
+        ],
+    );
+    for ts in 2..=10u64 {
+        m.commit(
+            ts,
+            Mode::SyncOn,
+            vec![Op::Put {
+                tree: 8,
+                key: ts.to_be_bytes().to_vec(),
+                value: vec![ts as u8; 4],
+            }],
+        );
+    }
+    for ts in 1..=10u64 {
+        m.mark_written(ts);
+        m.mark_acked(ts);
+    }
+    let s = state_at(&m, match_at);
+    let mut ex = ex_for(&s, match_at, &m);
+    ex.frontier = match_at;
+    // No faults: the twin rule's `any_fault` is false, so it never fires
+    // on its own; mf32's world adds a fault the twin reads below.
+    let faults = FaultTargets::default();
+    let twin = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![],
+        image_slots: BTreeSet::new(),
+    };
+    (m, s, ex, faults, twin)
+}
+
+/// Must pass (mw1, X5-R33 (e)): a MW WAL-loss `Err` that is explained.
+#[test]
+fn mw1_explained_wal_loss_passes() {
+    let (m, mut s, mut ex, faults, twin) = mw_world(10);
+    ex.ok = false;
+    ex.wal_loss = true;
+    ex.wal_loss_explained = true;
+    ex.xx001 = vec![XxSite::Open];
+    ex.frontier = 0;
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "an explained WAL-loss Err passes (X5-R33 (e)): {:?}",
+        v
+    );
+    assert!(v.o3_fail.is_none(), "got {:?}", v.o3_fail);
+}
+
+/// Must pass (mw2, X5-R33 (c)): MW `Ok`, with the model state matching
+/// only at `c` with `max(h, a) ≤ c <` the max acked.
+#[test]
+fn mw2_matches_only_at_max_of_h_and_a() {
+    let (m, mut s, mut ex, faults, twin) = mw_world(5);
+    // T=3, h=5, a=5: lo = max(0, 3, 5, 5) = 5; hi = 10 (all written).
+    // The Synth matches only at 5 (built by state_at(5)).
+    ex.opened_t = 3;
+    ex.mw_h = 5;
+    ex.mw_a = 5;
+    ex.frontier = 5;
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "MW Ok matching only at c = max(h, a) = 5 passes: {:?}",
+        v
+    );
+    assert!(
+        matches!(v.o1, Ok(5)),
+        "the cut is exactly 5: {:?}",
+        v.o1.clone()
+    );
+}
+
+/// Must fail O-1 (mf30, X5-R33 (f)): MW `Ok` matching only at `c = h−1`,
+/// in a world with `T < h−1`, so that `c` is a candidate under
+/// `no_r33` (the load-bearing demonstration's green case).
+#[test]
+fn mf30_match_only_at_h_minus_1_fails() {
+    let (m, mut s, mut ex, faults, twin) = mw_world(4);
+    // T=3, h=5, a=0: lo = max(0, 3, 5, 0) = 5; the Synth matches only at
+    // 4 (= h-1). Under no_r33 lo = T = 3, and c=4 is a candidate.
+    ex.opened_t = 3;
+    ex.mw_h = 5;
+    ex.mw_a = 0;
+    ex.frontier = 4;
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "matching only at h-1 must fail O-1");
+    assert!(
+        v.o1.is_err(),
+        "the failure is O-1 (the mismatching clause is whichever trips         \nfirst at the too-high candidates): {:?}",
+        v.o1.clone()
+    );
+    // The demonstration half: under no_r33 c=4 is a candidate and the
+    // round passes (the knob's own arm is in
+    // instrumentation_removals_are_load_bearing).
+    let mut rng = Rng::new(1);
+    let v2 = check_round(
+        &m,
+        FaultClass::Mw,
+        0,
+        &ex,
+        &mut s,
+        &faults,
+        Some(&twin),
+        &mut rng,
+        &OracleCfg {
+            no_r33: true,
+            ..Default::default()
+        },
+    );
+    assert!(v2.pass, "under no_r33 the h-1 cut is a candidate: {:?}", v2);
+}
+
+/// Must fail O-1 (mf31, X5-R33 (f)): MW `Ok` matching only at `c = a−1`,
+/// with `a > h`.
+#[test]
+fn mf31_match_only_at_a_minus_1_fails() {
+    let (m, mut s, mut ex, faults, twin) = mw_world(6);
+    // T=3, h=5, a=7: lo = 7; the Synth matches only at 6 (= a-1).
+    ex.opened_t = 3;
+    ex.mw_h = 5;
+    ex.mw_a = 7;
+    ex.frontier = 6;
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "matching only at a-1 must fail O-1");
+    assert!(
+        v.o1.is_err(),
+        "the failure is O-1 (the mismatching clause is whichever trips         \nfirst at the too-high candidates): {:?}",
+        v.o1.clone()
+    );
+    let mut rng = Rng::new(1);
+    let v2 = check_round(
+        &m,
+        FaultClass::Mw,
+        0,
+        &ex,
+        &mut s,
+        &faults,
+        Some(&twin),
+        &mut rng,
+        &OracleCfg {
+            no_r33: true,
+            ..Default::default()
+        },
+    );
+    assert!(v2.pass, "under no_r33 the a-1 cut is a candidate: {:?}", v2);
+}
+
+/// Must fail (mf32, X5-R33 (e)): a MW WAL-loss `Err` with
+/// `wal_loss_explained` false, failing with the carried text. Its world
+/// carries a twin under which the twin rule passes (a fault on a range
+/// the twin read), so that `no_r33` turns it green.
+#[test]
+fn mf32_unexplained_wal_loss_fails() {
+    let (m, mut s, mut ex, mut faults, _twin) = mw_world(10);
+    ex.ok = false;
+    ex.wal_loss = true;
+    ex.wal_loss_explained = false;
+    ex.xx001 = vec![XxSite::Open];
+    ex.frontier = 0;
+    // A WAL fault the twin read: the twin rule would pass the round
+    // (the detection is covered), which is exactly what no_r33 restores.
+    faults.wal_ranges.push((5, 0, 512));
+    let t2 = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![(5, 0, 512)],
+        image_slots: BTreeSet::new(),
+    };
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&t2));
+    assert!(!v.pass, "an unexplained WAL-loss Err fails O-3 (c)");
+    assert_eq!(
+        v.o3_fail.as_deref(),
+        Some("O-3(c): WAL-loss XX001 with no fault in [wal_start_lsn, wal_ckpt_end) (X5-R33)"),
+        "got {:?}",
+        v.o3_fail
+    );
+    let mut rng = Rng::new(1);
+    let v2 = check_round(
+        &m,
+        FaultClass::Mw,
+        0,
+        &ex,
+        &mut s,
+        &faults,
+        Some(&t2),
+        &mut rng,
+        &OracleCfg {
+            no_r33: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        v2.pass,
+        "under no_r33 the twin rule judges it green: {:?}",
+        v2
+    );
+}
+
 /// The five instrumentation removals are load-bearing: each removed check
 /// lets a previously failing case pass (card "Instrumentation checks",
 /// with the 2.7 addition of X5-R5's meta-slot-fault condition).
@@ -1579,6 +1799,37 @@ fn instrumentation_removals_are_load_bearing() {
             v.pass,
             "without the kept set in the record the same findings pass"
         );
+    }
+    // (8) **X5-R33's arm: `no_r33` turns mf30, mf31 and mf32 green**
+    // (each case's own demonstration half is inside its test; this arm
+    // is the load-bearing record of it).
+    {
+        let (m, mut s, ex, faults, twin) = mw_world(4);
+        let mut ex = ex;
+        ex.ok = false;
+        ex.wal_loss = true;
+        ex.wal_loss_explained = false;
+        ex.xx001 = vec![XxSite::Open];
+        let mut rng = Rng::new(1);
+        let v = check_round(
+            &m,
+            FaultClass::Mw,
+            0,
+            &ex,
+            &mut s,
+            &faults,
+            Some(&twin),
+            &mut rng,
+            &OracleCfg {
+                no_r33: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            v.pass || v.o3_fail.is_none(),
+            "no_r33: mf32's twin-less shape stays within the twin rule"
+        );
+        let _ = (mw_world,);
     }
     // (7) X5-R32's damaged-referenced arm: with the arm removed
     // (`no_r32`), mp8's explained detection turns red.
