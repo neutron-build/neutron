@@ -1,37 +1,24 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F3b's steps 0-6 done — step 0 committed F3-F3a's
-Acceptance 10k as the triage file of record (f8251b84) and re-derived the
-class table (MW-ORPHAN 406, the REFRESH's eight named 0..200 rounds);
-step 0' the folded X-5c-F3-F3a-F3 seed-403 pin (9580b10d, RG1/RG2
-demonstrated and reverted); step 1 the meta's WAL bound — wal_ckpt_end/
-ts_ckpt_hi inside the CRC, the flip's commit-cs exclusion, step 1 at the
-contiguous durable prefix, the step-4 fail-stop, the open-time XX001, two
-pins and CKPT-SYNC-OVER-HOLE/META-RANGE-SKIP demonstrated (f5ba9e6b);
-step 2 I-WAL-COVER fail-closed — Fail::WalLoss, nothing written, nine
-variants + two more pins, six mutants demonstrated (4c9905df); step 3 G8
-in full with the WAL path — every wait carries the mark, the broadcast
-after release, the wal_io_fail test hook, two pins and four mutants
-(POISON-AFTER-UNLATCH an equivalent mutant in S-BATON, demonstrated)
-(e724ce05); step 4 X5-R33 in one commit — the harness supply (lives,
-h, a, wal_loss_explained, the (d) cross-check over every meta written),
-the oracle text (lo = max(c_prev, T, h, a); the explained WAL-loss Err),
-mw1/mw2/mf30-32, the record fields and the self-tests with three revert
-demonstrations (86eddb34, its X33In wiring fix in c929c2a3); step 5 the
-smoke — the prediction holds: every live named round is an explained Err
-passing, the MW-ORPHAN shape count 0 in 0..200, 4699 r0 now an explained
-passing Err, the 37 named rounds all frontier >= lo, no MP or C cover_err
-round; over the whole Acceptance 10k MW_ORPHAN_SHAPE is 5 (1749/4139/
-5549/5839/7359 r2) — ESCALATED to P with per-round evidence, never a
-local fix; step 6 this README + "How to reproduce" + this line, with the
-full Acceptance (test 204/204, the 10k with prov, verify --no-quotas,
-the record check, gate.sh) at this card's final tip (the stage record
-below). The Acceptance 10k is the runner's (X5-R31): no campaign-class
-command beyond the 0..200 runs and single seeds ran in this card's
-attempts, all under the backstop with output outside the worktree. The
-stages before it (X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are
-complete and merged. Opus judges E4 on the RESULT with P's rulings
-X5-R1-R35.
+Status: **stage X-5c-F3-F3a-F2 done (with X-5c-F3-F3b-F1 Work 1-3
+folded in) — the C-DIV "missing <= T entry" remainder root-caused into
+two families: root cause A, the store's `gc_w_used` reset at open
+(S-STORE 10.5), fixed in `ckpt::open` with the pin
+`gc_w_survives_recovery_into_the_boot_checkpoint` (664 r2's (d) shape,
+now passing; the folded MW rounds 4139 r2 and 5839 r2 also now pass);
+root cause B, `Model::scan`'s drop+recreate gap (it never accounts
+`Op::DropTree`, so after DropTree(t)+CreateTree(t) it resurrects
+pre-drop content no correct store can serve) — frozen with the oracle,
+ESCALATED to P with five deterministic traces (112/63 r2 and the
+folded 1749/5549/7359 r2); every C-DIV round in 0..200 carries B's
+shape. The `E4_KEY_DIAG` key-history trace (b7fe409e) and the
+`E4_O1_AT_FRONTIER` frontier-candidate diagnostic with its 1749 r2 pin
+(204afb9a) land default-off. The stages before it (X-5c-F3-F3b,
+X-5c-F3-F3a, X-5c-F3-F1, X-5c-F3, X-5c-F2, X-5c) are complete and
+merged. Opus judges E4 on the RESULT with P's rulings X5-R1-R35.
+(The previous stage's own Status paragraph is preserved in its record
+section below: X-5c-F3-F3b's steps 0-6, from the triage file f8251b84
+through the Acceptance with MW_ORPHAN_SHAPE 5 escalated.)
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -3753,6 +3740,182 @@ command beyond the 0..200 runs and single seeds ran in this card's
 attempts, all under the backstop, output outside the worktree. The
 Acceptance 10k becomes **X-5c-F4's step-0 triage file**; its full
 class table is F4's to report.
+
+## Stage X-5c-F3-F3a-F2's record (this card; X-5c-F3-F3b-F1 Work 1-3
+## folded in per the orchestrator edit of 2026-11-04)
+
+Start **2026-11-04T01:56:30-07:00**, stop **2026-11-04T02:56-07:00**
+(root-causing inside the 90-minute budget; the traces below were
+gathered inside it). Repros are from X-5c-F3-F3b's Acceptance file
+(`~/.cache/nv3-review/runlogs/X-5c-F3-F3b.acc.campaign.json`, sha256
+`8332df8d...`, commit 86ecf8ff) as the fold directs; every command is
+a single seed or a <=200-seed window under the backstop, output
+outside the worktree.
+
+**Work 2 - the repros** (each run twice at the pre-fix tip, digests
+identical: `X-5c-F3-F3a-F2.s2.seed<N>.r{1,2}.json`):
+
+| Sub-kind | Round | o1 (first candidate) | frontier/lo/hi | digest |
+|---|---|---|---|---|
+| (b) | 112 r2 | O-1(b) at c=15, tree 3: scan mismatch | 15/15/15 | 3936867010 |
+| (c) | 63 r2 | O-1(c) at c=23, tree 2: raw entry above the cut (max ts 24) | 24/23/24 | 1693274365 |
+| (d) | 664 r2 | O-1(d) at c=26, tree 2, S=5: scan mismatch | 26/26/26 | 1302965675 |
+
+**Work 3 - the key-history trace** (`E4_KEY_DIAG`, stderr, default
+off, never a digest input; commit b7fe409e). At the O-1 failure it
+traces the first divergent key through the page file's whole
+durable-write history: every leaf write that carried the key's LPID
+(slot, content epoch, the key's ts values), every durable meta (T,
+gc_w, boot, map root, the WAL bound), each durable image's view of
+the key (rebuilt by replaying the durable writes below each meta and
+walking its map radix - the span math `ckpt::walk_radix` uses), the
+opened image's mapping beside the recovered store's served bytes, the
+directory's write history (which tree ids each durable version held)
+and each image's directory entry for the failing tree, plus the
+model's DDL timeline and the key's own model timeline. It names the
+**first durable meta whose image fails to hold the owner's entry
+while its `T` covers the owner ts** (S-STORE 13 (c)).
+
+- **(b) 112 r2** (`X-5c-F3-F3a-F2.s3.seed112.err`): key ...17 of tree
+  3, owner ts 5 (SyncOn, written, acked - round 0's commit). Image 2
+  (ckpt 2, T=7) holds it: LPID 40 -> slot 101 (epoch-1 content,
+  ts=[5]). **FIRST-LOST at meta 3** (T=11, boot 3 - round 2's boot
+  checkpoint): LPID 40 -> slot 137, an epoch-2 rewrite with no entry
+  of the key, and the directory leaf (LPID 1 -> slot 171, epoch 2)
+  holds ids `[1, 2, 50]` - **tree 3's directory entry is gone**. The
+  model's DDL timeline: `DropTree{3}` at ts 8 (round 1's DDL commit,
+  durable, <= round 1's cut 11), `CreateTree{3}` at ts 12 (round 2's
+  setup re-creating what `trees_at` missed at the cut). The store
+  dropped the tree correctly; the recovery re-created it fresh.
+- **(c) 63 r2** (`X-5c-F3-F3a-F2.s3.seed63.err`): key ...3 of tree 5,
+  owner ts 5 (SyncOff). Images 1-3 hold it (LPID 11 -> slot 43,
+  ts=[5]). **FIRST-LOST at meta 4** (T=16, boot 4): the epoch-3
+  rewrites of LPID 11 all lack the entry, and meta 4's directory leaf
+  is slot 135's epoch-3 version (`[1, 2, 3, 4]`, tree 5 gone) where
+  images 1-3 referenced slot 12 (`[1, 2, 3, 4, 5]`). DDL timeline:
+  `DropTree{5}` at ts 11, `CreateTree{5}` at ts 17 - the same
+  drop+recreate shape; the store's tree 5 is the fresh re-creation
+  (root 127, an empty leaf at image 5 while the old content pages
+  stay mapped).
+- **(d) 664 r2** (`X-5c-F3-F3a-F2.s3.seed664.err`): key ...39 of tree
+  2 (never dropped - round 1's drop retired tree 4), owner ts 5
+  (SyncOff); the key's model timeline: Puts at ts 5, 6, 9. Image 1
+  (T=6, gc_w=0) holds the key at LPID 57 with ts=[6,5]. **FIRST-LOST
+  at meta 2** (T=10, **gc_w=8**, round 1's in-workload checkpoint):
+  the image holds the key at LPID 50 with ts=[9,6] - ts 5 is gone.
+  That is a **legal GC prune** (at w=8 the newest version <= 8 is
+  ts 6, so 10.2 lets the sweep prune ts 5) and image 2 records
+  `gc_w = 8` truthfully. The failure is that the O-1 (d) sample range
+  came from the **opened meta's gc_w**, and the boot checkpoint after
+  the next recovery recorded **gc_w = 0** (image 4) because
+  `ckpt::open` never restored `gc_w_used` from the opened meta - the
+  sample set `[0, 26]` then reached S=5, below the image's true
+  bound, where the model (which never models GC) still expects the
+  pruned version.
+
+**Work 4 - the outcomes.**
+
+- **Root cause A (the store; fixed, commit e1bd478b).**
+  `src/store/ckpt.rs`, `open`: `StoreInner::empty` starts `gc_w_used`
+  at 0 and `open` never set it from the opened meta, so every boot
+  checkpoint after a recovery recorded `gc_w = 0` while the image it
+  froze had GC'd at `w > 0` - S-STORE 10.5: "At open it starts at the
+  recovered meta's `gc_w`, so a checkpoint taken before the first GC
+  mutation (including the boot checkpoint, 14 step 8) still records
+  the image's bound". The fix is one line
+  (`st.gc_w_used = meta.gc_w;` in `open`). **Pin**
+  `gc_w_survives_recovery_into_the_boot_checkpoint`
+  (`tests/store.rs`): a life that GC'd at w=4 with the apply frontier
+  at 5 checkpoints (its meta decoded from the durable stream carries
+  `gc_w = 4`), a clean crash, a recovery that runs no GC, and its
+  boot checkpoint - asserted to carry `gc_w = 4` again. **Mutant
+  demonstrated** (the fix line deleted): the pin fails `open starts
+  gc_w_used at the recovered meta's gc_w (10.5): left: 0, right: 4`,
+  reverted clean. Effect: **664 r2 passes** at the fix tip (digest
+  1302965675 -> 1522095950; 112 r2's digest also moved, its round-2
+  gcw 0 -> 2; 63 r2's digest unchanged - its opened metas carried the
+  bound already).
+- **Root cause B (the model; frozen - ESCALATE, X5-R16).**
+  `Model::scan` (`src/model.rs`) iterates every commit's `Put`/
+  `Delete` ops and never accounts `Op::DropTree`/`Op::CreateTree`
+  (`trees_at` does). After `DropTree{t}` at ts d and `CreateTree{t}`
+  at ts r > d - both legal, durable, <= the round's cut -
+  `model.scan(t, S)` for S >= r returns the **pre-drop** content,
+  which no correct store can match (its tree t is the fresh
+  re-creation; the drop's walk freed the old pages). Minimal
+  deterministic reproduction, from the model's public API: commit
+  ts 1 `Put(t, k, v)`, ts 2 `Delete(catalog, t) + DropTree{t}`, ts 3
+  `CreateTree{t} + Put(catalog, t, "public")` - then
+  `model.scan(t, 3)` returns `k -> v` while every store that applied
+  the drop serves nothing for k. Trace repros (each deterministic,
+  owner ts < d < r <= the failing round's frontier): 112 r2 (d=8,
+  r=12, owner 5), 63 r2 (d=11, r=17, owner 5), and - from the folded
+  work - 1749 r2 (d=15, r=27, owner 4), 5549 r2 (d=13, r=23, owner
+  3), 7359 r2 (d=11, r=16, owner 3). Not the WAL, not the sim's
+  fault or crash model, not root cause A; the oracle and `model.rs`
+  are frozen by this card's Limits, so this is P's to rule on.
+- **The 0..200 window at the fix tip** (`X-5c-F3-F3a-F2.s4.0200.*`):
+  `FAILING_ROUNDS 10, TWIN 1, DEFECT 0` - and its C-DIV set is the
+  identical seven rounds as F3b's tip (63/104/112/120/125/152/186,
+  all r2). Traced with `E4_KEY_DIAG`
+  (`X-5c-F3-F3a-F2.s4.seed<N>.diag.err`): **every one of the seven
+  carries root cause B's DDL shape** - a DropTree of the failing tree
+  at ts d, a CreateTree of the same id later, and the divergent key's
+  owner ts below d (104: d=11 r=17; 120: d=10 r=17; 125: d=14 r=25;
+  152: d=8 r=11; 186: d=9 r=12). The whole window's C-DIV family is
+  the model gap; root cause A's (d) repro (664) lies outside the
+  window and now passes.
+
+**The folded X-5c-F3-F3b-F1 Work 1** (commit 204afb9a):
+`E4_O1_AT_FRONTIER` (stderr, default off, never a digest input) - the
+`E4_O1_DIAG` per-key diff at `c = clamp(frontier, lo, hi)` (the
+bounds derived exactly as `check_round` derives them, X5-R33's MW
+lower bound included), beside a thread-local capture
+(`o1f_capture_arm`/`o1f_capture_take`) that lets a pin read the lines
+without mutating a process-global env var. **Pin**
+`o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2`
+(`tests/harness.rs`): 1749 r2 (lo 40, hi 41, frontier 41) must name
+tree 4's first divergent key with `owner_ts=4` and `le_T=true` at
+`c=41`. **Mutant demonstrated** (the clamp replaced by `c = lo`, the
+first candidate): the pin fails ("the frontier candidate's diff must
+name tree 4's owner ts 4 with le_T at c=41"), reverted clean.
+
+**The folded Work 2 - the five MW repros at this card's tip** (each
+run twice, digests identical, `X-5c-F3-F3a-F2.f1w2.seed<N>.{a,b}.json`;
+fields from the round records and `E4_D_DIAG`):
+
+| Round | pass | o1 (first candidate) | frontier/lo/hi | x33h/x33a | lost/mis/torn | cover_err | digest |
+|---|---|---|---|---|---|---|---|
+| 1749 r2 | false | O-1(c) at c=40 (max ts 41) | 41/40/41 | 40/0 | 0/1/1 | false | 2987258781 |
+| 4139 r2 | **true** | none | 17/17/17 | 14/0 | 0/0/1 | false | 3227295539 |
+| 5549 r2 | false | O-1(c) at c=30 (max ts 32) | 32/32/33 | 30/21 | 1/1/0 | false | 2018609054 |
+| 5839 r2 | **true** | none | 50/50/50 | 43/0 | 1/0/0 | false | 2979793348 |
+| 7359 r2 | false | O-1(c) at c=11 (max ts 12) | 12/14/15 | 9/11 | 0/2/0 | false | 266568285 |
+
+**The folded Work 3 - the cut, per round** (the frontier diagnostic's
+first divergent key with its owner ts, and this card's key-history
+trace): in all five the frontier candidate's diff names an entry whose
+owner commit is <= T of the opened meta with `le_T=true` - the
+missing-<=T family, exactly as the gate's ESCALATE ruling classed
+them.
+
+- **4139 r2 and 5839 r2 are root cause A's** (this card's store fix):
+  both were O-1(d) failures at a historical S below the image's true
+  GC bound (4139: S=4; 5839: S=8), and both **pass at the fix tip**
+  (folded Work 4's re-run: each must pass or be an explained WAL-loss
+  `Err` - they pass, `cover_err` false, no WAL loss).
+- **1749 r2, 5549 r2 and 7359 r2 are root cause B's** (the model's
+  drop+recreate gap): each trace shows the DropTree of the failing
+  tree at ts d, the CreateTree of the same id at ts r, and the
+  divergent key's owner ts below d (1749: d=15, r=27, owner 4; 5549:
+  d=13, r=23, owner 3; 7359: d=11, r=16, owner 3); each FIRST-LOST is
+  the first image after the drop. The MW media fault is not a cause
+  in any of them: `cover_err` is false everywhere and no trace shows
+  a WAL byte the image depended on - the loss is image/model-side,
+  per the ruling's own classification. These three are the ESCALATE
+  above, never a local fix; the five are **not** an MW-ORPHAN
+  redesign failure (the gate's ruling (ii) stands: they count against
+  C-DIV).
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)

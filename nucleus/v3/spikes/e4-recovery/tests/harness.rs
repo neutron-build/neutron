@@ -1832,3 +1832,47 @@ fn x33_damage_maps_through_the_bound_name() {
         "the destination range maps through the same bound name: {ranges2:?}"
     );
 }
+
+/// **X-5c-F3-F3b-F1 Work 1 pin (folded into X-5c-F3-F3a-F2; the
+/// frontier-candidate diagnostic, a literal-config seed pin).** The
+/// round record's `o1` keeps the **first** failing candidate's error,
+/// so a round whose ruling failure sits at the recovery-frontier
+/// candidate reads O-1(c) "raw entry above the cut" instead. Seed
+/// 1749 round 2 is the verdict's own repro: `lo` 40, `hi` 41,
+/// frontier 41 — the diagnostic must name tree 4's first divergent key
+/// with its owner ts 4 and `le_T` at `c = 41` (the clamp of the
+/// frontier), never the first candidate's `c = 40` view. The capture
+/// seam (`o1f_capture_arm`) runs the diagnostic without touching a
+/// process-global env var; the stderr side stays behind
+/// `E4_O1_AT_FRONTIER`, default off.
+#[test]
+fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
+    e4_recovery::harness::o1f_capture_arm();
+    let rec = e4_recovery::workload::run_seed(1749, None);
+    let lines = e4_recovery::harness::o1f_capture_take();
+    assert!(
+        !lines.is_empty(),
+        "the diagnostic must fire on 1749's failing rounds (defect: {:?})",
+        rec.defect
+    );
+    let hit = lines
+        .iter()
+        .find(|l| {
+            l.contains("round=2")
+                && l.contains("tree=4")
+                && l.contains("c=41")
+                && l.contains("owner_ts=4")
+                && l.contains("le_T=true")
+        })
+        .cloned();
+    let Some(line) = hit else {
+        panic!(
+            "1749 r2: the frontier candidate's diff must name tree 4's\
+             \nowner ts 4 with le_T at c=41 — got {lines:?}"
+        );
+    };
+    assert!(
+        line.contains("lo=40") && line.contains("hi=41") && line.contains("frontier=41"),
+        "the bounds and the frontier travel with the line: {line}"
+    );
+}

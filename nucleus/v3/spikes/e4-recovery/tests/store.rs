@@ -4924,3 +4924,98 @@ fn g8_wal_sync_error_poisons() {
         let _ = wrote_after;
     }
 }
+
+/// **X-5c-F3-F3a-F2 Work 4 pin (S-STORE §10.5; a literal config).**
+/// `gc_w_used` starts at the recovered meta's `gc_w` at open, so a
+/// checkpoint taken before the first GC mutation of the new boot — the
+/// boot checkpoint of §14 step 8 above all — still records the image's
+/// bound. Fixture: a store that GC'd at `w = 5` and checkpointed it
+/// (its meta carries `gc_w = 5`), a clean crash, and a recovery that
+/// runs no GC before its boot checkpoint. The pin decodes the winning
+/// meta's bytes from the durable stream (never store memory) and
+/// asserts `gc_w = 5`. With the fix reverted (open leaving `gc_w_used`
+/// at 0), the boot checkpoint records 0 and this pin fails — the
+/// X-5c-F3-F3a-F2 trace of 664 r2 (image 3 `gc_w = 8`, its recovery's
+/// boot checkpoint `gc_w = 0`, O-1 (d) sampling S = 5 below the true
+/// bound and failing on a version legally pruned at `w = 8`).
+#[test]
+fn gc_w_survives_recovery_into_the_boot_checkpoint() {
+    let seed = 7111u64;
+    let cfg = tcfg(8, 8, 1);
+    // Life 1: a tree with two versions of one key, the apply frontier
+    // at 5 (two applied commits), a GC sweep at w = 4 (advancing
+    // `gc_w_used`), and a checkpoint that records both.
+    let disk = {
+        let (disk, st) = create_store(cfg.clone(), seed, Some(2));
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        cx.with("pin:vis", |c| {
+            let st = c.store();
+            st.seq.visible_ts = 5;
+            st.seq.next_ts = 6;
+            st.wal.last_commit_ts = 5;
+            Ok(())
+        })
+        .expect("apply frontier");
+        let root = tree::dir_root_of(&cx, 2).expect("tree 2 root");
+        ins(&cx, 2, root, b"A0", 1, &[1u8; 8]);
+        ins(&cx, 2, root, b"A0", 5, &[2u8; 8]);
+        let mut resume = Vec::new();
+        loop {
+            let next = tree::gc_step(&cx, 2, root, 4, &resume).expect("gc step at w=4");
+            if next.is_empty() {
+                break;
+            }
+            resume = next;
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        // The image this life leaves: its meta must carry gc_w = 4.
+        let g = sched.lock();
+        let pf = g.disk.stat(e4_recovery::sim::PAGE_FILE).expect("page file");
+        let m1 = g.disk.durable_read(pf, 4096, 4096);
+        let m2 = g.disk.durable_read(pf, 8192, 4096);
+        match e4_recovery::store::page::select_meta(&m1, &m2, false) {
+            e4_recovery::store::page::MetaPick::Win { meta, .. } => assert_eq!(
+                meta.gc_w, 4,
+                "the GC'd life's own meta must record gc_w = 4 (§10.5)"
+            ),
+            pick => panic!("no winning meta after the GC'd life: {pick:?}"),
+        }
+        g.disk.clone()
+    };
+    // Life 2: a clean crash, a recovery that runs no GC, and its boot
+    // checkpoint. The winning meta must still carry gc_w = 5.
+    let mut d2 = disk;
+    crash_clean(&mut d2, seed + 1);
+    let sched2 = pass_world(1, seed + 2, d2, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &sched2,
+        t: HARNESS,
+    };
+    let (st2, _frontier) = ckpt::recover(&cx2, cfg.clone()).expect("recover");
+    assert_eq!(
+        st2.gc_w_used, 4,
+        "open starts gc_w_used at the recovered meta's gc_w (§10.5)"
+    );
+    cx2.with("pin:install", |c| {
+        *c.store() = st2;
+        Ok(())
+    })
+    .expect("install");
+    cx_checkpoint(&sched2, |_| Ok(()));
+    let g = sched2.lock();
+    let pf = g.disk.stat(e4_recovery::sim::PAGE_FILE).expect("page file");
+    let m1 = g.disk.durable_read(pf, 4096, 4096);
+    let m2 = g.disk.durable_read(pf, 8192, 4096);
+    match e4_recovery::store::page::select_meta(&m1, &m2, false) {
+        e4_recovery::store::page::MetaPick::Win { meta, .. } => assert_eq!(
+            meta.gc_w, 4,
+            "the boot checkpoint after a recovery with no GC mutation still\
+             \nrecords the image's bound (§10.5) — the 664 r2 shape"
+        ),
+        pick => panic!("no winning meta after the boot checkpoint: {pick:?}"),
+    }
+}

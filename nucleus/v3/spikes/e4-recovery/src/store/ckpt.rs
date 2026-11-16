@@ -289,6 +289,17 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
     st.k = meta.ckpt_id;
     st.e = meta.epoch.max(1);
     st.meta = meta;
+    // **S-STORE §10.5 (X-5c-F3-F3a-F2 Work 4):** `gc_w_used` starts at
+    // the recovered meta's `gc_w`, so a checkpoint taken before the
+    // first GC mutation — the boot checkpoint of §14 step 8 included —
+    // still records the image's bound. The draft left it at 0, so every
+    // boot checkpoint after a recovery wrote `gc_w = 0` while the image
+    // it froze had already GC'd at `w > 0` (the trace of 664 r2: image
+    // 3 carried `gc_w = 8`, the boot checkpoint after the recovery of
+    // its crash recorded 0, and the oracle's O-1 (d) sample range then
+    // reached S = 5, below the image's true bound, failing the round on
+    // a version the store had legally pruned at `w = 8`).
+    st.gc_w_used = meta.gc_w;
     st.slots.slot_count = st.slots.slot_count.max(meta.slot_count);
     // Load the map and the free set from the durable bytes (§14 step 2).
     load_image(cx, &mut st, &meta)?;
