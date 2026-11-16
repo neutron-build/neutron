@@ -3,7 +3,7 @@
 # (../v2/crates/*); the kept v2 crates move into crates/ at the start of Phase B.
 [workspace]
 resolver = "3"
-members = ["crates/*", "spikes/*", "bench/*"]
+members = ["crates/*", "spikes/*", "bench/*", "xtask"]
 
 [workspace.package]
 version = "3.0.0-dev"
