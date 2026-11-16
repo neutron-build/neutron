@@ -737,19 +737,24 @@ enum Outcome {
     Corrupt,
 }
 
-/// `select_meta`'s decision as an outcome; an `Open`'s identity must be
-/// its newest meta's.
+/// `select_meta`'s decision as an outcome.
 fn outcome_of(d: &OpenDecision) -> Outcome {
     match d {
-        OpenDecision::Open(sel) => {
-            assert_eq!(sel.identity, sel.newest.identity, "{d:?}");
-            Outcome::Open {
-                newest: sel.newest.clone(),
-                previous: sel.previous.clone(),
-            }
-        }
+        OpenDecision::Open(sel) => Outcome::Open {
+            newest: sel.newest.clone(),
+            previous: sel.previous.clone(),
+        },
         OpenDecision::AllUnreadable => Outcome::AllUnreadable,
         OpenDecision::Corrupt(_) => Outcome::Corrupt,
+    }
+}
+
+/// Whether an `Open`'s identity is its newest meta's, as it must be: a
+/// valid copy has the file's identity (§2.2).
+fn identity_is_newest(d: &OpenDecision) -> bool {
+    match d {
+        OpenDecision::Open(sel) => sel.identity == sel.newest.identity,
+        OpenDecision::AllUnreadable | OpenDecision::Corrupt(_) => true,
     }
 }
 
@@ -926,6 +931,10 @@ fn t_meta_copies() {
             want,
             "the oracle on spot case {syms:?}, page 0 {page0:?}"
         );
+        assert!(
+            identity_is_newest(&got),
+            "spot case {syms:?}, page 0 {page0:?}: {got:?}"
+        );
     }
 
     // Part 2: ties in serial-number order, outside the cross product.
@@ -984,6 +993,10 @@ fn t_meta_copies() {
                             outcome_of(&got),
                             want,
                             "case {syms:?}, page 0 {page0:?}: select_meta gave {got:?}"
+                        );
+                        assert!(
+                            identity_is_newest(&got),
+                            "case {syms:?}, page 0 {page0:?}: {got:?}"
                         );
                         let class = match want {
                             Outcome::Open { .. } => "Open",
