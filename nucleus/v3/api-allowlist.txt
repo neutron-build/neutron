@@ -1,0 +1,8 @@
+# Public items of the core crates (nucleus-store, nucleus-env, nucleus-am,
+# nucleus-txn) that standard-tier (non-core) code may use. Checked by
+# scripts/check-api-surface.sh. One crate-qualified path per line (underscored
+# crate names); an entry allows itself and everything below it (variants,
+# associated items). Widening this is a premium decision.
+# Provenance (card A-1a): the header of nucleus/v2/api-allowlist.txt at
+# 187cb226a9bf57ab2a7ba6b2b90fb28cdaf27c6b. No entries yet: no standard-tier
+# crate uses a core crate (PLAN-v3 §6.1).

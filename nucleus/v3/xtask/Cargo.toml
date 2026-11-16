@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+description = "Repository tooling for nucleus v3: the API-surface lint's parser (PLAN-v3 §6.1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
