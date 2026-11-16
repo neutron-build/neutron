@@ -451,6 +451,35 @@ pub struct StoreInner {
     pub freeset_grew: bool,
     /// Stale-record stops at renamed segment starts (Q11).
     pub stale_seg_reads: u64,
+    /// **X5-R38 (card X-5c-F4-F1 step 3; a store observable, flags
+    /// only — never a behaviour input): the W12 window is open** — a
+    /// `wal_recycle` rename returned and its `sync_dir` has not yet
+    /// completed. A crash in this window leaves the rename volatile, so
+    /// F-CRASH's directory draw can drop it (Q12's shape).
+    pub w12_window: bool,
+    /// **X5-R38 (card X-5c-F4-F1 step 3; rework 2 of the P gate verdict
+    /// X-5c-F4-F1, ruling (i) binding): the W11 window's boundary `b`**
+    /// — a segment boundary whose segment a `wal_recycle` rename bound
+    /// and which has had no completed `sync_data` since, opened when a
+    /// `sync_data` of the segment below `b` completes with
+    /// `wal.written ≥ b` (that segment's whole extent is then durable,
+    /// so a recovery walk reaches `b`; a crash in the window makes the
+    /// walk hop into `b` and read its previous life's records — Q11's
+    /// shape). Closes when a `sync_data` of a segment at or above `b`
+    /// completes. `None` = closed. A store observable, flags only —
+    /// never a behaviour input.
+    pub w11_window: Option<u64>,
+    /// **X5-R38:** the scheduler-yield indices of the open windows'
+    /// first crashable yields (one entry per window opening): the
+    /// current yield count plus one, read at the set — the set itself
+    /// happens between two yield events, so the next yield index is
+    /// the first a `CrashSpec::Yield(k)` can land on with the window
+    /// open (the set's own index names a yield that has already fired,
+    /// and arming it would never trip). Recorded by the counting pass
+    /// through [`crate::harness::WorkloadObs`]; a diagnostic only.
+    pub w11_yields: Vec<u64>,
+    /// **X5-R38:** the same for the W12 windows.
+    pub w12_yields: Vec<u64>,
     /// Named park points (card Work 13: the D5 split parking): name →
     /// remaining yields. `park()` at a named point yields while a budget
     /// remains.
@@ -487,8 +516,28 @@ pub struct StoreInner {
     /// interval reached (folded at each checkpoint begin; the crash-time
     /// open interval is read beside it).
     pub dirty_max: u64,
+    /// **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2 — a store
+    /// observable, a diagnostic pending OQ-1):** the `n` the **open**
+    /// checkpoint's begin step folded (the interval it closed). 0 when
+    /// no checkpoint is open (reset at `ckpt:end` and on the abort path
+    /// of a non-crash failure — **never on a sim-crash unwind**, so the
+    /// crash-time `obs` snapshot sees the folded interval; rework 1 of
+    /// the P gate verdict X-5c-F4-F1). Never a behaviour input.
+    pub ckpt_closed_dirty: u64,
     /// Poison reason (I-FAIL-STOP).
     pub poisoned: Option<String>,
+    /// **X-5c-F4 step 4 (the MP poison+task-error class):** the poison
+    /// was created by the **checkpoint path's own fail-stop** — the
+    /// I-GCW bound (`gc_w > T` at the flip), §13 step 4's meta bound,
+    /// or a checkpoint step's non-Sim failure (the wrapper's mark) —
+    /// as opposed to an external G8 detection mark (a gated op's XX001
+    /// read, a background job's detection). The store's checkpoint
+    /// invariant violations must stay **loud** round failures (D12b's
+    /// fail-stop, D4's step-1/step-4 refusals), while G8's detected
+    /// damage ends the workload at the poison crash and the round is
+    /// judged by the oracle (its harness contract). The checkpointer
+    /// consults this flag; nothing else reads it.
+    pub poison_fail_stop: bool,
     /// A world-acquisition failure observed on a release path (S-BATON
     /// rule 4: loud, never swallowed). Release helpers (`gate_release`,
     /// `tree_unlock`, `unpin`, the eviction ungate, the checkpoint's
@@ -549,6 +598,10 @@ impl StoreInner {
             epoch_exhausted: 0,
             freeset_grew: false,
             stale_seg_reads: 0,
+            w12_window: false,
+            w11_window: None,
+            w11_yields: Vec::new(),
+            w12_yields: Vec::new(),
             parks: BTreeMap::new(),
             meta_durable_k: 0,
             fs_building: BTreeSet::new(),
@@ -557,7 +610,9 @@ impl StoreInner {
             q9_partial_flips: 0,
             dirty_now: BTreeSet::new(),
             dirty_max: 0,
+            ckpt_closed_dirty: 0,
             poisoned: None,
+            poison_fail_stop: false,
             baton_fail: None,
             wal: wal::WalState::default(),
         }

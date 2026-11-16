@@ -1372,6 +1372,35 @@ fn evictor_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
     }
 }
 
+/// **X-5c-F4 step 4 (the MP poison+task-error class): the checkpointer's
+/// G8 poison end** — the poisoned store is the end of the round's
+/// workload exactly as the script task's `Fail::Poisoned` arm ends it:
+/// the crash desc of record becomes `poison` (the `poison_crash` flag),
+/// `workload_done` is set, the wait keys are woken and the crash is
+/// delivered at once — so the round continues to its faults, recovery
+/// and the ruled oracle "as usual" (G8's harness contract), never
+/// failing through a harness task error for the store's own designed
+/// post-mark refusal.
+fn checkpoint_poison_end(cx: &Cx<'_, RoundWorld>) {
+    let world_crashed = cx
+        .with("h:ckpoison", |c| {
+            let crashed = c.sched_mut().crashed;
+            if !crashed {
+                let h = c.h();
+                h.poison_crash = true;
+                h.workload_done = true;
+            }
+            Ok(crashed)
+        })
+        .unwrap_or(true);
+    if !world_crashed {
+        cx.w.wake(WaitKey::WalAcks);
+        cx.w.wake(WaitKey::MetaDurable);
+        cx.w.wake(WaitKey::Applied);
+        cx.w.deliver_crash();
+    }
+}
+
 fn checkpointer_body(
     cx: &Cx<'_, RoundWorld>,
     every: u64,
@@ -1383,7 +1412,17 @@ fn checkpointer_body(
             .with("h:ck", |c| {
                 if c.sched_mut().crashed || c.store().poisoned.is_some() {
                     // G8 (9.2, W8 (e)): the checkpointer issues no step
-                    // after the mark.
+                    // after the mark. **X-5c-F4-F1 step 5:** the quiet
+                    // poll arm that stood here is deleted — with the
+                    // mid-checkpoint `Fail::Poisoned` arm in place,
+                    // every schedule it covered (a mark observed at the
+                    // poll) produces an identical record through the
+                    // final checkpoint below, whose `ckpt:begin`
+                    // refuses on `alive()` with the same external-mark
+                    // `Fail::Poisoned` and ends the workload at the
+                    // same poison crash. A fail-stop mark
+                    // (`poison_fail_stop`) keeps its loud task error
+                    // through the generic arm below, exactly as before.
                     return Ok((true, true));
                 }
                 let h = c.h();
@@ -1457,6 +1496,50 @@ fn checkpointer_body(
             match r {
                 Err(Fail::Sim(SimFail::Crashed)) => return Ok(()),
                 Err(Fail::Sim(s)) => return Err(s),
+                Err(Fail::Poisoned(why)) => {
+                    // **X-5c-F4 step 4:** the mark landed mid-checkpoint
+                    // and this step's `alive()` refused. For an external
+                    // G8 detection mark that is the designed refusal
+                    // ("every later mutation refuses with
+                    // `Fail::Poisoned`"), never a round-failing task
+                    // error: the workload ends at the poison crash, as
+                    // the script task's arm ends it. A **fail-stop**
+                    // mark (`poison_fail_stop`) keeps the loud path —
+                    // the store's checkpoint invariant violations fail
+                    // the round with the same text the generic error
+                    // arm records.
+                    //
+                    // **X-5c-F4-F1 step 5 (P ruling (c)): this is the
+                    // one quiet checkpointer arm.** The draft's `h:ck`
+                    // poll arm (X-5c-F4 step 4's first half) was
+                    // deleted: with this arm present, every schedule
+                    // the poll arm covered produces an identical record
+                    // through it — the draft poll path ran a "final"
+                    // checkpoint whose `ckpt:begin` refused on
+                    // `alive()` with the same `Fail::Poisoned`, which
+                    // this arm ends the same way (the demonstration is
+                    // the step-5 record in the README) — so the poll
+                    // arm was unreachable alone and no single-arm pin
+                    // could exist for it.
+                    let fail_stop = cx
+                        .with("h:ckpoisontype", |c| Ok(c.store().poison_fail_stop))
+                        .map_err(fail_of)?;
+                    if !fail_stop {
+                        checkpoint_poison_end(cx);
+                    } else {
+                        let e = Fail::Poisoned(why);
+                        cx.with("h:ckfail", |c| {
+                            let h = c.h();
+                            if h.task_error.is_none() {
+                                h.task_error = Some(format!("checkpoint failed: {e:?}"));
+                            }
+                            h.workload_done = true;
+                            Ok(())
+                        })
+                        .ok();
+                    }
+                    return Ok(());
+                }
                 Err(e) => {
                     // A checkpoint that fails without a crash (the
                     // I-GCW fail-stop, a poisoned store) is a round
@@ -1904,6 +1987,31 @@ pub struct WorkloadObs {
     pub freeset_grew: bool,
     /// Stale-record stops at renamed segment starts (Q11).
     pub stale_seg_reads: u64,
+    /// **X5-R38 (card X-5c-F4-F1 step 3):** the scheduler-yield indices
+    /// of the W11 windows that opened during the pass — ruling (i) of
+    /// the rework gate: a `sync_data` of the segment below a boundary
+    /// `b` completed with `wal.written ≥ b`, while `b` is a recycled
+    /// segment with no completed `sync_data` since its rename. The
+    /// counting pass records them (the crash draw's window list); a
+    /// diagnostic only.
+    pub w11_yields: Vec<u64>,
+    /// **X5-R38:** the same for the W12 windows — a `wal_recycle`
+    /// rename returned, its `sync_dir` not yet complete.
+    pub w12_yields: Vec<u64>,
+    /// **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2):** the `n` the
+    /// open checkpoint's begin step folded (0 when no checkpoint is
+    /// open at the crash). A diagnostic pending OQ-1, never an exit
+    /// input.
+    pub ckpt_closed_dirty: u64,
+    /// **X5-R38, rework 2 (P gate verdict X-5c-F4-F1): the W11 window's
+    /// boundary at the crash** — a snapshot of the store's open
+    /// [`crate::store::StoreInner::w11_window`] (`Some(b)`: the crash
+    /// landed inside a W11 window whose guarantee is "the walk reaches
+    /// `b`"). A diagnostic only, never a behaviour input or a digest
+    /// input; it exists so the rework's pin can assert the walk
+    /// property itself (ruling (i): "so the walk reaches `b`") beside
+    /// the Q11 outcome.
+    pub w11_open: Option<u64>,
     /// Flips whose image held part of a commit above `T` (Q9).
     pub q9_partial_flips: u64,
     /// LPIDs dirtied in the still-open interval (Work 5.3's crash-time
@@ -2252,6 +2360,10 @@ pub fn run_round(
             epoch_exhausted: st.epoch_exhausted,
             freeset_grew: st.freeset_grew,
             stale_seg_reads: st.stale_seg_reads,
+            w11_yields: st.w11_yields.clone(),
+            w12_yields: st.w12_yields.clone(),
+            w11_open: st.w11_window,
+            ckpt_closed_dirty: st.ckpt_closed_dirty,
             q9_partial_flips: st.q9_partial_flips,
             dirty_now_len: st.dirty_now.len() as u64,
             dirty_max: st.dirty_max,

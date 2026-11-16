@@ -5021,3 +5021,147 @@ fn gc_w_survives_recovery_into_the_boot_checkpoint() {
         pick => panic!("no winning meta after the boot checkpoint: {pick:?}"),
     }
 }
+
+/// **Q11 (card X-5c-F4-F1 step 2; P ruling nv3-X-5c-F4-esc-1's
+/// ESCALATE 3): the counter was never wired.** This literal fixture
+/// builds the recycled-segment shape by hand on a real created disk:
+/// a meta whose replay start sits in segment A, a `SegmentEnd` at that
+/// start (the walk hops to segment B's first LSN), and segment B a
+/// *recycled* file — created in a previous life, its durable bytes at
+/// offset 0 a fully valid record whose embedded lsn is its OLD
+/// position. The walk's decode fails at `off == 0`,
+/// [`wal::is_stale_record`] holds, and the counter increments; the
+/// walk then stops exactly as it always did (the valid end — and
+/// everything downstream of it — is identical without the increment,
+/// which is what the M-Q11UNWIRED revert demonstrates).
+#[test]
+fn q11_stale_record_at_recycled_segment_start_counts() {
+    use e4_recovery::store::page;
+    let seed = 4242u64;
+    let cfg = tcfg(8, 12, 2);
+    let (disk, st0) = e4_recovery::harness::create_store(cfg.clone(), seed, 77).expect("create");
+    let mut disk = disk;
+    let pf = disk.stat(e4_recovery::sim::PAGE_FILE).expect("page file");
+    // Segment A (boundary 64 KiB): a SegmentEnd at L, at its own position.
+    let l = e4_recovery::store::WAL_SEG + 100;
+    let seg_a = e4_recovery::store::WAL_SEG;
+    let fa = disk
+        .create(&format!("/wal/{seg_a:016x}.log"))
+        .expect("segment A");
+    let se =
+        e4_recovery::store::wal::enc_record(e4_recovery::store::wal::K_SEGEND, (7, 0), 0, &[], l);
+    disk.write_at(fa, l - seg_a, &se).expect("write A");
+    disk.sync_data(fa).expect("sync A");
+    // Segment B (boundary 128 KiB): the recycled file. Its bytes at
+    // offset 0 are a record of its PREVIOUS life — magic, len and CRC
+    // intact, the embedded lsn an old position (42) that is not B's
+    // first LSN.
+    let b = 2 * e4_recovery::store::WAL_SEG;
+    let fb = disk
+        .create(&format!("/wal/{b:016x}.log"))
+        .expect("segment B");
+    let stale =
+        e4_recovery::store::wal::enc_record(e4_recovery::store::wal::K_COMMIT, (7, 1), 5, &[], 42);
+    disk.write_at(fb, 0, &stale).expect("write B");
+    disk.sync_data(fb).expect("sync B");
+    disk.sync_dir("/wal/").expect("dirsync");
+    // A meta that replays from L: meta 1 (its own slot, 2), the created
+    // image's fields, T = ts_ckpt_hi = 0 and wal_ckpt_end = L.
+    let meta = page::Meta {
+        ckpt_id: 1,
+        t: 0,
+        gc_w: 0,
+        epoch: st0.e,
+        boot_id: 7,
+        map_root: st0.meta.map_root,
+        free_root: st0.meta.free_root,
+        dir_root: st0.meta.dir_root,
+        next_lpid: st0.meta.next_lpid,
+        slot_count: st0.meta.slot_count,
+        wal_start_lsn: l,
+        wal_ckpt_end: l,
+        ts_ckpt_hi: 0,
+    };
+    disk.write_at(pf, 2 * page::PAGE as u64, &page::build_meta(&meta))
+        .expect("meta 1");
+    disk.sync_all(pf).expect("meta sync");
+    // Recover: the walk accepts the SegmentEnd at L, hops to B's first
+    // LSN, reads the stale bytes and stops there.
+    let sched = pass_world(1, seed + 2, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    let (st, _frontier) = ckpt::recover(&cx, cfg).expect("recover");
+    assert_eq!(
+        st.stale_seg_reads, 1,
+        "the stale record at the recycled segment's start is counted (Q11)"
+    );
+    assert_eq!(
+        st.wal.append, b,
+        "the valid end is B's first LSN — the walk stops exactly where it always did"
+    );
+}
+
+/// **Q11's mid-segment half:** a stale record at a NON-zero offset is
+/// §12.5's ordinary invalid tail, never a recycled segment's start —
+/// the counter must stay 0. M-Q11ANY (count at any offset) fails this
+/// pin. The walk reads a valid Chunk record at L, then meets the stale
+/// bytes at `L + 45` and stops there; the valid end is that position.
+#[test]
+fn q11_mid_segment_stale_does_not_count() {
+    use e4_recovery::store::page;
+    let seed = 4343u64;
+    let cfg = tcfg(8, 12, 2);
+    let (disk, st0) = e4_recovery::harness::create_store(cfg.clone(), seed, 77).expect("create");
+    let mut disk = disk;
+    let pf = disk.stat(e4_recovery::sim::PAGE_FILE).expect("page file");
+    let seg = e4_recovery::store::WAL_SEG;
+    let l = seg + 100;
+    let f = disk
+        .create(&format!("/wal/{seg:016x}.log"))
+        .expect("segment");
+    // A valid Chunk at L (ts reserved 0; no marker → never applied),
+    // then a stale record immediately after it, mid-segment.
+    let chunk =
+        e4_recovery::store::wal::enc_record(e4_recovery::store::wal::K_CHUNK, (7, 5), 0, &[], l);
+    disk.write_at(f, l - seg, &chunk).expect("write chunk");
+    let mid = l + chunk.len() as u64;
+    let stale =
+        e4_recovery::store::wal::enc_record(e4_recovery::store::wal::K_COMMIT, (7, 1), 5, &[], 42);
+    disk.write_at(f, mid - seg, &stale).expect("write stale");
+    disk.sync_data(f).expect("sync");
+    disk.sync_dir("/wal/").expect("dirsync");
+    let meta = page::Meta {
+        ckpt_id: 1,
+        t: 0,
+        gc_w: 0,
+        epoch: st0.e,
+        boot_id: 7,
+        map_root: st0.meta.map_root,
+        free_root: st0.meta.free_root,
+        dir_root: st0.meta.dir_root,
+        next_lpid: st0.meta.next_lpid,
+        slot_count: st0.meta.slot_count,
+        wal_start_lsn: l,
+        wal_ckpt_end: l,
+        ts_ckpt_hi: 0,
+    };
+    disk.write_at(pf, 2 * page::PAGE as u64, &page::build_meta(&meta))
+        .expect("meta 1");
+    disk.sync_all(pf).expect("meta sync");
+    let sched = pass_world(1, seed + 2, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    let (st, _frontier) = ckpt::recover(&cx, cfg).expect("recover");
+    assert_eq!(
+        st.stale_seg_reads, 0,
+        "a stale record at a mid-segment offset is never counted (Q11 counts only a segment start)"
+    );
+    assert_eq!(
+        st.wal.append, mid,
+        "the valid end is the stale record's start — the walk shape is unchanged"
+    );
+}

@@ -36,7 +36,7 @@
 //! any record in a created or renamed segment is counted durable or
 //! acked; `sync_dir("/")` after creating the page file and `wal/`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Cx, Fail, Mutant, StoreHost, StoreInner, WAL_SEG};
 use crate::crc::crc32c;
@@ -257,6 +257,19 @@ pub fn dec_record_with_lsn_check(
     )
 }
 
+/// **Q11 (card X-5c-F4-F1 step 2; P ruling nv3-X-5c-F4-esc-1's
+/// ESCALATE 3):** do the bytes at `lsn` decode as a **stale** record —
+/// magic, `len` and CRC all valid, but the embedded lsn ≠ the expected
+/// position (a recycled segment's previous-life content at its start)?
+/// Implemented through [`dec_record_inner`] (the skip-lsn-check decode
+/// succeeds where the checked decode fails — never a second copy of
+/// the check). The counter it feeds (`stale_seg_reads`) is an
+/// observable only: the walk's stop never changes.
+pub fn is_stale_record(b: &[u8], lsn: u64, seg_end: u64) -> bool {
+    dec_record_inner(b, lsn, seg_end, true).is_ok_and(|r| r.is_some())
+        && dec_record_inner(b, lsn, seg_end, false).is_err()
+}
+
 fn dec_record_inner(
     b: &[u8],
     lsn: u64,
@@ -370,6 +383,14 @@ pub struct WalState {
     /// The flips' enqueue positions, in flip order (M-CKPT-T's hook: the
     /// card names this supply, Work 3.10; read only by the monitors).
     pub flip_enqueue_pos: Vec<u64>,
+    /// **X5-R38 (a store observable's support set, never a behaviour
+    /// input):** segment boundaries a `wal_recycle` rename has bound,
+    /// with no completed `sync_data` of a segment at or above them
+    /// since — the recycled segments whose durable start still holds
+    /// the previous life's records (W11's condition "a recycled
+    /// segment's untouched start"). A completed sync of segment `s`
+    /// removes every boundary `≤ s`.
+    pub recycled_unsynced: BTreeSet<u64>,
 }
 
 /// The first LSN of the segment containing `lsn`.
@@ -681,6 +702,12 @@ fn wal_write_batch<H: StoreHost>(
                 )));
             }
             cx.env().sync_data(f).map_err(Fail::Sim)?;
+            // X5-R38: the W11 window note after this segment's sync.
+            cx.with("wal_writer:w11", |c| {
+                let y = c.sched_mut().yields + 1;
+                w11_window_note(c.store(), seg, y);
+                Ok(())
+            })?;
         }
     }
     cx.with("wal_writer:durable", |c| {
@@ -726,6 +753,51 @@ fn check_wal_inv(st: &StoreInner) -> Result<(), Fail> {
         )));
     }
     Ok(())
+}
+
+/// **X5-R38 (card X-5c-F4-F1 step 3; observables only; rework 2 of the
+/// P gate verdict X-5c-F4-F1, ruling (i) binding): the W11 window note,
+/// called right after a WAL `sync_data` of segment `seg` completes**
+/// (the writer's group-sync loop and `wal_sync_through`'s helper loop —
+/// the two sync sites). Ruling (i): "**W11.** Let `b` be a segment
+/// boundary whose segment a `wal_recycle` rename bound and which has
+/// had no completed `sync_data` since. W11 opens when a `sync_data` of
+/// the segment below `b` completes with `wal.written ≥ b`: that
+/// segment's whole extent, filler or boundary-ending record included,
+/// is then durable, so the walk reaches `b`. It closes when a
+/// `sync_data` of a segment at or above `b` completes. 'Untouched'
+/// means the durable image: a write at ≥ `b` may be issued and still
+/// volatile, and F-CRASH decides whether it survives. Q11 then requires
+/// that `b`'s first sector does not survive with new content." The
+/// `wal.written ≥ b` term is the rework's fix (the gate's finding 2):
+/// without it the window opened on **any** completed sync of the
+/// segment below `b` — durable 261,147, written 263,952, `b` 262,144
+/// at seed 4 — so the crash landed where the walk stops on zeros below
+/// `b` and Q11 could never hit (0 of 150 picks as built; 45 of 79 with
+/// the fix over 0..200, gate-measured). `y` is the next yield index
+/// (the caller's current count + 1 — the window's first crashable
+/// yield; the note runs between two yield events, so the current count
+/// itself names a yield that has already fired).
+fn w11_window_note(st: &mut StoreInner, seg: u64, y: u64) {
+    let b = seg + WAL_SEG;
+    // This sync made segment `seg`'s extent durable — every pending
+    // boundary at or below `seg` is retired, and a W11 window whose own
+    // boundary just became durable closes.
+    if st.w11_window.is_some_and(|w| w <= seg) {
+        st.w11_window = None;
+    }
+    st.wal.recycled_unsynced.retain(|x| *x > seg);
+    if st.wal.segs.contains_key(&b)
+        && st.wal.recycled_unsynced.contains(&b)
+        // Ruling (i)'s opening term: the segment below `b` synced only
+        // with its whole extent written — `written ≥ b` — does the walk
+        // reach `b` (the rework's fix).
+        && st.wal.written >= b
+        && st.w11_window.is_none()
+    {
+        st.w11_window = Some(b);
+        st.w11_yields.push(y);
+    }
 }
 
 /// Wait until the WAL is durable through `lsn` (a SyncOn ack). Waiting
@@ -846,6 +918,12 @@ fn wal_sync_through<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fail> 
         })?;
         if let Some(f) = f {
             cx.env().sync_data(f).map_err(Fail::Sim)?;
+            // X5-R38: the W11 window note after this segment's sync.
+            cx.with("wal_sync:w11", |c| {
+                let y = c.sched_mut().yields + 1;
+                w11_window_note(c.store(), seg, y);
+                Ok(())
+            })?;
         }
         seg += WAL_SEG;
     }
@@ -1036,18 +1114,38 @@ pub fn wal_recycle<H: StoreHost>(cx: &Cx<'_, H>, wal_start: u64) -> Result<u64, 
                 ))
             })?;
             cx.with("wal_recycle:rebind", |c| {
+                // X5-R38: the current yield count, read before the
+                // store borrow (the set records `current + 1`).
+                let y = c.sched_mut().yields + 1;
                 let st = c.store();
                 st.wal.segs.remove(&first);
                 st.wal.segs.insert(to, fid);
                 if skip {
                     st.wal.seg_needs_dirsync.push(to);
                 }
+                // **X5-R38 (card X-5c-F4-F1 step 3; observables only):
+                // the W12 window opens** — the rename returned, its
+                // `sync_dir` has not. The recorded yield index is the
+                // next one: the set happens between two yield events,
+                // so `current + 1` is the first index a
+                // `CrashSpec::Yield(k)` can fire on with the rename
+                // done and the dirsync not (firing at `current` itself
+                // is in the past — the crash would have preceded the
+                // rename). The boundary also becomes
+                // `recycled_unwritten` (W11's condition's input).
+                st.w12_window = true;
+                st.w12_yields.push(y);
+                st.wal.recycled_unsynced.insert(to);
                 Ok(())
             })?;
             if !skip {
                 cx.env().sync_dir("/wal/").map_err(Fail::Sim)?;
                 cx.with("wal_recycle:dirsynced", |c| {
-                    c.store().wal.seg_needs_dirsync.clear();
+                    let st = c.store();
+                    st.wal.seg_needs_dirsync.clear();
+                    // X5-R38: the dirsync completed — the W12 window
+                    // closes.
+                    st.w12_window = false;
                     Ok(())
                 })?;
             }

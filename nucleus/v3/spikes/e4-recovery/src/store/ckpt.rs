@@ -610,16 +610,37 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
                 let st = c.store();
                 if st.poisoned.is_none() {
                     st.poisoned = Some(format!("checkpoint step failed: {e} (9.2, G8)"));
+                    // X-5c-F4 step 4: a checkpoint step's own failure is
+                    // the checkpoint path's fail-stop — loud (the
+                    // checkpointer consults the flag). An external G8
+                    // mark (already set) keeps its quiet detection end.
+                    st.poison_fail_stop = true;
                 }
                 Ok(())
             })
             .ok();
         }
+        // **Rework 1 (P gate verdict X-5c-F4-F1, finding 1): a sim-crash
+        // unwind must not reset the SIZING-C observable.** `obs` is
+        // snapshotted when the tasks end — after the unwinding
+        // checkpointer gets its turn — so resetting here made
+        // `ckpt_closed_dirty` 0 in every crash round (0 of 15,386 at the
+        // first attempt's tip), and `szc`'s second disjunct was dead. A
+        // non-crash failure keeps the reset (no checkpoint is open once
+        // the abort path has run); `ckpt_open` and the rest reset on
+        // every `Err` exactly as before.
+        let crash_unwind = matches!(e, Fail::Sim(_));
         cx.with("ckpt:abort", |c| {
             let st = c.store();
             st.ckpt_open = false;
             st.flip_window = false;
             st.image_frozen = None;
+            // SIZING-C: no checkpoint is open (the abort path) — except
+            // across a sim-crash unwind, where the observable must
+            // survive into the crash-time `obs` snapshot.
+            if !crash_unwind {
+                st.ckpt_closed_dirty = 0;
+            }
             Ok(())
         })
         .ok();
@@ -646,6 +667,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let n = st.dirty_now.len() as u64;
         st.dirty_max = st.dirty_max.max(n);
         st.dirty_now.clear();
+        // SIZING-C (X-5c-F4-F1 step 4): the open checkpoint's folded n,
+        // an observable only (0 when no checkpoint is open).
+        st.ckpt_closed_dirty = n;
         Ok(())
     })?;
     hooks(CkptHook::Before0)?;
@@ -682,6 +706,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let skip_bound = matches!(st.cfg.mutant, Some(Mutant::GcwBoundSkip));
         if over && !skip_bound {
             st.poisoned = Some("gc_w > T at meta write".into());
+            // X-5c-F4 step 4: the checkpoint path's own fail-stop stays
+            // loud (the checkpointer consults the flag).
+            st.poison_fail_stop = true;
             return Ok(FlipOut::Abort(Fail::Poisoned("gc_w > T".into())));
         }
         if matches!(st.cfg.mutant, Some(Mutant::GcwNotRecorded)) {
@@ -888,6 +915,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
                 let st = c.store();
                 if st.poisoned.is_none() {
                     st.poisoned = Some(why.clone());
+                    // X-5c-F4 step 4: the checkpoint path's own fail-stop
+                    // stays loud (the checkpointer consults the flag).
+                    st.poison_fail_stop = true;
                 }
                 Ok(())
             })
@@ -979,6 +1009,8 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let st = c.store();
         st.ckpt_done += 1;
         st.ckpt_open = false;
+        // SIZING-C: no checkpoint is open.
+        st.ckpt_closed_dirty = 0;
         Ok(())
     })?;
     // `wait_ckpt` (Work 13) polls `force_ckpt || ckpt_open`; the step-5
@@ -1556,7 +1588,23 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                         continue 'outer;
                     }
                 }
-                Ok(None) | Err(()) => break 'outer,
+                Ok(None) | Err(()) => {
+                    // **Q11 (card X-5c-F4-F1 step 2; P ruling
+                    // nv3-X-5c-F4-esc-1's ESCALATE 3):** the decode
+                    // failed at the segment's first LSN (`off == 0`)
+                    // and the bytes are a *stale record* — magic, `len`
+                    // and CRC valid, the embedded lsn ≠ the position —
+                    // so this is a recycled segment's previous-life
+                    // content (a fresh segment starts zeroed: stale
+                    // content at a segment's start can only be a
+                    // recycled segment's). Count it, then stop exactly
+                    // as before — the walk's valid end never moves with
+                    // the counter (an observable only).
+                    if off == 0 && wal::is_stale_record(&bytes, lsn, seg + WAL_SEG) {
+                        st.stale_seg_reads += 1;
+                    }
+                    break 'outer;
+                }
             }
         }
         break 'outer;

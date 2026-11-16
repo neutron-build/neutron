@@ -40,14 +40,14 @@ fn smoke_16_seeds() {
         // failed round or a recovery without a store ends the chain —
         // recorded, never hidden).
         assert!(
-            rec.rounds.len() as u32 <= Knobs::derive(seed, 0).rounds,
+            rec.rounds.len() as u32 <= Knobs::derive(seed, 0, &workload::Tuning::BASE).rounds,
             "seed {seed}: round count {} over the knobs",
             rec.rounds.len()
         );
         if !rec.stopped_early {
             assert_eq!(
                 rec.rounds.len() as u32,
-                Knobs::derive(seed, 0).rounds,
+                Knobs::derive(seed, 0, &workload::Tuning::BASE).rounds,
                 "seed {seed}: round count without an early stop"
             );
         }
@@ -86,6 +86,435 @@ fn smoke_16_seeds() {
         assert_eq!(x.seed, y.seed);
         assert_eq!(x.digest, y.digest, "seed {} differs across threads", x.seed);
     }
+}
+
+/// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; this card's step 1): the
+/// frozen-tuning digest-literal pin.** A seed pin's identity is
+/// `(generator, seed)`, not the seed alone: every literal below is the
+/// digest of `run_seed_with(seed, None, &Tuning::BASE)` — 1b0ce54e's
+/// generator, bit for bit — copied from X-5c-F4's Acceptance file
+/// (`$HOME/.cache/nv3-review/runlogs/X-5c-F4.acc.campaign.json`, sha256
+/// `bec7056c4463b5b812f8d27a162046cd42be1f1242970b1da4da458305ab3ac6`,
+/// prov `commit=1b0ce54e63d044b239cae497d22104ccced41cba`), except
+/// seed 4's literal, which moved with step 2's Q11 wiring (its r0 Q11
+/// flag flipped 0→1 — the only digest input the wiring touches;
+/// X5-R37's moved-digest rule). The seed
+/// list is every seed any test passes to a seed runner (found by grep
+/// over `tests/`, cross-checked against P's 43-seed list; the smoke and
+/// round-trip seeds 0–9 are the grep's additions from the file, and P's
+/// 7359 — one of the C-DIV-in-MW five — is run by no test at this tip;
+/// the rework-1 pins added 41 and 303, their literals taken from the
+/// same file — neither moved with the rework's store fixes, `szc` not
+/// being a digest input).
+/// M-BASEDRIFT (one BASE constant changed) fails this pin.
+#[test]
+fn x5_r37_base_tuning_reproduces_1b0ce54e() {
+    const WANT: &[(u64, u64)] = &[
+        (0, 49696441),
+        (1, 1198539130),
+        (2, 927823387),
+        (3, 923362676),
+        (4, 1441374082),
+        (5, 980071820),
+        (6, 2097771150),
+        (7, 2267580514),
+        (8, 861904777),
+        (9, 429574859),
+        (10, 1043516495),
+        (11, 3292953852),
+        (12, 1120327746),
+        (13, 2781612228),
+        (14, 2027633753),
+        (15, 3135194667),
+        (41, 2325274127),
+        (47, 2526989435),
+        (48, 605204002),
+        (60, 2199024193),
+        (66, 123257877),
+        (67, 1488955537),
+        (112, 2157138087),
+        (118, 4034749261),
+        (198, 649857276),
+        (221, 2732451886),
+        (268, 317704428),
+        (303, 859193035),
+        (308, 522943877),
+        (387, 2151920803),
+        (403, 2657356820),
+        (537, 2279204905),
+        (660, 3256450980),
+        (747, 4071845386),
+        (907, 2332284720),
+        (967, 2847369120),
+        (987, 2492798953),
+        (1267, 1225086008),
+        (1749, 1584051239),
+        (1769, 2372375821),
+        (1787, 1119157608),
+        (1887, 3622450829),
+        (2669, 357787865),
+        (2927, 1901399424),
+        (4049, 2182387428),
+        (4309, 3466635396),
+        (5549, 308297210),
+        (5808, 2754578359),
+        (6149, 2623005576),
+        (7469, 3635220225),
+        (7528, 1612546402),
+        (8728, 3345856243),
+        (9809, 1177349546),
+    ];
+    // The seeds are independent (S-DET/W-DET, pinned), so the pin runs
+    // them across a small thread pool; the digests are byte-identical
+    // to a serial run.
+    let got: Vec<(u64, u64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = WANT
+            .iter()
+            .map(|(seed, _)| {
+                s.spawn(move || {
+                    let rec = workload::run_seed_with(*seed, None, &workload::Tuning::BASE);
+                    (*seed, rec.digest)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or((u64::MAX, u64::MAX)))
+            .collect()
+    });
+    for ((seed, want), (_, actual)) in WANT.iter().zip(got.iter()) {
+        assert_eq!(
+            want, actual,
+            "seed {seed}: Tuning::BASE must reproduce 1b0ce54e's digest bit for bit (X5-R37)"
+        );
+    }
+}
+
+/// **X5-R37: this card does no retune** — `Tuning::FINAL` equals
+/// `Tuning::BASE` at this card's tip (X-5c-F4's relaunch is the only
+/// card that may change FINAL, and the probe shares it sets in step 3
+/// are reverted).
+#[test]
+fn x5_r37_final_equals_base_at_this_tip() {
+    assert_eq!(
+        workload::Tuning::FINAL,
+        workload::Tuning::BASE,
+        "this card builds the machinery only: FINAL == BASE (the card's Goal)"
+    );
+}
+
+/// **Q11's seed pin (card X-5c-F4-F1 step 2): P's probe hit.** Seed 4
+/// round 0, under `Tuning::BASE`: the round's WAL crossed into a
+/// recycled segment whose start still held its previous life's
+/// records, the recovery walk read them, and the wired counter fires
+/// the Q11 flag (P's probe of 2026-11-04: wired, 1 hit in 891 rounds
+/// over 0..600, seed 4 r0 — ≈ 15 per 10k rounds; "probe, not
+/// evidence"; the wiring alone cannot meet Q11's 100, which is what
+/// X5-R38's W11 targets).
+#[test]
+fn q11_seed4_round0_reads_a_stale_record_at_a_recycled_segment_start() {
+    let rec = workload::run_seed_with(4, None, &workload::Tuning::BASE);
+    let r0 = &rec.rounds[0];
+    assert!(
+        r0.q11_stale_seg,
+        "seed 4 r0: the stale record read at the recycled segment's start must set the Q11 flag"
+    );
+}
+
+/// **Rework 1 (P gate verdict X-5c-F4-F1, finding 1; the verdict's
+/// named pins): a sim-crash unwind must not reset `ckpt_closed_dirty`
+/// — `RoundRec.szc` is true through the second disjunct.** The verdict:
+/// "`checkpoint()`'s `ckpt:abort` runs on every `Err`, including a sim
+/// crash, because the unwinding task gets its turn; it sets
+/// `ckpt_closed_dirty = 0` before `run_round` snapshots `obs`" — 0 in
+/// 15,386 rounds at the first attempt's tip, the second disjunct dead.
+/// With the fix, the folded `n` survives the unwind into the crash-time
+/// snapshot. Literal configs (both measured, under `Tuning::BASE`):
+/// **seed 41 round 2** crashes at `After1@0` and **seed 303 round 2**
+/// at `After3@0` — a checkpoint open at the crash whose begin step
+/// folded 221 (41; 4·F = 208) and 241 (303; 4·F = 196) dirtied LPIDs
+/// while the open interval at the crash held only 1 and 3 — so the
+/// record's `szc` can only be true through `ckpt_closed_dirty ≥ 4·F`.
+/// The record shows `szc` itself (the verdict's form); that the pins
+/// pin the disjunct and the unwind is proven by the mutants:
+/// M-SZC-ABORTRESET (reset on every `Err`) and M-SZC-NOCK (the
+/// disjunct removed) each fail this pin. `szc` is not a digest input —
+/// no digest moves (both seeds' literals in the X5-R37 pin are F4's
+/// own).
+#[test]
+fn szc_survives_the_sim_crash_unwind_into_the_record() {
+    for (seed, hook, four_f) in [(41u64, "After1@0", 208u64), (303, "After3@0", 196)] {
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
+        assert!(rec.defect.is_none(), "seed {seed}: {:?}", rec.defect);
+        let r2 = rec
+            .rounds
+            .get(2)
+            .unwrap_or_else(|| panic!("seed {seed}: three rounds"));
+        assert_eq!(
+            r2.crash, hook,
+            "seed {seed} r2: the pinned hook crash (the open checkpoint at the crash)"
+        );
+        assert!(r2.fired, "seed {seed} r2: the crash fired");
+        assert!(
+            r2.szc,
+            "seed {seed} r2: szc must be true — the open checkpoint folded \
+             ≥ 4·F = {four_f} LPIDs and the unwind must not reset it"
+        );
+        assert!(
+            r2.pass,
+            "seed {seed} r2: the round passes: o1={:?} o2={:?} o3={:?}",
+            r2.o1_fail, r2.o2_fail, r2.o3_fail
+        );
+    }
+}
+
+/// **Rework 1, the record-level M-SZC-ANY pin (the card's own mutant
+/// `szc := sizing_ok` at `round_rec`, UNCAUGHT at the first attempt's
+/// gate): a completed ≥ 4·F interval never makes the record's `szc`
+/// true.** Literal config: seed 660 round 2, under `Tuning::BASE` —
+/// the crash (`Mid2@3`) cut a checkpoint whose begin step folded a
+/// small interval while `dirty_max` = 250 ≥ 4·F = 184 from an earlier,
+/// completed one — so the record carries `sizing_ok` true and `szc`
+/// false. The literal `szc := sizing_ok` at `round_rec` flips this
+/// round's `szc` to true and fails this pin (the function-level pin
+/// `szc_a_completed_4f_interval_and_a_small_cut` reads `szc_of`
+/// directly and cannot see it).
+#[test]
+fn szc_a_completed_interval_never_sets_the_record_flag() {
+    let rec = workload::run_seed_with(660, None, &workload::Tuning::BASE);
+    let r2 = rec
+        .rounds
+        .get(2)
+        .unwrap_or_else(|| panic!("seed 660: three rounds"));
+    assert!(
+        r2.sizing_ok,
+        "seed 660 r2: an earlier interval reached 4·F (dirty_max 250 ≥ 184)"
+    );
+    assert!(
+        !r2.szc,
+        "seed 660 r2: the crash cut a small open interval (dirty_now 0 < 184) \
+         with the open checkpoint's own fold small — szc must stay false"
+    );
+}
+
+/// **X5-R38's W12 pin (card X-5c-F4-F1 step 3; a literal config): the
+/// share-forced crash at the rename→dirsync window drops the rename
+/// (Q12).** The tuning is BASE with `keep_latest_pm_table` zeroed
+/// (every F-CRASH directory draw drops the volatile prefix) and the
+/// W12 share at 1000 permille (every uniform draw takes the window
+/// list); seed 11's round 0 is the pinned shape. M-W12ALL (the W12
+/// draw over all yields) moves the crash out of the window and fails
+/// this pin.
+#[test]
+fn x5_r38_w12_crash_drops_the_rename() {
+    let mut tun = workload::Tuning::BASE;
+    tun.keep_latest_pm_table = [0, 0, 0, 0, 0];
+    tun.w12_share = 1000;
+    let rec = workload::run_seed_with(11, None, &tun);
+    assert!(rec.defect.is_none(), "seed 11: {:?}", rec.defect);
+    let r0 = &rec.rounds[0];
+    assert_eq!(
+        r0.cwin,
+        Some("w12"),
+        "seed 11 r0: the crash must be drawn from the W12 window list"
+    );
+    assert!(
+        r0.fired,
+        "seed 11 r0: the window crash fired (never a NEVER-FIRED)"
+    );
+    assert!(
+        r0.q12_dropped_rename,
+        "seed 11 r0: the crash in the rename→dirsync window with keep-latest 0 must drop the G1 rename (Q12)"
+    );
+    assert!(
+        r0.pass,
+        "seed 11 r0: the round passes (o1={:?} o2={:?} o3={:?})",
+        r0.o1_fail, r0.o2_fail, r0.o3_fail
+    );
+}
+
+/// **X5-R38's W11 pin (card X-5c-F4-F1 step 3; a literal config): the
+/// share-forced crash in the recycled-segment window reads the stale
+/// record (Q11).** The tuning is BASE with `w11_share` at 1000
+/// permille. Seed 276's round 0 crashes inside the window — after the
+/// segment below the recycled boundary `b` synced durable through
+/// `b`, before `b`'s own sync — so the crash drops `b`'s volatile
+/// record, and the recovery walk hops into `b` and reads its previous
+/// life's bytes.
+#[test]
+fn x5_r38_w11_crash_reads_stale_at_start() {
+    let mut tun = workload::Tuning::BASE;
+    tun.w11_share = 1000;
+    let rec = workload::run_seed_with(276, None, &tun);
+    assert!(rec.defect.is_none(), "seed 276: {:?}", rec.defect);
+    let r0 = &rec.rounds[0];
+    assert_eq!(
+        r0.cwin,
+        Some("w11"),
+        "seed 276 r0: the crash must be drawn from the W11 window list"
+    );
+    assert!(
+        r0.fired,
+        "seed 276 r0: the window crash fired (never a NEVER-FIRED)"
+    );
+    assert!(
+        r0.q11_stale_seg,
+        "seed 276 r0: the crash in the recycled-segment window must make the walk read the stale record (Q11)"
+    );
+    assert!(
+        r0.pass,
+        "seed 276 r0: the round passes (o1={:?} o2={:?} o3={:?})",
+        r0.o1_fail, r0.o2_fail, r0.o3_fail
+    );
+}
+
+/// **Rework 2 (P gate verdict X-5c-F4-F1, ruling (i); the verdict's
+/// added pin): a W11 crash's walk reaches `b`.** Ruling (i): the window
+/// opens "when a `sync_data` of the segment below `b` completes with
+/// `wal.written ≥ b`: that segment's whole extent … is then durable, so
+/// the walk reaches `b`". The literal config mirrors the driver's
+/// uniform-round machinery by hand: the counting pass (crash disabled,
+/// `w11_share` 1000) records the round's W11 window openings, the real
+/// round crashes at the first recorded window yield, and the recovered
+/// store's `wal.append` — the walk's valid end — must be at or above
+/// the boundary the crash-time snapshot names (`WorkloadObs::w11_open`,
+/// the open window's `b`). Seed 10 round 0 is the pinned shape (the
+/// gate's post-fix 0..200 probe measured it a Q11 hit, which is this
+/// property plus `b`'s first sector not surviving). **M-W11-ANYSYNC**
+/// (the window opened on **any** completed sync of the segment below
+/// `b`, the `wal.written ≥ b` term removed — the gate's finding 2)
+/// fails this pin: the crash lands where the walk stops on the
+/// not-yet-durable tail below `b` (0 of 150 picks hit Q11 as built).
+#[test]
+fn x5_r38_w11_crash_walk_reaches_the_boundary() {
+    use e4_recovery::harness::{self, CrashSpec, MediaDraw, RoundFaults, Script};
+    use e4_recovery::model::Model;
+    use e4_recovery::sim::FaultClass;
+
+    let seed = 10u64;
+    let mut tun = workload::Tuning::BASE;
+    tun.w11_share = 1000;
+    let knobs = Knobs::derive(seed, 0, &tun);
+    let cfg = knobs.store_cfg(None);
+    let (base, _desc, _hook) = workload::build_round(seed, 0, &tun, &knobs, &Model::new(), 0);
+    let probe_faults = RoundFaults {
+        class: FaultClass::C,
+        knobs: knobs.fault,
+        directed: Vec::new(),
+        no_r_taint: false,
+        media: MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
+        probe_pass: true,
+    };
+    let (disk, st0) = harness::create_store(cfg.clone(), seed, seed as u128).expect("create");
+    let probe = harness::run_round(
+        seed,
+        0,
+        &Script {
+            crash: None,
+            ..base.clone()
+        },
+        &probe_faults,
+        cfg.clone(),
+        disk.clone(),
+        st0.clone(),
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    let k = *probe
+        .obs
+        .w11_yields
+        .first()
+        .expect("the counting pass opens a W11 window (seed 10 r0)");
+    let real = harness::run_round(
+        seed,
+        0,
+        &Script {
+            crash: Some(CrashSpec::Yield(k)),
+            ..base
+        },
+        &RoundFaults {
+            class: FaultClass::C,
+            knobs: knobs.fault,
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg.clone(),
+        disk,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(
+        real.obs.crash_fired,
+        "seed 10 r0: the window crash at yield {k} fired (never a NEVER-FIRED)"
+    );
+    let b = real
+        .obs
+        .w11_open
+        .expect("the W11 window was open at the crash");
+    let end = real
+        .end_store
+        .as_ref()
+        .expect("the round's recovery produced a store");
+    assert!(
+        end.wal.append >= b,
+        "the walk's valid end ({}) must reach the window's boundary b={b}: \
+         everything below b was durable at the crash (ruling (i))",
+        end.wal.append
+    );
+}
+
+/// **Rework 3 (P gate verdict X-5c-F4-F1, finding 5): `cwin` is a
+/// digest input — pinned at the record level.** Two per-seed records
+/// differing only in a round's `cwin` have different digests (a window
+/// pick `Some("w11")`/`Some("w12")` against the plain uniform `None`),
+/// and two records whose shared round carries `None` on both sides are
+/// unchanged by it (BASE's shape — every pick `None`, which is why BASE
+/// digests never move on the field). **G-CWIN-NODIGEST** (the `cwin`
+/// contribution removed from `SeedRec::finish`) fails this pin.
+#[test]
+fn cwin_is_a_digest_input_only_when_set() {
+    use e4_recovery::workload::{RoundRec, SeedRec};
+    let rec_of = |cwin: Option<&'static str>| {
+        let mut rec = SeedRec {
+            seed: 12,
+            class: "C".to_owned(),
+            knobs: 99,
+            rounds: vec![RoundRec {
+                cwin,
+                ..RoundRec::default()
+            }],
+            ..SeedRec::default()
+        };
+        rec.finish();
+        rec
+    };
+    let none = rec_of(None).digest;
+    let w11 = rec_of(Some("w11")).digest;
+    let w12 = rec_of(Some("w12")).digest;
+    assert_ne!(
+        none, w11,
+        "a round picked into the W11 window must move the digest (G-CWIN-NODIGEST reverts this)"
+    );
+    assert_ne!(
+        w11, w12,
+        "the two windows are different digest inputs (a round picked into W12 vs W11)"
+    );
+    assert_eq!(
+        none,
+        rec_of(None).digest,
+        "both `None` leaves the digest unchanged (BASE's shape: no shares, every pick None)"
+    );
 }
 
 /// The scheduler-level uniform crash (5.5's "uniform over the round's
@@ -130,7 +559,7 @@ fn uniform_crash_fires_at_the_counted_yield() {
 #[test]
 fn knobs_derive_in_range() {
     for seed in 0..200u64 {
-        let k = Knobs::derive(seed, 0);
+        let k = Knobs::derive(seed, 0, &workload::Tuning::BASE);
         assert!(
             (2..=4).contains(&k.committers),
             "committers {}",
@@ -153,14 +582,14 @@ fn knobs_derive_in_range() {
         assert!((1..=3).contains(&k.rounds));
         assert!((320..=700).contains(&k.chunked_ops));
         assert!(k.pool_frames() >= 12);
-        let k2 = Knobs::derive(seed, 0);
+        let k2 = Knobs::derive(seed, 0, &workload::Tuning::BASE);
         assert_eq!(k.digest(), k2.digest(), "knob digest not pure");
         // The feature mix is per-round.
         let mix = |r: u32| {
             format!(
                 "{}{}",
-                u8::from(Knobs::derive(seed, r).bulk_load),
-                u8::from(Knobs::derive(seed, r).drop_tree)
+                u8::from(Knobs::derive(seed, r, &workload::Tuning::BASE).bulk_load),
+                u8::from(Knobs::derive(seed, r, &workload::Tuning::BASE).drop_tree)
             )
         };
         assert_ne!(mix(0), "", "empty mix");
@@ -171,7 +600,7 @@ fn knobs_derive_in_range() {
     let mut drops = 0u32;
     for seed in 0..400u64 {
         for r in 0..3 {
-            let k = Knobs::derive(seed, r);
+            let k = Knobs::derive(seed, r, &workload::Tuning::BASE);
             loads += u32::from(k.bulk_load);
             drops += u32::from(k.drop_tree);
         }
@@ -187,10 +616,11 @@ fn knobs_derive_in_range() {
 fn crash_spec_targeting() {
     use e4_recovery::harness::CrashSpec;
     use e4_recovery::store::ckpt::CKPT_HOOKS;
-    let knobs = Knobs::derive(0, 0);
+    let knobs = Knobs::derive(0, 0, &workload::Tuning::BASE);
     let model = e4_recovery::model::Model::new();
     for seed in 0..40u64 {
-        let (script, _d, hook) = workload::build_round(seed, 0, &knobs, &model, 0);
+        let (script, _d, hook) =
+            workload::build_round(seed, 0, &workload::Tuning::BASE, &knobs, &model, 0);
         let total: u64 = script.tasks.iter().map(|t| t.ops.len() as u64).sum();
         assert!(total > 10, "seed {seed}: script too small ({total})");
         if (seed / 10) % 2 == 0 {
@@ -209,9 +639,9 @@ fn crash_spec_targeting() {
 /// directory entry no committer will install.
 #[test]
 fn script_references_only_model_trees() {
-    let knobs = Knobs::derive(3, 0);
+    let knobs = Knobs::derive(3, 0, &workload::Tuning::BASE);
     let model = e4_recovery::model::Model::new();
-    let (script, _, _) = workload::build_round(3, 0, &knobs, &model, 0);
+    let (script, _, _) = workload::build_round(3, 0, &workload::Tuning::BASE, &knobs, &model, 0);
     let trees = workload::trees_at(&model, 0);
     assert!(trees.is_empty(), "the empty model has no trees");
     // Every Put/Delete references a tree the setup commit creates (the
@@ -252,9 +682,9 @@ fn script_references_only_model_trees() {
 #[test]
 fn chunked_txn_spans_two_segments() {
     use e4_recovery::model::Op;
-    let knobs = Knobs::derive(5, 0);
+    let knobs = Knobs::derive(5, 0, &workload::Tuning::BASE);
     let model = e4_recovery::model::Model::new();
-    let (script, _, _) = workload::build_round(5, 0, &knobs, &model, 0);
+    let (script, _, _) = workload::build_round(5, 0, &workload::Tuning::BASE, &knobs, &model, 0);
     let mut spans = 0u32;
     for t in &script.tasks {
         for op in &t.ops {
@@ -350,9 +780,10 @@ fn setup_barrier_guards_the_wal_order() {
     // the generated script is reproduced byte-identically by
     // `build_round`, so the pin does not depend on any code path beyond
     // it.)
-    let knobs = Knobs::derive(3, 0);
+    let knobs = Knobs::derive(3, 0, &workload::Tuning::BASE);
     let cfg3 = knobs.store_cfg(None);
-    let (script_b, _, _) = workload::build_round(3, 0, &knobs, &Model::new(), 0);
+    let (script_b, _, _) =
+        workload::build_round(3, 0, &workload::Tuning::BASE, &knobs, &Model::new(), 0);
     let strip = |s: &Script| Script {
         tasks: s
             .tasks
@@ -536,6 +967,63 @@ fn r15a_fold_line_from_a_literal_2_seed_record_set() {
     assert!(campaign::final_line(&[a.clone(), b.clone()]).starts_with("E4 SEEDS=2 "));
 }
 
+/// **X5-R17 pin: the SIZING quota row counts seeds, not rounds** (the
+/// ruling's own words: "`verify`'s SIZING row counts seeds"). Work 5.3
+/// asserts per seed — "every seed must reach, in at least one
+/// checkpoint interval, ≥ 4·F distinct dirtied LPIDs" — so a seed whose
+/// round 0 missed the bound but whose round 1 reached it is **met**;
+/// only a seed no round of which reached it counts. The literal set:
+/// seed A misses r0 and reaches it in r1 (a seed hit); seed B misses
+/// both rounds (a seed miss). The row must read `achieved 1` — the
+/// rounds-based counting this pin reverts to (X-5c-F4 step 1's mutant)
+/// reads 3 and fails here.
+#[test]
+fn x5r17_sizing_row_counts_seeds_not_rounds() {
+    use e4_recovery::workload::{RoundRec, SeedRec};
+    let seed_hit_in_r1 = SeedRec {
+        seed: 0,
+        class: "C".to_owned(),
+        knobs: 1,
+        rounds: vec![
+            RoundRec {
+                sizing_ok: false,
+                ..RoundRec::default()
+            },
+            RoundRec {
+                sizing_ok: true,
+                ..RoundRec::default()
+            },
+        ],
+        ..SeedRec::default()
+    };
+    let seed_all_miss = SeedRec {
+        seed: 1,
+        class: "C".to_owned(),
+        knobs: 2,
+        rounds: vec![
+            RoundRec {
+                sizing_ok: false,
+                ..RoundRec::default()
+            },
+            RoundRec {
+                sizing_ok: false,
+                ..RoundRec::default()
+            },
+        ],
+        ..SeedRec::default()
+    };
+    let rows = workload::quotas(&[seed_hit_in_r1, seed_all_miss], 2);
+    let sizing = rows
+        .iter()
+        .find(|r| r.id == "SIZING")
+        .expect("the SIZING row exists");
+    assert_eq!(
+        sizing.achieved, 1,
+        "one seed misses (the seed no round of which reached 4F); a rounds-based count gives 3"
+    );
+    assert_eq!(sizing.required, 0, "SIZING passes only at zero seed misses");
+}
+
 /// **X5-R15 (b) pin: `verify` reports all three checks before its exit,
 /// and `--no-quotas` does not fail on the quota table.** The exit code
 /// is decided once, at the end, from all three outcomes together
@@ -597,7 +1085,7 @@ fn r15b_verify_reports_all_three_checks_before_failing() {
 #[test]
 fn r16_never_fired_targeted_draws_reach_their_hook() {
     for seed in [60u64, 660] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.defect.is_none(),
             "seed {seed}: the fired-guard defect is back: {:?}",
@@ -634,7 +1122,7 @@ fn r16_never_fired_targeted_draws_reach_their_hook() {
 #[test]
 fn r16_no_twin_is_always_supplied() {
     for seed in [1267u64, 1769] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let no_twin = rec
             .rounds
             .iter()
@@ -664,7 +1152,7 @@ fn r16_no_twin_is_always_supplied() {
 #[test]
 fn r16_mpe_referenced_set_excludes_the_file_header() {
     for seed in [47u64, 118, 198] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let not_reported = rec
             .rounds
             .iter()
@@ -721,7 +1209,7 @@ fn r20_mpe_r_reads_the_issued_write_history() {
     // and every round passing). The assertions are unchanged, and the
     // events-half revert was re-demonstrated on the new configs.
     for seed in [48u64, 308] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let exactness = rec
             .rounds
             .iter()
@@ -766,7 +1254,7 @@ fn r20_mpe_r_reads_the_issued_write_history() {
 #[test]
 fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
     for seed in [2669u64, 4049, 4309, 7469, 9809] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.defect.is_none(),
             "seed {seed}: the fired-guard defect is back: {:?}",
@@ -826,7 +1314,7 @@ fn f1f2a_empty_masks_are_a_defect_not_a_hang() {
 fn f1f2b_repairs_without_a_store_reseed_the_twin_chain() {
     use e4_recovery::harness::RoundOutcome;
     use e4_recovery::store::StoreInner;
-    let cfg = Knobs::derive(7, 0).store_cfg(None);
+    let cfg = Knobs::derive(7, 0, &workload::Tuning::BASE).store_cfg(None);
     let tout = RoundOutcome {
         cut: 3,
         end_store: None,
@@ -863,7 +1351,7 @@ fn r28_residual_seeds_clear_via_k() {
     // assertions are unchanged and the M-R28g revert was
     // re-demonstrated on both.
     for seed in [1787u64, 5808] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         assert!(
             rec.rounds.iter().any(|r| r.meta_rollback),
             "seed {seed}: the residual round's rollback condition must hold (the K gate)"
@@ -902,7 +1390,7 @@ fn r28_residual_seeds_clear_via_k() {
 #[test]
 fn cxx_highest_lpid_free_never_shrinks_next_lpid_rounds() {
     for seed in [221u64, 66, 907] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         for r in &rec.rounds {
             assert!(
                 r.o2_fail.is_none() && r.o3_fail.is_none(),
@@ -936,7 +1424,7 @@ fn cxx_highest_lpid_free_never_shrinks_next_lpid_rounds() {
 /// text and the round's O-3 (c).
 #[test]
 fn cxx_g3_probe_never_swallows_a_recovery_crash() {
-    let rec = workload::run_seed(1769, None);
+    let rec = workload::run_seed_with(1769, None, &workload::Tuning::BASE);
     for t in &rec.twin {
         assert!(
             t.pass,
@@ -957,7 +1445,7 @@ fn cxx_g3_probe_never_swallows_a_recovery_crash() {
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let exactness = rec
             .rounds
             .iter()
@@ -1019,7 +1507,7 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
     // passing, no livelock), assertions byte-identical. 987 r1 still
     // holds.
     for seed in [987u64, 387] {
-        let rec = workload::run_seed(seed, None);
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
         let r1 = &rec.rounds[1];
         assert!(
             !r1.deadlock && !r1.livelock,
@@ -1038,6 +1526,60 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
         assert!(
             r1.pass,
             "seed {seed} round 1: the round must pass as the detection round it is: o1={:?} o2={:?} o3={:?}",
+            r1.o1_fail, r1.o2_fail, r1.o3_fail
+        );
+        assert!(rec.defect.is_none(), "seed {seed}: no harness defect");
+    }
+}
+
+/// **X-5c-F4 step 4 pin (the new MP poison+task-error class; literal
+/// configs = the class's repro seeds 747 and 967, round 1 each).** The
+/// class: G8's harness contract ends a poisoned workload at the poison
+/// crash ("the faults, the recovery and the oracle run as usual"), but
+/// `checkpointer_body` fell through to a final checkpoint whose first
+/// step refused on `alive()` with `Fail::Poisoned`, and its error arm
+/// recorded that designed refusal as a round-failing task error
+/// ("checkpoint failed: Poisoned("XX001 in gated op: …")") beside the
+/// poison crash — 17 MP rounds in X-5c-F4's step-0 file (zero in
+/// F3-F3a's), deterministically, whenever the checkpointer's poll
+/// landed between the mark and the poisoner's own crash delivery. The
+/// fix (`checkpoint_poison_end`) gives the checkpointer the script
+/// task's arm: no step after the mark, the crash delivered at once,
+/// the round judged as the detection round it is. Reverting the fix
+/// (mutant M-CKPOISONa: the `h:ck` poison arm falls through to the
+/// checkpoint again) fails this pin — seed 747 round 1 records
+/// `terr=true` and the round fails. A second revert arm (M-CKPOISONb:
+/// the mid-checkpoint `Fail::Poisoned` case removed) fails the same
+/// assertions whenever the mark lands mid-checkpoint.
+#[test]
+fn g8_checkpoint_poison_ends_the_workload() {
+    for seed in [747u64, 967] {
+        let rec = workload::run_seed_with(seed, None, &workload::Tuning::BASE);
+        let r1 = &rec.rounds[1];
+        assert!(
+            r1.crash == "poison",
+            "seed {seed} round 1: the crash desc must record the poison point: {:?}",
+            r1.crash
+        );
+        assert!(
+            r1.fired,
+            "seed {seed} round 1: the poison delivery is the round's crash (never a NEVER-FIRED)"
+        );
+        assert!(
+            r1.task_error.is_none(),
+            "seed {seed} round 1: the store's designed post-mark refusal is never a harness \
+             task error: {:?}",
+            r1.task_error
+        );
+        assert!(
+            !r1.deadlock && !r1.livelock,
+            "seed {seed} round 1: the workload ends at the poison, no livelock (site {:?})",
+            r1.livelock_site.as_str()
+        );
+        assert!(
+            r1.pass,
+            "seed {seed} round 1: the round must pass as the detection round it is: \
+             o1={:?} o2={:?} o3={:?}",
             r1.o1_fail, r1.o2_fail, r1.o3_fail
         );
         assert!(rec.defect.is_none(), "seed {seed}: no harness defect");

@@ -21,6 +21,20 @@ fn cfg(mutant: Option<Mutant>) -> StoreCfg {
     }
 }
 
+/// The SIZING-C pins' literal config: the smallest pool that holds a
+/// 3-level tree path, so 4·F = 24 distinct dirtied LPIDs is reachable
+/// inside one chunked transaction.
+fn scfg() -> StoreCfg {
+    StoreCfg {
+        map_leaf_cap: 8,
+        freeset_leaf_bits: 128,
+        pool_frames: 6,
+        r_epoch: 2,
+        mutant: None,
+        wal_io_fail: None,
+    }
+}
+
 fn drop_all() -> FaultKnobs {
     FaultKnobs {
         keep_latest_pm: 0,
@@ -515,7 +529,8 @@ fn r28_no_ground_truth_meta_finding() {
         disk.range_tainted(pf, 8192, 4096),
         "slot 2 is tainted (a crash-dropped volatile meta write)"
     );
-    let cfg = e4_recovery::workload::Knobs::derive(0, 0).store_cfg(None);
+    let cfg = e4_recovery::workload::Knobs::derive(0, 0, &e4_recovery::workload::Tuning::BASE)
+        .store_cfg(None);
     let (findings, used, meta) = e4_recovery::harness::durable_image(&disk, &cfg);
     assert!(meta.is_some(), "a valid meta must open (k=2)");
     assert!(
@@ -1061,7 +1076,8 @@ fn cxx_a_crash_at_any_recovery_yield_is_never_corruption() {
 #[test]
 fn r30_skx_and_smx_record_fields() {
     for (seed, want_skx, want_smx) in [(537u64, true, false), (1887, true, false)] {
-        let rec = e4_recovery::workload::run_seed(seed, None);
+        let rec =
+            e4_recovery::workload::run_seed_with(seed, None, &e4_recovery::workload::Tuning::BASE);
         let r = &rec.rounds[0];
         assert!(r.served, "seed {seed} r0: the MP-A serve must hold");
         assert_eq!(
@@ -1079,7 +1095,8 @@ fn r30_skx_and_smx_record_fields() {
         );
     }
     for seed in [2927u64, 7528, 8728] {
-        let rec = e4_recovery::workload::run_seed(seed, None);
+        let rec =
+            e4_recovery::workload::run_seed_with(seed, None, &e4_recovery::workload::Tuning::BASE);
         let r = &rec.rounds[0];
         assert!(r.served, "seed {seed} r0: the meta-slot serve must hold");
         assert!(!r.skx, "seed {seed} r0: a meta-slot serve is not inside K");
@@ -1102,7 +1119,8 @@ fn r30_skx_and_smx_record_fields() {
     // passing detection), and the chain stops there, so the old r1
     // index fails only at its shape precondition (an index out of
     // bounds), exactly as the rule describes.
-    let rec = e4_recovery::workload::run_seed(6149, None);
+    let rec =
+        e4_recovery::workload::run_seed_with(6149, None, &e4_recovery::workload::Tuning::BASE);
     let r = &rec.rounds[0];
     assert!(!r.served, "seed 6149 r0: the serve is gone after step 2");
     assert!(!r.skx && !r.smx, "seed 6149 r0: skx = smx = false");
@@ -1651,7 +1669,7 @@ fn name1_of() -> String {
 /// clean.
 #[test]
 fn x5r35_seed403_slice_feeds_the_derivation() {
-    let rec = e4_recovery::workload::run_seed(403, None);
+    let rec = e4_recovery::workload::run_seed_with(403, None, &e4_recovery::workload::Tuning::BASE);
     let create_failed = rec
         .defect
         .as_deref()
@@ -1853,7 +1871,8 @@ fn x33_damage_maps_through_the_bound_name() {
 #[test]
 fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
     e4_recovery::harness::o1f_capture_arm();
-    let rec = e4_recovery::workload::run_seed(1749, None);
+    let rec =
+        e4_recovery::workload::run_seed_with(1749, None, &e4_recovery::workload::Tuning::BASE);
     let lines = e4_recovery::harness::o1f_capture_take();
     assert!(
         !lines.is_empty(),
@@ -1895,7 +1914,8 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
 #[test]
 fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
     e4_recovery::harness::o1f_capture_arm();
-    let rec = e4_recovery::workload::run_seed(5549, None);
+    let rec =
+        e4_recovery::workload::run_seed_with(5549, None, &e4_recovery::workload::Tuning::BASE);
     let lines = e4_recovery::harness::o1f_capture_take();
     assert!(
         !lines.is_empty(),
@@ -1973,7 +1993,7 @@ fn check_le_t_agrees_with_owner_and_t(line: &str) {
 /// old failure returns and this pin fails.
 #[test]
 fn x5_r36_seed112_r2_no_longer_fails_o1b_on_tree_3() {
-    let rec = e4_recovery::workload::run_seed(112, None);
+    let rec = e4_recovery::workload::run_seed_with(112, None, &e4_recovery::workload::Tuning::BASE);
     let r2 = rec
         .rounds
         .get(2)
@@ -2050,4 +2070,495 @@ fn x5_r36_reuse_on_dropping_predicate() {
         5,
         10
     ));
+}
+
+/// **SIZING-C pin 1 (card X-5c-F4-F1 step 4; a literal config): the
+/// crash cuts an open interval that had already reached 4·F — `szc`
+/// and `sizing_ok` both true.** A pool of 6 frames makes 4·F = 24
+/// distinct dirtied LPIDs; one chunked transaction of 3,000 puts over
+/// a 3,000-key space (no checkpoint: `checkpointer_every: None`) fills
+/// the interval, and the crash at the next op's yield cuts it.
+#[test]
+fn szc_crash_cuts_an_open_4f_interval() {
+    let four_f = 4 * 6u64;
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![Op::CreateTree { tree: 2 }],
+                },
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..3000u64).map(|i| op_put(i, i & 0xFF)).collect(),
+                },
+                ScriptOp::Yields(1),
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: None,
+        crash: Some(CrashSpec::TaskYield(1, 3)),
+        nested: Vec::new(),
+    };
+    let (disk, st) = harness::create_store(scfg(), 5111, 77).expect("create");
+    let out = harness::run_round(
+        5111,
+        0,
+        &script,
+        &round_faults(),
+        scfg(),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(
+        out.obs.dirty_now_len >= four_f,
+        "the chunked txn dirtied {} LPIDs; the pin needs ≥ 4·F = {four_f} (shrink the pool or grow the txn)",
+        out.obs.dirty_now_len
+    );
+    assert!(out.obs.crash_fired, "the crash fired");
+    assert!(
+        e4_recovery::workload::szc_of(&out.obs, four_f),
+        "szc: the crash cut an open interval that had reached 4·F"
+    );
+    assert!(
+        e4_recovery::workload::sizing_ok_of(&out.obs, four_f),
+        "sizing_ok: the open interval reached 4·F at the crash"
+    );
+}
+
+/// **SIZING-C pin 2: the small cut — an earlier interval reached 4·F
+/// and completed (a checkpoint folded it into `dirty_max`), and the
+/// crash then cuts a small open interval: `sizing_ok` true, `szc`
+/// false.** M-SZC-ANY (`szc := sizing_ok`) fails this pin.
+#[test]
+fn szc_a_completed_4f_interval_and_a_small_cut() {
+    let four_f = 4 * 6u64;
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![Op::CreateTree { tree: 2 }],
+                },
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..3000u64).map(|i| op_put(i, i & 0xFF)).collect(),
+                },
+                // The forced checkpoint completes: its begin step folds
+                // the ≥ 4·F interval into `dirty_max` and clears
+                // `dirty_now` (and `ckpt_closed_dirty` resets at
+                // `ckpt:end`).
+                ScriptOp::Checkpoint,
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![op_put(5000, 1)],
+                },
+                ScriptOp::Yields(1),
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1_000_000),
+        crash: Some(CrashSpec::TaskYield(1, 5)),
+        nested: Vec::new(),
+    };
+    let (disk, st) = harness::create_store(scfg(), 5222, 77).expect("create");
+    let out = harness::run_round(
+        5222,
+        0,
+        &script,
+        &round_faults(),
+        scfg(),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(out.obs.crash_fired, "the crash fired");
+    assert!(
+        out.obs.dirty_max >= four_f,
+        "the completed interval reached 4·F (dirty_max = {})",
+        out.obs.dirty_max
+    );
+    assert!(
+        out.obs.dirty_now_len < four_f,
+        "the crash cut a small open interval ({})",
+        out.obs.dirty_now_len
+    );
+    assert_eq!(
+        out.obs.ckpt_closed_dirty, 0,
+        "no checkpoint is open at the crash"
+    );
+    assert!(
+        e4_recovery::workload::sizing_ok_of(&out.obs, four_f),
+        "sizing_ok: the completed interval reached 4·F"
+    );
+    assert!(
+        !e4_recovery::workload::szc_of(&out.obs, four_f),
+        "szc: the crash cut only a small interval — the ≥ 4·F one completed earlier"
+    );
+}
+
+/// **Step 5, the poll-path half (card X-5c-F4-F1; P ruling (c)): the
+/// `h:ck` poll arm is deleted — a mark observed at the poll produces,
+/// through the final checkpoint's `ckpt:begin` refusal and the
+/// mid-checkpoint arm, the identical quiet poison end.** This literal
+/// config is the demonstration schedule: the mark lands from the last
+/// script task's apply while the checkpointer (`every` unreachable)
+/// only polls — no checkpoint is open — and the workload still ends at
+/// the poison crash with no task error. It doubles as the pin that the
+/// post-deletion poll path (final checkpoint → refuse → the remaining
+/// arm) stays quiet.
+#[test]
+fn g8_poison_poll_path_stays_quiet_through_the_final_checkpoint() {
+    use e4_recovery::sim::{MediaFault, MediaKind, PAGE_FILE};
+
+    let r0_script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![Op::CreateTree { tree: 2 }],
+                },
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..600u64).map(|i| op_put(i, 7)).collect(),
+                },
+                ScriptOp::Checkpoint,
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1_000_000),
+        crash: Some(CrashSpec::TaskYield(1, 4)),
+        nested: Vec::new(),
+    };
+    let (disk0, st0) = harness::create_store(cfg(None), 6202, 77).expect("create");
+    let base = harness::run_round(
+        6202,
+        0,
+        &r0_script,
+        &round_faults(),
+        cfg(None),
+        disk0,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(base.pass, "round 0 base passes");
+    let pf = base.crashed_disk.stat(PAGE_FILE).expect("page file");
+    let (_findings, image_slots, _meta) = harness::durable_image(&base.crashed_disk, &cfg(None));
+    let w = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| {
+            w.off.is_multiple_of(4096)
+                && w.bytes.len() == 4096
+                && w.off > 3 * 4096
+                && image_slots.contains(&(w.off / 4096))
+                && matches!(
+                    e4_recovery::store::page::header_kind(&w.bytes),
+                    e4_recovery::store::page::KIND_LEAF | e4_recovery::store::page::KIND_INNER
+                )
+        })
+        .cloned()
+        .expect("a mapped tree-page write exists");
+    let fault = MediaFault {
+        inode: pf,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: MediaKind::Lost,
+    };
+    let (disk1, st1) = harness::create_store(cfg(None), 6202, 77).expect("create");
+    let mut reads0 = Vec::new();
+    let out0 = harness::run_round(
+        6202,
+        0,
+        &r0_script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: drop_all(),
+            directed: vec![fault],
+            no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg(None),
+        disk1,
+        st1,
+        &Model::new(),
+        0,
+        Some(&mut reads0),
+        None,
+    );
+    assert!(
+        out0.pass,
+        "round 0 (the R6 detection round) passes: {:#?} {:#?} {:#?}",
+        out0.o1, out0.o2_fail, out0.o3_fail
+    );
+    let (end_disk, end_st, end_model, cut) = match out0.end_store.clone() {
+        Some(st) => (out0.end_disk.clone(), st, out0.end_model, out0.cut),
+        None => panic!("round 0 must recover a store"),
+    };
+    // The poll-side shape: no checkpoint ever triggers (every is
+    // unreachable), the poisoner is the only remaining op, and the
+    // checkpointer observes the mark at its poll.
+    let r1_script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![ScriptOp::Chunked {
+                sync_on: true,
+                ops: (0..600u64).map(|i| op_put(i, 5)).collect(),
+            }],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1_000_000),
+        crash: Some(CrashSpec::TaskYield(1, 99)),
+        nested: Vec::new(),
+    };
+    let out1 = harness::run_round(
+        6202,
+        1,
+        &r1_script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: drop_all(),
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg(None),
+        end_disk,
+        end_st,
+        &end_model,
+        cut,
+        None,
+        None,
+    );
+    assert!(
+        out1.obs.poison_crash && out1.obs.crash_fired,
+        "round 1: the poll-observed mark ends the workload at the poison crash through the final checkpoint's refusal"
+    );
+    assert!(
+        out1.task_error.is_none(),
+        "round 1: no task error — the post-deletion poll path is quiet: {:?}",
+        out1.task_error
+    );
+}
+
+/// **Step 5 (card X-5c-F4-F1; P ruling (c)): the mid-checkpoint
+/// `Fail::Poisoned` arm's directed pin — only that arm can satisfy
+/// it.** A literal two-round config: round 0 is an MP detection round
+/// (a directed LOST fault on a mapped leaf of the durable image —
+/// recovery `Ok` with the damaged page still referenced, the R6
+/// shape), and round 1's workload — run on the recovered store, class
+/// MP so the detection is client-visible — marks the store from its
+/// LAST script task's apply (a gated read of the damaged leaf) while
+/// the checkpointer (`every = 1`, triggered by round 1's first clean
+/// commit) is inside its checkpoint. The checkpointer's next store
+/// step refuses at `alive()` with `Fail::Poisoned`, and the
+/// mid-checkpoint arm ends the workload at the poison crash — never a
+/// task error. With the arm reverted to the draft's loud path
+/// (M-CKPOISONb) the round fails with "checkpoint failed: Poisoned(…)"
+/// and no crash is delivered, which is exactly what this pin forbids.
+#[test]
+fn g8_poison_mid_checkpoint_ends_the_workload_quietly() {
+    use e4_recovery::sim::{MediaFault, MediaKind, PAGE_FILE};
+
+    // ---- round 0: the damage, judged as the R6 detection round ----
+    let r0_script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                ScriptOp::Commit {
+                    sync_on: true,
+                    ops: vec![Op::CreateTree { tree: 2 }],
+                },
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..600u64).map(|i| op_put(i, 7)).collect(),
+                },
+                ScriptOp::Checkpoint,
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1_000_000),
+        crash: Some(CrashSpec::TaskYield(1, 4)),
+        nested: Vec::new(),
+    };
+    let (disk0, st0) = harness::create_store(cfg(None), 6101, 77).expect("create");
+    let base = harness::run_round(
+        6101,
+        0,
+        &r0_script,
+        &round_faults(),
+        cfg(None),
+        disk0,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    // The faultless base passes and its image maps tree leaves.
+    assert!(
+        base.pass,
+        "round 0 base: {:#?} {:#?} {:#?}",
+        base.o1, base.o2_fail, base.o3_fail
+    );
+    let pf = base.crashed_disk.stat(PAGE_FILE).expect("page file");
+    let (_findings, image_slots, _meta) = harness::durable_image(&base.crashed_disk, &cfg(None));
+    let w = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| {
+            w.off.is_multiple_of(4096)
+                && w.bytes.len() == 4096
+                && w.off > 3 * 4096
+                && image_slots.contains(&(w.off / 4096))
+                && matches!(
+                    e4_recovery::store::page::header_kind(&w.bytes),
+                    e4_recovery::store::page::KIND_LEAF | e4_recovery::store::page::KIND_INNER
+                )
+        })
+        .cloned()
+        .expect("a mapped tree-page write exists");
+    let fault = MediaFault {
+        inode: pf,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: MediaKind::Lost,
+    };
+    let mp_faults = RoundFaults {
+        class: FaultClass::Mp,
+        knobs: drop_all(),
+        directed: vec![fault],
+        no_r_taint: false,
+        media: e4_recovery::harness::MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
+        probe_pass: false,
+    };
+    let (disk1, st1) = harness::create_store(cfg(None), 6101, 77).expect("create");
+    let model0 = Model::new();
+    let mut reads0 = Vec::new();
+    let out0 = harness::run_round(
+        6101,
+        0,
+        &r0_script,
+        &mp_faults,
+        cfg(None),
+        disk1,
+        st1,
+        &model0,
+        0,
+        Some(&mut reads0),
+        None,
+    );
+    // The R6 detection round: recovery Ok, the round passes, and the
+    // chain continues on a store whose image still references the
+    // damaged leaf.
+    assert!(
+        out0.pass,
+        "round 0 (the R6 detection round): o1={:#?} o2={:#?} o3={:#?}",
+        out0.o1, out0.o2_fail, out0.o3_fail
+    );
+    let (end_disk, end_st, end_model, cut) = match out0.end_store.clone() {
+        Some(st) => (out0.end_disk.clone(), st, out0.end_model, out0.cut),
+        None => panic!("round 0 must recover a store for round 1 to run on"),
+    };
+
+    // ---- round 1: the mark, landed while the checkpointer is inside
+    // its checkpoint; the poisoner is the last script task standing ----
+    let r1_script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                // A big CLEAN chunked transaction on a fresh tree
+                // first: at its `mark_applied` (commits_done = 1) the
+                // pool holds a large dirty set, the checkpointer (every
+                // = 1) triggers, and its step 2 writes that set out —
+                // a long phase over many yields, so the checkpoint is
+                // still open when the poisoner's mark lands.
+                ScriptOp::Chunked {
+                    sync_on: false,
+                    ops: std::iter::once(Op::CreateTree { tree: 3 })
+                        .chain((0..4000u64).map(|i| Op::Put {
+                            tree: 3,
+                            key: i.to_be_bytes().to_vec(),
+                            value: vec![i as u8 & 0x7F; 8],
+                        }))
+                        .collect(),
+                },
+                // The poisoner: the apply fetches the damaged leaf
+                // inside a gated op → the external G8 mark + XX001; in
+                // class MP the task unwinds as a client-visible
+                // detection (the plan's clause 3), and with it the last
+                // script task ends.
+                ScriptOp::Chunked {
+                    sync_on: true,
+                    ops: (0..600u64).map(|i| op_put(i, 5)).collect(),
+                },
+            ],
+        }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1),
+        crash: Some(CrashSpec::TaskYield(1, 99)),
+        nested: Vec::new(),
+    };
+    let out1 = harness::run_round(
+        6101,
+        1,
+        &r1_script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: drop_all(),
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg(None),
+        end_disk,
+        end_st,
+        &end_model,
+        cut,
+        None,
+        None,
+    );
+    assert!(
+        out1.obs.poison_crash,
+        "round 1: the workload must end at the poison crash (crash desc of record 'poison');          fired={} te={:?} cxx={} pass={}",
+        out1.obs.crash_fired, out1.task_error, out1.client_xx001, out1.pass
+    );
+    assert!(out1.obs.crash_fired, "round 1: the poison delivery fired");
+    assert!(
+        out1.task_error.is_none(),
+        "round 1: the mid-checkpoint arm ends the workload quietly, never a task error: {:?}",
+        out1.task_error
+    );
 }
