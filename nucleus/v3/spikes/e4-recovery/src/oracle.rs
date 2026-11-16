@@ -49,6 +49,22 @@
 //!   amcheck (i) ran and tainted referenced slots exist, whatever
 //!   amcheck reported (the X5-R5 completeness fix).
 //!
+//! X5-R7 (P ruling 2026-10-31, nv3-X-5c-esc-1): O-1 (b) and (d) compare
+//! the §8.3 projection — live values only, a tombstone reads as absent —
+//! so a tombstone §10.2 legally elided compares equal to the model's
+//! held tombstone ([`live`]).
+//!
+//! X5-R6 (same ruling, fixed before any campaign data was judged): in
+//! class MP with `res` `Ok`, an O-1 comparison whose read through the
+//! store fails with XX001 is a **detected loss**, not a mismatch; every
+//! comparison whose read returns must still be exact at the one matched
+//! `c`. A round with a detected loss counts a Read23 detection (so O-3
+//! (c) applies) and must have a damaged referenced slot to explain it
+//! (tainted at (i), or in an active `R`). In MW and C a failed O-1 read
+//! fails O-1, as before. If the published-set read failed
+//! ([`Extracted::published_read_failed`]), (a) is a detected loss in MP
+//! and (b)–(d) run over the model's published set at `c`.
+//!
 //! Pass (2.4): a round passes iff O-1, O-2 and O-3 hold as the class
 //! requires. A seed passes iff every round passes and no `DEADLOCK` or
 //! `PANIC` occurred. O-1f and the monitors are recorded separately.
@@ -131,6 +147,9 @@ pub struct Extracted {
     pub opened_t: u64,
     /// The published set (a catalog scan at the frontier).
     pub published: BTreeSet<u64>,
+    /// X5-R6: the published-set read (2.3) failed with XX001; the
+    /// harness also records it as a Read23 site.
+    pub published_read_failed: bool,
     /// Amcheck (i) findings (on the image open selected, before replay).
     pub amcheck_i: Vec<Finding>,
     /// Whether amcheck (ii) ran (only after a successful recovery plus
@@ -314,6 +333,9 @@ pub struct RoundVerdict {
     /// Acked commits lost above the matched cut (SyncOff in C; all in MW;
     /// reported, not judged — the known cost of X5-R1).
     pub acked_lost: Vec<(u64, bool)>,
+    /// X5-R6: O-1 comparisons at the matched `c` satisfied by a detected
+    /// loss (class MP only; reported beside the rule in RESULT item 7).
+    pub o1_detected_loss: u32,
 }
 
 /// Run Work 2's checks for one round.
@@ -364,11 +386,20 @@ pub fn check_round(
     candidates.sort_unstable();
     candidates.dedup();
 
+    // X5-R6: a failed O-1 read is a detected loss only in class MP with
+    // `res` Ok; in C and MW it fails O-1 exactly as before.
+    let detect_ok = class == FaultClass::Mp && ex.ok;
     let mut all: Vec<u64> = Vec::new();
+    let mut lost_at_match: u32 = 0;
     let mut o1_err: Option<String> = None;
     for c in candidates.iter().copied() {
-        match o1_at(model, c, ex, reader, sample_rng, cfg) {
-            Ok(()) => all.push(c),
+        match o1_at(model, c, ex, reader, sample_rng, cfg, detect_ok) {
+            Ok(lost) => {
+                if all.is_empty() {
+                    lost_at_match = lost;
+                }
+                all.push(c);
+            }
             Err(e) => {
                 if o1_err.is_none() {
                     o1_err = Some(e);
@@ -380,6 +411,11 @@ pub fn check_round(
         Some(c) => Ok(*c),
         None => Err(o1_err.unwrap_or_else(|| "no candidate c".to_owned())),
     };
+    // X5-R6: the oracle's own XX001s are detections like any other.
+    let xx_any = !ex.xx001.is_empty() || lost_at_match > 0;
+    let r_active_r6 = class == FaultClass::Mp
+        && ex.meta_rollback
+        && (cfg.no_meta_slot_cond || faults.meta_slot_fault);
 
     // ---- O-1f ----
     let o1f_ok = all.contains(&ex.frontier);
@@ -417,8 +453,20 @@ pub fn check_round(
             detections = ex.xx001.clone();
         }
     }
-    if matches!(class, FaultClass::Mp | FaultClass::Mw) && !ex.xx001.is_empty() && !cfg.no_twin_rule
-    {
+    if lost_at_match > 0 {
+        // X5-R6: reachable only in class MP (detect_ok).
+        if !detections.contains(&XxSite::Read23) {
+            detections.push(XxSite::Read23);
+        }
+        let explained =
+            !ex.tainted_image_slots.is_empty() || (r_active_r6 && !ex.rollback_slots.is_empty());
+        if !explained && o3_fail.is_none() {
+            o3_fail = Some(
+                "O-3(c): XX001 on an O-1 read with no damaged referenced slot (X5-R6)".to_owned(),
+            );
+        }
+    }
+    if matches!(class, FaultClass::Mp | FaultClass::Mw) && xx_any && !cfg.no_twin_rule {
         // O-3 (c): a false positive iff every media fault in the round
         // targeted a slot (or WAL range) that the twin shows was not read
         // by recovery and not referenced by the opened image. A missing
@@ -463,7 +511,7 @@ pub fn check_round(
             }
         }
     }
-    if matches!(class, FaultClass::Mp | FaultClass::Mw) && ex.ok && ex.xx001.is_empty() {
+    if matches!(class, FaultClass::Mp | FaultClass::Mw) && ex.ok && !xx_any {
         // O-3 (d): silent damage is a failure.
         if o1.is_err() {
             o3_fail = Some(format!("O-3(d): silent Ok with O-1 failing: {:?}", o1));
@@ -585,6 +633,7 @@ pub fn check_round(
         detections,
         pass,
         acked_lost,
+        o1_detected_loss: lost_at_match,
     }
 }
 
@@ -594,6 +643,16 @@ pub fn seed_passes(verdicts: &[RoundVerdict], deadlock: bool, panic: bool) -> bo
     !deadlock && !panic && verdicts.iter().all(|v| v.pass)
 }
 
+/// X5-R7: the §8.3 projection of a scan — live values only; a tombstone
+/// (and an elided tombstone) reads as absent.
+pub fn live(s: &Scan) -> Vec<(&Vec<u8>, &Vec<u8>)> {
+    s.iter()
+        .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+        .collect()
+}
+
+/// O-1 at one candidate `c`. `Ok(n)`: satisfied, with `n` comparisons
+/// satisfied by a detected loss (X5-R6; always 0 unless `detect_ok`).
 fn o1_at(
     model: &Model,
     c: u64,
@@ -601,45 +660,65 @@ fn o1_at(
     reader: &mut dyn StateReader,
     sample_rng: &mut Rng,
     cfg: &OracleCfg,
-) -> Result<(), String> {
+    detect_ok: bool,
+) -> Result<u32, String> {
+    let mut lost: u32 = 0;
     // (a) the published set equals the model's at c.
     let want_pub = model.published_at(c);
-    if ex.published != want_pub {
-        return Err(format!(
-            "O-1(a) at c={c}: published {:?} != model {:?}",
-            ex.published, want_pub
-        ));
-    }
-    // (b)/(d) per published tree.
-    for t in ex.published.iter() {
+    let trees: BTreeSet<u64> = if ex.published_read_failed {
+        if !detect_ok {
+            return Err("O-1(a): published-set read failed".to_owned());
+        }
+        lost += 1;
+        want_pub
+    } else {
+        if ex.published != want_pub {
+            return Err(format!(
+                "O-1(a) at c={c}: published {:?} != model {:?}",
+                ex.published, want_pub
+            ));
+        }
+        ex.published.clone()
+    };
+    // (b)/(c)/(d) per published tree.
+    for t in trees.iter() {
         if *t == CATALOG {
             continue;
         }
-        let got = reader
-            .scan(*t, c)
-            .map_err(|_| "O-1(b): scan read failed".to_owned())?;
-        let want = model.scan(*t, c);
-        if got != want {
-            return Err(format!("O-1(b) at c={c}, tree {t}: scan mismatch"));
+        match reader.scan(*t, c) {
+            Ok(got) => {
+                let want = model.scan(*t, c);
+                if live(&got) != live(&want) {
+                    return Err(format!("O-1(b) at c={c}, tree {t}: scan mismatch"));
+                }
+            }
+            Err(_) if detect_ok => lost += 1,
+            Err(_) => return Err("O-1(b): scan read failed".to_owned()),
         }
-        let raw = reader
-            .raw(*t)
-            .map_err(|_| "O-1(c): raw read failed".to_owned())?;
-        if !cfg.no_raw_cut && raw.iter().any(|e| e.ts > c) {
-            return Err(format!(
-                "O-1(c) at c={c}, tree {t}: raw entry above the cut (max ts {})",
-                raw.iter().map(|e| e.ts).max().unwrap_or(0)
-            ));
+        match reader.raw(*t) {
+            Ok(raw) => {
+                if !cfg.no_raw_cut && raw.iter().any(|e| e.ts > c) {
+                    return Err(format!(
+                        "O-1(c) at c={c}, tree {t}: raw entry above the cut (max ts {})",
+                        raw.iter().map(|e| e.ts).max().unwrap_or(0)
+                    ));
+                }
+            }
+            Err(_) if detect_ok => lost += 1,
+            Err(_) => return Err("O-1(c): raw read failed".to_owned()),
         }
         for s in model.sample_points(ex.gc_w, c, sample_rng) {
-            let got = reader
-                .scan(*t, s)
-                .map_err(|_| "O-1(d): scan read failed".to_owned())?;
-            let want = model.scan(*t, s);
-            if got != want {
-                return Err(format!("O-1(d) at c={c}, tree {t}, S={s}: scan mismatch"));
+            match reader.scan(*t, s) {
+                Ok(got) => {
+                    let want = model.scan(*t, s);
+                    if live(&got) != live(&want) {
+                        return Err(format!("O-1(d) at c={c}, tree {t}, S={s}: scan mismatch"));
+                    }
+                }
+                Err(_) if detect_ok => lost += 1,
+                Err(_) => return Err("O-1(d): scan read failed".to_owned()),
             }
         }
     }
-    Ok(())
+    Ok(lost)
 }

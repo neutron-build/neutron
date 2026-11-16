@@ -316,10 +316,30 @@ impl Inode {
             }
             let fseg = fbytes.get((s - fstart) as usize..(e - fstart) as usize);
             let vseg = view.get((s - off) as usize..(e - off) as usize);
+            // X5-R9 (P ruling 2026-10-31): taint is the bytes that
+            // differ (1.4), so push the maximal runs of differing bytes,
+            // never the whole issued-interval overlap. The overlap form
+            // tainted a record byte-identical to its issued bytes because
+            // a MISDIRECTED landing changed a later part of the same
+            // issued batch (seed 9 round 1, X-5c).
             if let (Some(f), Some(v)) = (fseg, vseg)
                 && f != v
             {
-                out.push((s, e));
+                let mut run: Option<u64> = None;
+                for (i, (a, b)) in f.iter().zip(v.iter()).enumerate() {
+                    let at = s + i as u64;
+                    match (a != b, run) {
+                        (true, None) => run = Some(at),
+                        (false, Some(r0)) => {
+                            out.push((r0, at));
+                            run = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(r0) = run {
+                    out.push((r0, e));
+                }
             }
         }
         out

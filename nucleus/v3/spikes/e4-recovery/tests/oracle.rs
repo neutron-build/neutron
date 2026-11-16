@@ -25,6 +25,7 @@ type SynthTree = Vec<(u64, Vec<u8>, Option<Vec<u8>>)>;
 struct Synth {
     trees: BTreeMap<u64, SynthTree>,
     raw_extra: Vec<(u64, RawEntry)>, // extra raw entries per tree
+    fail_trees: BTreeSet<u64>,       // X5-R6: reads of these trees fail (XX001)
 }
 
 impl Synth {
@@ -49,9 +50,15 @@ impl Synth {
 
 impl StateReader for Synth {
     fn scan(&mut self, tree: u64, s: u64) -> Result<Scan, ReadFail> {
+        if self.fail_trees.contains(&tree) {
+            return Err(ReadFail);
+        }
         Ok(self.scan_of(tree, s))
     }
     fn raw(&mut self, tree: u64) -> Result<Vec<RawEntry>, ReadFail> {
+        if self.fail_trees.contains(&tree) {
+            return Err(ReadFail);
+        }
         let mut out = Vec::new();
         if let Some(vers) = self.trees.get(&tree) {
             for (ts, k, v) in vers {
@@ -160,6 +167,7 @@ fn ex_for(_synth: &Synth, c: u64, model: &Model) -> Extracted {
         gc_w: 0,
         opened_t: 0,
         published: model.published_at(c),
+        published_read_failed: false,
         amcheck_i: vec![],
         amcheck_ii_ran: false,
         amcheck_ii: vec![],
@@ -1209,5 +1217,233 @@ fn instrumentation_removals_are_load_bearing() {
             v.pass,
             "without condition 1 the R findings without a meta-slot fault pass"
         );
+    }
+}
+
+// ---- P ruling 2026-10-31 (nv3-X-5c-esc-1): X5-R7 and X5-R6 pins ----
+
+/// base_model plus commit 40 (SyncOn, acked): Delete b. lo = hi = 40.
+fn tomb_model() -> Model {
+    let mut m = base_model();
+    m.commit(
+        40,
+        Mode::SyncOn,
+        vec![Op::Delete {
+            tree: 7,
+            key: b"b".to_vec(),
+        }],
+    );
+    m.mark_acked(40);
+    m.mark_written(40);
+    m
+}
+
+/// X5-R7 must pass: §10.2 elided b's tombstone (ts 40 ≤ w = 40) after
+/// deleting its older version; the store's scan omits b, the model holds
+/// it as a tombstone. Read-equivalent (§8.3), so O-1 holds. Fails under
+/// the structural comparison.
+#[test]
+fn r7_elided_tombstone_reads_absent() {
+    let m = tomb_model();
+    let mut s = state_at(&m, 40);
+    if let Some(vers) = s.trees.get_mut(&7) {
+        vers.retain(|(_, k, _)| k != b"b");
+    }
+    let mut ex = ex_for(&s, 40, &m);
+    ex.frontier = 40;
+    ex.gc_w = 40;
+    let v = run(
+        &m,
+        FaultClass::C,
+        &mut s,
+        &ex,
+        &FaultTargets::default(),
+        None,
+    );
+    assert!(v.pass, "a legally elided tombstone must pass: {:?}", v);
+}
+
+/// X5-R7 must fail: the tombstone elided but b's older version kept
+/// (G-RESURRECT) — b reads as live at S ≥ 40.
+#[test]
+fn r7_resurrected_version_fails() {
+    let m = tomb_model();
+    let mut s = state_at(&m, 40);
+    if let Some(vers) = s.trees.get_mut(&7) {
+        vers.retain(|(ts, k, _)| !(k == b"b" && *ts == 40));
+    }
+    let mut ex = ex_for(&s, 40, &m);
+    ex.frontier = 40;
+    ex.gc_w = 40;
+    let v = run(
+        &m,
+        FaultClass::C,
+        &mut s,
+        &ex,
+        &FaultTargets::default(),
+        None,
+    );
+    assert!(!v.pass, "a resurrected older version must fail");
+    assert!(v.o1.is_err());
+}
+
+/// The X5-R6 world: trees 7 and 8 published at 10 (SyncOn, acked);
+/// commit 20 (SyncOff, written) puts 8:x=2. Tree 7's reads fail with
+/// XX001 (its leaf is the tainted referenced slot 5, LOST, reported by
+/// amcheck (i)); tree 8 is readable. lo = 10, hi = 20; recovered at 20.
+fn r6_world(class: FaultClass) -> (Model, Synth, Extracted, FaultTargets, TwinInfo) {
+    let mut m = Model::new();
+    m.commit(
+        10,
+        Mode::SyncOn,
+        vec![
+            Op::CreateTree { tree: 7 },
+            Op::CreateTree { tree: 8 },
+            Op::Put {
+                tree: CATALOG,
+                key: to_be64(7),
+                value: PUBLIC.to_vec(),
+            },
+            Op::Put {
+                tree: CATALOG,
+                key: to_be64(8),
+                value: PUBLIC.to_vec(),
+            },
+            Op::Put {
+                tree: 7,
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            },
+            Op::Put {
+                tree: 8,
+                key: b"x".to_vec(),
+                value: b"1".to_vec(),
+            },
+        ],
+    );
+    m.commit(
+        20,
+        Mode::SyncOff,
+        vec![Op::Put {
+            tree: 8,
+            key: b"x".to_vec(),
+            value: b"2".to_vec(),
+        }],
+    );
+    m.mark_acked(10);
+    m.mark_written(20);
+    let mut s = state_at(&m, 20);
+    s.fail_trees.insert(7);
+    let mut ex = ex_for(&s, 20, &m);
+    ex.frontier = 20;
+    ex.ok = true;
+    ex.xx001 = vec![XxSite::AmcheckI];
+    ex.amcheck_i_ran = true;
+    ex.image_slots.insert(5u64);
+    ex.tainted_image_slots.insert(5u64);
+    ex.amcheck_i = vec![Finding {
+        slot: Some(5),
+        what: "crc mismatch".to_owned(),
+    }];
+    let fault = MediaFault {
+        inode: 0,
+        off: 5 * 4096,
+        len: 4096,
+        bytes: vec![1u8; 4096],
+        pre: vec![0u8; 4096],
+        kind: MediaKind::Lost,
+    };
+    let faults = if class == FaultClass::C {
+        FaultTargets::default()
+    } else {
+        FaultTargets::collect(&[fault], 0)
+    };
+    let mut twin = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![],
+        image_slots: BTreeSet::new(),
+    };
+    twin.image_slots.insert(5u64);
+    (m, s, ex, faults, twin)
+}
+
+/// X5-R6 must pass: MP, `res` Ok, tree 7 unreadable (XX001 on the O-1
+/// reads, explained by tainted referenced slot 5), tree 8 exact.
+#[test]
+fn r6_mp_detected_loss_passes() {
+    let (m, mut s, ex, faults, twin) = r6_world(FaultClass::Mp);
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(v.pass, "a detected, explained loss must pass: {:?}", v);
+    assert!(v.o1_detected_loss > 0);
+    assert!(v.detections.contains(&XxSite::Read23));
+}
+
+/// X5-R6 must pass: the same with the published-set read failed too —
+/// (a) is a detected loss and (b)–(d) run over the model's published set.
+#[test]
+fn r6_mp_published_read_failed_passes() {
+    let (m, mut s, mut ex, faults, twin) = r6_world(FaultClass::Mp);
+    ex.published = BTreeSet::new();
+    ex.published_read_failed = true;
+    ex.xx001.push(XxSite::Read23);
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(v.pass, "{:?}", v);
+}
+
+/// X5-R6 must fail: a readable tree must still be exact.
+#[test]
+fn r6_mp_readable_tree_must_match() {
+    let (m, mut s, ex, faults, twin) = r6_world(FaultClass::Mp);
+    if let Some(vers) = s.trees.get_mut(&8) {
+        vers.push((20, b"x".to_vec(), Some(b"9".to_vec())));
+        vers.retain(|(ts, k, v)| !(k == b"x" && *ts == 20 && v.as_deref() == Some(b"2")));
+    }
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "a wrong value in a readable tree must fail");
+    assert!(v.o1.is_err());
+}
+
+/// X5-R6 must fail: the same with the published-set read failed — the
+/// readable tree is still checked against the model's published set.
+#[test]
+fn r6_mp_published_read_failed_still_checks_trees() {
+    let (m, mut s, mut ex, faults, twin) = r6_world(FaultClass::Mp);
+    ex.published = BTreeSet::new();
+    ex.published_read_failed = true;
+    if let Some(vers) = s.trees.get_mut(&8) {
+        vers.retain(|(ts, _, _)| *ts != 20);
+        vers.retain(|(ts, _, _)| *ts != 10);
+    }
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "tree 8 missing must fail: {:?}", v);
+}
+
+/// X5-R6 must fail: a read failure with no damaged referenced slot
+/// (nothing tainted, no active R) is unexplained.
+#[test]
+fn r6_mp_unexplained_read_fail_fails() {
+    let (m, mut s, mut ex, faults, twin) = r6_world(FaultClass::Mp);
+    ex.tainted_image_slots = BTreeSet::new();
+    ex.amcheck_i = vec![];
+    ex.xx001 = vec![];
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "an unexplained read XX001 must fail");
+    assert!(v.o3_fail.clone().unwrap_or_default().contains("X5-R6"));
+}
+
+/// X5-R6 must fail: in MW and in C a failed O-1 read fails O-1.
+#[test]
+fn r6_read_fail_outside_mp_fails() {
+    for class in [FaultClass::Mw, FaultClass::C] {
+        let (m, mut s, mut ex, faults, twin) = r6_world(class);
+        if class == FaultClass::C {
+            ex.xx001 = vec![];
+            ex.amcheck_i = vec![];
+            ex.tainted_image_slots = BTreeSet::new();
+        }
+        let v = run(&m, class, &mut s, &ex, &faults, Some(&twin));
+        assert!(!v.pass, "{class:?}: a failed O-1 read must fail");
+        assert!(v.o1.is_err(), "{class:?}");
+        assert_eq!(v.o1_detected_loss, 0);
     }
 }

@@ -47,6 +47,24 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 
 use crate::rng::Rng;
 
+/// The fixed per-world yield budget (X5-R13 (b), P ruling nv3-X-5c-esc-2,
+/// 2026-10-31): 40× the largest world measured over seeds 0..199 (every
+/// terminating world used fewer than 25,000 yields). A world whose yield
+/// count exceeds it is **livelocked** — some task keeps yielding and never
+/// parks, so "all tasks blocked" never holds and the deadlock detector can
+/// never fire. The scheduler then fails the world exactly as the deadlock
+/// path does and returns [`SimFail::Livelock`]; the harness records it on
+/// the round (folded into the `deadlock` flags) — a recorded failure,
+/// never a pass, never a hang.
+///
+/// The constant is fixed (the ruling) and recorded in the crate README.
+/// It may change only as the fix for a seed whose root cause is a
+/// legitimately long world (an instrumentation defect), followed by a
+/// whole-campaign re-run. Yields are counted in sim order (under the
+/// world lock, one increment per yield point), so the trip point is a
+/// pure function of the schedule (S-DET/W-DET unchanged).
+pub const YIELD_BUDGET: u64 = 1_000_000;
+
 /// Identifies a task (an OS thread in the round).
 pub type TaskId = usize;
 
@@ -99,9 +117,36 @@ pub struct SchedCore {
     pub crashed: bool,
     /// A deadlock (all tasks blocked) was detected.
     pub deadlock: bool,
+    /// A livelock was detected (X5-R13 (b)): this world's `yields`
+    /// exceeded [`YIELD_BUDGET`]. Set once, with the tripping site,
+    /// when the world is failed; the harness folds it into the round's
+    /// and seed's `deadlock` flags.
+    pub livelock: bool,
+    /// **X5-R14 (nv3-X-5c-esc-3): the deterministic unwind turn.** Set
+    /// at every world-fail site (the crash trip, the livelock trip, the
+    /// deadlock detection and `deliver_crash`) to the smallest
+    /// `TaskId ≥ 1` that has not finished. From that moment until the
+    /// world is dropped, [`Sched::acquire`] grants a host step only to
+    /// this task (or to `HARNESS`), so the unwinding tasks' host
+    /// mutations — store error-path cleanup, harness records, accepts —
+    /// run in `TaskId` order instead of OS order. The ruling: "the
+    /// baton passes through the unwinding tasks in TaskId order".
+    /// `finish` advances it. `None` while the world has not failed.
+    pub unwind_turn: Option<TaskId>,
+    /// The call site of the yield that tripped [`YIELD_BUDGET`].
+    pub livelock_site: &'static str,
+    /// The park table at the trip (X5-R13 (b) diagnosis): each task's
+    /// [`WaitKey`] just before the world was failed — the stuck pattern
+    /// that the DEADLOCK detector could not see because some task kept
+    /// yielding. Diagnostic only; never a record or a digest input.
+    pub livelock_parked: Vec<Option<WaitKey>>,
     /// Trace of `(yield_count, picked_task)` handoffs, for the determinism
     /// self-test and diagnosis; bounded so long rounds stay cheap.
     pub trace: Vec<(u64, TaskId)>,
+    /// Per-task yield counts (diagnosis only, X5-R13 (b)): which tasks
+    /// were spinning when the budget tripped. Never a record or a digest
+    /// input.
+    pub yld_per_task: Vec<u64>,
 }
 
 impl SchedCore {
@@ -123,7 +168,12 @@ impl SchedCore {
             crash_at_yield: None,
             crashed: false,
             deadlock: false,
+            livelock: false,
+            unwind_turn: None,
+            livelock_site: "",
+            livelock_parked: Vec::new(),
             trace: Vec::new(),
+            yld_per_task: vec![0; ntasks],
         }
     }
 }
@@ -144,6 +194,15 @@ pub enum SimFail {
     /// All tasks were blocked; a per-seed failure (card 1.2).
     #[error("deadlock")]
     Deadlock,
+    /// The world exceeded [`YIELD_BUDGET`] (X5-R13 (b), P ruling
+    /// nv3-X-5c-esc-2): some task kept yielding and never parked, so the
+    /// deadlock detector could never fire. The string names the yield
+    /// site that tripped it. The scheduler has already failed the world
+    /// exactly as the deadlock path does; the harness records it on the
+    /// round, folded into the `deadlock` flags — a recorded failure,
+    /// never a pass.
+    #[error("livelock at {0}")]
+    Livelock(&'static str),
     /// An S-BATON violation (card X-5b Work 11, rule 4): a task tried to
     /// park (or to re-acquire the world) while holding the world lock, or
     /// the world lock was held by a task that stopped making progress.
@@ -172,11 +231,42 @@ pub fn world_held_by_me() -> bool {
     WORLD_HELD.with(|h| h.get())
 }
 
+/// The deterministic unwind turn (X5-R14): the smallest `TaskId ≥ 1`
+/// that has not finished, or `None` when every workload task has. A
+/// pure function of `finished`, so the turn order is a function of the
+/// task set, never of OS timing.
+fn smallest_unfinished(core: &SchedCore) -> Option<TaskId> {
+    (1..core.ntasks).find(|t| !core.finished.get(*t).copied().unwrap_or(true))
+}
+
 /// The baton scheduler over host `H`.
 pub struct Sched<H: SchedHost> {
     host: Mutex<H>,
     cvs: Vec<Condvar>,
+    /// X5-R14 diagnostic: the optional host-mutation log (enabled only
+    /// by `E4_SCHED_LOG=<path>`, default **off** — never a digest
+    /// input, never committed enabled; the ruling's method names it for
+    /// the non-determinism root-cause only).
+    mutlog: Option<std::sync::Mutex<std::fs::File>>,
+    /// X5-R14 diagnostic: this `Sched`'s world serial number in the log.
+    world_no: u64,
 }
+
+// X5-R14 diagnostic: the global world counter and log path plumbing.
+// Default off; see [`Sched::mutlog`].
+fn sched_log_file() -> Option<std::sync::Mutex<std::fs::File>> {
+    let path = std::env::var("E4_SCHED_LOG").ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(std::sync::Mutex::new)
+}
+
+/// X5-R14 diagnostic: the process-wide world serial counter (only
+/// touched when the log is enabled).
+static WORLD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<H: SchedHost> Sched<H> {
     /// Build a scheduler around `host`; task 0 holds the baton.
@@ -186,9 +276,34 @@ impl<H: SchedHost> Sched<H> {
         for _ in 0..n {
             cvs.push(Condvar::new());
         }
+        let mutlog = sched_log_file();
+        let world_no = if mutlog.is_some() {
+            WORLD_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+        } else {
+            0
+        };
         Self {
             host: Mutex::new(host),
             cvs,
+            mutlog,
+            world_no,
+        }
+    }
+
+    /// X5-R14 diagnostic: append one line to the host-mutation log when
+    /// enabled. The thread id distinguishes tasks that the scheduler
+    /// cannot name at this call (an `acquire` before the fix carried no
+    /// task id); `detail` carries what the caller already knows under
+    /// the lock (yield count, baton holder). Never called while the
+    /// world lock is held by this thread.
+    fn diag(&self, what: &str, detail: &str) {
+        use std::io::Write as _;
+        let Some(log) = &self.mutlog else {
+            return;
+        };
+        let tid = format!("{:?}", std::thread::current().id());
+        if let Ok(mut f) = log.lock() {
+            let _ = writeln!(f, "W{ab} {what} {detail} th={tid}", ab = self.world_no);
         }
     }
 
@@ -207,41 +322,140 @@ impl<H: SchedHost> Sched<H> {
     /// contention from a baton handoff still in flight (the previous
     /// holder finishing its own park) is retried; a holder that never
     /// releases is a violation and is reported.
-    pub fn acquire(&self, site: &'static str) -> Result<WorldGuard<'_, H>, SimFail> {
+    ///
+    /// **X5-R14 (P ruling nv3-X-5c-esc-3, the non-reproducing
+    /// digests):** the acquisition is also the S-DET gate — a host step
+    /// (`Cx::with`, every `E4Env` op, the accept hook) is granted only
+    /// to the task the scheduler currently authorises:
+    ///
+    /// - **a live world** (`!crashed && !deadlock`): only the baton
+    ///   holder (`running == Some(me)`). Before this gate, a task that
+    ///   had not been handed the baton yet — a freshly spawned service
+    ///   thread's loop-entry `Cx::with`, which can `wal_writer:take`
+    ///   the WAL buffer or advance the pool clock in `evict:pick` —
+    ///   could take host steps in OS start order, so the schedule (and
+    ///   with it every digest) was a function of host timing, not of
+    ///   `(seed, mutant)`. The refusal is loud ([`SimFail::Baton`]
+    ///   naming the site), never a silent fall-through.
+    /// - **a failed world** (`crashed || deadlock`, including the
+    ///   livelock trip and `deliver_crash`): only [`Self::unwind_turn`]
+    ///   — the deterministic unwind. Before it, every unwinding task's
+    ///   cleanup (`unpin`, `tree_unlock`, `gate_release`, harness
+    ///   records) ran concurrently in OS order with `running = None`.
+    ///
+    /// `HARNESS` is exempt: in the single-task recovery, extraction and
+    /// checkpoint worlds it is the only task, and in a multi-task world
+    /// the harness thread never acquires after the world fails (it
+    /// joins; its post-join reads use [`Self::lock`], the scheduler's
+    /// own blocking acquisition).
+    pub fn acquire(&self, me: TaskId, site: &'static str) -> Result<WorldGuard<'_, H>, SimFail> {
         if world_held_by_me() {
             // Re-entrant acquisition by this thread: the run-1 deadlock
             // shape, caught before it hangs.
             return Err(SimFail::Baton(site));
         }
-        // The handoff-in-flight window: the task that handed the baton to
-        // us may still hold the lock inside its own park for a moment.
-        // Retry with a bounded yield loop; a genuine violator never frees
-        // it and is reported rather than hung.
-        for _ in 0..1_000_000 {
+        // The acquisition loop never blocks on the world mutex: the
+        // handoff-in-flight window (the task that handed the baton to
+        // us may still hold the lock inside its own park for a moment)
+        // is retried with a bounded yield loop, and the unwind-turn
+        // wait parks on this task's condvar **while holding the lock**
+        // (released atomically by the wait), so a genuine violator that
+        // never frees the lock is reported ([`SimFail::Baton`]) rather
+        // than hung on — the cross-thread discipline the gate's R6
+        // correction fixed.
+        let mut spins: u64 = 0;
+        loop {
             match self.host.try_lock() {
-                Ok(g) => {
-                    WORLD_HELD.with(|h| h.set(true));
-                    return Ok(WorldGuard { g });
+                Ok(mut g) => {
+                    loop {
+                        // The X5-R14 S-DET gate, under the same lock as
+                        // the step it authorises.
+                        enum Gate {
+                            Step,
+                            AwaitTurn,
+                            Refuse,
+                        }
+                        let verdict = {
+                            let core = g.sched_mut();
+                            if core.crashed || core.deadlock {
+                                if me == HARNESS || core.unwind_turn == Some(me) {
+                                    Gate::Step
+                                } else {
+                                    Gate::AwaitTurn
+                                }
+                            } else if core.running == Some(me) {
+                                Gate::Step
+                            } else {
+                                Gate::Refuse
+                            }
+                        };
+                        match verdict {
+                            Gate::Step => {
+                                WORLD_HELD.with(|h| h.set(true));
+                                {
+                                    let core = g.sched_mut();
+                                    self.diag(
+                                        "ACQ",
+                                        &format!(
+                                            "site={site} me={me} y={} run={:?} crashed={} turn={:?}",
+                                            core.yields,
+                                            core.running,
+                                            core.crashed,
+                                            core.unwind_turn
+                                        ),
+                                    );
+                                }
+                                return Ok(WorldGuard { g });
+                            }
+                            Gate::AwaitTurn => {
+                                // Not this task's unwind turn yet:
+                                // park on our condvar; `finish` advances
+                                // the turn and notifies.
+                                let Some(cv) = self.cvs.get(me) else {
+                                    return Err(SimFail::Internal("cvs shorter than tasks"));
+                                };
+                                match cv.wait(g) {
+                                    Ok(g2) => g = g2,
+                                    Err(p) => {
+                                        // Cannot be poisoned (no panic
+                                        // crosses this boundary); stay
+                                        // fail-stop rather than hang.
+                                        drop(p.into_inner());
+                                        return Err(SimFail::Baton(site));
+                                    }
+                                }
+                            }
+                            Gate::Refuse => {
+                                // A host step without the baton (a live
+                                // world): the loud refusal.
+                                return Err(SimFail::Baton(site));
+                            }
+                        }
+                    }
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err(SimFail::Baton(site));
                 }
                 Err(std::sync::TryLockError::WouldBlock) => {
+                    spins += 1;
+                    if spins > 1_000_000 {
+                        return Err(SimFail::Baton(site));
+                    }
                     std::thread::yield_now();
                 }
             }
         }
-        Err(SimFail::Baton(site))
     }
 
     /// A plain yield point with a call-site name: gives up the baton, gets
     /// it back. Checks the S-BATON held flag first (rule 4): a task that
-    /// parks while holding the world lock is the run-1 violation.
+    /// parks while holding the world lock is the run-1 violation. The
+    /// name is also the livelock trip record's site (X5-R13 (b)).
     pub fn yield_baton_at(&self, me: TaskId, site: &'static str) -> Result<(), SimFail> {
         if world_held_by_me() {
             return Err(SimFail::Baton(site));
         }
-        self.yield_baton(me)
+        self.yield_baton_budget(me, site)
     }
 
     /// Release the workload tasks after construction (they wait on
@@ -264,12 +478,20 @@ impl<H: SchedHost> Sched<H> {
 
     /// A plain yield point: give up the baton, get it back. This is the
     /// primitive behind every `E4Env` call, `write_guard`, gate attempt,
-    /// WAL enqueue and commit-boundary yield the card names (1.2).
+    /// WAL enqueue and commit-boundary yield the card names (1.2). No
+    /// call-site name: the trip record (X5-R13 (b)) names the generic
+    /// `sched:yield` site for this form; prefer [`Self::yield_baton_at`].
     ///
     /// A task's first scheduler call goes through [`Self::park`] too: a
     /// thread that has not been handed the baton yet must not act (S-DET —
     /// otherwise OS thread start order leaks into the schedule).
     pub fn yield_baton(&self, me: TaskId) -> Result<(), SimFail> {
+        self.yield_baton_budget(me, "sched:yield")
+    }
+
+    /// The site-named form of [`Self::yield_baton`], shared by both (the
+    /// budget check lives here, once).
+    fn yield_baton_budget(&self, me: TaskId, site: &'static str) -> Result<(), SimFail> {
         self.park(me)?;
         let mut host = self.lock();
         {
@@ -278,12 +500,19 @@ impl<H: SchedHost> Sched<H> {
                 return Err(SimFail::Crashed);
             }
             core.yields += 1;
+            if let Some(y) = core.yld_per_task.get_mut(me) {
+                *y += 1;
+            }
             if let Some(t) = core.crash_at_yield
                 && t == core.yields
             {
                 core.crashed = true;
             }
             if core.crashed {
+                self.diag("CRASH-TRIP", &format!("y={}", core.yields));
+                // X5-R14: the deterministic unwind begins — the turn is
+                // the smallest unfinished task.
+                core.unwind_turn = smallest_unfinished(core);
                 core.running = None;
                 for w in core.waiting.iter_mut() {
                     *w = None;
@@ -293,6 +522,31 @@ impl<H: SchedHost> Sched<H> {
                 }
                 return Err(SimFail::Crashed);
             }
+            // X5-R13 (b): a world past the budget is livelocked. Fail it
+            // exactly as the deadlock path does (crashed, waiters
+            // cleared, all notified) and return the new failure naming
+            // the tripping site. Guarded by `!core.livelock` so the
+            // single trip that sets the flag is also the only one that
+            // reports it; every later caller sees `crashed` above.
+            if core.yields > YIELD_BUDGET && !core.livelock {
+                core.livelock = true;
+                core.livelock_site = site;
+                // Snapshot the stuck pattern before the world-fail
+                // clears it (diagnosis; the deadlock detector never
+                // saw it because some task kept yielding).
+                core.livelock_parked = core.waiting.clone();
+                core.crashed = true;
+                // X5-R14: the deterministic unwind (as at the crash trip).
+                core.unwind_turn = smallest_unfinished(core);
+                core.running = None;
+                for w in core.waiting.iter_mut() {
+                    *w = None;
+                }
+                for cv in self.cvs.iter() {
+                    cv.notify_all();
+                }
+                return Err(SimFail::Livelock(site));
+            }
         }
         self.handoff_locked(&mut host)?;
         drop(host);
@@ -301,11 +555,13 @@ impl<H: SchedHost> Sched<H> {
 
     /// Park until we hold the baton again (or the world crashed).
     fn park(&self, me: TaskId) -> Result<(), SimFail> {
+        self.diag("PARK-ENTER", &format!("me={me}"));
         let mut host = self.lock();
         loop {
             {
                 let core = host.sched_mut();
                 if core.crashed || core.deadlock {
+                    self.diag("PARK-OUT", &format!("me={me} crashed y={}", core.yields));
                     return Err(SimFail::Crashed);
                 }
                 if core.running == Some(me) {
@@ -381,6 +637,11 @@ impl<H: SchedHost> Sched<H> {
                 if any_alive && !core.crashed {
                     core.deadlock = true;
                     core.crashed = true;
+                    // X5-R14: the deterministic unwind (as at the crash
+                    // trip) — the deadlock release also empties
+                    // `running`, so unwinding cleanup must be turn-
+                    // ordered here too.
+                    core.unwind_turn = smallest_unfinished(core);
                     core.running = None;
                     for w in core.waiting.iter_mut() {
                         *w = None;
@@ -405,6 +666,7 @@ impl<H: SchedHost> Sched<H> {
         if host.sched_mut().trace.len() < 4096 {
             host.sched_mut().trace.push((yields, pick));
         }
+        self.diag("HANDOFF", &format!("y={yields} -> {pick}"));
         if let Some(cv) = self.cvs.get(pick) {
             cv.notify_one();
         }
@@ -417,10 +679,14 @@ impl<H: SchedHost> Sched<H> {
     /// scheduler call instead of parking forever.
     pub fn deliver_crash(&self) {
         let mut host = self.lock();
+        self.diag("DELIVER-CRASH", "manual");
         let cvs: Vec<&Condvar> = self.cvs.iter().collect();
         {
             let core = host.sched_mut();
             core.crashed = true;
+            // X5-R14: the deterministic unwind begins here too (the
+            // hook/task-yield crash arms deliver directly).
+            core.unwind_turn = smallest_unfinished(core);
             core.running = None;
             for w in core.waiting.iter_mut() {
                 *w = None;
@@ -446,7 +712,9 @@ impl<H: SchedHost> Sched<H> {
 
     /// A task ended its life; it never runs again. The last workload task
     /// to finish wakes the harness; a finishing baton holder hands the
-    /// baton on.
+    /// baton on. In a failed world it also advances the deterministic
+    /// unwind turn (X5-R14): the turn moves to the smallest unfinished
+    /// task and every turn waiter is woken to re-check.
     pub fn finish(&self, me: TaskId) {
         let mut host = self.lock();
         let all_done = {
@@ -459,6 +727,13 @@ impl<H: SchedHost> Sched<H> {
             }
             core.finished.iter().skip(1).all(|f| *f)
         };
+        if host.sched_mut().crashed || host.sched_mut().deadlock {
+            let core = host.sched_mut();
+            core.unwind_turn = smallest_unfinished(core);
+            for cv in self.cvs.iter() {
+                cv.notify_all();
+            }
+        }
         if all_done {
             let core = host.sched_mut();
             for w in core.waiting.iter_mut() {

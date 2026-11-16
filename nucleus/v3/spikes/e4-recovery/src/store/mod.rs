@@ -423,6 +423,25 @@ pub struct StoreInner {
     /// The free-set pages of the **last durable** image (unpinned at the
     /// next checkpoint's step 5, when nothing references them anymore).
     pub fs_prev: BTreeSet<u64>,
+    /// The workload's apply-progress tracking (card X-5c Work 5, the Q5/Q9
+    /// observables): commit ts → `(ops applied so far, total ops,
+    /// chunked)`. Written by the harness's commit path (the apply loop is
+    /// harness-side), read only by the flip's Q9 counter and the
+    /// crash-time quota snapshot — never by any durability decision.
+    pub apply_progress: BTreeMap<u64, (u64, u64, bool)>,
+    /// Q9 (card Work 5.6): flips whose image holds part of a commit above
+    /// `T` — at the flip, some commit with `ts > T` had `1 ≤ done < total`
+    /// ops applied (the out-of-order apply at the flip). Counted inside
+    /// the flip step itself, so `T` and the snapshot are atomic.
+    pub q9_partial_flips: u64,
+    /// Work 5.3 (the E4 row's dirty set): LPIDs dirtied since the last
+    /// checkpoint began. Fed by [`prims::store_page`] (the only mutation
+    /// path); folded into `dirty_max` at each checkpoint's begin step.
+    pub dirty_now: BTreeSet<u64>,
+    /// The largest [`StoreInner::dirty_now`] any completed checkpoint
+    /// interval reached (folded at each checkpoint begin; the crash-time
+    /// open interval is read beside it).
+    pub dirty_max: u64,
     /// Poison reason (I-FAIL-STOP).
     pub poisoned: Option<String>,
     /// A world-acquisition failure observed on a release path (S-BATON
@@ -488,6 +507,10 @@ impl StoreInner {
             meta_durable_k: 0,
             fs_building: BTreeSet::new(),
             fs_prev: BTreeSet::new(),
+            apply_progress: BTreeMap::new(),
+            q9_partial_flips: 0,
+            dirty_now: BTreeSet::new(),
+            dirty_max: 0,
             poisoned: None,
             baton_fail: None,
             wal: wal::WalState::default(),
@@ -523,13 +546,15 @@ impl<'a, H: StoreHost> Cx<'a, H> {
 
     /// Run one atomic step under the world lock (no yields inside; rule 1).
     /// The acquisition is a `try_lock` that reports [`SimFail::Baton`]
-    /// naming `site` on a violation (rule 4).
+    /// naming `site` on a violation (rule 4) and carries the caller's
+    /// task id into X5-R14's S-DET gate (only the baton holder — or, in
+    /// a failed world, the unwind turn — may take a host step).
     pub fn with<R>(
         &self,
         site: &'static str,
         f: impl FnOnce(&mut H) -> Result<R, Fail>,
     ) -> Result<R, Fail> {
-        let mut g = self.w.acquire(site).map_err(Fail::Sim)?;
+        let mut g = self.w.acquire(self.t, site).map_err(Fail::Sim)?;
         f(&mut g)
     }
 

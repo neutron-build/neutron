@@ -20,7 +20,8 @@
 //! - [`store`]: the S-STORE subset under test (Work 3–4), converted to
 //!   the S-BATON step discipline of card X-5b Work 11;
 //! - `monitor`: the harness-side monitors (M-*, Work 3.10);
-//! - `workload`/`campaign`: the seed campaign, `verify`, `mutants`.
+//! - `workload`: the seeded generator and per-seed driver (Work 5);
+//! - `campaign`: the seed campaign, `verify`, `mutants` (Work 7–8).
 
 pub mod campaign;
 pub mod crc;
@@ -31,3 +32,4 @@ pub mod oracle;
 pub mod rng;
 pub mod sim;
 pub mod store;
+pub mod workload;

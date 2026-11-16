@@ -74,6 +74,20 @@ pub const CKPT_HOOKS: [CkptHook; 10] = [
     CkptHook::After6,
 ];
 
+/// The hook's position bit in [`CKPT_HOOKS`] (X5-R16 NEVER-FIRED's
+/// per-index hook mask: the harness records which hooks each completed
+/// checkpoint reached, and the driver's targeted draw picks an index
+/// whose mask carries the drawn hook). Every hook is in `CKPT_HOOKS`;
+/// a hook that is not (none today) returns 0 — a conservative bit no
+/// draw relies on.
+pub fn hook_bit(hook: CkptHook) -> u16 {
+    CKPT_HOOKS
+        .iter()
+        .position(|h| *h == hook)
+        .map(|i| 1u16 << i)
+        .unwrap_or(0)
+}
+
 /// A checkpoint hook callback: `Err` aborts the checkpoint (a harness
 /// crash arms the scheduler's crash flag and returns `Crashed`).
 pub type Hooks<'a> = dyn FnMut(CkptHook) -> Result<(), Fail> + 'a;
@@ -557,6 +571,12 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         st.ckpt_splits = 0;
         st.ckpt_merges = 0;
         st.fs_building.clear();
+        // Work 5.3's interval fold: the interval this checkpoint closes
+        // reached `dirty_now.len()` distinct dirtied LPIDs; the next
+        // interval starts empty.
+        let n = st.dirty_now.len() as u64;
+        st.dirty_max = st.dirty_max.max(n);
+        st.dirty_now.clear();
         Ok(())
     })?;
     hooks(CkptHook::Before0)?;
@@ -597,6 +617,19 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
             .collect();
         st.e = k as u32 + 1;
         st.flip_window = true;
+        // Q9 (card X-5c Work 5.6), counted inside the flip so `T` and the
+        // apply-progress snapshot are atomic: this flip's image will hold
+        // part of a commit above `T` (an out-of-order apply at the flip)
+        // iff some tracked commit has `ts > T` with `1 ≤ done` (a partial
+        // apply). The counter is an observable only — it never gates
+        // behaviour.
+        if st
+            .apply_progress
+            .iter()
+            .any(|(ts, (done, _, _))| *done >= 1 && *ts > t)
+        {
+            st.q9_partial_flips += 1;
+        }
         Ok(FlipOut::Ok {
             t,
             gc_w,
@@ -1347,13 +1380,24 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             _ => {}
         }
     }
-    // Advance visible_ts through contiguous applied commits.
+    // §14 (X5-R10): C-T0 restarts its sequencer from the **apply
+    // frontier** — "the largest replayed commit_ts … C-T0 v8 restarts
+    // its sequencer … from that value" — not from the contiguous
+    // visible_ts walk. A replay that applied a non-contiguous set (a
+    // bulk load's §10.1 S_L draw consumed a ts that carries no record;
+    // any WAL shape that replays around a hole) leaves the contiguous
+    // walk stranded below the frontier, and a next_ts below it reissues
+    // ts's the recovered store already holds (the seed-10 shape: T=3,
+    // replay {4,6,7}, next_ts 5 reused 5–7 while the model silently
+    // overwrote ts 6). Every replayed commit is durable in the
+    // recovered state, so visible_ts jumps to the frontier and the
+    // leftover applied set is cleared: post-recovery commits continue
+    // strictly above the frontier.
     cx.with("recover:visible", |c| {
         let st = c.store();
-        while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
-            st.seq.visible_ts += 1;
-        }
-        st.seq.next_ts = st.seq.visible_ts + 1;
+        st.seq.visible_ts = frontier;
+        st.seq.next_ts = frontier + 1;
+        st.seq.applied.clear();
         Ok(())
     })?;
     // G2: physical truncation before returning (and before any new

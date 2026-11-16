@@ -94,13 +94,14 @@ impl<'a, H: SchedHost + HasDisk> EnvRef<'a, H> {
 
     /// One step body under the world lock acquired per S-BATON rule 4
     /// (every env call's host acquisition is a `try_lock` that reports
-    /// violations instead of blocking).
+    /// violations instead of blocking). The task id feeds X5-R14's
+    /// S-DET gate in [`Sched::acquire`].
     fn step<T>(
         &self,
         site: &'static str,
         f: impl FnOnce(&mut H) -> Result<T, String>,
     ) -> Result<T, SimFail> {
-        let mut g = self.sched.acquire(site)?;
+        let mut g = self.sched.acquire(self.task, site)?;
         f(&mut g).map_err(|_| SimFail::Crashed)
     }
 }
@@ -157,7 +158,7 @@ impl<'a, H: SchedHost + HasDisk> E4Env for EnvRef<'a, H> {
     }
 
     fn accepted(&mut self, f: FileId, off: u64, len: u64) -> Result<(), SimFail> {
-        let mut g = self.sched.acquire("env:accepted")?;
+        let mut g = self.sched.acquire(self.task, "env:accepted")?;
         g.disk().accepted(f, off, len);
         Ok(())
     }

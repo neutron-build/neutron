@@ -110,6 +110,15 @@ where
             let saw_baton = Arc::clone(&saw_baton);
             let saw_deadlock = Arc::clone(&saw_deadlock);
             handles.push(scope.spawn(move || {
+                // X5-R14: the task's first scheduler contact is a park
+                // (the same entry barrier the harness's `run_task`
+                // imposes): a body may not take host steps before the
+                // baton is handed to it. `Sched::acquire`'s S-DET gate
+                // enforces it; this barrier keeps every test body on
+                // the legal side of the gate.
+                if let Err(SimFail::Baton(s)) = sched.yield_baton(t) {
+                    panic!("entry barrier refused: Baton at {s}");
+                }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&sched, t)));
                 match r {
                     Err(_) => panicked.store(true, Ordering::SeqCst),
@@ -927,4 +936,73 @@ fn mutant_enum_is_complete() {
         seen.push(m);
     }
     assert_eq!(seen.len(), 28, "the card's 27-mutant enum plus G7's");
+}
+
+/// X5-R13's seed 36, root-caused (P: "`tree::gc_step` hands back its own
+/// cursor (`next == resume`)") and fixed: the §10.4 sweep's resume —
+/// `next_after` of the last processed cell — cannot carry the descent
+/// past the subtree the leaf closes when the key region ahead is empty
+/// (user keys with a gap across an inner boundary). The step then handed
+/// back its own cursor and `gc_sweep` looped at `h:gcyield` forever: a
+/// hang the DEADLOCK detector can never see, because the looping task
+/// never parks (the livelock X5-R13 (b)'s budget bounds and records).
+///
+/// Literal config: a depth-3 tree — an inner page holds at most
+/// (4096−24)/16 = 254 children, so ~9-cell leaves × 3,000 keys (~334
+/// leaves) force the third level — of 3,000 keys spaced 7 apart, one
+/// version each, so **every** inner boundary crossing has an empty key
+/// region ahead. One full sweep at a watermark above every ts must
+/// terminate in a bounded number of steps and lose nothing (the scan
+/// equals the model map). With the subtree-ceiling fix reverted the
+/// sweep hands back its own cursor at the first boundary and this pin
+/// fails on the step bound (verified mutant-style, then reverted).
+#[test]
+fn gc_sweep_crosses_subtree_boundaries() {
+    let cfg = tcfg(8, 16, 2);
+    let (disk, st) = create_store(cfg.clone(), 36, Some(2));
+    let sched = pass_world(1, 36, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    let root = tree::dir_root_of(&cx, 2).expect("root");
+    let mut want: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    for i in 0..3000u64 {
+        let k = (i * 7).to_be_bytes();
+        let mut v = vec![0u8];
+        v.extend_from_slice(&i.to_le_bytes());
+        v.extend(std::iter::repeat_n(7u8, 370));
+        ins(&cx, 2, root, &k, 1, &v);
+        want.insert(k.to_vec(), Some(v[1..].to_vec()));
+    }
+    // The construction's page math: ~9 cells per 4-KiB leaf over 3,000
+    // entries is ~334 leaves, and an inner page caps at 254 children —
+    // the third level exists (the root is inner, and at least one of
+    // its children is too).
+    let (rb, _) = prims::fetch_page(&cx, root, false).expect("root fetch");
+    assert_eq!(
+        rb.get(4).copied().unwrap_or(0),
+        e4_recovery::store::page::KIND_INNER,
+        "the tree did not grow an inner root"
+    );
+    // One full sweep at w above every ts: bounded steps, nothing lost.
+    let mut resume = Vec::new();
+    let mut steps = 0u32;
+    loop {
+        let next = tree::gc_step(&cx, 2, root, 2, &resume).expect("gc step");
+        steps += 1;
+        assert!(
+            steps < 5_000,
+            "the sweep does not terminate (steps={steps}) — the resume re-enters the subtree it closed"
+        );
+        if next.is_empty() {
+            break;
+        }
+        resume = next;
+    }
+    let scan = tree::tree_scan(&cx, root, 2).expect("scan");
+    assert_eq!(scan.len(), want.len(), "post-sweep scan size");
+    for (k, v) in &want {
+        assert_eq!(scan.get(k), Some(v), "post-sweep {k:?}");
+    }
 }

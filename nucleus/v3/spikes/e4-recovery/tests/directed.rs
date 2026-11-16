@@ -37,6 +37,10 @@ fn faults(class: FaultClass, k: FaultKnobs) -> RoundFaults {
         knobs: k,
         directed: Vec::new(),
         no_r_taint: false,
+        media: e4_recovery::harness::MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
+        probe_pass: false,
     }
 }
 
@@ -682,6 +686,10 @@ fn d7_zombie_tail() {
                 knobs: knobs(0, 0),
                 directed: vec![fault.clone()],
                 no_r_taint: false,
+                media: e4_recovery::harness::MediaDraw::None,
+                twin_supply: None,
+                nested_draw: 0,
+                probe_pass: false,
             },
             cfg(mutant),
             disk,
@@ -976,6 +984,10 @@ fn d10_lost_meta() {
             knobs: knobs(0, 0),
             directed: vec![fault.clone()],
             no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
         },
         cfg(None),
         disk,
@@ -998,21 +1010,40 @@ fn d10_lost_meta() {
         "D10 clean: never served (o3={:?})",
         clean.o3_fail
     );
-    let m = run(
+    // X5-R11 (e) (P ruling 2026-10-31): after (b), this round carries
+    // an AmcheckI site from the meta fault (the stale-durable-meta-slot
+    // finding), so O-3 (d) no longer fires; supply the twin (the clean
+    // arm's collector pattern) and keep the catch on O-1, which X5-R6
+    // item 5 keeps strict: a mismatch on a read that returns is a
+    // failure, whatever else was detected.
+    let (disk, st) = harness::create_store(cfg(None), 2009, 7).expect("create");
+    let mut twin = Vec::new();
+    let m = harness::run_round(
         2009,
+        0,
         &script,
         &RoundFaults {
             class: FaultClass::Mp,
             knobs: knobs(0, 0),
             directed: vec![fault],
             no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
         },
-        Some(Mutant::StartSegmentMissingOk),
+        cfg(Some(Mutant::StartSegmentMissingOk)),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
     );
     assert!(
-        !m.pass && m.o1.is_err() && m.o3_fail.as_deref().unwrap_or("").contains("O-3(d)"),
-        "D10 mutant: the silent empty WAL must lose the acked commits (o1={:?}, o3={:?})",
+        !m.pass && m.o1.is_err(),
+        "D10 mutant: the silent empty WAL must lose the acked commits — O-1 fails on the returned read (o1={:?}, pass={}, o3={:?})",
         m.o1,
+        m.pass,
         m.o3_fail
     );
 }
@@ -1126,6 +1157,10 @@ fn d10b_rollback_exception() {
                 knobs: knobs(0, 0),
                 directed: vec![fault.clone()],
                 no_r_taint,
+                media: e4_recovery::harness::MediaDraw::None,
+                twin_supply: None,
+                nested_draw: 0,
+                probe_pass: false,
             },
             cfg(m),
             disk,
@@ -1205,6 +1240,170 @@ fn d10b_rollback_exception() {
         silent.pass,
         "D10b G5 pin: without the R-taint the served corruption must pass silently (pass={}, o3={:?})",
         silent.pass, silent.o3_fail
+    );
+}
+
+/// X5-R10 (P ruling 2026-10-31, nv3-X-5c-esc-1): §14 — "the apply
+/// frontier is the largest replayed `commit_ts` … C-T0 v8 restarts its
+/// sequencer … from that value". The literal shape, a config not a seed
+/// number: the bulk load's §10.1 `S_L` draw consumes a commit ts that
+/// carries **no record** (ts 6 below), the publish commit (ts 7) is
+/// durable above the opened image's `T` (5 — the forced checkpoint's
+/// flip ran after the load's `CreateTree` at ts 5 was applied but
+/// before the publish), and recovery replays a non-contiguous set
+/// {7}. The draft advanced `visible_ts` only through contiguous
+/// replayed ts, stranding it at 5 with the frontier at 7: `next_ts`
+/// became 6, and the next round reissued ts's the recovered store
+/// already held (seed 10 round 1: the store held seven entries at ts 6,
+/// the model four — `Model::commit` had silently overwritten ts 6).
+///
+/// Pins: (1) the recovered store's sequencer restarts strictly above
+/// the frontier (`next_ts == frontier + 1`, `visible_ts == frontier`,
+/// no leftover `applied`); (2) the ruling's own form — a crash, then
+/// recovery, then a new commit whose ts must exceed the frontier (the
+/// round-1 chain makes three commits so a reissue at 6–7 also trips the
+/// harness guard); (3) the harness guard — a model commit at a ts the
+/// model already holds is a loud `task_error`, never a silent
+/// overwrite.
+#[test]
+fn r10_sequencer_restarts_at_the_frontier() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        // ts 2, 3, 4: three acked commits below the load.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(1, 1)],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(2, 1)],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(3, 1)],
+        },
+        // ts 5: the load's CreateTree; ts 6: the S_L draw — a ts with
+        // no commit record; ts 7: the publish commit. The forced
+        // checkpoint's flip takes T = visible_ts = 5 (the pre-marked
+        // S_L ts 6 lets the *live* contiguous walk pass through later,
+        // but recovery's replayed set is what rebuilds it).
+        ScriptOp::BulkLoad {
+            tree: 3,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::Yields(3),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 6)),
+        nested: Vec::new(),
+    };
+    let base = run(2031, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass && base.o1.is_ok(),
+        "R10 base: the round itself is sound (o1={:?}, o3={:?}, te={:?})",
+        base.o1,
+        base.o3_fail,
+        base.task_error
+    );
+    // The literal shape under test: T=5, the S_L hole at 6, the
+    // publish at 7 durable and replayed. (The opened meta is read from
+    // the crashed disk — the recovery input; `opened_t` on the outcome
+    // is the harness checkpoint's later meta.)
+    let (crashed_meta, _) = harness::read_opened_meta(&base.crashed_disk);
+    let crashed_t = crashed_meta.expect("R10: a valid meta at the crash").t;
+    assert_eq!(
+        crashed_t, 5,
+        "R10: the opened image's T must sit below the S_L draw (frontier={})",
+        base.frontier
+    );
+    assert_eq!(base.frontier, 7, "R10: the publish commit is the frontier");
+    let st = base
+        .end_store
+        .as_ref()
+        .expect("R10: recovery returned a store");
+    assert_eq!(
+        st.seq.next_ts,
+        base.frontier + 1,
+        "R10 pin 1: §14 — the sequencer restarts at the frontier + 1, never below it (visible={}, applied={:?})",
+        st.seq.visible_ts,
+        st.seq.applied
+    );
+    assert_eq!(
+        st.seq.visible_ts, base.frontier,
+        "R10 pin 1: visible_ts jumps to the apply frontier over the S_L hole"
+    );
+    assert!(
+        st.seq.applied.is_empty(),
+        "R10 pin 1: the leftover replayed set is cleared"
+    );
+    // The ruling's form: a crash (round 0 above), recovery, then a new
+    // commit whose ts must exceed the frontier. Three commits, so a
+    // reissue at 6–7 would also collide with a held model ts and trip
+    // the guard.
+    let r1 = {
+        let script2 = Script {
+            tasks: vec![ScriptTask {
+                ops: vec![
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![put(4, 9)],
+                    },
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![put(5, 9)],
+                    },
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![put(6, 9)],
+                    },
+                    ScriptOp::Yields(1),
+                ],
+            }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, 5)),
+            nested: Vec::new(),
+        };
+        harness::run_round(
+            2032,
+            1,
+            &script2,
+            &faults(FaultClass::C, knobs(0, 0)),
+            cfg(None),
+            base.end_disk.clone(),
+            base.end_store.clone().expect("R10 end store"),
+            &base.end_model,
+            base.cut,
+            None,
+        )
+    };
+    assert!(
+        r1.pass && r1.o1.is_ok() && r1.task_error.is_none(),
+        "R10 pin 2+3: the post-recovery commits continue above the frontier with no held-ts collision (o1={:?}, te={:?}, o3={:?})",
+        r1.o1,
+        r1.task_error,
+        r1.o3_fail
+    );
+    let new_ts = r1.end_model.commits.keys().copied().max();
+    assert_eq!(
+        new_ts,
+        Some(base.frontier + 3),
+        "R10 pin 2: the new commits' ts values must exceed the frontier ({}), never reissue below it",
+        base.frontier
     );
 }
 
@@ -1385,6 +1584,64 @@ fn d12_gcw() {
         m.gc_w < 2,
         "D12 mutant: gc_w must not be recorded — the named catcher (gc_w={})",
         m.gc_w
+    );
+}
+
+/// The X-5c stage pin (RESULT item 5, this stage's development
+/// failure): the GC pack step's kept-entry split. The sweep processes
+/// leaf L **and its right sibling R** as one gated step and re-splits
+/// the kept entries between them; the draft split them by L's
+/// pre-prune **count** (`keep.take(n_left)`), so every version the
+/// §10.2 rule pruned from L moved that many of R's lowest entries —
+/// keys at or above the parent separator — into L. The durable image
+/// then held a leaf with entries at or above its own subtree bound
+/// (seed 10 round 1's amcheck (ii): "entry above subtree bound", slots
+/// with an entry exactly equal to its bound). The split is by **key**
+/// against the cell bound (`l_bound`), which is §6.5's cell convention
+/// under any pruning. Literal config: 60 contiguous keys with one
+/// version each (the kept mass — the pair must not absorb), two of them
+/// re-Put above a checkpoint so the sweep prunes exactly their older
+/// versions from the leftmost pair, then a checkpoint that serialises
+/// the swept pages before the crash. Class C, no faults; amcheck must
+/// be clean and the round must pass.
+#[test]
+fn gc_pack_splits_kept_entries_at_the_separator() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..60u64).map(|i| putv(i, 1, 180)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![putv(0, 2, 180), putv(1, 2, 180)],
+        },
+        ScriptOp::Gc { tree: 2, w: None },
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let mut script = script_with_crash(None);
+    script.tasks[0].ops = ops;
+    script.checkpointer_every = Some(1000);
+    script.crash = Some(CrashSpec::TaskYield(1, 6));
+    let clean = run(2012, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        clean.pass,
+        "the swept pair must stay bound-consistent (o1={:?}, o2={:?}, o3={:?}, te={:?})",
+        clean.o1, clean.o2_fail, clean.o3_fail, clean.task_error
+    );
+    assert!(
+        clean.amcheck_i.is_empty() && clean.amcheck_ii.is_empty(),
+        "amcheck must be clean on a legal sweep (i={:?}, ii={:?})",
+        clean.amcheck_i,
+        clean.amcheck_ii
     );
 }
 
@@ -2087,6 +2344,10 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
                 knobs: knobs(0, 0),
                 directed: vec![fault.clone()],
                 no_r_taint: false,
+                media: e4_recovery::harness::MediaDraw::None,
+                twin_supply: None,
+                nested_draw: 0,
+                probe_pass: false,
             },
             r4cfg(mutant),
             disk,
@@ -2206,6 +2467,10 @@ fn d17_integrity() {
                 knobs: knobs(0, 0),
                 directed: vec![fault],
                 no_r_taint: false,
+                media: e4_recovery::harness::MediaDraw::None,
+                twin_supply: None,
+                nested_draw: 0,
+                probe_pass: false,
             },
             cfg254(mutant),
             disk,
@@ -2483,6 +2748,10 @@ fn d17_integrity() {
                 knobs: knobs(0, 0),
                 directed: vec![f],
                 no_r_taint: false,
+                media: e4_recovery::harness::MediaDraw::None,
+                twin_supply: None,
+                nested_draw: 0,
+                probe_pass: false,
             },
             cfg254(mutant),
             disk,
@@ -2684,15 +2953,15 @@ fn d17_integrity() {
                     },
                 };
                 match (target, kind) {
-                    // The two R6 cells (P's F4 ruling; X-5c's
-                    // pre-registered X5-R6): recovery returned `Ok`, the
-                    // extraction's scan hit the faulted page (an XX001
-                    // that surfaced through O-1's own reads — hence the
-                    // read-failed message), and the frozen oracle's
-                    // strict reading fails the round through O-3 (d).
-                    // Whether that reading is right is X-5c's to rule:
-                    // assert neither `pass` nor `!pass`, only the
-                    // reading-independent facts.
+                    // The two R6 cells, ruled (X5-R6, P ruling 2026-10-31,
+                    // nv3-X-5c-esc-1): recovery returned `Ok`, the leaf's
+                    // XX001 surfaces on O-1's own reads and is a detected
+                    // loss in class MP; every readable comparison is exact,
+                    // nothing is served, amcheck (i) names the tainted leaf
+                    // (O-3 (e)), and the round passes. P-written before the
+                    // harness fix it needs (amcheck (i) must reach every
+                    // referenced leaf, and amcheck findings must be recorded
+                    // as XX001 sites): red until that fix lands.
                     (Cell::Leaf, Kind::Lost) | (Cell::Leaf, Kind::Torn) => {
                         let r = run17(None, fault);
                         assert!(
@@ -2701,8 +2970,8 @@ fn d17_integrity() {
                             r.o1
                         );
                         assert!(
-                            is_read_failed(&r.o1),
-                            "D17 leaf {kind:?}: the o1 error must be a read-failed form — anything else is silent damage (o1={:?})",
+                            r.o1.is_ok(),
+                            "D17 leaf {kind:?}: X5-R6 — the unreadable leaf is a detected loss, the rest exact (o1={:?})",
                             r.o1
                         );
                         assert!(
@@ -2711,9 +2980,10 @@ fn d17_integrity() {
                             r.served,
                             r.task_error
                         );
-                        println!(
-                            "D17 [R6] leaf {kind:?}: o1={:?} o3={:?} pass={} (X-5c's X5-R6)",
-                            r.o1, r.o3_fail, r.pass
+                        assert!(
+                            r.pass,
+                            "D17 leaf {kind:?}: X5-R6 — a detected, explained loss passes (o3={:?})",
+                            r.o3_fail
                         );
                     }
                     // G7's catching test (the F3 ruling): clean — the

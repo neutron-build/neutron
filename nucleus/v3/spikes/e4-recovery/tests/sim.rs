@@ -21,6 +21,10 @@ use e4_recovery::sim::{
 struct TestHost {
     sched: SchedCore,
     disk: SimDisk,
+    /// X5-R14's unwind-order pin: the log of the tasks' post-crash host
+    /// steps, appended by each unwinding task (see
+    /// `r14_unwind_host_steps_run_in_taskid_order`).
+    unwind_log: Vec<TaskId>,
 }
 
 impl SchedHost for TestHost {
@@ -45,6 +49,7 @@ where
     let host = TestHost {
         sched: SchedCore::new(ntasks, seed),
         disk: SimDisk::new(),
+        unwind_log: Vec::new(),
     };
     let sched = Arc::new(Sched::new(host));
     let body = &body;
@@ -343,6 +348,7 @@ fn crash_at_armed_yield() {
     let host = TestHost {
         sched: SchedCore::new(3, 1),
         disk: SimDisk::new(),
+        unwind_log: Vec::new(),
     };
     let sched = Sched::new(host);
     {
@@ -393,6 +399,7 @@ fn env_calls_yield_and_crash() {
     let host = TestHost {
         sched: SchedCore::new(2, 1),
         disk: SimDisk::new(),
+        unwind_log: Vec::new(),
     };
     let sched = Sched::new(host);
     let fid = {
@@ -745,7 +752,7 @@ fn baton_violation_is_reported() {
         // (a) The run-1 shape: a world guard held across a yield. The
         // yield refuses to park and names its site.
         let g = sched
-            .acquire("test:hold")
+            .acquire(t, "test:hold")
             .map_err(|_| SimFail::Internal("acquire failed"))?;
         assert_eq!(
             sched.yield_baton_at(t, "test:yield-under-guard"),
@@ -761,7 +768,7 @@ fn baton_violation_is_reported() {
         // (c) A re-entrant acquisition is refused before it deadlocks.
         assert!(
             matches!(
-                sched.acquire("test:reentrant"),
+                sched.acquire(t, "test:reentrant"),
                 Err(SimFail::Baton("test:reentrant"))
             ),
             "a re-entrant world acquisition must report Baton"
@@ -1000,33 +1007,173 @@ fn r_taint_window_semantics() {
 /// `try_lock` is replaced by a blocking `lock`, this task parks its OS
 /// thread inside the world mutex and this test hangs (demonstrated by
 /// hand and recorded in the stage RESULT; the run is killed).
+///
+/// X5-R14 note: the cross-thread holder takes the scheduler's own
+/// blocking `Sched::lock` (the documented internal acquisition — a
+/// task-thread `acquire` from a non-holder would now be refused by the
+/// S-DET gate before it could hold anything). The acquirer below is
+/// task 0, which a fresh `SchedCore` authorises (`running ==
+/// Some(HARNESS)`), so what is under test is exactly the exhaustion of
+/// the `try_lock` retry loop against a genuinely held cross-thread
+/// lock.
 #[test]
 fn baton_violation_cross_thread_holder_is_reported() {
     let host = TestHost {
         sched: SchedCore::new(2, 7),
         disk: SimDisk::new(),
+        unwind_log: Vec::new(),
     };
     let sched = Arc::new(Sched::new(host));
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let sched2 = Arc::clone(&sched);
     let holder = std::thread::spawn(move || {
-        let g = match sched2.acquire("test:holder") {
-            Ok(g) => g,
-            Err(e) => panic!("holder acquire failed: {e:?}"),
-        };
+        let g = sched2.lock();
         held_tx.send(()).unwrap();
         // Hold until the acquirer has been refused.
         release_rx.recv().unwrap();
         drop(g);
     });
     held_rx.recv().unwrap();
-    let r = sched.acquire("test:cross-thread");
+    let r = sched.acquire(0, "test:cross-thread");
     release_tx.send(()).unwrap();
     holder.join().unwrap();
     assert!(
         matches!(r, Err(SimFail::Baton("test:cross-thread"))),
         "a cross-thread holder must be reported as Baton at the call site, not hung on: {:?}",
         r.map(|_| ())
+    );
+}
+
+/// X5-R9 (P ruling 2026-10-31, nv3-X-5c-esc-1): taint is byte-precise.
+/// One issued 8 KiB batch whose surviving bytes differ from the issued
+/// ones only in `[5000, 5100)`: the read's tainted ranges are exactly
+/// that run, an accept of `[0, 4096)` is clean, and an accept covering
+/// the run is served. The interval-granular form (the whole overlap
+/// pushed on any difference) fails the first two assertions; it is the
+/// seed-9 round-1 false serve.
+#[test]
+fn taint_is_byte_precise_within_an_issued_batch() {
+    let mut rng = Rng::new(29);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    let mut next = vec![1u8; 8192];
+    for b in next.iter_mut().take(5100).skip(5000) {
+        *b = 2;
+    }
+    disk.write_at(f, 0, &next).unwrap(); // volatile, will drop
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    let _ = disk.read_at(f, 0, 8192).unwrap();
+    assert_eq!(
+        disk.reads.last().unwrap().tainted_ranges,
+        vec![(5000, 5100)]
+    );
+    disk.accepted(f, 0, 4096);
+    assert!(
+        disk.served.is_empty(),
+        "bytes equal to the issued ones are not served"
+    );
+    disk.accepted(f, 4096, 2000);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "an accept covering the differing run is served"
+    );
+}
+
+// ---- X5-R14 (P ruling nv3-X-5c-esc-3, 2026-10-31): the S-DET gate and
+// the deterministic unwind ----
+
+/// **X5-R14 pin 1 (the refusal): a host step without the baton is
+/// refused, loudly.** A literal config of the thread-start window: a
+/// live world whose baton still sits with the harness (`start` is never
+/// called, so `running == Some(HARNESS)` for the whole test), and task
+/// 1's body attempts a host step as its **first** scheduler contact —
+/// it has never been handed the baton. Pre-fix, `acquire` granted the
+/// world lock to any caller, so a freshly spawned service thread's
+/// loop-entry step could act (`wal_writer:take`, `evict:pick`) in OS
+/// start order — the window that made the digests of seeds
+/// 180/559/7474/8832 a function of host timing. Post-fix the gate
+/// refuses it with [`SimFail::Baton`] naming the site. Fails
+/// deterministically on the pre-fix code (the acquire returns `Ok`).
+#[test]
+fn r14_pre_baton_host_step_is_refused() {
+    let host = TestHost {
+        sched: SchedCore::new(2, 991),
+        disk: SimDisk::new(),
+        unwind_log: Vec::new(),
+    };
+    let sched = Arc::new(Sched::new(host));
+    let sched2 = Arc::clone(&sched);
+    let body = std::thread::spawn(move || {
+        let r = sched2.acquire(1, "test:prebaton");
+        assert!(
+            matches!(r, Err(SimFail::Baton("test:prebaton"))),
+            "a host step before the baton is handed over must be refused loudly (Ok means the S-DET gate is gone: the X5-R14 thread-start window is open again)"
+        );
+        sched2.finish(1);
+    });
+    body.join().unwrap();
+    let h = sched.lock();
+    assert!(!h.sched.deadlock, "no deadlock may be recorded");
+    assert!(!h.sched.crashed, "no crash may be recorded");
+}
+
+/// **X5-R14 pin 2 (the order): post-crash host steps run in `TaskId`
+/// order.** A literal config of the unwind window: two tasks; task 2,
+/// while holding the baton (its first legal yield returned), delivers
+/// the crash itself (`Sched::deliver_crash`) — so task 2 unwinds on a
+/// warm thread while task 1 must first wake from its condvar park.
+/// Each task's unwind then performs one host mutation (appending its
+/// id to `TestHost::unwind_log`) through `Sched::acquire` before
+/// finishing, whatever return the crash gave its own yields (a crash
+/// landing inside the first yield unwinds the same way). Post-fix the
+/// deterministic unwind orders the log `[1, 2]` whatever the OS does.
+/// Pre-fix, `running = None` let every unwinding task acquire at once,
+/// and the crash-delivering task's mutation reliably lands first
+/// (`[2, 1]`): its path is a few instructions while task 1's needs a
+/// futex wake — exactly the OS-order dependence X5-R14 rules out.
+/// (Verified mutant-style: on the pre-fix `acquire` this test fails
+/// with `[2, 1]`.)
+#[test]
+fn r14_unwind_host_steps_run_in_taskid_order() {
+    let sched = run_world(3, 992, |sched, t| {
+        // Legal entry: one yield. Whatever it returns, the task is now
+        // either the holder or already unwinding.
+        let tripped = matches!(sched.yield_baton(t), Err(SimFail::Crashed));
+        if !tripped && t == 2 {
+            // Task 2 holds the baton here (its park returned): deliver
+            // the crash and unwind like a store error path.
+            sched.deliver_crash();
+        } else if !tripped {
+            // Task 1: keep yielding; the crash makes the next one fail.
+            loop {
+                match sched.yield_baton(t) {
+                    Ok(()) => continue,
+                    Err(SimFail::Crashed) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        // The unwind's host mutation — turn-ordered post-fix.
+        {
+            let mut g = sched
+                .acquire(t, "test:unwind")
+                .map_err(|_| SimFail::Internal("unwind acquire failed"))?;
+            g.unwind_log.push(t);
+        }
+        Ok(())
+    });
+    let h = sched.lock();
+    assert!(h.sched.crashed, "the crash was delivered");
+    assert_eq!(
+        h.unwind_log,
+        vec![1, 2],
+        "post-crash host steps must run in TaskId order (the deterministic unwind), got {:?}",
+        h.unwind_log
     );
 }

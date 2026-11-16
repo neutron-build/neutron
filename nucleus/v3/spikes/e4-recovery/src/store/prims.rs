@@ -674,6 +674,9 @@ pub fn store_page<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Re
                 f.epoch = e;
                 f.dirty = true;
                 f.refed = true;
+                // Work 5.3's dirty-set observable: this LPID was mutated
+                // in the current checkpoint interval.
+                st.dirty_now.insert(lpid);
                 return Ok(true);
             }
             if let Some(f) = normal
@@ -686,6 +689,7 @@ pub fn store_page<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Re
                 f.dirty = true;
                 f.pins = 0;
                 f.refed = true;
+                st.dirty_now.insert(lpid);
                 return Ok(true);
             }
             Ok(false)

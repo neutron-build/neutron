@@ -33,6 +33,10 @@ fn round_faults() -> RoundFaults {
         knobs: drop_all(),
         directed: Vec::new(),
         no_r_taint: false,
+        media: e4_recovery::harness::MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
+        probe_pass: false,
     }
 }
 
@@ -238,13 +242,22 @@ fn exception_set_r_consults_its_noinplace_hits() {
     let image: BTreeSet<u64> = [7u64].into_iter().collect();
     let tainted: BTreeSet<u64> = BTreeSet::new();
     let hits: BTreeSet<u64> = [7u64].into_iter().collect();
-    let r = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &hits);
+    let r =
+        e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &hits, &disk.events);
     assert!(
         !r.contains(&7),
         "condition 3 at the call site: a slot with an M-NOINPLACE hit must not enter R (R={r:?})"
     );
     let no_hits: BTreeSet<u64> = BTreeSet::new();
-    let r2 = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &no_hits);
+    let r2 = e4_recovery::harness::exception_set_r(
+        &disk,
+        pf,
+        1,
+        &image,
+        &tainted,
+        &no_hits,
+        &disk.events,
+    );
     assert_eq!(
         r2,
         BTreeSet::from([7u64]),
@@ -400,5 +413,284 @@ fn derivation_reports_written_unparsable_commits() {
         u3,
         Vec::<u64>::new(),
         "a never-written record is not a defect"
+    );
+}
+
+/// X5-R11 (a)+(b) (P ruling 2026-10-31, nv3-X-5c-esc-1): amcheck (i)
+/// must apply §3.3 to **every page the opened map references**, and a
+/// slotted finding must be recorded as an XX001 site the verdict can
+/// see. The defect: `walk_map_disk` pre-inserts every mapped slot into
+/// `used`, and the draft's directory→tree walk then `continue`d past
+/// the **descent of inner pages** on their first visit (the `used`
+/// dedup fired before the separators were parsed), so a tainted leaf
+/// under an inner page — D17's slot 92, seeds 7–8's map-referenced
+/// leaves — was never §3.3-checked, never named by amcheck (i), and
+/// (before X5-R6) hid behind O-3 (d).
+///
+/// The literal shape: a tree with ≥ 2 radix levels (`map_leaf_cap` 8)
+/// and a B+tree root that is an **inner** page; a directed TORN fault
+/// on a *leaf* page under it (a sector the write changed); (a) the
+/// `durable_image` walk of the faulted disk names the slot, and the
+/// slot is a referenced (mapped), tainted one; (b) the full MP round
+/// reports the detection site `amcheck_i` beside the read-site one and
+/// the round passes (X5-R6's detected, explained loss).
+#[test]
+fn r11a_amcheck_reaches_a_torn_leaf_under_an_inner_page() {
+    use e4_recovery::sim::{MediaFault, MediaKind, PAGE_FILE};
+    use e4_recovery::store::page::{KIND_INNER, KIND_LEAF, header_kind};
+
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: 0 }],
+        },
+        // Chunked (§12.2/§12.7): 600 puts exceed the 16-KiB record cap.
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..600u64).map(|i| op_put(i, 7)).collect(),
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(2),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 4)),
+        nested: Vec::new(),
+    };
+    // A faultless base round supplies the crashed disk the fault is
+    // built from (the same schedule prefix, so the same bytes).
+    let (disk0, st0) = harness::create_store(cfg(None), 2033, 7).expect("create");
+    let base = harness::run_round(
+        2033,
+        0,
+        &script,
+        &round_faults(),
+        cfg(None),
+        disk0,
+        st0,
+        &Model::new(),
+        0,
+        None,
+    );
+    assert!(
+        base.pass,
+        "R11 base: the faultless round passes (o1={:?}, o2={:?}, o3={:?}, te={:?})",
+        base.o1, base.o2_fail, base.o3_fail, base.task_error
+    );
+    let pf = base.crashed_disk.stat(PAGE_FILE).expect("R11: page file");
+    // The torn target: a mapped tree-leaf write (a leaf of tree 2 —
+    // every leaf in the image belongs to it at this scale).
+    let (_findings, image_slots, _meta) = harness::durable_image(&base.crashed_disk, &cfg(None));
+    let w = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| {
+            w.off.is_multiple_of(4096)
+                && w.bytes.len() == 4096
+                && header_kind(&w.bytes) == KIND_LEAF
+                && w.off > 3 * 4096
+                && image_slots.contains(&(w.off / 4096))
+        })
+        .cloned()
+        .expect("R11: a mapped tree-leaf write exists");
+    let slot = w.off / 4096;
+    // A sector the write actually changed (a tear onto unchanged bytes
+    // is a no-op).
+    let mut sector = w.off;
+    for s in 0..8u64 {
+        let a = w.bytes.get((s * 512) as usize..(s * 512 + 512) as usize);
+        let b = w.pre.get((s * 512) as usize..(s * 512 + 512) as usize);
+        if a.is_some_and(|a| b.is_some_and(|b| a != b)) {
+            sector = w.off + s * 512;
+            break;
+        }
+    }
+    let fault = MediaFault {
+        inode: pf,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: MediaKind::Torn {
+            sectors: vec![sector],
+        },
+    };
+    // (a) the unit pin: the walk of the faulted disk names the slot.
+    let mut faulted = base.crashed_disk.clone();
+    faulted.apply_one_media_fault(&fault);
+    let (findings, used, _) = harness::durable_image(&faulted, &cfg(None));
+    assert!(
+        used.contains(&slot),
+        "R11 (a): the torn leaf's slot {slot} is a referenced (mapped) page"
+    );
+    assert!(
+        faulted.range_tainted(pf, slot * 4096, 4096),
+        "R11 (a): the torn leaf's slot is tainted (the completeness half's input)"
+    );
+    assert!(
+        findings.iter().any(|f| f.slot == Some(slot)),
+        "R11 (a): amcheck (i) must §3.3-check every mapped LPID — the torn leaf under the inner page must be named (findings={findings:?})"
+    );
+    // The shape, checked last so the earlier assertions name the defect
+    // precisely: the image holds an INNER B+tree page (the root of
+    // tree 2 — every mapped page belongs to tree 2, the catalog or the
+    // metadata at this scale), so the torn leaf truly sat under an
+    // inner page — the page the draft's dedup-skipped walk never
+    // descended.
+    let has_inner = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .filter(|w| w.off.is_multiple_of(4096) && w.bytes.len() == 4096)
+        .any(|w| header_kind(&w.bytes) == KIND_INNER && image_slots.contains(&(w.off / 4096)));
+    assert!(
+        has_inner,
+        "R11: the image must hold an inner B+tree page for the leaf-under-inner shape"
+    );
+}
+
+/// X-5c's park-loop discipline (found root-causing seed 7 round 1
+/// after X5-R11 (a) let round 0 pass): a script op that fails with a
+/// store error — an MP round's legitimately damaged page (XX001 on a
+/// bricked tree, the plan's clause 3 working as designed) — records
+/// its task error, wakes the park keys **once** (Mesa), and exits; the
+/// peers parked in the `Applied`/`MetaDurable` waits re-check their
+/// own still-false condition and parked again forever: the scheduler's
+/// DEADLOCK, with the round's true cause hidden behind it. The fix
+/// extends X-5b's N3 discipline (fail loudly, never spin into the
+/// deadlock detector) to every harness park loop. Unit pin: with the
+/// round already failed, `mark_applied`, `WaitVisible`, the commit
+/// critical section and the forced-checkpoint wait all return loudly
+/// instead of parking. The end-to-end catcher is the smoke's
+/// no-DEADLOCK assertion over the 16 seeds (seed 7's round 1 is the
+/// literal shape; it deadlocked before the fix — demonstrated by hand
+/// and reverted).
+#[test]
+fn park_loops_exit_loudly_on_a_failed_round() {
+    use e4_recovery::sim::HARNESS;
+    use e4_recovery::store::Cx;
+
+    // A world whose round has already failed (a task error, and
+    // workload_done — exactly what the failing task sets), with a
+    // sequencer whose visible_ts can never reach the waited ts.
+    let (disk, st) = harness::create_store(cfg(None), 2036, 7).expect("create");
+    let world = harness::round_world(2036, disk, st);
+    {
+        let mut g = world.lock();
+        g.h.task_error = Some("Corrupt(\"integrity fail lpid 75 slot 87\")".to_owned());
+        g.h.workload_done = true;
+        g.h.tasks_left = 2;
+        // A sequencer hole: the commit below draws ts 9 while visible_ts
+        // stays 0 (the failed peer's ts 1..8 never arrive), so
+        // mark_applied can only exit through the round-failed check.
+        g.st.seq.next_ts = 9;
+    }
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    // mark_applied's exit: visible_ts (0) can never reach ts 9.
+    let r = harness::commit_txn(&cx, &[Op::CreateTree { tree: 9 }], true, false);
+    // The commit path unwinds loudly somewhere inside (the CS wait, the
+    // apply wait or mark_applied), never by parking; the recorded
+    // error is the harness's loud unwind, not a hang.
+    assert!(
+        r.is_err(),
+        "P1: a failed round's commit path must unwind loudly (got {r:?})"
+    );
+    let te = world.lock().h.task_error.clone();
+    assert!(
+        te.as_deref().is_some_and(|t| t.contains("integrity fail")),
+        "P1: the original store error stays the recorded one (te={te:?})"
+    );
+    // WaitVisible's and the forced-checkpoint wait's exits, directly
+    // through the ops.
+    let vis = harness::script_op(&cx, &ScriptOp::WaitVisible(1 << 40));
+    assert!(
+        vis.is_err(),
+        "P1: WaitVisible must unwind loudly, never park (got {vis:?})"
+    );
+    let ck = harness::script_op(&cx, &ScriptOp::Checkpoint);
+    assert!(
+        ck.is_err(),
+        "P1: the forced-checkpoint wait must unwind loudly (got {ck:?})"
+    );
+}
+
+/// X5-R13 (a): campaign stderr carries only the progress lines, real
+/// errors and the watchdog's abort line — the `TEMP-PROBE (reverted)`
+/// `eprintln!("SCRIPT-OP FAIL …")` (P's ruling: about 0.8 MB per seed,
+/// about 8 GB per 10k pass, all of it from that one line) is gone. The
+/// pin reads the harness source and fails if the probe (or any
+/// SCRIPT-OP stderr print) comes back: the flood was stderr-side, so
+/// the source is the deterministic observable.
+#[test]
+fn r13a_no_script_op_probe_on_stderr() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness.rs"))
+        .expect("read src/harness.rs");
+    assert!(
+        !src.contains("SCRIPT-OP FAIL"),
+        "X5-R13 (a): the TEMP-PROBE stderr line is back in src/harness.rs"
+    );
+    assert!(
+        !src.contains("TEMP-PROBE"),
+        "X5-R13 (a): a TEMP-PROBE marker is back in src/harness.rs"
+    );
+}
+
+/// X5-R13 (b), the ruled directed pin — a literal config, not a seed
+/// number: a task that only yields and never parks (1,050,000 bounded
+/// `Yields`, comfortably past `YIELD_BUDGET` = 1,000,000 with no service
+/// tasks adding noise). The world crosses the budget mid-round; the
+/// scheduler fails it exactly as the deadlock path does, and the round
+/// records `livelock` (with the tripping site, the yielding task's own
+/// `h:yields`) and `deadlock`, never a pass. With the budget check
+/// removed (verified mutant-style, then reverted), the task completes
+/// all its yields, the round ends normally, `livelock` stays false and
+/// this test fails.
+#[test]
+fn r13b_livelock_budget_trips_and_folds_into_deadlock() {
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![ScriptOp::Yields(1_050_000)],
+        }],
+        writer: false,
+        evictor: false,
+        checkpointer_every: None,
+        crash: None,
+        nested: Vec::new(),
+    };
+    let (disk, st) = harness::create_store(cfg(None), 2099, 7).expect("create");
+    let out = harness::run_round(
+        2099,
+        0,
+        &script,
+        &round_faults(),
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        None,
+    );
+    assert!(out.livelock, "the round must record the livelock");
+    assert!(
+        out.deadlock,
+        "the livelock folds into the round's deadlock flag"
+    );
+    assert_eq!(
+        out.livelock_site, "h:yields",
+        "the tripping site is the yielding task's own yield point"
+    );
+    assert!(!out.pass, "a livelock is never a pass");
+    assert!(
+        out.sched_yields > e4_recovery::sim::YIELD_BUDGET,
+        "the trip happens past the budget (yields={})",
+        out.sched_yields
     );
 }
