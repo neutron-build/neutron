@@ -184,12 +184,27 @@ pub struct Extracted {
     /// that itself — and `meta_rollback`), and must be a subset of the
     /// image's untainted referenced slots (the structural guard).
     pub rollback_slots: BTreeSet<u64>,
+    /// X5-R28: the kept set `K` at the amcheck (i) point — slots the
+    /// newer meta freed and the store reissued after a meta rollback,
+    /// whose reissue **did not land** (durable bytes = the opened
+    /// image's own content, `V_k(s)`), so they are tainted by 1.4 yet
+    /// §3.3 passes and no correct amcheck can report them. Harness-
+    /// computed from SimDisk history only; the completeness half skips
+    /// them and the exactness half fails findings that name them,
+    /// each only while `r_active` holds, and the structural guard
+    /// holds them to `tainted ∩ referenced`, out of `R`, outside
+    /// slots 0–2, whatever `r_active` is.
+    pub kept_slots: BTreeSet<u64>,
     /// X5-R5: the slots the image references at the amcheck (ii) point
     /// (after recovery plus the harness checkpoint).
     pub image_slots_ii: BTreeSet<u64>,
     /// X5-R5: the image's referenced slots that are tainted at the
     /// amcheck (ii) point.
     pub tainted_image_slots_ii: BTreeSet<u64>,
+    /// X5-R28: the kept set at the amcheck (ii) point, computed the
+    /// same way as [`Extracted::kept_slots`] against the end image's
+    /// own meta and the (ii) taint.
+    pub kept_slots_ii: BTreeSet<u64>,
 }
 
 /// Reads the recovered state for the oracle: the harness implements this
@@ -458,8 +473,14 @@ pub fn check_round(
         if !detections.contains(&XxSite::Read23) {
             detections.push(XxSite::Read23);
         }
-        let explained =
-            !ex.tainted_image_slots.is_empty() || (r_active_r6 && !ex.rollback_slots.is_empty());
+        // X5-R28 (b) (a tightening): a tainted slot in `K` does not
+        // explain an O-1 read's XX001 — the rule is "some tainted
+        // referenced slot outside K, or an active non-empty R".
+        let explained = ex
+            .tainted_image_slots
+            .iter()
+            .any(|s| !ex.kept_slots.contains(s))
+            || (r_active_r6 && !ex.rollback_slots.is_empty());
         if !explained && o3_fail.is_none() {
             o3_fail = Some(
                 "O-3(c): XX001 on an O-1 read with no damaged referenced slot (X5-R6)".to_owned(),
@@ -531,7 +552,13 @@ pub fn check_round(
         // checked here from the fault list, never from harness state)
         // and condition 2 (`meta_rollback`, harness-computed). Otherwise
         // `rollback_slots` is ignored and the strict X5-R2 reading
-        // applies unchanged.
+        // applies unchanged. **X5-R28 adds the kept set `K` beside `R`:
+        // a reissued-after-rollback slot whose reissue did not land is
+        // tainted yet §3.3-clean — the completeness half skips it and
+        // the exactness half fails a finding that names it, each only
+        // while `r_active` holds; the completeness halves also skip the
+        // meta slots 1 and 2 unconditionally (a meta-slot fault is
+        // judged where it acts: open's selection, O-1, O-3 (a)–(d)).**
         let cond1 = cfg.no_meta_slot_cond || faults.meta_slot_fault;
         let r_active = ex.meta_rollback && cond1;
         // The first (e) failure is the reported one (deterministic
@@ -544,13 +571,32 @@ pub fn check_round(
                 o3e.get_or_insert_with(|| format!("O-3(e): harness R set malformed (slot {slot})"));
             }
         }
+        // Structural guard (X5-R28): a kept slot must be a tainted
+        // referenced slot outside R and outside the meta slots 0–2 —
+        // checked whether or not `r_active` holds, like R's guard. A
+        // harness defect must never pass.
+        for slot in ex.kept_slots.iter() {
+            if *slot <= 2
+                || !ex.image_slots.contains(slot)
+                || !ex.tainted_image_slots.contains(slot)
+                || ex.rollback_slots.contains(slot)
+            {
+                o3e.get_or_insert_with(|| format!("O-3(e): harness K set malformed (slot {slot})"));
+            }
+        }
         // Completeness half, the X5-R5 completeness fix: run it whenever
         // amcheck (i) ran and tainted referenced slots exist, whatever
         // amcheck reported. (Run 1 gated it on findings existing, which
         // let a fully missed detection pass beside any other XX001 of
-        // the round.)
-        if ex.amcheck_i_ran && !ex.tainted_image_slots.is_empty() {
+        // the round.) X5-R28: skip slots 1 and 2 (no §3.3 reference
+        // model covers a meta slot) and, while `r_active` holds, the
+        // kept slots — every other tainted referenced slot must still
+        // be reported.
+        if ex.amcheck_i_ran {
             for slot in ex.tainted_image_slots.iter() {
+                if *slot <= 2 || (r_active && ex.kept_slots.contains(slot)) {
+                    continue;
+                }
                 let reported = ex.amcheck_i.iter().any(|f| f.slot == Some(*slot));
                 if !reported {
                     o3e.get_or_insert_with(|| {
@@ -559,9 +605,21 @@ pub fn check_round(
                 }
             }
         }
-        // Exactness half (X5-R2's "and only for those", with X5-R5's R).
+        // Exactness half (X5-R2's "and only for those", with X5-R5's R
+        // and X5-R28's tightening: while `r_active` holds, a finding on
+        // a kept slot fails — its bytes are the opened image's own
+        // content, so a report names what amcheck cannot have seen; the
+        // tainted ∪ active-R rule stands for everything else).
         for f in ex.amcheck_i.iter() {
             if let Some(slot) = f.slot {
+                if r_active && ex.kept_slots.contains(&slot) {
+                    o3e.get_or_insert_with(|| {
+                        format!(
+                            "O-3(e): amcheck reported kept slot {slot} (its bytes are the opened image's content)"
+                        )
+                    });
+                    continue;
+                }
                 let tainted = ex.tainted_image_slots.contains(&slot);
                 let in_r = r_active && ex.rollback_slots.contains(&slot);
                 if !tainted && !in_r {
@@ -574,9 +632,26 @@ pub fn check_round(
             }
         }
         // X5-R5: (e) applies to amcheck (ii) as well whenever it ran,
-        // against the (ii) sets, with the same R.
+        // against the (ii) sets and its own kept set `K_ii` (X5-R28),
+        // with the same R.
         if ex.amcheck_ii_ran {
+            // The (ii) structural guard (X5-R28), against the (ii)
+            // sets, checked whether or not `r_active` holds.
+            for slot in ex.kept_slots_ii.iter() {
+                if *slot <= 2
+                    || !ex.image_slots_ii.contains(slot)
+                    || !ex.tainted_image_slots_ii.contains(slot)
+                    || ex.rollback_slots.contains(slot)
+                {
+                    o3e.get_or_insert_with(|| {
+                        format!("O-3(e): harness K set malformed (slot {slot})")
+                    });
+                }
+            }
             for slot in ex.tainted_image_slots_ii.iter() {
+                if *slot <= 2 || (r_active && ex.kept_slots_ii.contains(slot)) {
+                    continue;
+                }
                 let reported = ex.amcheck_ii.iter().any(|f| f.slot == Some(*slot));
                 if !reported {
                     o3e.get_or_insert_with(|| {
@@ -586,6 +661,14 @@ pub fn check_round(
             }
             for f in ex.amcheck_ii.iter() {
                 if let Some(slot) = f.slot {
+                    if r_active && ex.kept_slots_ii.contains(&slot) {
+                        o3e.get_or_insert_with(|| {
+                            format!(
+                            "O-3(e): (ii) amcheck reported kept slot {slot} (its bytes are the opened image's content)"
+                        )
+                        });
+                        continue;
+                    }
                     let tainted = ex.tainted_image_slots_ii.contains(&slot);
                     let in_r = r_active && ex.rollback_slots.contains(&slot);
                     if !tainted && !in_r {

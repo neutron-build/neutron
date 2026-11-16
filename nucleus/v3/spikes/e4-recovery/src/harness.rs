@@ -1492,6 +1492,23 @@ pub struct RoundOutcome {
     /// The digest of the canonical record (byte-identical for the same
     /// inputs; `tests/harness.rs`).
     pub digest: u64,
+    /// X-5c-F2 step 1 (e): the anchor-0 fallback's precondition broke —
+    /// this life's event stream holds a page-file
+    /// `SyncReturned { all: false }` while the fallback anchor 0 was in
+    /// force. A harness-side tripwire lifted to a seed-level defect by
+    /// the driver (never an oracle input; never silently widening R).
+    pub r5_anchor0_defect: bool,
+    /// X5-R30 (a): every served range of the round lies wholly inside
+    /// slots of `K` (vacuously true when nothing was served). A
+    /// diagnostic in the record, never an oracle input.
+    pub served_k: bool,
+    /// X5-R28 (a): the kept set `K` at the amcheck (i) point —
+    /// SimDisk-history-computed (see [`kept_set_k`]); the oracle's
+    /// O-3 (e) amendment reads it from `Extracted::kept_slots`.
+    pub kept_slots: BTreeSet<u64>,
+    /// X5-R28 (a): the kept set `K_ii` at the amcheck (ii) point
+    /// (empty unless (ii) ran).
+    pub kept_slots_ii: BTreeSet<u64>,
 }
 
 impl Default for RoundOutcome {
@@ -1538,6 +1555,10 @@ impl Default for RoundOutcome {
             r6_round: false,
             renames_dropped: 0,
             digest: 0,
+            r5_anchor0_defect: false,
+            served_k: false,
+            kept_slots: BTreeSet::new(),
+            kept_slots_ii: BTreeSet::new(),
         }
     }
 }
@@ -1754,7 +1775,7 @@ pub fn run_round(
     // see the arm there.
     run_script(&sched, script, seed);
     let sched_yields_total = sched.lock().sched.yields;
-    let (mut disk, mut model, flip_pos, flags, wal_commits, events, obs) = {
+    let (mut disk, mut model, flip_pos, flags, wal_commits, events, obs, workload_served) = {
         let g = sched.lock();
         // The workload-pass observables, snapshotted the moment the tasks
         // ended (a crash mid-task leaves the partial-apply and walk flags
@@ -1835,6 +1856,10 @@ pub fn run_round(
             g.h.wal_commits.clone(),
             g.disk.events.clone(),
             obs,
+            // X5-R30 (a): the workload pass's served-corruption ranges
+            // (the round's served_k input; `new_round` below clears the
+            // disk's list, so they are captured here).
+            g.disk.served.clone(),
         )
     };
     if faults.probe_pass {
@@ -2211,9 +2236,60 @@ pub fn run_round(
         }
         None => (false, BTreeSet::new()),
     };
+    // **X5-R28 (a): the kept set `K`**, computed beside R with the same
+    // anchor. Non-empty only while X5-R5's conditions 1 and 2 hold (a
+    // media fault of this round damaged meta slot 1 or 2 — which
+    // classes C and MW never meet — and the opened meta is a rollback);
+    // then a tainted, referenced, reissued-but-not-landed slot whose
+    // durable bytes are the opened image's own content is kept out of
+    // the completeness half's expectation (the oracle amendment, X5-R28
+    // (b)). Pure SimDisk history; never store memory or §3.3 output.
+    let kept_slots = match &meta_i {
+        Some(opened) => kept_set_k(
+            &disk,
+            pf,
+            opened.ckpt_id,
+            &image_slots,
+            &tainted_slots,
+            &noinplace_hits,
+            &events,
+            meta_rollback && media_targets.meta_slot_fault,
+        ),
+        None => BTreeSet::new(),
+    };
+    // X5-R28 (e) evidence (`E4_MPE_DIAG`, stderr only, never a digest
+    // input): each kept slot's durable bytes — which condition 2 holds
+    // equal to `V_k(s)` — as a CRC, beside the round's own record.
+    if std::env::var("E4_MPE_DIAG").is_ok() {
+        for slot in kept_slots.iter() {
+            let b = disk.durable_read(pf, slot * 4096, 4096);
+            eprintln!(
+                "MPE diag: K slot {slot} durable==V_k crc32c={:08x} len={}",
+                crate::crc::crc32c(0, &b),
+                b.len()
+            );
+        }
+    }
+    // X-5c-F2 step 1 (e): the anchor-0 fallback's precondition. When
+    // the events half's anchor is the fallback 0 (the whole stream read
+    // as post-graduation) and this life's stream holds a page-file
+    // `sync_data` return, the round flags the tripwire — the driver
+    // records the seed-level defect; R is never silently widened. (This
+    // store only ever `sync_all`s the page file, so on a real campaign
+    // the flag cannot rise; it exists so the unsound reading can never
+    // pass silently.)
+    let anchor0_broke = matches!(&meta_i, Some(opened)
+        if matches!(r5_anchor(&disk, pf, opened.ckpt_id, &events), Some((_, 0)))
+            && r5_anchor0_defect(&events, pf).is_some());
 
     // ---- the extraction and the oracle ----
     let mut sample_rng = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
+    // X5-R30 (a): served_k, set by the arms that judge the round (the
+    // Ok and Err arms; the livelock arm fails the fold and leaves it
+    // false). The initializer only satisfies the borrow checker, like
+    // `recovery_reads` above.
+    #[allow(unused_assignments)]
+    let mut served_k_flag = false;
     let mut outcome = RoundOutcome {
         class: faults.class,
         deadlock: flags.0,
@@ -2223,6 +2299,7 @@ pub fn run_round(
         livelock_site: flags.5,
         livelock_parked: flags.6,
         task_error,
+        r5_anchor0_defect: anchor0_broke,
         ..Default::default()
     };
     match recovery {
@@ -2278,6 +2355,7 @@ pub fn run_round(
                 tainted_image_slots: tainted_slots.clone(),
                 meta_rollback,
                 rollback_slots: rollback_slots.clone(),
+                kept_slots: kept_slots.clone(),
                 ..Default::default()
             };
             // The published set (a catalog scan at the frontier, 2.3).
@@ -2311,17 +2389,29 @@ pub fn run_round(
             // from open until the store next writes it, judged over the
             // interleaved write/accept history (recovery's accepts
             // included; the events walk of [`r_taint_of`]).
+            //
+            // X5-R30 (a): the round's served ranges are collected in
+            // full (workload pass, recovery pass(es), this world's own
+            // accepts) — `ex.served` is their non-emptiness (with
+            // R-taint), and `served_k` (a diagnostic in the record,
+            // never an oracle input) is true iff every served range
+            // lies wholly inside slots of `K` (vacuously true when
+            // nothing was served).
             {
                 let g = world.lock();
                 let r_taint = !faults.no_r_taint && r_taint_of(&g.disk.events, pf, &rollback_slots);
-                let workload_served = {
-                    let g2 = sched.lock();
-                    !g2.disk.served.is_empty()
-                };
-                ex.served = workload_served
-                    || !recovery_served.is_empty()
-                    || !g.disk.served.is_empty()
-                    || r_taint;
+                let mut served_ranges: Vec<(usize, u64, u64)> = workload_served.clone();
+                served_ranges.extend(recovery_served.iter().copied());
+                served_ranges.extend(g.disk.served.iter().copied());
+                ex.served = !served_ranges.is_empty() || r_taint;
+                served_k_flag = served_ranges.iter().all(|&(f, off, len)| {
+                    if f != pf || len == 0 {
+                        return false;
+                    }
+                    let s0 = off / 4096;
+                    let s1 = (off + len - 1) / 4096;
+                    (s0..=s1).all(|s| kept_slots.contains(&s))
+                });
             }
             // The class MP/MW twin supply (card Work 2.5): the
             // campaign's pre-supplied twin (the faultless run's recovery
@@ -2389,19 +2479,59 @@ pub fn run_round(
                 let g = world.lock();
                 (g.disk.clone(), g.st.clone())
             };
+            // X5-R29 (a): the subtree-fallout reading's evidence, on
+            // this round's end disk (stderr only, never a digest
+            // input).
+            if std::env::var("E4_MPE_DIAG").is_ok() {
+                r29_subtree_diag(&end_disk2, &cfg, &findings_ii);
+            }
             // The (ii) image's referenced and tainted slots, from the
             // durable bytes (the same walk as the (i) point).
-            let (ii_findings, image_slots_ii, _meta_ii) = durable_image(&end_disk2, &cfg);
+            let (ii_findings, image_slots_ii, meta_ii) = durable_image(&end_disk2, &cfg);
             let _ = ii_findings;
             let tainted_slots_ii: BTreeSet<u64> = image_slots_ii
                 .iter()
                 .copied()
                 .filter(|s| end_disk2.range_tainted(pf, s * 4096, 4096))
                 .collect();
+            // **X5-R28 (a): `K_ii`** — the kept set computed the same
+            // way, against the end image's own meta (`durable_image`'s
+            // third value here) and the (ii) taint. The events view is
+            // the round's full issue history in order (the workload
+            // life's captured stream, then the end disk's own events —
+            // recovery, extraction and this checkpoint); the
+            // M-NOINPLACE hits are recomputed over that combined
+            // stream. The end meta is normally the newest image, so no
+            // newer covered meta anchors the set and K_ii stays empty;
+            // the computation exists so the exotic ends (a misplaced
+            // newer meta among them) follow the same rule.
+            let mut events_ii = events.clone();
+            events_ii.extend(end_disk2.events.iter().cloned());
+            let noinplace_hits_ii = crate::monitor::noinplace_slot_hits(&events_ii, &mcfg);
+            let kept_slots_ii = match &meta_ii {
+                Some(endm) => kept_set_k(
+                    &end_disk2,
+                    pf,
+                    endm.ckpt_id,
+                    &image_slots_ii,
+                    &tainted_slots_ii,
+                    &noinplace_hits_ii,
+                    &events_ii,
+                    meta_rollback_of(&end_disk2, pf, endm.ckpt_id) && media_targets.meta_slot_fault,
+                ),
+                None => BTreeSet::new(),
+            };
             ex.amcheck_ii = findings_ii.clone();
             ex.amcheck_ii_ran = ck.is_ok();
             ex.image_slots_ii = image_slots_ii;
             ex.tainted_image_slots_ii = tainted_slots_ii;
+            ex.kept_slots_ii = kept_slots_ii.clone();
+            if std::env::var("E4_MPE_DIAG").is_ok() {
+                eprintln!(
+                    "MPE diag: kept K {:?} K_ii {:?} served_k={} (X5-R28/R30; stderr only)",
+                    kept_slots, kept_slots_ii, served_k_flag
+                );
+            }
             // X5-R11 (b): the (ii) sites, same as the (i) push above.
             if findings_ii.iter().any(|f| f.slot.is_some())
                 && !ex.xx001.contains(&XxSite::AmcheckIi)
@@ -2444,6 +2574,13 @@ pub fn run_round(
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
             outcome.served = ex.served;
+            // X5-R28 (a) / X5-R30 (a): the kept sets and served_k ride
+            // the outcome (the record's and the diagnostic's inputs;
+            // the oracle reads them from `Extracted`, wired in the
+            // X5-R28 (b) commit).
+            outcome.served_k = served_k_flag;
+            outcome.kept_slots = kept_slots.clone();
+            outcome.kept_slots_ii = kept_slots_ii.clone();
             // `pass` folds every per-seed failure flag: a DEADLOCK, a
             // PANIC or an S-BATON violation is never a pass (card "Do
             // not"; the gate's minor finding: the draft ignored
@@ -2481,21 +2618,32 @@ pub fn run_round(
         Err(_) => {
             // Recovery failed: XX001 at Open (class C fails O-3 (b); in
             // MP/MW it is a detection).
+            let mut served_ranges: Vec<(usize, u64, u64)> = workload_served.clone();
+            served_ranges.extend(recovery_served.iter().copied());
+            let r_taint_err =
+                !faults.no_r_taint && r_taint_of(&recovery_events, pf, &rollback_slots);
+            // X5-R30 (a): the same served_k diagnostic over every
+            // served range of the round (no extraction world exists on
+            // this arm).
+            served_k_flag = served_ranges.iter().all(|&(f, off, len)| {
+                if f != pf || len == 0 {
+                    return false;
+                }
+                let s0 = off / 4096;
+                let s1 = (off + len - 1) / 4096;
+                (s0..=s1).all(|s| kept_slots.contains(&s))
+            });
             let mut ex = Extracted {
                 ok: false,
                 xx001: vec![XxSite::Open],
-                served: {
-                    let g2 = sched.lock();
-                    !g2.disk.served.is_empty()
-                        || !recovery_served.is_empty()
-                        || (!faults.no_r_taint && r_taint_of(&recovery_events, pf, &rollback_slots))
-                },
+                served: !served_ranges.is_empty() || r_taint_err,
                 amcheck_i: amcheck_i.clone(),
                 amcheck_i_ran: meta_i.is_some(),
                 image_slots: image_slots.clone(),
                 tainted_image_slots: tainted_slots.clone(),
                 meta_rollback,
                 rollback_slots: rollback_slots.clone(),
+                kept_slots: kept_slots.clone(),
                 ..Default::default()
             };
             // X5-R11 (b): the failed-recovery path records the (i) sites
@@ -2542,6 +2690,10 @@ pub fn run_round(
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
             outcome.served = ex.served;
+            // X5-R28 (a) / X5-R30 (a): the (i) kept set and served_k
+            // (amcheck (ii) never ran; K_ii stays empty).
+            outcome.served_k = served_k_flag;
+            outcome.kept_slots = kept_slots.clone();
             outcome.pass = fold_pass(
                 verdict.pass,
                 outcome.task_error.as_deref(),
@@ -3031,30 +3183,18 @@ pub fn durable_image(
             what: "slot_count below a referenced slot".into(),
         });
     }
-    // The meta slots are referenced pages of the image: a faulted one
-    // whose bytes still parse (a rollback's fallout — the durable bytes
-    // are the pre-write ones, tainted against the issued reference) is
-    // reported, so O-3 (e)'s completeness half holds for meta-slot
-    // faults too (the frozen oracle requires every tainted referenced
-    // slot to be named; the loser slot of an unwritten pair never
-    // differs from its issued bytes and stays silent). Gated on media
-    // faults existing: a **crash-dropped** volatile meta write leaves
-    // the same taint signature with no fault behind it, and reporting
-    // it would fail O-2's class-C cleanliness on every ordinary crash
-    // at a step-4/5 boundary (D1's After4).
-    if !disk.media.is_empty() {
-        for slot in [1u64, 2] {
-            if disk.range_tainted(pf, slot * 4096, 4096) {
-                if mpe_diag {
-                    eprintln!("MPE diag: meta slot {slot} tainted (rollback fallout)");
-                }
-                out.push(Finding {
-                    slot: Some(slot),
-                    what: "stale durable meta slot (rollback fallout)".into(),
-                });
-            }
-        }
-    }
+    // **X5-R28 (c) (P ruling nv3-X-5c-F2-amend-1): the meta-slot
+    // rollback-fallout loop is deleted.** The draft pushed a finding
+    // for every tainted meta slot ("stale durable meta slot (rollback
+    // fallout)") — a finding derived from `range_tainted` ground truth,
+    // standing in for amcheck exactly the way X5-R23 banned for the
+    // completeness residual. This walk never pushes a finding derived
+    // from `range_tainted`, `issued`, `dwrites` or any other ground
+    // truth. Slots 1 and 2 stay in `image_slots` (O-3 (c)'s twin rule
+    // and R's guard read that set); a meta-slot fault is judged where
+    // it acts — open's selection (S-STORE §2.2), O-1 (the MP lower
+    // bound) and O-3 (a)–(d) — and the per-slot completeness halves
+    // skip slots 1 and 2 under the oracle amendment (X5-R28 (b)).
     (out, used, Some(meta))
 }
 
@@ -3226,6 +3366,109 @@ pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
     max_k > opened_k
 }
 
+/// **X5-R5's anchor, as the events half computes it** (X-5c-F2 step 1
+/// (d) pins it at the sync's return): the pair `(g, ev_anchor)` for one
+/// (disk, this life's events) view. `g` is the dwrites index of the
+/// first `sync_all`-covered meta newer than `opened_k` (the durable
+/// half's anchor: writes at dwrite indices above it are post-anchor);
+/// `ev_anchor` is the event index the events half skips to — the
+/// in-stream graduation sync's **return** when the first issued-and-
+/// covered newer meta is the in-stream one, else `0`, the fallback
+/// that reads this life's whole stream as post-anchor (a still earlier
+/// graduation preceded it). `None` when no newer covered meta exists
+/// at all: R is empty and no anchor is in force.
+pub fn r5_anchor(
+    disk: &SimDisk,
+    pf: usize,
+    opened_k: u64,
+    events: &[DiskEvent],
+) -> Option<(usize, usize)> {
+    let dw = disk.dwrites_of(pf);
+    let mut newer_graduation: Option<usize> = None;
+    for (i, w) in dw.iter().enumerate() {
+        if w.all
+            && (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
+            && m.ckpt_id > opened_k
+        {
+            newer_graduation = Some(i);
+            break;
+        }
+    }
+    let g = newer_graduation?;
+    // The anchor in the event stream: the first completed `sync_all`
+    // after the first issued write of a meta newer than the opened one.
+    // When that first issued-and-covered newer meta (`dw[g]`) is **not**
+    // the in-stream one, a still earlier graduation happened in a prior
+    // life of the seed (chained round) and the whole stream is
+    // post-anchor. When no in-stream pair exists at all but `dw[g]`
+    // does, same: the graduation precedes this life. Writes before the
+    // anchor are not excused — the slot was the opened image's own
+    // content when they were issued.
+    let is_meta_issued = |e: &DiskEvent| -> bool {
+        match e {
+            DiskEvent::WriteIssued { inode, off, bytes }
+                if *inode == pf && (*off == 4096 || *off == 8192) =>
+            {
+                crate::store::page::parse_meta(bytes)
+                    .ok()
+                    .is_some_and(|m| m.ckpt_id > opened_k)
+            }
+            _ => false,
+        }
+    };
+    let in_stream = events.iter().position(is_meta_issued);
+    let anchor: usize = match in_stream {
+        Some(w) => {
+            let synced = events.iter().skip(w + 1).position(
+                |e| matches!(e, DiskEvent::SyncReturned { inode, all: true } if *inode == pf),
+            );
+            match synced {
+                // The in-stream pair exists: if that issued write is
+                // the same one `dw[g]` covered, this life holds the
+                // earliest graduation and the anchor is its sync's
+                // return (w + 1 + s, the event index of the
+                // `SyncReturned`); otherwise a prior-life graduation
+                // precedes the whole stream (the in-stream one never
+                // synced, or a still earlier covered meta exists).
+                Some(s) => {
+                    let same = match &events[w] {
+                        DiskEvent::WriteIssued { off, bytes, .. } => {
+                            dw[g].off == *off && dw[g].bytes == *bytes
+                        }
+                        _ => false,
+                    };
+                    if same { w + 1 + s } else { 0 }
+                }
+                None => 0,
+            }
+        }
+        None => 0,
+    };
+    Some((g, anchor))
+}
+
+/// **X5-R5 anchor-0 precondition (X-5c-F2 step 1 (e)): the fallback
+/// anchor's tripwire.** The anchor-0 fallback reads this life's whole
+/// event stream as post-graduation, which is only sound while the page
+/// file was never `sync_data`-ed in this life (this store only ever
+/// `sync_all`s the page file, so the tripwire cannot fire on a real
+/// campaign — it exists so the unsound reading can never pass
+/// silently). A page-file `SyncReturned { all: false }` in the stream
+/// breaks the precondition: the round records the returned seed-level
+/// defect instead of silently widening R.
+pub const R5_ANCHOR0_DEFECT: &str = "page file synced by sync_data: X5-R5 anchor precondition";
+
+/// Whether [`r5_anchor`]'s fallback anchor 0 is in force for this view
+/// (the events half reads the whole stream as post-graduation).
+pub fn r5_anchor0_defect(events: &[DiskEvent], pf: usize) -> Option<&'static str> {
+    let sync_data = events
+        .iter()
+        .any(|e| matches!(e, DiskEvent::SyncReturned { inode, all: false } if *inode == pf));
+    sync_data.then_some(R5_ANCHOR0_DEFECT)
+}
+
 /// X5-R5's set R: slots the opened image references that are not tainted,
 /// written after the first completed `sync_all` covering a meta newer
 /// than the opened one, **and never written with an M-NOINPLACE hit**
@@ -3248,7 +3491,8 @@ pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
 /// k=1 graduation's sync at ev[128], the crash kept ev[287]'s id-6
 /// epoch-2 page, `check2` fails against meta k=0's map-root ref). Both
 /// sources are consulted: the durable-write list (cross-life, as
-/// before) and this life's event stream (the unsynced reuses).
+/// before) and this life's event stream (the unsynced reuses), through
+/// the shared anchor of [`r5_anchor`].
 pub fn exception_set_r(
     disk: &SimDisk,
     pf: usize,
@@ -3258,24 +3502,11 @@ pub fn exception_set_r(
     noinplace_hits: &BTreeSet<u64>,
     events: &[DiskEvent],
 ) -> BTreeSet<u64> {
-    let mut newer_graduation: Option<usize> = None;
-    let dw = disk.dwrites_of(pf);
-    for (i, w) in dw.iter().enumerate() {
-        if w.all
-            && (w.off == 4096 || w.off == 8192)
-            && w.bytes.len() == 4096
-            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
-            && m.ckpt_id > opened_k
-        {
-            newer_graduation = Some(i);
-            break;
-        }
-    }
-    let Some(g) = newer_graduation else {
+    let Some((g, anchor)) = r5_anchor(disk, pf, opened_k, events) else {
         return BTreeSet::new();
     };
     let mut out = BTreeSet::new();
-    for (i, w) in dw.iter().enumerate() {
+    for (i, w) in disk.dwrites_of(pf).iter().enumerate() {
         if i <= g {
             continue;
         }
@@ -3284,55 +3515,9 @@ pub fn exception_set_r(
             out.insert(slot);
         }
     }
-    // The issued-write half (X5-R20 shape B). The anchor in the event
-    // stream: the first completed `sync_all` after the first issued
-    // write of a meta newer than the opened one. When that first
-    // issued-and-covered newer meta (`dw[g]`) is **not** the in-stream
-    // one, a still earlier graduation happened in a prior life of the
-    // seed (chained round) and the whole stream is post-anchor. When
-    // no in-stream pair exists at all but `dw[g]` does, same: the
-    // graduation precedes this life. Writes before the anchor are not
-    // excused — the slot was the opened image's own content when they
-    // were issued.
-    let is_meta_issued = |e: &DiskEvent| -> bool {
-        match e {
-            DiskEvent::WriteIssued { inode, off, bytes }
-                if *inode == pf && (*off == 4096 || *off == 8192) =>
-            {
-                crate::store::page::parse_meta(bytes)
-                    .ok()
-                    .is_some_and(|m| m.ckpt_id > opened_k)
-            }
-            _ => false,
-        }
-    };
-    let in_stream = events.iter().position(is_meta_issued);
-    let anchor: usize = match in_stream {
-        Some(w) => {
-            let synced = events.iter().skip(w + 1).position(
-                |e| matches!(e, DiskEvent::SyncReturned { inode, all: true } if *inode == pf),
-            );
-            match synced {
-                // The in-stream pair exists: if that issued write is
-                // the same one `dw[g]` covered, this life holds the
-                // earliest graduation and the anchor is its sync;
-                // otherwise a prior-life graduation precedes the whole
-                // stream (the in-stream one never synced, or a still
-                // earlier covered meta exists).
-                Some(s) => {
-                    let same = match &events[w] {
-                        DiskEvent::WriteIssued { off, bytes, .. } => {
-                            dw[g].off == *off && dw[g].bytes == *bytes
-                        }
-                        _ => false,
-                    };
-                    if same { w + 1 + s } else { 0 }
-                }
-                None => 0,
-            }
-        }
-        None => 0,
-    };
+    // The issued-write half (X5-R20 shape B), anchored at the sync's
+    // return (step 1 (d)) or at the fallback 0 (step 1 (e)'s
+    // precondition guards that reading).
     for (i, e) in events.iter().enumerate() {
         if i <= anchor {
             continue;
@@ -3348,6 +3533,277 @@ pub fn exception_set_r(
         }
     }
     out
+}
+
+/// X5-R28 (a) condition 2's `V_k(s)`: the page's content as the
+/// durable-write history had it when the given meta was written —
+/// 4096 zero bytes, then every `DWrite` of the page file that overlaps
+/// `[slot*4096, (slot+1)*4096)` and precedes the meta's own `DWrite`
+/// (dwrite index `cutoff`, exclusive), applied in order at each
+/// write's own offset. Pure history composition from SimDisk's
+/// durable-write list — never store memory, never a §3.3 verdict.
+pub fn v_at_meta(disk: &SimDisk, pf: usize, slot: u64, cutoff: usize) -> Vec<u8> {
+    let mut page = vec![0u8; 4096];
+    for (i, w) in disk.dwrites_of(pf).iter().enumerate() {
+        if i >= cutoff {
+            break;
+        }
+        let wend = w.off + w.bytes.len() as u64;
+        if w.off < (slot + 1) * 4096 && wend > slot * 4096 {
+            let dst0 = (w.off.max(slot * 4096) - slot * 4096) as usize;
+            let src0 = (w.off.max(slot * 4096) - w.off) as usize;
+            let span = ((wend.min((slot + 1) * 4096) - w.off.max(slot * 4096)) as usize)
+                .min(w.bytes.len().saturating_sub(src0));
+            if let (Some(dst), Some(src)) = (
+                page.get_mut(dst0..dst0 + span),
+                w.bytes.get(src0..src0 + span),
+            ) {
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+    page
+}
+
+/// X5-R28 (a): the opened meta's own `DWrite` — the **last** `DWrite`
+/// at offset 4096 or 8192 whose bytes parse as a meta with the opened
+/// `ckpt_id`. `None` means no such write exists in the durable history
+/// (the opened image's meta never became durable as a distinct write):
+/// `K` fails closed to empty for the round.
+pub fn meta_dwrite_cutoff(disk: &SimDisk, pf: usize, opened_k: u64) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    for (i, w) in disk.dwrites_of(pf).iter().enumerate() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
+            && m.ckpt_id == opened_k
+        {
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// **X5-R28 (a): the kept set `K`** (P ruling nv3-X-5c-F2-amend-1).
+/// The mirror of X5-R5's `R`: after a meta rollback, a slot the newer
+/// meta freed and the store reissued, where the reissue **did not
+/// land** (dropped by F-CRASH, or a LOST fault reverted it), is tainted
+/// by 1.4 yet its durable bytes are the opened image's own content —
+/// §3.3 passes, and no correct amcheck can report it. `K` is computed
+/// from SimDisk history only: never from store memory, never from
+/// §3.3 or amcheck output, and never from the taint map except as
+/// condition 1's membership test.
+///
+/// `K` is non-empty only while `r5_active` holds — X5-R5's conditions
+/// 1 and 2 (a media fault of the round damaged meta slot 1 or 2, and
+/// the opened meta is a rollback), the same gate `R` honours; classes
+/// C and MW never meet condition 1, so `K` is empty there. Then `s ∈
+/// K` iff:
+///
+/// 1. `s ∉ {0, 1, 2}`, `s` is referenced by the opened image, and `s`
+///    is tainted at the amcheck point of this computation;
+/// 2. the durable bytes of `s` equal `V_k(s)` byte for byte
+///    ([`v_at_meta`]; fail-closed to empty when the opened meta's own
+///    `DWrite` does not exist — [`meta_dwrite_cutoff`]);
+/// 3. SimDisk records a page-file write to `s` issued after X5-R5's
+///    anchor ([`r5_anchor`]: the durable half's `g`, the events half's
+///    anchor — the first completed `sync_all` covering a meta newer
+///    than the opened one, at its return);
+/// 4. no write to `s` drew an M-NOINPLACE hit.
+///
+/// So `K ⊆ tainted ∩ referenced` and `K ∩ R = ∅` (R requires
+/// untainted). At the (ii) point the caller computes `K_ii` the same
+/// way, against the end image's own meta and the (ii) taint.
+#[allow(clippy::too_many_arguments)]
+pub fn kept_set_k(
+    disk: &SimDisk,
+    pf: usize,
+    opened_k: u64,
+    image_slots: &BTreeSet<u64>,
+    tainted: &BTreeSet<u64>,
+    noinplace_hits: &BTreeSet<u64>,
+    events: &[DiskEvent],
+    r5_active: bool,
+) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    if !r5_active {
+        return out;
+    }
+    let Some((g, anchor)) = r5_anchor(disk, pf, opened_k, events) else {
+        return out;
+    };
+    // Fail closed: no opened-meta DWrite means no composable history.
+    let Some(cutoff) = meta_dwrite_cutoff(disk, pf, opened_k) else {
+        return out;
+    };
+    for &s in tainted.iter() {
+        // Condition 1.
+        if s < 3 || !image_slots.contains(&s) || !tainted.contains(&s) {
+            continue;
+        }
+        // Condition 4.
+        if noinplace_hits.contains(&s) {
+            continue;
+        }
+        // Condition 3: a write to s issued after the anchor — the
+        // durable half (dwrite index above g) or the issued half
+        // (event index above the events anchor).
+        let dw_after = disk.dwrites_of(pf).iter().enumerate().any(|(i, w)| {
+            i > g && w.off < (s + 1) * 4096 && w.off + w.bytes.len() as u64 > s * 4096
+        });
+        let ev_after = events.iter().enumerate().any(|(i, e)| match e {
+            DiskEvent::WriteIssued { inode, off, bytes } if i > anchor && *inode == pf => {
+                *off < (s + 1) * 4096 && *off + bytes.len() as u64 > s * 4096
+            }
+            _ => false,
+        });
+        if !dw_after && !ev_after {
+            continue;
+        }
+        // Condition 2: the durable bytes are the opened image's own
+        // content for this slot.
+        if disk.durable_read(pf, s * 4096, 4096) == v_at_meta(disk, pf, s, cutoff) {
+            out.insert(s);
+        }
+    }
+    out
+}
+
+/// **X5-R29 (a)'s diagnostic** (`E4_MPE_DIAG`, stderr only, never a
+/// digest input): on the end disk's image, the failed lpids (mapped
+/// pages whose durable bytes fail §3.3 against their map `Ref` — the
+/// nodes the store's `check_tree` cannot pass, so never descends), the
+/// descendant set of every failed node (children parsed through the
+/// store's own page decoder — from the failed node's `V_e` content,
+/// composed as X5-R28 (a) composes `V_k`, because the damaged bytes
+/// cannot be trusted to enumerate a subtree; intact descendants parse
+/// from their own durable bytes), and the "mapped lpid N unreachable"
+/// set the store's amcheck reported. Equal sets ⇒ subtree fallout (the
+/// walk cannot decide reachability below a failed node); differing
+/// sets ⇒ real orphan map entries (I-LPID-EXACT), F3's store
+/// deviation. Pure SimDisk history; never an oracle input.
+pub fn r29_subtree_diag(disk: &SimDisk, cfg: &StoreCfg, findings: &[Finding]) {
+    let pf = match disk.stat(crate::sim::PAGE_FILE) {
+        Some(f) => f,
+        None => return,
+    };
+    let m1 = disk.durable_read(pf, 4096, 4096);
+    let m2 = disk.durable_read(pf, 8192, 4096);
+    let meta = match crate::store::page::select_meta(&m1, &m2, false) {
+        crate::store::page::MetaPick::Win { meta, .. } => meta,
+        _ => return,
+    };
+    // The flat map (lpid → Ref), by the same walk durable_image uses.
+    let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    let mut sink: Vec<Finding> = Vec::new();
+    if meta.map_root.slot != 0 {
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        let span = ckpt::radix_child_span(cfg.map_leaf_cap, n, meta.next_lpid);
+        walk_map_disk(
+            disk,
+            pf,
+            meta.map_root,
+            0,
+            span,
+            cfg.map_leaf_cap,
+            0,
+            &mut flat,
+            &mut used,
+            &mut sink,
+            false,
+        );
+    }
+    // The failed nodes: mapped pages failing §3.3 against their Ref.
+    let failed: Vec<u64> = flat
+        .iter()
+        .filter(|(l, r)| {
+            let b = disk.durable_read(pf, r.slot * 4096, 4096);
+            crate::store::page::check(&b, r, **l, None).is_err()
+        })
+        .map(|(l, _)| *l)
+        .collect();
+    // The end meta's V_e cutoff (fail closed: without it the
+    // descendant set cannot be composed and the diag says so).
+    let cutoff = meta_dwrite_cutoff(disk, pf, meta.ckpt_id);
+    // The children of one page's bytes, through the store's decoder.
+    let children_of = |bytes: &[u8]| -> Vec<u64> {
+        if crate::store::page::header_kind(bytes) == crate::store::page::KIND_LEAF {
+            return Vec::new();
+        }
+        match crate::store::tree::inner_seps(bytes) {
+            Ok((seps, right)) => seps.iter().map(|(c, _)| *c).chain([right]).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    // Descendants of the failed nodes: expand a failed node from its
+    // V_e content, an intact one from its durable bytes.
+    let mut desc: BTreeSet<u64> = BTreeSet::new();
+    if let Some(cut) = cutoff {
+        let mut stack: Vec<u64> = failed.clone();
+        while let Some(l) = stack.pop() {
+            let Some(r) = flat.get(&l) else { continue };
+            let is_failed = failed.contains(&l);
+            let kids = if is_failed {
+                let ve = v_at_meta(disk, pf, r.slot, cut);
+                children_of(&ve)
+            } else {
+                let b = disk.durable_read(pf, r.slot * 4096, 4096);
+                children_of(&b)
+            };
+            for c in kids {
+                if desc.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    // The unreachable set, from the store's own findings.
+    let unreachable: BTreeSet<u64> = findings
+        .iter()
+        .filter_map(|f| {
+            f.what
+                .strip_prefix("mapped lpid ")
+                .and_then(|t| t.strip_suffix(" unreachable"))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .collect();
+    // Debug detail for the branch decision (stderr only): the image's
+    // shape and every failed node's V_e header kind and parsed
+    // children, plus the (lpid, slot) of the failed and unreachable
+    // sets.
+    let mut note: BTreeSet<u64> = failed.iter().copied().collect();
+    note.extend(unreachable.iter().copied());
+    eprintln!(
+        "R29 dbg: dir_root={} next_lpid={} slots_of_note={:?}",
+        meta.dir_root,
+        meta.next_lpid,
+        note.iter()
+            .filter_map(|l| flat.get(l).map(|r| (*l, r.slot)))
+            .collect::<Vec<_>>()
+    );
+    if let Some(cut) = cutoff {
+        for l in failed.iter() {
+            let Some(r) = flat.get(l) else { continue };
+            let ve = v_at_meta(disk, pf, r.slot, cut);
+            eprintln!(
+                "R29 dbg: failed lpid {l} slot {} ve_kind={} kids={:?}",
+                r.slot,
+                crate::store::page::header_kind(&ve),
+                children_of(&ve)
+            );
+        }
+    }
+    let equal = cutoff.is_some() && desc == unreachable;
+    eprintln!(
+        "R29 diag: failed_lpids {:?} cutoff_ok={} descendants {:?} unreachable {:?} equal={}",
+        failed,
+        cutoff.is_some(),
+        desc,
+        unreachable,
+        equal
+    );
 }
 
 /// The pure conditions of X5-R5's R for one write's slot: the slot is

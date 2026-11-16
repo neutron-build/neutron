@@ -476,14 +476,25 @@ fn value_of(rng: &mut Rng, lo: u64) -> Vec<u8> {
 /// round does reach, drawn deterministically from `(seed, round)` over
 /// the union mask — the same adaptation the uniform draw makes to the
 /// counted yield total. The workload itself is untouched (no retune:
-/// X5-R17 is X-5c-F2's).
+/// X5-R17 is X-5c-F4's, per X5-R31).
+///
+/// **X-5c-F2 step 1 (a): an empty mask list, or a union of zero (no
+/// checkpoint reached any hook at all) is a loud `Err`, never a
+/// re-derive.** The draft's fallback loop walks `CKPT_HOOKS` in order
+/// decrementing `left`, and with `union == 0` no candidate ever
+/// matches, so `left` never reaches 0 and the loop spins forever — a
+/// hang, in the exact path that exists to fix an unfired round. The
+/// caller records the `Err` as a seed-level defect (beside the
+/// fired-guard's, which the unfired attempt trips anyway: both are
+/// counted in `DEFECT_SEEDS`), and the round is never re-run on a spec
+/// no checkpoint can reach.
 pub fn reachable_hook_spec(
     masks: &[u16],
     hook: crate::store::ckpt::CkptHook,
     drawn_idx: u64,
     seed: u64,
     round: u32,
-) -> (u64, crate::store::ckpt::CkptHook) {
+) -> Result<(u64, crate::store::ckpt::CkptHook), String> {
     let bit = crate::store::ckpt::hook_bit(hook);
     let reached: Vec<u64> = masks
         .iter()
@@ -497,9 +508,19 @@ pub fn reachable_hook_spec(
         } else {
             *first
         };
-        (idx, hook)
+        Ok((idx, hook))
     } else {
         let union: u16 = masks.iter().fold(0u16, |a, m| a | m);
+        if union == 0 {
+            // Covers the empty list too (its fold is 0): no checkpoint
+            // of the attempt reached any hook, so there is nothing to
+            // re-derive a reachable spec from.
+            return Err(format!(
+                "no checkpoint hook was ever reached ({} complete masks, union 0): \
+                 the crash spec cannot be made reachable",
+                masks.len()
+            ));
+        }
         let mut hrng = Rng::new(derive(seed * 13 + round as u64, S_HOOK));
         let mut pick = hook;
         let mut left = 1 + hrng.below(10);
@@ -522,7 +543,7 @@ pub fn reachable_hook_spec(
             .position(|m| crate::store::ckpt::hook_bit(pick) & *m != 0)
             .map(|i| i as u64)
             .unwrap_or(drawn_idx);
-        (idx, pick)
+        Ok((idx, pick))
     }
 }
 
@@ -654,6 +675,11 @@ pub struct RoundRec {
     pub o3_fail: Option<String>,
     /// O-3 (a)'s input (reported beside the rule, never inside it).
     pub served: bool,
+    /// X5-R30 (a): every served range of the round lies wholly inside
+    /// slots of the kept set `K` (vacuously true when nothing was
+    /// served). A diagnostic beside the rule, never an oracle input;
+    /// evidence for F3's O-3 (a) question.
+    pub served_k: bool,
     /// Monitor hits.
     pub monitors: Vec<&'static str>,
     /// XX001 detection sites.
@@ -808,7 +834,7 @@ impl SeedRec {
         );
         for r in &self.rounds {
             s.push_str(&format!(
-                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.crash,
                 r.fired,
                 r.nested,
@@ -824,6 +850,7 @@ impl SeedRec {
                 r.o3_fail,
                 r.o1f_fail,
                 r.served,
+                r.served_k,
                 r.meta_rollback,
                 r.r_len,
                 r.o1_detected_loss,
@@ -867,12 +894,36 @@ impl SeedRec {
 
 // ---- the per-seed driver (5.5) ----
 
-/// The round-chain state: what the next round starts from.
-struct Chain {
-    disk: crate::sim::SimDisk,
-    st: crate::store::StoreInner,
-    model: Model,
-    cut: u64,
+/// The round-chain state: what the next round starts from. Public with
+/// public fields for the X-5c-F2 step 1 (b) pin
+/// ([`twin_chain_after_repair`]); the twin chain and the real chain are
+/// the same shape.
+pub struct Chain {
+    /// The durable disk at the chain point.
+    pub disk: crate::sim::SimDisk,
+    /// The recovered store at the chain point.
+    pub st: crate::store::StoreInner,
+    /// The model, truncated at `cut`.
+    pub model: Model,
+    /// The truncation cut.
+    pub cut: u64,
+}
+
+/// X5-R21 (c) re-pair update (X-5c-F2 step 1 (b)): the twin chain
+/// after the **re-paired** twin round — `Some(end_store)` continues it
+/// from that round's own end state; `None` (the re-paired twin's
+/// recovery produced no store) **re-seeds** it: the next round's supply
+/// block rebuilds the twin chain from the real round's own start (Work
+/// 2.5: the twin is the same script, crash and F-CRASH resolutions,
+/// from the same base). The draft kept the first attempt's chain in
+/// that case — a chain at a crash spec the round that ran never used.
+pub fn twin_chain_after_repair(tout: &harness::RoundOutcome) -> Option<Chain> {
+    tout.end_store.clone().map(|st| Chain {
+        disk: tout.end_disk.clone(),
+        st,
+        model: harness::clone_model(&tout.end_model),
+        cut: tout.cut,
+    })
 }
 
 /// Run one seed: create, then 1–3 rounds (each with its twin first for
@@ -1093,42 +1144,55 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 && !out.0.obs.crash_fired
                 && let Some(CrashSpec::Hook { ckpt_index, hook }) = script_twin_run.crash
             {
-                let (idx2, hook2) =
-                    reachable_hook_spec(&out.0.obs.ckpt_hooks_hit, hook, ckpt_index, seed, round);
-                script_twin_run = Script {
-                    crash: Some(CrashSpec::Hook {
-                        ckpt_index: idx2,
-                        hook: hook2,
-                    }),
-                    nested: Vec::new(),
-                    ..script_twin_run
-                };
-                // The real round follows the twin's fixed spec (Work
-                // 2.5: the same crash point).
-                script_real = Script {
-                    crash: Some(CrashSpec::Hook {
-                        ckpt_index: idx2,
-                        hook: hook2,
-                    }),
-                    ..script_real
-                };
-                crash_desc = format!("{hook2:?}@{idx2}");
-                let mut reads = Vec::new();
-                out = {
-                    let o = harness::run_round(
-                        seed,
-                        round,
-                        &script_twin_run,
-                        &tf,
-                        cfg.clone(),
-                        tch_retry.disk,
-                        tch_retry.st,
-                        &tch_retry.model,
-                        tch_retry.cut,
-                        Some(&mut reads),
-                    );
-                    (o, reads)
-                };
+                // X-5c-F2 step 1 (a): the re-derive can refuse (no
+                // checkpoint reached any hook — empty masks or union 0).
+                // That is a loud seed defect, never a hang; the unfired
+                // attempt this block would have replaced still trips the
+                // fired-guard below, so the round can never pass.
+                match reachable_hook_spec(&out.0.obs.ckpt_hooks_hit, hook, ckpt_index, seed, round)
+                {
+                    Ok((idx2, hook2)) => {
+                        script_twin_run = Script {
+                            crash: Some(CrashSpec::Hook {
+                                ckpt_index: idx2,
+                                hook: hook2,
+                            }),
+                            nested: Vec::new(),
+                            ..script_twin_run
+                        };
+                        // The real round follows the twin's fixed spec (Work
+                        // 2.5: the same crash point).
+                        script_real = Script {
+                            crash: Some(CrashSpec::Hook {
+                                ckpt_index: idx2,
+                                hook: hook2,
+                            }),
+                            ..script_real
+                        };
+                        crash_desc = format!("{hook2:?}@{idx2}");
+                        let mut reads = Vec::new();
+                        out = {
+                            let o = harness::run_round(
+                                seed,
+                                round,
+                                &script_twin_run,
+                                &tf,
+                                cfg.clone(),
+                                tch_retry.disk,
+                                tch_retry.st,
+                                &tch_retry.model,
+                                tch_retry.cut,
+                                Some(&mut reads),
+                            );
+                            (o, reads)
+                        };
+                    }
+                    Err(d) => {
+                        if rec.defect.is_none() {
+                            rec.defect = Some(format!("twin round {round}: {d}"));
+                        }
+                    }
+                }
             } else if uniform_wrap {
                 let total = out.0.sched_yields.max(1);
                 let k2 = match script_twin_run.crash {
@@ -1250,121 +1314,137 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             script.crash.clone(),
         ) {
             if let CrashSpec::Hook { ckpt_index, hook } = crash {
-                let (idx2, hook2) =
-                    reachable_hook_spec(&out.obs.ckpt_hooks_hit, hook, ckpt_index, seed, round);
-                let spec2 = CrashSpec::Hook {
-                    ckpt_index: idx2,
-                    hook: hook2,
-                };
-                let script2 = Script {
-                    crash: Some(spec2.clone()),
-                    ..script
-                };
-                crash_desc = format!("{hook2:?}@{idx2}");
-                // **X5-R21 (c) (P ruling nv3-X-5c-F1-esc-1): the real
-                // round's retry re-pairs its twin.** The twin and real
-                // chains can diverge, so the twin's firing does not
-                // guarantee the real round's — and when the real round
-                // re-derives a targeted spec, the twin re-runs at that
-                // same spec, from its own start (`tch_pair`, the same
-                // start the ruling's `tch_retry` names), BEFORE the
-                // real round uses its supply and nested points. The
-                // first attempts' twin (at the old spec) is not the
-                // twin of the round that ran: Work 2.5's twin is the
-                // same script, crash and F-CRASH resolutions. Its
-                // record, supply, nested points and chain continuation
-                // replace the first attempts' (class C has no twin and
-                // keeps its own retry, below, unchanged).
-                let mut supply2 = None;
-                let mut twin_points2 = Vec::new();
-                if let Some(tch) = tch_pair.take() {
-                    let tscript = Script {
-                        nested: Vec::new(),
-                        ..script2.clone()
+                'derive: {
+                    // X-5c-F2 step 1 (a): a refused re-derive (no hook was
+                    // ever reached) is a loud seed defect; the unfired first
+                    // attempt's outcome stands and trips the fired-guard, so
+                    // the round can never pass and the retry is skipped.
+                    let (idx2, hook2) = match reachable_hook_spec(
+                        &out.obs.ckpt_hooks_hit,
+                        hook,
+                        ckpt_index,
+                        seed,
+                        round,
+                    ) {
+                        Ok(x) => x,
+                        Err(d) => {
+                            if rec.defect.is_none() {
+                                rec.defect = Some(format!("round {round}: {d}"));
+                            }
+                            break 'derive;
+                        }
                     };
-                    let tf_pair = RoundFaults {
-                        class: FaultClass::C,
+                    let spec2 = CrashSpec::Hook {
+                        ckpt_index: idx2,
+                        hook: hook2,
+                    };
+                    let script2 = Script {
+                        crash: Some(spec2.clone()),
+                        ..script
+                    };
+                    crash_desc = format!("{hook2:?}@{idx2}");
+                    // **X5-R21 (c) (P ruling nv3-X-5c-F1-esc-1): the real
+                    // round's retry re-pairs its twin.** The twin and real
+                    // chains can diverge, so the twin's firing does not
+                    // guarantee the real round's — and when the real round
+                    // re-derives a targeted spec, the twin re-runs at that
+                    // same spec, from its own start (`tch_pair`, the same
+                    // start the ruling's `tch_retry` names), BEFORE the
+                    // real round uses its supply and nested points. The
+                    // first attempts' twin (at the old spec) is not the
+                    // twin of the round that ran: Work 2.5's twin is the
+                    // same script, crash and F-CRASH resolutions. Its
+                    // record, supply, nested points and chain continuation
+                    // replace the first attempts' (class C has no twin and
+                    // keeps its own retry, below, unchanged).
+                    let mut supply2 = None;
+                    let mut twin_points2 = Vec::new();
+                    if let Some(tch) = tch_pair.take() {
+                        let tscript = Script {
+                            nested: Vec::new(),
+                            ..script2.clone()
+                        };
+                        let tf_pair = RoundFaults {
+                            class: FaultClass::C,
+                            knobs: knobs.fault,
+                            directed: Vec::new(),
+                            no_r_taint: false,
+                            media: MediaDraw::None,
+                            twin_supply: None,
+                            nested_draw: nested_draw_for(seed, round),
+                            probe_pass: false,
+                        };
+                        let mut treads = Vec::new();
+                        let tout = harness::run_round(
+                            seed,
+                            round,
+                            &tscript,
+                            &tf_pair,
+                            cfg.clone(),
+                            tch.disk,
+                            tch.st,
+                            &tch.model,
+                            tch.cut,
+                            Some(&mut treads),
+                        );
+                        if let Some(d) = crash_fired_defect(&tout, &crash_desc)
+                            && rec.defect.is_none()
+                        {
+                            rec.defect = Some(format!("twin round {round}: {d}"));
+                        }
+                        rec.twin.pop();
+                        rec.twin.push(TwinRound {
+                            pass: tout.pass,
+                            o1_fail: tout.o1.clone().err(),
+                        });
+                        twin_points2 = tout.nested_points.clone();
+                        supply2 = Some(TwinSupply {
+                            recovery_reads: treads,
+                            image_slots: harness::durable_image(&tout.crashed_disk, &cfg).1,
+                        });
+                        // X-5c-F2 step 1 (b): the re-paired twin's own
+                        // outcome decides the chain — a recovery without
+                        // a store re-seeds it (None), never keeps the
+                        // first attempt's chain at the old spec.
+                        twin_chain = twin_chain_after_repair(&tout);
+                        twin_final_spec = Some(spec2.clone());
+                    }
+                    let script3 = Script {
+                        nested: twin_points2,
+                        ..script2
+                    };
+                    let faults_pair = RoundFaults {
+                        class,
                         knobs: knobs.fault,
                         directed: Vec::new(),
                         no_r_taint: false,
-                        media: MediaDraw::None,
-                        twin_supply: None,
-                        nested_draw: nested_draw_for(seed, round),
+                        media: match class {
+                            FaultClass::C => MediaDraw::None,
+                            FaultClass::Mp => MediaDraw::Page,
+                            FaultClass::Mw => MediaDraw::Wal,
+                        },
+                        twin_supply: supply2,
+                        nested_draw: if class == FaultClass::C {
+                            nested_draw_for(seed, round)
+                        } else {
+                            0
+                        },
                         probe_pass: false,
                     };
-                    let mut treads = Vec::new();
-                    let tout = harness::run_round(
+                    real_final_spec = Some(spec2);
+                    out = harness::run_round(
                         seed,
                         round,
-                        &tscript,
-                        &tf_pair,
+                        &script3,
+                        &faults_pair,
                         cfg.clone(),
-                        tch.disk,
-                        tch.st,
-                        &tch.model,
-                        tch.cut,
-                        Some(&mut treads),
+                        retry.disk,
+                        retry.st,
+                        &retry.model,
+                        retry.cut,
+                        None,
                     );
-                    if let Some(d) = crash_fired_defect(&tout, &crash_desc)
-                        && rec.defect.is_none()
-                    {
-                        rec.defect = Some(format!("twin round {round}: {d}"));
-                    }
-                    rec.twin.pop();
-                    rec.twin.push(TwinRound {
-                        pass: tout.pass,
-                        o1_fail: tout.o1.clone().err(),
-                    });
-                    twin_points2 = tout.nested_points.clone();
-                    supply2 = Some(TwinSupply {
-                        recovery_reads: treads,
-                        image_slots: harness::durable_image(&tout.crashed_disk, &cfg).1,
-                    });
-                    if let Some(st) = tout.end_store.clone() {
-                        twin_chain = Some(Chain {
-                            disk: tout.end_disk.clone(),
-                            st,
-                            model: tout.end_model,
-                            cut: tout.cut,
-                        });
-                    }
-                    twin_final_spec = Some(spec2.clone());
                 }
-                let script3 = Script {
-                    nested: twin_points2,
-                    ..script2
-                };
-                let faults_pair = RoundFaults {
-                    class,
-                    knobs: knobs.fault,
-                    directed: Vec::new(),
-                    no_r_taint: false,
-                    media: match class {
-                        FaultClass::C => MediaDraw::None,
-                        FaultClass::Mp => MediaDraw::Page,
-                        FaultClass::Mw => MediaDraw::Wal,
-                    },
-                    twin_supply: supply2,
-                    nested_draw: if class == FaultClass::C {
-                        nested_draw_for(seed, round)
-                    } else {
-                        0
-                    },
-                    probe_pass: false,
-                };
-                real_final_spec = Some(spec2);
-                out = harness::run_round(
-                    seed,
-                    round,
-                    &script3,
-                    &faults_pair,
-                    cfg.clone(),
-                    retry.disk,
-                    retry.st,
-                    &retry.model,
-                    retry.cut,
-                    None,
-                );
             }
         } else if !uniform && let Some(CrashSpec::Hook { ckpt_index, hook }) = script.crash {
             crash_desc = format!("{hook:?}@{ckpt_index}");
@@ -1394,6 +1474,12 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             && rec.defect.is_none()
         {
             rec.defect = Some(format!("round {round}: {d}"));
+        }
+        // X-5c-F2 step 1 (e): the anchor-0 precondition defect is
+        // seed-level (counted in DEFECT_SEEDS), exactly as P's text
+        // records it.
+        if out.r5_anchor0_defect && rec.defect.is_none() {
+            rec.defect = Some(harness::R5_ANCHOR0_DEFECT.to_owned());
         }
         let rr = round_rec(&knobs, &cfg, &out, &crash_desc, &crash_hook);
         rec.deadlock |= rr.deadlock;
@@ -1479,6 +1565,7 @@ fn round_rec(
     rr.o2_fail = out.o2_fail.clone();
     rr.o3_fail = out.o3_fail.clone();
     rr.served = out.served;
+    rr.served_k = out.served_k;
     rr.monitors = out.monitors.clone();
     rr.detections = out.detections.clone();
     rr.acked_lost = out.acked_lost.len() as u64;

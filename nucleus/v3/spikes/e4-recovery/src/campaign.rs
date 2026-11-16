@@ -1388,7 +1388,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1406,6 +1406,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.o2_fail.as_deref().map(esc).unwrap_or_else(|| "null".into()),
                 x.o3_fail.as_deref().map(esc).unwrap_or_else(|| "null".into()),
                 x.served,
+                x.served_k,
                 x.acked_lost,
                 x.acked_lost_syncoff,
                 x.meta_rollback,
@@ -1824,6 +1825,7 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "o2" => x.o2_fail = j.opt_string()?,
             "o3" => x.o3_fail = j.opt_string()?,
             "served" => x.served = j.boolv()?,
+            "sk" => x.served_k = j.boolv()?,
             "ackl" => x.acked_lost = j.int()?,
             "ackls" => x.acked_lost_syncoff = j.int()?,
             "mrb" => x.meta_rollback = j.boolv()?,
@@ -2087,6 +2089,34 @@ mod tests {
         for (a, b) in sorted_in.iter().zip(back.iter()) {
             assert_eq!(a.digest, b.digest, "seed {} digest", a.seed);
         }
+    }
+
+    /// **X-5c-F2 step 1 (c) pin (gate mutant M13): the FOLD counts a
+    /// twin-only failure.** A literal `SeedRec` whose primary rounds
+    /// all pass, with one failing twin round, gives
+    /// `FAILING_SEEDS=1 FAILING_ROUNDS=0 TWIN_FAILING_ROUNDS=1` —
+    /// dropping the twin term from `fold_line` (M13) would report
+    /// `FAILING_SEEDS=0` and let a Work 2.5 failure hide inside a
+    /// passing-looking campaign.
+    #[test]
+    fn f1f2c_fold_counts_a_twin_only_failure() {
+        let recs = vec![SeedRec {
+            seed: 1,
+            rounds: vec![workload::RoundRec {
+                pass: true,
+                ..workload::RoundRec::default()
+            }],
+            twin: vec![workload::TwinRound {
+                pass: false,
+                o1_fail: Some("O-1(b): scan mismatch".to_owned()),
+            }],
+            ..SeedRec::default()
+        }];
+        let line = fold_line(&recs);
+        assert_eq!(
+            line, "E4 FOLD FAILING_SEEDS=1 FAILING_ROUNDS=0 TWIN_FAILING_ROUNDS=1 DEFECT_SEEDS=0",
+            "a seed failing only through its twin must count in FAILING_SEEDS"
+        );
     }
 
     /// X5-R13 (d)'s pins: `0..10000` is 10,000 seeds; `5..5` is empty,

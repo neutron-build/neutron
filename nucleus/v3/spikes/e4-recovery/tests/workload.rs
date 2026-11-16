@@ -777,6 +777,99 @@ fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
     }
 }
 
+/// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
+/// loud defect, never a hang.** The draft's `reachable_hook_spec`
+/// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with
+/// `union == 0` no candidate ever matches, so it spun forever — in the
+/// exact path that exists to repair an unfired round. The function now
+/// returns `Err` (the caller records a seed-level defect beside the
+/// fired-guard's). The call runs on a spawned thread with a 5 s channel
+/// timeout (the card's test-only wall-clock exception): on the revert
+/// the timeout is what fails the pin.
+#[test]
+fn f1f2a_empty_masks_are_a_defect_not_a_hang() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        use e4_recovery::store::ckpt::CkptHook;
+        let empty = workload::reachable_hook_spec(&[], CkptHook::Mid2, 0, 7, 0);
+        let zeros = workload::reachable_hook_spec(&[0, 0], CkptHook::After2, 1, 7, 0);
+        let _ = tx.send((empty.is_err(), zeros.is_err()));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    assert!(
+        got.unwrap_or((false, false)) == (true, true),
+        "reachable_hook_spec must refuse (&[] and &[0, 0]) within 5 s, not hang or loop"
+    );
+    handle.join().expect("the spec thread must finish");
+}
+
+/// **X-5c-F2 step 1 (b) pin: the R21 (c) re-pair update.** A re-paired
+/// twin whose recovery returns no store re-seeds the twin chain
+/// (`twin_chain = None` — the next round's supply block rebuilds it
+/// from the real round's own start); a re-paired twin with a store
+/// continues the chain from the re-paired round's own end state. The
+/// draft kept the FIRST attempt's chain when the re-paired twin's
+/// recovery failed — a chain at a crash spec the round that ran never
+/// used. On the revert (`twin_chain_after_repair` restoring the first
+/// attempt's chain, i.e. keeping the incoming chain on the `None`
+/// arm) this pin fails.
+#[test]
+fn f1f2b_repairs_without_a_store_reseed_the_twin_chain() {
+    use e4_recovery::harness::RoundOutcome;
+    use e4_recovery::store::StoreInner;
+    let cfg = Knobs::derive(7, 0).store_cfg(None);
+    let tout = RoundOutcome {
+        cut: 3,
+        end_store: None,
+        ..RoundOutcome::default()
+    };
+    assert!(
+        workload::twin_chain_after_repair(&tout).is_none(),
+        "a re-paired twin whose recovery returned no store must re-seed the twin chain"
+    );
+    let tout = RoundOutcome {
+        cut: 3,
+        end_store: Some(StoreInner::empty(cfg, 0)),
+        ..RoundOutcome::default()
+    };
+    let ch = workload::twin_chain_after_repair(&tout)
+        .expect("a re-paired twin with a store continues the chain");
+    assert_eq!(ch.cut, 3, "the chain carries the re-paired round's own cut");
+}
+
+/// **X5-R28 (e) pin (literal configs = the ruling's residual seeds 1787
+/// and 6157, round 0 each).** The rounds that failed O-3 (e) as
+/// "tainted referenced slot 10/42 not reported" now pass: their named
+/// slot is in the kept set `K` (the diag prints `K slot … durable==V_k`
+/// per round), the rollback conditions hold (`mrb=true`), and no O-3
+/// text remains. That the clear comes **through K** is demonstrated on
+/// the revert: with the harness K computation disabled (always empty —
+/// mutant M-R28g) the completeness text returns and this pin fails.
+#[test]
+fn r28_residual_seeds_clear_via_k() {
+    for seed in [1787u64, 6157] {
+        let rec = workload::run_seed(seed, None);
+        assert!(
+            rec.rounds.iter().any(|r| r.meta_rollback),
+            "seed {seed}: the residual round's rollback condition must hold (the K gate)"
+        );
+        for r in &rec.rounds {
+            assert!(
+                r.o3_fail.is_none(),
+                "seed {seed}: O-3 must be clear (the named slot is kept): {:?}",
+                r.o3_fail
+            );
+            assert!(
+                r.pass,
+                "seed {seed}: the residual round must pass: {:?}",
+                r.o3_fail
+            );
+        }
+    }
+}
+
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {
