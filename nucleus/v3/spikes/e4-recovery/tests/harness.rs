@@ -1649,6 +1649,375 @@ fn name1_of() -> String {
     e4_recovery::harness::x5r34_seg_name(65536)
 }
 
+// ---- X5-R47 (card X-5c-F4-F1-F1-O1C-F1): the replay's self-tests ----
+
+/// **X5-R47, 1066 r0's literal shape:** a recycled file's earlier-life
+/// write `[206, 10897)` (issued first, its own old-life record at 206)
+/// sits at a map key between the new life's write key 0 and the new
+/// record at 2453 — under the pre-X5-R47 `stitched` resolver the
+/// greatest key ≤ 2453 picked the **old** write's bytes and the new
+/// record never entered `ts_pos`, capping `hi` one commit below the
+/// recovered frontier (verdict X-5c-F4-F1-F1-O1C). Under the replay,
+/// the later-issued bytes replace the earlier ones and **both** new
+/// records — at 0 and at 2453 — are written. **M-R47-KEY-COVER** (the
+/// old greatest-key resolver restored) fails this pin: ts 21 stays
+/// unwritten behind the old write.
+#[test]
+fn r47_new_life_record_behind_old_write() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 2usize;
+    let seg_a = 196608u64; // 3 * WAL_SEG: the recycled segment's first LSN
+    // The old life's write [206, 10897): its own record at 206, then
+    // zeros (an earlier segment-0 body that never held the new life).
+    let mut old = x5r34::rec(5, 206, 2000);
+    old.resize(10897 - 206, 0);
+    // The new life's single batch [0, 5046): ts 20's record at 0 and
+    // ts 21's at 2453 — 1066's exact positions and lengths.
+    let mut new = x5r34::rec(20, seg_a, 2453);
+    new.extend_from_slice(&x5r34::rec(21, seg_a + 2453, 2593));
+    assert_eq!(old.len(), 10897 - 206);
+    assert_eq!(new.len(), 5046);
+    let mut ev = x5r34::Ev::new();
+    ev.write(inode, 206, &old).write(inode, 0, &new);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(20u64, (false, seg_a, 2453));
+    commits.insert(21u64, (false, seg_a + 2453, 2593));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, seg_a, &bindings);
+    assert_eq!(
+        written,
+        vec![20u64, 21],
+        "the new life's records at 0 and 2453 are both written — the\
+         \nold life's earlier write cannot shadow them (X5-R47: no\
+         \nresolver by key)"
+    );
+    assert_eq!(
+        acked,
+        vec![20u64, 21],
+        "SyncOff's acked stays iff written (both commits are SyncOff)"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "both records parse at their own lsns — no F1"
+    );
+}
+
+/// **X5-R47's monotone clause:** a record whose bytes a later life
+/// overwrites stays written — once written, always written; the test
+/// is never made against the final image alone. **M-R47-FINAL-IMAGE**
+/// (testing the final image only) fails this pin: the final image
+/// holds only the overwriting garbage, and the commit would unwrap.
+#[test]
+fn r47_earlier_life_record_stays_written() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 3usize;
+    let rec = x5r34::rec(9, 1000, 500);
+    let mut ev = x5r34::Ev::new();
+    // The earlier life's record at [1000, 1500), then the recycle's new
+    // life overwriting [900, 1600) wholesale with its own bytes.
+    ev.write(inode, 1000, &rec)
+        .write(inode, 900, &vec![0xCDu8; 700]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(9u64, (false, 1000, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![9u64],
+        "the record was held by the image after its own write — the\
+         \nlater life's overwrite does not unwrite it (monotone)"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "the garbage at the position has no magic — no F1"
+    );
+}
+
+/// **X5-R47's negative space:** a commit with no bytes issued at all,
+/// and one whose record's last byte is never issued (a torn tail, a
+/// normal crash outcome), stay unwritten and unreported. **M-R47-ALL-
+/// WRITTEN** (every commit written) fails this pin.
+#[test]
+fn r47_never_issued_stays_unwritten() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 4usize;
+    let mut ev = x5r34::Ev::new();
+    // ts 30's record, whole (the positive control); ts 31 has no bytes
+    // issued anywhere; ts 32's record misses exactly its last byte.
+    ev.write(inode, 30000, &x5r34::rec(30, 30000, 400));
+    let torn = x5r34::rec(32, 60000, 500);
+    ev.write(inode, 60000, &torn[..torn.len() - 1]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(30u64, (false, 30000, 400));
+    commits.insert(31u64, (false, 50000, 300));
+    commits.insert(32u64, (false, 60000, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![30u64],
+        "only the whole record marks its commit written: ts 31 was\
+         \nnever issued and ts 32's last byte never was"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "a never-written record and a torn tail are not F1: ts 32's\
+         \nheader fits its segment (no len past the end)"
+    );
+}
+
+/// **X5-R47's identity clause:** the image must hold a record that
+/// `dec_record` accepts **with its own `lsn`** and with `rec.ts == ts`
+/// — a valid record at the position with another lsn (a recycled
+/// segment's stale content, §12.5's position rule), and one with the
+/// same lsn but another ts (another commit's record), both leave the
+/// commit unwritten. **M-R47-NO-TS** (dropping `rec.ts == ts`) fails
+/// this pin through the same-lsn case.
+#[test]
+fn r47_wrong_record_at_position_stays_unwritten() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 6usize;
+    let mut ev = x5r34::Ev::new();
+    // ts 40 at 50000: the positive control (a correct record).
+    // ts 41's lsn lands at 30000, where a *stale* record with its own
+    // lsn 30000 lives; ts 42's lsn lands at 40000, where a record with
+    // the same lsn carries another commit's ts.
+    ev.write(inode, 30000, &x5r34::rec(91, 30000, 500))
+        .write(inode, 40000, &x5r34::rec(92, 40000, 500))
+        .write(inode, 50000, &x5r34::rec(40, 50000, 400));
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(40u64, (false, 50000, 400));
+    commits.insert(41u64, (false, 65536 + 30000, 500));
+    commits.insert(42u64, (false, 40000, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![40u64],
+        "only the record with its own lsn and this commit's ts counts:\
+         \nts 41 found a stale-lsn record and ts 42 another commit's"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "both foreign records fit their segments — no F1"
+    );
+}
+
+/// **X5-R47's F1 by the same replay:** a commit whose record header
+/// sits at the segment-relative position with its own lsn and a length
+/// past the segment end — written, never parseable — is reported even
+/// when an old-life write's key covers the header's position (the
+/// masking shape: the new batch starts below the header, the old write
+/// was issued at a key between the two). **M-R47-NO-F1** (no report)
+/// fails this pin.
+#[test]
+fn r47_f1_on_recycled_file() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 5usize;
+    // The over-cap record: header at 65000 saying len 1000 — 65000 +
+    // 1000 runs past WAL_SEG. Only its first 24 bytes are ever issued,
+    // as the tail of a batch that starts at 64800.
+    let over = x5r34::rec(51, 65000, 1000);
+    let mut batch = vec![0x11u8; 200];
+    batch.extend_from_slice(&over[..24]);
+    assert_eq!(batch.len(), 224);
+    let mut ev = x5r34::Ev::new();
+    // The old life's write [64900, 65200) — its key 64900 sits between
+    // the batch's key 64800 and the header at 65000, and covers 65000.
+    ev.write(inode, 64900, &vec![0xEEu8; 300])
+        .write(inode, 64800, &batch);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(51u64, (false, 65000, 1000));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, _acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert!(
+        written.is_empty(),
+        "a header whose len runs past the segment is never a whole\
+         \nrecord — the commit is not written"
+    );
+    assert_eq!(
+        unparsed,
+        vec![51u64],
+        "the replay saw the header with its own lsn behind the old\
+         \nlife's write — F1 reports it (the loud half)"
+    );
+}
+
+/// **X-5c-PINS-1 item 5 (folded card X-5c-F4-F1-F1-O1C-F1-F1; verdict
+/// X-5c-F4-F1-F1-O1C-F1 finding 2): a record completed by a later
+/// write.** One commit whose record the WAL writer issues as two
+/// writes — the first holds its first 100 bytes, header included, the
+/// second the rest from `pos + 100` on — becomes written exactly at
+/// the second write: the replay's overlap window is the record's whole
+/// extent (`pos + len.max(24)`), not its header. **G1-HEADER-WINDOW**
+/// (`pos + 24` in place of `pos + (*len).max(24)`) skips the second
+/// write's test (`pos + 100 ≥ pos + 24`), so the commit never enters
+/// `written` although the image then holds its whole record — this pin
+/// fails. The control — the same commit with only the first write —
+/// stays unwritten and unreported. No live stream reaches the shape
+/// today (the WAL writer splits a batch only at segment boundaries),
+/// so a future writer change is what this pin guards.
+#[test]
+fn r47_record_completed_by_a_later_write() {
+    use e4_recovery::harness;
+    use std::collections::BTreeMap;
+    let inode = 8usize;
+    let lsn = 30000u64;
+    let rec = x5r34::rec(33, lsn, 500);
+    assert!(
+        rec.len() > 124,
+        "the record must outlast its first 100 bytes"
+    );
+    let mut ev = x5r34::Ev::new();
+    ev.write(inode, lsn, &rec[..100])
+        .write(inode, lsn + 100, &rec[100..]);
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(33u64, (false, lsn, 500));
+    let bindings = x5r34::Ev::bindings(&[]);
+    let (written, acked, unparsed) =
+        harness::derive_written_acked(&ev.events, &commits, 0, &bindings);
+    assert_eq!(
+        written,
+        vec![33u64],
+        "the record is written at its second write — the overlap window is the \
+         record's whole extent, header alone is not the record (G1-HEADER-WINDOW \
+         reverts this)"
+    );
+    assert_eq!(
+        acked,
+        vec![33u64],
+        "SyncOff's acked stays iff written (the commit is SyncOff)"
+    );
+    assert_eq!(
+        unparsed,
+        Vec::<u64>::new(),
+        "the record fits its segment — no F1"
+    );
+    // The control: the first write alone leaves the commit unwritten
+    // and unreported.
+    let mut ev1 = x5r34::Ev::new();
+    ev1.write(inode, lsn, &rec[..100]);
+    let (written1, _acked1, unparsed1) =
+        harness::derive_written_acked(&ev1.events, &commits, 0, &bindings);
+    assert_eq!(
+        written1,
+        Vec::<u64>::new(),
+        "the control: 100 of 500 bytes is not a whole record — the commit stays \
+         unwritten"
+    );
+    assert_eq!(
+        unparsed1,
+        Vec::<u64>::new(),
+        "the control: a torn body is not F1 (the header fits its segment)"
+    );
+}
+
+/// **X5-R47's pairing guard** (the `returned_end` extent test's
+/// replacement): `SimDisk::write_at` emits `WriteIssued` and its
+/// `WriteReturned` in one step, so a paired stream passes quietly and
+/// any `WriteIssued` without its immediately following own return —
+/// absent, or with a different length — is named for the round's
+/// `task_error`.
+#[test]
+fn r47_pairing_guard_names_an_unpaired_write() {
+    use e4_recovery::sim::DiskEvent;
+    let paired = {
+        let mut ev = x5r34::Ev::new();
+        ev.write(7, 0, &x5r34::rec(3, 0, 500));
+        ev
+    };
+    assert!(
+        e4_recovery::harness::r47_issue_return_paired(&paired.events).is_none(),
+        "a stream of paired writes passes the guard"
+    );
+    // No return at all: the next event is a sync.
+    let missing = vec![
+        DiskEvent::WriteIssued {
+            inode: 7,
+            off: 40,
+            bytes: vec![1u8; 60],
+        },
+        DiskEvent::SyncIssued {
+            inode: 7,
+            all: false,
+        },
+    ];
+    let why = e4_recovery::harness::r47_issue_return_paired(&missing)
+        .expect("an unpaired WriteIssued is named");
+    assert!(
+        why.contains("E[0]") && why.contains("len 60"),
+        "the guard names the event index and length: {why}"
+    );
+    // A return with a different length is not its own.
+    let wrong_len = vec![
+        DiskEvent::WriteIssued {
+            inode: 7,
+            off: 40,
+            bytes: vec![1u8; 60],
+        },
+        DiskEvent::WriteReturned {
+            inode: 7,
+            off: 40,
+            len: 59,
+        },
+    ];
+    assert!(
+        e4_recovery::harness::r47_issue_return_paired(&wrong_len).is_some(),
+        "a WriteReturned with a different length does not pair"
+    );
+}
+
+/// **X5-R47 on the three rounds** (verdict X-5c-F4-F1-F1-O1C's, at
+/// this tip): 1066, 6555 and 7590 r0 — the faultless class C rounds
+/// whose recovered frontier sat one commit above the stitched walk's
+/// `hi` — now pass with `hi` raised to the replayed last WAL-written
+/// commit, exactly the F2-tip values the card quotes (CXX moved none
+/// of them; the pre-change values at this tip were (20, 20, —, 21)
+/// fail, (22, 23, —, 24) fail, (19, 20, —, 21) fail). 6555's rounds 1
+/// and 2 continue passing, as the verdict's re-judgement measured.
+#[test]
+fn r47_three_rounds() {
+    let want: &[(u64, u64, u64, u64, u64)] = &[
+        // (seed, lo, hi, c, frontier)
+        (1066, 20, 21, 21, 21),
+        (6555, 22, 24, 24, 24),
+        (7590, 19, 21, 21, 21),
+    ];
+    for (seed, lo, hi, c, frontier) in want {
+        let rec =
+            e4_recovery::workload::run_seed_with(*seed, None, &e4_recovery::workload::Tuning::BASE);
+        let rr = rec
+            .rounds
+            .first()
+            .expect("the seed must reach round 0 (the pin's subject)");
+        assert!(rr.pass, "seed {seed} r0 must pass under X5-R47");
+        assert_eq!(
+            (rr.lo, rr.hi, rr.c, rr.frontier),
+            (*lo, *hi, Some(*c), *frontier),
+            "seed {seed} r0: (lo, hi, c, frontier)"
+        );
+        if *seed == 6555 {
+            for (ri, r) in rec.rounds.iter().enumerate().skip(1) {
+                assert!(r.pass, "seed 6555 r{ri} continues passing: {r:?}");
+            }
+        }
+    }
+}
+
 /// **X-5c-F3-F3a-F3, the folded follow-up (S, test-only; F3-F3b's step
 /// 0′): X5-R35 (a)'s slicing rule held on a real seed, not only by the
 /// (g) 6 event fixture.** The seed driver runs seed 403 through round 1:
@@ -1868,6 +2237,15 @@ fn x33_damage_maps_through_the_bound_name() {
 /// process-global env var; the stderr side stays behind
 /// `E4_O1_AT_FRONTIER`, default off, and never moves the digest (the
 /// diff runs on a throwaway clone of the recovered world).
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the window collapsed —
+/// every r2 line now prints `lo=38 hi=38 frontier=38 T=35 c=38`
+/// (owner ts 38 > T 35, `le_T=false`, so the `le_T`-from-frontier
+/// mutant is still caught here), because the freed-home release moves
+/// the round's frontier onto its window bound; the clamp literals
+/// moved with it and, with `lo = hi = frontier`, this round no longer
+/// separates `c = lo`/`c = hi` on its own (5549's `c=34 < hi=35` still
+/// catches `c = hi`; see the anomaly note in the card's README record).
 #[test]
 fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
     e4_recovery::harness::o1f_capture_arm();
@@ -1884,17 +2262,17 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
         .find(|l| {
             l.contains("round=2")
                 && l.contains("tree=4")
-                && l.contains("lo=40")
-                && l.contains("hi=41")
-                && l.contains("frontier=41")
-                && l.contains("T=38")
-                && l.contains("c=41")
+                && l.contains("lo=38")
+                && l.contains("hi=38")
+                && l.contains("frontier=38")
+                && l.contains("T=35")
+                && l.contains("c=38")
         })
         .cloned();
     let Some(line) = hit else {
         panic!(
-            "1749 r2: the frontier candidate's line must name lo 40 / hi 41\
-             \n/ frontier 41 / T 38 at c=41 — got {lines:?}"
+            "1749 r2: the frontier candidate's line must name lo 38 / hi 38\
+             \n/ frontier 38 / T 35 at c=38 — got {lines:?}"
         );
     };
     check_le_t_agrees_with_owner_and_t(&line);
@@ -1911,6 +2289,16 @@ fn o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2() {
 /// so `le_T` is false and a `le_T`-from-frontier computation (32 ≤ 32)
 /// breaks the agreement. The twin round's line (frontier 34, `T` 31)
 /// must not satisfy the literal.
+///
+/// **X-5c-F4-F1-F1-F3-F2-F1 (X5-R49, step 2):** the window moved to
+/// `lo=34 hi=35 frontier=34 T=31 c=34` with the newest owner ts 34
+/// above `T` 31 — the freed-home release shifts the replay frontier,
+/// and the round's window slid up by what the twin's used to be. The
+/// clamp still does real work on the hi side (`c=34 < hi=35`, so
+/// FRONTIER-AS-HI prints 35 and fails the `c=34` match), the
+/// `le_T`-from-frontier mutant is still caught (34 > 31), and at this
+/// tip round 2 prints exactly one window (three tree lines), so no
+/// twin line can satisfy the literal either.
 #[test]
 fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
     e4_recovery::harness::o1f_capture_arm();
@@ -1926,31 +2314,31 @@ fn x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2() {
         .iter()
         .filter(|l| {
             l.contains("round=2")
-                && l.contains("lo=30")
-                && l.contains("hi=33")
-                && l.contains("frontier=32")
-                && l.contains("T=29")
-                && l.contains("c=32")
+                && l.contains("lo=34")
+                && l.contains("hi=35")
+                && l.contains("frontier=34")
+                && l.contains("T=31")
+                && l.contains("c=34")
         })
         .cloned()
         .collect();
     assert!(
         !hits.is_empty(),
-        "5549 r2: the real MW round's line must sit at c=32 with frontier 32\
-         \n< hi 33 and T=29 — got {lines:?}"
+        "5549 r2: the real MW round's line must sit at c=34 with frontier 34\
+         \n< hi 35 and T=31 — got {lines:?}"
     );
     // The frontier is strictly inside the candidate window here: the
-    // clamp did real work (FRONTIER-AS-HI prints c=33).
+    // clamp did real work (FRONTIER-AS-HI prints c=35).
     assert!(
-        hits.iter().all(|l| l.contains("c=32 ")),
+        hits.iter().all(|l| l.contains("c=34 ")),
         "every matched line names the clamped candidate: {hits:?}"
     );
-    // The newest owner (32) is above T (29): le_T is false, and the
+    // The newest owner (34) is above T (31): le_T is false, and the
     // agreement check below is what a frontier-computed le_T breaks.
     assert!(
         hits.iter()
-            .any(|l| l.contains("owner_ts=32") && l.contains("le_T=false")),
-        "5549 r2's newest owner (ts 32, above T 29, at the frontier) must\
+            .any(|l| l.contains("owner_ts=34") && l.contains("le_T=false")),
+        "5549 r2's newest owner (ts 34, above T 31, at the frontier) must\
          \nprint le_T=false — got {hits:?}"
     );
     for line in hits.iter() {

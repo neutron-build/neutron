@@ -1,0 +1,38 @@
+--- a/spikes/e4-recovery/src/workload.rs
++++ b/spikes/e4-recovery/src/workload.rs
+@@ -1707,35 +1707,6 @@
+                 cut: ch.cut,
+             });
+         }
+-        // **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b); the directory
+-        // re-seed):** a real MW round whose WAL fault loses a DropTree
+-        // keeps the tree in the real chain's directory while the
+-        // faultless twin's drops it, and the next round's script — built
+-        // from the real model (`build_round(.., &ch.model, ..)`) — then
+-        // writes into a tree the twin's image no longer holds: the
+-        // twin's recovery replays a record into a missing tree and
+-        // fails with `Corrupt("tree N missing in directory")` (verdict
+-        // X-5c-F4-F1-F1-F3-F2-F1, finding 1). That twin no longer runs
+-        // "the same script, crash and F-CRASH resolutions, faultless …
+-        // from the same base" (Work 2.5), so whenever the two chains'
+-        // directory key sets differ at round start it is re-seeded from
+-        // the real round's own start — the same clone the broken-chain
+-        // re-seed above makes. `twin_chain` is `Some` only on MP/MW
+-        // seeds (class C never builds one), which is the ruling's "every
+-        // MP/MW round"; nothing else changes (the twin still runs class
+-        // C, faultless, at the same crash and resolutions, and no record
+-        // field or digest input is added).
+-        if twin_chain
+-            .as_ref()
+-            .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
+-        {
+-            twin_chain = Some(Chain {
+-                disk: ch.disk.clone(),
+-                st: ch.st.clone(),
+-                model: harness::clone_model(&ch.model),
+-                cut: ch.cut,
+-            });
+-        }
+         // The targeted draw of a class C round retries on its own
+         // (no twin exists); keep the round's start for the re-run. The
+         // MP/MW real round needs its own retry too (the twin and real

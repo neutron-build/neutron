@@ -1,0 +1,14 @@
+--- a/spikes/e4-recovery/src/workload.rs
++++ b/spikes/e4-recovery/src/workload.rs
+@@ -1725,10 +1725,7 @@
+         // MP/MW round"; nothing else changes (the twin still runs class
+         // C, faultless, at the same crash and resolutions, and no record
+         // field or digest input is added).
+-        if twin_chain
+-            .as_ref()
+-            .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
+-        {
++        if twin_chain.as_ref().is_some() {
+             twin_chain = Some(Chain {
+                 disk: ch.disk.clone(),
+                 st: ch.st.clone(),

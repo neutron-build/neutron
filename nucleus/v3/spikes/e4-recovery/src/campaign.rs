@@ -36,6 +36,168 @@ pub const CAMPAIGN_SEEDS: u64 = 10_000;
 /// The mutant sweep's seed range (Work 8).
 pub const MUTANT_SEEDS: u64 = 500;
 
+// ---- the judged seed sets (X5-R44–R46, REFRESH 9; card X-5c-F4-F2 step 2) ----
+
+/// **X5-R44 (REFRESH 9; owner decision 2026-11-05, PLAN §10 item 11):
+/// the campaign's tuning ids.** FINAL and `MP_PRESSURE` are equal at
+/// this tip (Limit 2 writes the latter as `Tuning { ..Tuning::FINAL }`),
+/// so only the id can show which tuning a set selects; X-5c-F4-F3's
+/// retune may change that. **M-MP-TUNING** (`mp-pressure` selects
+/// `TuningId::Final`) reverts `tuning_id` and fails its pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuningId {
+    /// `Tuning::FINAL` (the campaign's generator).
+    Final,
+    /// `Tuning::MP_PRESSURE` (the MP-pressure set's own).
+    MpPressure,
+}
+
+/// **X5-R44 (REFRESH 9; owner decision 2026-11-05): the three judged
+/// seed sets.** `Main` is `0..10000`; `HeldOut` is `10000..20000`
+/// ("fresh seeds nobody has triaged"); `MpPressure` is the 2,000 seeds
+/// `s` in `20000..30000` with `s % 10 ∈ {7, 8}` — exactly the MP class
+/// of [`crate::workload::class_of`]. Pure functions only: the seed
+/// lists are literals of the set, never of a run, and read no clock,
+/// environment or state (REFRESH 9: "Untriaged means untouched").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CampaignSet {
+    /// The judged 10k (`0..10000`).
+    Main,
+    /// The held-out 10k (`10000..20000`).
+    HeldOut,
+    /// The MP-pressure 2,000 (`s % 10 ∈ {7, 8}` over `20000..30000`).
+    MpPressure,
+}
+
+impl CampaignSet {
+    /// The set's seeds, ascending. `mp-pressure` is **not a range** —
+    /// a `--seeds` flag with it is always refused.
+    pub fn seeds(&self) -> Vec<u64> {
+        match self {
+            CampaignSet::Main => (0..10_000).collect(),
+            CampaignSet::HeldOut => (10_000..20_000).collect(),
+            CampaignSet::MpPressure => (20_000..30_000)
+                .filter(|s| s % 10 == 7 || s % 10 == 8)
+                .collect(),
+        }
+    }
+
+    /// The set's name — the `--set` value and the file's recorded set.
+    pub fn name(&self) -> &'static str {
+        match self {
+            CampaignSet::Main => "main",
+            CampaignSet::HeldOut => "held-out",
+            CampaignSet::MpPressure => "mp-pressure",
+        }
+    }
+
+    /// The set's tuning id: `MpPressure` for the mp-pressure set only.
+    pub fn tuning_id(&self) -> TuningId {
+        match self {
+            CampaignSet::MpPressure => TuningId::MpPressure,
+            CampaignSet::Main | CampaignSet::HeldOut => TuningId::Final,
+        }
+    }
+
+    /// The set's tuning — matched on the id, never on the set, so the
+    /// equal-at-this-tip constants cannot hide a wrong selection.
+    pub fn tuning(&self) -> &'static workload::Tuning {
+        match self.tuning_id() {
+            TuningId::Final => &workload::Tuning::FINAL,
+            TuningId::MpPressure => &workload::Tuning::MP_PRESSURE,
+        }
+    }
+
+    /// Parse a `--set` (or recorded) name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "main" => Some(CampaignSet::Main),
+            "held-out" => Some(CampaignSet::HeldOut),
+            "mp-pressure" => Some(CampaignSet::MpPressure),
+            _ => None,
+        }
+    }
+}
+
+/// **REFRESH 9 (card step 2): the MP-pressure probe seeds** — exactly
+/// the 200 MP-class seeds of `30000..31000` (`s % 10 ∈ {7, 8}`). The
+/// `--probe mp-pressure` form is the one route to the `MP_PRESSURE`
+/// tuning outside the judged set; `--set` cannot reach it, so this is
+/// the minimum that makes REFRESH 9's probes possible. Never run by
+/// this card (the probe range `30000..31000` is outside the seeds a
+/// card may run).
+pub fn probe_mp_seeds() -> Vec<u64> {
+    (30_000..31_000)
+        .filter(|s| s % 10 == 7 || s % 10 == 8)
+        .collect()
+}
+
+/// **X5-R45 (REFRESH 9; card step 2): the per-set exit rows**, one pure
+/// function of `(set, row id)`. `main`: every 5.6 row and every X5-R39
+/// row except `SZC-MP`, plus Q4-I (`SIZING` is per-seed reporting,
+/// never an exit row — X5-R39). `held-out`: none. `mp-pressure`:
+/// `SZC-MP` only. A row that is not an exit row prints as
+/// `INFO <id> … achieved <n> required <n> INFO`; an exit row keeps the
+/// `QUOTA <id> … achieved <n> required <n> MET|MISSED` form, because
+/// X-5c-F4's bars line reads it. **M-MP-MAINEXIT** (`SZC-MP` exits in
+/// `main`) and **M-MP-NOEXIT** (`SZC-MP` never exits in `mp-pressure`)
+/// revert the two arms and fail their pins; **M-HELD-QUOTA** (held-out
+/// exits on a quota) reverts the `HeldOut` arm.
+pub fn is_exit_row(set: CampaignSet, id: &str) -> bool {
+    match set {
+        CampaignSet::Main => id != "SIZING" && id != "SZC-MP",
+        CampaignSet::HeldOut => false,
+        CampaignSet::MpPressure => id == "SZC-MP",
+    }
+}
+
+/// **X5-R45: the recorded-set check, pure** — `verify` re-runs the
+/// seeds of the set its `--set` names, and a file whose recorded set
+/// differs, or that records none (a probe file, an older file, a
+/// `.partial`), is refused (exit 2). **M-SET-MISMATCH** (`verify`
+/// ignores the file's set) reverts this and fails its pin.
+pub fn verify_recorded_set_ok(recorded: Option<&str>, want: CampaignSet) -> bool {
+    recorded == Some(want.name())
+}
+
+/// **X5-R45: the seed-set check per set, pure** — exactly the set's own
+/// seeds, ascending, nothing missing, nothing extra, no wrong class (a
+/// seed outside the set — one short, one over, or a non-MP-class seed
+/// in `mp-pressure` — breaks the equality). **M-MP-CLASS** (the set
+/// takes every seed in the range) and **M-HELD-RANGE** (held-out
+/// accepts `0..10000`) mutate the sets' own seed lists and fail their
+/// pins.
+pub fn verify_seed_set_for(set: CampaignSet, recs: &[SeedRec]) -> bool {
+    let want = set.seeds();
+    recs.len() == want.len() && recs.iter().zip(want.iter()).all(|(r, s)| r.seed == *s)
+}
+
+/// **X5-R46 (REFRESH 9; card step 2): the MP refusal rate** — printed
+/// once per `verify`, class MP only: `MP_REFUSAL rounds=<n>
+/// refused=<n> rate=<r>` over the file's MP-class rounds and their
+/// `rfs` flags, `rate` as `refused/rounds` to four decimals. Reported
+/// and **never an exit input**. **M-REFUSAL-ALL** (every class counted)
+/// reverts the class filter and fails its pin.
+pub fn mp_refusal_line(recs: &[SeedRec]) -> String {
+    let rounds = recs
+        .iter()
+        .filter(|r| r.class == "MP")
+        .flat_map(|r| r.rounds.iter())
+        .count() as u64;
+    let refused = recs
+        .iter()
+        .filter(|r| r.class == "MP")
+        .flat_map(|r| r.rounds.iter())
+        .filter(|x| x.rfs)
+        .count() as u64;
+    let rate = if rounds > 0 {
+        refused as f64 / rounds as f64
+    } else {
+        0.0
+    };
+    format!("MP_REFUSAL rounds={rounds} refused={refused} rate={rate:.4}")
+}
+
 // ---- the entry point ----
 
 /// The binary entry point. Returns the process exit code.
@@ -48,6 +210,7 @@ pub fn main(args: &[String]) -> i32 {
         "run" => cmd_run(&args[1..]),
         "verify" => cmd_verify(&args[1..]),
         "mutants" => cmd_mutants(&args[1..]),
+        "seeded-faults" => cmd_seeded_faults(&args[1..]),
         "--help" | "-h" | "help" => {
             usage();
             0
@@ -62,10 +225,13 @@ pub fn main(args: &[String]) -> i32 {
 
 fn usage() {
     eprintln!(
-        "usage: e4-campaign run --seeds A..B --threads N --out results/campaign.json\n\
-         \x20      e4-campaign verify --results results/campaign.json [--threads N]\n\
+        "usage: e4-campaign run [--set main|held-out|mp-pressure] [--threads N] --out results/campaign.json\n\
+         \x20      e4-campaign run --seeds A..B --threads N --out results/campaign.json   (a probe: below 10000 only)\n\
+         \x20      e4-campaign run --probe mp-pressure --threads N --out results/campaign.json\n\
+         \x20      e4-campaign verify [--set main|held-out|mp-pressure] --results results/campaign.json [--threads N]\n\
          \x20      e4-campaign mutants --seeds A..B --out results/mutants.json\n\
-         \x20      e4-campaign mutants --check results/mutants.json"
+         \x20      e4-campaign mutants --check results/mutants.json\n\
+         \x20      e4-campaign seeded-faults --seeds A..B --threads N --out results/seeded.json"
     );
 }
 
@@ -88,6 +254,150 @@ fn parse_seeds(args: &[String], default: u64) -> (u64, u64) {
         i += 1;
     }
     (lo, hi)
+}
+
+/// **Card X-5c-PINS-2 item 6 (verdict `9f96f31e` finding 3, Follow-ups
+/// F3): parse `--seeds A..B` when the flag is present, refusing a
+/// malformed value.** `Ok(None)` when absent (the forms' dispatch needs
+/// the distinction: a `run` with neither `--seeds` nor `--set` means
+/// `main`, never a default range); `Ok(Some((lo, hi)))` when the value
+/// reads `A..B` with both halves non-negative integers; `Err` — exit 2
+/// at the command level, before anything runs, exactly like
+/// [`run_form`]'s refusals — when it does not (`--seeds 5`,
+/// `--seeds abc`, `--seeds a..b` all refuse). The old reader skipped a
+/// value with no `..`, so `run --seeds 5` silently became a full
+/// `main` run and `--set mp-pressure --seeds 5` was accepted despite
+/// "always refused"; **M-SEEDS-SKIPPED** reverts to that skip and fails
+/// the pure pin. [`parse_seeds`] (the sweep/mutants default parser) and
+/// `verify`'s parsing do not change. Pub for the card's pure pin.
+pub fn parse_seeds_opt(args: &[String]) -> Result<Option<(u64, u64)>, String> {
+    let mut i = 0usize;
+    while i + 1 < args.len() {
+        if args[i] == "--seeds" {
+            let v = &args[i + 1];
+            let bad = || {
+                format!(
+                    "--seeds {v:?} is not a range: it must read A..B \
+                     (both halves non-negative integers)"
+                )
+            };
+            let (a, b) = v.split_once("..").ok_or_else(bad)?;
+            let lo = a.parse::<u64>().map_err(|_| bad())?;
+            let hi = b.parse::<u64>().map_err(|_| bad())?;
+            return Ok(Some((lo, hi)));
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+/// **Card step 2:** parse a value flag (`--set <name>`,
+/// `--probe <name>`); the flag's value, or `None` when absent.
+fn parse_flag(args: &[String], flag: &str) -> Option<String> {
+    let mut i = 0usize;
+    while i + 1 < args.len() {
+        if args[i] == flag {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// **Card step 2 (REFRESH 9): the `run` command's form.** A judged set
+/// (`--set <name>`, or neither flag — `main`; the set is recorded in
+/// the file), a probe range (`--seeds A..B` without `--set`: records no
+/// set, runs FINAL, refused at any range reaching 10000 or above), or
+/// the MP-pressure probe (`--probe mp-pressure`: the 200 MP-class seeds
+/// of `30000..31000` under `Tuning::MP_PRESSURE`, records no set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunForm {
+    /// A judged set (records the set; prints the census, never
+    /// `PROBE_QUOTA`).
+    Set(CampaignSet),
+    /// A probe range `lo..hi` (records no set; prints `PROBE_QUOTA`).
+    ProbeRange(u64, u64),
+    /// The MP-pressure probe (records no set; prints `PROBE_QUOTA`).
+    ProbeMp,
+}
+
+/// **Card step 2:** decide the `run` form from the flags, pure. `Err`
+/// carries the refusal text (exit 2 at the command level, before
+/// anything runs): an unknown `--set`/`--probe` name; `--set` with a
+/// `--seeds` that differs from the set's own range (`mp-pressure` is
+/// not a range, so `--seeds` with it is always refused); a probe range
+/// that is empty or reaches 10000 or above (**M-PROBE-RANGE** reverts
+/// the bound); and `--probe` together with `--set` or `--seeds`.
+pub fn run_form(
+    set_flag: Option<&str>,
+    probe_flag: Option<&str>,
+    seeds_flag: Option<(u64, u64)>,
+) -> Result<RunForm, String> {
+    if let Some(probe) = probe_flag {
+        if probe != "mp-pressure" {
+            return Err(format!("unknown --probe {probe:?} (only mp-pressure)"));
+        }
+        if set_flag.is_some() {
+            return Err("--probe cannot be combined with --set".to_owned());
+        }
+        if seeds_flag.is_some() {
+            return Err("--probe cannot be combined with --seeds".to_owned());
+        }
+        return Ok(RunForm::ProbeMp);
+    }
+    if let Some(name) = set_flag {
+        let Some(set) = CampaignSet::from_name(name) else {
+            return Err(format!(
+                "unknown --set {name:?} (main, held-out or mp-pressure)"
+            ));
+        };
+        if let Some((lo, hi)) = seeds_flag {
+            let (wlo, whi) = match set {
+                CampaignSet::Main => (0, 10_000u64),
+                CampaignSet::HeldOut => (10_000, 20_000),
+                // mp-pressure is not a range: --seeds with it is always
+                // refused.
+                CampaignSet::MpPressure => (u64::MAX, u64::MAX),
+            };
+            if (lo, hi) != (wlo, whi) {
+                return Err(if set == CampaignSet::MpPressure {
+                    format!("--set mp-pressure is not a range: it cannot take --seeds {lo}..{hi}")
+                } else {
+                    format!(
+                        "--set {name} cannot take --seeds {lo}..{hi} \
+                         (the set is {wlo}..{whi})"
+                    )
+                });
+            }
+        }
+        return Ok(RunForm::Set(set));
+    }
+    if let Some((lo, hi)) = seeds_flag {
+        if lo >= hi {
+            return Err(format!("empty seed range {lo}..{hi}"));
+        }
+        if hi >= CAMPAIGN_SEEDS {
+            return Err(format!(
+                "the probe range {lo}..{hi} reaches {CAMPAIGN_SEEDS} or above: \
+                 judged seeds run only under --set"
+            ));
+        }
+        return Ok(RunForm::ProbeRange(lo, hi));
+    }
+    // Neither flag: `main`.
+    Ok(RunForm::Set(CampaignSet::Main))
+}
+
+/// **Card step 2:** the set a form records in its file — `Some` for a
+/// `--set` run, `None` for both probe forms (a probe file records no
+/// set, so `verify` refuses it; **M-PROBE-SET-NAME**, the probe form
+/// records a set, reverts this and fails its pin). Pure, so the rule
+/// is pinnable without running a probe.
+pub fn run_form_set(form: RunForm) -> Option<CampaignSet> {
+    match form {
+        RunForm::Set(set) => Some(set),
+        RunForm::ProbeRange(..) | RunForm::ProbeMp => None,
+    }
 }
 
 /// The seed count of a half-open range `lo..hi` (X5-R13 (d)'s pin:
@@ -371,20 +681,48 @@ fn cmd_run(args: &[String]) -> i32 {
         eprintln!("e4-campaign run: --out is required");
         return 2;
     };
-    let (lo, hi) = parse_seeds(args, CAMPAIGN_SEEDS);
+    // **Card X-5c-F4-F2 step 2 (REFRESH 9): the run forms.** `--set`
+    // determines the seeds and the tuning and records the set in the
+    // file; the probe forms record no set. Every refusal (exit 2) is
+    // decided by [`run_form`] before anything runs — and, card
+    // X-5c-PINS-2 item 6, a malformed `--seeds` value refuses one step
+    // earlier still, so no `run` form can fall through to a run.
+    let seeds_flag = match parse_seeds_opt(args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("e4-campaign run: {e}");
+            return 2;
+        }
+    };
+    let form = match run_form(
+        parse_flag(args, "--set").as_deref(),
+        parse_flag(args, "--probe").as_deref(),
+        seeds_flag,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("e4-campaign run: {e}");
+            return 2;
+        }
+    };
     let threads = parse_threads(args);
-    // X5-R13 (d): the range is half-open; `5..5` is empty, an error.
-    if lo >= hi {
-        eprintln!("e4-campaign run: empty seed range {lo}..{hi}");
-        return 2;
-    }
+    // The form's seed list and tuning (a probe range runs FINAL through
+    // the unchanged range dispatch; the set and mp-probe forms go
+    // through the list dispatch under the set's own tuning). The set
+    // of record comes from [`run_form_set`] (a probe records none).
+    let set_of_record = run_form_set(form);
+    let (seeds, tuning): (Vec<u64>, &'static workload::Tuning) = match form {
+        RunForm::Set(set) => (set.seeds(), set.tuning()),
+        RunForm::ProbeRange(lo, hi) => ((lo..hi).collect(), &workload::Tuning::FINAL),
+        RunForm::ProbeMp => (probe_mp_seeds(), &workload::Tuning::MP_PRESSURE),
+    };
     // X5-R13 (c): the watchdog rides with the run — on a trip it stops
     // dispatch, writes the completed records to `<out>.partial`, prints
     // the abort line and exits 3, so this function never reaches its own
     // writes. `WatchRetire` retires it the moment the run completes
     // normally (a last-instant sample may not abort a finished run).
     let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
-    let dispatch = std::sync::Arc::new(Dispatch::new(seed_count(lo, hi)));
+    let dispatch = std::sync::Arc::new(Dispatch::new(seeds.len() as u64));
     let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::new(PartialSink::Seeds {
@@ -396,17 +734,79 @@ fn cmd_run(args: &[String]) -> i32 {
         std::sync::Arc::clone(&dispatch),
         Some(sink),
     );
-    run_range_into(&shared, lo, hi, None, threads, Some((&watch, &dispatch)));
+    if let RunForm::ProbeRange(lo, hi) = form {
+        // The range form's dispatch does not change.
+        run_range_into(&shared, lo, hi, None, threads, Some((&watch, &dispatch)));
+    } else {
+        run_list_into(&shared, &seeds, tuning, threads, Some((&watch, &dispatch)));
+    }
     let _retire = WatchRetire(std::sync::Arc::clone(&watch));
     let mut recs = shared.lock().map(|m| m.clone()).unwrap_or_default();
     recs.sort_unstable_by_key(|r| r.seed);
-    let json = emit_campaign(&recs);
+    let json = emit_campaign_for(&recs, set_of_record.as_ref());
     if let Err(e) = std::fs::write(&out, json) {
         eprintln!("e4-campaign run: cannot write {out}: {e}");
         return 2;
     }
+    // **Card step 2:** both probe forms print one `PROBE_QUOTA <id>
+    // <achieved>` line per `quotas()` row and one for Q4-I, from the
+    // same `quotas()` and `q4i_count` `verify` uses, so a probe cannot
+    // count differently; they print no census, and the set form prints
+    // no `PROBE_QUOTA`.
+    if matches!(form, RunForm::ProbeRange(..) | RunForm::ProbeMp) {
+        let rows = workload::quotas(&recs, recs.len() as u64);
+        for row in &rows {
+            println!("PROBE_QUOTA {} {}", row.id, row.achieved);
+        }
+        println!("PROBE_QUOTA Q4-I {}", q4i_count(&recs));
+    }
+    // **Card step 3 (P ruling G5-CENSUS (c)): the census line** — one
+    // stdout line per `--set` run, immediately before the final
+    // `E4 SEEDS=` line, computed in memory from the `SeedRec`s this
+    // process executed. It changes no exit rule, and the two census
+    // fields stay unserialized and never digest inputs.
+    if let Some(set) = set_of_record {
+        println!("{}", joint_arm_census_line(set, &recs));
+    }
     print_final_line(&recs);
     0
+}
+
+/// **P ruling G5-CENSUS (c), in `cmd_run` (card X-5c-F4-F2 step 3): the
+/// `JOINT_ARM_CENSUS` line** — `seeds` counts the records this process
+/// executed, `arm_rounds` counts true entries of `twin_joint_arm`,
+/// `stale_reads` sums `twin_joint_stale_reads`, and `arm_seeds` is
+/// ascending, comma-separated and empty as `[]`. Pure in
+/// `(set, &[SeedRec])`; it changes no exit rule, and the two census
+/// fields stay unserialized and never digest inputs (X-5c-PINS-1's
+/// Limit: G5-CENSUS (d)'s Acceptance line greps this exact form).
+pub fn joint_arm_census_line(set: CampaignSet, recs: &[SeedRec]) -> String {
+    let seeds = recs.len() as u64;
+    let arm_rounds = recs
+        .iter()
+        .flat_map(|r| r.twin_joint_arm.iter())
+        .filter(|x| **x)
+        .count() as u64;
+    let stale_reads = recs
+        .iter()
+        .flat_map(|r| r.twin_joint_stale_reads.iter())
+        .sum::<usize>() as u64;
+    let mut arm_seeds: Vec<u64> = recs
+        .iter()
+        .filter(|r| r.twin_joint_arm.iter().any(|x| *x))
+        .map(|r| r.seed)
+        .collect();
+    arm_seeds.sort_unstable();
+    let list = arm_seeds
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "JOINT_ARM_CENSUS set={} seeds={seeds} arm_rounds={arm_rounds} \
+         stale_reads={stale_reads} arm_seeds=[{list}]",
+        set.name()
+    )
 }
 
 /// Retires a watchdog on drop (the command's own writes are about to
@@ -437,6 +837,9 @@ pub fn run_range(lo: u64, hi: u64, mutant: Option<Mutant>, threads: usize) -> Ve
 /// stops dispatch — no worker takes a new seed; the abort itself is the
 /// watchdog's). Progress lines print every 500 completions with the
 /// latest RSS sample, `rss=<MiB>`.
+///
+/// Card X-5c-F4-F2 step 2: this range form's dispatch does not change —
+/// the set and probe forms go through [`run_list_into`].
 pub fn run_range_into(
     shared: &std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>>,
     lo: u64,
@@ -496,6 +899,58 @@ pub fn livelock_seeds(recs: &[SeedRec]) -> u64 {
     recs.iter()
         .filter(|r| r.rounds.iter().any(|x| x.livelock))
         .count() as u64
+}
+
+/// **Card X-5c-F4-F2 step 2 (REFRESH 9): the set/probe dispatch loop** —
+/// a seed **list** under an explicit tuning (the set's own; the tuned
+/// seed runner is [`workload::run_seed_with`], X5-R37). The same
+/// watchdog, dispatch and progress-line discipline as
+/// [`run_range_into`]; the range form's dispatch does not change.
+pub fn run_list_into(
+    shared: &std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>>,
+    seeds: &[u64],
+    tun: &workload::Tuning,
+    threads: usize,
+    watch: Option<(&Watch, &Dispatch)>,
+) {
+    let next = AtomicU64::new(0);
+    let done = AtomicU64::new(0);
+    let total = seeds.len() as u64;
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    if let Some((w, _)) = watch
+                        && w.stop()
+                    {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(&s) = seeds.get(i as usize) else {
+                        break;
+                    };
+                    if let Some((_, d)) = watch {
+                        d.taken.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let rec = workload::run_seed_with(s, None, tun);
+                    if let Ok(mut o) = shared.lock() {
+                        o.push(rec);
+                    }
+                    let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some((_, disp)) = watch {
+                        disp.done.store(d, Ordering::SeqCst);
+                    }
+                    if d.is_multiple_of(500) {
+                        let rss = match watch {
+                            Some((w, _)) if w.rss() > 0 => w.rss(),
+                            _ => rss_mib().unwrap_or(0),
+                        };
+                        eprintln!("e4-campaign: {d}/{total} seeds done rss={rss}");
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// **X5-R15 (a) (P ruling nv3-X-5c-esc-3): the pass-fold line.** Its
@@ -584,25 +1039,86 @@ fn print_final_line(recs: &[SeedRec]) {
 // ---- verify ----
 
 /// X5-R15 (b): the seed-set check, pure — exactly `0..CAMPAIGN_SEEDS-1`
-/// in order, nothing missing, nothing extra.
+/// in order, nothing missing, nothing extra. The per-set form is
+/// [`verify_seed_set_for`] (card X-5c-F4-F2 step 2); this is `main`'s.
 pub fn verify_seed_set_ok(recs: &[SeedRec]) -> bool {
-    recs.len() == CAMPAIGN_SEEDS as usize
-        && recs.first().map(|r| r.seed) == Some(0)
-        && recs.last().map(|r| r.seed) == Some(CAMPAIGN_SEEDS - 1)
-        && !recs.windows(2).any(|w| w[0].seed + 1 != w[1].seed)
+    verify_seed_set_for(CampaignSet::Main, recs)
 }
 
 /// X5-R15 (b): the digest comparison, pure — the count and the list of
 /// non-reproducing seeds (the report prints the list; the re-run itself
 /// is the command's job).
+///
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6):** a seed also counts as
+/// non-reproducing when any of its rounds' `q4i` differs between the
+/// file and the re-run — `q4i` stays out of the digest (X5-R37's BASE
+/// literals must not move), so the file-versus-re-run comparison is its
+/// only guard (M-Q4I-NOREPRO removes it).
+///
+/// **X5-R39 (card X-5c-F4-F2 step 1):** `szq` and `szi` join the same
+/// comparison, for the same reason (never digest inputs; a mismatch
+/// counts that seed as non-reproducing — M-SZ-NOREPRO removes it).
+/// **X5-R46 (step 2):** `rfs` joins them (the same rule, the same
+/// reason).
 pub fn verify_digest_report(recs: &[SeedRec], rerun: &[SeedRec]) -> (u64, Vec<u64>) {
     let mut bad_list = Vec::new();
     for (a, b) in recs.iter().zip(rerun.iter()) {
-        if a.seed != b.seed || a.digest != b.digest {
+        let nondigest_differs = a.rounds.len() != b.rounds.len()
+            || a.rounds
+                .iter()
+                .zip(b.rounds.iter())
+                .any(|(x, y)| x.q4i != y.q4i || x.szq != y.szq || x.szi != y.szi || x.rfs != y.rfs);
+        if a.seed != b.seed || a.digest != b.digest || nondigest_differs {
             bad_list.push(a.seed);
         }
     }
     (bad_list.len() as u64, bad_list)
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row's floor** —
+/// owner decision of 2026-11-05 (option A; PLAN §10 item 11): ≥ 1,000
+/// crash rounds whose final recovery opens an image whose own window
+/// held an LPID freed after that image's flip and reused before its
+/// table froze. The row counts `q4i` over the campaign's whole 10k.
+pub const Q4I_REQUIRED: u64 = 1_000;
+
+/// **X5-R42:** the Q4-I achieved count over the records — the rounds
+/// whose `q4i` holds.
+pub fn q4i_count(recs: &[SeedRec]) -> u64 {
+    recs.iter()
+        .flat_map(|r| r.rounds.iter())
+        .filter(|x| x.q4i)
+        .count() as u64
+}
+
+/// **X5-R42:** the row's verdict at `achieved` (M-Q4I-NOFLOOR takes the
+/// minimum to 0).
+pub fn q4i_row_ok(achieved: u64) -> bool {
+    achieved >= Q4I_REQUIRED
+}
+
+/// **X5-R39 (card X-5c-F4-F2 step 1): the quota rows' miss count** —
+/// every row except `SIZING`, whose achieved is the per-seed miss
+/// count. OQ-1's ruling (PLAN §10 item 10) replaced "every seed" with
+/// the coverage quota and kept the per-seed count as reporting only:
+/// "The per-seed count stays reported (option A's `INFO`), and is no
+/// longer an exit input." A per-seed miss with every judged row met
+/// exits 0 (**M-SZ-EXIT**, the SIZING seed miss failing the exit
+/// again, reverts this and fails that pin).
+///
+/// **X5-R45 (step 2):** the count is per set — a row is judged iff
+/// [`is_exit_row`] says so (`held-out` judges no row; `mp-pressure`
+/// judges `SZC-MP` only). `SIZING` is an exit row in no set.
+pub fn verify_quota_missed(set: CampaignSet, rows: &[workload::QuotaRow]) -> u64 {
+    rows.iter()
+        .filter(|row| is_exit_row(set, row.id) && row.achieved < row.required)
+        .count() as u64
+}
+
+/// The recorded-set display for `verify`'s refusal line (`"none"` when
+/// the file records no set).
+fn recorded_display(recorded: &Option<String>) -> String {
+    recorded.clone().unwrap_or_else(|| "none".to_owned())
 }
 
 /// X5-R15 (b): the exit decision, pure and **at the end** — every check
@@ -636,7 +1152,23 @@ fn cmd_verify(args: &[String]) -> i32 {
     // `--no-quotas` checks the seed set and the digests and prints the
     // quota table without failing on it; it exists only for X-5c-F1's
     // Acceptance (X-5c's own keeps plain `verify`).
+    //
+    // **Card X-5c-F4-F2 step 2 (X5-R45):** `--set <name>` (omitted
+    // means `main`) selects the set whose seeds are re-run, under that
+    // set's tuning; the exit rows are per set ([`is_exit_row`]).
     let no_quotas = args.iter().any(|a| a == "--no-quotas");
+    let set = match parse_flag(args, "--set").as_deref() {
+        None => CampaignSet::Main,
+        Some(name) => match CampaignSet::from_name(name) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "e4-campaign verify: unknown --set {name:?} (main, held-out or mp-pressure)"
+                );
+                return 2;
+            }
+        },
+    };
     let Some(path) = parse_results(args) else {
         eprintln!("e4-campaign verify: --results is required");
         return 2;
@@ -646,36 +1178,48 @@ fn cmd_verify(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!(
                 "e4-campaign verify: cannot read {path}: {e}\n\
-                 \x20(no campaign results there yet: run `run --seeds 0..10000 --threads N\n\
+                 \x20(no campaign results there yet: run `run --set main --threads N\n\
                  \x20 --out <path>` first; see the crate README)"
             );
             return 2;
         }
     };
-    let recs = match parse_campaign(&text) {
+    let (recorded_set, recs) = match parse_campaign_with_set(&text) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("e4-campaign verify: {path} does not parse: {e}");
             return 2;
         }
     };
+    // X5-R45: a file whose recorded set differs, or that records none,
+    // is refused (exit 2) — before anything re-runs.
+    if !verify_recorded_set_ok(recorded_set.as_deref(), set) {
+        eprintln!(
+            "e4-campaign verify: {path} records set {:?}, not {:?} (or no set): \
+             refusing (each set is re-run under its own seeds and tuning)",
+            recorded_display(&recorded_set),
+            set.name()
+        );
+        return 2;
+    }
     // X5-R15 (b): the exit code is decided once, at the end, after all
     // three checks have been reported (see `verify_exit_code` below).
-    // 1. The seed set is exactly the campaign's (0..9999).
+    // 1. The seed set is exactly the set's (X5-R45: per set).
     let n = recs.len();
-    let seed_set_ok = verify_seed_set_ok(&recs);
+    let seed_set_ok = verify_seed_set_for(set, &recs);
     if !seed_set_ok {
         eprintln!(
-            "e4-campaign verify: the seed set is not exactly 0..{} ({} records)",
-            CAMPAIGN_SEEDS - 1,
+            "e4-campaign verify: the seed set is not exactly {}'s ({} records)",
+            set.name(),
             n
         );
     }
-    // 2. The digests reproduce. A re-run of every seed in the file.
-    // X5-R13 (b) bounds the workers at 16 and digests are independent
-    // of the thread count (pinned), so the re-run defaults to 16: at
-    // the card's 10,000 seeds a 4-thread re-run would not fit a
-    // 60-minute command budget.
+    // 2. The digests reproduce. A re-run of every seed in the file,
+    // under the set's own tuning (X5-R45) — the tuned seed runner is
+    // `run_seed_with`. X5-R13 (b) bounds the workers at 16 and digests
+    // are independent of the thread count (pinned), so the re-run
+    // defaults to 16: at the card's 10,000 seeds a 4-thread re-run
+    // would not fit a 60-minute command budget.
     let threads = parse_threads(args).max(16);
     let rss = rss_mib().unwrap_or(0);
     eprintln!("e4-campaign verify: re-running {n} seeds at {threads} threads rss={rss}");
@@ -684,7 +1228,8 @@ fn cmd_verify(args: &[String]) -> i32 {
     // the record-writing commands; a trip still stops dispatch, prints
     // the abort line and exits 3).
     let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
-    let dispatch = std::sync::Arc::new(Dispatch::new(CAMPAIGN_SEEDS));
+    let set_seeds = set.seeds();
+    let dispatch = std::sync::Arc::new(Dispatch::new(set_seeds.len() as u64));
     let _wd = start_watchdog(
         std::sync::Arc::clone(&watch),
         std::sync::Arc::clone(&dispatch),
@@ -692,11 +1237,10 @@ fn cmd_verify(args: &[String]) -> i32 {
     );
     let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    run_range_into(
+    run_list_into(
         &shared,
-        0,
-        CAMPAIGN_SEEDS,
-        None,
+        &set_seeds,
+        set.tuning(),
         threads,
         Some((&watch, &dispatch)),
     );
@@ -724,28 +1268,56 @@ fn cmd_verify(args: &[String]) -> i32 {
             }
         );
     }
-    // 3. Every 5.6 quota is met (and Work 5.3's sizing assertion holds:
-    // its row's achieved counts **misses**, which must be zero). The
-    // table always prints; with `--no-quotas` a miss is reported but
-    // does not fail the exit.
-    let rows = workload::quotas(&recs, CAMPAIGN_SEEDS);
-    let mut missed = 0u64;
+    // 3. The quota table, judged per set (X5-R45): an exit row prints
+    // the `QUOTA … MET|MISSED` form and counts toward `missed`; a row
+    // that is not an exit row prints
+    // `INFO <id> … achieved <n> required <n> INFO` and never counts.
+    // With `--no-quotas` a miss is reported but does not fail the exit.
+    let rows = workload::quotas(&recs, set_seeds.len() as u64);
     for row in &rows {
-        let ok = if row.id == "SIZING" {
-            row.achieved == 0
+        if is_exit_row(set, row.id) {
+            let ok = row.achieved >= row.required;
+            println!(
+                "QUOTA {} {:<62} achieved {:>6} required {:>6} {}",
+                row.id,
+                row.what,
+                row.achieved,
+                row.required,
+                if ok { "MET" } else { "MISSED" }
+            );
         } else {
-            row.achieved >= row.required
-        };
-        println!(
-            "QUOTA {} {:<62} achieved {:>6} required {:>6} {}",
-            row.id,
-            row.what,
-            row.achieved,
-            row.required,
-            if ok { "MET" } else { "MISSED" }
-        );
-        if !ok {
-            missed += 1;
+            println!(
+                "INFO {} {:<62} achieved {:>6} required {:>6} INFO",
+                row.id, row.what, row.achieved, row.required
+            );
+        }
+    }
+    let mut missed = verify_quota_missed(set, &rows);
+    // **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row** — the
+    // owner's option A, judged like every exit row (a miss fails the
+    // exit; `--no-quotas` keeps its exemption). An exit row in `main`
+    // only (X5-R45); printed after the 5.6 table; its achieved count is
+    // the file's own (the re-run's q4i already guarded reproduction
+    // above).
+    {
+        let achieved = q4i_count(&recs);
+        let ok = q4i_row_ok(achieved);
+        if is_exit_row(set, "Q4-I") {
+            println!(
+                "QUOTA Q4-I {:<62} achieved {:>6} required {:>6} {}",
+                "crash rounds whose opened image's window held a reuse",
+                achieved,
+                Q4I_REQUIRED,
+                if ok { "MET" } else { "MISSED" }
+            );
+            if !ok {
+                missed += 1;
+            }
+        } else {
+            println!(
+                "INFO Q4-I {:<62} achieved {:>6} required {:>6} INFO",
+                "crash rounds whose opened image's window held a reuse", achieved, Q4I_REQUIRED
+            );
         }
     }
     // **SIZING-C (card X-5c-F4-F1 step 4; ESCALATE 2): one INFO line,
@@ -765,6 +1337,58 @@ fn cmd_verify(args: &[String]) -> i32 {
             by_class[0].1, by_class[1].1, by_class[2].1
         );
     }
+    // **X5-R39 (step 1): `INFO` diagnostics only, never exit inputs.**
+    // `szi` per class and per hook (the interrupted-checkpoint floor's
+    // own reading — the crash-cut hook of each counted round; a uniform
+    // round's crash point is no hook, counted as `uniform`), and
+    // poison-end `szq` (REFRESH 6: "Poison ends count as the round's
+    // crash, and F4 reports that count as `INFO`").
+    {
+        let mut by_class = [("C", 0u64), ("MP", 0u64), ("MW", 0u64)];
+        const HOOKS: [&str; 11] = [
+            "Before0", "After0", "After1", "Mid2", "After2", "After3", "After4", "After5", "Mid6",
+            "After6", "uniform",
+        ];
+        let mut by_hook = [0u64; 11];
+        for rec in recs.iter() {
+            if let Some((_, n)) = by_class.iter_mut().find(|(c, _)| *c == rec.class) {
+                *n += rec.rounds.iter().filter(|r| r.szi).count() as u64;
+            }
+            for r in rec.rounds.iter().filter(|r| r.szi) {
+                let h = if r.hook.is_empty() {
+                    "uniform"
+                } else {
+                    r.hook.as_str()
+                };
+                if let Some(i) = HOOKS.iter().position(|x| *x == h) {
+                    by_hook[i] += 1;
+                }
+            }
+        }
+        println!(
+            "INFO SZI crash rounds interrupting the closing checkpoint, by class: C {} MP {} MW {}",
+            by_class[0].1, by_class[1].1, by_class[2].1
+        );
+        let pairs: Vec<String> = HOOKS
+            .iter()
+            .zip(by_hook.iter())
+            .map(|(h, n)| format!("{h}={n}"))
+            .collect();
+        println!("INFO SZI by hook: {}", pairs.join(" "));
+    }
+    {
+        let n = recs
+            .iter()
+            .flat_map(|r| r.rounds.iter())
+            .filter(|r| r.szq && r.crash == "poison")
+            .count() as u64;
+        println!(
+            "INFO SZQ-POISON poison-end crash rounds cutting a >= 4*F interval, recovery opened: {n}"
+        );
+    }
+    // **X5-R46 (step 2): the MP refusal rate** — once per `verify`,
+    // class MP only, reported and never an exit input.
+    println!("{}", mp_refusal_line(&recs));
     if missed > 0 && !no_quotas {
         eprintln!("e4-campaign verify: {missed} quotas missed");
     }
@@ -788,6 +1412,220 @@ fn cmd_verify(args: &[String]) -> i32 {
         println!("VERIFY FAILED seeds={n} (all three checks reported above; exit {exit})");
     }
     exit
+}
+
+// ---- seeded-faults (X5-R43, card X-5c-F4-F1-F1-F3 step 7) ----
+
+/// **X5-R43:** the new failing rounds of a seeded fault's arm — every
+/// `(seed, round)` that fails O-1, O-2 or O-3 in the mutant's arm and
+/// passes in the clean arm. Deadlock, panic and monitor-only hits do
+/// not count (the O-1 text a livelock arm carries is excluded with the
+/// round's own deadlock flag). **M-SEEDED-NOBASELINE** drops the clean
+/// arm's subtraction.
+pub fn seeded_new_failures(clean: &[SeedRec], faulty: &[SeedRec]) -> Vec<(u64, usize)> {
+    let mut out = Vec::new();
+    for (c, f) in clean.iter().zip(faulty.iter()) {
+        if c.seed != f.seed {
+            continue;
+        }
+        for (i, (cr, fr)) in c.rounds.iter().zip(f.rounds.iter()).enumerate() {
+            let fails_oracle = fr.o1_fail.is_some() || fr.o2_fail.is_some() || fr.o3_fail.is_some();
+            // "Passes in the clean arm" is the oracle, not the fold: a
+            // clean round that already carries an O-1/O-2/O-3 text (an
+            // MP detection round, say) is a known failure, and a fault
+            // that changes nothing about it must not count as caught —
+            // the pin's own wording ("the oracle fails on with the
+            // mutant and passes on without it") is the rule.
+            let passes_oracle =
+                cr.o1_fail.is_none() && cr.o2_fail.is_none() && cr.o3_fail.is_none();
+            if fails_oracle && !fr.deadlock && !fr.panic && passes_oracle {
+                out.push((f.seed, i));
+            }
+        }
+    }
+    out
+}
+
+/// **X5-R43:** one arm's table — the new failing rounds, their breakdown
+/// by crash position, by Q4's own split-and-merge predicate and by
+/// `q4i_raw`, and the Caught verdict: **≥ 5 new failing rounds, ≥ 1 of
+/// them with the arm's predicate** (`q4i_raw` for the Joint fault,
+/// `q4_split_merge` for the Slot fault). **M-SEEDED-NOARMRULE** drops
+/// the arm predicate.
+#[derive(Debug, Clone)]
+pub struct SeededTable {
+    /// The arm's name (printed and serialized).
+    pub arm: &'static str,
+    /// The mutant behind the arm.
+    pub mutant: &'static str,
+    /// The new failing `(seed, round)` pairs, in sweep order.
+    pub new_failing: Vec<(u64, usize)>,
+    /// The new failing rounds' crash descriptions, in the same order.
+    pub crashes: Vec<String>,
+    /// How many of them carry Q4's own split-and-merge predicate.
+    pub with_q4sm: u64,
+    /// How many of them carry `q4i_raw`.
+    pub with_q4ir: u64,
+    /// The Caught verdict (≥ 5 new failing rounds and ≥ 1 arm-predicate
+    /// hit).
+    pub caught: bool,
+}
+
+/// Compute one arm's table. `joint` selects the arm predicate:
+/// `q4i_raw` for the Joint fault, `q4_split_merge` for the Slot fault.
+pub fn seeded_faults_table(
+    arm: &'static str,
+    mutant: &'static str,
+    clean: &[SeedRec],
+    faulty: &[SeedRec],
+    joint: bool,
+) -> SeededTable {
+    let new_failing = seeded_new_failures(clean, faulty);
+    let mut crashes = Vec::new();
+    let mut with_q4sm = 0u64;
+    let mut with_q4ir = 0u64;
+    for &(seed, round) in &new_failing {
+        if let Some(fr) = faulty
+            .iter()
+            .find(|r| r.seed == seed)
+            .and_then(|r| r.rounds.get(round))
+        {
+            crashes.push(fr.crash.clone());
+            if fr.q4_split_merge {
+                with_q4sm += 1;
+            }
+            if fr.q4i_raw {
+                with_q4ir += 1;
+            }
+        }
+    }
+    let caught = new_failing.len() as u64 >= 5 && (if joint { with_q4ir } else { with_q4sm } >= 1);
+    SeededTable {
+        arm,
+        mutant,
+        new_failing,
+        crashes,
+        with_q4sm,
+        with_q4ir,
+        caught,
+    }
+}
+
+/// The subcommand's exit: non-zero if either fault is not caught.
+pub fn seeded_exit(joint: &SeededTable, slot: &SeededTable) -> i32 {
+    if joint.caught && slot.caught { 0 } else { 2 }
+}
+
+/// `e4-campaign seeded-faults --seeds A..B --threads N --out F`: run the
+/// range three times at the campaign's tuning (`Tuning::FINAL` — the
+/// share being probed is compiled in and reverted after the probe),
+/// clean and under each seeded fault, then print both tables and write
+/// them to `F`. Exits non-zero if either fault is not caught.
+fn cmd_seeded_faults(args: &[String]) -> i32 {
+    let Some(out) = parse_out(args) else {
+        eprintln!("e4-campaign seeded-faults: --out is required");
+        return 2;
+    };
+    let (lo, hi) = parse_seeds(args, 0);
+    if lo >= hi {
+        eprintln!("e4-campaign seeded-faults: --seeds A..B is required (half-open)");
+        return 2;
+    }
+    let threads = parse_threads(args);
+    let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
+    let dispatch = std::sync::Arc::new(Dispatch::new(seed_count(lo, hi) * 3));
+    let _wd = start_watchdog(
+        std::sync::Arc::clone(&watch),
+        std::sync::Arc::clone(&dispatch),
+        None,
+    );
+    let sweep = |m: Option<Mutant>| -> Vec<SeedRec> {
+        dispatch.taken.store(0, Ordering::SeqCst);
+        dispatch.done.store(0, Ordering::SeqCst);
+        let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_range_into(&shared, lo, hi, m, threads, Some((&watch, &dispatch)));
+        let mut recs = shared.lock().map(|s| s.clone()).unwrap_or_default();
+        recs.sort_unstable_by_key(|r| r.seed);
+        recs
+    };
+    let clean = sweep(None);
+    let joint_recs = sweep(Some(Mutant::ReuseDropsImg));
+    let slot_recs = sweep(Some(Mutant::FreeHomeAlloc));
+    let _retire = WatchRetire(std::sync::Arc::clone(&watch));
+    let joint = seeded_faults_table(
+        "Joint",
+        "M-REUSE-DROPS-IMG (Mutant::ReuseDropsImg)",
+        &clean,
+        &joint_recs,
+        true,
+    );
+    let slot = seeded_faults_table(
+        "Slot",
+        "M-FREE-HOME-ALLOC (Mutant::FreeHomeAlloc)",
+        &clean,
+        &slot_recs,
+        false,
+    );
+    for t in [&joint, &slot] {
+        let mut by_crash: BTreeMap<&str, u64> = BTreeMap::new();
+        for c in t.crashes.iter() {
+            *by_crash.entry(c.as_str()).or_insert(0) += 1;
+        }
+        println!(
+            "SEEDED {:<6} {:<38} new-failing {:>3} (>=5) q4_split_merge {:>3} q4i_raw {:>3} (>=1 arm predicate) {}",
+            t.arm,
+            t.mutant,
+            t.new_failing.len(),
+            t.with_q4sm,
+            t.with_q4ir,
+            if t.caught { "CAUGHT" } else { "NOT CAUGHT" }
+        );
+        let breakdown = if by_crash.is_empty() {
+            "-".to_owned()
+        } else {
+            by_crash
+                .iter()
+                .map(|(k, v)| format!("{k} x{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("SEEDED {:<6} by crash position: {breakdown}", t.arm);
+        let pairs = t
+            .new_failing
+            .iter()
+            .map(|(s, r)| format!("{s}r{r}"))
+            .collect::<Vec<_>>();
+        println!("SEEDED {:<6} rounds: {}", t.arm, pairs.join(" "));
+    }
+    let json = format!(
+        "{{\"e4\":1,\"seeded\":[{}]}}",
+        [&joint, &slot]
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"arm\":{},\"mutant\":{},\"new_failing\":[{}],\"crashes\":{:?},\"with_q4sm\":{},\"with_q4ir\":{},\"caught\":{}}}",
+                    esc(t.arm),
+                    esc(t.mutant),
+                    t.new_failing
+                        .iter()
+                        .map(|(s, r)| format!("{{\"seed\":{s},\"round\":{r}}}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    t.crashes,
+                    t.with_q4sm,
+                    t.with_q4ir,
+                    t.caught
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if let Err(e) = std::fs::write(&out, json) {
+        eprintln!("e4-campaign seeded-faults: cannot write {out}: {e}");
+        return 2;
+    }
+    seeded_exit(&joint, &slot)
 }
 
 // ---- mutants ----
@@ -1151,6 +1989,14 @@ pub mod directed_arms {
         (Mutant::DupDifferentAccepted, "d13_dup"),
         (Mutant::InplaceEvict, "d14_frees"),
         (Mutant::DropRootFirst, "d15_drop_lpid_exact"),
+        (
+            Mutant::ExhaustNoRevalidate,
+            "exhausted_reserve_keeps_both_copies / exhausted_record_stays_out_of_the_next_window",
+        ),
+        (
+            Mutant::DropEntrySplit,
+            "drop_cut_never_names_a_freed_root / drop_cut_never_names_a_reused_root",
+        ),
         (Mutant::RenameNoDirsync, "d9_dropped_rename"),
         (Mutant::TruncateLogicalOnly, "d7_zombie_tail"),
         (Mutant::StartSegmentMissingOk, "d10_start_segment"),
@@ -1386,9 +2232,14 @@ fn esc(s: &str) -> String {
     out
 }
 
-/// Emit the campaign file.
-pub fn emit_campaign(recs: &[SeedRec]) -> String {
-    let mut s = String::from("{\"e4\":1,\"seeds\":[");
+/// Emit the campaign file (card X-5c-F4-F2 step 2: a `--set` run
+/// records its set — `{"e4":1,"set":"main","seeds":[…]}`; a probe file
+/// records none, and `verify` refuses a file that records none).
+pub fn emit_campaign_for(recs: &[SeedRec], set: Option<&CampaignSet>) -> String {
+    let mut s = match set {
+        Some(set) => format!("{{\"e4\":1,\"set\":{},\"seeds\":[", esc(set.name())),
+        None => "{\"e4\":1,\"seeds\":[".to_owned(),
+    };
     for (i, r) in recs.iter().enumerate() {
         if i > 0 {
             s.push(',');
@@ -1410,7 +2261,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"r32\":{},\"skx\":{},\"smx\":{},\"pass_na\":{},\"ack_over\":[{}],\"cover_err\":{},\"x33h\":{},\"x33a\":{},\"x33x\":{},\"reuse\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"cwin\":{},\"szc\":{},\"szq\":{},\"szi\":{},\"rfs\":{},\"q4sp\":{},\"q4mg\":{},\"q4ru\":{},\"imgsp\":{},\"imgmg\":{},\"imgru\":{},\"imgrupf\":{},\"q4ir\":{},\"q4i\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1461,6 +2312,18 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.task_error.is_some(),
                 esc(x.cwin.unwrap_or("u")),
                 u8::from(x.szc),
+                u8::from(x.szq),
+                u8::from(x.szi),
+                u8::from(x.rfs),
+                x.q4sp,
+                x.q4mg,
+                x.q4reuse,
+                x.imgsp,
+                x.imgmg,
+                x.imgreuse,
+                x.imgreuse_pf,
+                u8::from(x.q4i_raw),
+                u8::from(x.q4i),
                 u8::from(x.q4_split_merge),
                 u8::from(x.q5_open),
                 u8::from(x.q5_marked),
@@ -1502,6 +2365,12 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
     }
     s.push_str("]}");
     s
+}
+
+/// Emit the campaign file with no recorded set (the pre-step-2 form:
+/// partials and probes).
+pub fn emit_campaign(recs: &[SeedRec]) -> String {
+    emit_campaign_for(recs, None)
 }
 
 /// Emit the mutants file.
@@ -1737,13 +2606,22 @@ fn utf8_len(b: u8) -> usize {
 /// fields; the other round fields parse into place for the digest
 /// comparison to be meaningful).
 pub fn parse_campaign(text: &str) -> Result<Vec<SeedRec>, String> {
+    Ok(parse_campaign_with_set(text)?.1)
+}
+
+/// **Card X-5c-F4-F2 step 2:** parse a campaign file into its recorded
+/// set (`None` when the file records none — a probe file, an older
+/// file, a `.partial`) and its records.
+pub fn parse_campaign_with_set(text: &str) -> Result<(Option<String>, Vec<SeedRec>), String> {
     let mut j = Jx::new(text);
     j.eat(b'{')?;
     let mut out = Vec::new();
+    let mut set = None;
     loop {
         let k = j.string()?;
         j.eat(b':')?;
         match k.as_str() {
+            "set" => set = Some(j.string()?),
             "seeds" => {
                 j.eat(b'[')?;
                 if j.try_eat(b']') {
@@ -1766,7 +2644,7 @@ pub fn parse_campaign(text: &str) -> Result<Vec<SeedRec>, String> {
         j.eat(b'}')?;
         break;
     }
-    Ok(out)
+    Ok((set, out))
 }
 
 fn parse_seed(j: &mut Jx<'_>) -> Result<SeedRec, String> {
@@ -1910,14 +2788,81 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
                 // SIZING-C (step 4): the crash-cut diagnostic.
                 x.szc = j.int()? != 0;
             }
+            "szq" => {
+                // X5-R39 (card X-5c-F4-F2 step 1): the sizing quota's
+                // per-round predicate. Absent in older files, where it
+                // defaults to 0.
+                x.szq = j.int()? != 0;
+            }
+            "szi" => {
+                // X5-R39: the interrupted-checkpoint floor's per-round
+                // predicate, compared per round between the file and
+                // the re-run by `verify` (a mismatch counts the seed as
+                // non-reproducing), never a digest input.
+                x.szi = j.int()? != 0;
+            }
+            "rfs" => {
+                // X5-R46 (card X-5c-F4-F2 step 2): the refusal flag,
+                // compared per round like `szq`/`szi`. Absent in older
+                // files, where it defaults to 0.
+                x.rfs = j.int()? != 0;
+            }
+            "q4sp" => {
+                // X-5c-F4-F1-F1 step 1: the Q4 halves (splits inside the
+                // crash-time checkpoint window). Absent in older files,
+                // where it defaults to 0.
+                x.q4sp = j.int()?;
+            }
+            "q4mg" => {
+                // The same for merges.
+                x.q4mg = j.int()?;
+            }
+            "q4ru" => {
+                // X5-R41 (X-5c-F4-F1-F1-F3 step 2): the reuse half in
+                // the crash's window. Absent in older files (default 0).
+                x.q4reuse = j.int()?;
+            }
+            "imgsp" => {
+                // X5-R41/R42: the completed-window arm (the last
+                // checkpoint whose step 5 returned).
+                x.imgsp = j.int()?;
+            }
+            "imgmg" => {
+                x.imgmg = j.int()?;
+            }
+            "imgru" => {
+                x.imgreuse = j.int()?;
+            }
+            "imgrupf" => {
+                // X5-R42 (X-5c-F4-F1-F1-F3-F1 step 2a): the same
+                // window's pre-freeze reuses (Q4-I's reading). Absent
+                // in older files (default 0).
+                x.imgreuse_pf = j.int()?;
+            }
+            "q4ir" => {
+                // X5-R42: the opened image's own window held a reuse.
+                x.q4i_raw = j.int()? != 0;
+            }
+            "q4i" => {
+                // X5-R42: the Q4-I row's per-round predicate. Compared
+                // per round between the file and the re-run by `verify`
+                // (a mismatch counts the seed as non-reproducing),
+                // never a digest input.
+                x.q4i = j.int()? != 0;
+            }
             "cwin" => {
                 // X5-R38: the window pick of record ("u" = the plain
-                // uniform point / a targeted round).
+                // uniform point / a targeted round). X5-R56's `w7`/`w7-`
+                // labels read back too (card X-5c-PINS-2 item 2; verdict
+                // `ec9f84a6` §7): display-only — never a digest input,
+                // never a `verify` comparison, never a comparator input.
                 x.cwin = match j.string()?.as_str() {
                     "w11" => Some("w11"),
                     "w12" => Some("w12"),
                     "w11-" => Some("w11-"),
                     "w12-" => Some("w12-"),
+                    "w7" => Some("w7"),
+                    "w7-" => Some("w7-"),
                     _ => None,
                 };
             }
@@ -2231,4 +3176,195 @@ mod tests {
             "run_range(0, 3) runs exactly three seeds"
         );
     }
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): the Q4-I row's floor.**
+/// ≥ 1,000 crash rounds (owner decision of 2026-11-05, option A);
+/// at 999 the row misses, at 1,000 it meets. **M-Q4I-NOFLOOR** (the
+/// minimum goes to 0) reads 999 as met and fails this pin.
+#[test]
+fn x5_r42_row_at_999_and_1000() {
+    assert_eq!(Q4I_REQUIRED, 1_000, "the owner's floor is 1,000");
+    assert!(
+        !q4i_row_ok(999),
+        "999 achieved is a miss (M-Q4I-NOFLOOR reverts this)"
+    );
+    assert!(q4i_row_ok(1_000), "1,000 achieved meets the row");
+    assert!(!q4i_row_ok(0), "an empty campaign misses the row");
+    // The count reads the rounds' q4i flags, nothing else.
+    let recs = vec![SeedRec {
+        seed: 1,
+        rounds: vec![
+            workload::RoundRec {
+                q4i: true,
+                ..workload::RoundRec::default()
+            },
+            workload::RoundRec::default(),
+        ],
+        ..SeedRec::default()
+    }];
+    assert_eq!(q4i_count(&recs), 1);
+}
+
+/// **X5-R42 (step 6): a flipped `q4i` fails reproduction.** Two
+/// records with identical digests whose rounds differ only in
+/// `q4i`: the seed counts as non-reproducing (the field stays out
+/// of the digest, so the file-versus-re-run comparison is its only
+/// guard). **M-Q4I-NOREPRO** (the comparison removed) fails this
+/// pin.
+#[test]
+fn x5_r42_flipped_q4i_fails_reproduction() {
+    let rec = |q4i: bool| SeedRec {
+        seed: 7,
+        digest: 12345,
+        rounds: vec![workload::RoundRec {
+            q4i,
+            ..workload::RoundRec::default()
+        }],
+        ..SeedRec::default()
+    };
+    let same = (rec(true), rec(true));
+    let (bad, _) = verify_digest_report(&[same.0], &[same.1]);
+    assert_eq!(bad, 0, "identical records reproduce");
+    let flipped = (rec(true), rec(false));
+    let (bad, list) = verify_digest_report(&[flipped.0], &[flipped.1]);
+    assert_eq!(
+        bad, 1,
+        "a flipped q4i must count the seed as non-reproducing (M-Q4I-NOREPRO reverts this)"
+    );
+    assert_eq!(list, vec![7]);
+    // A differing round count is a non-reproduction on the same
+    // rule (the zip cannot compare what is not there).
+    let short = (rec(true), SeedRec::default());
+    let (bad, _) = verify_digest_report(&[short.0], &[short.1]);
+    assert_eq!(bad, 1, "a missing round is a non-reproduction");
+}
+
+/// **X5-R43 (card X-5c-F4-F1-F1-F3 step 7): a round failing in both
+/// arms is not new.** A known failure (the clean round already
+/// fails the fold) that the mutant's arm also fails never counts as
+/// a new failing round. **M-SEEDED-NOBASELINE** (the mutant's
+/// failing rounds counted without subtracting the clean arm's)
+/// fails this pin.
+#[test]
+fn x5_r43_known_failures_are_not_new() {
+    let round = |pass: bool, o1: bool| workload::RoundRec {
+        pass,
+        o1_fail: o1.then(|| "O-1(b): scan mismatch".to_owned()),
+        ..workload::RoundRec::default()
+    };
+    let clean = SeedRec {
+        seed: 3,
+        rounds: vec![round(false, true), round(true, false), round(true, false)],
+        ..SeedRec::default()
+    };
+    let faulty = SeedRec {
+        seed: 3,
+        // Round 0 fails in both arms (a known failure); round 1 fails
+        // only in the mutant's arm (new); round 2 is a deadlock hit.
+        rounds: vec![
+            round(false, true),
+            round(false, true),
+            workload::RoundRec {
+                pass: false,
+                deadlock: true,
+                o1_fail: Some("recovery livelock".to_owned()),
+                ..workload::RoundRec::default()
+            },
+        ],
+        ..SeedRec::default()
+    };
+    let nf = seeded_new_failures(std::slice::from_ref(&clean), &[faulty]);
+    assert_eq!(
+        nf,
+        vec![(3, 1)],
+        "only the round that passed the clean arm is new, and a deadlock round never counts \
+         (M-SEEDED-NOBASELINE reverts the first half)"
+    );
+}
+
+/// **X5-R43 (step 7): Caught needs the arm predicate.** Five new
+/// failing rounds with none carrying the arm's predicate
+/// (`q4i_raw` for Joint, `q4_split_merge` for Slot) is **not**
+/// caught; one predicate hit among them is.
+/// **M-SEEDED-NOARMRULE** (the arm predicates dropped) fails this
+/// pin.
+#[test]
+fn x5_r43_caught_needs_the_arm_predicate() {
+    let arm = |q4sm: bool, q4ir: bool| SeedRec {
+        seed: 1,
+        rounds: (0..5)
+            .map(|i| workload::RoundRec {
+                pass: false,
+                o1_fail: Some(format!("O-1 at {i}")),
+                q4_split_merge: q4sm,
+                q4i_raw: q4ir,
+                ..workload::RoundRec::default()
+            })
+            .collect(),
+        ..SeedRec::default()
+    };
+    let clean = SeedRec {
+        seed: 1,
+        rounds: vec![
+            workload::RoundRec {
+                pass: true,
+                ..workload::RoundRec::default()
+            };
+            5
+        ],
+        ..SeedRec::default()
+    };
+    // Five new failures, no predicate hits: not caught on either
+    // arm (M-SEEDED-NOARMRULE reverts this).
+    let no_hit = arm(false, false);
+    let jt = seeded_faults_table(
+        "Joint",
+        "m",
+        std::slice::from_ref(&clean),
+        std::slice::from_ref(&no_hit),
+        true,
+    );
+    assert!(!jt.caught, "Joint needs >=1 new failing round with q4i_raw");
+    let st = seeded_faults_table(
+        "Slot",
+        "m",
+        std::slice::from_ref(&clean),
+        std::slice::from_ref(&no_hit),
+        false,
+    );
+    assert!(
+        !st.caught,
+        "Slot needs >=1 new failing round with q4_split_merge"
+    );
+    // With the predicate hit present, both are caught.
+    let jt_hit = arm(false, true);
+    let jt = seeded_faults_table("Joint", "m", std::slice::from_ref(&clean), &[jt_hit], true);
+    assert!(jt.caught, "Joint caught with a q4i_raw hit beside the five");
+    assert_eq!(jt.with_q4ir, 5);
+    let st_hit = arm(true, false);
+    let st = seeded_faults_table("Slot", "m", std::slice::from_ref(&clean), &[st_hit], false);
+    assert!(st.caught, "Slot caught with a q4_split_merge hit");
+    // And four new failures with a predicate hit is still not
+    // caught: the >=5 floor is its own term.
+    let four = SeedRec {
+        seed: 2,
+        rounds: arm(true, true).rounds.into_iter().take(4).collect(),
+        ..SeedRec::default()
+    };
+    let clean4 = SeedRec {
+        seed: 2,
+        rounds: vec![
+            workload::RoundRec {
+                pass: true,
+                ..workload::RoundRec::default()
+            };
+            4
+        ],
+        ..SeedRec::default()
+    };
+    let st4 = seeded_faults_table("Slot", "m", &[clean4], &[four], false);
+    assert!(!st4.caught, "four new failing rounds miss the >=5 floor");
+    assert_eq!(seeded_exit(&jt, &st), 0, "both caught exits zero");
+    assert_ne!(seeded_exit(&jt, &st4), 0, "an uncaught arm exits non-zero");
 }

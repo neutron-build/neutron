@@ -37,14 +37,22 @@ use crate::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, pr
 /// A read/serve record: `(file, offset, length)`.
 type Reads = Vec<(usize, u64, u64)>;
 
-/// A WAL file's stitched issued writes: offset → latest bytes.
-type FileWrites = BTreeMap<u64, Vec<u8>>;
-
 /// Stream tags (independent splitmix64 derivations per concern).
 const S_SCHED: u64 = 1;
 const S_CRASH: u64 = 4;
 const S_MEDIA: u64 = 5;
 const S_SAMPLE: u64 = 6;
+
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1):** the spin-turn budget of
+/// the checkpointer's window hold and of [`ScriptOp::R41Wait`]'s exit —
+/// a fixed backstop, in deterministic sim-order turns and never wall
+/// clock. The hold normally ends within tens or hundreds of turns (the
+/// alignment block's commits and sweep run to `R41Done` while the
+/// checkpointer spins); the budget only trips when the block can no
+/// longer finish (a failed task — which the hold's own exit set covers —
+/// or a window that never opens for the waiter), and it is far below
+/// `YIELD_BUDGET` so a tripped spin can never masquerade as a livelock.
+const R41_TURNS: u64 = 20_000;
 
 /// One scripted operation of a task (card Work 13, "Workload").
 #[derive(Debug, Clone)]
@@ -83,6 +91,43 @@ pub enum ScriptOp {
     },
     /// Request a checkpoint and wait for it to complete.
     Checkpoint,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+    /// before this card's probes):** arm the checkpointer's window hold
+    /// for checkpoint completion index `idx` — the round's
+    /// `knobs.target_ckpt`, the crash's own checkpoint. Goes at the very
+    /// front of the GC task (before the setup barrier); inert in a round
+    /// that never reaches checkpoint `idx`, and in every unselected
+    /// round (the op is inserted only in a selected round, so no BASE
+    /// schedule moves).
+    R41Arm {
+        /// The checkpoint completion index whose window is held.
+        idx: u64,
+    },
+    /// **X5-R41:** wait until the armed checkpoint's window is held
+    /// open (the checkpointer set the window flag at its `After0`), or
+    /// the workload can no longer open one (the workload done, this the
+    /// last unfinished script task, or the [`R41_TURNS`] budget). A
+    /// spin-yield loop, like the checkpointer's own poll pattern: no
+    /// wait key is woken when the flag is set, so a parked waiter could
+    /// only ever observe the window after the hold released it.
+    /// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a):** the op carries
+    /// the index it pairs with — the armed checkpoint whose window this
+    /// op's alignment block runs in (`knobs.target_ckpt` for block B,
+    /// `target_ckpt − 1` for block A).
+    R41Wait {
+        /// The checkpoint completion index whose window flag is waited
+        /// on.
+        idx: u64,
+    },
+    /// **X5-R41:** the alignment block is complete — releases the
+    /// checkpointer's hold (sticky for the rest of the round, so a
+    /// window that opens late never waits on a block that already
+    /// ran). **X5-R50:** carries the index it pairs with, exactly as
+    /// [`ScriptOp::R41Wait`] does.
+    R41Done {
+        /// The checkpoint completion index whose hold this releases.
+        idx: u64,
+    },
     /// Set a named park point's budget (the D5 split parking).
     Park {
         /// The park point.
@@ -251,9 +296,62 @@ pub struct HarnessState {
     /// the world crashed (the task unwinds inside the walk and never
     /// clears this).
     pub drop_walk: Option<u64>,
+    /// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment): the walk now in
+    /// flight's first crashable yield** — the scheduler's yield count
+    /// `+ 1`, read at `h:dropwalk` when the walk opens. The set runs
+    /// between two yield events, so `current + 1` is the first index a
+    /// `CrashSpec::Yield(k)` can fire on with the walk in flight (the
+    /// same convention as W11/W12's recorded indices). Cleared at
+    /// `h:dropdone`, when the range it spans is folded into
+    /// [`Self::drop_walk_yields`].
+    pub drop_walk_start: Option<u64>,
+    /// **X5-R56:** every scheduler-yield index at which a DropTree walk
+    /// was in flight during this pass — for each walk, the whole range
+    /// from its first crashable yield (`drop_walk_start`) through the
+    /// last yield that fired before `h:dropdone` closed it (the walk
+    /// holds the baton away and back across its gated steps, so yields
+    /// of other tasks inside the range also find it in flight: the flag
+    /// is world-global and only the walking task clears it). A crash at
+    /// any index in the list leaves `drop_walk` set — Q7's observable.
+    /// A diagnostic only, never a digest input and never a quota input;
+    /// the w7 pick's window list (snapshotted into
+    /// [`WorkloadObs::drop_walk_yields`]).
+    pub drop_walk_yields: Vec<u64>,
     /// Card Work 5.6's Q18 observable: a GC sweep ran with a watermark
     /// above the previous `gc_w` while a checkpoint window was open.
     pub gc_adv_in_window: bool,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1) / X5-R50 (card
+    /// X-5c-F4-F1-F1-F3-F1 step 5a): the armed checkpoint indices, at
+    /// most two.** Slot 0 is X5-R41's block B's arm (index
+    /// `knobs.target_ckpt`, the crash's own checkpoint); slot 1 is
+    /// X5-R50's block A's arm (index `target_ckpt − 1`, armed only in
+    /// an eligible selected round at `r41p_share > 0`). [`ScriptOp::R41Arm`]
+    /// fills the first empty slot, so a single-block round uses slot 0
+    /// alone and behaves exactly as at F3; the hold triggers at the
+    /// `After0` of exactly the armed completion index in its slot.
+    pub r41_idx: [Option<u64>; 2],
+    /// **X5-R41/X5-R50:** the per-slot window flags — set when the
+    /// checkpointer's hold begins at that slot's armed checkpoint's
+    /// `After0` (read by [`ScriptOp::R41Wait`]).
+    pub r41_win: [bool; 2],
+    /// **X5-R41/X5-R50:** the per-slot completion flags — that slot's
+    /// alignment block completed ([`ScriptOp::R41Done`]; releases that
+    /// slot's hold, sticky for the round).
+    pub r41_done: [bool; 2],
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-checkpoint
+    /// window ledger** — one `(ckpt_id, splits, merges, reuses,
+    /// pre-freeze reuses)` row per checkpoint whose step 5 returned,
+    /// appended at the checkpointer's `After5` hook (the counters still
+    /// hold that window's counts; the next `ckpt:begin` resets them).
+    /// The fifth element is the pre-freeze reuse count of
+    /// X-5c-F4-F1-F1-F3-F1 step 2a (`ckpt_reuse_pf`), which `q4i_raw`
+    /// reads; the fourth is the whole-window count the Q4 arm keeps.
+    /// The driver carries the rows for the whole seed keyed by
+    /// `ckpt_id`, so a round's final recovery reads the opened image's
+    /// **own** window however far the round rolled back. The harness
+    /// checkpoint's window is never here (it runs through a no-op hook
+    /// closure, in its own world).
+    pub ckpt_windows: Vec<(u64, u64, u64, u64, u64)>,
     /// The last checkpoint hook the checkpointer passed (0 = none): a
     /// small position code for the Q4 window (1 = Before0 … 6 = After3;
     /// 7+ are later hooks). Maintained by the checkpointer's hook
@@ -388,12 +486,42 @@ fn round_failed(cx: &Cx<'_, RoundWorld>) -> Result<bool, Fail> {
 /// `mark_applied` (visible_ts advances in ts order). Chunked
 /// transactions write their chunks first and apply after the marker's
 /// group sync (§12.7). Returns the commit ts.
+///
+/// **E4-R1 (card E4-SILENT-1):** the plain four-argument form carries no
+/// checkpoint dependency; a bulk load's publishing commit goes through
+/// [`commit_txn_req`] with `require_ckpt` set to the durable checkpoint
+/// id read after `wait_ckpt` returned (§12.8 step 3).
 pub fn commit_txn(
     cx: &Cx<'_, RoundWorld>,
     ops: &[Op],
     sync_on: bool,
     chunked: bool,
 ) -> Result<u64, Fail> {
+    commit_txn_req(cx, ops, sync_on, chunked, None)
+}
+
+/// **E4-R1 (card E4-SILENT-1; §12.8 step 3):** [`commit_txn`]'s body
+/// with an optional checkpoint dependency. `require_ckpt = Some(id)`
+/// encodes a `WOp::RequireCkpt{id}` op **before the other ops** of a
+/// non-chunked commit's payload, so recovery (§14 pass 1, after the
+/// coverage check) can refuse a replay of the publication over an image
+/// older than checkpoint `id`. It is a parameter, never shared state: a
+/// shared slot could be taken by another task's commit while the
+/// publisher waits in the critical section. The prototype's publish is
+/// never chunked, so `chunked` with `Some` is refused with
+/// [`Fail::Invalid`] (the `CommitMarker` form is not built).
+pub fn commit_txn_req(
+    cx: &Cx<'_, RoundWorld>,
+    ops: &[Op],
+    sync_on: bool,
+    chunked: bool,
+    require_ckpt: Option<u64>,
+) -> Result<u64, Fail> {
+    if chunked && require_ckpt.is_some() {
+        return Err(Fail::Invalid(
+            "RequireCkpt with a chunked publish: only the Commit form is built (E4-R1)".into(),
+        ));
+    }
     let txn = cx.with("h:txn", |c| {
         // S-1-F3 §12.2 (W2; X-5c-F3-F3a step 4): the txn id is
         // `(boot_id, n)`, n ≥ 1 dense per boot (the harness's
@@ -491,6 +619,11 @@ pub fn commit_txn(
         let nchunks = ops.len().div_ceil(20) as u32;
         payload.extend_from_slice(&nchunks.to_le_bytes());
     } else {
+        // E4-R1: the dependency op is encoded before the other ops, so
+        // the check reads it first whatever the record holds.
+        if let Some(id) = require_ckpt {
+            wal::enc_op(&wal::WOp::RequireCkpt { id }, &mut payload);
+        }
         for op in ops {
             wal::enc_op(&to_wop(op), &mut payload);
         }
@@ -639,15 +772,31 @@ pub fn commit_txn(
             };
             cx.with("h:dropwalk", |c| {
                 c.h().drop_walk = Some(tree);
+                // X5-R56: the walk's first crashable yield index —
+                // read before the harness borrow (the same convention
+                // as `wal_recycle:rebind`'s `current + 1`).
+                let y = c.sched_mut().yields + 1;
+                c.h().drop_walk_start = Some(y);
                 Ok(())
             })?;
         }
-        if let Err(e) = ckpt::apply_op(cx, &to_wop(op), ts, false) {
+        if let Err(e) = ckpt::apply_op(cx, &to_wop(op), ts, false, false) {
             client_xx001_unwind(cx, ts, e)?;
         }
         if is_drop {
             cx.with("h:dropdone", |c| {
                 c.h().drop_walk = None;
+                // X5-R56: fold the walk's whole yield range into the
+                // pass's list — every index from the first crashable
+                // one (recorded at `h:dropwalk`) through the last
+                // yield that fired before this close. An empty range
+                // (nothing fired between open and close) records
+                // nothing, because no crash address lies inside it.
+                let last = c.sched_mut().yields;
+                let start = c.h().drop_walk_start.take().filter(|s| *s <= last);
+                if let Some(s0) = start {
+                    c.h().drop_walk_yields.extend(s0..=last);
+                }
                 Ok(())
             })?;
         }
@@ -1037,6 +1186,15 @@ fn run_task(
 /// Run one scripted op. Returns the store's `Fail` unchanged (every
 /// `Cx` call already yields `Fail`): the task runner records the
 /// original error, never a masked one (the gate's N3).
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the slot of an armed
+/// checkpoint index.** [`HarnessState::r41_idx`] holds at most two
+/// armed indices (slot 0 = X5-R41's block B, slot 1 = X5-R50's block
+/// A); this maps an index to its slot, `None` when no arm holds it.
+/// Pure over the state.
+fn r41_slot(h: &HarnessState, idx: u64) -> Option<usize> {
+    h.r41_idx.iter().position(|a| *a == Some(idx))
+}
+
 /// Run one scripted op (pub for the harness tests' unit pins).
 pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
     match op {
@@ -1049,6 +1207,58 @@ pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
                 Ok(())
             })?;
             wait_ckpt(cx)
+        }
+        ScriptOp::R41Arm { idx } => cx.with("h:r41arm", |c| {
+            // X5-R41/X5-R50: the first arm takes slot 0 (block B's),
+            // a second takes slot 1 (block A's, X5-R50) — at most two
+            // arms exist, so a third (never emitted) is ignored.
+            let h = c.h();
+            if h.r41_idx[0].is_none() {
+                h.r41_idx[0] = Some(*idx);
+            } else if h.r41_idx[1].is_none() {
+                h.r41_idx[1] = Some(*idx);
+            }
+            Ok(())
+        }),
+        ScriptOp::R41Done { idx } => cx.with("h:r41done", |c| {
+            let h = c.h();
+            if let Some(s) = r41_slot(h, *idx) {
+                h.r41_done[s] = true;
+            }
+            Ok(())
+        }),
+        ScriptOp::R41Wait { idx } => {
+            // X5-R41: spin-yield (the checkpointer's own poll pattern)
+            // until the armed checkpoint's window is held open or the
+            // workload can no longer open one. The exit set is wider
+            // than "the window flag" for the same circularity the old
+            // X5-R40 gate hit: `workload_done` is set when the last
+            // script task finishes, and this task waiting for a window
+            // that only a *future commit* could open would hold that
+            // last slot forever — so the op also exits when it is the
+            // last unfinished script task (`tasks_left <= 1`: no
+            // further commit can arrive, so no commits-triggered window
+            // can open) and after the fixed [`R41_TURNS`] budget. In
+            // every exit-but-flag case the following block ops simply
+            // run ungated — the round proceeds exactly as it would
+            // without the alignment, never a hang. A crash unwinds
+            // through `yield_now`'s `Err(Crashed)` as every scripted op
+            // does. X5-R50 (step 5a): the op waits on its own index's
+            // slot flag; an index with no armed slot (never emitted)
+            // reads the flag as already set and does not wait.
+            let mut turns = 0u64;
+            loop {
+                let (win, done, left) = cx.with("h:r41wait", |c| {
+                    let h = c.h();
+                    let win = r41_slot(h, *idx).map(|s| h.r41_win[s]).unwrap_or(true);
+                    Ok((win, h.workload_done, h.tasks_left))
+                })?;
+                if win || done || left <= 1 || turns >= R41_TURNS {
+                    return Ok(());
+                }
+                turns += 1;
+                cx.yield_now("h:r41wait")?;
+            }
         }
         ScriptOp::Park { name, budget } => cx.with("h:park", |c| {
             c.store().parks.insert(name, *budget);
@@ -1270,11 +1480,20 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         wait_ckpt(cx)?;
     }
     // Publication (§12.8 step 3): after the forced meta is durable.
-    cx.with("h:loadph1", |c| {
+    // **E4-R1 (card E4-SILENT-1):** the publish commit names the
+    // durable checkpoint it depends on — `meta_durable_k` as read here,
+    // in the existing `h:loadph1` step, after `wait_ckpt` returned. The
+    // op is appended only after meta `id`'s step 5 `sync_all` returned
+    // (that is where `meta_durable_k` is set), so a healthy store's
+    // newest valid meta always sits at or above `id` and the recovery
+    // check never fires; `id` can exceed the forced checkpoint's own id
+    // (a later non-forced checkpoint already durable at capture), never
+    // fall below it.
+    let need_ckpt = cx.with("h:loadph1", |c| {
         c.h().load_phase.insert(t, LoadPhase::Publishing);
-        Ok(())
+        Ok(c.store().meta_durable_k)
     })?;
-    commit_txn(
+    commit_txn_req(
         cx,
         &[Op::Put {
             tree: CATALOG,
@@ -1283,6 +1502,7 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         }],
         true,
         false,
+        Some(need_ckpt),
     )?;
     cx.with("h:pub", |c| {
         c.h().published.insert(t);
@@ -1485,6 +1705,77 @@ fn checkpointer_body(
                     }
                     Ok(())
                 });
+                // **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the window
+                // ledger row.** Step 5 just resolved — `st.k` is this
+                // checkpoint's id and the counters still hold its
+                // window's counts (the next `ckpt:begin` resets them,
+                // `ckpt:post5` having cleared the flip window so
+                // nothing further accrues). Recorded for the driver's
+                // per-seed ledger; `imgsp`/`imgmg`/`imgreuse` (the
+                // record's fields) are the last row at the crash-time
+                // snapshot.
+                if hook == CkptHook::After5 {
+                    let _ = cx.with("h:r41win5", |c| {
+                        let (k, sp, mg, ru, rupf) = {
+                            let st = c.store();
+                            (
+                                st.k,
+                                st.ckpt_splits,
+                                st.ckpt_merges,
+                                st.ckpt_reuse,
+                                st.ckpt_reuse_pf,
+                            )
+                        };
+                        c.h().ckpt_windows.push((k, sp, mg, ru, rupf));
+                        Ok(())
+                    });
+                }
+                // **X5-R41 (card X-5c-F4-F1-F1-F3 step 1): the hold.**
+                // At `After0` of the armed checkpoint — after the flip
+                // released the epoch gate, before any later step — set
+                // the window flag, then spin-yield until the alignment
+                // block ends (`R41Done`), the workload is done, a task
+                // error unwinds the round, or the fixed [`R41_TURNS`]
+                // budget. Holding the window open is what makes the
+                // block's SMOs and reuses land in the crash's own
+                // window: without it the crash hook (which may fire at
+                // this very hook) beats the block — X5-R40's third
+                // design miss. This is not contrived: a real checkpoint
+                // over a large dirty set stays open far longer than one
+                // tree sweep; the spike's window is short only because
+                // its dirty set is small.
+                //
+                // **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the
+                // hold is per armed index.** Slot 0 holds checkpoint
+                // `idx` (block B), slot 1 holds checkpoint `idx−1`
+                // (block A, in exactly the rounds that recover it);
+                // the two armed indices differ, so at most one slot
+                // triggers at any one `After0`. A single-block round
+                // behaves exactly as at F3.
+                if hook == CkptHook::After0 {
+                    for s in 0..2 {
+                        let armed =
+                            cx.with("h:r41armed", |c| Ok(c.h().r41_idx[s] == Some(ck_idx)))?;
+                        if armed {
+                            cx.with("h:r41winflag", |c| {
+                                c.h().r41_win[s] = true;
+                                Ok(())
+                            })?;
+                            let mut turns = 0u64;
+                            loop {
+                                let (done, wd, err) = cx.with("h:r41hold", |c| {
+                                    let h = c.h();
+                                    Ok((h.r41_done[s], h.workload_done, h.task_error.is_some()))
+                                })?;
+                                if done || wd || err || turns >= R41_TURNS {
+                                    break;
+                                }
+                                turns += 1;
+                                cx.yield_now("h:r41hold")?;
+                            }
+                        }
+                    }
+                }
                 if Some(hook) == fire_at {
                     arm_crash(cx.w);
                     return Err(Fail::Sim(SimFail::Crashed));
@@ -1649,6 +1940,18 @@ pub struct RoundOutcome {
     pub crashed_disk: SimDisk,
     /// The recovered store's state (for the next round).
     pub end_store: Option<StoreInner>,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the `ckpt_id` of the
+    /// meta the round's final recovery opened** (`None` on every `Err`
+    /// arm — no image was opened). The driver's `q4i_raw` lookup keys on
+    /// it, never on "the last checkpoint": a meta rollback reads the
+    /// older image's own window.
+    pub opened_ckpt_id: Option<u64>,
+    /// **X5-R42:** the `ckpt_id` the round's harness checkpoint wrote
+    /// (`Some` only when that checkpoint completed; the opened id + 1).
+    /// The driver removes it from the per-seed ledger — that meta is the
+    /// harness checkpoint's, whose window is not recorded ("the harness
+    /// checkpoint's windows are not recorded").
+    pub harness_ckpt_id: Option<u64>,
     /// The truncation cut for the model (`c`).
     pub cut: u64,
     /// Whether the round was judged class C / MP / MW (for the record).
@@ -1804,6 +2107,8 @@ impl Default for RoundOutcome {
             end_disk: SimDisk::new(),
             crashed_disk: SimDisk::new(),
             end_store: None,
+            opened_ckpt_id: None,
+            harness_ckpt_id: None,
             cut: 0,
             class: FaultClass::C,
             deadlock: false,
@@ -1981,6 +2286,18 @@ pub struct WorkloadObs {
     pub splits: u64,
     /// Merges inside the open checkpoint window (Q4).
     pub merges: u64,
+    /// **X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 step 2): window reuses**
+    /// (`alloc_lpid` handing out an LPID freed since this flip), the
+    /// reuse companion of `splits`/`merges` (the store's `ckpt_reuse`).
+    pub reuses: u64,
+    /// **X5-R42:** the window ledger as of the crash — one
+    /// `(ckpt_id, splits, merges, reuses, pre-freeze reuses)` row per
+    /// checkpoint of this workload pass whose step 5 returned before
+    /// the tasks ended. The record's `imgsp`/`imgmg`/`imgreuse` (and
+    /// its pre-freeze companion `imgreuse_pf`) are the last row; the
+    /// driver merges the rows into its per-seed ledger for `q4i_raw`,
+    /// which reads the pre-freeze element (X-5c-F4-F1-F1-F3-F1 step 2a).
+    pub ckpt_windows: Vec<(u64, u64, u64, u64, u64)>,
     /// R_EPOCH exhaustion count (Q10).
     pub epoch_exhausted: u64,
     /// The free-set serialisation grew the file (Q17).
@@ -2032,6 +2349,19 @@ pub struct WorkloadObs {
     pub load_phases: Vec<(u64, LoadPhase)>,
     /// A DropTree walk was in flight (Q7).
     pub drop_walk: Option<u64>,
+    /// **X5-R56 (card X-5c-F4-F5): every scheduler-yield index at
+    /// which a DropTree walk was in flight during the pass** — for
+    /// each walk, the whole range from its first crashable yield
+    /// (`yields + 1` when `h:dropwalk` opened it) through the last
+    /// yield that fired before `h:dropdone` closed it. A crash at any
+    /// listed index leaves `drop_walk` set — Q7's observable — because
+    /// the crash's deterministic unwind means the walking task never
+    /// reaches the clear. A diagnostic only, never a digest input and
+    /// never a quota input: the w7 pick's window list, read from the
+    /// counting pass (which runs the identical script from the
+    /// identical start under the identical scheduler seed, so the
+    /// walk's yields sit at the same indices as the real round's).
+    pub drop_walk_yields: Vec<u64>,
     /// A GC sweep advanced past the previous `gc_w` inside an open
     /// checkpoint window (Q18).
     pub gc_adv_in_window: bool,
@@ -2357,6 +2687,8 @@ pub fn run_round(
             crash_fired: g.sched.crashed,
             splits: st.ckpt_splits,
             merges: st.ckpt_merges,
+            reuses: st.ckpt_reuse,
+            ckpt_windows: g.h.ckpt_windows.clone(),
             epoch_exhausted: st.epoch_exhausted,
             freeset_grew: st.freeset_grew,
             stale_seg_reads: st.stale_seg_reads,
@@ -2371,6 +2703,7 @@ pub fn run_round(
             open_chunks,
             load_phases: g.h.load_phase.iter().map(|(t, p)| (*t, *p)).collect(),
             drop_walk: g.h.drop_walk,
+            drop_walk_yields: g.h.drop_walk_yields.clone(),
             gc_adv_in_window: g.h.gc_adv_in_window,
             ckpt_step: g.h.ckpt_step,
             ckpt_hooks_hit: g.h.ckpt_hooks_hit.clone(),
@@ -2462,6 +2795,11 @@ pub fn run_round(
         .filter(|(_, (_, lsn, _))| *lsn < p0)
         .map(|(ts, (_, lsn, _))| (*ts, *lsn))
         .collect::<Vec<_>>();
+    // X5-R47's pairing guard (debug-free, always on): every
+    // `WriteIssued` in `E` immediately followed by its own
+    // `WriteReturned` — the replacement for the removed `returned_end`
+    // extent test (`SimDisk::write_at` emits the pair in one step).
+    let r47_pairing = r47_issue_return_paired(e4_events);
     let (written_ts, acked_ts, unparsed_written) =
         derive_written_acked(e4_events, &wal_commits, p0, &wal_bindings);
     // X5-R34 (d) diagnostic (`E4_D_DIAG`, default off, stderr only,
@@ -2594,6 +2932,12 @@ pub fn run_round(
         task_error = Some(format!(
             "X5-R34 p0 guard: wal_commits record below p0={p0}: {p0_guard:?}"
         ));
+    }
+    // X5-R47's pairing guard: a `WriteIssued` without its immediately
+    // following `WriteReturned` is a harness defect (the replay's
+    // premise), and fails the round.
+    if r47_pairing.is_some() && task_error.is_none() {
+        task_error = r47_pairing;
     }
     // X5-R34 (f): the judged cross-check — a client-observed SyncOn ack
     // above `D` is a store failure of the round (the pass fold fails it
@@ -3184,6 +3528,9 @@ pub fn run_round(
             let (opened_meta, _opened_xx) = read_opened_meta(&end_disk);
             let opened_t = opened_meta.as_ref().map(|m| m.t).unwrap_or(0);
             let gc_w = opened_meta.as_ref().map(|m| m.gc_w).unwrap_or(0);
+            // X5-R42 (step 2): the opened meta's own ckpt_id — the
+            // `q4i_raw` lookup key.
+            outcome.opened_ckpt_id = opened_meta.as_ref().map(|m| m.ckpt_id);
             // **X5-R36 (e): the round's `reuse_on_dropping`** — the
             // opened image's directory (durable bytes) beside the
             // model's `CreateTree` replay window `(T, frontier]`. The
@@ -3489,6 +3836,33 @@ pub fn run_round(
                     }
                 }
             }
+            // Card X-5c-F4-F1-F1-O1C (`E4_O1C_TRACE`, stderr only,
+            // default off, never a digest input): the trace of a round
+            // whose recovered frontier sits above `hi` — the three
+            // faultless class C O-1(c) rounds of X-5c-F4's file. The
+            // trace answers the card's Work 1 per replayed record: its
+            // commit ts, when its bytes were written relative to the
+            // crash (`E` ends at the crash, so an event's index names
+            // its place before it), and when the model recorded it (the
+            // model records at the enqueue's `h:model` step, so presence
+            // in `model.commits` dates the recording before the crash).
+            if std::env::var("E4_O1C_TRACE").is_ok() {
+                o1c_frontier_trace(
+                    seed,
+                    round,
+                    faults.class,
+                    &ex,
+                    &model,
+                    &wal_commits,
+                    e4_events,
+                    &wal_bindings,
+                    p0,
+                    c_prev,
+                    d_val,
+                    &d_stop,
+                    &d_rc,
+                );
+            }
             // X-5c-F3-F3a-F2 Work 3 (`E4_KEY_DIAG`, stderr only, default
             // off, never a digest input): the key-history trace of the
             // first divergent key — every page write that carried its
@@ -3606,6 +3980,14 @@ pub fn run_round(
                 let g = world.lock();
                 (g.disk.clone(), g.st.clone())
             };
+            // X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the harness
+            // checkpoint's own id — `Some` only when it completed (its
+            // post5 advanced `st.k` to it), so the driver can drop that
+            // id's ledger row (the harness checkpoint's windows are not
+            // recorded).
+            if ck.is_ok() {
+                outcome.harness_ckpt_id = Some(end_store.k);
+            }
             // X5-R29 (a): the subtree-fallout reading's evidence, on
             // this round's end disk (stderr only, never a digest
             // input).
@@ -4029,86 +4411,180 @@ pub fn run_round(
     outcome
 }
 
-/// Work 2.1's durability flags from the round's disk events: for each
-/// commit ts, the WAL write carrying its record's last byte returned
-/// (`written`), and its ack — a covering WAL sync returned (SyncOn) or
-/// the write itself (SyncOff). A WAL file's bytes are stitched from its
-/// write events (issue order, latest write per offset wins), then walked
-/// record by record from offset 0 (§12.5's alignment: a record lives at
-/// `lsn mod WAL_SEG` in whichever segment file holds it — a recycled
-/// segment's new life overwrites its old one from offset 0, so the walk
-/// sees exactly the latest life). The page file's stitched bytes fail
-/// the record magic immediately and contribute nothing. Record ends are
-/// **file-relative** throughout (B5 fixes: split records across a
-/// writer's 4-KiB batch chunks, and recycled segments' file-relative
-/// positions; D9's renamed-segment shape pinned both).
-///
+/// X5-R47's replay step (card X-5c-F4-F1-F1-O1C-F1): apply one issued
+/// write to its inode's byte image. The image grows to the write's end
+/// (the gap zero-filled, as a sparse write's bytes read below the
+/// round's later writes) and the bytes replace `[off, off + len)` —
+/// later bytes replace earlier bytes because they were issued later,
+/// never because a per-offset map or a greatest-key cover resolved
+/// them.
+fn r47_apply_write(image: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+    let end = off as usize + bytes.len();
+    if image.len() < end {
+        image.resize(end, 0);
+    }
+    if let Some(dst) = image.get_mut(off as usize..end) {
+        dst.copy_from_slice(bytes);
+    }
+}
+
+/// X5-R47's `written` test on one inode's image: does it hold at
+/// `[lsn mod WAL_SEG, lsn mod WAL_SEG + len)` a record `dec_record`
+/// accepts with its own `lsn` (the §12.5 position rule — a recycled
+/// segment's stale content fails it), `rec.ts == ts`, and kind
+/// `Commit` or `CommitMarker`? The record must fit its segment; the
+/// `seg_end` handed to `dec_record` is the position's own segment end,
+/// exactly as the pre-X5-R47 walk computed it.
+fn r47_image_holds(image: &[u8], ts: u64, lsn: u64, len: u64, seg: u64) -> bool {
+    let pos = (lsn % seg) as usize;
+    let Some(b) = image.get(pos..pos + len as usize) else {
+        return false;
+    };
+    if pos as u64 + len > seg || !magic_ok(b) {
+        return false;
+    }
+    match crate::store::wal::dec_record(b, lsn, lsn - pos as u64 + seg) {
+        Ok(Some(rec)) => rec.ts == ts && (rec.kind == K_COMMIT || rec.kind == K_MARKER),
+        _ => false,
+    }
+}
+
+/// X5-R47's F1 test on one inode's image: does it hold at
+/// `lsn mod WAL_SEG` the 24 header bytes of a record — correct magic,
+/// its own embedded `lsn` — whose `len_in_header` runs past the
+/// segment end? §12.2 never places such a record and §12.5's reader
+/// stops at it, so a commit that is not written but shows this header
+/// had bytes issued that can never parse: reported, and the harness
+/// fails the round (dropping it silently once let an acked commit
+/// vanish from the model while recovery lost it too — the round-3 F1
+/// demonstration).
+fn r47_header_runs_past_segment(image: &[u8], lsn: u64, seg: u64) -> bool {
+    let pos = (lsn % seg) as usize;
+    let Some(h) = image.get(pos..pos + 24) else {
+        return false;
+    };
+    if !magic_ok(h) {
+        return false;
+    }
+    let embedded = {
+        let mut a = [0u8; 8];
+        if let Some(s) = h.get(16..24) {
+            a.copy_from_slice(s);
+        }
+        u64::from_le_bytes(a)
+    };
+    let len_in_header = {
+        let mut l = [0u8; 4];
+        if let Some(s) = h.get(4..8) {
+            l.copy_from_slice(s);
+        }
+        u32::from_le_bytes(l) as u64
+    };
+    embedded == lsn && pos as u64 + len_in_header > seg
+}
+
 /// X-5c-F3-F1 step 1 (e) diagnostic helper (`E4_ACK_DIAG` only): does
-/// the issued-write history hold a parsable record at `lsn`'s
-/// segment-relative position with its own lsn (the walk's `ts_pos`
-/// precondition)? Hops record-to-record exactly as
-/// [`derive_written_acked`] does, so its verdict matches the walk's.
-/// Never a digest input; exists only to name the failing half of a
-/// derived-vs-client ack disagreement.
+/// the issued-write history hold, at `lsn`'s segment-relative
+/// position, a record `dec_record` accepts with `lsn` as its own
+/// (X5-R47's `written` precondition, ts and kind aside)? Replays each
+/// `WriteIssued` of `E` in order into per-inode byte images exactly as
+/// [`derive_written_acked`] does — the derivation itself, never a
+/// mirror of it — so its verdict matches the derivation's. Never a
+/// digest input; exists only to name the failing half of a
+/// derived-vs-client ack disagreement (a record present but not acked
+/// means the durability test failed; absent means the round never
+/// wrote it).
 fn ack_record_present(events: &[DiskEvent], lsn: u64) -> bool {
     let seg = crate::store::WAL_SEG;
-    let mut files: BTreeMap<usize, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
+    let pos = lsn % seg;
+    let mut images: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     for e in events {
-        if let DiskEvent::WriteIssued { inode, off, bytes } = e {
-            files.entry(*inode).or_default().insert(*off, bytes.clone());
+        let DiskEvent::WriteIssued { inode, off, bytes } = e else {
+            continue;
+        };
+        let image = images.entry(*inode).or_default();
+        r47_apply_write(image, *off, bytes);
+        // The header at `pos` changes only under a write overlapping
+        // it; the body below may have been completed by any earlier
+        // write (all writes are applied, so the image holds them).
+        let Some(h) = image.get(pos as usize..pos as usize + 24) else {
+            continue;
+        };
+        if !magic_ok(h) {
+            continue;
         }
-    }
-    for writes in files.values() {
-        let mut off = writes.keys().copied().min().unwrap_or(0);
-        loop {
-            if off >= seg {
-                break;
+        let embedded = {
+            let mut a = [0u8; 8];
+            if let Some(s) = h.get(16..24) {
+                a.copy_from_slice(s);
             }
-            let whole = stitched(writes, off, (seg - off) as usize);
-            if whole.len() >= 24 && whole.get(0..4) == Some(&0x4C41574Eu32.to_le_bytes()) {
-                let len = {
-                    let mut b = [0u8; 4];
-                    if let Some(s) = whole.get(4..8) {
-                        for (i, x) in s.iter().enumerate() {
-                            b[i] = *x;
-                        }
-                    }
-                    u32::from_le_bytes(b) as u64 & 0xFFFF_FFFF
-                };
-                let rec_lsn = {
-                    let mut b = [0u8; 8];
-                    if let Some(s) = whole.get(16..24) {
-                        for (i, x) in s.iter().enumerate() {
-                            b[i] = *x;
-                        }
-                    }
-                    u64::from_le_bytes(b)
-                };
-                if rec_lsn == lsn && rec_lsn % seg == off && len >= 16 && off + len <= seg {
-                    return true;
-                }
-                if len >= 16 && off + len <= seg {
-                    off += len;
-                    continue;
-                }
+            u64::from_le_bytes(a)
+        };
+        if embedded != lsn {
+            continue;
+        }
+        let len_in_header = {
+            let mut l = [0u8; 4];
+            if let Some(s) = h.get(4..8) {
+                l.copy_from_slice(s);
             }
-            match writes.range(off + 1..).next() {
-                Some((&next, _)) if next < seg => off = next,
-                _ => break,
-            }
+            u32::from_le_bytes(l) as u64
+        };
+        if len_in_header < 16 || pos + len_in_header > seg {
+            continue;
+        }
+        if let Some(b) = image.get(pos as usize..(pos + len_in_header) as usize)
+            && crate::store::wal::dec_record(b, lsn, lsn - pos + seg).is_ok_and(|r| r.is_some())
+        {
+            return true;
         }
     }
     false
 }
 
-/// The third return is the **loud** half of the gate's round-3 F1: every
-/// commit whose record header is present in some WAL file's issued
-/// writes at its segment-relative position with its own lsn, but whose
-/// `len` runs past the segment end — bytes written, never parseable
-/// (§12.2 never places such a record; only an over-cap enqueue ever
-/// could, and the cap now refuses it). The harness fails the round on
-/// any; dropping the entry silently let an acked commit vanish from the
-/// model while recovery lost it too (the F1 demonstration).
+/// Work 2.1's durability flags from the round's disk events: for each
+/// commit ts, its record's bytes were written (`written`), and its ack
+/// — a covering WAL sync returned (SyncOn) or the write itself
+/// (SyncOff). Record ends are **file-relative** throughout (B5 fixes:
+/// split records across a writer's 4-KiB batch chunks, and recycled
+/// segments' file-relative positions; D9's renamed-segment shape
+/// pinned both).
+///
+/// **X5-R47 (card X-5c-F4-F1-F1-O1C-F1, amending X5-R34's
+/// "Unchanged: `written`"; carried verbatim in the crate README):** a
+/// commit `(ts, lsn, len)` of `wal_commits` is **written** iff, at
+/// some event of `E`, immediately after a `WriteIssued` is applied in
+/// `E`'s order to a per-inode byte image
+/// ([`r47_apply_write`]/[`r47_image_holds`]), some inode's image holds
+/// at `[lsn mod WAL_SEG, lsn mod WAL_SEG + len)` a record that
+/// `dec_record` accepts with its own `lsn` and with `rec.ts == ts` and
+/// kind `Commit` or `CommitMarker`. The verdict is **monotone** — once
+/// written, always written; a later life overwriting the bytes never
+/// unwrites the commit, and the test is never made against the final
+/// image alone — and **no resolver by key** takes part: no per-offset
+/// map and no greatest-key cover, later bytes replace earlier bytes
+/// because they were issued later. (The pre-X5-R47 stitched walk
+/// resolved a byte by the greatest map key at or below the cursor,
+/// ignoring issue order, so a recycled file's earlier-life write hid
+/// the new life's records: verdict X-5c-F4-F1-F1-O1C's three faultless
+/// class C O-1(c) rounds — 1066, 6555, 7590 r0 — with `hi` capped one
+/// commit below the recovered frontier.) **Issued is returned:**
+/// `SimDisk::write_at` emits `WriteIssued` and `WriteReturned` in one
+/// step, so no crash separates them; the old `returned_end` extent
+/// test is removed and the always-on pairing guard
+/// [`r47_issue_return_paired`] takes its place in `run_round`.
+///
+/// The third return is the **loud** half of the gate's round-3 F1,
+/// derived by the same replay ([`r47_header_runs_past_segment`]): a
+/// commit is reported in `unparsed_written` iff it is not written
+/// and, at some such point, an image holds at `lsn mod WAL_SEG` 24
+/// header bytes with correct magic, its own embedded `lsn`, and
+/// `lsn mod WAL_SEG + len_in_header > WAL_SEG` — bytes written, never
+/// parseable (§12.2 never places such a record; only an over-cap
+/// enqueue ever could, and the cap now refuses it). The harness fails
+/// the round on any; dropping the entry silently let an acked commit
+/// vanish from the model while recovery lost it too (the F1
+/// demonstration).
 ///
 /// **X5-R34 (a), binding:** the **SyncOn acked half is I-ACK-PREFIX's
 /// `durable_end` derived from SimDisk history** (`x5r34_durable_prefix`,
@@ -4116,9 +4592,9 @@ fn ack_record_present(events: &[DiskEvent], lsn: u64) -> bool {
 /// durable `/wal/` directory bindings read through
 /// [`SimDisk::durable_dir_bindings`]). A SyncOn commit is acked iff
 /// `lsn + len ≤ D`, or its segment name is in `Rc` (the recycled
-/// exemption). Unchanged: `written` (the `hi` input), SyncOff's acked
-/// (= written) and the `unparsed_written` report. The acked half never
-/// reads store memory (`wal.durable`/`wal.written`) — only `E`, `p0`
+/// exemption). **SyncOff's acked stays "iff written"** (X5-R47); the
+/// SyncOn half is otherwise untouched. The acked half never reads
+/// store memory (`wal.durable`/`wal.written`) — only `E`, `p0`
 /// and the durable bindings (X5-R34 (b), (i)).
 pub fn derive_written_acked(
     events: &[DiskEvent],
@@ -4126,91 +4602,41 @@ pub fn derive_written_acked(
     p0: u64,
     wal_bindings: &BTreeMap<String, usize>,
 ) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
-    // inode → (off → latest issued bytes) and the returned extents (the
-    // `written` half's inputs). X5-R34 removed the per-inode sync-extent
-    // ratchet this acked half used; `D` comes from
-    // [`x5r34_durable_prefix`] below.
-    let mut files: BTreeMap<usize, FileWrites> = BTreeMap::new();
-    let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
-    for e in events {
-        match e {
-            DiskEvent::WriteIssued { inode, off, bytes } => {
-                files.entry(*inode).or_default().insert(*off, bytes.clone());
-            }
-            DiskEvent::WriteReturned { inode, off, len } => {
-                let w = returned_end.entry(*inode).or_default();
-                *w = (*w).max(off + len);
-            }
-            _ => {}
-        }
-    }
-    // Walk each stitched file's records; ts → (inode, record end in-file).
-    // The header carries the record's own lsn; a record belongs at
-    // `lsn mod WAL_SEG` (§12.5's position rule), which is what ties a
-    // recycled file's latest life to its overwritten bytes.
-    let mut ts_pos: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
+    // X5-R47: one pass over `E`, each write tested only against
+    // commits whose record overlaps it (the 24 header bytes included:
+    // a write that completes only the header still decides F1). The
+    // per-inode images are the replay state; `written_ts` and
+    // `header_past_end` are monotone sets — once a point qualifies at
+    // some event of `E`, it stays qualified. The commits' fixed
+    // geometry (`lsn % WAL_SEG`) is hoisted out of the loop.
     let seg = crate::store::WAL_SEG;
-    for (inode, writes) in files.iter() {
-        // A chained round's events hold only **this round's** writes (a
-        // prior round's records are below them, their flags already
-        // carried by the incoming model, Work 2.1): start at the round's
-        // own first write, and on a gap — a chunk boundary that begins
-        // mid-record — jump to the next write offset instead of stopping
-        // (records are self-delimiting through their `len`, and the
-        // position rule still validates each one). Single-round disks
-        // keep the from-zero walk: their first write is at 0.
-        let mut off = writes.keys().copied().min().unwrap_or(0);
-        loop {
-            if off >= seg {
-                break;
-            }
-            let hdr = stitched(writes, off, 24);
-            if hdr.len() < 24 || !magic_ok(&hdr) {
-                let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
-                    break;
-                };
-                off = next;
+    let commits: Vec<(u64, u64, u64, u64)> = wal_commits
+        .iter()
+        .map(|(ts, (_, lsn, len))| (*ts, *lsn, *len, lsn % seg))
+        .collect();
+    let mut images: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    let mut written_ts: BTreeSet<u64> = BTreeSet::new();
+    let mut header_past_end: BTreeSet<u64> = BTreeSet::new();
+    for e in events {
+        let DiskEvent::WriteIssued { inode, off, bytes } = e else {
+            continue;
+        };
+        let image = images.entry(*inode).or_default();
+        r47_apply_write(image, *off, bytes);
+        let end = *off + bytes.len() as u64;
+        for (ts, lsn, len, pos) in commits.iter() {
+            if *off >= pos + (*len).max(24) || end <= *pos {
                 continue;
             }
-            let rd = |r: std::ops::Range<usize>| -> u64 {
-                let mut b = [0u8; 8];
-                if let Some(s) = hdr.get(r) {
-                    for (i, x) in s.iter().enumerate() {
-                        b[i] = *x;
-                    }
-                }
-                u64::from_le_bytes(b)
-            };
-            let len = rd(4..8) & 0xFFFF_FFFF;
-            let lsn = rd(16..24);
-            if len < 16 || off + len > seg || lsn % seg != off {
-                let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
-                    break;
-                };
-                off = next;
-                continue;
+            // A write to one inode cannot change another's image, and
+            // the image of the inode just written is the only one that
+            // changed at this event of `E`, so testing it here finds
+            // every point at which any image newly holds the record.
+            if !written_ts.contains(ts) && r47_image_holds(image, *ts, *lsn, *len, seg) {
+                written_ts.insert(*ts);
             }
-            let whole = stitched(writes, off, len as usize);
-            if (whole.len() as u64) < len {
-                let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
-                    break;
-                };
-                off = next;
-                continue;
-            }
-            match crate::store::wal::dec_record(&whole, lsn, lsn - off + seg) {
-                Ok(Some(rec)) => {
-                    if rec.kind == K_COMMIT || rec.kind == K_MARKER {
-                        ts_pos.insert(rec.ts, (*inode, off + len));
-                    }
-                    off += len;
-                }
-                _ => {
-                    let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
-                        break;
-                    };
-                    off = next;
-                }
+            if !header_past_end.contains(ts) && r47_header_runs_past_segment(image, *lsn, seg) {
+                header_past_end.insert(*ts);
             }
         }
     }
@@ -4220,39 +4646,28 @@ pub fn derive_written_acked(
     // X5-R34 (d)/(e): the durable prefix `D` and the recycled set.
     let (d, _d_stop, rc) = x5r34_durable_prefix(events, wal_bindings, p0);
     for (ts, (sync_on, lsn, _len)) in wal_commits.iter() {
-        // The `written` half — unchanged (the walk + the returned
-        // extents; the `hi` input).
-        let w_ok = match ts_pos.get(ts).copied() {
-            Some((inode, end)) => {
-                let w = returned_end.get(&inode).copied().unwrap_or(0);
-                if w >= end {
-                    written.push(*ts);
-                    true
-                } else {
-                    false
-                }
+        // The `written` half — X5-R47's replay (the `hi` input).
+        let w_ok = if written_ts.contains(ts) {
+            written.push(*ts);
+            true
+        } else {
+            // The replay never held this commit's whole record. If, at
+            // some point, an image held its header at the
+            // segment-relative position with its own lsn and a length
+            // past the segment end, the bytes were written but can
+            // never parse — report it (F1); the harness fails the
+            // round. A record simply never written (or torn mid-body,
+            // a normal crash outcome) has no such header, and stays
+            // silent.
+            if header_past_end.contains(ts) {
+                unparsed_written.push(*ts);
             }
-            None => {
-                // The walk never yielded this commit's record. If its
-                // header sits issued at the segment-relative position
-                // with its own lsn and a length past the segment end,
-                // the bytes were written but can never parse — report
-                // it (F1); the harness fails the round. A record simply
-                // never written (or torn mid-body, a normal crash
-                // outcome) has no full header or a length that fits,
-                // and stays silent.
-                if let Some(rec_len) = issued_header_len(&files, *lsn, seg)
-                    && (*lsn % seg) + rec_len > seg
-                {
-                    unparsed_written.push(*ts);
-                }
-                false
-            }
+            false
         };
-        // The acked half — X5-R34 (e), independent of the walk: a
+        // The acked half — X5-R34 (e), independent of the replay: a
         // SyncOn commit is acked iff its record ends at or below `D`,
         // or its segment was recycled away this round (`Rc`); a SyncOff
-        // commit is acked iff written (unchanged).
+        // commit is acked iff written (X5-R47).
         let acked_now = if *sync_on {
             let name = x5r34_seg_name(*lsn - (*lsn % seg));
             lsn + _len <= d || rc.contains(&name)
@@ -4266,34 +4681,204 @@ pub fn derive_written_acked(
     (written, acked, unparsed_written)
 }
 
-/// The record length an issued NWAL header carries at `lsn % seg`, if
-/// some file's stitched writes hold a magic-correct header with exactly
-/// this lsn embedded (the F1 report's discriminator). `None` when no
-/// file's issued bytes hold such a header.
-fn issued_header_len(files: &BTreeMap<usize, FileWrites>, lsn: u64, seg: u64) -> Option<u64> {
-    let off = lsn % seg;
-    for writes in files.values() {
-        let hdr = stitched(writes, off, 24);
-        if hdr.len() < 24 || !magic_ok(&hdr) {
-            continue;
-        }
-        let embedded = {
-            let s = hdr.get(16..24)?;
-            let mut a = [0u8; 8];
-            a.copy_from_slice(s);
-            u64::from_le_bytes(a)
-        };
-        if embedded == lsn {
-            let len = {
-                let s = hdr.get(4..8)?;
-                let mut a = [0u8; 4];
-                a.copy_from_slice(s);
-                u32::from_le_bytes(a) as u64
-            };
-            return Some(len);
+/// X5-R47's pairing guard (always on — debug-free): `SimDisk::write_at`
+/// emits each `WriteIssued` and its `WriteReturned` in one atomic sim
+/// step, so no crash separates them and, in `E`, every `WriteIssued`
+/// must sit immediately before its own `WriteReturned` — same inode,
+/// same offset, same length. X5-R47 removes the old `written` half's
+/// `returned_end` extent test (it could never fail while the pairing
+/// holds, and nothing else may separate the pair); this guard takes
+/// its place, so an event stream that could otherwise let the replay
+/// read bytes the workload never saw returned fails the round loudly
+/// through `task_error` instead of mis-deriving `written`. Returns the
+/// first violation's description, if any. Pub for its directed pin
+/// (`r47_pairing_guard_names_an_unpaired_write`), as the X5-R34
+/// guards are.
+pub fn r47_issue_return_paired(events: &[DiskEvent]) -> Option<String> {
+    for (i, e) in events.iter().enumerate() {
+        if let DiskEvent::WriteIssued { inode, off, bytes } = e {
+            let paired = matches!(
+                events.get(i + 1),
+                Some(DiskEvent::WriteReturned {
+                    inode: r_inode,
+                    off: r_off,
+                    len: r_len,
+                }) if r_inode == inode && r_off == off && *r_len == bytes.len() as u64
+            );
+            if !paired {
+                return Some(format!(
+                    "X5-R47 pairing guard: WriteIssued at E[{i}] (inode {inode}, off {off}, len {}) is not immediately followed by its own WriteReturned",
+                    bytes.len()
+                ));
+            }
         }
     }
     None
+}
+
+// ---- card X-5c-F4-F1-F1-O1C: the frontier-above-`hi` trace ----
+//
+// The three faultless class C O-1(c) rounds of X-5c-F4's file (1066 r0,
+// 6555 r0, 7590 r0) recovered a frontier above `model.upper_bound(lo)`
+// — the only three of the 10k, root-caused by the card's diagnosis and
+// closed by X5-R47 (this branch). The trace (`E4_O1C_TRACE`, stderr
+// only, default off, never a digest input) fires on the same shape —
+// under X5-R47 a frontier above `hi` means the store replayed a commit
+// the replay derivation did not count as written, a harness defect —
+// and answers, for each commit above `hi`: when its bytes were written
+// relative to the crash (`E`, the workload pass's slice, ends at the
+// crash, so an event's index in `E` names its distance before it),
+// when the model recorded it (`h:model`, the step after the enqueue
+// returns — presence in `model.commits` dates the recording before the
+// crash), and the derivation's own written/F1/acked verdicts — read by
+// calling [`derive_written_acked`] itself, never a mirror of it (the
+// card X-5c-F4-F1-F1-O1C-F1 step 3 ruling: `o1c_stitched_walk` and its
+// per-inode path log mirrored a reader that no longer exists, and are
+// deleted).
+
+/// The frontier-above-`hi` trace (card X-5c-F4-F1-F1-O1C's Work 1).
+/// Prints only when `frontier > hi` (the shape under study: `hi` is
+/// recomputed exactly as `check_round` derives it —
+/// `model.upper_bound(model.lower_bound(c_prev))`, the class-C bounds —
+/// and `hi` is class-independent in the oracle, which overrides only
+/// `lo` in MW). Everything printed comes from `E` (the workload pass's
+/// slice, which ends at the crash), the model, `wal_commits` and the
+/// X5-R34 verdicts — never store memory.
+#[allow(clippy::too_many_arguments)]
+fn o1c_frontier_trace(
+    seed: u64,
+    round: u32,
+    class: FaultClass,
+    ex: &Extracted,
+    model: &Model,
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+    e4_events: &[DiskEvent],
+    wal_bindings: &BTreeMap<String, usize>,
+    p0: u64,
+    c_prev: u64,
+    d_val: u64,
+    d_stop: &str,
+    d_rc: &BTreeSet<String>,
+) {
+    let lo = model.lower_bound(c_prev);
+    let hi = model.upper_bound(lo);
+    if ex.frontier <= hi {
+        return;
+    }
+    eprintln!(
+        "O1C trace: seed={seed} round={round} class={class:?} lo={lo} hi={hi} frontier={} T={} p0={p0} D={d_val} rc={d_rc:?}",
+        ex.frontier, ex.opened_t
+    );
+    eprintln!(
+        "O1C trace: |E|={} (E ends at the crash) D_stop=\"{d_stop}\"",
+        e4_events.len()
+    );
+    // The model's recording, per ts: present (recorded at the enqueue's
+    // `h:model` step, before the crash) with its flags.
+    let model_ts: Vec<String> = model
+        .commits
+        .range(lo..)
+        .map(|(ts, rec)| {
+            format!(
+                "ts={ts} {:?} written={} acked={} wal_commits={:?}",
+                rec.mode,
+                rec.written,
+                rec.acked,
+                wal_commits.get(ts).map(|&(s, l, n)| (s, l, n))
+            )
+        })
+        .collect();
+    eprintln!(
+        "O1C trace: model commits at or above lo={lo}: [{:?}]",
+        model_ts
+    );
+    // The derivation's own verdicts (X5-R47's replay — the derivation
+    // itself is called here, so the trace cannot drift from it again):
+    // the `written` flag, the F1 report and the acked rule per commit,
+    // then the same for the rows below.
+    let (w_set, _a_set, u_set) = derive_written_acked(e4_events, wal_commits, p0, wal_bindings);
+    // The write/sync history of every inode durably bound to a segment
+    // holding an above-`hi` commit's record (recycles included): when
+    // the bytes reached the file, relative to the crash, and which
+    // life of the file they belong to.
+    let mut inodes: BTreeSet<usize> = BTreeSet::new();
+    for (ts, (_, lsn, _)) in wal_commits.iter() {
+        if *ts > hi {
+            let name = x5r34_seg_name(*lsn - (*lsn % crate::store::WAL_SEG));
+            eprintln!(
+                "O1C trace: ts={ts} segment {name} -> binding inode {:?} (durable dir bindings at the workload's end)",
+                wal_bindings.get(&name).copied()
+            );
+            if let Some(i) = wal_bindings.get(&name) {
+                inodes.insert(*i);
+            }
+        }
+    }
+    let n = e4_events.len();
+    for inode in inodes.iter() {
+        let ev: Vec<String> = e4_events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let tail = n - i;
+                match e {
+                    DiskEvent::WriteIssued {
+                        inode: f,
+                        off,
+                        bytes,
+                    } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) W+ f{f}@{off}+{}", bytes.len()))
+                    }
+                    DiskEvent::WriteReturned { inode: f, off, len } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) W= f{f}@{off}+{len}"))
+                    }
+                    DiskEvent::SyncIssued { inode: f, all } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) S+ f{f} all={all}"))
+                    }
+                    DiskEvent::SyncReturned { inode: f, all } if f == inode => {
+                        Some(format!("E[{i}](-{tail}) S= f{f} all={all}"))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        eprintln!("O1C trace: inode {inode} write/sync events: [{ev:?}]");
+    }
+    let dir: Vec<String> = e4_events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let tail = n - i;
+            match e {
+                DiskEvent::DirOpIssued { dir: d, what } if d.contains("/wal/") => {
+                    Some(format!("E[{i}](-{tail}) {what}"))
+                }
+                DiskEvent::SyncDirReturned { dir: d } if d.contains("/wal/") => {
+                    Some(format!("E[{i}](-{tail}) sync_dir {d}"))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    eprintln!("O1C trace: /wal/ directory ops: [{dir:?}]");
+    // The derivation's own verdict per above-`lo` commit (computed once
+    // above, straight from [`derive_written_acked`]): the X5-R47
+    // `written` flag, the F1 report and X5-R34's durable verdict — the
+    // row that decides which half diverges.
+    let rows: Vec<String> = wal_commits
+        .range(lo..)
+        .map(|(ts, &(sync_on, lsn, len))| {
+            let name = x5r34_seg_name(lsn - (lsn % crate::store::WAL_SEG));
+            let durable = lsn + len <= d_val || d_rc.contains(&name);
+            format!(
+                "ts={ts} sync_on={sync_on} lsn={lsn} len={len} written={} f1={} acked_rule={}",
+                w_set.contains(ts),
+                u_set.contains(ts),
+                if sync_on { durable } else { w_set.contains(ts) }
+            )
+        })
+        .collect();
+    eprintln!("O1C trace: derivation rows at or above lo={lo}: [{rows:?}]");
 }
 
 /// The NWAL record magic (§12.2, `enc_record`'s first word).
@@ -5841,43 +6426,6 @@ pub fn x5r34_durable_prefix(
         }
         lsn = seg + wseg;
     }
-}
-
-/// The `len` bytes at `off` of the stitched file, if fully present.
-fn stitched(writes: &BTreeMap<u64, Vec<u8>>, off: u64, len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    // Walk the issued write chunks covering [off, off+len): each write is
-    // a contiguous run at its own offset, and a run may **start before**
-    // the byte we want (records begin mid-chunk when the writer split a
-    // batch), so the covering run — the last one starting at or before
-    // the cursor — is picked first.
-    let mut cur = off;
-    while out.len() < len {
-        let cover = writes
-            .range(..=cur)
-            .next_back()
-            .filter(|(k, v)| **k + v.len() as u64 > cur)
-            .map(|(k, v)| (*k, v.clone()));
-        let ahead = writes.range(cur..).next().map(|(k, v)| (*k, v.clone()));
-        let Some((woff, bytes)) = cover.or(ahead) else {
-            break;
-        };
-        if woff > cur {
-            break;
-        }
-        let skip = (cur - woff) as usize;
-        let Some(take) = bytes.get(skip..) else {
-            break;
-        };
-        let need = len - out.len();
-        let take = &take[..take.len().min(need)];
-        out.extend_from_slice(take);
-        cur += take.len() as u64;
-        if take.is_empty() {
-            break;
-        }
-    }
-    out
 }
 
 fn site_name(d: XxSite) -> &'static str {

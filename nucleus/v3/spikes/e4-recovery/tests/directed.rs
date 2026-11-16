@@ -3312,3 +3312,838 @@ fn twin_supply_carries_a_failed_recovery_reads() {
         "the twin collector must not be empty after a failed recovery (M-TWa)"
     );
 }
+
+// ---- card E4-SILENT-1 (the two silent-data fixes before E4's final run) ----
+
+/// **E4-R1's script (card E4-SILENT-1 step 1; the eval appendix of
+/// `header-durability-design-eval.md` §3):** setup and publication of
+/// tree 2, one logged commit, a checkpoint (meta 1), a 20-entry
+/// unlogged bulk load of tree 5 with its forced checkpoint (meta 2) and
+/// publication, one later logged commit, then `Yields(4)`. Seed 4242,
+/// no evictor. `extra` (when non-empty) runs as one more logged commit
+/// between the last put and the yields — the over-refusal shapes.
+fn es1_script(crash: Option<CrashSpec>, extra: Vec<Op>) -> Script {
+    let mut ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..8u64).map(|i| put(i, 1)).collect(),
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::BulkLoad {
+            tree: 5,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (8..12u64).map(|i| put(i, 3)).collect(),
+        },
+    ];
+    if !extra.is_empty() {
+        ops.push(ScriptOp::Commit {
+            sync_on: true,
+            ops: extra,
+        });
+    }
+    ops.push(ScriptOp::Yields(4));
+    Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash,
+        nested: Vec::new(),
+    }
+}
+
+/// **The two-publication script (card X-5c-PINS-2 item 7):** setup and
+/// a logged commit, a checkpoint (meta 1, publication A's dependency
+/// context), bulk load A on tree 5 with its forced checkpoint (meta 2)
+/// and its publication (`RequireCkpt{2}`), then bulk load B on tree 6
+/// with its forced checkpoint (meta 3) and its publication
+/// (`RequireCkpt{3}`), then yields. Exactly three script-driven
+/// checkpoints run (ids 1, 2, 3) over the initial meta 0, with the
+/// round-end harness checkpoint as meta 4 — so a crash after B's
+/// publication and before the round's end leaves **B's own checkpoint
+/// as the newest durable meta (kmax == 3)**, and a fault on it reverts
+/// the slot to the meta before, leaving the open at meta 2: A's
+/// dependency satisfied, B's violated.
+fn es1_script_two_pub(crash: Option<CrashSpec>) -> Script {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..8u64).map(|i| put(i, 1)).collect(),
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::BulkLoad {
+            tree: 5,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::BulkLoad {
+            tree: 6,
+            entries: (20..40u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 8]))
+                .collect(),
+        },
+        ScriptOp::Yields(4),
+    ];
+    Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash,
+        nested: Vec::new(),
+    }
+}
+
+/// The newest durable meta write of a crashed disk, as one directed
+/// `Lost` fault (the d10 pattern, generalized over the ckpt_id: the
+/// highest valid meta the faultless round made durable, its last write
+/// in issue order).
+fn es1_newest_meta_lost(base: &harness::RoundOutcome) -> e4_recovery::sim::MediaFault {
+    es_meta_lost(base, None)
+}
+
+/// [`es1_newest_meta_lost`] for one named meta id (`Some(k)`), or the
+/// newest (`None`).
+fn es_meta_lost(base: &harness::RoundOutcome, want: Option<u64>) -> e4_recovery::sim::MediaFault {
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("es: the page file");
+    let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
+    for w in base.crashed_disk.dwrites_of(pf).iter() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && want.is_none_or(|k| m.ckpt_id == k)
+            && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
+        {
+            best = Some((
+                m.ckpt_id,
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: w.off,
+                    len: 4096,
+                    bytes: w.bytes.clone(),
+                    pre: w.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Lost,
+                },
+            ));
+        }
+    }
+    best.expect("es: the named durable meta write exists").1
+}
+
+/// One directed-fault es1 round (the d17 runner shape: class MP, the
+/// fault applied after F-CRASH, a twin collector supplied).
+fn es1_fault_round(
+    seed: u64,
+    script: &Script,
+    fault: e4_recovery::sim::MediaFault,
+) -> harness::RoundOutcome {
+    let (disk, st) = harness::create_store(cfg(None), seed, 7).expect("create");
+    let mut twin = Vec::new();
+    harness::run_round(
+        seed,
+        0,
+        script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: vec![fault],
+            no_r_taint: false,
+            media: e4_recovery::harness::MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
+        None,
+    )
+}
+
+/// **E4-R1 (card E4-SILENT-1):** a lost forced-checkpoint header must
+/// not serve a published bulk load with its loaded entries missing.
+/// The eval appendix's script at six crash points
+/// (`CrashSpec::TaskYield(1, n)`, `n` in `4..=9`, seed 4242, 20
+/// entries). The faultless class C round passes at every `n` and
+/// supplies the newest meta write. At `n` 5 and 6 (the forced meta 2 is
+/// newest) a directed `Lost` on it gives no opened meta, a detection at
+/// `open`, `pass` and not `served`. At the others it opens and passes.
+#[test]
+fn es1_lost_forced_header_refused() {
+    for n in 4u64..=9 {
+        let script = es1_script(Some(CrashSpec::TaskYield(1, n)), Vec::new());
+        let base = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            base.pass && base.opened_ckpt_id.is_some(),
+            "es1 n={n}: the faultless round passes with an opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+            base.pass,
+            base.opened_ckpt_id,
+            base.o1,
+            base.o3_fail,
+            base.task_error
+        );
+        let out = es1_fault_round(4242, &script, es1_newest_meta_lost(&base));
+        if n == 5 || n == 6 {
+            assert!(
+                out.opened_ckpt_id.is_none(),
+                "es1 n={n}: the older image must never be opened (opened={:?}, det={:?})",
+                out.opened_ckpt_id,
+                out.detections
+            );
+            assert!(
+                out.detections.contains(&"open"),
+                "es1 n={n}: the refusal is a detection at open (det={:?})",
+                out.detections
+            );
+            assert!(
+                out.pass,
+                "es1 n={n}: the detected refusal passes (o1={:?}, o3={:?}, te={:?})",
+                out.o1, out.o3_fail, out.task_error
+            );
+            assert!(
+                !out.served,
+                "es1 n={n}: nothing is served from the refused image"
+            );
+        } else {
+            assert!(
+                out.pass && out.opened_ckpt_id.is_some(),
+                "es1 n={n}: the fall-back opens an image at or above the dependency and passes (pass={}, opened={:?}, det={:?}, o1={:?}, o3={:?})",
+                out.pass,
+                out.opened_ckpt_id,
+                out.detections,
+                out.o1,
+                out.o3_fail
+            );
+        }
+    }
+}
+
+/// **E4-R1:** a torn or far-misdirected forced header is refused too —
+/// the same script at `n` = 6, the newest (forced) meta write faulted
+/// as `Torn` (one reverted sector breaks the meta's CRC) and as
+/// `Misdirected` to a far, unreferenced slot. Both revert the meta slot
+/// to its previous content, so open falls back to meta 1 and the
+/// publication's dependency refuses it (header-design-verify §1.1: both
+/// were the same silent wrong data pre-fix).
+#[test]
+fn es1_torn_or_misdirected_forced_header_refused() {
+    let script = es1_script(Some(CrashSpec::TaskYield(1, 6)), Vec::new());
+    let base = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(base.pass, "es1 torn/mis: the faultless round passes");
+    let lost = es1_newest_meta_lost(&base);
+    for kind in [
+        e4_recovery::sim::MediaKind::Torn {
+            // The meta's fields and CRC all live in [0, 512); a sector
+            // in the zero tail reverts zeros to zeros and the meta
+            // stays valid.
+            sectors: vec![lost.off],
+        },
+        e4_recovery::sim::MediaKind::Misdirected {
+            to_off: lost.off + 100 * 4096,
+        },
+    ] {
+        let fault = e4_recovery::sim::MediaFault {
+            kind,
+            ..lost.clone()
+        };
+        let out = es1_fault_round(4242, &script, fault);
+        assert!(
+            out.opened_ckpt_id.is_none()
+                && out.detections.contains(&"open")
+                && out.pass
+                && !out.served,
+            "es1 torn/misdirected: the forced header's loss is refused, detected, passing, never served (opened={:?}, det={:?}, pass={}, served={}, o1={:?}, o3={:?})",
+            out.opened_ckpt_id,
+            out.detections,
+            out.pass,
+            out.served,
+            out.o1,
+            out.o3_fail
+        );
+    }
+}
+
+/// **E4-R1's deliberate over-refusals, pinned** (header-design-verify
+/// §1.5): a tree dropped after publication, and a tree with logged
+/// writes after publication — neither can serve wrong data, but the
+/// replay still crosses the publication over an image older than its
+/// dependency, and the rule refuses both. Extra logged commit between
+/// the last put and the yields; the crash at task 1's yield 7 (after
+/// the extra commit, with the forced meta 2 still newest).
+#[test]
+fn es1_over_refusals_pinned() {
+    for extra in [
+        // A drop is the catalog Delete plus the DropTree, in one commit
+        // (the model's contract, model.rs's header).
+        vec![
+            Op::Delete {
+                tree: CATALOG,
+                key: to_be64(5),
+            },
+            Op::DropTree { tree: 5 },
+        ],
+        (100..104u64)
+            .map(|i| Op::Put {
+                tree: 5,
+                key: i.to_be_bytes().to_vec(),
+                value: vec![9u8; 8],
+            })
+            .collect(),
+    ] {
+        let script = es1_script(Some(CrashSpec::TaskYield(1, 7)), extra);
+        let base = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            base.pass && base.opened_ckpt_id.is_some(),
+            "es1 over-refusal: the faultless round passes (pass={}, opened={:?}, o1={:?}, te={:?})",
+            base.pass,
+            base.opened_ckpt_id,
+            base.o1,
+            base.task_error
+        );
+        let out = es1_fault_round(4242, &script, es1_newest_meta_lost(&base));
+        assert!(
+            out.opened_ckpt_id.is_none()
+                && out.detections.contains(&"open")
+                && out.pass
+                && !out.served,
+            "es1 over-refusal: refused at open, passing, never served (opened={:?}, det={:?}, pass={}, served={})",
+            out.opened_ckpt_id,
+            out.detections,
+            out.pass,
+            out.served
+        );
+    }
+}
+
+/// The newest durable meta write of a crashed disk, as `(ckpt_id,
+/// fault)` — or `None` when the disk holds no durable meta write (a
+/// round whose crash never fired; the family's [`es1_newest_meta_lost`]
+/// expects one and is only used on rounds that crashed).
+fn es1p_newest_meta(base: &harness::RoundOutcome) -> Option<(u64, e4_recovery::sim::MediaFault)> {
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("es: the page file");
+    let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
+    for w in base.crashed_disk.dwrites_of(pf).iter() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
+        {
+            best = Some((
+                m.ckpt_id,
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: w.off,
+                    len: 4096,
+                    bytes: w.bytes.clone(),
+                    pre: w.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Lost,
+                },
+            ));
+        }
+    }
+    best
+}
+
+/// **E4-R1 (card X-5c-PINS-2 item 7; E4-SILENT-1's verdict `8d679ccd`
+/// finding 5, Follow-ups F1): every publication is checked — a
+/// two-publication round.** The script (gate case `g8`'s shape, seeds
+/// 4242 and 91, `TaskYield(1, n)` over `n` in `0..16`, the newest meta
+/// faulted `Lost`, `Torn` and `Misdirected`): setup and a logged
+/// commit, a checkpoint (meta 1), bulk load A on tree 5 with its forced
+/// checkpoint (meta 2) and publication A (`RequireCkpt{2}`), then bulk
+/// load B on tree 6 with its forced checkpoint (meta 3) and publication
+/// B (`RequireCkpt{3}`). The script drives exactly three checkpoints —
+/// ids 1 (the explicit one), 2 (A's forced), 3 (B's forced) — over the
+/// initial meta 0, with the round-end harness checkpoint as meta 4.
+/// When the newest durable meta is **B's own checkpoint (kmax == 3**,
+/// measured: `n` 6 at both seeds, all three fault kinds), a fault on it
+/// reverts the slot to the meta before, the open falls back to meta 2,
+/// A's dependency is satisfied, **B's is violated, and the open must
+/// refuse on B** — a detection at `open`, no image opened
+/// (`E4_SILENT_REFUSE rule=R1 opened=2 need=3`). The check that stops
+/// at the first `RequireCkpt` op (gate mutant **OWN-FIRSTONLY**) checks
+/// A's satisfied op, stops, and serves B's tree from an image older
+/// than B's dependency — silent wrong data, an `O-3(d)` round — which
+/// the no-silent-Ok assertion forbids. Measured per `n` at this tip:
+/// `n` 1–3 (kmax 0), `n` 5 (kmax 2, refused on A) and `n` 6 (kmax 3,
+/// refused on B) refuse at `open`; `n` 4 (kmax 1) opens meta 0 and
+/// passes; `n` 0 and 7–15 (kmax 4, the harness checkpoint newest) open
+/// meta 3 and pass — 30 refusing cells of 96, `served` false on every
+/// faulted cell (recorded, never asserted).
+#[test]
+fn es1_two_publications_each_checked() {
+    let mut refusals = 0u32;
+    for seed in [4242u64, 91] {
+        for n in 0u64..16 {
+            let script = es1_script_two_pub(Some(CrashSpec::TaskYield(1, n)));
+            let base = run(seed, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+            assert!(
+                base.pass && base.opened_ckpt_id.is_some(),
+                "es1 two-pub seed {seed} n={n}: the faultless round passes with an \
+                 opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+                base.pass,
+                base.opened_ckpt_id,
+                base.o1,
+                base.o3_fail,
+                base.task_error
+            );
+            let Some((kmax, lost)) = es1p_newest_meta(&base) else {
+                continue;
+            };
+            for kind in [
+                e4_recovery::sim::MediaKind::Lost,
+                e4_recovery::sim::MediaKind::Torn {
+                    // The meta's fields and CRC all live in [0, 512);
+                    // a sector in the zero tail reverts zeros to zeros
+                    // and the meta stays valid — so fault the meta's
+                    // own sector (the torn/misdirected kinds of
+                    // es1_torn_or_misdirected_forced_header_refused).
+                    sectors: vec![lost.off],
+                },
+                e4_recovery::sim::MediaKind::Misdirected {
+                    to_off: lost.off + 100 * 4096,
+                },
+            ] {
+                let fault = e4_recovery::sim::MediaFault {
+                    kind,
+                    ..lost.clone()
+                };
+                let out = es1_fault_round(seed, &script, fault);
+                let silent_ok = out
+                    .o3_fail
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("O-3(d)"));
+                assert!(
+                    !silent_ok,
+                    "es1 two-pub seed {seed} n={n} kmax={kmax}: a faulted round must \
+                     never read O-3(d) silent Ok (OWN-FIRSTONLY stops at A's op and \
+                     serves B over an older image; o3={:?}, o1={:?}, opened={:?})",
+                    out.o3_fail, out.o1, out.opened_ckpt_id
+                );
+                if kmax == 3 {
+                    assert!(
+                        out.opened_ckpt_id.is_none() && out.detections.contains(&"open"),
+                        "es1 two-pub seed {seed} n={n}: the newest meta is publication \
+                         B's own checkpoint (kmax 3), so the open must refuse on B — a \
+                         detection at open (opened={:?}, det={:?}, pass={}, o1={:?})",
+                        out.opened_ckpt_id,
+                        out.detections,
+                        out.pass,
+                        out.o1
+                    );
+                    refusals += 1;
+                }
+                // `served` is recorded per n, never asserted (the es1
+                // family's refused_old_page shape may keep it true).
+                let _ = out.served;
+            }
+        }
+    }
+    assert!(
+        refusals > 0,
+        "the matrix must hold refusals (the newest meta = B's own checkpoint, \
+         faulted Lost/Torn/Misdirected)"
+    );
+}
+
+/// **E4-R1's healthy-store proof:** the faultless class C round at
+/// every crash point `n` in `0..40` passes with an opened meta — the
+/// dependency op never fires on a store whose newest valid meta is at
+/// or above `id` (M-R1-GE, which refuses at `id >= ckpt_id`, fails
+/// here: at `n` 5 and 6 the publish replays above meta 2's own `T` with
+/// `id == ckpt_id == 2`).
+#[test]
+fn es1_faultless_every_crash_point() {
+    for n in 0u64..40 {
+        let script = es1_script(Some(CrashSpec::TaskYield(1, n)), Vec::new());
+        let out = run(4242, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            out.pass && out.opened_ckpt_id.is_some(),
+            "es1 faultless n={n}: pass with an opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+            out.pass,
+            out.opened_ckpt_id,
+            out.o1,
+            out.o3_fail,
+            out.task_error
+        );
+    }
+}
+
+// ---- E4-R2 (card E4-SILENT-1 step 2: an open needs proof its log
+// start survives) ----
+
+/// The es2 setup: the standard publication of tree 2.
+fn es2_setup() -> ScriptOp {
+    ScriptOp::Commit {
+        sync_on: true,
+        ops: vec![
+            Op::CreateTree { tree: 2 },
+            Op::CreateTree { tree: CATALOG },
+            publish(2),
+        ],
+    }
+}
+
+/// Seven commits of 100 puts of 120 bytes each — enough logged bytes to
+/// push the append position across segment 0 (~100 KiB of records).
+fn es2_seven_commits() -> Vec<ScriptOp> {
+    (0..7u64)
+        .map(|k| ScriptOp::Commit {
+            sync_on: true,
+            ops: ((k * 100)..((k + 1) * 100))
+                .map(|i| putv(i, 1, 120))
+                .collect(),
+        })
+        .collect()
+}
+
+/// **E4-R2 (card E4-SILENT-1; header-design-verify §1.4's first row):**
+/// a lost header over a recycled start segment must not open with
+/// acknowledged commits gone. Setup, seven commits of 100 puts of 120
+/// bytes, one checkpoint (meta 1, start above 0; its step 6 recycles
+/// segment 0), the crash at `CkptHook::After6` of checkpoint 0, seed
+/// 77. The faultless round passes with metas 0 (start 0) and 1 (start
+/// above 0). A directed `Lost` on meta 1 falls back to meta 0, whose
+/// start segment was recycled while another segment is present — the
+/// E4-R2 arm refuses at G3: no opened meta, a detection at `open`,
+/// `pass`, not `served` (pre-fix this opened an empty database with
+/// every acked commit gone, silently).
+#[test]
+fn es2_recycled_start_zero_refused() {
+    let mut ops = vec![es2_setup()];
+    ops.extend(es2_seven_commits());
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Yields(3));
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 0,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let base = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass && base.opened_ckpt_id == Some(1),
+        "es2 recycled: the faultless round passes opening meta 1 (pass={}, opened={:?}, o1={:?}, te={:?})",
+        base.pass,
+        base.opened_ckpt_id,
+        base.o1,
+        base.task_error
+    );
+    let out = es1_fault_round(77, &script, es_meta_lost(&base, Some(1)));
+    assert!(
+        out.opened_ckpt_id.is_none() && out.detections.contains(&"open") && out.pass && !out.served,
+        "es2 recycled: the start-0 meta over a recycled segment 0 is refused at G3, detected, passing, never served (opened={:?}, det={:?}, pass={}, served={}, o1={:?}, o3={:?})",
+        out.opened_ckpt_id,
+        out.detections,
+        out.pass,
+        out.served,
+        out.o1,
+        out.o3_fail
+    );
+}
+
+/// **E4-R2's control:** a start **above** 0 whose segment was recycled
+/// is refused exactly as at the Base — E4-R2 changes nothing on that
+/// path. Setup, one commit of one put, a checkpoint (meta 1, a small
+/// nonzero start inside segment 0), the same seven commits, a second
+/// checkpoint (meta 2, start above 0; its step 6 recycles segment 0),
+/// the crash at `CkptHook::After6` of checkpoint 1, seed 77. A directed
+/// `Lost` on the newest meta (2) falls back to meta 1, whose start sits
+/// in the recycled segment 0: G3's start-above-0 arm refuses, as it
+/// always has.
+#[test]
+fn es2_nonzero_start_control() {
+    let mut ops = vec![
+        es2_setup(),
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(0, 1)],
+        },
+        ScriptOp::Checkpoint,
+    ];
+    ops.extend(es2_seven_commits());
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Yields(3));
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 1,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let base = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass && base.opened_ckpt_id == Some(2),
+        "es2 control: the faultless round passes opening meta 2 (pass={}, opened={:?}, o1={:?}, te={:?})",
+        base.pass,
+        base.opened_ckpt_id,
+        base.o1,
+        base.task_error
+    );
+    let out = es1_fault_round(77, &script, es1_newest_meta_lost(&base));
+    assert!(
+        out.opened_ckpt_id.is_none() && out.detections.contains(&"open") && out.pass && !out.served,
+        "es2 control: the nonzero start in a recycled segment refuses at G3 as at the Base (opened={:?}, det={:?}, pass={}, served={})",
+        out.opened_ckpt_id,
+        out.detections,
+        out.pass,
+        out.served
+    );
+}
+
+/// **E4-R2's healthy-store proof:** the start-0 arm never fires on a
+/// healthy store. The same script as `es2_recycled_start_zero_refused`
+/// at `CrashSpec::TaskYield(1, n)` for `n` in `0..30`, and a
+/// one-commit script at `n` in `0..4` (the store with no segment at
+/// all — the empty-directory exception): `pass` and an opened meta at
+/// every point. M-R2-ALWAYS (no empty-directory exception) and
+/// M-R2-ANYNAME (no `*.log` filter, so `.keep` counts) both fail the
+/// one-commit arm.
+#[test]
+fn es2_healthy_start_zero_every_crash_point() {
+    let mut ops = vec![es2_setup()];
+    ops.extend(es2_seven_commits());
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Yields(3));
+    for n in 0u64..30 {
+        let script = Script {
+            tasks: vec![ScriptTask { ops: ops.clone() }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, n)),
+            nested: Vec::new(),
+        };
+        let out = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            out.pass && out.opened_ckpt_id.is_some(),
+            "es2 healthy n={n}: pass with an opened meta (pass={}, opened={:?}, o1={:?}, o3={:?}, te={:?})",
+            out.pass,
+            out.opened_ckpt_id,
+            out.o1,
+            out.o3_fail,
+            out.task_error
+        );
+    }
+    // The store with no segment: one commit, then yields; the crash at
+    // n=1 lands before the commit, so no record was ever appended and
+    // `/wal/` holds only `.keep`.
+    for n in 0u64..4 {
+        let script = Script {
+            tasks: vec![ScriptTask {
+                ops: vec![es2_setup(), ScriptOp::Yields(3)],
+            }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, n)),
+            nested: Vec::new(),
+        };
+        let out = run(77, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+        assert!(
+            out.pass && out.opened_ckpt_id.is_some(),
+            "es2 healthy one-commit n={n}: the store with no segment opens (pass={}, opened={:?}, o1={:?}, te={:?})",
+            out.pass,
+            out.opened_ckpt_id,
+            out.o1,
+            out.task_error
+        );
+    }
+}
+
+/// **X-5c-F4-F7's unit pin (owner ruling 2026-11-14; P's fix,
+/// `E4-final-diagnostics.md` §A.3 step 4): `SimDisk::heal_media`
+/// restores exactly the no-fault bytes on a re-seeded twin's cloned
+/// disk, and touches nothing else.** A synthetic page file with four
+/// twice-written slots takes one LOST (slot 3), one TORN (slot 5) and
+/// one MISDIRECTED (slot 9's write, its stray bytes landing on slot
+/// 7): healing must return the bytes the file held before any fault —
+/// the in-order composition of its durable writes — over all four
+/// damaged ranges (three own ranges and the misdirect's landing), leave
+/// every other byte alone, and clear the taint at every damaged range.
+///
+/// It also pins the card's two bounds: the fault **history
+/// (`disk.media`) is kept** (X-5c-F4-F7's documented choice — the heal
+/// acts on bytes, not on the bookkeeping list the real chain's oracle
+/// arms read), and a damaged range that is **not live** is untouched
+/// (a synced rewrite after the fault already holds the issued bytes, so
+/// the heal is a no-op there — with no live range anywhere it is a no-op
+/// everywhere, card Limit 1). **M-TWIN-NO-HEAL** (skip the heal
+/// entirely) fails the seed pins in `tests/workload.rs`, not this one.
+#[test]
+fn x5f4f7_heal_media_restores_the_no_fault_bytes() {
+    use e4_recovery::sim::{MediaFault, MediaKind, ROOT_DIR, SimDisk};
+
+    let mut disk = SimDisk::new();
+    let f = disk.create("/pages").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    // Four twice-written slots: every faulted write has a non-trivial
+    // pre-image (its slot's first write), and the composition over a
+    // slot is its second write.
+    for slot in [3u64, 5, 7, 9] {
+        disk.write_at(f, slot * 4096, &vec![(slot as u8) * 2; 4096])
+            .unwrap();
+        disk.sync_all(f).unwrap();
+        disk.write_at(f, slot * 4096, &vec![(slot as u8) * 2 + 1; 4096])
+            .unwrap();
+        disk.sync_all(f).unwrap();
+    }
+    let mut clean = disk.clone();
+    let dw = disk.dwrites_of(f).to_vec();
+    let second_write = |slot: u64| {
+        dw.iter()
+            .filter(|w| w.off == slot * 4096)
+            .nth(1)
+            .unwrap()
+            .clone()
+    };
+
+    let lost = second_write(3);
+    let torn = second_write(5);
+    let mis = second_write(9);
+    disk.apply_one_media_fault(&MediaFault {
+        inode: f,
+        off: lost.off,
+        len: lost.bytes.len() as u64,
+        bytes: lost.bytes.clone(),
+        pre: lost.pre.clone(),
+        kind: MediaKind::Lost,
+    });
+    disk.apply_one_media_fault(&MediaFault {
+        inode: f,
+        off: torn.off,
+        len: torn.bytes.len() as u64,
+        bytes: torn.bytes.clone(),
+        pre: torn.pre.clone(),
+        kind: MediaKind::Torn {
+            sectors: vec![torn.off + 512, torn.off + 2048],
+        },
+    });
+    disk.apply_one_media_fault(&MediaFault {
+        inode: f,
+        off: mis.off,
+        len: mis.bytes.len() as u64,
+        bytes: mis.bytes.clone(),
+        pre: mis.pre.clone(),
+        kind: MediaKind::Misdirected { to_off: 7 * 4096 },
+    });
+    // All four damaged ranges are live before the heal (durable differs
+    // from the last issued bytes on each).
+    for (off, len) in [
+        (3 * 4096u64, 4096u64),
+        (5 * 4096, 4096),
+        (9 * 4096, 4096),
+        (7 * 4096, 4096),
+    ] {
+        assert!(
+            disk.range_tainted(f, off, len),
+            "slot {}: the fault must leave the range live before the heal",
+            off / 4096
+        );
+    }
+
+    let still = disk.heal_media();
+    assert!(
+        still.is_empty(),
+        "the heal must leave no damaged range tainted: {still:?}"
+    );
+
+    // Exactly the no-fault bytes, and no other byte: the healed disk
+    // equals the clean clone everywhere, durable and current view.
+    let extent = 10 * 4096u64;
+    assert_eq!(
+        disk.durable_read(f, 0, extent),
+        clean.durable_read(f, 0, extent),
+        "the healed durable bytes must equal the no-fault clone's, byte for byte"
+    );
+    assert_eq!(
+        disk.read_at(f, 0, extent).unwrap(),
+        clean.read_at(f, 0, extent).unwrap(),
+        "the healed current view must equal the no-fault clone's, byte for byte"
+    );
+
+    // The fault history is kept (X-5c-F4-F7's documented choice).
+    assert_eq!(
+        disk.media.len(),
+        3,
+        "the heal keeps the fault history (disk.media), all three faults"
+    );
+    assert!(matches!(disk.media[0].kind, MediaKind::Lost));
+    assert!(matches!(disk.media[1].kind, MediaKind::Torn { .. }));
+    assert!(matches!(disk.media[2].kind, MediaKind::Misdirected { .. }));
+
+    // A damaged range that is not live is untouched: after the LOST, a
+    // fresh synced write re-covers the slot, durable equals the issued
+    // bytes again, and the heal must not revert the newer bytes.
+    let mut disk2 = SimDisk::new();
+    let f2 = disk2.create("/pages").unwrap();
+    disk2.sync_dir(ROOT_DIR).unwrap();
+    disk2.write_at(f2, 3 * 4096, &[6u8; 4096]).unwrap();
+    disk2.sync_all(f2).unwrap();
+    disk2.write_at(f2, 3 * 4096, &[7u8; 4096]).unwrap();
+    disk2.sync_all(f2).unwrap();
+    let w2 = disk2.dwrites_of(f2).iter().last().unwrap().clone();
+    disk2.apply_one_media_fault(&MediaFault {
+        inode: f2,
+        off: w2.off,
+        len: w2.bytes.len() as u64,
+        bytes: w2.bytes.clone(),
+        pre: w2.pre.clone(),
+        kind: MediaKind::Lost,
+    });
+    disk2.write_at(f2, 3 * 4096, &[42u8; 4096]).unwrap();
+    disk2.sync_all(f2).unwrap();
+    let still2 = disk2.heal_media();
+    assert!(
+        still2.is_empty(),
+        "a not-live damaged range heals nothing: {still2:?}"
+    );
+    assert!(
+        disk2
+            .durable_read(f2, 3 * 4096, 4096)
+            .iter()
+            .all(|&b| b == 42),
+        "the heal must keep the post-fault synced write's bytes (no revert to the \
+         faulted write or its pre-image)"
+    );
+}

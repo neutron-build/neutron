@@ -1167,10 +1167,26 @@ pub fn dir_load<H: StoreHost>(
     Ok(out)
 }
 
-/// `DropTree(id)` (§6.8): set `dropping`, free the tree's pages bottom-up
-/// in bounded gated steps (one leaf per step, the root last), then remove
-/// the entry. DROP-ROOT-FIRST frees the root first (the mutant's leak:
-/// amcheck's LPID exactness fails).
+/// `DropTree(id)` (§6.8, as amended by S-1-F7: I-LINK-ATOMIC): set
+/// `dropping`, free the tree's pages bottom-up in bounded gated steps
+/// (the root last), and — in the **last step's own gate hold** — remove
+/// the directory entry and the in-memory `dir` record **first**, then
+/// free the emptied path top-down, root first. The last step's
+/// `PinGuard` — the root and every page the step empties, noted before
+/// its first mutation — stays live across the whole hold, through the
+/// frees (§6.8 step 3): dropped at the step's edge, the root's dirty
+/// frame was a legal eviction victim during the directory descent's
+/// I/O, and `evict:finish` resurrected the freed root into `map.cur`
+/// (mapped and free, referenced by nothing — 444 r1 and 3005 r1 of the
+/// rework verdict's scan). Entry first is what keeps every image
+/// closed: an image cut between the root free and the entry removal
+/// would hold `dropping tree → root` with the root unmapped (an open
+/// refuses it) or reused by another tree (a resumed walk frees a live
+/// page) — the two straddles of the 27 A rounds (310 r0, 8010 r1;
+/// M-DROP-ENTRY-SPLIT is today's split code). The two mutexes (the
+/// tree's and the directory's) are never nested and the gate is never
+/// taken twice. DROP-ROOT-FIRST frees the root immediately instead
+/// (the mutant's leak: amcheck's LPID exactness fails).
 pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail> {
     let entry = cx.with("drop:entry", |c| Ok(c.store().dir.get(&id).copied()))?;
     let Some(entry) = entry else {
@@ -1178,25 +1194,7 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
     };
     if !entry.dropping {
         // Step 1: the entry becomes `dropping` in one directory mutation.
-        gate_shared(cx)?;
-        if let Err(e2) = tree_lock(cx, DIR_TREE) {
-            gate_release(cx);
-            return Err(e2);
-        }
-        let mut pins = PinGuard::new(cx);
-        let dir_root = cx.with("drop:dr", |c| Ok(c.store().meta.dir_root))?;
-        let e = cx.with("drop:epoch", |c| Ok(c.store().e))?;
-        let w = dir_put_locked(cx, &mut pins, dir_root, id, entry.root, true, e);
-        drop(pins);
-        tree_unlock(cx, DIR_TREE);
-        gate_release(cx);
-        w?;
-        cx.with("drop:mark", |c| {
-            if let Some(en) = c.store().dir.get_mut(&id) {
-                en.dropping = true;
-            }
-            Ok(())
-        })?;
+        dir_mark_dropping(cx, id, entry.root)?;
     }
     if cx.with("drop:mut", |c| {
         Ok(matches!(c.store().cfg.mutant, Some(Mutant::DropRootFirst)))
@@ -1217,7 +1215,14 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
         dir_remove_entry(cx, id)?;
         return Ok(true);
     }
-    // Step 2: the bounded walk, one gated step per leaf, the root last.
+    // M-DROP-ENTRY-SPLIT (the straddle mutant, today's code): the last
+    // step frees the path inside its gate hold and the entry removal
+    // runs afterwards, in its **own** hold — the cut this card removes.
+    let entry_split = cx.with("drop:mut2", |c| {
+        Ok(matches!(c.store().cfg.mutant, Some(Mutant::DropEntrySplit)))
+    })?;
+    // Step 2: the bounded walk, one gated step per freed path, the root
+    // last.
     loop {
         let root = cx.with("drop:root3", |c| {
             Ok(c.store().dir.get(&id).map(|en| en.root).unwrap_or(0))
@@ -1229,32 +1234,164 @@ pub fn dir_drop_tree<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail
         }
         let mut pins = PinGuard::new(cx);
         let walk = drop_walk_step(cx, &mut pins, root);
-        drop(pins);
-        tree_unlock(cx, id);
-        gate_release(cx);
-        if walk?.is_none() {
-            break;
+        match walk {
+            Ok(WalkOut::Stepped) => {
+                drop(pins);
+                tree_unlock(cx, id);
+                gate_release(cx);
+            }
+            Ok(WalkOut::Last(path)) => {
+                if entry_split {
+                    // The mutant: free now, remove the entry in its own
+                    // gate hold below (bottom-up, today's order).
+                    drop(pins);
+                    let mut fr = Ok(());
+                    for lpid in path.iter().rev() {
+                        if let Err(e2) = free_lpid(cx, *lpid) {
+                            fr = Err(e2);
+                            break;
+                        }
+                    }
+                    tree_unlock(cx, id);
+                    gate_release(cx);
+                    fr?;
+                    break;
+                }
+                // **The last step (§6.8 step 3, as amended by S-1-F7;
+                // rework finding 1 of verdict X-5c-F4-F1-F1-CXX): entry
+                // first, then the free, in this one gate hold — and the
+                // step's `PinGuard` stays live across the whole hold.**
+                // The walk pinned the root and every page it empties
+                // before its first mutation; releasing the pins at the
+                // step's edge left the root's dirty frame a legal
+                // eviction victim during the directory descent's I/O:
+                // the evictor latches it, `free_lpid` clears the frame
+                // and hands the LPID to the free set, and `evict:finish`
+                // re-inserts the freed root into `map.cur` — mapped and
+                // free, referenced by nothing (444 r1 and 3005 r1, the
+                // census's blind spot). Held through the frees, the
+                // frame is not evictable and the frees themselves see
+                // the frames they clear. The tree mutex is released
+                // before the directory descent and re-taken for the
+                // frees — never nested, the gate never taken twice.
+                tree_unlock(cx, id);
+                let rm = dir_remove_entry_held(cx, id).and_then(|()| {
+                    cx.with("drop:rm", |c| {
+                        c.store().dir.remove(&id);
+                        Ok(())
+                    })
+                });
+                if let Err(e2) = rm {
+                    drop(pins);
+                    gate_release(cx);
+                    return Err(e2);
+                }
+                if let Err(e2) = tree_lock(cx, id) {
+                    drop(pins);
+                    gate_release(cx);
+                    return Err(e2);
+                }
+                // The entry is gone, so the path is unreachable: free
+                // it top-down, root first.
+                let mut fr = Ok(());
+                for lpid in path.iter() {
+                    if let Err(e2) = free_lpid(cx, *lpid) {
+                        fr = Err(e2);
+                        break;
+                    }
+                }
+                drop(pins);
+                tree_unlock(cx, id);
+                gate_release(cx);
+                fr?;
+                return Ok(true);
+            }
+            Err(e2) => {
+                drop(pins);
+                tree_unlock(cx, id);
+                gate_release(cx);
+                return Err(e2);
+            }
         }
     }
-    // Step 3: remove the entry.
+    // Step 3 (M-DROP-ENTRY-SPLIT's second hold; the fixed last step
+    // removed the entry inside its own hold above).
     dir_remove_entry(cx, id)?;
     Ok(true)
 }
-/// One DropTree walk step: free the leftmost leaf (the root last).
-/// Freeing an only child empties its parent, which is freed in the same
-/// step, cascading upward; the root is freed only when nothing remains
-/// (I-LPID-EXACT: every unlink and its free happen together).
-/// `Ok(None)` = the tree is gone.
+
+/// DropTree's step 1 alone (§6.8): set the entry's state to `dropping`
+/// in one directory mutation — the full drop's first step and the
+/// replay path's whole `DropTree` (below) share this one definition of
+/// the mark.
+fn dir_mark_dropping<H: StoreHost>(cx: &Cx<'_, H>, id: u64, root: u64) -> Result<(), Fail> {
+    gate_shared(cx)?;
+    if let Err(e2) = tree_lock(cx, DIR_TREE) {
+        gate_release(cx);
+        return Err(e2);
+    }
+    let mut pins = PinGuard::new(cx);
+    let dir_root = cx.with("drop:dr", |c| Ok(c.store().meta.dir_root))?;
+    let e = cx.with("drop:epoch", |c| Ok(c.store().e))?;
+    let w = dir_put_locked(cx, &mut pins, dir_root, id, root, true, e);
+    drop(pins);
+    tree_unlock(cx, DIR_TREE);
+    gate_release(cx);
+    w?;
+    cx.with("drop:mark", |c| {
+        if let Some(en) = c.store().dir.get_mut(&id) {
+            en.dropping = true;
+        }
+        Ok(())
+    })
+}
+
+/// A replayed `DropTree` (§14 step 4, as amended by S-1-F7): set
+/// `dropping` and do nothing else — pass 2 runs no walk; the walk is
+/// step 6's (`resume_drops`), after replay has finished allocating.
+/// Dropping an absent id does nothing.
+pub fn dir_drop_tree_replay<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<bool, Fail> {
+    let entry = cx.with("drop:entry", |c| Ok(c.store().dir.get(&id).copied()))?;
+    let Some(entry) = entry else {
+        return Ok(false); // dropping an absent id does nothing
+    };
+    if !entry.dropping {
+        dir_mark_dropping(cx, id, entry.root)?;
+    }
+    Ok(true)
+}
+
+/// One walk step's outcome.
+enum WalkOut {
+    /// The step unlinked the topmost page it empties from its parent
+    /// and freed the emptied path below it, top-down. The walk
+    /// continues.
+    Stepped,
+    /// The step empties the root (a leaf root, or only children up to
+    /// the root): the **last step**. Nothing is freed yet — the caller
+    /// closes the tree: the directory entry goes first, then this whole
+    /// path is freed top-down, root first, in the same gate hold. The
+    /// path is root-first.
+    Last(Vec<u64>),
+}
+
+/// One DropTree walk step (§6.8 as amended by S-1-F7): read first — a
+/// step frees nothing until it knows the topmost page it empties. The
+/// descent is to the leftmost leaf; if the leaf has siblings the step
+/// unlinks it and frees just it; if the chain of only children reaches
+/// up to a page with siblings, the step unlinks that page and frees the
+/// emptied path below it, top-down; if the chain reaches the root, the
+/// step is the last step ([`WalkOut::Last`], nothing freed).
 fn drop_walk_step<H: StoreHost>(
     cx: &Cx<'_, H>,
     pins: &mut PinGuard<'_, H>,
     root: u64,
-) -> Result<Option<()>, Fail> {
+) -> Result<WalkOut, Fail> {
     let e = cx.with("dropwalk:epoch", |c| Ok(c.store().e))?;
     let path = descend(cx, pins, root, &[])?;
     if path.len() == 1 {
-        free_lpid(cx, root)?;
-        return Ok(None);
+        // A leaf root: the step empties the root itself.
+        return Ok(WalkOut::Last(vec![root]));
     }
     let mut level = path.len() - 1;
     loop {
@@ -1269,26 +1406,30 @@ fn drop_walk_step<H: StoreHost>(
         let (mut seps, right) = inner_seps(&parent_bytes)?;
         match seps.iter().position(|(c, _)| *c == child_lpid) {
             Some(idx) => {
+                // The child has siblings: the topmost emptied page is
+                // the child. Unlink it from its parent, then free the
+                // emptied path below it, top-down.
                 seps.remove(idx);
                 store_page(
                     cx,
                     parent_lpid,
                     page::build_inner(parent_lpid, e, &seps_refs(&seps), right),
                 )?;
-                free_lpid(cx, child_lpid)?;
-                return Ok(Some(()));
+                for (lpid, _) in path.iter().skip(level) {
+                    free_lpid(cx, *lpid)?;
+                }
+                return Ok(WalkOut::Stepped);
             }
             None if right == child_lpid => {
                 if level == 1 {
-                    // The parent is the root and the tree is gone.
-                    free_lpid(cx, child_lpid)?;
-                    free_lpid(cx, root)?;
-                    return Ok(None);
+                    // Only children up to the root: the last step. The
+                    // whole path (root first) is the caller's to free,
+                    // after the entry removal.
+                    let path_lpids = path.iter().map(|(l, _)| *l).collect();
+                    return Ok(WalkOut::Last(path_lpids));
                 }
-                // An only child: free it and the now-empty parent, then
-                // unlink the parent one level up.
-                free_lpid(cx, child_lpid)?;
-                free_lpid(cx, parent_lpid)?;
+                // An only child: the step empties its parent too — keep
+                // climbing, freeing nothing yet.
                 level -= 1;
             }
             None => {
@@ -1298,13 +1439,30 @@ fn drop_walk_step<H: StoreHost>(
     }
 }
 
-/// Remove a directory entry and the in-memory dir record (idempotent).
+/// Remove a directory entry and the in-memory dir record (idempotent),
+/// in the entry removal's own gate hold. The DropTree walk's **last
+/// step** must not use this: it removes the entry inside its own
+/// already-held gate (via [`dir_remove_entry_held`]) so the root free
+/// and the entry removal are one gated operation (I-LINK-ATOMIC).
 fn dir_remove_entry<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<(), Fail> {
     gate_shared(cx)?;
-    if let Err(e) = tree_lock(cx, DIR_TREE) {
-        gate_release(cx);
-        return Err(e);
-    }
+    let r = dir_remove_entry_held(cx, id);
+    gate_release(cx);
+    r?;
+    cx.with("drop:rm", |c| {
+        c.store().dir.remove(&id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// The entry removal under a gate the caller already holds (its step
+/// names, its latches): descend the directory, rewrite its leaf without
+/// the entry. The in-memory `dir` record is the caller's to remove (the
+/// last step removes it before its frees; the standalone wrapper after
+/// the release).
+fn dir_remove_entry_held<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<(), Fail> {
+    tree_lock(cx, DIR_TREE)?;
     let mut pins = PinGuard::new(cx);
     let dir_root = cx.with("drop:dr2", |c| Ok(c.store().meta.dir_root))?;
     let e = cx.with("drop:epoch2", |c| Ok(c.store().e))?;
@@ -1329,11 +1487,6 @@ fn dir_remove_entry<H: StoreHost>(cx: &Cx<'_, H>, id: u64) -> Result<(), Fail> {
     }
     drop(pins);
     tree_unlock(cx, DIR_TREE);
-    gate_release(cx);
-    cx.with("drop:rm", |c| {
-        c.store().dir.remove(&id);
-        Ok(())
-    })?;
     Ok(())
 }
 

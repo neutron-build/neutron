@@ -10,6 +10,12 @@
 //! (card X-5b Work 11): a `try_lock` whose violation reports
 //! [`SimFail::Baton`] naming the call site instead of hanging.
 //!
+//! The two exceptions, both **not** yield points (they take the world
+//! under rule 4 and return without offering the baton):
+//! [`E4Env::accepted`] (card 1.4's hook, a bookkeeping record) and
+//! [`E4Env::wal_names`] (E4-R2's G3 probe listing — the card's Limit 4:
+//! "at start 0 the G3 probe is yield-free").
+//!
 //! The trait is deliberately shaped like the env surface A-1a/A-1b will
 //! provide (`open/create/rename/unlink/sync_dir` for files, plus
 //! `read_at/write_at/set_len/sync_data/sync_all`), so swapping in
@@ -73,6 +79,16 @@ pub trait E4Env {
     /// caller must propagate it: an accept that silently fails to record
     /// fails open on an oracle input (the X-5b gate's minor finding).
     fn accepted(&mut self, f: FileId, off: u64, len: u64) -> Result<(), SimFail>;
+    /// **E4-R2 (card E4-SILENT-1): the names currently bound in `/wal/`**
+    /// (sorted), for the store's G3 probe at `wal_start_lsn == 0`.
+    /// **Not a yield point** (unlike every I/O op above): a listing of
+    /// the current directory view cannot hand the baton elsewhere — the
+    /// verification's probe form (which called `exists` here and so
+    /// yielded at every start-0 open) moved 19 seeds' `nested` draws
+    /// alone; this form adds no yield on any path a seed reaches. It
+    /// still acquires the world under S-BATON rule 4, so `Err` is a
+    /// world-acquisition failure exactly as for [`Self::accepted`].
+    fn wal_names(&mut self) -> Result<Vec<String>, SimFail>;
 }
 
 /// A bound view of the world for one task: store code obtains it from its
@@ -176,5 +192,10 @@ impl<'a, H: SchedHost + HasDisk> E4Env for EnvRef<'a, H> {
         let mut g = self.sched.acquire(self.task, "env:accepted")?;
         g.disk().accepted(f, off, len);
         Ok(())
+    }
+
+    fn wal_names(&mut self) -> Result<Vec<String>, SimFail> {
+        // E4-R2: built on `step` with no yield (see the trait's doc).
+        self.step("env:wal_names", |h| Ok(h.disk().dir_names(WAL_DIR)))
     }
 }

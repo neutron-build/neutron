@@ -114,6 +114,18 @@ pub enum Mutant {
     InplaceEvict,
     /// I-LPID-EXACT: DropTree frees the root first.
     DropRootFirst,
+    /// I-CKPT-AT-T (X-5c-F4-F1-F1-CXX, cause B1): `epoch_copy:record`
+    /// clears the exhausted reserve's frame unconditionally — the
+    /// re-validation after the write-out's yield is skipped, so a second
+    /// exhausted task destroys the copy the first refilled (today's
+    /// code, the 18 B1 rounds of the C-XX census).
+    ExhaustNoRevalidate,
+    /// I-LINK-ATOMIC (X-5c-F4-F1-F1-CXX, cause A): the DropTree walk's
+    /// last step frees the path inside its gate hold and the directory
+    /// entry's removal runs in its **own** hold afterwards — the
+    /// straddle a flip can cut (today's code, the 27 A rounds of the
+    /// C-XX census).
+    DropEntrySplit,
     /// G1: no `sync_dir` after segment create/rename.
     RenameNoDirsync,
     /// G2: recovery truncates logically, not physically.
@@ -127,6 +139,33 @@ pub enum Mutant {
     /// is `open`'s call to [`page::select_meta`]; amcheck, the monitors
     /// and the harness walks keep the check unconditionally.
     MetaWrongSlot,
+    /// **X5-R43 (card X-5c-F4-F1-F1-F3 step 7; the verdict's seeded
+    /// Joint fault, owner decision of 2026-11-05 — `M-REUSE-DROPS-IMG`):
+    /// `alloc_lpid`'s reuse removes `map.img[l]`.** A window reuse hands
+    /// out an LPID the image being built still maps; the fault drops
+    /// that image entry, so the finished image leaves the page unmapped
+    /// (the freed LPID's `cur` is gone) and the page's content is lost
+    /// from image k — the one true SMO-against-SMO interaction §4.2's
+    /// immediate reuse admits. Inert when `cfg.mutant` is `None`; the
+    /// single site is `alloc_lpid`'s reuse branch.
+    ReuseDropsImg,
+    /// **X5-R43 (the verdict's seeded Slot fault, I-FREE-SAFE's shape —
+    /// `M-FREE-HOME-ALLOC`): `free_lpid` removes the freed LPID's
+    /// durable home from `used_durable`, `image_refs` and
+    /// `used_cur`.** With all three references dropped the slot is
+    /// allocatable at once while meta k−1 still references it — a
+    /// crash before meta k is durable opens image k−1 over the wrong
+    /// bytes. The `used_cur` line is the F3 gate's prototype form,
+    /// restored by X-5c-F4-F1-F1-F3-F1 step 1a: F3's card text dropped
+    /// it, which made the mutant inert at F3's tip (the clean free
+    /// never released `used_cur` there, so no slot ever became
+    /// allocatable — verdict X-5c-F4-F1-F1-F3 finding D1). Since X5-R49
+    /// (a) the clean free releases `used_cur` unconditionally, so the
+    /// mutant's own removal is redundant at runtime; it is kept anyway
+    /// so the fault never depends on the clean release. Inert when
+    /// `cfg.mutant` is `None`; the single site is `free_lpid`'s
+    /// home-release.
+    FreeHomeAlloc,
 }
 
 /// Store configuration (card 3.3–3.4 with the Work 12 amendment, 4.1).
@@ -321,11 +360,19 @@ pub struct FrozenImage {
     pub slot_count: u64,
 }
 
-/// Slot bookkeeping (§4.4–§4.5).
+/// Slot bookkeeping (§4.4–§4.5). The four sets are the allocator's
+/// whole decision — [`crate::store::prims::slot_free`] is its only
+/// test — and their discipline is X5-R49 (card
+/// X-5c-F4-F1-F1-F3-F2): a freed LPID's home leaves `used_cur` at the
+/// free itself (§4.4's last paragraph when no image holds it), a slot
+/// image k−1 references and image k does not moves to `pending_free`
+/// at post-5 and is released only at step 6 (§13 step 6).
 #[derive(Debug, Default, Clone)]
 pub struct SlotState {
     /// Current homes (the current map's pages, plus the current image's
-    /// map/free-set pages).
+    /// map/free-set pages). A freed LPID's home leaves this set in
+    /// `free_lpid`'s own atomic step (X5-R49 (a)), so the set never
+    /// outlives the map entry it stood for.
     pub used_cur: BTreeSet<u64>,
     /// The durable image's referenced slots (all of them: data, map and
     /// free-set pages).
@@ -333,7 +380,11 @@ pub struct SlotState {
     /// Slots frozen into `At` overrides of the image being built (from
     /// freeze to step 5): protected from reuse while image k needs them.
     pub image_refs: BTreeSet<u64>,
-    /// Slots freed at step 6 (between the frees and the recycle).
+    /// Slots referenced by image k−1 and not by image k, moved here at
+    /// post-5; `alloc_slot` refuses them, and §13 step 6's clearance
+    /// (between the frees and the WAL recycle) is their release point —
+    /// a slot becomes allocatable at step 6, not at post-5 (I-FREE-SAFE,
+    /// X5-R49 (b)).
     pub pending_free: BTreeSet<u64>,
     /// The file length in slots.
     pub slot_count: u64,
@@ -445,6 +496,23 @@ pub struct StoreInner {
     pub ckpt_splits: u64,
     /// Merges inside the open checkpoint window (Q4).
     pub ckpt_merges: u64,
+    /// **X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 step 2; a store
+    /// observable, never a behaviour input): `alloc_lpid` reuses inside
+    /// the open checkpoint window that handed out an LPID freed since
+    /// this flip** — a reuse during the flip window of an LPID the image
+    /// being built still maps (`map.img` holds it), reset at each
+    /// `ckpt:begin` exactly like `ckpt_splits`/`ckpt_merges`. The Q4
+    /// reuse half (`q4reuse`) reads it.
+    pub ckpt_reuse: u64,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2a; a store observable,
+    /// never a behaviour input): the pre-freeze half of
+    /// [`ckpt_reuse`](Self::ckpt_reuse)** — the same window reuses
+    /// counted only while `image_frozen.is_none()`, i.e. from
+    /// `ckpt:begin` until this checkpoint's step 2 map phase froze the
+    /// table, reset beside `ckpt_reuse`. Q4-I's row reads this count
+    /// (the owner's row text: "reused **before its step 2 froze the
+    /// table**"); `ckpt_reuse` keeps the whole window for the Q4 arm.
+    pub ckpt_reuse_pf: u64,
     /// R_EPOCH exhaustion count (Q10).
     pub epoch_exhausted: u64,
     /// The free-set serialisation grew the file (Q17).
@@ -595,6 +663,8 @@ impl StoreInner {
             ckpt_open: false,
             ckpt_splits: 0,
             ckpt_merges: 0,
+            ckpt_reuse: 0,
+            ckpt_reuse_pf: 0,
             epoch_exhausted: 0,
             freeset_grew: false,
             stale_seg_reads: 0,

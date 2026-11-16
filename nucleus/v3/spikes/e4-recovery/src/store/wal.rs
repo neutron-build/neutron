@@ -15,7 +15,10 @@
 //! Framing (§12.2): `magic u32 "NWAL", len u32, crc u32 (over the bytes
 //! after it), lsn u64, kind u8, txn (u32, u64), commit_ts u64, payload`.
 //! Kinds: 1 Commit, 2 Chunk, 3 CommitMarker, 4 SegmentEnd. Ops:
-//! CreateTree, DropTree, Put, Delete with user keys (no `before`).
+//! CreateTree, DropTree, Put, Delete with user keys (no `before`), and
+//! **E4-R1's store-level `RequireCkpt{id}`** (card E4-SILENT-1; §12.8
+//! step 3's dependency, encoded as byte `0x52` — never 5, which two WAL
+//! fixtures use as raw payload bytes).
 //!
 //! Group commit (§12.4): writers drain the queue in batches — one
 //! batch write, then one `sync_data` per touched segment, then the
@@ -84,6 +87,26 @@ pub enum WOp {
         /// The user key.
         key: Vec<u8>,
     },
+    /// **E4-R1 (card E4-SILENT-1; S-STORE §12.8 step 3's dependency,
+    /// header-design-verify §1.5 item 1):** the publishing commit of an
+    /// unlogged bulk load names the **durable checkpoint id** that made
+    /// the load durable. It is a checkpoint id, never a WAL position: a
+    /// load writes no WAL, so two checkpoints around it can share
+    /// `wal_ckpt_end` and `ts_ckpt_hi`, and a position test would accept
+    /// the wrong one. Recovery (§14 pass 1, after the coverage check)
+    /// refuses the open with XX001 when a `Commit` above `T` carries an
+    /// `id` above the opened meta's `ckpt_id` — a replay of a
+    /// publication over an image older than the checkpoint it depends
+    /// on serves the published tree with its loaded entries missing.
+    /// Encoded as the byte `0x52` (not 5: raw payload bytes 5 and 6
+    /// appear in two WAL test fixtures and would decode as the op) then
+    /// the id as `u64`. A store-level marker only: `apply_op` ignores
+    /// it, and `commit_txn_req` refuses to combine it with a chunked
+    /// publish.
+    RequireCkpt {
+        /// The durable checkpoint id the publication depends on.
+        id: u64,
+    },
 }
 
 fn wr_u16(b: &mut Vec<u8>, v: u16) {
@@ -132,6 +155,12 @@ pub fn enc_op(op: &WOp, out: &mut Vec<u8>) {
             wr_u16(out, key.len() as u16);
             out.extend_from_slice(key);
         }
+        // E4-R1: the kind byte is 0x52, never 5 (two WAL fixtures use
+        // raw payload bytes 5 and 6; byte 5 would decode as this op).
+        WOp::RequireCkpt { id } => {
+            out.push(0x52);
+            wr_u64(out, *id);
+        }
     }
 }
 
@@ -179,6 +208,12 @@ pub fn dec_op(b: &[u8]) -> Option<(WOp, usize)> {
             let key = b.get(i..i + klen)?.to_vec();
             i += klen;
             Some((WOp::Delete { tree: t, key }, i))
+        }
+        // E4-R1: the dependency op's kind byte (0x52; see enc_op).
+        0x52 => {
+            let id = rd_u64(b, i)?;
+            i += 8;
+            Some((WOp::RequireCkpt { id }, i))
         }
         _ => None,
     }
@@ -562,6 +597,54 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     res
 }
 
+/// Create + preallocate + G1 for one WAL segment (the creation branch
+/// of [`wal_write_batch`]'s segment loop, as one function so **WR-1**
+/// (E4-SILENT-1) can create segment 0 with the **same** create-or-open,
+/// `set_len`, bind and `sync_dir` steps before a higher segment).
+/// With more than one batch in flight (X-5c-F3-F3a step 3) two tasks
+/// can race this create for the same segment: the loser's `create`
+/// fails "exists" and falls back to `open`, which resolves to the same
+/// inode; the second `set_len` and `sync_dir` are idempotent, and
+/// durability of the segment's records is never counted before at least
+/// one completed dirsync.
+///
+/// G8 (9.2, W8): a segment's creation, preallocation and `/wal/`
+/// directory sync are WAL-path operations — a non-crash failure there
+/// poisons the store (the test hook can only fire on the write/sync
+/// shapes; the create/set_len/dirsync sites share the poison rule
+/// through their callers' error exit above).
+fn wal_create_segment<H: StoreHost>(cx: &Cx<'_, H>, seg: u64) -> Result<usize, Fail> {
+    let name = format!("/wal/{seg:016x}.log");
+    let created = cx.env().create(&name);
+    let f = match created {
+        Ok(f) => f,
+        Err(_) => cx.env().open(&name).map_err(Fail::Sim)?,
+    };
+    cx.env().set_len(f, WAL_SEG).map_err(Fail::Sim)?;
+    cx.with("wal_writer:bind", |c| {
+        let st = c.store();
+        st.wal.segs.insert(seg, f);
+        if !st.wal.seg_needs_dirsync.contains(&seg) {
+            st.wal.seg_needs_dirsync.push(seg);
+        }
+        Ok(())
+    })?;
+    if !cx.with("wal_writer:mut", |c| {
+        Ok(matches!(
+            c.store().cfg.mutant,
+            Some(Mutant::RenameNoDirsync)
+        ))
+    })? {
+        cx.env().sync_dir("/wal/").map_err(Fail::Sim)?;
+        cx.with("wal_writer:dirsynced", |c| {
+            let st = c.store();
+            st.wal.seg_needs_dirsync.retain(|s| *s != seg);
+            Ok(())
+        })?;
+    }
+    Ok(f)
+}
+
 /// One in-flight batch's write-out: the optional `writer:prewrite`
 /// hold, the segment loop, the `written` advance over the interval
 /// set, the `writer:presync` park, the group sync and the `durable`
@@ -601,49 +684,37 @@ fn wal_write_batch<H: StoreHost>(
             match existing {
                 Some(f) => f,
                 None => {
-                    // Create + preallocate + G1. With more than one
-                    // batch in flight (X-5c-F3-F3a step 3) two tasks
-                    // can race this create for the same segment: the
-                    // loser's `create` fails "exists" and falls back to
-                    // `open`, which resolves to the same inode; the
-                    // second `set_len` and `sync_dir` are idempotent,
-                    // and durability of the segment's records is never
-                    // counted before at least one completed dirsync.
-                    let name = format!("/wal/{seg:016x}.log");
-                    // G8 (9.2, W8): a segment's creation, preallocation
-                    // and `/wal/` directory sync are WAL-path operations
-                    // — a non-crash failure there poisons the store (the
-                    // hook below can only fire on the write/sync shapes;
-                    // the create/set_len/dirsync sites share the poison
-                    // rule through their callers' error exit above).
-                    let created = cx.env().create(&name);
-                    let f = match created {
-                        Ok(f) => f,
-                        Err(_) => cx.env().open(&name).map_err(Fail::Sim)?,
-                    };
-                    cx.env().set_len(f, WAL_SEG).map_err(Fail::Sim)?;
-                    cx.with("wal_writer:bind", |c| {
-                        let st = c.store();
-                        st.wal.segs.insert(seg, f);
-                        if !st.wal.seg_needs_dirsync.contains(&seg) {
-                            st.wal.seg_needs_dirsync.push(seg);
-                        }
-                        Ok(())
-                    })?;
-                    if !cx.with("wal_writer:mut", |c| {
-                        Ok(matches!(
-                            c.store().cfg.mutant,
-                            Some(Mutant::RenameNoDirsync)
-                        ))
-                    })? {
-                        cx.env().sync_dir("/wal/").map_err(Fail::Sim)?;
-                        cx.with("wal_writer:dirsynced", |c| {
+                    // **WR-1 (card E4-SILENT-1; E4-R2's precondition,
+                    // S-STORE §2.3's shape): segment 0 is created, and
+                    // its directory entry made durable, before any
+                    // other segment, whenever the durable meta's start
+                    // is 0.** Without it, a first batch starting in
+                    // segment 1 while segment 0 is uncreated (`wal_
+                    // wait_durable` and the writer task can hold two
+                    // batches) leaves a healthy store whose start-0 open
+                    // finds another segment present and no segment 0 —
+                    // a false E4-R2 XX001. The check acts only in that
+                    // history (segment 0 missing while the store creates
+                    // a higher segment under a start-0 meta), so no
+                    // seed-reached path in `0..10000` moves. The durable
+                    // meta's start is `st.meta.wal_start_lsn`: `st.meta`
+                    // is installed only from a meta a completed step 5
+                    // made durable (or the opened one), and only
+                    // `next_lpid`/`slot_count` grow afterwards. The
+                    // `wal_names` probe adds no yield (E4Env's doc).
+                    if seg > 0 {
+                        let meta_start0 = cx.with("wal_writer:wr1", |c| {
                             let st = c.store();
-                            st.wal.seg_needs_dirsync.retain(|s| *s != seg);
-                            Ok(())
+                            Ok(st.meta.wal_start_lsn == 0 && !st.wal.segs.contains_key(&0))
                         })?;
+                        if meta_start0 {
+                            let names = cx.env().wal_names().map_err(Fail::Sim)?;
+                            if !names.iter().any(|n| n == "0000000000000000.log") {
+                                wal_create_segment(cx, 0)?;
+                            }
+                        }
                     }
-                    f
+                    wal_create_segment(cx, seg)?
                 }
             }
         };
@@ -766,7 +837,7 @@ fn check_wal_inv(st: &StoreInner) -> Result<(), Fail> {
 /// segment's whole extent, filler or boundary-ending record included,
 /// is then durable, so the walk reaches `b`. It closes when a
 /// `sync_data` of a segment at or above `b` completes. 'Untouched'
-/// means the durable image: a write at ≥ `b` may be issued and still
+/// means the durable image: a write at `≥ b` may be issued and still
 /// volatile, and F-CRASH decides whether it survives. Q11 then requires
 /// that `b`'s first sector does not survive with new content." The
 /// `wal.written ≥ b` term is the rework's fix (the gate's finding 2):
@@ -1087,6 +1158,19 @@ fn wal_io_hook_fails<H: StoreHost>(cx: &Cx<'_, H>, op: WalIoOp, start: u64) -> R
 /// `wal_start_lsn` to a future first LSN (the next boundaries after the
 /// append position), with G1's dirsync after each rename. Returns the
 /// number of recycled segments.
+///
+/// **A rename that fails while the world has crashed is a delivered
+/// crash and is returned, never swallowed** (X-5c-F4-F1's re-gate,
+/// finding 1; card X-5c-F4-F1-F1 step 0 (a)): the sim's env maps every
+/// disk error to `SimFail::Crashed`, so a crash delivered at the
+/// rename's yield and a plain "`to` exists" failure carry the same
+/// `Err` — the world's `crashed` flag is what tells them apart. A plain
+/// `?` would be wrong (measured by the gate: "`to` exists" is routine,
+/// 111 times over 0..200, and the store relies on that quiet skip —
+/// `M-RENAME-ANYERR` moved 67 of 200 digests); swallowing the crash let
+/// step 6's tail (`After6`, `ckpt:end`, the next poll's final
+/// checkpoint) run on a crashed world and clear the SIZING-C fold, so
+/// seed 2376 r2 undercounted (`szc` false with the fold at 235 ≥ 4·F).
 pub fn wal_recycle<H: StoreHost>(cx: &Cx<'_, H>, wal_start: u64) -> Result<u64, Fail> {
     let mut recycled = 0u64;
     let plan = cx.with("wal_recycle:plan", |c| {
@@ -1105,7 +1189,13 @@ pub fn wal_recycle<H: StoreHost>(cx: &Cx<'_, H>, wal_start: u64) -> Result<u64, 
     for (first, fid, to) in plan {
         let name = format!("/wal/{first:016x}.log");
         let to_name = format!("/wal/{to:016x}.log");
-        if cx.env().rename(&name, &to_name).map_err(Fail::Sim).is_ok() {
+        let renamed = cx.env().rename(&name, &to_name).map_err(Fail::Sim);
+        if let Err(e) = &renamed
+            && cx.with("wal_recycle:crashed", |c| Ok(c.sched_mut().crashed))?
+        {
+            return Err(e.clone());
+        }
+        if renamed.is_ok() {
             recycled += 1;
             let skip = cx.with("wal_recycle:mut", |c| {
                 Ok(matches!(

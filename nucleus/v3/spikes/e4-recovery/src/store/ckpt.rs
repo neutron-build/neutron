@@ -75,6 +75,37 @@ pub const CKPT_HOOKS: [CkptHook; 10] = [
     CkptHook::After6,
 ];
 
+/// **X5-R39 (card X-5c-F4-F2 step 1; REFRESH 5 as corrected by REFRESH
+/// 6; PLAN §10 item 10): the `ckpt_unflipped` observable** — true iff
+/// the round's own crash fired **from the completion of step 0 until
+/// step 5's `sync_all` returned**. PLAN §10 item 10's floor: "only from
+/// the completion of step 0 until step 5's `sync_all` returns. Before
+/// that, nothing of the checkpoint has happened. After it, the meta is
+/// durable and the interval is closed."
+///
+/// The window's carrier is the crash-time checkpoint position code
+/// (`WorkloadObs::ckpt_step`, written by the checkpointer's hook
+/// bookkeeping at every hook **before any crash arm**): the harness
+/// state lives outside the store, so no `checkpoint()` abort path can
+/// touch it and it survives the sim-crash unwind into the crash-time
+/// `obs` snapshot — which is REFRESH 6's rule ("never on a sim-crash
+/// unwind, because `obs` is read after the unwind") held structurally.
+/// Set immediately before `hooks(CkptHook::After0)` — code 2, the
+/// completion of step 0 — and cleared where step 5 sets
+/// `meta_durable_k` (before `hooks(CkptHook::After5)` — code 8,
+/// `sync_all` returned); `Mid6`/`After6` (9/0, past `ckpt:end`) and
+/// `Before0` (1, nothing of the checkpoint has happened yet) read
+/// false. The abort-path clear of a **non-crash** failure (REFRESH 6)
+/// is carried by the `ckpt_closed_dirty ≥ 4·F` term `szi` conjoins:
+/// `checkpoint()`'s `ckpt:abort` step zeroes `ckpt_closed_dirty` on
+/// every non-`Sim` failure and keeps it across a sim-crash unwind (the
+/// `!crash_unwind` guard), so a checkpoint aborted without a crash can
+/// never leave a live `szi` behind. A pure observable, never a
+/// behaviour input.
+pub fn ckpt_unflipped(step: u8) -> bool {
+    (2..=7).contains(&step)
+}
+
 /// The hook's position bit in [`CKPT_HOOKS`] (X5-R16 NEVER-FIRED's
 /// per-index hook mask: the harness records which hooks each completed
 /// checkpoint reached, and the driver's targeted draw picks an index
@@ -324,9 +355,37 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
     // nested recovery crash that landed on this yield was reported as
     // "start segment missing" — an XX001 at Open in a faultless class C
     // round (seed 1769's family), with the crash never fired.
+    //
+    // **E4-R2 (card E4-SILENT-1; S-STORE §14 step 3a's start-segment
+    // proof, header-design-verify §1.4):** an open from a meta whose
+    // `wal_start_lsn` is 0 also needs proof its log start survives.
+    // Without this arm a lost header over a recycled segment 0 opened
+    // meta 0 with segment 0 gone and another segment present: the walk
+    // stopped at once (a missing segment is a §12.5 stop), the coverage
+    // check passed vacuously (`wal_ckpt_end == wal_start_lsn == 0` at a
+    // quiescent flip), and the store served an empty database with
+    // acknowledged commits gone — silently. The proof is the listing:
+    // `wal_recycle` renames segments lowest first and directory
+    // operations persist as a prefix of issue order, so if the start
+    // segment is present, no segment at or above it was recycled — and
+    // start 0 with segment 0 missing while any other `*.log` segment
+    // exists can only be a recycled-or-never-created segment 0 under a
+    // meta that claims start 0. The one exception is `wal_start_lsn ==
+    // 0` with no `*.log` file in `/wal/` at all: a store that never
+    // made a segment durable (`/wal/.keep` is not a segment and does
+    // not count — the filter is `*.log`). The start-0 probe is
+    // yield-free (`wal_names` adds no yield), and at start above 0 the
+    // `exists` call is exactly as at the Base.
     let start_seg = meta.wal_start_lsn - (meta.wal_start_lsn % WAL_SEG);
     let name = format!("/wal/{start_seg:016x}.log");
-    if meta.wal_start_lsn > 0 && !cx.env().exists(&name).map_err(Fail::Sim)? {
+    let start_missing = if meta.wal_start_lsn > 0 {
+        !cx.env().exists(&name).map_err(Fail::Sim)?
+    } else {
+        let names = cx.env().wal_names().map_err(Fail::Sim)?;
+        let segs: Vec<&String> = names.iter().filter(|n| n.ends_with(".log")).collect();
+        !segs.is_empty() && !segs.iter().any(|n| name.ends_with(n.as_str()))
+    };
+    if start_missing {
         if matches!(meta_is_mutant(cx)?, Some(Mutant::StartSegmentMissingOk)) {
             // The mutant treats the WAL as empty.
             cx.with("open:mutwal", |c| {
@@ -337,6 +396,10 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
                 Ok(())
             })?;
         } else {
+            eprintln!(
+                "E4_SILENT_REFUSE rule=R2 opened={} start={}",
+                meta.ckpt_id, meta.wal_start_lsn
+            );
             return Err(Fail::Corrupt(format!("start segment {name} missing (G3)")));
         }
     }
@@ -637,7 +700,14 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
             st.image_frozen = None;
             // SIZING-C: no checkpoint is open (the abort path) — except
             // across a sim-crash unwind, where the observable must
-            // survive into the crash-time `obs` snapshot.
+            // survive into the crash-time `obs` snapshot. X5-R39's
+            // `ckpt_unflipped` keeps the same rule (REFRESH 6: cleared
+            // on the abort path of a non-crash failure, never on a
+            // sim-crash unwind): this reset is its abort-path clear —
+            // `szi` conjoins `ckpt_closed_dirty ≥ 4·F`, so a checkpoint
+            // aborted without a crash cannot leave a live `szi` — while
+            // the unwind half is structural for the position-code
+            // carrier (see [`ckpt_unflipped`]).
             if !crash_unwind {
                 st.ckpt_closed_dirty = 0;
             }
@@ -660,6 +730,12 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         st.ckpt_open = true;
         st.ckpt_splits = 0;
         st.ckpt_merges = 0;
+        // X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the window's
+        // reuse counter resets with the split/merge counters.
+        st.ckpt_reuse = 0;
+        // X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2a): its pre-freeze
+        // half resets beside it (Q4-I reads the pre-freeze count).
+        st.ckpt_reuse_pf = 0;
         st.fs_building.clear();
         // Work 5.3's interval fold: the interval this checkpoint closes
         // reached `dirty_now.len()` distinct dirtied LPIDs; the next
@@ -779,6 +855,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         }
     };
     prims::gate_flip_release(cx);
+    // X5-R39's `ckpt_unflipped` is set here — immediately before the
+    // `After0` hook fires, the completion of step 0 (see
+    // [`ckpt_unflipped`]: carried by the hook position code).
     hooks(CkptHook::After0)?;
     // FREE-EARLY (I-FREE-SAFE): the step-5/6 frees happen **at the
     // flip** — while durable meta k−1 still references these slots.
@@ -800,7 +879,13 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
                 .copied()
                 .collect();
             let old = std::mem::take(&mut st.slots.used_durable);
-            st.slots.pending_free = old.difference(&live).copied().collect();
+            // **X5-R49 (c) (card X-5c-F4-F1-F1-F3-F2): the early frees
+            // leave `used_durable` into no set at all.** `pending_free`
+            // is step 6's set, and `slot_free` refuses it (X5-R49 (b)),
+            // so routing them there would hide the mutant behind the
+            // refusal — its frees must be allocatable **at the flip**,
+            // while meta k−1 still references them, which is the
+            // I-FREE-SAFE violation D14's M-NOINPLACE catches.
             st.slots.used_durable = old.intersection(&live).copied().collect();
             Ok(())
         })?;
@@ -974,6 +1059,10 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
             st.meta.slot_count = live_sc;
         }
         st.meta_durable_k = k;
+        // X5-R39's `ckpt_unflipped` is cleared here — step 5's
+        // `sync_all` returned and the meta is durable, the interval
+        // closed (see [`ckpt_unflipped`]: code 8 from the `After5`
+        // hook on).
         st.flip_window = false;
         st.image_frozen = None;
         let old_durable = std::mem::take(&mut st.slots.used_durable);
@@ -1009,7 +1098,9 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         let st = c.store();
         st.ckpt_done += 1;
         st.ckpt_open = false;
-        // SIZING-C: no checkpoint is open.
+        // SIZING-C: no checkpoint is open. (X5-R39's `ckpt_unflipped`
+        // is already false here — cleared at step 5 — and the position
+        // code left the window at `After5`; see [`ckpt_unflipped`].)
         st.ckpt_closed_dirty = 0;
         Ok(())
     })?;
@@ -1638,6 +1729,75 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             });
         }
     }
+    // **E4-R1 (card E4-SILENT-1; S-STORE §12.8 step 3's dependency,
+    // header-design-verify §1.5 item 3):** every `Commit` above `T`
+    // that carries a `RequireCkpt{id}` op names the durable checkpoint
+    // the publication depends on. If `id` is above the opened meta's
+    // `ckpt_id`, this replay runs over an image older than the
+    // checkpoint that made the unlogged load durable — the loaded
+    // entries are in neither the image nor the log, and the open would
+    // serve the published tree silently incomplete. The open fails with
+    // XX001 here, in pass 1 — after the coverage check (worse WAL
+    // damage is reported as itself) and before `recover:install`, pass
+    // 2, any eviction write and `truncate_wal`: **nothing is written**.
+    // A publication at or below `T` is already in the image and never
+    // checks; every commit without the op never checks.
+    for rec in replay.iter() {
+        if rec.kind != K_COMMIT || rec.ts <= meta.t {
+            continue;
+        }
+        for op in wal::rec_ops(rec) {
+            if let wal::WOp::RequireCkpt { id } = op
+                && id > meta.ckpt_id
+            {
+                eprintln!(
+                    "E4_SILENT_REFUSE rule=R1 opened={} need={} ts={}",
+                    meta.ckpt_id, id, rec.ts
+                );
+                return Err(Fail::Corrupt(format!(
+                    "publication at ts {} needs checkpoint {id}; the opened image is {} (E4-R1, 12.8 step 3)",
+                    rec.ts, meta.ckpt_id
+                )));
+            }
+        }
+    }
+    // Card X-5c-F4-F1-F1-O1C (`E4_O1C_TRACE`, stderr only, default off,
+    // never a digest input): the walk's own record list — every
+    // `Commit`/`CommitMarker` the walk accepted, with its ts, kind, lsn
+    // and txn, beside the opened meta's bounds and the valid end. This
+    // is the authoritative "replayed" side of the frontier-above-`hi`
+    // trace (the harness's `E4_O1C_TRACE` block prints the event side);
+    // the walk's records and the harness's stitched-walk records must
+    // agree on everything above `T`.
+    if std::env::var("E4_O1C_TRACE").is_ok() {
+        let recs: Vec<String> = replay
+            .iter()
+            .filter(|r| r.kind == K_COMMIT || r.kind == K_MARKER)
+            .map(|r| {
+                format!(
+                    "(ts={}, kind={}, lsn={}, len={}, txn=({},{}))",
+                    r.ts,
+                    r.kind,
+                    r.lsn,
+                    r.len(),
+                    r.txn.0,
+                    r.txn.1
+                )
+            })
+            .collect();
+        eprintln!(
+            "O1C walk: opened k={} t={} gc_w={} boot_id={} wal_start_lsn={} wal_ckpt_end={} ts_ckpt_hi={} valid_end={} records_above_T={:?}",
+            meta.ckpt_id,
+            meta.t,
+            meta.gc_w,
+            meta.boot_id,
+            meta.wal_start_lsn,
+            meta.wal_ckpt_end,
+            meta.ts_ckpt_hi,
+            valid_end,
+            recs
+        );
+    }
     // X-5c-F3-F3a step 6 (c) (`E4_TXN_DIAG`, stderr only, default off,
     // never a digest input): per recovery, each marker's recorded chunk
     // count against the chunks this walk attached to its txn. A mismatch
@@ -1683,7 +1843,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         match rec.kind {
             K_COMMIT if rec.ts > meta.t => {
                 for op in wal::rec_ops(rec) {
-                    apply_op(cx, &op, rec.ts, false)?;
+                    apply_op(cx, &op, rec.ts, false, true)?;
                 }
                 cx.with("recover:applied", |c| {
                     c.store().seq.applied.insert(rec.ts);
@@ -1715,7 +1875,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     && ts > meta.t
                 {
                     for op in wal::rec_ops(rec) {
-                        apply_op(cx, &op, ts, true)?;
+                        apply_op(cx, &op, ts, true, true)?;
                     }
                     cx.with("recover:applied2", |c| {
                         c.store().seq.applied.insert(ts);
@@ -1754,6 +1914,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                                         wal::WOp::Delete { tree, key } => {
                                             format!("X{tree}/{}", key.len())
                                         }
+                                        wal::WOp::RequireCkpt { id } => format!("R{id}"),
                                     })
                                     .collect::<Vec<_>>()
                                     .join(",")
@@ -1917,12 +2078,17 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
 
 /// Apply one op at `ts` (the gated insert path; §9). `chunked` marks a
 /// chunked transaction's superseding replay ops (§14: the last op per key
-/// wins — a replace, not a conflict).
+/// wins — a replace, not a conflict). `replay` marks recovery's pass 2
+/// (§14 step 4, as amended by S-1-F7): a replayed `DropTree` sets its
+/// entry's `dropping` state and does nothing else — pass 2 runs no walk;
+/// the walk is step 6's (`resume_drops`). The live apply path passes
+/// `false` and drops in full, exactly as before.
 pub fn apply_op<H: StoreHost>(
     cx: &Cx<'_, H>,
     op: &wal::WOp,
     ts: u64,
     chunked: bool,
+    replay: bool,
 ) -> Result<(), Fail> {
     match op {
         wal::WOp::CreateTree { tree } => {
@@ -1930,6 +2096,16 @@ pub fn apply_op<H: StoreHost>(
             Ok(())
         }
         wal::WOp::DropTree { tree } => {
+            if replay {
+                // §14 step 4 as amended: "A replayed `DropTree` sets
+                // `dropping` and does nothing else (nothing if the id is
+                // absent). Its walk runs at step 6. Pass 2 runs no
+                // walk." Walking here would free pages mid-replay, and
+                // the LPIDs pass 2's own later records allocate (§14.1)
+                // would take them — M-REPLAY-DROP-WALK.
+                tree::dir_drop_tree_replay(cx, *tree)?;
+                return Ok(());
+            }
             tree::dir_drop_tree(cx, *tree)?;
             Ok(())
         }
@@ -1950,6 +2126,10 @@ pub fn apply_op<H: StoreHost>(
             tree::tree_insert(cx, *tree, root, &ekey, &[1u8], chunked)?;
             Ok(())
         }
+        // **E4-R1 (card E4-SILENT-1):** the checkpoint dependency is a
+        // store-level marker, never a data op. Pass 1's check (above)
+        // consumed it before any apply ran; pass 2 ignores it.
+        wal::WOp::RequireCkpt { .. } => Ok(()),
     }
 }
 

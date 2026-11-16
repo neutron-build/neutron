@@ -1,25 +1,89 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F4-F1 (E4 quota machinery: the frozen-tuning seed
-pins (X5-R37), the Q11 counter wired, X5-R38's window crashes, SIZING
-crash-cut accounting, the M-CKPOISON arms) — all six steps landed, and
-the P gate's REWORK (verdict `verdicts/X-5c-F4-F1.md`, 2026-11-04)
-consumed: the sim-crash unwind keeps `ckpt_closed_dirty` (finding 1),
-W11 opens only at `wal.written ≥ b` (ruling (i), finding 2), `cwin` is
-pinned as a digest input (finding 5), and the record below carries the
-corrected four-seed movement list, the MP root cause, the re-measured
-probe and ESCALATE 4's correction.** The record below carries P's
-nv3-X-5c-F4-esc-1 rulings verbatim and this card's work records.
-`Tuning::FINAL == Tuning::BASE` at this tip (this card does no retune);
-every seed pin runs `Tuning::BASE` (1b0ce54e's generator, bit for bit,
-pinned by `x5_r37_base_tuning_reproduces_1b0ce54e` over all 53 seeds
-any test passes to a seed runner — 41 and 303 joined with the rework's
-pins); the only BASE digests that moved are the Q11 wiring's four
-(seeds 4, 8422, 9226 and 9606, each on the q11 flag alone — seed 4's
-literal updated in the wiring's own commit; the other three are run by
-no test and stay unpinned). The stages before it (X-5c-F4, X-5c-F3-F3b
-and back to X-5c) are complete and merged. Opus judges E4 on the RESULT
-with P's rulings X5-R1–R38.
+Status: **stage X-5c-F4-F1-F1-F3-F1 — the Slot mutant made live
+(`M-FREE-HOME-ALLOC` also removes `used_cur`, as the F3 gate's
+prototype form, its false doc comments and README cause corrected),
+F3's four unpinned behaviours pinned (the targeted-crash clause, the
+reuse counter's `map.img` test, the ledger's harness-checkpoint
+removal, the oracle-pass reading of `seeded-faults`), Q4-I counted
+before the freeze (the store observable `ckpt_reuse_pf`, `q4i_raw`
+reading it, `q4reuse` keeping the whole window), and F3's rule applied
+unchanged over 0..1000 under the ladder S0 → S1 → S2 of X5-R50 (built
+only if S0 misses), per the owner decision of 2026-11-07 and the
+image-arm ruling (q4i, pre-freeze) fixed before any measurement.**
+Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F2 — the twin directory re-seed
+(the -F2 the F2-F1 verdict ordered): the twin chain re-seeds from the
+real round's own start whenever the two chains' `dir` key sets differ at
+round start, under the P ruling below, so the C-XX "recovery-Err default"
+twin family is root-caused and fixed (2859 t1 and 609 t1 pinned healing;
+X5-R52 (g): (c)(i) is void here, the comparator runs with
+`--no-twin-exemption --max-twin-failing 0`, and any failing twin entry is
+a STOP). Its 10k replaces F2-F1's as the BASE baseline of record.**
+Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 — the X5-R53 verdict's
+follow-up -F1: the comparator's two checking holes closed — `read_monitor`
+requires an `E4 SEEDS … MONITOR=` line in **every** run-out file, and
+`compare` refuses a `--run`/`--run-out` count mismatch (both cannot-check
+exits 2, nothing that counts as exempt moves) — and the verdict's sixteen
+surviving mutants die in `self-test` (seventeen new cases in all,
+thirteen beside the refusals' four — count corrected by X-5c-PINS-1,
+verdict `db1e5162` §5 finding 2); the same 10k re-read once more under the hardened
+comparator, same reading (no campaign re-run; nothing under `src/`,
+`tests/`, `examples/`, `results/` or `x5r52-twin-diag.patch` changes).**
+Before it: stage X-5c-F4-F1-F1-F3-F2-F1-F1-F1 — the X5-R53 card: P's
+post-data amendment to X5-R52 (verbatim below), written after the
+re-verdict at `26bcee4b` (MERGE-WITH-FOLLOWUPS) named two follow-ups on
+X5-R52's comparator and rule. This card narrows `check-twin` to the
+twin's own segments (T1 and T3 as X5-R53 (b) writes them), adds the
+sixth check T6 (the ts-level link, on one clock per chain), caps
+exemption (iii) on the MP-A class size and prints `MPA_CLASS`
+(X5-R53 (d)), makes a MONITOR>0 run stop the comparison by itself
+(X5-R53 (e)), closes the four self-test coverage holes the gate's
+mutants found, and re-reads the same F2-F1 10k again requiring the same
+reading (no campaign re-run; nothing under `src/`, `tests/`,
+`examples/`, `results/` or `x5r52-twin-diag.patch` changes).** Before
+it: stage X-5c-F4-F1-F1-F3-F2-F1-F1 — the X5-R52 card: P's
+post-data amendment to X5-R51 (verbatim below, with X5-R51 quoted
+unchanged beside it), written after the F2-F1 gate verdict's ESCALATE;
+the comparator committed as a tool with bullet 1 testable, and the same
+10k re-read under the amendment (no campaign re-run). F2-F1's commits
+merge through this card, on its chain, with no code change. Before it:
+stage X-5c-F4-F1-F1-F3-F2-F1 — this card continues F2
+(X5-R49) from its tip `1524e284` under the gate verdict's P ruling
+X5-R51, the step-4 movement exemption (fixed verbatim below, with the
+g8 re-selection rule, before any code or literal of this card).**
+F2 stopped because its own step-4 rule fired on seven rounds; the
+gate's finding (verdict `X-5c-F4-F1-F1-F3-F2.md`) is that those are
+schedule movement, not a loss X5-R49 introduced — X5-R49's code at
+`b5c9a840` is correct as written and stays untouched. This card
+re-reads the movement under X5-R51, runs F2's step-4 "Otherwise"
+branch (the literals, the share-1000 comparison, F3's mutants, the
+diagnostic), adds the verdict's -F2 pin for the uncaught
+O-FREE-DROP-IMGREFS window (-F2 folded in here, no separate card), and
+re-selects `g8`'s second seed by a fixed rule. Before it: stage
+X-5c-F4-F1-F1-F3-F2 (X5-R49) implemented and pinned (three new pins,
+six mutants caught, D14 and rework 6 unchanged), stopped at step 4's
+gate — the record and the rounds are below, with this card's
+correction of its reading per verdict finding 2. ESCALATE resolved by
+P ruling X5-R51.** Before it:
+stage X-5c-F4-F1-F1-F3 (X5-R41/X5-R42/X5-R43) complete — its decision
+rule NOT MET by all three shares, the Joint fault CAUGHT at share 1000
+and the Slot fault UNCAUGHT at every setting measured (both ESCALATEs,
+the record below; the Slot fault's cause — this card's store deviation
+— is what X5-R49 fixes). `Tuning::FINAL == Tuning::BASE` at this tip
+(no setting was handed off); the X5-R37 pin holds the **old** literals
+at this tip (13 of its 54 seeds moved with the fix; the measured new
+digests are recorded below, unapplied). The stages before it
+(X-5c-F4-F1-F1 and its follow-ups, X-5c-F4-F1, X-5c-F4, X-5c-F3-F3b
+and back to X-5c) are complete and merged. Opus judges E4 on the
+RESULT with P's rulings X5-R1–R49.
+**Card X-5c-F4-F1-F1-O1C-F1 (X5-R47) has since replaced the `written`
+half and the F1 report of `derive_written_acked` with the replay in
+issue order — the three faultless class C O-1(c) rounds (1066, 6555,
+7590 r0) now pass; the record is below.** **Card
+X-5c-F4-F1-F1-CXX-F1 (X5-R48) has since repaired X5-R21 (c)'s
+re-pair for the twin that never fires (the joint spec): 7469, the
+one defect seed of CXX's 10k window, now passes with all three
+rounds; the record is below.**
 
 ## P ruling nv3-X-5c-F4-esc-1, verbatim (2026-11-04; binding)
 
@@ -104,7 +168,7 @@ W11 bullet and X5-R38's W11 clause above — carried verbatim, binding:
 > `wal.written ≥ b`: that segment's whole extent, filler or
 > boundary-ending record included, is then durable, so the walk reaches
 > `b`. It closes when a `sync_data` of a segment at or above `b`
-> completes. "Untouched" means the durable image: a write at ≥ `b` may
+> completes. "Untouched" means the durable image: a write at `≥ b` may
 > be issued and still volatile, and F-CRASH decides whether it survives.
 > Q11 then requires that `b`'s first sector does not survive with new
 > content.
@@ -347,6 +411,4338 @@ decided):**
 - REFRESH 6 of the F4 card (pasted by the gate verdict) supersedes the
   older REFRESH text where they differ — F4 relaunches only after this
   rework's gate and X-5c-F4-F1-F1.
+
+## Card X-5c-F4-F1-F1's record (Q4 reachability: the halves, X5-R40)
+
+The question: is Q4 ≥ 1,000 per 10k reachable without changing Q4's
+definition or threshold? **Answer, by this card's rule: not by any of
+its three settings — ESCALATE (step 4 below).** The halves measurement
+says why: the merge half never reaches the crash's window at BASE or
+at the burst knobs alone, and even with the X5-R40 alignment the two
+halves land in-window in *different* rounds — only 1 round in 1,239
+carries both (the pin hunt).
+
+**Step 0 — the re-gate's findings closed (verdict X-5c-F4-F1
+MERGE-WITH-FOLLOWUPS, findings 1, 2 and 4; commits dc156302, ebf30ee9,
+26a969e0), before any probe.**
+- **(a) `wal_recycle` must not swallow a delivered crash.** The
+  rename's error now returns through a crashed-flag check — never a
+  plain `?`, which would also return the quiet uncrashed-world failure
+  ("`to` exists") the store relies on skipping. Pin
+  `szc_rename_crash_keeps_the_open_fold`: `run_seed_with(2376, None,
+  &Tuning::BASE)`, r2 crash `uniform@y:17768`, `szc` true; 2376 joined
+  the X5-R37 literal list (54 seeds now) with F4's own literal — no
+  digest moves (the gate ran the change over the whole 10k: only seed
+  2376 r2's non-digest `szc` changed). M-RENAME-SWALLOW (`is_ok()`
+  restored) fails the new pin, and M-RENAME-ANYERR (a plain `?`)
+  fails `x5_r37_base_tuning_reproduces_1b0ce54e` — applied, shown,
+  reverted clean.
+- **(b) `x5_r38_w11_needs_no_completed_sync_since`:** BASE with
+  `w11_share` 1000, seed 30 r0, `cwin` `w11-` (the W11 list empty —
+  the `recycled_unsynced.retain` retire line is what empties it).
+  G-W11-NORETIRE fails it — applied, shown, reverted clean.
+- **(c) `szc_non_crash_abort_resets_the_fold`:** a literal
+  `wal_io_fail` schedule whose open checkpoint has folded 2 (proven by
+  `dirty_max`) fails with a non-`Sim` error and ends the round with
+  `ckpt_closed_dirty` 0. G-SZC-ABORTNORESET fails it — applied, shown,
+  reverted clean. The README's ruling (i) and the `wal.rs` doc now
+  read `≥ b` exactly as the verdict (finding 4's backtick).
+
+**Step 1 — the two halves (commit a2c2d979).** Per-round record fields
+`q4sp` (splits) and `q4mg` (merges): the store's
+`ckpt_splits`/`ckpt_merges` at the crash-time `obs` snapshot — reset at
+each `ckpt:begin`, counting only while a checkpoint is open, so at the
+crash they read the interrupted window's own counts. Serialized in
+`campaign.json` (old files parse unchanged), never digest inputs,
+never quota inputs; the JSON round-trip asserts them. **Probe, not
+evidence** (`run --seeds 0..200 --threads 16`, output outside the
+worktree, re-verified at this tip):
+
+- **BASE:** 305 rounds, 84 in the Q4 window (crash at position code
+  1–6), **7 with a split, 0 with a merge, 0 with both** (Q5a 3, Q7 5,
+  Q18 20; failing rounds 2 — the pre-existing 8/178 pair; 72 s).
+- **bursts 600/8:** 309 rounds, 87 in the window, **7 splits, 0
+  merges, 0 both** (Q5a 4, Q7 10, Q18 47; 0 failing; 75 s) — matching
+  the gate's re-measurement (600/8: 0 of 309; 900/16: 0 of 308).
+
+**The cause of the rare in-window merge, found by single seeds** (the
+`E4_SMO_DIAG`/`Q4DIAG` probes, since removed): **`w` held back — by
+the chunked transaction's single atomic apply, not by readers — plus
+the merge-capable sweep landing after the windows.** The burst's
+deletes are durable in the WAL but sit above the apply frontier until
+the chunked txn's marker syncs, and `gc_locked` elides (the step that
+makes leaf pairs underfull — `count_merge`'s precondition, the GC's
+merge condition) only below the boot watermark: the early sweeps read
+`w` = 0–2 with the deletes durable but unapplied (seed 11's diag: ten
+sweeps, all `w` ≤ 2, all merges 0; probe s1000b: 0 in-window merges in
+43 rounds). When `w` does advance, later in the round, the sweeps'
+merges land with no window open (seed 81's diag: 13 merges in the
+round, every one at `ckpt_open=false`, the in-window counters 0). At
+BASE the merge condition itself rarely has material — the 1-in-4
+deletes scatter over random keys of 2–4 trees and seldom leave
+adjacent underfull pairs — so BASE shows no merge half at all (0 of
+84 window rounds).
+
+**Step 2 — X5-R40, the SMO alignment (commit f9c4405d; a 5.2
+amendment, pre-registered before every probe above).** `Tuning` gains
+`smo_share` (permille, **0 in BASE and FINAL**); the independent
+per-round stream `S_SMO` (`smo_pick`) draws only when the share is
+non-zero, so BASE consumes no stream state and an unselected round's
+script is bit-for-bit the pre-X5-R40 generator's. In a selected round
+the GC task's front becomes `AwaitCkptOpen` (a spin-yield gate on
+`ckpt_open`, the checkpointer's own poll pattern — no wait key is
+woken at `ckpt:begin`, so a parked waiter could only observe a window
+after it closed; a deterministic turn budget `AWAIT_CKPT_OPEN_TURNS`
+1024 backstops the circular livelock where the spinner itself is the
+last unfinished task, probe s1000a seeds 4/20) → half the burst's
+sweeps → one split-seeding commit (≤ 20 Puts into a dense run of
+consecutive fresh keys at the value ceiling of a tree *other* than the
+burst tree, so it cannot refill the holes the sweeps merge) → the
+other half → the base sweeps. Targeted rounds keep their hook and
+uniform rounds keep their draw: the crash spec is untouched. Pins:
+`x5_r40_smo_not_drawn_at_base` (the draw-count contract — the `S_SMO`
+stream is independent, so no digest can see the draw),
+`x5_r40_awaitckptopen_parks_until_a_window` (a gated commit must not
+record while no window can open), `x5_r40_selected_round_digest_is_pinned`
+(seed 0 under the literal SMO tuning, digest 3330201367) and the
+card's named `x5_r40_aligned_round_has_split_and_merge_in_window`:
+**seed 886 round 2** (crash `After2@2`), `q4_split_merge` true with
+`q4sp` 2 / `q4mg` 1, digest 2522830599 — the pin-hunt hit (seeds
+200..1000 at smo 1000 / burst 900/8). M-SMO-NOWAIT (the gate returns
+at once) and M-SMO-NOMERGE (the aligned sweeps removed) both fail the
+named pin and the digest pin; M-SMO-DRAW (`S_SMO` drawn at share 0)
+fails the draw-count pin while
+`x5_r37_base_tuning_reproduces_1b0ce54e` still passes — all three
+applied, shown, reverted clean.
+
+**Step 3 — the three settings (probe, not evidence).** Each is
+`run --seeds 0..200 --threads 16` with only (`smo_share`, `burst_frac`,
+`burst_gc_loops`) changed, then reverted; BASE re-measured the same
+way, back-to-back on one host (72 s). "In window" = the crash at a
+position code 1–6 hook; split/merge = `q4sp`/`q4mg` ≥ 1.
+
+| setting (smo/burst/gc) | rounds | in window | split | merge | Q4 | Q5a | Q7 | Q18 | failing rounds | wall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1000 / 600 / 8   | 313 | 87 | 10 | 2 | **0** | 2 | 4 | 184 | 1 (seed 151 r1, O-1(a)) | 85 s |
+| 1000 / 900 / 16  | 306 | 83 | 12 | 2 | **0** | 5 | 5 | 176 | 1 (151 r1) + 1 twin (seed 9) | 94 s |
+| 1000 / 900 / 8   | 309 | 85 | 8  | 4 | **0** | 3 | 3 | 180 | 2 (151 r1, 190 r1) | 88 s |
+
+The alignment works as designed — each half now reaches windows (8–12
+split rounds, 2–4 merge rounds per ~310) — but **never the same
+round**: 0 rounds with both at every setting. The pin hunt at
+1000/900/8 over seeds 200..1000 measured the joint rate: 1,239 rounds,
+33 split rounds, 11 merge rounds, **exactly one with both** (seed 886
+r2) ≈ 1.25 per 1,000 seeds ≈ 12–13 per 10k against the 1,000 required.
+The two failing seeds (151 r1, 190 r1) are new under these
+probe-only schedules (BASE keeps 8/178 alone); `defect` is none of
+them — they are ordinary oracle failures on modified generators, and
+the settings are reverted.
+
+**Step 4 — the decision rule, applied verbatim (fixed before any
+probe).** *Met* needs: Q4 × 50 ≥ 1,500, at wall ≤ +25% of BASE (72 s →
+90 s), with no Q5a, Q7 or Q18 below the lower of its row and BASE's
+own count × 50 on the same seeds (BASE: Q5a 3, Q7 5, Q18 20 — floors
+150, 200, 1,000).
+- Setting 1 (1000/600/8): Q4 0 → 0 × 50 = 0 ≥ 1,500 **false**
+  (and Q5a 2 × 50 = 100 < the 150 floor).
+- Setting 2 (1000/900/16): Q4 0 → **false** (and wall 94 s > 90 s).
+- Setting 3 (1000/900/8): Q4 0 → **false** (and Q7 3 × 50 = 150 <
+  the 200 floor).
+
+**Not met by all three → ESCALATE with the numbers.** Q4's definition
+and threshold are unchanged — no card, gate or orchestrator lowers or
+redefines them. P takes the reachability question to the owner.
+
+**The hand-off: none.** No setting meets the rule, so F4's REFRESH
+gets no Q4 knob from this card. The X5-R40 machinery stays in the
+tree, inert at BASE and FINAL (`smo_share` 0, no draw, no op
+inserted), for whatever the owner decides.
+
+## Card X-5c-F4-F1-F1-CXX's record (C-XX's two remaining causes: the DropTree straddle and the exhausted reserve's double evict)
+
+QUEUE row X-5c-F3-F1-F2: 51 faultless class C rounds failing O-3(b)
+XX001 in `X-5c-F4.acc.campaign.json` (16 `[Open]`, 35 `[AmcheckIi]`).
+P classified all 51 on a clean export of a4c1f869 (the census,
+`~/.cache/nv3-review/pxx/evidence/census-51.txt`; the per-seed class
+table is reproduced below). Three causes:
+
+| Cause | Rounds | Mechanism | Fixed by |
+|---|---|---|---|
+| **A** (spec) | 27, plus 3 with B1 | S-6.8's cut between the root free and the entry removal | this card, per S-1-F7 |
+| **B1** (prototype) | 18, plus 3 with A | two exhausted first touches evict the same copy; the second clears the frame the first refilled | this card |
+| **B2** (prototype) | 3 | a late copy outlives its checkpoint | -F2's install guard (the previous section) |
+
+The 3 with both are 4784 (needs both fixes), 1612 and 9433 (either fix
+alone moves the schedule off them). Probes over the 51 seeds
+(single-seed runs, P's `pxx` toggles on scratch exports): A-fix alone
+21 rounds still fail; B1-fix alone 31; -F2's guard alone 48 (it clears
+exactly 5706, 8725, 8956); all three **0** — and this card's re-run of
+the 54 seeds (51 + 190, 6195, 6990, the three the -F2 guard moved onto
+B1) shows **0 failing rounds, no defect, deadlock or panic**.
+
+**Census (class per seed, P's, verbatim from the evidence):** 27 `A
+need:A`, 16 `B1 need:B1`, 2 `A/B1 need:either`, 2 `A/B1 need:B1`, 2
+`B2 need:B2`, 1 `A/B1 need:A/B1` (4784), 1 `B2 need:either`.
+
+**Cause B1's mechanism — a correction to the older "late copy" account
+for B1's rounds.** The -F2 record above left the exhausted path's
+*record* as its ESCALATE sibling; the draft's Cause B reading ("the
+`ckpt:freecopies` clear destroys these copies") was wrong for most of
+its rounds. `ckpt:freecopies` is not what destroys them: in
+`record_image_copy`'s exhausted path, tasks T1 and T2 both read
+`oldest = frame i` holding copy X and both proceed into `write_fresh`;
+T1's `epoch_copy:record` records X and clears frame i, and T1's retry
+installs copy Y there; T2's `epoch_copy:record` then clears frame i
+**again**, with no re-validation after its yield — Y is destroyed
+unwritten, `map.img[Y]` stays `CopyPending`, and the freeze maps Y to
+nothing. 3534 r1: `exhaustion frame 0 no longer holds 16`, then
+`FREEZE unresolved CopyPending lpids=[29] k=3` — an `[Open]`/`[AmcheckIi]`
+XX001 with no injected fault. The same step has a **second, silent
+outcome** (verdict X-5c-F4-F1-F1-F2's sibling): when the record lands
+after its checkpoint's post-5 it inserts `Img::At(flip-k bytes)` into
+the cleared map, nothing clears it, the next freeze takes it over
+`cur`, and the next image loses the mutations between the flips with
+no XX001. One re-validation closes both (Work 1).
+
+**The two schedules, with traces.**
+
+- **Pin 1, `drop_cut_never_names_a_freed_root` (310 r0's shape, seed
+  1).** Phase A: trees 2 (a leaf root, one entry) and 4, one durable
+  checkpoint. Phase B: t1 drops tree 2 — the walk's first step *is*
+  the last (a leaf root), so at this tip the root frees inside the
+  walk's gate hold and `dir_remove_entry` runs in its **own** hold; t2
+  (the checkpointer) spins for the straddle and flips inside the gap.
+  The image: `dropping tree2 -> root 1` with `free = {1}`. Crash,
+  `ckpt::recover`: the resumed walk descends the unmapped root —
+  `Corrupt("lpid 1 unmapped")` at `[Open]` (rule: I-LPID-EXACT /
+  I-LINK-ATOMIC, S-6.8 as amended). The pin failed at the pre-fix tip
+  and passes at this one.
+- **Pin 2, `drop_cut_never_names_a_reused_root` (8010 r1's shape, seed
+  77).** The same cut with t3 splitting tree 4 onto the freed LPID
+  before the flip (S-4.2's immediate reuse: the freed root is the
+  lowest free LPID; tree 4 holds eight 400-byte cells, t3's ninth goes
+  in pre-positioned at the mark, and the tenth splits). The opened
+  image reaches lpid 1 from trees 2 and 4 — rule: one page, two
+  references — and the resumed walk frees tree 4's live child; its
+  scan after recovery fails (`Corrupt`, the page gone). Under the fix
+  the reuse happens only after the entry removal, so no image names a
+  reused root.
+
+**The fixes.** Work 1 (B1): `epoch_copy:record` re-validates its
+reserve frame after the write-out's yield, in the record's own atomic
+step — if the frame no longer holds `(key, is_epoch_copy)` another
+task resolved it, so the write is an orphan: its slot leaves
+`used_cur` and neither the image map nor the frame changes
+(`PR-EXHAUST-REVALIDATE`). Work 2 (A, per S-1-F7's amended S-6.8): a
+walk step reads first and frees nothing until it knows the topmost
+page it empties; the last step, in its one gate hold, removes the
+directory entry and the in-memory record **first**, then frees the
+path top-down root first — the two mutexes never nest, the gate is
+never taken twice. Work 3 (S-14 step 4 as amended): pass 2's
+`DropTree` sets `dropping` only (`dir_drop_tree_replay`); the walk is
+step 6's; the live apply is unchanged.
+
+**The pins and their mutants** (each mutant applied to the real code,
+shown failing, reverted clean):
+
+| Mutant | Failing pins |
+|---|---|
+| M-DROP-ENTRY-SPLIT (the entry removal in its own gate hold — today's code; also a `mutants`-table row) | `drop_cut_never_names_a_freed_root` ("recover: Corrupt(lpid 1 unmapped)"), `drop_cut_never_names_a_reused_root` (tree 4's scan Corrupt on the freed page) |
+| M-EXHAUST-NO-REVALIDATE (`epoch_copy:record` clears unconditionally — today's code; also a row) | `exhausted_reserve_keeps_both_copies` (a `CopyPending` at `ckpt:freeze`), `exhausted_record_stays_out_of_the_next_window` (image 2 maps P to its flip-1 leaf) |
+| M-EXHAUST-RECORD-FIRST (the clear guarded, `record_image_at` unconditional) | `exhausted_record_stays_out_of_the_next_window` |
+| M-REPLAY-DROP-WALK (pass 2 walks) | `drop_replay_only_marks` (the freed root mapped again after recovery) |
+| M-DROP-FREE-FIRST (inside the one hold, the root freed before the entry is removed) | `drop_entry_gone_before_root_free` (the watcher sees an entry name an unmapped root) |
+
+Plus two more directed pins: `exhausted_reserve_keeps_both_copies`
+itself (3534 r1's shape — one frame, two first touches in
+`write_fresh`; no `CopyPending` at `ckpt:freeze`, both LPIDs in the
+image), and `drop_entry_gone_before_root_free`'s watcher (at each
+atomic step, no entry — persisted or in `dir` — names an unmapped
+root; the in-memory record outlives the persisted one, so one check
+covers both).
+
+**Digest movement (Work 5).** The 54 seeds re-run one seed per process
+under `ulimit -v 25165824`: 0 failing rounds. X5-R37's literals moved
+at 9 seeds — 66 `123257877 -> 3628190779`, 112 `2157138087 ->
+2438489582`, 198 `649857276 -> 95622311`, 303 `859193035 ->
+4147169426`, 907 `2332284720 -> 1749572610`, 1769 `2372375821 ->
+1311732889`, 6149 `2623005576 -> 123186068`, 7469 `3635220225 ->
+3658720859`, 7528 `1612546402 -> 122281874` (the drop rework
+restructured the walk's steps, so every drop-bearing schedule
+re-derived; each value is this card's own measurement).
+`late_copy_count_is_zero_at_base` moved at one seed: 190
+`4013865743 -> 679383372` — the -F2 verdict's probe value under Work 1
+alone, now with all three fixes in.
+
+**The rework's re-measured attribution (rework step 4; the REWORK
+verdict's finding 6, whose per-step table this now matches).** Each
+move of 1b0ce54e's baseline has exactly one first owner, and the
+rework's pin hold (step 1) is a fourth:
+
+| First moves at | Seeds |
+|---|---|
+| Work 1 (B1) | 190 |
+| Work 2 (A) | 66, 907, 1769, 6149, 7469, 7528 |
+| Work 3 (replay) | 112, 198, 303 |
+| Rework step 1 (the pin hold) | 112, 1769, 7469 |
+
+The rework's three are second moves: 112 `2438489582 -> 3003462667`,
+1769 `1311732889 -> 2372375821` (back to 1b0ce54e's own value — the
+pin hold moved the schedule off the drop-arm change and onto the base
+draw), 7469 `3658720859 -> 1670717970` (the seed the verdict's trial
+flagged: its twin round 1's re-derived spec `Mid2@1` never fires —
+the NEVER-FIRED shape on a moved schedule; the re-gate reads it).
+Pass/fail does not change on any of the three (all rounds pass; 112's
+R36 pin and 1769's no-twin pin still hold), and
+`late_copy_count_is_zero_at_base`'s four digests did not move again
+(96, 104, 161, 190 re-measured identical). Attempt 1's "every
+drop-bearing schedule re-derived" was loose, as the verdict said: of
+the ten, three first moved at the replay change and one at B1, not
+the drop arms — as the table above itself shows (the "nine/four"
+count was the verdict's finding 4; corrected by card
+X-5c-F4-F1-F1-CXX-F1's step 7).
+
+**The rework (P gate verdict REWORK 10567da6, 2026-11-06; finding 1,
+blocking).** Attempt 1's last step dropped its `PinGuard` at the walk
+step's edge, before the directory descent: unpinned, the root's dirty
+frame was a legal eviction victim during that I/O — the evictor
+latches it and yields in `write_fresh`, `free_lpid` clears the frame
+and puts the LPID in the free set, and `evict:finish` (whose
+`map.cur.insert` is unconditional) resurrects the freed root at its
+write's fresh slot. Mapped and in the free set, referenced by
+nothing; amcheck (ii) reports "mapped lpid N unreachable". Two new
+faultless class C XX001 at BASE — **444 r1** (`LAST tree 3 path
+[4, 63]`, slot 109) and **3005 r1** (`LAST tree 4 path [5, 75]`,
+slot 132) — are the **census's blind spot**: neither is in the
+51-round file nor the 54 seeds, which is why Work 5 read 0 while the
+10k carried them; S-1-F7's trial range and 50000..50200 miss them
+too. The fix (rework 1): the guard stays live across the whole one
+gate hold, through the frees; every other arm unchanged, and
+`evict:finish` untouched (Limit 1 does not name it — §6.8 is the
+rule). The gate's own trial with the pins held read C-XX 0 over
+0..10000, and one defect: 7469's twin round 1 (`Mid2@1` never fires,
+the NEVER-FIRED shape) — the re-gate reads that seed; at this tip its
+digest moved again (above) and `r21c`'s literal moved to 9469 (the
+judgment call below). The rework's new directed evidence:
+
+| Mutant (hand-applied, shown failing, reverted clean) | Failing pin |
+|---|---|
+| M-DROP-UNPIN-EARLY (the `PinGuard` dropped at the step's edge — f703c08d) | `drop_last_step_keeps_its_pages_pinned` (seed 38: "root 2 is mapped and in the free set"; 38, 85, 444, 467 of 1..=500 at f703c08d, 0 held) |
+| G3-FREE-IN-SECOND-HOLD (the gate released and re-taken between the entry removal and the frees) | `drop_one_hold_the_flip_never_finds_the_straddle` (seed 5: "the flip found the straddle: entry absent, root 2 mapped, gate free"; 105 of 1..=200 under the mutant, 0 clean) |
+| G2-ORPHAN-KEEPS-SLOT (the orphan's `used_cur` release removed) | `exhausted_reserve_keeps_both_copies` ("seed 1: slots [13] entered used_cur referenced by nothing") |
+| G-W11-NORETIRE (the `recycled_unsynced` retain removed) | `x5_r38_w11_needs_no_completed_sync_since` (seed 30 reads `w11-` clean, `w11` under the mutant) |
+
+Finding 3's two rules now have directed pins: the one-hold pin above
+(a flip that waits for "entry absent, root mapped" must never find it
+— under the fix the straddle exists only inside the hold, so the
+check can never pass), and pin 3's world-end orphan assertion (the
+used-but-unreferenced slots are exactly the phase-A baseline plus the
+one stale flip-window write-out, slot 5 at seed 1, measured and
+documented in the pin). Finding 4: pin 2's assertion is eight cells,
+matching its comment. **The r21c literal (a judgment call, recorded
+in the RESULT):** the pin hold moved 7469 onto the NEVER-FIRED shape
+— the fired-guard defect is by design a seed failure, so the ruling's
+fifth literal could not stay; it moved to 9469 under the gate's
+Limit-3 ruling class (a schedule literal of the X5-R37 kind; the
+assertions unchanged), measured: class MW, twin round 0's re-derive
+**succeeds**, real round 1 re-derives its spec (the R21 (c) re-pair
+path 7469 was pinned for), no defect, every twin paired. The W11 fallback literal
+(`x5_r38_w11_needs_no_completed_sync_since`) moved from seed 30 to
+seed 11 — a Limit-3 deviation recorded in the card's RESULT (the pin
+is a schedule literal of the X5-R37 class that Limit 3 did not name;
+the invariant and the assertion are unchanged).
+
+**The rework's correction to that W11 move (the REWORK verdict's
+finding 2, binding):** seed 11 was vacuous — it reads `w11-` with the
+retain line in **and** with it removed (no boundary to retire), so the
+pin held nothing. The rework's pin hold moved the schedule again and
+the literal is back at **seed 30** (measured at the rework tip, share
+1000: seed 30 reads `w11-` clean and `w11` under G-W11-NORETIRE, shown
+failing; the other flippers of 0..200 are 37, 98, 111, 138, 156, 170
+and 192, and 51 uniform-mode seeds read `w11-` clean).
+
+**A correction to -F2's record above:** its "no seed fails before or
+after" is false — at -F2's tip, 190 r1 fails and passed before (the
+verdict's finding 1). B1 was already there; the -F2 guard moved the
+schedule onto it. This card clears it (190 passes above).
+
+**What did not change:** the oracle, the model, the sim, K, R, the
+generators, every quota's definition and threshold, `verify`'s exit
+rule, `ckpt2:scan`'s condition, `resume_drops`' error handling,
+DROP-ROOT-FIRST, and `docs/` (S-1-F7 carries the spec text; it is not
+merged into this branch's `docs/`, which this card may not edit).
+
+## Card X-5c-F4-F1-F1-F2's record (finding 1: the late epoch copy)
+
+Verdict X-5c-F4-F1-F1, finding 1, confirmed by a literal schedule and
+fixed: a first touch's epoch copy can still be on its way (the only
+yield between the freeze and the install is the exhausted reserve
+path's write-out of the oldest copy) while step 2 writes the page's
+normal frame — the parked mutator is the one that would have replaced
+its bytes — and resolves `Img::CopyPending` to `Img::At`; then
+`ckpt:freecopies` frees the reserve and the checkpoint completes. The
+install then lands **late**: a dirty, `is_epoch_copy` frame with
+`f.epoch = e − 1` past its own checkpoint's cleanup. The next
+checkpoint's scan accepts it (`f.is_epoch_copy || f.epoch <= k`) and
+its record path maps the LPID to epoch-`k` content while `T` says
+replay need not restore it — a silent class-C loss, no injected fault
+(the gate's trace: seed 845 r0 under the X5-R41 prototype).
+
+**The fix (step 1, one atomic step in `epoch_copy:install`):** install
+only while `map.img[lpid]` is still `Img::CopyPending`; otherwise drop
+the bytes — the image's content is already recorded (step 2's write, a
+previous-epoch eviction's `At`, or a closed window). This is S-STORE
+§5.6's copy condition ("copies only if that content is not yet at a
+slot the image map references") **re-tested after the wait**, exactly
+as P read it. Invariant `PR-LATECOPY` added to `prims.rs`'s header. A
+new named park point, `epochcopy:prewrite`, holds a copy in the
+exhausted path for the directed pins (no budget set: returns at once).
+
+**The literal schedule (step 0,
+`late_epoch_copy_must_not_enter_the_next_image`)** — twelve one-page
+trees, `R_EPOCH = 1`: the first `Mid2` hook performs P's first touch
+and fills the reserve deterministically; the mutator task's touch of B
+(the highest frame, above ten padding trees) parks in the exhausted
+path; step 2 writes P's copy (the fixpoint re-scan) and B's normal
+frame (resolving `CopyPending` → `At(slot 17)`); the `After2` hook —
+past `ckpt:freecopies` — releases the parked copy, which installs late
+(img `At`, past freecopies, dirty, `is_epoch_copy`, epoch 1); B's frame
+is evicted between the checkpoints so checkpoint 2's scan cannot
+overwrite the leaked entry; a crash after checkpoint 2's meta; the
+reopen from meta 2 read the leaked copy's flip-1 leaf (slot 24, the
+flip-1 crc) and **lost the window-1 key** — the pin failed at the
+pre-fix tip exactly as the card demands, with the path matching the
+Goal's reading (recorded by a trace before the fix). The pin also
+reopens from meta 1 (reverted): the flip-1 cut must hold one entry per
+tree, which is the half that catches an over-eager drop.
+
+**The freed-LPID pin (`freed_lpids_late_copy_never_remaps`)** — the
+same park holds a raw `store_page` (not a tree insert: an insert holds
+the epoch gate across the parked wait and the next flip cannot start —
+the first draft deadlocked the flip against the park until the budget
+self-drained) across two flips; checkpoint 1 completes, B's LPID is
+freed between the checkpoints, and window 2 opens with the map empty
+for B. The real guard drops the copy (an absent entry is not
+`CopyPending`); the reopened store's `cur` has no entry for B and the
+free set holds it. Under **M-LATECOPY-ATONLY** (the guard testing
+`Img::At` only) the copy installs onto the absent entry and
+checkpoint 2's scan records it — `img[B] = At(slot 33)`, the flip-1
+crc — the pin fails.
+
+**Late and stale counts at BASE (step 2), seeds 0..200, measured with
+the gate prototype's `LATECOPY`/`STALECOPY` counters (env-gated, on
+`git archive` exports of the pre-fix base `a4c1f869` and the post-fix
+tip; `e4-campaign run --seeds 0..200 --threads 16` under
+`ulimit -v 25165824`):**
+
+| | LATECOPY (late installs → drops) | STALECOPY (a stale copy reaching a later scan) |
+|---|---|---|
+| pre-fix (a4c1f869) | 7 | 0 |
+| post-fix (this tip) | 7 | **0** |
+
+The seven events sit on seeds **96 (×2), 104 (×1), 161 (×1), 190
+(×3)** (located by single-seed runs). Post-fix the same seven installs
+are drops — no stale copy reaches a scan over 0..200, so **the
+`ckpt2:scan` guard is not needed** and the scan condition is
+untouched. (The verdict's 0..1000 probe counted 34 late installs and 7
+stale copies pre-fix; my 0..200 slice shows 7 and 0 — consistent, the
+leak-into-scan is the rarer tail.) No seed fails before or after (the
+runner's fold: 2 vs 3 *failing rounds*, both known classes on moved
+schedules; the per-seed records pass).
+
+**Digest movement (step 4).** Over 0..200 the digests that move are
+**96** (`83795711 → 4266526636`) and **190** (`813405985 →
+4013865743`) — the drop is the only difference. Seeds 104 and 161 hit
+the path too but their late installs were observably benign pre-fix
+(same digest both sides). **No seed in X5-R37's literal list moves**:
+the whole 54-seed list re-ran green at the tip twice — once as the
+in-suite pin (`x5_r37_base_tuning_reproduces_1b0ce54e`, all 55
+assertions) and once as an independent campaign-binary pass over the
+same seeds (chunks 200..1000 plus singles through 9809, digests
+compared against the literals) — so no literal changed and F4's new
+baseline is the old one. `late_copy_count_is_zero_at_base` (step 3)
+pins the four hitting seeds' post-fix digests; the count itself is not
+observable inside this card's Limit 1 (a store counter would touch
+`StoreInner`), which the pin's doc states.
+
+**Mutation evidence** (each applied to the real code, shown failing,
+reverted clean — `git diff` empty after each):
+
+| Mutant | Failing pins |
+|---|---|
+| M-LATECOPY-INSTALL (the guard removed) | `late_epoch_copy_must_not_enter_the_next_image` (missing key), `late_copy_count_is_zero_at_base` (seed 96's digest reverts) |
+| M-LATECOPY-DROPALWAYS (every copy dropped) | `late_epoch_copy_must_not_enter_the_next_image` ("scan P after meta 1: lpid 12 unmapped" — the unresolved `CopyPending`), `step2_fixpoint_writes_late_epoch_copies` ("scan B after reopen: lpid 3 unmapped") |
+| M-LATECOPY-ATONLY (the guard tests `Img::At` only) | `freed_lpids_late_copy_never_remaps` (the freed LPID remapped) |
+
+**ESCALATE (a sibling this card's prescribed fix does not cover).**
+The exhausted path's own **record** for the oldest copy has the same
+late-landing shape: `record_image_at(key, r)` runs right after the
+park's write-out, and when the wait crossed its checkpoint's post-5
+(the map cleared), it inserts a stale `Img::At` — the oldest copy's
+flip-`k` content — into the *next* window's map. Nothing clears it
+(the flip does not clear `map.img`), the next freeze lets it override
+`cur`, and the next image maps that LPID to flip-`k` content while the
+mutations between the flips (committed, ts ≤ T) are not replayed: the
+same silent class-C loss, through the record rather than the install.
+A deterministic reproduction at this (fixed) tip — preserved at
+`~/.cache/nv3-review/x-5c-F4-F1-F1-F2/sibling_stale_record_repro.rs`
+(scratch, never committed; a self-contained `#[test]` built on the
+committed pin's world) — drives the same park across post-5, releases in
+the post-5→next-flip gap, evicts the oldest copy's LPID between the
+checkpoints (so the next scan cannot self-heal the entry by re-writing
+the frame), and reopens after the second checkpoint's meta: image 2
+maps P to `Ref { slot: 32, epoch: 1 }` — the flip-1 leaf, crc
+4182374088 — and P's scan loses the window-1 key. The committed
+`freed_lpids_late_copy_never_remaps` pin rides on the same world with
+its release inside window 2, where the record's stale insert is
+unobserved (its doc says so); a guard at the record (the same
+`CopyPending` re-test, or a window re-test) would close it, but that
+is outside this card's prescribed fix ("at `epoch_copy:install`") and
+Limit 1's letter leaves the decision to P.
+
+**What did not change:** the oracle, the model, the sim, K, R, the
+generators, every quota, `verify`'s exit rule, `ckpt2:scan`'s
+condition, and `docs/` (P decides at this card's gate whether S-STORE
+§5.6 needs its "re-test the copy condition after any wait on the
+reserve" sentence, as its own Class: spec card).
+
+## Card X-5c-F4-F1-F1-O1C's record (the three faultless class C
+## O-1(c) rounds with no owner: the recovered frontier above the
+## model's upper bound)
+
+Diagnosis only, per the card's Limits: **no fix** (the oracle, the
+model, `upper_bound`, the sim, K, R, the generators, every quota and
+the store are untouched; `docs/`, `cards/` and `verdicts/` untouched).
+The one code change is the diagnostic the card prescribes:
+**`E4_O1C_TRACE`** (stderr only, default off, never a digest input,
+verified below) — the harness side prints the trace of any round whose
+`frontier > model.upper_bound(lower_bound(c_prev))` (the exact bounds
+`check_round` derives; `hi` is class-independent in the oracle), and
+`ckpt::recover`'s walk prints its own accepted-record list beside the
+opened meta's bounds (`O1C walk:` lines), so the replayed side and the
+event side can be matched record for record. The harness side also
+re-runs `derive_written_acked`'s stitched-write walk step for step
+(`o1c_stitched_walk`) with a per-inode path log, so a record the
+`written` half missed is located on the walk's own path.
+
+**The three rounds, each reproduced twice** (single seeds under
+`ulimit -v 25165824`, output outside the worktree; digests identical
+across the two runs and equal to `X-5c-F4.acc.campaign.json`'s and P's
+`o_base.json`/`o_allf.json` — the rounds are unchanged at this tip):
+
+| Seed/round | crash | lo | hi | frontier | digest (×2) | o1 |
+|---|---|---|---|---|---|---|
+| 1066 r0 | `Mid2@2` | 20 | 20 | **21** | 1383263257 | `O-1(c) at c=20, tree 2: raw entry above the cut (max ts 21)` |
+| 6555 r0 | `uniform@y:11624` | 22 | 23 | **24** | 3687676066 | `O-1(c) at c=22, tree 2: raw entry above the cut (max ts 24)` |
+| 7590 r0 | `uniform@y:10872` | 19 | 20 | **21** | 3340396508 | `O-1(c) at c=19, tree 2: raw entry above the cut (max ts 21)` |
+
+All three are round 0, faultless (`lost/mis/torn` 0), no nested
+recovery crashes, `served=false`, amcheck clean — REFRESH 8's "a class
+C O-1 **with no XX001**" shape, escalated below.
+
+**The trace, one mechanism in all three.** Each round's chunked
+transaction fills segment 0 early (writes spanning tens of KiB of the
+file); a mid-round checkpoint recycles segments 0 and 1 (§13 step 6 —
+renamed to segments 3 and 4, each rename `sync_dir`'d); the renamed
+file then receives the round's last commits as its **new life**. The
+record above `hi` is always the round's last commit, its bytes written
+and synced before the crash inside the new life — and the harness's
+`written` derivation never sees them:
+
+- **1066 r0.** The old life of inode 2 (created as segment 0 at E[0])
+  wrote `E[31] W+ f2@206+10691` — file bytes [206, 10897). The recycle
+  `rename /wal/0000000000000000.log -> /wal/0000000000030000.log`
+  lands at E[1685] (dir-synced E[1687]). The new life's single batch
+  `E[1806] W+ f2@0+5046` / `E[1807] W=` (returned), sync `E[1812]/E[1813]`,
+  with `|E| = 1819` — **the write returned 12 events before the crash,
+  the sync 6 before** (the crash is `Mid2@2`, the checkpointer's
+  step-2 write hook). The batch holds ts 20's record [0, 2453) and
+  **ts 21's record [2453, 5046) — `Commit`, txn (0,19), lsn 199061,
+  len 2593**. The model recorded ts 21 at the enqueue's `h:model` step
+  (`owner_in_model=true`, mode `SyncOff`); the derivation's stitched
+  walk decodes ts 20 at off 0 (the new write's key 0 replaced the old
+  life's key-0 write, and the whole [0,2453) fetch is one chunk), then
+  at **off 2453 `stitched` picks the greatest map key ≤ 2453 — the old
+  life's key 206 (issued E[31]), which still covers 2453 — over the
+  later-issued new write at key 0** (issued E[1806]). The fetched
+  header is the old segment-0 body: magic fails, the walk jumps to
+  10897, and **ts 21's record never enters `ts_pos`** → `written=false`
+  → `hi = 20`. The walk path, verbatim:
+  `off=0: rec ts=20 … end=2453`, `off=2453: undecodable, jump to
+  10897`, then the old life's chunks to 58239, stop.
+- **6555 r0.** Old life write `E[58] W+ f2@24454+30070` ([24454,
+  54524)); recycle at E[1689] (dir-sync E[1692]); the new life's last
+  batch `E[2269] W+ f2@22864+5037` / `E[2270] W=`, sync
+  `E[2271]/E[2272]`, `|E| = 2301` (**write returned 31 events before
+  the crash, sync 29**). The batch holds ts 23's record [22864,
+  24895) and **ts 24's record [24895, 27901) — `Commit`, txn (0,24),
+  lsn 221503, len 3006**; the model holds ts 24 (`SyncOff`). The walk
+  decodes the new life's records up to ts 23 (each record's start is
+  its own write's key: 17919, 21164, 22864), then at **off 24895 the
+  greatest covering key ≤ 24895 is the old write's 24454** (issued
+  E[58], 2200 events earlier) — magic fails, jump to 54524 (the old
+  life's chunks), and ts 24 never enters `ts_pos` → `hi = 23`.
+- **7590 r0.** Old life write `E[16] W+ f2@2379+29226` ([2379,
+  31605)); recycle at E[1770] (dir-sync E[1774]); the new life's batch
+  `E[1981] W+ f2@2120+4408` / `E[1982] W=`, syncs `E[1983]/E[1984]`
+  and `E[1985]/E[1986]`, `|E| = 2084` (**write returned 102 events
+  before the crash, the first sync 100**). The batch holds ts 20's
+  record [2120, 4994) and **ts 21's record [4994, 6528) — `Commit`,
+  txn (0,20), lsn 201602, len 1534**; the model holds ts 21
+  (`SyncOff`). The walk decodes ts 19 at 0 and ts 20 at 2120 (the new
+  write's own key), then at **off 4994 the greatest covering key ≤
+  4994 is the old write's 2379** (issued E[16], ~1965 events earlier)
+  — magic fails, jump to 31605, and ts 21 never enters `ts_pos` →
+  `hi = 20`.
+
+**The store's side, all three.** `ckpt::recover`'s walk reads the
+renamed file's **current** view (`read_at` — later writes overwrite
+earlier ones in the disk), so it decodes the new life's records
+correctly and stops where the old bytes begin: 1066 replays ts 11–21
+(`valid_end = 201654` = ts 21's end), 6555 ts 17–24 (`valid_end =
+224509`), 7590 ts 19–21 (`valid_end = 203136`). The frontier equals
+the last replayed ts in each — the records' bytes are durable (X5-R34's
+`D` covers each record's end exactly; `D`'s own stop reason names the
+same old write and the recycle binding: "the last covering write (ev
+31, [206,10897)) precedes the durable binding (ev 1685) — stale bytes
+of an earlier segment name"), the recycle is consistent with §12.6's
+rule (segments 0 and 1 lie wholly below the opened meta's
+`wal_start_lsn`: 179837 / 203646 / 196608), and the replays are
+ts-ordered with LSN (I-WAL-TS-ORDER holds across every walk record).
+
+**Work 2's answer.** In all three rounds the replayed commit is **a
+commit the model should have counted as WAL-written** — not a commit
+that should not be in the WAL. Evidence per card Work 1, holding for
+all three: the commit was enqueued and the model recorded it before
+the crash (`owner_in_model=true`; `h:model` runs the step after
+`wal_enqueue` returns, so the recording itself dates the enqueue
+before the crash); the record's bytes were **written and synced
+before the crash** (the write and sync events with their returns sit
+inside `E`, 6–102 events before its end — the exact indices above);
+the bytes are durable by X5-R34's own rules (`D` ends exactly at the
+record's end); and recovery replayed them per §12.5/§14, which is
+what a correct store must do with a durable record. The commit is not
+spurious, stale or mis-positioned: the record decodes at its own lsn
+under the file's current view, its boot id is this round's boot 0,
+and its ts is the largest in the stream (a previous life's stale bytes
+would carry an older lsn and fail §12.5's position rule — the walk's
+stop at the old bytes shows that rule working).
+
+**Which side is at fault under S-STORE §14's oracle text.** **Neither
+`upper_bound` nor the store.** §14's oracle bounds `c` by "the last
+WAL-written commit" — a property of the durable WAL, which in these
+three rounds **includes** the replayed ts (its write and sync
+returned before the crash; `D` covers it). The store's replay is
+exactly §14 step 4's rule applied to a durable, correctly-positioned
+record, and the frontier is §14's "largest replayed `commit_ts`". The
+defect is in the **harness accounting that feeds `hi`**:
+`derive_written_acked`'s written half builds a per-inode,
+per-offset-latest-issued-bytes map (`files.insert(off, …)`) and
+`stitched` resolves a byte by the **greatest map key ≤ the cursor**,
+ignoring issue order — so when a recycled file's earlier-life write
+starts at a key between the new life's write key and the new record's
+start, and still covers that start, the **old** bytes shadow the
+**new** record (the exact masking family the `E4_ACK_DIAG`
+cross-check's escalation already recorded for `acked`, X-5c-F3-F1
+step 1 (e) shape 2 — there the same per-offset map hid an original
+record behind a recycled life's bytes; here it hides the new life's
+record behind the old life's write, and the victim is `written`, the
+`hi` input). `upper_bound` itself faithfully reports
+`max{ts : recorded ∧ written}` over what it is given; the derivation
+never marked ts 21/24/21 written, so `hi` sits one commit below the
+true last WAL-written commit, the candidate set excludes the
+frontier, and O-1(c) fails at every candidate. A fix (resolving
+`stitched`'s cover by issue order, or keying the map by interval
+supersession, as X5-R34's per-NAME view with its β binding-index
+already does correctly for `acked`) is P's ruling — this card's
+Limit 1 forbids it, and the oracle and model are frozen.
+
+**What did not change:** the oracle, the model, `upper_bound`, the
+sim, K, R, the generators, every quota, the store, `docs/`, `cards/`,
+`verdicts/`. The diagnostic is default-off and moves no digest
+(verified: seeds 1066/6555/7590 produce identical digests with
+`E4_O1C_TRACE` on and off, and both trace runs are byte-identical in
+stderr). Artifacts: `/tmp/opencode` is not durable, so the trace
+stderrs live beside the runner's logs at
+`$HOME/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-O1C.*` (copied there
+by this card's commands: `t<seed>.{a,b}.{err,json}`).
+
+## Card X-5c-F4-F1-F1-O1C-F1's record (X5-R47: `written` by replay in issue order)
+
+## X5-R47 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the
+step-0 discipline, as X5-R6–R46 before it). It amends X5-R34's
+"Unchanged: `written`" and supersedes the O1C record's diagnosis
+above: the fix it prescribes replaces the `written` half and the F1
+report of `derive_written_acked`.
+
+**X5-R47 (amends X5-R34's "Unchanged: `written`").** A commit `(ts, lsn, len)` of `wal_commits` is **written** iff, at some event of `E`, immediately after a `WriteIssued` is applied in `E`'s order to a per-inode byte image, some inode's image holds at `[lsn mod WAL_SEG, lsn mod WAL_SEG + len)` a record that `dec_record` accepts with its own `lsn` and with `rec.ts == ts` and kind `Commit` or `CommitMarker`.
+- **Monotone.** Once written, always written: a later life overwriting the bytes does not unwrite the commit. The test is never made against the final image alone.
+- **No resolver by key.** No per-offset map and no greatest-key cover take part. Later bytes replace earlier bytes because they were issued later.
+- **Issued is returned.** `SimDisk::write_at` emits `WriteIssued` and `WriteReturned` in one step, so no crash separates them. The old `returned_end` test is removed. Add a debug-free guard: a `WriteIssued` in `E` without its immediately following `WriteReturned` fails the round through `task_error`.
+- **F1.** A commit is reported in `unparsed_written` iff it is not written and, at some such point, an image holds at `lsn mod WAL_SEG` 24 header bytes with correct magic, its own embedded `lsn`, and `lsn mod WAL_SEG + len_in_header > WAL_SEG`.
+- **SyncOff's acked** stays "iff written". SyncOn's acked half is untouched.
+- **Rejected forms.** A final-image walk, an interval-superseded view, and resolving `stitched`'s cover by issue order over the whole history all drop earlier-life records (measured: 1,028 of 19,118 rounds).
+
+**Step 0 — the diagnosis brought in.** `git cherry-pick c13299c0
+82062a02`, card X-5c-F4-F1-F1-O1C's two commits (not its verdict),
+clean on this base.
+
+**Steps 2–3 — the implementation (commit a3b64979).**
+`derive_written_acked`'s `written` half and F1 report are now one
+pass over `E`: each `WriteIssued` is applied in `E`'s order to its
+inode's byte image (`r47_apply_write`), and immediately after the
+application the just-written image is tested — `r47_image_holds` for
+`written` (the record at `[lsn mod WAL_SEG, +len)` decoding with its
+own lsn, `rec.ts == ts`, kind `Commit`/`CommitMarker`, inside its
+segment), `r47_header_runs_past_segment` for F1 (the 24 header bytes,
+correct magic, its own embedded lsn, `len_in_header` past the segment
+end). Each write is tested only against commits whose record overlaps
+it (the union window `[pos, pos + max(len, 24))`; the geometry
+hoisted out of the loop), and both verdict sets are monotone — a
+point that qualified at some event of `E` is never re-tested and
+never unqualified. **Issued is returned:** the `returned_end` extent
+test is removed and `r47_issue_return_paired` (always on,
+debug-free) takes its place in `run_round`'s `task_error` cascade —
+a `WriteIssued` whose immediately following event is not its own
+`WriteReturned` (same inode, offset, length) fails the round. The
+SyncOn acked half, `D`, `Rc`, the oracle, the model, the sim, K, R,
+the generators, the quotas and the store are untouched. The
+diagnostics: `o1c_stitched_walk` and its per-inode path log are
+deleted (they mirrored a reader that no longer exists), as are
+`issued_header_len`, `stitched` and the `FileWrites` alias (no
+remaining readers); `ack_record_present` replays the same way and its
+doc now names the derivation itself, never a mirror; the false "the
+walk sees exactly the latest life" doc is gone; `o1c_frontier_trace`
+keeps its frontier-above-`hi` shape but computes its derivation rows
+by **calling `derive_written_acked` directly** (the trace can no
+longer drift from the derivation), and its inode histories come from
+the durable bindings of above-`hi` commits.
+
+**Step 4 — the pins (commit d8f9f7a0).** Seven, hand-built events
+unless stated, beside the x5r34 self-tests in `tests/harness.rs`:
+
+- `r47_new_life_record_behind_old_write` — 1066's literal shape (old
+  write `[206, 10897)`, new write `[0, 5046)` holding records at 0
+  and 2453): both written, both acked (SyncOff), no F1.
+- `r47_earlier_life_record_stays_written` — a record overwritten
+  wholesale by a later life stays written (monotone).
+- `r47_never_issued_stays_unwritten` — no bytes issued, and a last
+  byte never issued (a torn tail), stay unwritten and unreported;
+  a whole record is the positive control.
+- `r47_wrong_record_at_position_stays_unwritten` — a valid record at
+  the position with another lsn (the §12.5 stale rule) and one with
+  the same lsn but another ts; a correct record is the control.
+- `r47_f1_on_recycled_file` — a past-segment header behind an
+  old-life write (the new batch's key below the header, the old
+  write's key between the two) is reported and never written.
+- `r47_pairing_guard_names_an_unpaired_write` — a paired stream
+  passes `r47_issue_return_paired`; a missing return and a
+  different-length return are both named (the guard is pub for the
+  pin, as the X5-R34 guards are — a pin beyond the card's named six,
+  judgment call: the guard is new judged code and deserves its own).
+- `r47_three_rounds` — seeds 1066, 6555, 7590 under
+  `Tuning::BASE`: r0 passes with `(lo, hi, c, frontier)` =
+  (20, 21, 21, 21), (22, 24, 24, 24), (19, 21, 21, 21) — **the
+  F2-tip values the card quotes, unmoved by CXX** (this tip's
+  pre-change values were (20, 20, —, 21) fail, (22, 23, —, 24) fail,
+  (19, 20, —, 21) fail); 6555's rounds 1–2 continue passing.
+
+**Step 5 — the mutants** (each applied to the real code, shown
+failing its pin, reverted completely — `git diff` clean after every
+revert):
+
+| Mutant | Failing pin (measured) |
+|---|---|
+| M-R47-KEY-COVER (the old greatest-key resolver: per-offset map, each byte by the greatest key ≤ the cursor, tested once over the history) | `r47_new_life_record_behind_old_write` — `left: [20] right: [20, 21]`: ts 21's record masked by the old write's key 206 |
+| M-R47-FINAL-IMAGE (each commit tested against the final images only) | `r47_earlier_life_record_stays_written` — `left: [] right: [9]`: the overwritten record unwritten |
+| M-R47-ALL-WRITTEN (every commit written) | `r47_never_issued_stays_unwritten` — `left: [30, 31, 32] right: [30]` |
+| M-R47-NO-TS (`rec.ts == ts` dropped) | `r47_wrong_record_at_position_stays_unwritten` — `left: [40, 42] right: [40]`: the same-lsn record with another ts counts (the stale-lsn case stays unwritten through `dec_record`'s own lsn check) |
+| M-R47-NO-F1 (the header-past-end set never recorded) | `r47_f1_on_recycled_file` — `left: [] right: [51]` |
+
+**Step 6 — digest movement** (single seeds, one process each, under
+`ulimit -v 25165824`, output outside the worktree; pre = this tip
+without the change — the cherry-picked diagnosis commits, post = the
+X5-R47 commits):
+
+| Seed | pre digest | post digest | verdict |
+|---|---|---|---|
+| 1066 r0 | 1383263257 | 423674518 | **fail → pass** (O-1(c) cleared; (lo, hi, c, frontier) (20, 20, —, 21) → (20, 21, 21, 21)) |
+| 6555 r0 | 3687676066 | 3744559595 | **fail → pass** ((22, 23, —, 24) → (22, 24, 24, 24); r1, r2 keep passing) |
+| 7590 r0 | 3340396508 | 3293778794 | **fail → pass** ((19, 20, —, 21) → (19, 21, 21, 21)) |
+| 8852 r0 | 564931007 | 564931007 | **no move** (see below) |
+
+The X5-R37 literal list (54 seeds, run singly before and after):
+**zero digests moved** — the pin `x5_r37_base_tuning_reproduces_1b0ce54e`
+holds byte for byte at this tip. The contiguous `run --seeds 0..200
+--threads 16`: **zero digest moves, zero verdict changes** (the
+failing rounds stay exactly the known 8/178 pair, `DEFECT_SEEDS=0`),
+so no literal was re-derived — no pinned seed's digest moved, and
+X5-R47 explains every movement there was.
+
+**8852, reported as measured (a judgment call).** The card expects
+8852's "only change `hi` 32 to 33" (the O1C gate's F2-tip
+measurement: a SyncOn record issued 2 events before the crash, not
+durable, `D` below its end, the frontier staying put). At **this**
+tip 8852 r0 runs a different schedule — CXX moved the seed's rounds
+(the O1C verdict itself warned "CXX and X5-R41 change the rounds") —
+and reads `(lo, hi, c, frontier)` = (8, 8, 8, 8), passing, with **no
+replay/walk divergence at all**: its digest is byte-identical before
+and after (564931007). No verdict changed in either direction on
+8852, so the card's stop clause ("any other verdict change") is not
+reached; the expected movement simply does not exist at this tip. No
+other seed in any run changed verdict.
+
+**The 0..200 cost, probe, not evidence** (`run --seeds 0..200
+--threads 16`, same host; pre = the tip's binary built before the
+change, post = after it): pre wall **12.6 s**, CPU 127.4 s user +
+29.5 s sys (≈ 157 s); post wall 18.5–38.5 s across three runs (the
+host carries other load; the quiet-host run is 18.5 s), CPU 181–192 s
+user + 41–45 s sys (≈ 226–233 s). **[Raw measurements kept, labelled
+host state — the "+45% CPU" sentence that stood here was wrong, and is
+replaced by X-5c-PINS-1 with the O1C-F1 verdict's Cost-section
+numbers, quoted from `verdicts/X-5c-F4-F1-F1-O1C-F1.md`: "The +45%
+does not reproduce. The replay costs less than the walk it
+replaced." — derivation time inside the 0..10000 run: 96.7 s (pre) →
+**63.9 s** (post); 0..200 alternating CPU: pre 174, 251, 250 s, post
+243, 253, 252 s; 0..10000 CPU: 13,171 s → 13,831 s; wall: 22.8 min →
+22.1 min; "The derivation is 0.5% of a run's CPU either way, and the
+change is −33 s CPU over 10k"; the +45% itself "resembles my first
+pre probe of the alternating series, 174 s, taken at a quiet moment …
+Contention inflates CPU seconds on this host", which is exactly what
+the 157 s vs 226–233 s readings above show; budget effect on F4:
+"none (under 15 s at any plausible FINAL)".]** No `E4 ABORT`, no
+livelock, no deadlock.
+
+**The gate's enforcement step in this container (a judgment call,
+recorded with its evidence).** `bash scripts/gate.sh` failed at
+`STEP enforcement-tests EXIT=1` three times, deterministically, on
+one test only: "runner e2e: K: SIGTERM kills opencode and closes the
+ledger range". Root cause, measured on a preserved scratch run:
+**every real assertion of K held** — the driver exited rc 143, the
+ledger range closed at the branch tip, and the fake opencode's pid
+was dead (`kill(pid, 0) → ESRCH`) — but `dead()` also probes
+`killpg(pgid, 0)`, which succeeded because the killed `sleep 30`
+(orphaned when its parent died in the same group kill) stayed a
+**zombie**: `ps` shows `[sleep] <defunct>` at exactly the run's pgid,
+and the container carries 706 unreaped zombies, because **this
+container's PID 1 is the card session's own `opencode` process**,
+which never `wait()`s — no adopted orphan is ever collected, and a
+zombie keeps its process group visible to `killpg`. The test is
+self-contained (a throwaway repo under `mktemp -d`, copying only
+`scripts/*.sh`, `CORE_PATHS` and `tools/run_card.py` — nothing this
+card touched), and the same suite passed for the CXX and O1C gates on
+hosts whose init reaps. The card's Touch-only list forbids editing
+`scripts/` or `tools/`, so the fix here is **environmental**: the
+Acceptance gate runs under a stdlib subreaper wrapper
+(`PR_SET_CHILD_SUBREAPER` + a tight `waitpid(-1, WNOHANG)` loop,
+preserved at `/tmp/…/reaper.py`, never in the repo) that adopts and
+reaps orphaned descendants — the service a normal init provides. It
+changes no gate step, no file and no test; `bash
+scripts/test-enforcement.sh` under it prints `test-enforcement: all
+passed` (exit 0), and the wrapper is not needed for any other step.
+
+## Card X-5c-F4-F1-F1-CXX-F1's record (X5-R48: the re-paired twin that
+## never fires)
+
+## X5-R48 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the
+step-0 discipline, as X5-R6–R47 before it). It amends X5-R21 (c)'s
+re-pair (P ruling nv3-X-5c-F1-esc-1, above): when the re-paired
+twin's crash does not fire at the real round's re-derived spec, the
+re-pair itself re-derives, from both complete mask lists. The
+diagnosis is verdict X-5c-F4-F1-F1-CXX's finding 1 (seed 7469).
+
+**X5-R48 (amends X5-R21 (c)).** When the re-paired twin's crash does not fire at the real round's re-derived spec, both unfired attempts ran to completion, so both mask lists are complete.
+- **Joint spec.** Take the per-index AND of the twin's masks and the real round's first-attempt masks, over the shorter length. Call `reachable_hook_spec` on it with the same drawn `(hook, ckpt_index)` and the same `(seed, round)`.
+- **Re-run.** The twin re-runs at the joint spec from its own start. The real round then runs at that same spec. `twin_final_spec` and `real_final_spec` both name it, and `crash_desc` describes it.
+- **Refusal.** A refused re-derive (union 0, or an empty list) leaves the unfired twin and its fired-guard defect standing. A joint-spec twin that still does not fire also trips the guard. There is no third attempt.
+- **Unchanged.** Every round whose re-paired twin fires, the twin's first-attempt re-derive, the uniform wrap and the class C retry. No other arm draws anything.
+
+**Step 0 — the ruling carried (commit 1c600515).** The text above,
+verbatim, before any code of this card.
+
+**Step 1 — the pin, failing at this tip (commit 42801a1f).**
+`r48_repaired_twin_fires_at_the_joint_spec` (seed 7469 under
+`Tuning::BASE`): no defect, `twin_paired` true on every round, round
+1's crash `Mid2@4` and fired. At this tip it failed on
+`Some("twin round 1: the crash spec never fired (Mid2@1)")` — 7469
+was CXX's one defect seed of 0..10000 (the pre-change single-seed
+run: `DEFECT_SEEDS=1`, the seed stopping after round 1, digest
+1670717970).
+
+**Step 2 — X5-R48 implemented (commit 45ab6b49).** The R21 (c)
+re-pair block of `run_seed_with` (`src/workload.rs`), the only code
+this card touches: when the re-paired twin does not fire at the real
+round's re-derived spec, the per-index AND of the twin's complete
+masks and the real round's first-attempt complete masks (over the
+shorter length) goes to one `reachable_hook_spec` draw — the same
+drawn `(hook, ckpt_index)`, the same `(seed, round)` — and on `Ok`
+the twin re-runs at that joint spec from its own start (kept beside
+`tch_pair` as `tch_retry` is), `spec2`/`script2`/`crash_desc` name
+it, the real round then runs at it, and `twin_final_spec` and
+`real_final_spec` both name it. On `Err` nothing changes: the unfired
+attempt's fired-guard defect stands (the Refusal clause); a
+joint-spec twin that still does not fire trips the guard the same
+way; there is no third attempt. Every other arm — a firing re-pair,
+the twin's first-attempt re-derive, the uniform wrap, the class C
+retry — is untouched, and no other arm draws anything. Measured on
+7469 (an instrumented scratch copy, single seed): the re-pair's own
+masks `[3ff, 3f7, 3ff, 3f7, 3ff, 3ff, 3ff, 3ff]` AND the real first
+attempt's `[3f7, 3ff, 3f7, 3ff, 3ff, 3ff, 3ff, 3ff]` = `[3f7, 3f7,
+3f7, 3f7, 3ff, 3ff, 3ff, 3ff]`, and the draw moves `Mid2@0 ->
+Mid2@4` (`Mid2` is `CKPT_HOOKS[3]`, bit 3 — the one bit `0x3f7`
+lacks; the joint first carries it at index 4, and the drawn index 0
+does not), twin and real both fire, three rounds all pass, no defect,
+digest **1393729414** — the gate trial's exact value
+(`trial-joint-repair.diff`, a diagnostic; this code was written
+against the ruling, not copied from it).
+
+**Step 3 — the mutant.** **M-R48-REAL-MASKS-ONLY** (the second
+re-derive consults the real round's masks alone): the draw returns
+`Mid2@1` again, the re-paired twin re-runs there and never fires, and
+the pin fails on `Some("twin round 1: the crash spec never fired
+(Mid2@1)")`. Applied to the real code, shown, reverted completely
+(`git diff` empty, the pin green again at the reverted tip).
+
+**Step 4 — `r21c` (commit 70e87d9a).** 7469 is back in the list
+beside 9469, and the pin's doc is corrected per the verdict's finding
+2: at CXX's tip, within `r21c`'s literal list, only 9469 reaches the
+re-pair path with a firing twin; 2669 re-derives in the twin's first
+attempt; 4049, 4309 and 9809 re-derive nothing. (Scope corrected by
+X-5c-PINS-1, verdict `5db63057` finding 1: over 0..10000 — outside the
+literal list — 8469 and 8869 reach it with a firing twin too.)
+
+**Step 5 — the last-step pin's second seed (commit 39ddccdd).**
+`drop_last_step_keeps_its_pages_pinned` runs its unchanged body at
+seeds 38 and 467. **G6-UNPIN-BEFORE-FREES** (the guard dropped after
+the directory descent, before the tree mutex is re-taken, applied by
+hand to `dir_drop_tree`'s last step): the pin **passes at 38** and
+**fails at 467** — `seed 467: root 2 is mapped and in the free set —
+the last step freed a page whose frame an evictor had already
+latched (evict:finish resurrected it)`. Reverted clean (`git diff`
+empty, the pin green at both seeds). The CXX verdict's
+"UNCAUGHT at the literal seed 38" row is closed by the 467 literal,
+exactly as its finding 3 prescribed.
+
+**Step 6 — the digests (commit ba4aac1f).** Single seeds and the one
+contiguous 0..200, under `ulimit -v 25165824`, output outside the
+worktree; pre = O1C-F1 at `86e17a34` (this card's base, whose literals
+the X5-R37 pin holds byte for byte — **not** CXX's tip: corrected by
+X-5c-PINS-1, verdict `5db63057` finding 1. CXX's tip differs from
+O1C-F1 in 3 digests — `1066`, `6555` and `7590` r0, O1C-F1's own named
+movers, outside this list and outside 0..200 — so a comparison against
+CXX's tip would have shown them; the measured table below compares
+against the base as recorded), post = this tip:
+
+| Run | Movement |
+|---|---|
+| 7469 singly | `1670717970 -> 1393729414`; `DEFECT_SEEDS 1 -> 0`; 2 rounds -> 3, all passing; r1's crash `Mid2@1 -> Mid2@4`, fired; the twin rounds all pass |
+| the X5-R37 list (54 seeds), singly | 7469 alone; the other 53 byte-identical |
+| contiguous 0..200, 16 threads | zero digest moves, zero record changes; the failing rounds stay the known 8/178 pair; `DEFECT_SEEDS=0` |
+
+7469's literal is re-derived in the pin and the movement attributed
+in its doc (X5-R48's own row).
+
+**Step 7 — this record, and the correction above.** CXX's movement
+passage said "of the nine, four first moved at the replay change";
+its own table shows ten movers — three first at the replay change,
+one at B1 — and the passage now says so (the verdict's finding 4).
+
+## Card X-5c-F4-F1-F1-F3's record (X5-R41 the window-targeted SMO
+## alignment, X5-R42 the Q4-I row, X5-R43 the seeded faults)
+
+**Limit 5 (first commit, b7651f73) — X5-R40 removed.** `smo_share`,
+`S_SMO`, `ScriptOp::AwaitCkptOpen`, `AWAIT_CKPT_OPEN_TURNS`, its four
+pins and the seed 886 pin: it never handed off a setting and has no
+reader. Its 0..200 result stays in `verdicts/X-5c-F4-F1-F1.md`.
+
+**Step 1 — X5-R41 (commit f69e94b5).** A round is selected when all
+hold: a targeted crash (`seed / 10` even), no drop this round, and a
+draw from the new `S_R41` stream below `r41_share` permille — nothing
+is drawn at share 0, and every content draw comes from the second new
+stream `S_R41C`, so an unselected round consumes nothing (BASE's
+scripts are bit-for-bit the generator's; the 54-seed BASE pin still
+passes). The block, at the front of the GC task after the barrier:
+two sync-on commits of 20 Puts each at the value ceiling (a dense run
+of 40 keys in tree `tm`), two sync-on commits of Deletes of those
+keys, `R41Wait`, `Gc { tree: tm }`, one sync-on commit of 20 Puts at
+the ceiling (a dense run in a tree other than `tm`), `R41Done`; a
+`R41Arm { idx: knobs.target_ckpt }` goes before the barrier. The hold
+lives in the checkpointer's hook closure: at `After0` of the armed
+checkpoint, before the crash arm, it sets the window flag and
+spin-yields until `R41Done`, `workload_done`, a task error, or the
+fixed 20,000-turn budget (`R41_TURNS`; no wall clock). `R41Wait`
+spin-yields on the flag, `workload_done`, `tasks_left <= 1`, or the
+same budget. Why this is not contrived: a real checkpoint over a
+large dirty set stays open far longer than one tree sweep; the spike's
+window is short only because its dirty set is small.
+
+**Step 2 (commit 58e99890) — the record fields, never digest inputs.**
+`q4reuse` (the store's new `ckpt_reuse` observable: `alloc_lpid`
+handing out an LPID freed since this flip, reset per window beside
+`ckpt_splits`/`ckpt_merges`), `imgsp`/`imgmg`/`imgreuse` (the same
+counts for the window of the last checkpoint whose step 5 returned,
+from the harness's per-checkpoint ledger), `q4i_raw` (the window of
+the checkpoint whose meta the round's **final recovery opened**, by
+that meta's `ckpt_id` through a per-seed ledger kept for the whole
+seed — a meta rollback reads the older image's window, never the last
+step-5 checkpoint's, and the harness checkpoint's id is dropped after
+each round so its meta finds no row) and `q4i` (`q4i_raw` ∧ the
+round's crash fired ∧ Q18's `end.is_some()`, in `q4i_of`). The JSON
+round-trips all six. The store also gains exactly the two X5-R43
+`Mutant` variants, inert when `cfg.mutant` is `None`, at the gate's
+`patch.py` sites. **The reuse window is the whole flip window (the
+flip through step 5), the field definition of step 2 — the Q4-I row's
+"reused before its step 2 froze the table" is the coverage intent it
+serves; a reuse after the freeze but before step 5 counts.**
+
+**Step 4/5 — the three shares over 0..200, each with only that knob,
+then reverted; probe, not evidence.** Same session, 16 threads,
+`ulimit -v 25165824`, outputs outside the worktree. CPU is user+sys of
+the run command; wall beside it.
+
+| probe, not evidence | BASE | R41 1000 | R41 800 | R41 600 |
+|---|---|---|---|---|
+| rounds | 304 | 308 | 307 | 304 |
+| Q4 | 0 | 28 | 23 | 18 |
+| Q4 × 50 | 0 | **1,400** | 1,150 | 900 |
+| Q5a (row 200) | 3 | 4 | 2 | 2 |
+| Q7 (row 200) | 6 | 6 | 7 | 7 |
+| Q18 (row 1,000) | 19 | 94 | 84 | 63 |
+| q4i_raw / q4i | 4 / 4 | 30 / 30 | 27 / 27 | 18 / 18 |
+| **Q4-I × 50** | 200 | **1,500** | 1,350 | 900 |
+| imgboth (imgsp ∧ imgmg rounds) | 1 | 35 | 31 | 21 |
+| imgru (imgreuse ≥ 1 rounds) | 4 | 35 | 32 | 22 |
+| CPU s (wall s) | 163 (13.3) | 331 (36.8) | 299 (35.3) | 251 (34.0) |
+| CPU vs BASE | — | +103% | +83% | +54% |
+| failing rounds | 8 r0, 178 r1 | 178 r1 | 178 r1 | 8 r0, 178 r1 |
+
+The failing rounds are the known pair (both MP O-3 (e) (ii) amcheck
+findings, F4's MP-A class); the alignment makes 8 r0 pass at 1000/800
+and leaves 178 r1 untouched. No new failure class appeared under any
+share (no class C O-1 without XX001, no C-XX, no deadlock, no livelock
+— `DEADLOCK=0 PANIC=0 DEFECT_SEEDS=0` everywhere).
+
+**The decision rule, verbatim (fixed before any probe).** *Met: Q4 ×
+50 ≥ 1,500, with no Q5a, Q7 or Q18 below the lower of its row and
+BASE's own count × 50 on the same seeds, and CPU ≤ +60% of BASE. Also,
+because the owner chose option A: the image arm with reuse × 50 ≥
+1,500. Hand off the setting for F4's REFRESH. Not met by all three:
+ESCALATE with the numbers. Q4 is never lowered or redefined by a card,
+a gate or an orchestrator.*
+
+Applied (the floors: Q5a min(200, 3×50=150)=150; Q7 min(200, 6×50=300,
+row 200)=200; Q18 min(1000, 19×50=950)=950; "the image arm with reuse"
+read as `q4i`, the row's own quantity — `q4i_raw` and `imgreuse` are
+reported beside it):
+
+- **1000: NOT MET.** Q4 ×50 = 1,400 < 1,500; CPU +103% > +60%; the
+  image arm ×50 = 1,500 ≥ 1,500 (exactly); Q5a 200 ≥ 150, Q7 300 ≥
+  200, Q18 4,700 ≥ 950.
+- **800: NOT MET.** Q4 1,150; CPU +83%; image arm 1,350; floors held.
+- **600: NOT MET.** Q4 900; CPU +54% (met); image arm 900; floors held.
+
+**NOT MET by all three → no setting is handed off; ESCALATE with the
+numbers** (Q4 at the best share reads 1,400 per 10k against the
+1,500 bar; the prototype's 1,760-per-10k reading predates this card's
+own `!knobs.drop_tree` selection clause, which removes a third of the
+selected rounds). Q4's definition and threshold are untouched.
+
+**Step 6 — X5-R42 (commit dc11158d).** `verify`'s exit rule gains the
+Q4-I row (≥ 1,000 `q4i` rounds over the whole 10k, printed beside the
+5.6 table and counted in its miss total) and its reproduction check
+(a per-round `q4i` mismatch between the file and the re-run counts the
+seed as non-reproducing; `q4i` stays out of the digest so X5-R37's
+BASE literals cannot move). At this tip FINAL == BASE, so the row
+reads short there; no Acceptance line runs `verify`.
+
+**Step 7 — X5-R43 (commits f921a2a2 and the correction c3d1b4b5).**
+The `seeded-faults` subcommand runs the range three times at the
+campaign's tuning (clean, Joint `M-REUSE-DROPS-IMG`, Slot
+`M-FREE-HOME-ALLOC`). A **new failing round** fails O-1, O-2 or O-3 in
+the mutant's arm and **passes the oracle** in the clean arm
+(no O-1/O-2/O-3 text — the pin's own wording, "a literal seed the
+oracle fails on with the mutant and passes on without it"; the first
+draft subtracted the clean arm's *fold* pass instead, which counted 46
+MP detection rounds whose failure texts are identical between the
+arms — a fault that changed nothing — and is corrected in c3d1b4b5).
+Deadlock, panic and monitor-only hits never count. Caught is ≥ 5 new
+failing rounds with ≥ 1 arm-predicate hit (`q4i_raw` for Joint,
+`q4_split_merge` for Slot); the exit is non-zero if either fault is
+not caught. Measured over 0..200, 16 threads:
+
+| arm (probe, not evidence) | at BASE (share 0) | at share 1000 |
+|---|---|---|
+| Joint new failing rounds | 1 (`63r1`) | **19** (all at After4–After6/Mid6) |
+| Joint with `q4i_raw` | 1 | **6** |
+| Joint verdict | NOT CAUGHT (< 5) | **CAUGHT** |
+| Slot new failing rounds | 0 | **0** |
+| Slot with `q4_split_merge` | 0 | 0 |
+| Slot verdict | NOT CAUGHT | **NOT CAUGHT** |
+
+The Joint catches at share 1000, by crash position: After4@0 ×1,
+After4@1 ×2, After5@1 ×3, After5@2 ×1, After6@0 ×1, After6@1 ×2,
+After6@2 ×3, Mid6@0 ×2, Mid6@1 ×4 — exactly the gate's "all at
+After4–After6" shape, and the gate's own "0 failing among Q4-window
+reuse rounds" held too: **no Q4 round (a steps-0–3 crash) catches the
+Joint fault**; its 6 arm-predicate hits are `q4i_raw` rounds (the
+completed-window arm), consistent with the verdict's finding that
+Q4's crash position cannot see the joint case. The Slot fault reads
+**zero new failing rounds at every setting measured** (BASE and share
+1000): its damage lands only in rounds that already carry oracle
+texts (MP media detections) or pass — with no catch, the Caught rule
+fails and with it the card's own bar, "**A fault not caught at the
+chosen share is an ESCALATE, with no hand-off.**"
+
+**M-FREE-HOME-ALLOC is UNCAUGHT** (no catcher exists over the card's
+probe range; the named pin `x5_r43_free_home_alloc_is_caught` cannot
+be written and is not — reported, never hidden). All other named
+mutants were applied to the real code, shown failing their named
+test, and reverted clean (`git diff` empty of the mutant each time):
+
+| mutant | catching test (each shown failing, then reverted clean) |
+|---|---|
+| M-R41-NOHOLD (hold returns at once) | `x5_r41_aligned_round_has_q4_and_reuse` (digest 47420405 ≠ 1771266996) |
+| M-R41-WRONGWINDOW (hold/gate key on checkpoint 0) | the same pin (digest 4213423696; the pin's seed has `idx` 1) |
+| M-R41-NOPREP (the block's Deletes removed) | the same pin (digest 2823454535; `q4mg` falls) |
+| M-R41-DRAW (`S_R41` drawn at share 0, fed into `S_GEN`) | `x5_r37_base_tuning_reproduces_1b0ce54e` (seed 0's BASE digest moved) |
+| M-R41-AFTERCRASHARM (hold after the crash arm) | the same pin (digest 47420405; the pin's seed's hook is `After0`) |
+| G-Q4MG-FROM-SPLITS (`q4mg` from `obs.splits`) | the exact-value pin (`q4mg` 4 ≠ 8) |
+| M-REUSE-DROPS-IMG | `x5_r41_completed_window_arm` (seed 142's digest 2081828015 ≠ 1664460399 and the clean round fails the oracle) |
+| M-FREE-HOME-ALLOC | **UNCAUGHT** — no catcher exists over 0..200 at BASE or share 1000 |
+| M-Q4I-LASTCKPT (`q4i_raw` reads the last step-5 checkpoint) | `x5_r42_q4i_keys_on_the_opened_image` |
+| M-Q4I-REFUSED (`q4i` drops `end.is_some()`) | `x5_r42_refused_round_is_not_q4i` |
+| M-Q4I-NOFLOOR (the row's minimum to 0) | `x5_r42_row_at_999_and_1000` |
+| M-Q4I-NOREPRO (the re-run comparison removed) | `x5_r42_flipped_q4i_fails_reproduction` |
+| M-SEEDED-NOBASELINE (no clean-arm subtraction) | `x5_r43_known_failures_are_not_new` |
+| M-SEEDED-NOARMRULE (the arm predicates dropped) | `x5_r43_caught_needs_the_arm_predicate` |
+
+**Pins (step 3, commit c1e879f5).** `x5_r41_not_drawn_at_base`
+(`r41_pick` draws nothing at share 0; the BASE-digest half is the
+54-seed pin), `x5_r41_aligned_round_has_q4_and_reuse` (seed 21 r0 at
+`r41_share` 1000: crash `After0@1`, `q4sp` **4** and `q4mg` **8**
+exact — verdict finding 3: exact values, 4 ≠ 8 — `q4reuse` ≥ 1,
+digest 1771266996), `x5_r41_completed_window_arm` (seed 142 r1:
+`After5@1`, `imgsp`/`imgmg`/`imgreuse` **15/12/9** exact, `q4i_raw`,
+clean oracle-clean, and the Joint fault's arm fails the oracle on the
+same round), `x5_r42_q4i_keys_on_the_opened_image` (the ledger lookup's
+discriminating case, and seed 148 r0: `imgreuse` **5** with `q4i_raw`
+**false**), `x5_r42_refused_round_is_not_q4i`, and the campaign-side
+pins of steps 6/7. The literals are probe-found at the first probe
+share (1000) — no setting met the rule, so nothing was handed off;
+the pins pin the machinery, not a chosen setting, and are labelled
+probe-found, never evidence for a quota claim.
+
+**What F4 inherits.** No `r41_share` is handed off (the rule is NOT
+MET by all three; the ESCALATE carries the table above). The
+machinery is in place and inert at share 0; X5-R42's row and its
+reproduction check are in `verify`; the `seeded-faults` subcommand is
+F4's to run on FINAL in its Acceptance (REFRESH 9), where the Joint
+fault must be caught and the Slot fault's fate is the owner's to
+decide (this card's ESCALATE).
+
+## Card X-5c-F4-F1-F1-F3-F2's record (X5-R49: step 6 frees a freed
+## LPID's home slot)
+
+## X5-R49 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the
+step-0 discipline, as X5-R6–R48 before it). The premise ruling first,
+then the ruling itself.
+
+**P ruling on the premise: yes, this is a prototype deviation from S-STORE §6.5 item 3 and §13 step 6, not a spec question.**
+- §6.5 item 3's merge "frees `R`'s LPID (§4.2)". §4.4 lets a slot be written once nothing references it among the durable image, the image being built and the current map.
+- After `free_lpid`, the current map no longer maps the LPID, so the third reference is gone. §13 step 6 then moves the slot from pending to free once meta `k` is synced and image `k` does not reference it.
+- The spike keeps the slot in `used_cur`, the set that stands for that third reference, forever. It is a leak, not a loss: I-FREE-SAFE holds and nothing is overwritten. But the clean store never reuses a freed page's slot within a session, so I-FREE-SAFE's reuse path is never exercised, and a fault in it cannot be seen. That is why the Slot mutant can only show up through -F1's extra `used_cur` line.
+- The spec text is unambiguous, so no spec change is needed.
+
+**X5-R49 (a prototype deviation fixed; S-STORE §4.4, §6.5 item 3, §13 step 6).**
+- **(a) Release at the free.** `free_lpid` removes the freed LPID's current home from `used_cur` in the same atomic step that removes `map.cur[lpid]`, **unconditionally**. It reads the home before the map drops it.
+  - **Why unconditional, not `unpin_home`.** `free_lpid` runs `freeze_first_touch` first, so during a flip window the image being built already holds its own reference: an `Img::At` whose slot is in `image_refs`, or an epoch copy at another slot. (`Img::Same` is never constructed.) The durable image's reference is in `used_durable`.
+  - `unpin_home` returns early on an `image_refs` slot. That would keep a window-freed home in `used_cur` after post-5 clears the pins: the same leak, only rarer. The gate's scratch (`E4G_SLOT=fixstore`) used `unpin_home` and left exactly those slots pinned.
+- **(b) Step 6 is the release point.** `alloc_slot` also refuses a slot in `pending_free`. `ckpt:step6` clears `pending_free`, as it does today. So a slot that image `k−1` references and image `k` does not becomes allocatable at step 6, not at post-5. One pure predicate, `slot_free(&SlotState, slot)`, is `alloc_slot`'s only test.
+- **(c) FREE-EARLY keeps its meaning.** Its apply makes its early frees allocatable at the flip, so it does not route them through `pending_free`, which (b) now protects. D14 still sees M-NOINPLACE.
+- **(d) Nothing else changes:** not `unpin_home`, not post-5, not the step-6 closure, not the open's slot-set rebuild, and not `Mutant::FreeHomeAlloc`'s site (that site is -F1's).
+
+**Step 0 — the ruling carried.** The text above, verbatim, before any
+code of this card.
+
+**Step 1 — `slot_free`, then the pins failing (commit cfd9fa69).**
+`slot_free(&SlotState, slot)` is now `alloc_slot`'s only test, as one
+pure predicate over the slot sets (a pure refactor: the 54-seed BASE
+pin `x5_r37_base_tuning_reproduces_1b0ce54e` still passes, bit for
+bit). The three pins were added and shown failing at the Base:
+`x5_r49_freed_home_frees_at_step6` (its Mid6 check: slot 6 not free),
+`x5_r49_window_freed_home_frees_at_next_step6` (its k+1 Mid6 check),
+`x5_r49_unimaged_home_frees_at_once` (its free-at-once check).
+
+**Step 2 — X5-R49 implemented (commit 2e274d09).** (a) `free_lpid`
+releases the freed home from `used_cur` unconditionally, in the same
+atomic step that drops `map.cur[lpid]`, reading the home before the
+drop (`Mutant::FreeHomeAlloc`'s site above it untouched); (b)
+`slot_free` refuses `pending_free`, so post-5 keeps a superseded slot
+pending and §13 step 6's clearance (unchanged) is the release point;
+(c) FREE-EARLY's apply frees into no set — `pending_free` is step 6's,
+and routing there would hide the mutant behind (b)'s refusal. The
+`SlotState` doc comments state the four sets' discipline. The three
+pins pass; D14's FREE-EARLY still fires M-NOINPLACE; rework 6's
+literal did **not** move and its pin is green. Seven digest-literal
+pins fail at this commit pending step 4's re-derivation (the X5-R37
+table, 1749 r2 and 5549 r2's O-1f lines, 7469, the late-copy seeds,
+`szc`). **The eviction in flight across a free:** its `evict:finish`
+re-inserts `map.cur[key] = r` — the free is undone in the map, the
+documented "evict:finish resurrected it" shape, demonstrated by
+`drop_last_step_keeps_its_pages_pinned` at seed 467 (CXX-F1 step 5) —
+and `used_cur.insert(r.slot)`: the new slot stays in `used_cur`
+**referenced by the resurrected entry** (inside a window,
+`record_image_at` also pins it in `image_refs`, and post-5 carries it
+into the durable set), so it is *not* rework 6's unreferenced class;
+nothing to fix here, and (a) correctly released the *old* home at the
+free (a later re-free of the resurrected LPID releases the new one).
+Through the store's own paths the interleave cannot precede a free: a
+pack or drop walk fetches the page first, and a fetch parks on an
+`evicting` frame, so the free observes the finished eviction.
+
+**Step 3 — the mutant table (this commit).** Each mutant applied to
+the real code, shown failing its named test, reverted completely
+(`git diff` empty after each; all named tests green at the reverted
+tip):
+
+| mutant | catching test (shown failing) |
+|---|---|
+| M-FREE-LEAK (no release at the free — the Base's code) | `x5_r49_freed_home_frees_at_step6` (Mid6 check) and `x5_r49_unimaged_home_frees_at_once` (at-once check); pin 2's k+1 check also fails |
+| M-FREE-UNPIN-ONLY (the release through `unpin_home`, the gate's scratch form) | `x5_r49_window_freed_home_frees_at_next_step6` (k+1's Mid6 check) — pins 1 and 3 pass, exactly the ruling's "the same leak, only rarer" |
+| M-STEP6-AT-POST5 (`slot_free` ignores `pending_free`) | `x5_r49_freed_home_frees_at_step6` (its After5 check: "must be pending at After5") |
+| M-FREE-RELEASE-DURABLE (the release also removes `used_durable`) | `x5_r49_freed_home_frees_at_step6` (its before-the-flip check: image 1 still references the slot) |
+| G-FE-PENDING (FREE-EARLY's apply routes its frees through `pending_free`) | D14's FREE-EARLY assertion (`monitors=[]` — M-NOINPLACE never fires, the mutant is inert behind (b)) |
+| G2 (rework 6's own: the orphaned write-out's release removed) | `exhausted_reserve_keeps_both_copies` at its unmoved literal (`slots [13] entered used_cur referenced by nothing`) |
+
+**Step 4 — movement measured, then the STOP (this commit).** Base =
+`1180d761` (this card's Base), built from a `git archive` export at a
+target dir outside the worktree; tip = this branch. Every run under
+`ulimit -v 25165824`, 16 threads, output outside the worktree.
+
+- **The Base reproduces `m/b1.json` exactly**: BASE 0..200 at the Base
+  binary is byte-identical (sha256 `3480c86b…c3c6`, `E4 FOLD
+  FAILING_SEEDS=2 FAILING_ROUNDS=2`), so the reference files stand.
+- **X5-R37's 54 seeds, singly**: 41 byte-identical, **13 moved** —
+  measured new digests (recorded here, **not applied** — see the stop):
+  3 `923362676→4196035152`, 47 `2526989435→1878234829`, 112
+  `3003462667→841173046`, 198 `95622311→3654049329`, 303
+  `4147169426→144621379`, 967 `2847369120→3916549382`, 987
+  `2492798953→1449471436`, 1749 `1584051239→3785784973`, 2376
+  `3116539881→926921172`, 2927 `1901399424→1916772534`, 5549
+  `308297210→3614535945`, 7469 `1393729414→1742707490`, 7528
+  `122281874→3346573892`.
+- **BASE 0..1000** (five 200-seed blocks at the tip vs `m/b1k.json`):
+  243 digests moved; failing rounds Base 5 (`8r0, 178r1, 457r0, 537r0,
+  688r0`, all the known MP class) → tip 4 (`8r0, 178r1, 537r0, 688r0`);
+  twin failing rounds both sides `609r1, 849r1`; `DEFECT_SEEDS=0`,
+  `DEADLOCK=0`, `PANIC=0` everywhere. **BASE 0..200** (tip block 1 vs
+  `m/b1.json`): 51 moved, failing rounds 2 vs 2 — the known `8r0` /
+  `178r1` pair on both sides.
+- **New failures (the card's bullets, applied per (seed, round) and per
+  twin) — not zero, so the card's stop rule fires.** All of them are
+  bullet-2 (a round with no O-1/O-2/O-3 text at the Base that has one
+  here); no fold regression (no round that passed the fold at the Base
+  fails it here), and no new DEADLOCK, PANIC, MONITOR, DEFECT or baton
+  hit anywhere:
+
+  | seed, round | class | Base | tip |
+  |---|---|---|---|
+  | 47 r1 (round count 1→2) | MP | (no round 1; the seed's r0 carried the detection) | `pass=true`, `o1='O-1(a) at c=19: published {} != model {2, 3, 4, 5}'`, `crash=poison`; r0 is now text-free |
+  | 339 r0 | MW | `pass=true`, no text, `crash=uniform@y:9569` | `pass=true`, `o1='O-1(a) at c=5: published {} != model {2, 3, 4}'`, `crash=uniform@y:6802` |
+  | 547 r0 | MP | `pass=true`, no text, `crash=After5@2` | `pass=true`, `o1='O-1(a) at c=26: published {} != model {2}'`, `crash=After5@2` |
+  | 779 r0 | MW | `pass=true`, no text, `crash=uniform@y:369` | `pass=true`, `o1='O-1(a) at c=7: published {} != model {2}'`, `crash=uniform@y:5896` |
+  | 797 r0 | MP | `pass=true`, no text, `crash=uniform@y:9889` | `pass=true`, `o1='O-1(a) at c=21: published {} != model {2, 3}'`, `crash=uniform@y:11872` |
+  | 799 r0 | MW | `pass=true`, no text, `crash=uniform@y:13386` | `pass=true`, `o1='O-1(a) at c=5: published {} != model {2}'`, `crash=uniform@y:9670` |
+  | 967 r0 (round count 2→1) | MP | `pass=true`, no text, `crash=Mid6@0` | `pass=true`, `o1='O-1(a) at c=7: published {} != model {2, 3}'`, `crash=Mid6@0` |
+
+  Reading (the rounds' own shapes, not a fix attempt): every new text
+  is an **O-1(a) detected-and-explained loss** — X5-R6's MP/MW rule:
+  a loss the round's media faults explain passes with the text
+  recorded (`o1_detected_loss`). The fix moves the store's yield
+  pattern (allocations differ from the free onward), so the drawn
+  uniform crash points landed elsewhere (`9569→6802`, `369→5896`,
+  `9889→11872`, `13386→9670`) and the media-fault ∩ recovery
+  intersections changed in both directions: 47 and 967 each moved an
+  existing detection one round (47's from r0 to a new r1, 967's from
+  r1 into r0); 339/547/779/797/799 each gained one on a round that had
+  none; and 457 r0's Base failure — an **unexplained** `O-3(a)` served
+  corruption beside its `O-1(a)` — became explained at the tip
+  (`crash=uniform@y:14318→6537`, `pass=false→true`), which is why the
+  tip has one fewer failing round. Seeds 47 and 967 are reported under
+  the strict reading (an added round carrying a text has vacuously
+  "no text at the Base"); 339/547/779/797/799 (and 967 r0) meet the
+  bullet as written, so the stop is mandatory under any reading.
+
+**The stop, and what did not run.** Per Work 4: no fix was attempted.
+The step's remaining items are machinery of the "Otherwise" branch and
+did not run: the `r41_share` 1000 over 0..200 comparison against
+`m/a1.json`; the literal re-derivation commits (the 13 measured new
+digests above are recorded, not applied — the pins keep the old
+literals and are red at this tip: `x5_r37_base_tuning_reproduces_1b0ce54e`,
+`o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2` (its new
+line: r2 tree 4 `lo=38 hi=38 frontier=38 T=35 c=38`),
+`x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2` (its new line:
+r2 `lo=34 hi=35 frontier=34 T=31 c=34`, owner ts 34 > T 31, the clamp
+still not the identity), `r48_repaired_twin_fires_at_the_joint_spec`,
+`late_copy_count_is_zero_at_base`, `szc_rename_crash_keeps_the_open_fold`,
+`g8_checkpoint_poison_ends_the_workload`); F3's 14 named mutants against
+re-derived pins; and the frees / freed-homes-released-at-step-6 /
+handed-out-again diagnostic over BASE 0..200 (the gate read 0 and 0 at
+the Base). Steps 5's re-derivations are therefore also not done; this
+record is the card's end state.
+
+## Card X-5c-F4-F1-F1-F3-F2-F1's record (X5-R51 the movement
+## exemption, the literals re-derived, the image_refs pin, the 10k)
+
+## X5-R51 (P ruling, verbatim, fixed before this card's code and before any literal; any change is an ESCALATE)
+
+Copied verbatim from the card before any code, run or literal of this
+card (the step-0 discipline, as X5-R6–R50 before it). **Numbering.**
+The verdict proposes calling this rule X5-R50. But X5-R50 is already
+taken: card X-5c-F4-F1-F1-F3-F1 uses it for its prior-window generator
+block. The highest X5-R number in use in the README, the cards and the
+verdicts is R50, so **this rule is X5-R51**. The numbers do not follow
+landing order: X5-R51 lands before F3-F1's X5-R50, and that is
+intended.
+
+**X5-R51 (the step-4 movement exemption; a P rule on this card's comparisons only; X5-R49 unchanged).**
+- **(a) Scope.**
+  - X5-R51 amends only bullet 2 of F2's step-4 "new failure" list: "a round with no O-1, O-2 or O-3 text at the Base that has one here".
+  - It applies to `rounds` entries, never to `twin` entries. It compares the same seed at the Base and at the tip under the same `Tuning`.
+  - A round that exists at the tip but not at the Base counts as text-free at the Base.
+  - Bullet 1 (a fold regression) and bullet 3 (a DEADLOCK, PANIC, MONITOR, DEFECT or baton hit the Base lacks) are unchanged.
+  - The rule that a changed text in a round that already carried one is reported, not counted, is unchanged.
+- **(b) Moved, not new.** A bullet-2 round, seed `s` round `i`, is **moved** only when every check below holds. Each check is read from the named output and nothing else:
+  1. **Class.** The seed's `class` in the run JSON is `MP` or `MW`.
+  2. **Pass.** The round's `pass` is `true`.
+  3. **The text.** `o2` and `o3` are null, and `o1` begins with `O-1(a)`.
+  4. **No monitor hit.** The run's `E4 SEEDS=… MONITOR=` count is 0. For a single-seed run, that run's own line counts. A non-zero count exempts nothing in that run.
+  5. **Fully explained.** Run seed `s` alone at the tip with `E4_MPE_DIAG=1 E4_X33_DIAG=1`.
+     - **MP:** take the `amcheck_i findings … tainted …` line inside the `=== seed s round i class Mp ===` block. It must hold:
+       - at least one finding;
+       - a non-empty `tainted` set;
+       - every finding's `slot` is `Some(n)` with `n` in `tainted`.
+
+       A `None` slot, a slot outside `tainted`, an empty finding list or a missing block means the round is **not** explained.
+     - **MW:** the round's JSON `x33x` and `cover_err` are both `true`, and the `X33 diag: seed=s round=i ERR arm: damaged=[…]` line has a non-empty `damaged` list.
+- **(c) Lost.** The reverse direction is a Base round with a text whose tip round is text-free and `pass`, or missing.
+  - It is **moved-lost** when the Base round meets checks 1–3, plus the MW part of check 5 (the JSON fields only).
+  - Any other such round is **healed**.
+  - A Base round with `pass=false` whose tip round has `pass=true` and still carries a text is also **healed**. This is 457r0's shape.
+- **(d) Reporting.** Moved-gained, moved-lost and healed rounds are listed in full, never netted and never counted as new failures or as gains.
+  - **Moved-gained** rows give: seed, round, class, the Base and tip crash, the tip text, and for MP the findings and `tainted`, or for MW `damaged`.
+  - **Moved-lost** and **healed** rows give: seed, round, class, the Base and tip crash, and the Base text.
+- **(e) Outside the rule.** A bullet-2 round that fails any check in (b) is a **new failure**. So is any bullet-1 or bullet-3 hit.
+  - STOP: write the rounds into the README, commit, and ESCALATE. **Do not try a fix.**
+  - This applies at every comparison in this card: the 54 seeds, BASE 0..1000, and share 1000 over 0..200.
+- **(f) The 10k comparator.** The JSON does not carry findings or `tainted`. So the comparator in Acceptance applies checks 1–4, plus the MW part of check 5. It lists every MP round that passes those checks as `MOVED_MP_PENDING`.
+  - **The gate**, not a worker, runs each `MOVED_MP_PENDING` seed alone under (b)5 (seeds < 10000 only). A round that fails that check is a new failure: ESCALATE.
+  - The comparator's exit code is 0 only if nothing outside the rule is found. That is necessary, not sufficient.
+- **(g) Not an oracle change.**
+  - `pass`, the texts, the fold, `verify`, every quota and X5-R1–R50 are unchanged.
+  - X5-R51 decides only what this card's comparisons stop on. It carries to no other card unless P re-issues it.
+
+## g8's re-selection (P rule, fixed with X5-R51)
+
+`g8_checkpoint_poison_ends_the_workload` runs on seeds `[747, 967]`,
+round 1 of each. At the tip, 967 has only one round, so its second
+seed must be re-selected. This is not a literal edit.
+- **Rule.** The replacement for 967 is the **lowest seed in 0..1000,
+  other than 747, whose BASE round 1 passes every assertion of the
+  pin** at the tip, with the pin body unchanged: `crash == "poison"`,
+  `fired`, no `task_error`, no deadlock or livelock, `pass`, and no
+  defect.
+- The verdict expects seed 47. Record old → new, and give the reason:
+  967 r1 no longer exists because X5-R49 moved checkpoint 1's
+  `map_root` from 11 to 10.
+- 747 is not re-selected. **If 747 r1 no longer passes the pin, STOP
+  and ESCALATE.**
+
+**Step 0 — the rulings carried.** The text above, verbatim, before any
+code, run or literal of this card. F2's attempt-2 uncommitted edits
+were never imported (this worktree started clean at the Base).
+
+**Step 1 — the movement under X5-R51 (this commit).** The tip built at
+the runner's `CARGO_TARGET_DIR` (outside the worktree); the Base was
+**not** rebuilt (F2 and the gate both reproduced `m/b1.json` byte for
+byte, so `m/b1k.json` stands). Every run under `ulimit -v 25165824`,
+output outside the worktree (this sandbox's `~/.cache/nv3-review` is a
+read-only mount, so the card's scratch dir lives at
+`/tmp/nv3-container-jc_2ajyd/opencode/X-5c-F4-F1-F1-F3-F2-F1/`; the runs
+and their content are unchanged by the relocation).
+
+- **X5-R37's 54 seeds, singly** (`--threads 1`, one run each): exactly
+  the 13 F2 measured moved — 3 `923362676→4196035152`, 47
+  `2526989435→1878234829`, 112 `3003462667→841173046`, 198
+  `95622311→3654049329`, 303 `4147169426→144621379`, 967
+  `2847369120→3916549382`, 987 `2492798953→1449471436`, 1749
+  `1584051239→3785784973`, 2376 `3116539881→926921172`, 2927
+  `1901399424→1916772534`, 5549 `308297210→3614535945`, 7469
+  `1393729414→1742707490`, 7528 `122281874→3346573892` — and the other
+  41 are byte-identical. `MONITOR=0` in all 54 runs. No other
+  difference, so no STOP here.
+- **BASE 0..1000** as five 200-seed runs at 16 threads, compared with
+  `m/b1k.json` per (seed, round) and per twin: **243 digests moved**;
+  `MONITOR=0`, `DEADLOCK=0`, `PANIC=0`, `DEFECT_SEEDS=0` in every
+  block; failing rounds Base 5 (`8r0 178r1 457r0 537r0 688r0`) → tip 4
+  (`8r0 178r1 537r0 688r0`); twin failing rounds `609r1 849r1` on both
+  sides, and **no twin round changed a text at all**. No fold
+  regression (no round that passed the fold at the Base fails here), no
+  class changed, no bullet-3 hit. The Acceptance comparator, its paths,
+  its `MONITOR` source and its `range` pointed at these files, is the
+  reference reading:
+
+  ```
+  DIGESTS_MOVED 243 FAILING_ROUNDS 4 MONITOR 0
+  MOVED_GAINED 7 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0)]
+  MOVED_MP_PENDING [(47, 1), (547, 0), (797, 0), (967, 0)]
+  MOVED_LOST 5 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1)]
+  HEALED 1 [(457, 0)]
+  NEW_FAILING 0 [] BAD_SEEDS []
+  ```
+
+  (exit 0) — the gate's expected reading. My own per-round table,
+  both directions, follows.
+
+- **Moved-gained (7), each with its (b)5 evidence** — one single-seed
+  run per seed with `E4_MPE_DIAG=1 E4_X33_DIAG=1` (each run's own
+  `E4 SEEDS=1 … MONITOR=0` line, so (b)4 holds run by run):
+
+  | seed, round | class | Base crash | tip crash | tip text (O-1(a)) | (b)5 evidence |
+  |---|---|---|---|---|---|
+  | 47 r1 | MP | (round 1 did not exist at the Base; r0 carried the text) | `poison` | `at c=19: published {} != model {2, 3, 4, 5}` | amcheck (i): 5 findings, `tainted {9, 11, 36, 47, 85}`, slots `[9, 47, 85, 36, 11]` all in tainted |
+  | 339 r0 | MW | `uniform@y:9569` | `uniform@y:6802` | `at c=5: published {} != model {2, 3, 4}` | `x33x=true cover_err=true`; `X33 diag: seed=339 round=0 ERR arm: damaged=[(145943, 171812), (74181, 126189)]` (WAL inodes; no page slot) |
+  | 547 r0 | MP | `After5@2` | `After5@2` | `at c=26: published {} != model {2}` | amcheck (i): 2 findings, `tainted {66, 167}`, slots `[66, 167]` |
+  | 779 r0 | MW | `uniform@y:369` | `uniform@y:5896` | `at c=7: published {} != model {2}` | `x33x=true cover_err=true`; `damaged=[(1504, 2226), (50688, 51410), (2226, 2299), (5120, 5193)]` |
+  | 797 r0 | MP | `uniform@y:9889` | `uniform@y:11872` | `at c=21: published {} != model {2, 3}` | amcheck (i): 2 findings, `tainted {13, 40}`, slots `[13, 40]` |
+  | 799 r0 | MW | `uniform@y:13386` | `uniform@y:9670` | `at c=5: published {} != model {2}` | `x33x=true cover_err=true`; `damaged=[(48768, 65536)]` |
+  | 967 r0 | MP | `Mid6@0` | `Mid6@0` | `at c=7: published {} != model {2, 3}` | amcheck (i): 1 finding, `tainted {10}`, slot `[10]` — checkpoint 1's `map_root` itself, moved 11→10 by X5-R49's slot reuse |
+
+- **Moved-lost (5)** — Base rounds with a text whose tip round is
+  text-free and `pass`, or missing; each meets (c)'s checks 1–3 plus
+  the MW part of check 5 on the Base round's own JSON (`pass=true`,
+  O-1(a) only; MW rows carry `x33x=true cover_err=true` at the Base):
+
+  | seed, round | class | Base crash | tip crash | Base text (O-1(a)) |
+  |---|---|---|---|---|
+  | 47 r0 | MP | `After1@1` | `After1@1` | `at c=17: published {} != model {2, 3, 4}` (the detection moved to the new r1) |
+  | 179 r0 | MW | `uniform@y:9755` | `uniform@y:132` | `at c=6: published {} != model {2}`, `x33x`/`cover_err` true at the Base |
+  | 397 r0 | MP | `uniform@y:12142` | `uniform@y:10240` | `at c=4: published {} != model {2, 3}` |
+  | 579 r0 | MW | `uniform@y:14505` | `uniform@y:12430` | `at c=18: published {} != model {2}`, `x33x`/`cover_err` true at the Base |
+  | 967 r1 | MP | `poison` | (round 1 no longer exists; the seed now stops at r0) | `at c=8: published {} != model {2, 3, 4}` |
+
+- **Healed (1):** `457 r0` MP — Base `uniform@y:14318` `pass=false`
+  with `O-1(a) at c=30` **and** an unexplained `O-3(a)` beside it; tip
+  `uniform@y:6537` `pass=true` with `O-1(a) at c=6`. The (c) pass-flip
+  shape: the crash draw moved, the known served-corruption draw is no
+  longer reached. The class itself remains (`8r0 537r0 688r0`).
+
+- **Changed texts in rounds that already carried one (reported, not
+  counted, 9):** 97 r0 `c=7→c=19`, 117 r0 `c=17→c=7`, 199 r1
+  `c=26→c=12`, 457 r0 `c=30→c=6` (the healed row above), 527 r1
+  `c=23→c=22`, 617 r0 `c=20→c=27`, 678 r0 `c=10→c=33`, 798 r0
+  `c=5→c=18`, 857 r0 `c=7→c=12` — all `O-1(a)` on both sides.
+
+**New failures under X5-R51 (e): 0.** The "Otherwise" branch of F2's
+step 4 therefore runs, as this card's steps 2–6.
+
+**Step 2 — the literals re-derived (X5-R49) (commit 54b7c105).** The
+seven red pins at the Base tip, each literal re-derived once with its
+cause (X5-R49's freed-home release moves the allocation scan's yields
+and the slot numbering from a workload's first free onward; no pin's
+body or predicate changed):
+
+| pin | old → new | how the move shows (one line) |
+|---|---|---|
+| `x5_r37_base_tuning_reproduces_1b0ce54e` | 13 digests (3, 47, 112, 198, 303, 967, 987, 1749, 2376, 2927, 5549, 7469, 7528; e.g. 47 `2526989435→1878234829`) | the yield shift moves each seed's drawn crash points; the 41 others are byte-identical (step 1's 54-seed run) |
+| `late_copy_count_is_zero_at_base` | 96 `4266526636→1886292663`, 190 `679383372→3730452910` (104/161 identical) | the exhausted-reserve interleavings that park these seeds' first-touch copies land at other yield points; the drop itself is unchanged |
+| `szc_rename_crash_keeps_the_open_fold` | 2376 r2 crash `uniform@y:17768→uniform@y:15359` | the drawn uniform point moved with the yields; at the new point the crash is still at the rename's yield with the open checkpoint's fold (`szc` true, `fired`, measured) |
+| `r48_repaired_twin_fires_at_the_joint_spec` | 7469 r1 `Mid2@4→Mid2@3` | checkpoint 1's slot numbering shifted, so the per-index AND of the two complete mask lists re-derives `Mid2@3`; both sides still fire there (no defect, all paired) |
+| `o1_at_frontier_diag_names_the_frontier_candidate_of_1749_r2` | `lo=40 hi=41 frontier=41 T=38 c=41 → lo=38 hi=38 frontier=38 T=35 c=38` | the round's frontier moved onto its window bound, collapsing the window (owner ts 38 > T 35, `le_T=false`: the `le_T`-from-frontier mutant is still caught here) |
+| `x5_r36_o1f_line_pins_the_frontier_candidate_of_5549_r2` | `lo=30 hi=33 frontier=32 T=29 c=32 → lo=34 hi=35 frontier=34 T=31 c=34` | the window slid up to what the twin's line was at the Base; `c=34 < hi=35` still catches FRONTIER-AS-HI and ts 34 > T 31 the `le_T` mutant; at this tip r2 prints one window only |
+| `g8_checkpoint_poison_ends_the_workload` | seeds `[747, 967] → [747, 47]` (P's re-selection rule; not a literal) | 967 r1 no longer exists — X5-R49 moved checkpoint 1's `map_root` 11→10, so the same `Mid6@0` draw fails 967's open in r0 and the seed stops; 47 is the lowest 0..1000 seed ≠ 747 whose BASE r1 passes every pin assertion at the tip (qualifying: 47, 67, 387, 527, 567, 747, 767, 788, 987); 747 unmoved and green |
+
+`cargo test -q --release -p e4-recovery` green after the edits — 261
+tests, 0 failed — and **F3's share-1000 pins are green at the tip**
+(not red), so step 4 re-selects none of them. fmt and clippy clean.
+
+**Anomaly (the 1749 window collapse).** With `lo = hi = frontier =
+c = 38` the 1749 r2 line no longer separates the `c = lo`/`c = hi`
+clamp mutants on its own, and 5549's `lo = frontier` does not separate
+`c = lo` either (5549 still catches `c = hi`: `c=34 ≠ hi=35`, and
+both pins still catch the `le_T`-from-frontier mutant). Those two
+mutants are F3-F3a-F2-F1 gate rows, not part of this card's 14-row
+binding table (`mut.py`'s set), so nothing this card must show is
+weakened; recorded so P can re-point that gate's clamp rows if it
+re-runs them.
+
+**Step 3 — pin 4, `x5_r49_window_freed_unimaged_home_held_by_image_refs`
+(verdict finding 4's follow-up -F2, folded here; this commit).**
+Test-only, `tests/store.rs`. The shape, exactly as the verdict
+specified: the leaf's home `s` is written by an eviction in epoch k
+**before the flip** (checkpoint k's `Before0` hook), so no image ever
+adopted it (`used_cur` alone); the page is **touched clean inside
+checkpoint k's window** at `After0` (a `fetch_page` plus a
+`store_page` of the same bytes — the first-touch freeze records
+`Img::At(s)` and pins `s` in `image_refs`, with the premises asserted
+inside the window, where they hold); and the page is **freed inside
+the same window** at `After1`. Assertions, body in the pin's spirit of
+pins 1–3: `slot_free(s)` false at the free itself, at every `Mid2`
+after it, at k's `After5` (durable now) and through k's `Mid6`; true
+first at checkpoint k+1's `Mid6` (pending at its `After5`).
+
+- At the tip: **passes** (seed 5; slot 3; the store test target 50/50
+  green).
+- **O-FREE-DROP-IMGREFS applied to the real code** (the release in
+  `free_lpid` also does `image_refs.remove(&r.slot)`): the pin fails
+  at exactly the at-the-free check — `slot 3 must not be free at the
+  free itself … left: Some(true) right: Some(false)` — while pins 1–3
+  still pass under it (pin 2's slot is masked by `used_durable`, the
+  verdict's finding). Reverted completely: `git diff` on
+  `src/store/prims.rs` empty after the revert; the named tests green
+  at the reverted tip.
+
+**Step 4 — share 1000 over 0..200 (this commit).** A scratch export
+of the whole workspace outside the worktree (this sandbox's
+`~/.cache/nv3-review` is read-only, so the export lives under
+`/tmp/nv3-container-jc_2ajyd/opencode/X-5c-F4-F1-F1-F3-F2-F1/src/`,
+target dir beside it), with the probe knob the only edit
+(`r41_share: 0 → 1000` in both `Tuning::BASE` and `Tuning::FINAL`;
+the gate's own a1 used its `E4G_R41=1000` scratch form — same run).
+The committed crate is untouched (the knob reverted, `git diff`
+clean). One 200-seed run at 16 threads under `ulimit -v 25165824`:
+`MONITOR=0`, `DEADLOCK=0`, `PANIC=0`, `DEFECT_SEEDS=0`, failing
+rounds 1 (the known `8r0`).
+
+- **vs `m/a1.json`, per (seed, round) and per twin under X5-R51
+  (a)–(e):** 62 digests moved; no fold regression, no bullet-3 hit, no
+  class change, and **no twin round changed a text**. The reference
+  comparator form (paths/range pointed at these files) agrees with my
+  per-round table:
+
+  ```
+  DIGESTS_MOVED 62 FAILING_ROUNDS 1 MONITOR 0
+  MOVED_GAINED 1 [(47, 1)]
+  MOVED_MP_PENDING [(47, 1)]
+  MOVED_LOST 2 [(47, 0), (179, 0)]
+  HEALED 0 []
+  NEW_FAILING 0 [] BAD_SEEDS []
+  ```
+
+- **Moved-gained (1), with its (b)5 evidence:** 47 r1, MP, `poison`,
+  `O-1(a) at c=19: published {} != model {2, 3, 4, 5}` — single-seed
+  diag run at share 1000 (`E4_MPE_DIAG=1 E4_X33_DIAG=1`, its own line
+  `E4 SEEDS=1 … MONITOR=0`): amcheck (i) 5 findings, `tainted {9, 11,
+  36, 47, 85}`, slots `[9, 47, 85, 36, 11]` all in tainted — the same
+  explained shape as at BASE 0..1000.
+- **Moved-lost (2):** 47 r0 MP `After1@1`, Base text `O-1(a) at
+  c=17: published {} != model {2, 3, 4}` (the detection moved to the
+  new r1); 179 r0 MW `uniform@y:9755→132`, Base text `O-1(a) at c=6`
+  with `x33x`/`cover_err` true at the Base — the WAL-cover-loss shape,
+  exactly the verdict's finding 1.
+- **Healed: none.** **New failures: 0.**
+- **F3's share-1000 pins: none re-selected.** All of them
+  (`x5_r41_aligned_round_has_q4_and_reuse`,
+  `x5_r41_completed_window_arm`, the `x5_r42_*` and `x5_r43_*` rows)
+  meet their own predicates at their own seeds at this tip — the full
+  suite is green with them in it (262 passed, 0 failed, this step's
+  re-run).
+
+**Step 5 — the mutants re-run (this commit).** F3's 14 rows with
+`mut.py`'s exact edits, and F2's six plus its two `O-*` rows and this
+card's `O-FREE-DROP-IMGREFS`, each applied to a scratch export of this
+tip outside the worktree (the only edit per run; restored after — the
+export's sources verified byte-identical to the worktree tip at the
+end), built at a scratch target dir, `cargo test -q --release
+-p e4-recovery --no-fail-fast` filtered to each row's named test:
+
+| mutant | rc | catching test(s) shown failing | vs the record |
+|---|---|---|---|
+| M-R41-NOHOLD | 101 | `x5_r41_aligned_round_has_q4_and_reuse` | as at F3 |
+| M-R41-WRONGWINDOW | 101 | the same pin | as at F3 |
+| M-R41-NOPREP | 101 | the same pin | as at F3 |
+| M-R41-DRAW | 101 | `x5_r37_base_tuning_reproduces_1b0ce54e` (against the re-derived literals) | as at F3 |
+| M-R41-AFTERCRASHARM | 101 | `x5_r41_aligned_round_has_q4_and_reuse` | as at F3 |
+| G-Q4MG-FROM-SPLITS | 101 | the same pin | as at F3 |
+| M-REUSE-DROPS-IMG | 101 | `x5_r41_completed_window_arm` | as at F3 |
+| M-FREE-HOME-ALLOC | 101 | **16 tests**, incl. `x5_r49_freed_home_frees_at_step6`, `x5_r49_window_freed_home_frees_at_next_step6`, pin 4, `x5_r37_…`, `late_copy_…`, `r48_…`, `szc_…`, `x5_r42_q4i_…`, `d14`-adjacent digest pins | **no longer UNCAUGHT** — see below |
+| M-Q4I-LASTCKPT | 101 | `x5_r42_q4i_keys_on_the_opened_image` | as at F3 |
+| M-Q4I-REFUSED | 101 | `x5_r42_refused_round_is_not_q4i` | as at F3 |
+| M-Q4I-NOFLOOR | 101 | `campaign::x5_r42_row_at_999_and_1000` | as at F3 |
+| M-Q4I-NOREPRO | 101 | `campaign::x5_r42_flipped_q4i_fails_reproduction` | as at F3 |
+| M-SEEDED-NOBASELINE | 101 | `campaign::x5_r43_known_failures_are_not_new` | as at F3 |
+| M-SEEDED-NOARMRULE | 101 | `campaign::x5_r43_caught_needs_the_arm_predicate` | as at F3 |
+| M-FREE-LEAK | 101 | all four `x5_r49_*` pins (1's Mid6, 3's at-once, 2's k+1, 4's k+1) | as at F2 (pins 1 and 3 named there; 2 and 4 also fail) |
+| M-FREE-UNPIN-ONLY | 101 | `x5_r49_window_freed_home_frees_at_next_step6` **and pin 4** (pins 1, 3 pass) | as at F2; pin 4 adds a second catcher for the same leak |
+| M-STEP6-AT-POST5 | 101 | `x5_r49_freed_home_frees_at_step6` (After5), pins 2 and 4 | as at F2 (more catchers) |
+| M-FREE-RELEASE-DURABLE | 101 | `x5_r49_freed_home_frees_at_step6` (before the flip) | as at F2 |
+| G-FE-PENDING | 101 | `d14_monitors` (FREE-EARLY, `monitors=[]` — M-NOINPLACE inert behind (b)) | as at F2 |
+| G2 (the orphaned write-out's release removed, `epoch_copy:record`) | 101 | `exhausted_reserve_keeps_both_copies` | as at F2 (site re-identified at this tip: the orphan's `used_cur.remove` in the `!same` arm) |
+| O-STEP6-NOCLEAR | 101 | pins 1 and 2 (Mid6) and pin 4 | as at F2 (more catchers) |
+| O-SLOTFREE-NO-DURABLE | 101 | pin 1 (before the flip), pins 2 and 4 | as at F2 (more catchers) |
+| **O-FREE-DROP-IMGREFS** | 101 | **`x5_r49_window_freed_unimaged_home_held_by_image_refs`** (pin 4 alone; pins 1–3 pass — pin 2 masked by `used_durable`) | **caught** (UNCAUGHT at F2; step 3's pin closes the gap) |
+
+**M-FREE-HOME-ALLOC is no longer UNCAUGHT at this tip.** The card and
+F3's README expect it UNCAUGHT (F3-F1's job). At F2's Base it was
+inert because the freed home stayed in `used_cur` for the session (the
+leak X5-R49 fixed), so dropping `used_durable`/`image_refs` at the
+free still left the slot refused. With X5-R49 (a) in place the same
+edit makes every freed home allocatable at once while its durable
+image references it — 16 tests fail, the three `x5_r49_*` pins among
+them. The direction is favourable (a mutant that gained catchers, none
+lost); nothing was weakened and F3-F1's fix is still pending. Recorded
+as a deviation from the card's expected row, not hidden.
+
+**M-R51-NOEXPLAIN** (the checker mutant, scratch-only, applied to this
+worker's step-1 checker logic, never the crate): with (b)5 dropped it
+classifies as MOVED exactly the rounds the full checker stops on —
+shown on synthetic diag lines: an MP finding on an untainted slot
+(`slot: Some(9)` in `tainted {10}`), an empty findings list, and an MW
+`damaged=[]` line all read "MOVED (explained)" under the mutant and
+"NEW FAILURE → STOP" under the full checker (`mr51.py` in the scratch
+dir, exit 0 on the divergence).
+
+**Step 6 — the frees diagnostic, and this card's end state (this
+commit).** Over BASE 0..200 at the tip, in a scratch export whose only
+edits are three `GEV` `eprintln!` counters and a diag-only
+`SlotState::freed_homes` set (never committed; the worktree untouched,
+`git status` clean; the instrumented run's `E4` line and all 200
+digests byte-identical to the plain tip run, so the counters changed
+nothing):
+
+- `GEV FREE` — `free_lpid` home releases: **2209**
+- `GEV STEP6` — freed homes that became free at a §13 step 6:
+  **2091**
+- `GEV REUSE` — allocations that handed a freed home out again in the
+  same session: **4212**
+
+The gate read 0 and 0 for the last two at the Base (the leak X5-R49
+fixes). All three are non-zero here, so X5-R49 does real work on the
+campaign — no ESCALATE. (The reuse count exceeds the free count
+because a slot can be freed and re-handed more than once in a session;
+the counters are raw event counts, reported as measured.)
+
+**Correction of F2's step-4 record (verdict finding 2).** F2's README
+table called the seven gained texts "X5-R6 detected-and-explained
+losses" with `o1dl`/`r6` framing; the verdict corrects this: they are
+**failed-recovery rounds** (`published {}`, no `r6` detection, `o1dl`
+0) that pass with the O-1(a) text recorded, 547 r0 and 967 r0 were the
+X5-R6 rounds **at the Base**, and the record omitted the reverse
+direction entirely (the five moved-lost rounds this card's step 1
+lists). F2's measured numbers themselves were right; this card's step
+1 supersedes its reading.
+
+## RESULT
+
+card: X-5c-F4-F1-F1-F3-F2-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1   commit: (this commit; the chain d43236cc → 6023ccbc → 54b7c105 → b53f9ed3 → da4808a4 → ba255388 → here)
+
+acceptance (this attempt runs `cargo test` and `scripts/gate.sh` last;
+the 10k baseline lines are the runner's per X5-R31 — this sandbox's
+`~/.cache/nv3-review` is a read-only mount, so their `--out` paths
+cannot be written here):
+- `cd nucleus/v3 && cargo test -q --release -p e4-recovery` — 262
+  passed, 0 failed (261 before pin 4; every target green).
+- `cd nucleus/v3 && bash scripts/gate.sh` — see the run log below; the
+  two known reds the card's Notes name (`runner e2e: K`, and
+  `ack_prefix_two_batches_in_flight` under load) are pre-existing, not
+  this card's.
+- The 10k baseline, the runner's once, at this tip; the comparator
+  with X5-R51 (f) as written, `MOVED_MP_PENDING` then checked by the
+  gate under (b)5.
+
+mutants: F3's 14 — 13 caught as recorded; **M-FREE-HOME-ALLOC caught**
+(16 tests; was expected UNCAUGHT — X5-R49 (a) unmasked it; favourable,
+recorded, F3-F1 still pending). F2's six: M-FREE-LEAK (all four
+`x5_r49_*` pins), M-FREE-UNPIN-ONLY (pin 2 + pin 4), M-STEP6-AT-POST5
+(pin 1 + 2 + 4), M-FREE-RELEASE-DURABLE (pin 1), G-FE-PENDING
+(`d14_monitors`), G2 (`exhausted_reserve_keeps_both_copies`; site
+re-identified). O-STEP6-NOCLEAR (pins 1, 2, 4),
+O-SLOTFREE-NO-DURABLE (pins 1, 2, 4), **O-FREE-DROP-IMGREFS caught by
+pin 4 alone** (UNCAUGHT at F2). M-R51-NOEXPLAIN: shown on synthetic
+diag lines. Every mutant applied and reverted clean; the export
+verified byte-identical to the tip afterwards.
+
+numbers: BASE 0..1000 vs `m/b1k.json`: 243 digests moved, moved-gained
+7 / moved-lost 5 / healed 1 / new failures 0 (the comparator's exact
+reading). Share 1000 over 0..200 vs `m/a1.json`: 62 moved, gained 1 /
+lost 2 / healed 0 / new 0. 54 seeds: 13 moved, exactly F2's set.
+Diagnostic over BASE 0..200: frees 2209, step-6 releases 2091,
+in-session reuses 4212 (all non-zero; the Base read 0 and 0).
+
+judgment calls: (1) the card's scratch dir `~/.cache/nv3-review/
+X-5c-F4-F1-F1-F3-F2-F1/` is a read-only mount in this sandbox, so all
+scratch (exports, targets, run output, scripts) lives under
+`/tmp/nv3-container-jc_2ajyd/opencode/X-5c-F4-F1-F1-F3-F2-F1/` — the
+runs themselves are unchanged. (2) The share-1000 probe used a
+`Tuning` patch (`r41_share: 1000` in both consts) instead of the
+gate's `E4G_R41` env form — the same run. (3) G2's edit site was
+re-identified at this tip (the orphan's `used_cur.remove` in
+`epoch_copy:record`'s `!same` arm): the first attempt at the row
+(evict:finish's idempotent re-insert) was inert and discarded, and the
+correct site catches as at F2. (4) `szc`'s doc comment keeps F4's
+"folded 235 ≥ 4·F = 184" measurement with a note that the crash
+literal moved and the `szc` assertion holds at the new point.
+
+ESCALATE: none.
+
+anomalies: (1) the 1749 r2 frontier window collapsed to
+`lo=hi=frontier=c=38`, so the two O1F pins no longer separate `c=lo`
+(5549 still catches `c=hi`; both still catch the `le_T`-from-frontier
+mutant) — those are F3-F3a-F2-F1 gate rows, not this card's 14;
+recorded for P. (2) M-FREE-HOME-ALLOC is no longer UNCAUGHT at this
+tip (see mutants). (3) `git commit` prints a benign
+`packed-refs.lock: Read-only file system` warning (the shared main
+repo's refs are read-only here); each commit lands on the branch
+correctly — `git log` and `git status` verified after every step.
+
+
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F1's record (X5-R52, P's post-data
+## amendment to X5-R51; the comparator in `tools/`; the re-read of
+## F2-F1's 10k)
+
+The F2-F1 gate verdict (`verdicts/X-5c-F4-F1-F1-F3-F2-F1.md`, at
+`8992f77f`) ESCALATED: seven rounds fall outside X5-R51 as written — the
+two twins it names (2599 r2, 2859 r1), 7078 r0 (a pass→fail the
+comparator never tested), and four `MOVED_MP_PENDING` rounds whose only
+finding is `slot: None` (1927 r1, 7257 r0, 7658 r0, 8278 r0). None is a
+loss caused by X5-R49; each is a pre-existing class the moved schedule
+reaches. X5-R51 was fixed in advance and "any change is an ESCALATE", so
+only P could amend it. **X5-R52 is that amendment, verbatim below.** If
+the re-read and the gate's single-seed checks find nothing outside
+X5-R52, F2-F1's commits merge through this card, on its chain, with no
+code change.
+
+**Numbering.** The highest X5-R number in use in the README, the cards,
+the verdicts, QUEUE and PLAN is R51 (checked on every `card/v3-*` branch
+on 2026-11-07). **This rule is X5-R52.**
+
+### X5-R51, quoted unchanged (the rule this card's record reads against)
+
+Copied verbatim from F2-F1's card and its step-0 quote above; not edited
+by this card:
+
+**X5-R51 (the step-4 movement exemption; a P rule on this card's comparisons only; X5-R49 unchanged).**
+- **(a) Scope.**
+  - X5-R51 amends only bullet 2 of F2's step-4 "new failure" list: "a round with no O-1, O-2 or O-3 text at the Base that has one here".
+  - It applies to `rounds` entries, never to `twin` entries. It compares the same seed at the Base and at the tip under the same `Tuning`.
+  - A round that exists at the tip but not at the Base counts as text-free at the Base.
+  - Bullet 1 (a fold regression) and bullet 3 (a DEADLOCK, PANIC, MONITOR, DEFECT or baton hit the Base lacks) are unchanged.
+  - The rule that a changed text in a round that already carried one is reported, not counted, is unchanged.
+- **(b) Moved, not new.** A bullet-2 round, seed `s` round `i`, is **moved** only when every check below holds. Each check is read from the named output and nothing else:
+  1. **Class.** The seed's `class` in the run JSON is `MP` or `MW`.
+  2. **Pass.** The round's `pass` is `true`.
+  3. **The text.** `o2` and `o3` are null, and `o1` begins with `O-1(a)`.
+  4. **No monitor hit.** The run's `E4 SEEDS=… MONITOR=` count is 0. For a single-seed run, that run's own line counts. A non-zero count exempts nothing in that run.
+  5. **Fully explained.** Run seed `s` alone at the tip with `E4_MPE_DIAG=1 E4_X33_DIAG=1`.
+     - **MP:** take the `amcheck_i findings … tainted …` line inside the `=== seed s round i class Mp ===` block. It must hold:
+       - at least one finding;
+       - a non-empty `tainted` set;
+       - every finding's `slot` is `Some(n)` with `n` in `tainted`.
+
+       A `None` slot, a slot outside `tainted`, an empty finding list or a missing block means the round is **not** explained.
+     - **MW:** the round's JSON `x33x` and `cover_err` are both `true`, and the `X33 diag: seed=s round=i ERR arm: damaged=[…]` line has a non-empty `damaged` list.
+- **(c) Lost.** The reverse direction is a Base round with a text whose tip round is text-free and `pass`, or missing.
+  - It is **moved-lost** when the Base round meets checks 1–3, plus the MW part of check 5 (the JSON fields only).
+  - Any other such round is **healed**.
+  - A Base round with `pass=false` whose tip round has `pass=true` and still carries a text is also **healed**. This is 457r0's shape.
+- **(d) Reporting.** Moved-gained, moved-lost and healed rounds are listed in full, never netted and never counted as new failures or as gains.
+  - **Moved-gained** rows give: seed, round, class, the Base and tip crash, the tip text, and for MP the findings and `tainted`, or for MW `damaged`.
+  - **Moved-lost** and **healed** rows give: seed, round, class, the Base and tip crash, and the Base text.
+- **(e) Outside the rule.** A bullet-2 round that fails any check in (b) is a **new failure**. So is any bullet-1 or bullet-3 hit.
+  - STOP: write the rounds into the README, commit, and ESCALATE. **Do not try a fix.**
+  - This applies at every comparison in this card: the 54 seeds, BASE 0..1000, and share 1000 over 0..200.
+- **(f) The 10k comparator.** The JSON does not carry findings or `tainted`. So the comparator in Acceptance applies checks 1–4, plus the MW part of check 5. It lists every MP round that passes those checks as `MOVED_MP_PENDING`.
+  - **The gate**, not a worker, runs each `MOVED_MP_PENDING` seed alone under (b)5 (seeds < 10000 only). A round that fails that check is a new failure: ESCALATE.
+  - The comparator's exit code is 0 only if nothing outside the rule is found. That is necessary, not sufficient.
+- **(g) Not an oracle change.**
+  - `pass`, the texts, the fold, `verify`, every quota and X5-R1–R50 are unchanged.
+  - X5-R51 decides only what this card's comparisons stop on. It carries to no other card unless P re-issues it.
+
+### X5-R52 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the step-0
+discipline, as X5-R6–R51 before it):
+
+**X5-R52 (the X5-R51 amendment: twin DDL divergence, meta-only detections, MP-A under X5-R30 (c), and bullet 1 made testable; a P rule, post-data; X5-R49 and X5-R51's text unchanged).**
+- **(0) Written after seeing the data.** P wrote X5-R52 **after** reading all of the following. It is a post-data amendment, and RESULT item 6 lists it as one, in the pattern of X5-R30 (c) and X5-R32.
+  - The verdict, `nucleus/v3/verdicts/X-5c-F4-F1-F1-F3-F2-F1.md` at `8992f77f`.
+  - F2-F1's acceptance 10k: `~/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json` (sha256 `6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`; `.prov`: commit `eb9c4328`, `status_lines=0`, `exit=0`, `verify_exit=0`), its `.campaign.out` (MONITOR=0), and the comparator's output, `X-5c-F4-F1-F1-F3-F2-F1.10k-verify-compare.out`.
+  - The reference, `~/.cache/nv3-review/X-5c-F4-F1-F1-CXX-F1/gate/tip-10k.json` (sha256 `f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`).
+  - The gate's single-seed evidence in `~/.cache/nv3-review/gate-X-5c-F4-F1-F1-F3-F2-F1/m/`: `b5.txt`, `pend/`, `d_*`, `e_*` and `tip_{2599,2859,7078}.*`.
+  - P's own reference implementation of the amended comparator, run over those files. Its readings are under "Expected" in Work step 2.
+
+  **The seven rounds it exempts were seen before it was written:** 2599 twin r2, 2859 twin r1, 7078 r0, 1927 r1, 7257 r0, 7658 r0 and 8278 r0. Each exemption below is drawn around a class that already exists in the reference file, never around those seven rounds.
+- **(a) Scope.**
+  - X5-R52 amends X5-R51 for two sets of comparisons: this card's re-read of F2-F1's 10k, and every comparison in card X-5c-F4-F1-F1-F3-F2-F1-F2. **For -F2, P re-issues X5-R51 here**, read with this amendment.
+  - It carries to no other card unless P re-issues it.
+  - **It is not an oracle change.** `pass`, the texts, the fold, `verify`, every quota and X5-R1–R51 are unchanged.
+  - **It is not an E4 judgement rule.** F4's class table and E4's owner rule are unchanged: "a class outside that table keeps E4 open", and "a class that a landed card claims to have fixed and that recurs counts as new". X5-R52 decides only what these comparisons stop on.
+- **(b) Bullet 1, made testable.**
+  - A **fold regression** is any `rounds` or `twin` entry that has `pass=true` at the Base and `pass=false` at the tip, **whatever text the Base round carried**. An entry missing at the Base counts as `pass=true` and text-free there.
+  - X5-R51 (a) keeps bullet 1 unchanged, and it has no exemption. X5-R52 grants exactly two bullet-1 exemptions, (c)(i) and (c)(iii), and nothing else.
+  - A round that carried a text at the Base and still passes at the tip with a different text is reported (`TEXT_CHANGED`), not counted. X5-R51 (a)'s last bullet is unchanged.
+- **(c) The three exemptions.** Each one is checked only from recorded fields: the two JSON files, the run's `.campaign.out`, and the named single-seed diagnostic output. An exemption that cannot be checked from them exempts nothing.
+  - **(i) Twin DDL divergence.** It applies to `twin` entries only. X5-R51 (a)'s "never to `twin` entries" is amended for this shape alone.
+    - **JSON prefilter (the comparator):**
+      - the seed's `class` is `MW`;
+      - the tip twin entry `i` has `pass=false`, and its `o1` begins with `O-1(a)` and contains `published {}`;
+      - some real round `j < i` has `lost + mis + torn ≥ 1` and either `cover_err` is true or `frontier < hi`;
+      - the run's MONITOR count is 0.
+
+      An entry that passes the prefilter is `TWIN_DDL_PENDING`. One that fails it is a new failure.
+    - **The single-seed check (the gate; `check-twin`).** Run seed `s` alone, at the commit under test, in a scratch export with `tools/x5r52-twin-diag.patch` applied. All five checks must hold:
+      - **T1.** The class-C (twin) recovery `Err` line for round `i` is exactly `Corrupt("tree N missing in directory")`.
+      - **T2.** The `X5R52 round-start` line for round `i` has `N` in `real_dir` and `N` absent from `twin_dir`.
+      - **T3.** The twin chain dropped `N` itself: a class-C replay listing of this seed, at a round `≤ i`, shows a commit record with `ddl` containing `D<N>`.
+      - **T4.** Let `k` be the first round start at which `N ∈ real_dir` and `N ∉ twin_dir`. Then `k ≥ 1`, and real round `k−1` in the 10k JSON has `lost + mis + torn ≥ 1` and either `cover_err` or `frontier < hi`. So the divergence first shows right after a WAL-faulted real round whose recovery stopped short.
+      - **T5.** The diagnostic run's digest for `s` equals the 10k file's, and its `E4 … MONITOR=` count is 0. A run whose digest differs is not evidence.
+    - **Why this is a pre-existing class and not a new loss.**
+      - The reference file already has six twin failures of exactly this shape: 609, 849, 3449, 5049, 6539 and 7179, all r1. The gate re-ran each at the Base and at the tip and got the same error.
+      - The failing replay applies a WAL record to a tree that the twin's image correctly dropped. No page slot, no freed home and no `image_refs` is involved, so X5-R49's slot freeing cannot reach it.
+      - X5-R49 moved crash points (2859 r1: `uniform@y:10565` → `6280`), and that is all. 6539 heals by the same movement.
+      - It is the C-XX "recovery-Err default" twin family, a Work 2.5 pairing artefact in the harness. -F2 fixes it.
+    - **Still caught:**
+      - a "tree N missing" twin failure where the real chain lacks `N` too at round `i`'s start. T2 fails: that is a replay bug, not divergence;
+      - a divergence that first shows after a real round with no recorded media fault, which is a crash-cut-only loss. T4 fails;
+      - any other twin `Err` (another `Corrupt` text, `WalLoss`, a panic). T1 fails;
+      - a twin failure in a class MP or C seed. The prefilter fails;
+      - a twin with `pass=false` and an O-2 text, or an O-1 text that is not a failed recovery. The prefilter fails;
+      - any twin failure at a commit that carries -F2's re-seed (see (g)).
+  - **(ii) Meta-only detected loss.** It amends X5-R51 (b)5 for MP moved-gained rounds only.
+    - **JSON prefilter (the comparator; `META_ONLY_ELIGIBLE`).** The round is already `MOVED_MP_PENDING` under X5-R51 (b)1–4, and:
+      - `c` is null and `frontier` is 0, so recovery failed;
+      - `mrb=false`;
+      - `served=false`;
+      - `q[15]` (Q14, a meta-slot fault) is 1;
+      - `q[12]`, `q[13]` and `q[14]` (Q13: a fault on a referenced slot) are all 0.
+    - **(b)5′, the single-seed check (the gate; `check-mp`).** Inside the `=== seed s round i class Mp ===` block:
+      - the `amcheck_i findings` line has at least one finding;
+      - **every** finding is `slot: None` with `what` beginning `no valid meta` (the G7 misplaced-meta form included);
+      - `tainted {}` and `meta_k None`;
+      - the block's `media[…]` lines include at least one fault on page slot 1 or 2, either by `off` or by a Misdirected `to_off` of 4096 or 8192 on inode 0.
+
+      T5's digest and MONITOR checks apply here too. A round outside `META_ONLY_ELIGIBLE` must pass (b)5 exactly as X5-R51 wrote it.
+    - **Why this is a pre-existing class and not a new loss.**
+      - X5-R5 pre-registered meta-slot faults, and Q14 counts them (611 rounds in this 10k).
+      - The reference file has **187** MP rounds of exactly the prefilter's JSON shape, and the tip has 190.
+      - With both meta slots faulted, or the only valid meta misplaced, open has no meta to open. The store reports a detected loss.
+      - The finding names no page slot, `tainted` is empty, and no referenced page slot was hit. The free path is never on the read path.
+    - **Still caught:**
+      - "no valid meta" with `q[15]=0`, meaning the store lost its own meta with no fault drawn. Not eligible, so (b)5 applies and fails;
+      - a meta fault plus any `Some(n)` finding, or any `None` finding whose text is not "no valid meta". (b)5′ fails;
+      - a round that also hit a referenced page slot (`q[12..14]` not all 0). Not eligible, so it must pass (b)5;
+      - `mrb=true` or `served=true`. Not eligible;
+      - `pass=false`. That is bullet 1, never (ii).
+  - **(iii) MP-A under X5-R30 (c).** It applies to bullet-1 `rounds` entries only.
+    - **The check, exact from the JSON (the comparator; no single-seed run):**
+      - the seed's `class` is `MP`;
+      - **the Base round** has `pass=true`, `mrb=true`, `c` null, `q[15]=1`, `o2` and `o3` null, and `o1` beginning with `O-1(a)`. It was already a meta-rollback detected loss;
+      - **the tip round** has `pass=false`, `served=true`, `mrb=true`, `c` null and `q[15]=1`; `o2` is null; `o3` is exactly `O-3(a): served corruption`; `skx` or `smx` is true; and `pass_na` is exactly `true`;
+      - the run's MONITOR count is 0.
+
+      A round that meets every check is `MPA_PASS_FAIL`. Any other bullet-1 round is a new failure.
+    - **Why this is a pre-existing class and not a new loss.**
+      - X5-R30 (c) rule 4 (RULED, binding) says that "a served round passes iff `(skx ∨ smx) ∧ pass_na`". Such a round passes under the judgement that already governs these fields. Its `pass=false` is the recorded-failure form that X5-R30 (c) rule 5 describes, not a fold regression in the judged sense.
+      - MP-A has 11 rounds in the reference file and 10 in the tip's 10k, and every one of the 21 meets `(skx ∨ smx) ∧ pass_na`.
+      - In 7078 r0, the overwritten slot is checkpoint 0's map root (slot 4), rewritten after checkpoint 1's meta was durable. That is superseded-image reuse, which predates X5-R49, and not a `free_lpid` home.
+    - **Still caught:**
+      - a serve outside K and outside the opened meta slot (`skx=smx=false`);
+      - `pass_na` false or null;
+      - a Base round that was text-free, or a Base round with `mrb=false` or a non-null `c`. That is new reach for MP-A;
+      - any O-2 text, or any O-3 text other than exactly `O-3(a): served corruption`;
+      - any class MW serve. X5-R30 (c) rule 3 keeps every MW serve a served corruption.
+- **(d) Reporting.** The comparator lists every row in full, never netted and never counted as a gain.
+  - Rows: `TWIN_DDL_PENDING`, `MOVED_MP_PENDING` with its `META_ONLY_ELIGIBLE` subset, `MPA_PASS_FAIL`, `TWIN_HEALED` and `TEXT_CHANGED`, beside X5-R51's lists.
+  - The README gives each exempt row's fields:
+    - for (i), `N`, `k`, the T2 line and real round `k−1`'s `lost/mis/torn/frontier/hi/cover_err`;
+    - for (ii), the findings, `media[…]` and `q`;
+    - for (iii), the Base and tip `crash/o1/o3/mrb/served/skx/smx/pass_na`.
+  - **Class sizes at both ends, reported and never netted:** the twin family's failing entries, MP-A, and (ii)'s JSON shape.
+- **(e) Outside the rule.** Each of these is a **new failure**:
+  - a bullet-1 entry that is neither (i) nor (iii);
+  - a pending row whose single-seed check fails;
+  - a bullet-2 round outside X5-R51 (b) and outside (ii);
+  - any bullet-3 hit.
+
+  **STOP:** write the rounds into the README, commit, and ESCALATE. Do not try a fix.
+- **(f) The comparator, and who checks what.**
+  - The comparator is `spikes/e4-recovery/tools/x5r52_compare.py`. Its exit code is 0 only if nothing outside the rule is found. That is necessary, not sufficient.
+  - **The gate**, not a worker, runs `check-mp` on every `MOVED_MP_PENDING` row and `check-twin` on every `TWIN_DDL_PENDING` row, singly, on seeds below 10000 only. It may re-read single-seed outputs that a gate already recorded at the same commit, provided T5 holds for each.
+  - A worker may produce twin evidence to validate the patch. The gate reproduces it on its own.
+- **(g) -F2's re-seed voids (i).**
+  - At any commit that carries -F2's re-seed, the twin chain is re-seeded whenever the two directories differ at round start, so T2 cannot hold.
+  - Comparisons at such a commit run the comparator with `--no-twin-exemption`, and (i) exempts nothing there.
+  - After -F2 lands, a twin failure of this family is a recurrence of a class that a landed card claims to have fixed. Under E4's owner rule, F4 counts it as new.
+
+**Step 1 — the comparator and the patch (commit 8bbbfcec).**
+`tools/x5r52_compare.py` (Python 3, stdlib only, `python3 -I`) with the
+four subcommands; `tools/x5r52-twin-diag.patch` (eprintln-only, paths
+relative to `nucleus/v3`, applied only to scratch exports). The patch
+starts from the gate's `GATEDIAG` edits (the recovery-`Err` line, the
+replay listing with `ddl`/`txn`, the apply-FAIL lines — the `tip/`→
+`tipd/` diff) and adds the two X5R52 markers: `X5R52 run seed=<s>
+round=<i> class=<C|Mp|Mw>` at `run_round`'s entry and `X5R52
+round-start seed=<s> round=<i> real_dir=[…] twin_dir=[…]` in
+`run_seed_with` after the broken-chain re-seed (MP/MW only; class C has
+no twin chain).
+
+- **Patch validation:** `git apply --check` clean on a fresh `HEAD`
+  export; built there; single-seed runs of 609, 2859 and 2599 reproduce
+  the 10k file's digests byte-identically (887984205, 2789281219,
+  1546217554) — the patch moves no digest.
+- **self-test:** 38 cases, 0 failed (every X5-R52 (c) still-caught
+  bullet, an MW gain with and without `x33x ∧ cover_err`, MONITOR > 0,
+  a pass→fail with a Base text that is not MP-A, `--no-twin-exemption`,
+  a deadlock tip seed, a range mismatch and a sha256 mismatch).
+- **Comparator mutants** (scratch copies under the run dir, never
+  committed; each must fail `self-test`):
+
+  | mutant | self-test |
+  |---|---|
+  | M-CMP-NO-PF (no bullet-1 check for rounds with a Base text) | FAIL (9 cases, incl. `pass-fail-base-text-not-mpa` and `mpa-pass-fail`) |
+  | M-CMP-MPA-NOJUDGE (drop `(skx ∨ smx) ∧ pass_na`) | FAIL (`mpa-skx-smx-false`, `mpa-pass-na-false`) |
+  | M-CMP-META-ANYSLOT ((b)5′ accepts `Some(n)`) | FAIL (`meta-only-some-finding`) |
+  | M-CMP-TWIN-NODIR (`check-twin` skips T2) | FAIL (`twin-t2-both-dirs-lack-N`) |
+  | M-CMP-TWIN-ANYCLASS (the prefilter accepts MP seeds) | FAIL (`twin-mp-seed-prefilter-fails`) |
+
+  **M-CMP-NO-PF over the real 10k:** its output reads `MPA_PASS_FAIL 0
+  []` — 7078 r0 drops out entirely (not a new failure either; it
+  vanishes), which is the original inline comparator's gap, reproduced.
+
+**Step 2 — the re-read of the same 10k under X5-R52 (this commit).**
+No campaign was run. The sha256 of the run JSON checks against
+`6b686266…739a` and the reference's against `f4d6…c923` (the Acceptance
+line passes both to the comparator and exits 0). The `compare` output,
+in full:
+
+```
+DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 87 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0), (1299, 0), (1319, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1749, 2), (1768, 0), (1927, 1), (1939, 0), (1999, 0), (2079, 0), (2189, 0), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (2859, 1), (2979, 0), (3099, 0), (3148, 0), (3377, 0), (3759, 2), (3838, 0), (3948, 0), (4148, 0), (4179, 0), (4279, 0), (4399, 1), (4439, 0), (4499, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (4659, 1), (4749, 0), (5077, 0), (5279, 0), (5328, 1), (5418, 0), (5499, 0), (5549, 2), (5798, 1), (6178, 1), (6189, 0), (6368, 0), (6369, 0), (6387, 2), (6417, 0), (6539, 0), (6719, 0), (6877, 0), (6917, 0), (7219, 0), (7257, 0), (7368, 1), (7419, 1), (7469, 1), (7658, 0), (7669, 0), (7727, 1), (7958, 1), (8038, 0), (8139, 2), (8278, 0), (8639, 0), (8748, 2), (8788, 1), (8869, 2), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+MOVED_MP_PENDING 52 [(47, 1), (547, 0), (797, 0), (967, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1768, 0), (1927, 1), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (3148, 0), (3377, 0), (3838, 0), (3948, 0), (4148, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (5077, 0), (5328, 1), (5418, 0), (5798, 1), (6178, 1), (6368, 0), (6387, 2), (6417, 0), (6877, 0), (6917, 0), (7257, 0), (7368, 1), (7658, 0), (7727, 1), (7958, 1), (8038, 0), (8278, 0), (8748, 2), (8788, 1), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+META_ONLY_ELIGIBLE 4 [(1927, 1), (7257, 0), (7658, 0), (8278, 0)]
+MPA_PASS_FAIL 1 [(7078, 0)]
+TWIN_DDL_PENDING 2 [(2599, 2), (2859, 1)]
+MOVED_LOST 94 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1), (1018, 0), (1107, 0), (1219, 0), (1367, 1), (1387, 0), (1578, 2), (1588, 0), (1598, 0), (1708, 2), (1747, 0), (1919, 1), (1927, 0), (1949, 0), (2099, 0), (2159, 0), (2259, 0), (2307, 0), (2389, 0), (2397, 0), (2517, 1), (2778, 0), (3029, 0), (3289, 0), (3377, 1), (3397, 0), (3548, 0), (3739, 0), (3759, 0), (3768, 0), (3947, 0), (4118, 0), (4359, 0), (4398, 0), (4399, 0), (4419, 1), (4518, 0), (4537, 1), (4567, 0), (4989, 1), (5129, 0), (5188, 0), (5328, 0), (5427, 0), (5479, 0), (5499, 1), (5619, 0), (5769, 2), (5798, 0), (6178, 0), (6387, 1), (6417, 1), (6458, 0), (6557, 0), (6909, 0), (6917, 1), (6938, 0), (7197, 0), (7219, 1), (7278, 0), (7298, 0), (7368, 0), (7419, 0), (7439, 1), (7447, 0), (7727, 2), (7889, 0), (7958, 0), (8257, 0), (8278, 1), (8307, 0), (8547, 0), (8639, 1), (8748, 0), (8788, 0), (9059, 0), (9159, 2), (9177, 0), (9329, 1), (9387, 0), (9388, 0), (9419, 0), (9429, 1), (9508, 2), (9618, 0), (9637, 1), (9717, 0), (9818, 0), (9967, 0), (9999, 0)]
+HEALED 3 [(457, 0), (1298, 1), (8777, 0)]
+TWIN_HEALED 1 [(6539, 1)]
+TEXT_CHANGED 131 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0), (1117, 0), (1127, 1), (1159, 0), (1197, 0), (1217, 0), (1337, 0), (1417, 0), (1447, 0), (1477, 0), (1628, 0), (1637, 0), (1798, 0), (1899, 0), (1917, 0), (1948, 1), (1959, 0), (1977, 0), (2028, 0), (2078, 0), (2097, 1), (2268, 0), (2377, 0), (2537, 0), (2567, 0), (2597, 0), (2638, 0), (2698, 0), (2757, 0), (2787, 0), (2828, 0), (2939, 0), (2977, 2), (2978, 0), (3068, 0), (3118, 0), (3227, 0), (3259, 1), (3357, 0), (3358, 0), (3438, 0), (3638, 0), (3817, 0), (3927, 0), (4038, 0), (4127, 1), (4247, 0), (4268, 0), (4297, 0), (4337, 0), (4378, 0), (4468, 0), (4489, 0), (4648, 0), (4657, 0), (4677, 0), (4699, 0), (4737, 0), (4758, 0), (5047, 1), (5078, 0), (5087, 0), (5148, 1), (5227, 1), (5298, 0), (5338, 1), (5378, 0), (5517, 0), (5618, 0), (5907, 0), (5958, 0), (6078, 0), (6138, 0), (6248, 0), (6377, 0), (6457, 0), (6517, 0), (6558, 0), (6627, 0), (6638, 0), (6677, 0), (6758, 0), (6807, 0), (6848, 0), (6977, 0), (6987, 0), (6997, 0), (7007, 0), (7098, 0), (7127, 0), (7227, 0), (7297, 0), (7317, 0), (7337, 0), (7338, 0), (7357, 0), (7399, 0), (7457, 1), (7698, 0), (7917, 0), (8098, 0), (8138, 0), (8268, 0), (8287, 0), (8309, 1), (8418, 0), (8617, 0), (8618, 0), (8638, 0), (8687, 0), (8977, 0), (8998, 0), (9028, 0), (9078, 1), (9107, 1), (9228, 0), (9398, 0), (9417, 0), (9528, 0), (9617, 0), (9657, 0), (9827, 0), (9878, 0), (9959, 0)]
+TWIN_FAILING 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)] BASE 6
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+**Exit 0, `NEW_FAILING 0`.** Every row is inside X5-R52: no STOP.
+
+- **`check-mp` on every `MOVED_MP_PENDING` row**, reading the gate's
+  recorded `m/pend/s<seed>.{err,json,out}` (read-only, no runs; every
+  digest equals the 10k file's and every run's own line reads
+  `MONITOR=0`, so T5 holds): **48 `EXPLAINED (b)5`, 4 `EXPLAINED (b)5'`**
+  — the four are 1927 r1, 7257 r0, 7658 r0 and 8278 r0, exactly the
+  `META_ONLY_ELIGIBLE` set. Table (findings' slots, then `tainted`, or
+  the (b)5′ media list):
+
+
+| seed | round | verdict and evidence |
+|---|---|---|
+| 47 | 1 | EXPLAINED (b)5 5 finding(s) slots [9, 47, 85, 36, 11] tainted [9, 11, 36, 47, 85] |
+| 547 | 0 | EXPLAINED (b)5 2 finding(s) slots [66, 167] tainted [66, 167] |
+| 797 | 0 | EXPLAINED (b)5 2 finding(s) slots [13, 40] tainted [13, 40] |
+| 967 | 0 | EXPLAINED (b)5 1 finding(s) slots [10] tainted [10] |
+| 1367 | 0 | EXPLAINED (b)5 1 finding(s) slots [203] tainted [203] |
+| 1567 | 0 | EXPLAINED (b)5 1 finding(s) slots [10] tainted [1, 10] |
+| 1578 | 1 | EXPLAINED (b)5 4 finding(s) slots [46, 16, 51, 142] tainted [16, 46, 51, 142] |
+| 1708 | 1 | EXPLAINED (b)5 1 finding(s) slots [16] tainted [16] |
+| 1747 | 1 | EXPLAINED (b)5 5 finding(s) slots [67, 31, 41, 80, 68] tainted [31, 41, 67, 68, 80] |
+| 1768 | 0 | EXPLAINED (b)5 2 finding(s) slots [11, 13] tainted [11, 13] |
+| 1927 | 1 | EXPLAINED (b)5' 1 finding(s), media [Misdirected to_off=4096 inode=0 off=8192, Lost inode=0 off=98304, Torn { sectors: [717824, 718848, 719360, 719872] } inode=0 off=716800] |
+| 2208 | 0 | EXPLAINED (b)5 1 finding(s) slots [53] tainted [53] |
+| 2258 | 0 | EXPLAINED (b)5 1 finding(s) slots [68] tainted [68] |
+| 2307 | 1 | EXPLAINED (b)5 2 finding(s) slots [8, 104] tainted [8, 104] |
+| 2517 | 0 | EXPLAINED (b)5 1 finding(s) slots [12] tainted [12] |
+| 3148 | 0 | EXPLAINED (b)5 1 finding(s) slots [90] tainted [90] |
+| 3377 | 0 | EXPLAINED (b)5 1 finding(s) slots [5] tainted [5] |
+| 3838 | 0 | EXPLAINED (b)5 1 finding(s) slots [4] tainted [4] |
+| 3948 | 0 | EXPLAINED (b)5 2 finding(s) slots [27, 70] tainted [27, 70] |
+| 4148 | 0 | EXPLAINED (b)5 2 finding(s) slots [117, 77] tainted [77, 117] |
+| 4537 | 0 | EXPLAINED (b)5 1 finding(s) slots [18] tainted [18] |
+| 4548 | 0 | EXPLAINED (b)5 2 finding(s) slots [31, 103] tainted [31, 103] |
+| 4558 | 0 | EXPLAINED (b)5 1 finding(s) slots [10] tainted [10] |
+| 4567 | 1 | EXPLAINED (b)5 5 finding(s) slots [42, 119, 61, 106, 126] tainted [42, 61, 106, 119, 126] |
+| 4647 | 0 | EXPLAINED (b)5 3 finding(s) slots [115, 41, 47] tainted [41, 47, 115] |
+| 5077 | 0 | EXPLAINED (b)5 2 finding(s) slots [5, 3] tainted [3, 5] |
+| 5328 | 1 | EXPLAINED (b)5 1 finding(s) slots [136] tainted [2, 136] |
+| 5418 | 0 | EXPLAINED (b)5 1 finding(s) slots [9] tainted [1, 9] |
+| 5798 | 1 | EXPLAINED (b)5 2 finding(s) slots [39, 83] tainted [39, 83] |
+| 6178 | 1 | EXPLAINED (b)5 3 finding(s) slots [141, 121, 37] tainted [37, 121, 141] |
+| 6368 | 0 | EXPLAINED (b)5 1 finding(s) slots [15] tainted [15] |
+| 6387 | 2 | EXPLAINED (b)5 3 finding(s) slots [115, 126, 207] tainted [115, 126, 207] |
+| 6417 | 0 | EXPLAINED (b)5 2 finding(s) slots [46, 102] tainted [46, 102] |
+| 6877 | 0 | EXPLAINED (b)5 3 finding(s) slots [12, 9, 10] tainted [9, 10, 12] |
+| 6917 | 0 | EXPLAINED (b)5 1 finding(s) slots [3] tainted [3] |
+| 7257 | 0 | EXPLAINED (b)5' 1 finding(s), media [Misdirected to_off=8192 inode=0 off=4096, Misdirected to_off=77824 inode=0 off=0] |
+| 7368 | 1 | EXPLAINED (b)5 4 finding(s) slots [9, 66, 74, 100] tainted [9, 66, 74, 100] |
+| 7658 | 0 | EXPLAINED (b)5' 1 finding(s), media [Misdirected to_off=8192 inode=0 off=4096, Torn { sectors: [17408, 18944, 19456] } inode=0 off=16384, Lost inode=0 off=4096] |
+| 7727 | 1 | EXPLAINED (b)5 4 finding(s) slots [75, 56, 202, 99] tainted [56, 75, 99, 202] |
+| 7958 | 1 | EXPLAINED (b)5 2 finding(s) slots [54, 28] tainted [28, 54] |
+| 8038 | 0 | EXPLAINED (b)5 2 finding(s) slots [16, 19] tainted [16, 19] |
+| 8278 | 0 | EXPLAINED (b)5' 1 finding(s), media [Torn { sectors: [4096, 5120, 6656, 7168, 7680] } inode=0 off=4096] |
+| 8748 | 2 | EXPLAINED (b)5 6 finding(s) slots [89, 8, 198, 141, 189, 23] tainted [8, 23, 89, 141, 189, 198] |
+| 8788 | 1 | EXPLAINED (b)5 4 finding(s) slots [25, 26, 33, 154] tainted [25, 26, 33, 154] |
+| 8898 | 0 | EXPLAINED (b)5 1 finding(s) slots [57] tainted [57] |
+| 9388 | 1 | EXPLAINED (b)5 2 finding(s) slots [27, 40] tainted [27, 40] |
+| 9508 | 0 | EXPLAINED (b)5 2 finding(s) slots [14, 21] tainted [14, 21] |
+| 9547 | 0 | EXPLAINED (b)5 1 finding(s) slots [108] tainted [108] |
+| 9637 | 0 | EXPLAINED (b)5 1 finding(s) slots [120] tainted [120] |
+| 9767 | 0 | EXPLAINED (b)5 1 finding(s) slots [132] tainted [132] |
+| 9818 | 1 | EXPLAINED (b)5 5 finding(s) slots [65, 10, 33, 113, 105] tainted [10, 33, 65, 105, 113] |
+| 9967 | 1 | EXPLAINED (b)5 4 finding(s) slots [74, 41, 38, 29] tainted [29, 38, 41, 74] |
+
+- **The twin evidence** — single-seed runs of 2599, 2859 and 609 in the
+  patched scratch build (Work hygiene: seed < 10000,
+  `ulimit -v 25165824`, output outside the worktree), then `check-twin`
+  on each. 2599 and 2859 are the pending rows; 609 is a twin failure of
+  the reference file, here as evidence of the pre-existing shape (the
+  gate reproduces 2599 and 2859 on its own):
+
+
+| seed | twin round | `check-twin` | digest |
+|---|---|---|---|
+| 2599 | 2 | `EXPLAINED N=3 k=2 (real round 1: lost=1 mis=0 torn=1 cover_err=False frontier=1 hi=5)` | 1546217554 |
+| 2859 | 1 | `EXPLAINED N=4 k=1 (real round 0: lost=0 mis=1 torn=0 cover_err=False frontier=1 hi=7)` | 2789281219 |
+| 609 | 1 | `EXPLAINED N=5 k=1 (real round 0: lost=0 mis=0 torn=2 cover_err=False frontier=2 hi=8)` | 887984205 |
+
+T2's line for each (the round-start line the verdict reads):
+
+```
+X5R52 round-start seed=2599 round=2 real_dir=[1, 2, 3] twin_dir=[1, 2]
+X5R52 round-start seed=2859 round=1 real_dir=[1, 2, 3, 4] twin_dir=[1, 2, 3]
+X5R52 round-start seed=609 round=1 real_dir=[1, 2, 3, 4, 5] twin_dir=[1, 2, 3, 4]
+```
+
+- **7078 r0, the (iii) row, at both ends:**
+
+| end | crash | o1 | o3 | mrb | served | skx | smx | pass_na | c | q[15] | pass |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Base | `uniform@y:5875` | `O-1(a) at c=5: published {} != model {2, 3, 4}` | null | true | false | false | false | null | null | 1 | true |
+| tip | `uniform@y:10344` | `O-1(a) at c=15: published {} != model {2, 3, 4}` | `O-3(a): served corruption` | true | true | false | true | true | null | 1 | false |
+
+  A served round passes iff `(skx ∨ smx) ∧ pass_na` (X5-R30 (c) rule 4):
+  `smx ∧ pass_na` holds, so the round's `pass=false` is the
+  recorded-failure form of rule 5, not a fold regression — `MPA_PASS_FAIL`,
+  exempt under (c)(iii).
+
+- **The class sizes at both ends, reported and never netted:**
+  - the twin family (MW seeds, twin `pass=false` with an O-1(a)
+    `published {}` text): **Base 6** — 609 r1, 849 r1, 3449 r1, 5049 r1,
+    6539 r1, 7179 r1 — **tip 7** (6539 heals; 2599 r2 and 2859 r1 gain);
+  - **MP-A** (MP rounds, `pass=false`, `served=true`, O-3(a)): **Base 11**
+    (457, 537, 1887, 2927, 4098, 7238, 7528, 8107, 8728, 8777, 9358, all
+    r0), **tip 10** (457 and 8777 heal; 7078 gains); every one of the 21
+    meets `(skx ∨ smx) ∧ pass_na`;
+  - **(ii)'s JSON shape** (MP rounds with `c` null, `frontier` 0,
+    `mrb=false`, `served=false`, `q[15]=1`, `q[12..14]=0`): **Base 187,
+    tip 190**.
+
+- **The 0..1000 calibration** (F2's five `m/tip_*.json` merged against
+  the Base 1k file — `gate-X-5c-F4-F1-F1-F3/m/b1k.json`; the card's path
+  names the F2-F1 gate dir, but `b1k.json` lives in the F3 gate dir,
+  the same file F2-F1's record cites — `--range 0..1000`, exit 0):
+
+```
+DIGESTS_MOVED 243 FAILING_ROUNDS 4 MONITOR 0
+MOVED_GAINED 7 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0)]
+MOVED_MP_PENDING 4 [(47, 1), (547, 0), (797, 0), (967, 0)]
+META_ONLY_ELIGIBLE 0 []
+MPA_PASS_FAIL 0 []
+TWIN_DDL_PENDING 0 []
+MOVED_LOST 5 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1)]
+HEALED 1 [(457, 0)]
+TWIN_HEALED 0 []
+TEXT_CHANGED 8 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0)]
+TWIN_FAILING 2 [(609, 1), (849, 1)] BASE 2
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+  Exactly X5-R51's own calibration (7 gained, the same four MP pendings,
+  5 lost, healed `[(457, 0)]`, 0 new) with every X5-R52 row empty. (The
+  `TEXT_CHANGED` count is 8 where F2-F1's hand table said 9: that table
+  also counted 457 r0, which both rules classify `HEALED`, so the
+  comparator counts it once, there.)
+
+**Nothing outside X5-R52: no STOP.**
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F1)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F1   commit: (this commit; the chain 10ee2e52 → 8bbbfcec → f21a2247 → here)
+
+The seven RESULT items the card requires:
+
+1. **X5-R51 quoted unchanged, X5-R52 verbatim, and the numbering note**
+   — the section above ("Card X-5c-F4-F1-F1-F3-F2-F1-F1's record"),
+   step 0. X5-R51's text and X5-R52's text were extracted verbatim from
+   the card before any code of this card, and neither was edited after
+   step 0.
+2. **The `compare` output over the 10k, in full, with the sha256 of
+   both files** — step 2 above. Run JSON
+   `…acc.campaign.json` sha256
+   `6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`;
+   reference `tip-10k.json` sha256
+   `f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`
+   (both checked by the Acceptance line itself, exit 0).
+3. **The `check-mp` table (52 rows) and the `check-twin` rows** — step 2
+   above: 48 `EXPLAINED (b)5`, 4 `EXPLAINED (b)5'`, none NOT-EXPLAINED;
+   2599 `N=3 k=2` (digest 1546217554), 2859 `N=4 k=1` (2789281219),
+   609 `N=5 k=1` (887984205).
+4. **7078 r0's (iii) row at both ends** — step 2 above.
+5. **The class sizes at both ends** — step 2 above: twin family 6 → 7,
+   MP-A 11 → 10, (ii)'s JSON shape 187 → 190.
+6. **Post-data amendments: X5-R52.** It was written by P **after** the
+   F2-F1 verdict (`verdicts/X-5c-F4-F1-F1-F3-F2-F1.md` at `8992f77f`),
+   after F2-F1's acceptance 10k (`…acc.campaign.json`, the file this
+   card re-reads, its `.campaign.out` and the old comparator's
+   `NEW_FAILING 2` output), after the reference `tip-10k.json`, and
+   after the gate's single-seed evidence in
+   `~/.cache/nv3-review/gate-X-5c-F4-F1-F1-F3-F2-F1/m/` (`b5.txt`,
+   `pend/`, `d_*`, `e_*`, `tip_{2599,2859,7078}.*`). **The rounds it
+   moved were all seen before it was written:** 2599 twin r2 and 2859
+   twin r1 (exemption (i)), 7078 r0 (exemption (iii)), and 1927 r1,
+   7257 r0, 7658 r0 and 8278 r0 (exemption (ii)). Each exemption is
+   drawn around a class that already exists in the reference file, never
+   around those seven rounds. In the pattern of X5-R30 (c) and X5-R32.
+7. **The comparator mutant table and the 0..1000 calibration reading** —
+   step 1 (mutants) and step 2 (calibration) above.
+
+acceptance (this attempt): `cargo test -q --release -p e4-recovery` —
+**262 passed, 0 failed** (nothing in the crate changed; green as at
+`eb9c4328`); `python3 -I …/x5r52_compare.py self-test` — **38 cases,
+0 failed**; the scratch-export `git apply --check` of
+`tools/x5r52-twin-diag.patch` — clean, and the patched build reproduces
+the 10k digests of 609/2859/2599; the Acceptance `compare` line — exit
+0; `scripts/gate.sh` — run last, `GATE EXIT=0`.
+
+judgment calls (all recorded in the sections above): the comparator
+prints `TWIN_FAILING <n> <list> BASE <m>` (the class size at both ends,
+never netted), and counts `FAILING_ROUNDS` from the run JSON (it equals
+the E4 FOLD sum on every file read); `check-mp`/`check-twin` exit 0 on
+EXPLAINED and 1 on NOT-EXPLAINED; the 0..1000 calibration's Base file is
+`gate-X-5c-F4-F1-F1-F3/m/b1k.json` (the card's path names the F2-F1
+gate dir, but the file lives in the F3 gate dir — the same file F2-F1's
+record cites); a twin entry that fails at both ends with a changed text
+is reported in `TWIN_FAILING` only (X5-R51 (a) keeps twins out of
+`TEXT_CHANGED`); the round-start marker prints for MP/MW only (class C
+has no twin chain to read).
+
+ESCALATE: none. anomalies: the `git add`/`git commit` pair prints a
+benign `Unable to create …/.git/packed-refs.lock: Read-only file system`
+line from the host's git maintenance in this sandbox; the commits land
+(the log and the clean tree confirm). F2-F1's hand table counted 457 r0
+in its "changed texts (9)"; the comparator counts it once, as `HEALED`
+(the calibration's `TEXT_CHANGED 8`), because both rules classify the
+Base-`pass=false` shape healed first.
+
+### Re-verification attempt (2026-11-07, after the 60-min kill and the
+### quota stop)
+
+Attempt 1 (killed at 60 min) left all four step commits on the branch
+(`10ee2e52 → 8bbbfcec → f21a2247 → 689db626`) with a clean tree, so the
+restart rule resumes at the first step with no commit: there is none.
+This attempt re-verified every recorded reading and re-ran every
+Acceptance line for real. Nothing outside `tools/`+this README changed;
+`git status` stayed clean throughout.
+
+- **Acceptance 1** `cargo test -q --release -p e4-recovery`: exit 0,
+  **262 passed, 0 failed** (18+0+25+43+55+28+50+43+0), green as at
+  `eb9c4328`.
+- **Acceptance 2** `self-test`: exit 0, **38 cases, 0 failed**.
+- **Acceptance 3** the scratch-export `git apply --check` of
+  `tools/x5r52-twin-diag.patch`: exit 0 on a fresh `git archive HEAD
+  nucleus` export. (The sandbox's shell guard rejects `git -C`, so the
+  archive was taken from the worktree root — the same repository state
+  `git -C ../..` names; the `rm -rf` scratch reset was replaced by a
+  fresh directory name, which is equivalent for a one-shot extract.)
+- **Acceptance 4** the 10k `compare` line, verbatim: exit 0, both
+  sha256 checks green, and exactly P's reference reading —
+  `DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0`, `MOVED_GAINED 87`,
+  `MOVED_MP_PENDING 52`, `META_ONLY_ELIGIBLE 4 [(1927,1),(7257,0),
+  (7658,0),(8278,0)]`, `MPA_PASS_FAIL 1 [(7078,0)]`, `TWIN_DDL_PENDING
+  2 [(2599,2),(2859,1)]`, `MOVED_LOST 94`, `HEALED 3 [(457,0),(1298,1),
+  (8777,0)]`, `TWIN_HEALED 1 [(6539,1)]`, `TEXT_CHANGED 131`,
+  `TWIN_FAILING 7 BASE 6`, `NEW_FAILING 0`, `BAD_SEEDS 0`.
+- **Acceptance 5** `bash scripts/gate.sh` (full log kept at
+  `${CARGO_TARGET_DIR}/gate-full.out`): `STEP test EXIT=0`, `STEP clippy
+  EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`,
+  `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=1`
+  with exactly **one** FAIL row — `runner e2e: K: SIGTERM kills opencode
+  and closes the ledger range` — so `GATE EXIT=1`. **This is the known,
+  ruled row, not a finding of this card.** Verdict
+  `verdicts/X-5c-F4-F1-F1.md` (K ruling): "`kill_child` is correct.
+  `dead()` asks the wrong question: `killpg` succeeds on a zombie-held
+  group"; a worker's own-session gate reads red on that row alone "when
+  opencode as PID 1 reaps no orphans… It is the only row. The runner's
+  Acceptance is the truth. Do not chase it, and do not run a subreaper
+  to make it pass." This container matches the ruling's premise:
+  `/proc/1/comm` = `opencode`. The fix is queued as card
+  X-5c-F4-F1-F1-F1 ("does not block the held card or F4"), and this
+  card's Touch-only list forbids `scripts/` anyway. CXX-F1's subreaper
+  wrapper (recorded above, before the ruling) is overruled for cards
+  after it; F2-F1's own record already carried the row as a known red.
+  My probes match the ruled mechanism: at check time the fake's pid is
+  dead by every oracle (`kill(pid,0)→ESRCH`, no `/proc/<pid>`, `ps`
+  empty; the pid allocator is sequential with no `ns_last_pid` rewind —
+  verified by a 21k-sample monitor running concurrently with a failing
+  suite — and ~23M kill probes over isolated kill+reap repros never
+  fired), yet `killpg(pgid,·)` succeeds on the orphaned `sleep`'s
+  unreaped zombie holding the group, exactly as the verdict states.
+- **The 0..1000 calibration** re-run exactly as recorded: 243/4/0,
+  gained 7, MP pending `[(47,1),(547,0),(797,0),(967,0)]`, empty X5-R52
+  rows, lost 5, healed `[(457,0)]`, `TEXT_CHANGED 8`, twin failing 2
+  BASE 2, `NEW_FAILING 0`, exit 0.
+- **All 52 `check-mp` rows** re-derived from the gate's `m/pend/`
+  recordings: **48 `EXPLAINED (b)5`, 4 `EXPLAINED (b)5'`** (1927 r1,
+  7257 r0, 7658 r0, 8278 r0 — the `META_ONLY_ELIGIBLE` four), none
+  NOT-EXPLAINED, no missing file.
+- **The three `check-twin` rows** re-derived from attempt 1's preserved
+  patched single-seed runs (`${CARGO_TARGET_DIR}/x5r52/s*.{err,json,
+  out}`; T5's digest/MONITOR checks inside): 2599 twin r2 `EXPLAINED
+  N=3 k=2` (real round 1: lost=1 mis=0 torn=1, frontier=1 hi=5), 2859
+  twin r1 `EXPLAINED N=4 k=1` (real round 0: mis=1, frontier=1 hi=7),
+  609 twin r1 `EXPLAINED N=5 k=1` (real round 0: torn=2, frontier=2
+  hi=8) — the pre-existing shape, as evidence. The gate reproduces 2599
+  and 2859 on its own per (f).
+- **Mutation evidence re-applied this attempt** to fresh scratch copies
+  under `CARGO_TARGET_DIR` (never the worktree; the tree stayed clean):
+  M-CMP-NO-PF — `self-test` FAIL, 9 cases incl. `pass-fail-base-text-
+  not-mpa`, and over the real 10k `MPA_PASS_FAIL 0 []` with `7078`
+  absent from the entire output, exit 0 (the original comparator's gap,
+  reproduced); M-CMP-MPA-NOJUDGE — FAIL `mpa-skx-smx-false`,
+  `mpa-pass-na-false`; M-CMP-META-ANYSLOT — FAIL `meta-only-some-finding`;
+  M-CMP-TWIN-NODIR — FAIL `twin-t2-both-dirs-lack-N`; M-CMP-TWIN-ANYCLASS
+  — FAIL `twin-mp-seed-prefilter-fails`. No UNCAUGHT.
+
+anomaly: attempt 1's RESULT paragraph above records `scripts/gate.sh`
+ending `GATE EXIT=0`; this attempt cannot reproduce that reading in this
+container (`opencode` as PID 1) without the subreaper wrapper the
+X-5c-F4-F1-F1 verdict later forbade, and attempt 1's log was killed
+before its end. The one row that differs is the ruled `runner e2e: K`
+row; every other gate step is green here, and every other recorded
+number of this card reproduces exactly as written above.
+
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F1-F1's record (X5-R53, P's post-data
+## amendment to X5-R52; check-twin narrowed to the twin's own segments,
+## T6 the ts-level link, the MP-A class cap, MONITOR as a stop; the same
+## 10k re-read again)
+
+The re-verdict of the X5-R52 card
+(`verdicts/X-5c-F4-F1-F1-F3-F2-F1-F1.md` at `26bcee4b`,
+MERGE-WITH-FOLLOWUPS) left two follow-ups on X5-R52's comparator and
+rule. Neither changes the reading of F2-F1's 10k; both have to land
+before card X-5c-F4-F1-F1-F3-F2-F1-F2's 10k, because that run uses this
+comparator:
+
+- **The comparator is wider than X5-R52.** `check-twin`'s T1 accepted
+  `Corrupt("tree N missing in directory")` from any class-C `Err` line
+  for round `i` — including the uniform probe on the real chain and a
+  pairing re-run. T3 likewise read probe segments. The gate built two
+  adversarial logs that came back `EXPLAINED` under that reading, and
+  four of its mutants survived `self-test`: G-EXIT-NOBAD, G-T4-NO-SHORT,
+  G-TWIN-PREFILTER-ALLJ and G-T3-ANYCLASS.
+- **X5-R52 dropped two parts of the verdict's proposals at `8992f77f`.**
+  (c)(i) replaced the ts-level link with T3 and T4, and (c)(iii) dropped
+  "while the class count does not grow". P rules on both below, **before
+  any code**, and also on whether a run with MONITOR > 0 fails the
+  comparator's exit by itself.
+
+This card does three things: commits **X5-R53** with X5-R52 quoted
+unchanged, narrows `tools/x5r52_compare.py` to X5-R52 as written and to
+X5-R53 while closing the self-test gaps, and re-reads the **same** 10k
+JSON requiring the **same** reading. No campaign is run again and no
+Rust changes (X5-R31 run hygiene: everything reads recorded files).
+
+**Numbering.** The highest X5-R number in use in the README, the cards,
+the verdicts, QUEUE and PLAN is R52 (checked in the cards tree and on
+every `card/v3-*` branch on 2026-11-08). **This rule is X5-R53.**
+
+### P's three rulings (the reasoning; X5-R53 below is the binding text)
+
+1. **The ts-level check: restored, as a new check T6, with its
+   real-chain half rewritten.**
+   - The check can be computed from recorded fields. Twin listings carry
+     each record's `ts` and `ddl`, the replay-start line carries
+     `meta.t`, and the real listing and JSON give the real side.
+   - T1–T5 show that the directories diverged right after a faulted,
+     short real recovery. They do not tie that divergence to one
+     DropTree in that round. Without T6, a tree the real chain dropped
+     and then re-created, or a drop the twin itself replays in the
+     failing recovery, passes.
+   - **The proposal's real-side test, "its frontier is below that ts",
+     compares two different clocks.** `frontier` is the real chain's and
+     the DropTree's `ts` is the twin's. The clocks do drift apart: in
+     2599 r1 the twin's CreateTree is `ts=5` and the real chain's is
+     `ts=1`. Read literally, the test would pass a real round that did
+     replay the drop whenever the twin's clock is ahead, and refuse a
+     genuine loss whenever it is behind.
+   - So T6 keeps the proposal's intent on one clock: the real round's
+     own replay listing, read against its own `frontier`. The
+     `cover_err`/`x33x` alternative stays, because a refused recovery
+     prints no listing.
+2. **The MP-A cap: restored.**
+   - It can be computed exactly from the two JSON files.
+   - (iii) calls a bullet-1 regression "movement within MP-A". Movement
+     within a class that X5-R30 keeps open is only a fair description
+     while the class is not growing. Without the cap, a real rise in
+     served corruption passes every comparison, one exempt row at a
+     time, and shows up only as a number nobody is required to read.
+   - An ESCALATE on a one-round rise is the cheap outcome: P looks, and
+     rules. A silent rise is the expensive one.
+   - -F2's 10k will use it, so it is fixed here, before that run.
+3. **MONITOR > 0: it stops the comparison by itself.** X5-R51 (a)
+   bullet 3 already calls a MONITOR hit a new failure. The comparator
+   only voids exemptions on one. This makes the existing bullet
+   testable, as X5-R52 (b) did for bullet 1.
+
+### X5-R53 (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+Copied verbatim from the card before any code of this card (the step-0
+discipline, as X5-R6–R52 before it):
+
+**X5-R53 (the X5-R52 amendment: `check-twin`'s attribution made exact, the ts-level link T6, the MP-A class cap, and MONITOR as a stop; a P rule, post-data; X5-R49, X5-R51's text and X5-R52's text unchanged).**
+- **(0) What was known when this was written.** X5-R53 is a post-data amendment, and RESULT item 6 lists it as one. P wrote it **after** reading all of the following:
+  - verdict `X-5c-F4-F1-F1-F3-F2-F1-F1` at `26bcee4b`, including both of the gate's adversarial logs;
+  - F2-F1's 10k JSON (sha256 `6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`), the reference (`f4d6f1ff…c923`), and the gate's recorded `t_2599.*` and `t_2859.*`;
+  - P's own scratch reference implementation of (b), (c) and (d), run over those files. Its reading is under "Expected" in Work step 4.
+
+  **So P knew, before writing it, that:** both pending twin rows meet T6 (2599: `ts_D=7`, `meta.t=9`, one real record replayed, frontier 1; 2859: `ts_D=3`, `meta.t=7`, one real record replayed, frontier 1); MP-A is 11 rounds at the reference and 10 at the tip, all class MP and all `pass=false`; and the run's MONITOR is 0. **The rulings do not rest on those facts.** Each was decided on whether the check is computable from recorded fields and on what it rules out. Parts (b), (c) and (d) only remove exemptions. Part (e) only adds a stop. X5-R53 exempts no round that X5-R52 did not.
+- **(a) Scope.**
+  - X5-R53 amends X5-R52 for the same comparisons X5-R52 (a) names: this card's re-read of F2-F1's 10k, and every comparison in card X-5c-F4-F1-F1-F3-F2-F1-F2. **For -F2, P re-issues X5-R52 read with this amendment.**
+  - X5-R52 (g) stands: at a commit carrying -F2's re-seed, (c)(i) is void, so (b) and (c) below have nothing to act on there. (d) and (e) apply there.
+  - It carries to no other card unless P re-issues it.
+  - **It is not an oracle change and not an E4 judgement rule.** `pass`, the texts, the fold, `verify`, every quota, X5-R1–R52, F4's class table and E4's owner rule are unchanged.
+- **(b) T1 and T3 read the twin's own runs.** This states what X5-R52's "class-C (twin)" means; the comparator was wider than that text.
+  - **Segments.** A diag line belongs to the most recent `X5R52 run seed=<s> round=<r> class=<K>` marker for seed `s`. A marker for another seed ends the segment.
+  - **A twin segment of round `r`** is a `class=C` marker for round `r` that comes **after** that seed's `X5R52 round-start` line for round `r`.
+    - That covers the twin's first run, its NEVER-FIRED re-runs and the X5-R21 (c) pairing re-runs, all of which run on the twin chain.
+    - A `class=C` marker for round `r` **before** that line is the uniform probe, which runs on the real chain. It is never a twin segment.
+  - **T1** becomes:
+    - there is at least one class-C recovery `Err` line for round `i` inside a twin segment of round `i`; and
+    - **every** class-C recovery `Err` line for round `i`, in any segment, has the same text, and that text is exactly `Corrupt("tree N missing in directory")`.
+
+    A probe's `Err`, a pairing re-run's `Err` or any other class-C `Err` that differs is NOT-EXPLAINED T1.
+  - **T3** reads twin segments only, for seed `s` only, at rounds `≤ i`. The rest of its text is unchanged.
+  - T2, T4 and T5 are unchanged.
+- **(c) T6, the ts-level link (a sixth check; all six must hold).** Let `N` be T1's tree and `k` be T4's round.
+  - **T6a, the twin side.** Collect each `ts` of a commit record (`kind=1`) whose `ddl` contains `D<N>`, in the replay listings of the twin segments of round `k−1`. At least one must exist. For every twin-segment `Err` line of T1, let `t` be the `meta.t` of that segment's most recent `GATEDIAG replay start` line above it, which must exist. Every collected `ts` must be `≤` every such `t`.
+    - So the twin's image at the failing recovery already holds the drop, and the record is in the twin run paired with real round `k−1`.
+  - **T6b, the real side, on the real chain's own clock.** Real round `k−1` in the 10k JSON has `cover_err` true or `x33x` true; **or** both of these hold:
+    - there is a real-class (`Mw` or `Mp`) segment of round `k−1` with a `GATEDIAG replay start` line;
+    - the listing after the last such line, in the last such segment, has **no** commit record whose `ddl` contains `D<N>` at a `ts` at or below that round's JSON `frontier`.
+  - **What T6b is not.** `frontier` is never compared with T6a's `ts`, because the two chains' clocks differ (2599 r1: twin CreateTree `ts=5`, real `ts=1`). T6 does not establish that a media fault rather than a crash cut lost the record. T4 carries that condition, unchanged.
+  - **Still caught:** a drop at a `ts` above the failing recovery's `meta.t`; a drop listed only in a twin round other than `k−1`; a real round whose recovery replayed the drop at or below its frontier, so that `N` is in `real_dir` for some other reason; a real round with no listing and neither `cover_err` nor `x33x`.
+- **(d) The MP-A class cap on (c)(iii).**
+  - **The class.** The MP-A count of a file is the number of `rounds` entries with seed `class` `MP`, `served=true` and `mrb=true`, over the seeds of the comparison, including a `--range` slice. It is counted the same way at both ends.
+  - **The cap.** If the tip's count is **greater** than the Base's, (iii) exempts nothing in that comparison: every round that would be `MPA_PASS_FAIL` is a new failure, with reason `bullet1-mpa-cap`. An equal or smaller count leaves (iii) as X5-R52 wrote it.
+  - **Reporting.** The comparator prints `MPA_CLASS base <B> tip <T>` directly after `MPA_PASS_FAIL`, on every run.
+  - **What the cap does not do.** A round can join MP-A without a bullet-1 row only by failing at both ends. No exemption is in play there, so the cap does not stop on it. The line is printed, and F4's class table judges the class.
+  - **A one-for-one swap passes** (2 healed and 1 gained passes; so would 1 and 1). The cap is a bound on size, not a proof that no round is new. X5-R52 (c)(iii)'s per-round checks still apply to each row.
+- **(e) MONITOR.** A run whose `E4 SEEDS=… MONITOR=` total is above 0 is a new failure by itself, with row `(-1, "run", None, "bullet3-monitor")`, so the comparator's exit is 1. X5-R51 (b)4's voiding stays. The comparator does not read the reference's MONITOR: F2-F1's run has MONITOR 0, and a run hit is one this comparison must stop on either way.
+- **(f) Outside the rule.** X5-R52 (e) is extended by: a `TWIN_DDL_PENDING` row whose T6 fails; a `bullet1-mpa-cap` row; a `bullet3-monitor` row. **STOP:** write the rounds into the README, commit, and ESCALATE. Do not try a fix.
+
+**Step 1 — `check-twin`: (b) and (c) (this commit).**
+`tools/x5r52_compare.py` gains one line-walking helper,
+`walk_seed_segments(diag_text, seed)`, which yields every diag line
+with `(seg_id, seg)` — the segment's class and round, whether it is a
+**twin segment** (a class-C marker after that seed's `round-start` line
+for that round; a class-C marker before it is the uniform probe on the
+real chain, and a marker for another seed ends the segment), and the
+segment's latest `GATEDIAG replay start` `meta.t` above each line. T1,
+T3 and T6 all read that one walk; T2, T4 and T5 keep their own scans
+and texts. The check order is T5, T1, T2, T3, T4, T6, and T6 failures
+read `NOT-EXPLAINED T6a/T6b <reason>`:
+
+- **T1 (X5-R53 (b)).** At least one class-C recovery `Err` line for
+  round `i` inside a twin segment of round `i`; every class-C `Err`
+  line for round `i`, in any segment, the same text, exactly
+  `Corrupt("tree N missing in directory")`. The probe's `Err`, a
+  pairing re-run's `Err` or any other class-C `Err` that differs is
+  NOT-EXPLAINED T1.
+- **T3 (X5-R53 (b)).** Twin segments of this seed only, at rounds
+  `≤ i`: a kind=1 record with `D<N>` in `ddl`.
+- **T6a (X5-R53 (c)).** The `ts` of every kind=1 `D<N>` record in the
+  twin segments of round `k−1` (at least one), every one `≤` the
+  `meta.t` of each twin-segment `Err` line of T1 (each of which must
+  have one above it).
+- **T6b (X5-R53 (c)).** Real round `k−1` has `cover_err` or `x33x`;
+  or the listing after the last `GATEDIAG replay start` line in the
+  last real-class (`Mw`/`Mp`) segment of round `k−1` holds no kind=1
+  `D<N>` record at a `ts` `≤` that round's JSON `frontier`.
+  `frontier` is never compared with T6a's `ts` — the two chains' clocks
+  differ.
+
+`self_test`'s `twin_diag` was rewritten to the harness's real order
+(per round: probe marker, `round-start`, twin marker, the twin's lines,
+real marker, the real run's listing — the old fixture put the class-C
+marker before its `round-start` line, so the twin read as a probe and
+the `Err` line sat there), with a real listing in its round 0. Every
+existing case keeps its name and its expected verdict; 15 cases were
+added, each named for its check (`twin-t1-probe-only`,
+`twin-t1-probe-no-twin-err`, `twin-t1-pairing-rerun-differs`,
+`twin-t1-probe-differs-from-twin`, `twin-t1-identical-rerun-ok`,
+`twin-t3-probe-only`, `twin-t3-mw-only`, `twin-t4-no-short`,
+`twin-t4-cover-err-short`, `twin-t6-drop-above-meta`,
+`twin-t6-drop-other-round`, `twin-t6-real-replayed-drop`,
+`twin-t6-real-listed-above-frontier`, `twin-t6-no-real-listing`,
+`twin-t6-cross-clock`). `self-test` now reads **53 cases, 0 failed**.
+Against the prior gate's real recordings (read-only):
+2599 twin r2 `EXPLAINED N=3 k=2 (… T6a ts=[7] meta.t=[9]; T6b no D3 at
+or below frontier, real_nrec=1)` and 2859 twin r1 `EXPLAINED N=4 k=1
+(… T6a ts=[3] meta.t=[7]; T6b no D4 at or below frontier, real_nrec=1)`
+— the narrowed rules still exempt exactly the two rows, and the details
+carry X5-R53's ts-level facts (RESULT item 4's fields).
+
+**Step 2 — `compare`: (d), (e) and the exit code (this commit).**
+`compare_reading` counts the MP-A class at both ends over the compared
+seeds (rounds entries of seeds with class `MP` where `served` and `mrb`
+are both true — the same count at both ends, range slices included) and
+applies the cap after the round loop: a tip count **greater** than the
+Base's moves every `MPA_PASS_FAIL` row into `new_failing` with reason
+`bullet1-mpa-cap`. `format_rows` prints `MPA_CLASS base <B> tip <T>`
+directly after `MPA_PASS_FAIL`, on every run (X5-R53 (d)). A run whose
+MONITOR total is above 0 gains the `(-1, "run", None,
+"bullet3-monitor")` new-failure row, so the exit is 1 (X5-R53 (e));
+X5-R51 (b)4's voiding inside the prefilters is unchanged. The existing
+`mpa-pass-fail` case's Base file gained a second MP seed holding an
+MP-A round that heals at the tip (Base 1, tip 1 — without it the cap
+would void the row the case asserts); its name and expected row stay.
+Eight cases added: `mpa-cap-equal-keeps`, `mpa-cap-fewer-keeps`,
+`mpa-cap-grown-voids`, `mpa-cap-counts-class-mp-only`, `mpa-class-line`,
+`monitor-run-stops`, `exit-bad-seeds-only` (a deadlock seed at both
+ends: no new failure, exit 1) and `twin-prefilter-fault-at-i-only` (the
+only media-faulted short real round at `j = i`: `bullet1-twin`, not
+pending). `self-test` reads **61 cases, 0 failed**, and the 10k
+`compare` output is byte-identical to the chain-head comparator's
+except the added `MPA_CLASS base 11 tip 10` line (the record is
+below, step 4).
+
+**Step 3 — the mutants (this commit).**
+Every mutant is a scratch copy under
+`${CARGO_TARGET_DIR}/x5r53-review/mut/` (never the worktree; the tree
+stayed clean), applied by an anchored replacement
+(`${CARGO_TARGET_DIR}/x5r53-review/mutants.py`, which asserts each
+anchor's count) and run through `self-test`. Each must make `self-test`
+exit non-zero on at least its named case; **all 25 are caught, none
+UNCAUGHT** — the verdict's four survivors (G-EXIT-NOBAD, G-T4-NO-SHORT,
+G-TWIN-PREFILTER-ALLJ, G-T3-ANYCLASS) are caught by the new cases:
+
+| mutant | self-test failing cases |
+|---|---|
+| G-EXIT-NOBAD (`compare_exit_code` ignores `bad_seeds`) | `exit-bad-seeds-only` |
+| G-T4-NO-SHORT (T4 drops `cover_err ∨ frontier < hi`) | `twin-t4-no-short` |
+| G-TWIN-PREFILTER-ALLJ (the prefilter reads every real round) | `twin-prefilter-fault-at-i-only` |
+| G-T3-ANYCLASS (T3 reads any segment's class) | `twin-t3-mw-only`, `twin-t3-probe-only` |
+| M-T1-ORIGINAL (the chain-head T1 scan, restored) | `twin-t1-probe-only`, `twin-t1-probe-no-twin-err`, `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-NO-TWIN-REQ (no "in a twin segment" half) | `twin-t1-probe-no-twin-err` |
+| M-T1-NO-DIFFER (no every-line-same half) | `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-DIFFER-TWIN-ONLY (same-half reads twin segments only) | `twin-t1-probe-differs-from-twin` |
+| M-T1-ONE-ERR (exactly one class-C `Err` line) | `twin-t1-identical-rerun-ok` |
+| M-T3-PROBE (probe segments count as twin) | `twin-t3-probe-only`, `twin-t1-probe-no-twin-err` |
+| M-T6-NO-META (T6a drops `ts ≤ meta.t`) | `twin-t6-drop-above-meta` |
+| M-T6-ANY-ROUND (T6a accepts any round `≤ i`) | `twin-t6-drop-other-round` |
+| M-T6-NO-REAL (T6b always holds) | `twin-t6-real-replayed-drop`, `twin-t6-no-real-listing` |
+| M-T6-ANY-TS (T6b refuses `D<N>` at any `ts`) | `twin-t6-real-listed-above-frontier` |
+| M-T6-CROSS-CLOCK (T6b also requires `frontier < ts`, the proposal's literal form) | `twin-t6-cross-clock` |
+| M-MPA-NO-CAP (the cap is removed) | `mpa-cap-grown-voids` |
+| M-MPA-CAP-GE (`tip ≥ Base` voids) | `mpa-cap-equal-keeps`, `mpa-cap-counts-class-mp-only`, `mpa-pass-fail` |
+| M-MPA-CAP-ANYCLASS (MW rounds count toward the class) | `mpa-cap-counts-class-mp-only` |
+| M-MON-NO-STOP (no `bullet3-monitor` row) | `monitor-run-stops` |
+| M-CMP-NO-PF (no bullet-1 check — re-applied) | 13 cases: the nine `mpa-*`/`pass-fail-base-text-not-mpa` set plus the four new `mpa-cap-*`/`mpa-pass-fail` |
+| M-CMP-MPA-NOJUDGE (re-applied) | `mpa-skx-smx-false`, `mpa-pass-na-false` |
+| M-CMP-META-ANYSLOT (re-applied) | `meta-only-some-finding` |
+| M-CMP-TWIN-NODIR (re-applied) | `twin-t2-both-dirs-lack-N` |
+| M-CMP-TWIN-ANYCLASS (re-applied) | `twin-mp-seed-prefilter-fails` |
+
+**M-CMP-NO-PF over the real 10k**, as in the R52 record: exit 0,
+`MPA_PASS_FAIL 0 []`, `NEW_FAILING 0 []` — 7078 r0 vanishes from the
+entire output (the original comparator's gap, reproduced under the
+X5-R53 comparator too; `MPA_CLASS base 11 tip 10` still prints).
+
+**Step 4 — the re-read of the same 10k under X5-R53 (this commit).**
+No campaign was run; everything reads recorded files. The inputs and
+their sha256 (each checked by the Acceptance lines themselves): the run
+JSON `X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json`
+`6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`,
+its `.campaign.out` `cf3de932fc2e82e8042e0b784c3fd071d9d3b9d9a7df543a9411152ae1e26059`
+(MONITOR=0), the reference `tip-10k.json`
+`f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`,
+and the prior gate's recordings `t_2599.{err,json,out}`
+(`a22f0fed…5ef`, `7e5aaf13…f49`, `ef1c8441…999`) and
+`t_2859.{err,json,out}` (`2d0dbb54…692`, `25f442f7…a59`,
+`5e9c50f1…afa`) — the six match Acceptance line 3's `sha256sum -c`
+list exactly. The `compare` output, in full (exit 0):
+
+```
+DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 87 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0), (1299, 0), (1319, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1749, 2), (1768, 0), (1927, 1), (1939, 0), (1999, 0), (2079, 0), (2189, 0), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (2859, 1), (2979, 0), (3099, 0), (3148, 0), (3377, 0), (3759, 2), (3838, 0), (3948, 0), (4148, 0), (4179, 0), (4279, 0), (4399, 1), (4439, 0), (4499, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (4659, 1), (4749, 0), (5077, 0), (5279, 0), (5328, 1), (5418, 0), (5499, 0), (5549, 2), (5798, 1), (6178, 1), (6189, 0), (6368, 0), (6369, 0), (6387, 2), (6417, 0), (6539, 0), (6719, 0), (6877, 0), (6917, 0), (7219, 0), (7257, 0), (7368, 1), (7419, 1), (7469, 1), (7658, 0), (7669, 0), (7727, 1), (7958, 1), (8038, 0), (8139, 2), (8278, 0), (8639, 0), (8748, 2), (8788, 1), (8869, 2), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+MOVED_MP_PENDING 52 [(47, 1), (547, 0), (797, 0), (967, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1768, 0), (1927, 1), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (3148, 0), (3377, 0), (3838, 0), (3948, 0), (4148, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (5077, 0), (5328, 1), (5418, 0), (5798, 1), (6178, 1), (6368, 0), (6387, 2), (6417, 0), (6877, 0), (6917, 0), (7257, 0), (7368, 1), (7658, 0), (7727, 1), (7958, 1), (8038, 0), (8278, 0), (8748, 2), (8788, 1), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+META_ONLY_ELIGIBLE 4 [(1927, 1), (7257, 0), (7658, 0), (8278, 0)]
+MPA_PASS_FAIL 1 [(7078, 0)]
+MPA_CLASS base 11 tip 10
+TWIN_DDL_PENDING 2 [(2599, 2), (2859, 1)]
+MOVED_LOST 94 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1), (1018, 0), (1107, 0), (1219, 0), (1367, 1), (1387, 0), (1578, 2), (1588, 0), (1598, 0), (1708, 2), (1747, 0), (1919, 1), (1927, 0), (1949, 0), (2099, 0), (2159, 0), (2259, 0), (2307, 0), (2389, 0), (2397, 0), (2517, 1), (2778, 0), (3029, 0), (3289, 0), (3377, 1), (3397, 0), (3548, 0), (3739, 0), (3759, 0), (3768, 0), (3947, 0), (4118, 0), (4359, 0), (4398, 0), (4399, 0), (4419, 1), (4518, 0), (4537, 1), (4567, 0), (4989, 1), (5129, 0), (5188, 0), (5328, 0), (5427, 0), (5479, 0), (5499, 1), (5619, 0), (5769, 2), (5798, 0), (6178, 0), (6387, 1), (6417, 1), (6458, 0), (6557, 0), (6909, 0), (6917, 1), (6938, 0), (7197, 0), (7219, 1), (7278, 0), (7298, 0), (7368, 0), (7419, 0), (7439, 1), (7447, 0), (7727, 2), (7889, 0), (7958, 0), (8257, 0), (8278, 1), (8307, 0), (8547, 0), (8639, 1), (8748, 0), (8788, 0), (9059, 0), (9159, 2), (9177, 0), (9329, 1), (9387, 0), (9388, 0), (9419, 0), (9429, 1), (9508, 2), (9618, 0), (9637, 1), (9717, 0), (9818, 0), (9967, 0), (9999, 0)]
+HEALED 3 [(457, 0), (1298, 1), (8777, 0)]
+TWIN_HEALED 1 [(6539, 1)]
+TEXT_CHANGED 131 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0), (1117, 0), (1127, 1), (1159, 0), (1197, 0), (1217, 0), (1337, 0), (1417, 0), (1447, 0), (1477, 0), (1628, 0), (1637, 0), (1798, 0), (1899, 0), (1917, 0), (1948, 1), (1959, 0), (1977, 0), (2028, 0), (2078, 0), (2097, 1), (2268, 0), (2377, 0), (2537, 0), (2567, 0), (2597, 0), (2638, 0), (2698, 0), (2757, 0), (2787, 0), (2828, 0), (2939, 0), (2977, 2), (2978, 0), (3068, 0), (3118, 0), (3227, 0), (3259, 1), (3357, 0), (3358, 0), (3438, 0), (3638, 0), (3817, 0), (3927, 0), (4038, 0), (4127, 1), (4247, 0), (4268, 0), (4297, 0), (4337, 0), (4378, 0), (4468, 0), (4489, 0), (4648, 0), (4657, 0), (4677, 0), (4699, 0), (4737, 0), (4758, 0), (5047, 1), (5078, 0), (5087, 0), (5148, 1), (5227, 1), (5298, 0), (5338, 1), (5378, 0), (5517, 0), (5618, 0), (5907, 0), (5958, 0), (6078, 0), (6138, 0), (6248, 0), (6377, 0), (6457, 0), (6517, 0), (6558, 0), (6627, 0), (6638, 0), (6677, 0), (6758, 0), (6807, 0), (6848, 0), (6977, 0), (6987, 0), (6997, 0), (7007, 0), (7098, 0), (7127, 0), (7227, 0), (7297, 0), (7317, 0), (7337, 0), (7338, 0), (7357, 0), (7399, 0), (7457, 1), (7698, 0), (7917, 0), (8098, 0), (8138, 0), (8268, 0), (8287, 0), (8309, 1), (8418, 0), (8617, 0), (8618, 0), (8638, 0), (8687, 0), (8977, 0), (8998, 0), (9028, 0), (9078, 1), (9107, 1), (9228, 0), (9398, 0), (9417, 0), (9528, 0), (9617, 0), (9657, 0), (9827, 0), (9878, 0), (9959, 0)]
+TWIN_FAILING 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)] BASE 6
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+**Exactly the same reading as under X5-R52.** The diff against the
+chain-head comparator's output (`git show 26bcee4b` copy, run over the
+same files by the Acceptance line) is the **`MPA_CLASS base 11 tip 10`
+line alone** — every other byte identical, both exits 0. The cap did
+not void (iii): the class count fell, 11 → 10, so 7078 r0 stays
+`MPA_PASS_FAIL`. MONITOR is 0, so no `bullet3-monitor` row. The two
+`check-twin` rows (Acceptance lines 5 and 6, both exit 0):
+
+```
+EXPLAINED N=3 k=2 (real round 1: lost=1 mis=0 torn=1 cover_err=False frontier=1 hi=5; T6a ts=[7] meta.t=[9]; T6b no D3 at or below frontier, real_nrec=1)
+EXPLAINED N=4 k=1 (real round 0: lost=0 mis=1 torn=0 cover_err=False frontier=1 hi=7; T6a ts=[3] meta.t=[7]; T6b no D4 at or below frontier, real_nrec=1)
+```
+
+RESULT item 4's fields: 2599 `N=3 k=2`, T6a drop `ts` 7 against the
+failing recovery's `meta.t` 9, T6b's real listing 1 record at frontier 1;
+2859 `N=4 k=1`, T6a `ts` 3 against `meta.t` 7, real listing 1 record at
+frontier 1. Both hold by T6b's **second** arm (each real round's
+`cover_err` and `x33x` are false, its listing replays only the
+CreateTree record, `ts=1 ≤ frontier`, no `D<N>`) — exactly the facts P
+listed in X5-R53 (0). **Nothing outside X5-R52 read with X5-R53: no
+STOP.**
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F1-F1)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F1-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F1-F1   commit: (this commit; the chain c51b4218 → 8819a073 → b9ea6ff7 → 888078eb → here)
+
+The six RESULT items the card requires:
+
+1. **X5-R53 verbatim and the numbering note** — the section above, step
+   0. The rule was extracted byte-for-byte from the card before any
+   code of this card (`diff` against the card's lines 146–185 is empty)
+   and not edited after step 0. X5-R51's and X5-R52's texts are
+   unchanged: the only deleted lines in this card's whole README diff
+   are the three Status-paragraph lines the new stage's Status rework
+   replaced (checked `git diff 26bcee4b HEAD`, 3 deleted lines, all in
+   the Status paragraph; X5-R52's block diffs empty).
+2. **P's three rulings, as the card gives them** — "P's three rulings"
+   above: the ts-level check restored as T6 with its real-chain half
+   rewritten onto one clock, the MP-A cap restored, MONITOR > 0 stops
+   the comparison by itself.
+3. **The `compare` output in full, both files' sha256, and the diff
+   against the chain-head comparator's output** — step 4 above: exit 0,
+   the sha256s listed there, and the diff is the `MPA_CLASS base 11
+   tip 10` line only.
+4. **The `check-twin` rows for 2599 and 2859** — step 4 above: `N`, `k`,
+   T6a's `ts` and `meta.t`, and T6b's real listing size and frontier,
+   all in the recorded rows.
+5. **The MP-A class at both ends, and the mutant table** —
+   `MPA_CLASS base 11 tip 10` (the count fell; the cap leaves (iii) as
+   X5-R52 wrote it), and the 25-mutant table of step 3 (none UNCAUGHT).
+6. **Post-data amendments: X5-R53.** It was written by P **after** the
+   re-verdict at `26bcee4b` (both adversarial logs included), after
+   F2-F1's 10k JSON and the reference, after the gate's recorded
+   `t_2599.*`/`t_2859.*`, and after P's own scratch reference
+   implementation — the full list is its (0), quoted verbatim above.
+   **The rounds it moved: none.** X5-R53 exempts no round that X5-R52
+   did not, and the re-read confirms it: every row of the reading is
+   unchanged, the cap voids nothing here, and both pending twin rows
+   pass the sixth check.
+
+acceptance (this attempt, every line run for real): `python3 -I
+spikes/e4-recovery/tools/x5r52_compare.py self-test` — **61 cases,
+0 failed**, exit 0; the two `git diff --quiet ad4fa999… HEAD` lines
+(`src`, `Cargo.toml`, `x5r52-twin-diag.patch`) — both quiet; the
+six-line `sha256sum -c` over `t_2599.*`/`t_2859.*` — all OK; the 10k
+`compare` line — exit 0, byte-identical to the chain-head output except
+`MPA_CLASS base 11 tip 10`, with the four `grep -Fxq` rows green; the
+two `check-twin` lines — exit 0, `EXPLAINED N=3 k=2 ` / `EXPLAINED
+N=4 k=1 `; `scripts/gate.sh` — `STEP test EXIT=0`, `STEP clippy
+EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`,
+`STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=1`
+with exactly **one** FAIL row — `runner e2e: K: SIGTERM kills opencode
+and closes the ledger range` — so the last line reads `GATE EXIT=1`.
+**This is the known, ruled row, not a finding of this card**: the
+container matches the ruling's premise (`/proc/1/comm` = `opencode`),
+verdict `verdicts/X-5c-F4-F1-F1.md` (the K ruling) says "`kill_child`
+is correct. `dead()` asks the wrong question: `killpg` succeeds on a
+zombie-held group" and "It is the only row. The runner's Acceptance is
+the truth. Do not chase it, and do not run a subreaper to make it
+pass." The parent card's own re-verification recorded the identical
+reading in this same container shape (its attempt-1 `GATE EXIT=0` was
+flagged unreproducible there), and the fix is queued as card
+X-5c-F4-F1-F1-F1; `scripts/` is outside this card's Touch only either
+way. Every other step is green and nothing this card touched (a README
+and a Python tool) is exercised by that row.
+
+judgment calls (recorded in the sections above): scratch output and
+mutant copies live under `${CARGO_TARGET_DIR}/x5r53-review/` — the
+card's Run hygiene names `~/.cache/nv3-review/X-5c-…-F1/`, but `$HOME`
+is read-only in this container, and the card's own Notes direct outputs
+under `$CARGO_TARGET_DIR`; the mutant driver asserts every anchor's
+occurrence count before applying; the T3-attribution mutants are caught
+where the fixture's shape forces it — a mutant that wrongly passes T3
+then falls to T6a/T6b's refusal on the same fixture, which is the only
+possible divergence for a check that must fail (the case still fails
+under the mutant, on its named case); `check-twin`'s EXPLAINED detail
+grew to carry T6a's `ts`/`meta.t` and T6b's listing size (RESULT
+item 4 requires them; the `N=… k=… ` prefix the rules and the
+self-test assert is unchanged); the module docstring was updated to
+name X5-R53 (no behaviour; the four functions X5-R53 leaves untouched
+— `check_mp`, `meta_only_eligible`, `mpa_pass_fail`,
+`twin_ddl_prefilter` — are byte-identical to `26bcee4b`).
+
+ESCALATE: none.
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the parent card's record; the commits land — the
+log and the clean tree confirm); (b) the gate's `GATE EXIT=1` on the
+single ruled `runner e2e: K` row as recorded above — environmental,
+pre-existing on this chain in this container, and outside this card's
+scope; (c) the verdict's stacked-tip re-gate (at `60f919d7`, scaffold
+`acc81c77`) read that row ok and `GATE EXIT=0`, while the parent card's
+own in-container re-verification and this attempt read it red — the row
+tracks the container's PID 1, not the tree.
+
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1's record (the X5-R53 verdict's
+## follow-up -F1: every run-out file carries its own MONITOR line, the
+## --run/--run-out counts are tied, and the sixteen survivors die; the
+## same 10k re-read once more)
+
+The X5-R53 verdict (`verdicts/X-5c-F4-F1-F1-F3-F2-F1-F1-F1.md` at
+`991ee5fe`, MERGE-WITH-FOLLOWUPS) found one code hole in `read_monitor`
+(its §3) and ruled its sixteen surviving mutants "test gaps, not
+rework" (its §4). This card is that verdict's -F1 follow-up, landing
+before X-5c-F4-F1-F1-F3-F2-F1-F2's five-file comparison (that card's
+Limits freeze `x5r52_compare.py`; its Work 2 repeats five `.out` files
+that each carry the line, so both new checks hold there unchanged).
+**No rule text changed:** X5-R51, X5-R52 and X5-R53 stay verbatim
+(checked below), nothing that counts as exempt moves, and the two new
+refusals ride the comparator's existing cannot-check channel (exit 2,
+like the hash and range checks).
+
+**Step 0 — the two refusals (verdict §3).** `read_monitor` now requires
+at least one `E4 SEEDS=… MONITOR=` line in **every** run-out text —
+exactly what its docstring already claimed — and still sums every line
+of every file. `cmd_compare` refuses a comparison whose `--run` and
+`--run-out` counts differ, after the sha256 checks and before any
+campaign file is read. Four cases, in `self_test`'s scratch-file block
+beside `range-mismatch` (equal ref/run docs, so only MONITOR can move
+the exit):
+
+- `monitor-every-run-out-file` — two `--run-out` files, the **first**
+  with no `E4 SEEDS` line, the last with `MONITOR=0`; rc 2.
+- `monitor-sums-every-file` — the first file `MONITOR=1`, the last
+  `MONITOR=0` (two `--run` covering the ref's seeds exactly, so the
+  count tie holds): the `(-1, "run", None, "bullet3-monitor")` row is
+  present and the exit is 1.
+- `monitor-sums-every-line` — one file with two `E4 SEEDS` lines,
+  `MONITOR=1` then `MONITOR=0`: the row is present and the exit is 1.
+- `monitor-run-out-count-mismatch` — two `--run`, one `--run-out`;
+  rc 2.
+
+**Step 1 — the cap's three unpinned filters (verdict §2: "served-only,
+mrb-only and MW rounds do not count").** Three cases beside the existing
+`mpa-cap-*` ones, each asserting the exact `(1, 1)` class tuple and that
+the `MPA_PASS_FAIL` row stays exempt: `mpa-cap-counts-mrb-only` (an
+extra class-MP round `served=true, mrb=false` at both ends),
+`mpa-cap-counts-served-only` (the same with `served=false, mrb=true`)
+and `mpa-cap-base-mp-only` (a Base **MW** seed holding a
+`served=true, mrb=true` round — the mirror of
+`mpa-cap-counts-class-mp-only`).
+
+**Step 2 — the ten twin cases (the verdict's survivors), built on the
+two builders, never forks of them.** `twin_diag` gains six knobs —
+`twin0_meta_t` (round 0's twin replay-start `meta.t`, 0 as before),
+`twin1_meta_t2` (an older second replay start in round 1's twin
+segment), `twin1_recs` (records in round 1's own twin segment),
+`foreign_seed` (a run marker for another seed between round 1's twin
+replay start and its `Err`), `real0_extra` (a second real segment of
+round 0) and `tail_lines` (a later round's segments after round 1's
+blocks) — plus the two new records `D4_TS5`/`D4_TS7` beside
+`D4_TS1`/`D4_TS2`, which are records, not knobs (count corrected by
+X-5c-PINS-1, verdict `db1e5162` §5 finding 3) — and `twin_diag3` gains `div_rounds` (which round-starts
+diverge on `N=4`). Every default keeps the original log byte for byte,
+and no existing case's name or expected verdict moved. The cases, each
+naming the check it expects (and the half, for T6a/T6b):
+
+- `twin-t6a-most-recent-t` — round 1's twin segment holds two replay
+  starts above its `Err` (older `meta.t=9`, most recent `meta.t=5`) and
+  the drop is `D4` at `ts=7` in round 0's twin listing: `ts 7 > t 5`,
+  NOT-EXPLAINED T6a (any start's or the first start's `meta.t` reads 9
+  and wrongly passes).
+- `twin-t6a-ts-equal-t` — `D4` at `ts=5` against `meta.t=5`: EXPLAINED
+  (T6a's bound is `≤`).
+- `twin-t6b-x33x-short` — real round `k−1` `x33x=true, cover_err=false`,
+  no real listing: EXPLAINED (the short-cut's `x33x` half).
+- `twin-t6b-last-listing` — two real (`Mw`) segments of round `k−1`,
+  each with a replay start; the first segment's listing replays `D4` at
+  `ts=1 ≤ frontier=1`, the last's does not: EXPLAINED (T6b reads the
+  last listing).
+- `twin-t6b-real-class-only` — no real-class segment of `k−1` has a
+  replay start; the class-C twin segment's start (lifted to `meta.t=2`
+  so T6a holds) whose listing replays `D4` at `ts=1` does not serve:
+  NOT-EXPLAINED, `T6b no real-class replay listing`.
+- `twin-t6a-twin-segments-only` — round `k−1`'s real listing holds `D4`
+  at `ts=2 > frontier=1` and its twin listing holds none, while round
+  `i`'s own twin segment lists `D4` (so T3 holds): NOT-EXPLAINED T6a.
+- `twin-t1-same-round-only` — the `Err` for round `i` sits inside round
+  0's twin segment (that segment's start at `meta.t=5`, `D4` in its
+  listing); round `i`'s own twin segment has no `Err`: NOT-EXPLAINED
+  T1.
+- `twin-t4-first-k` — round-starts 1 **and** 2 both diverge on `N`
+  (`twin_diag3(div_rounds=(1, 2))`), real round 0 faulted and short,
+  real round 1 clean, the twin failing at `i=2` with `D4` in round 0's
+  twin listing: EXPLAINED `N=4 k=1` (the **first** divergent start).
+- `twin-t3-round-le-i` — `D4` listed only in round 2's twin segment,
+  with `i=1` and `k=1`: NOT-EXPLAINED T3.
+- `twin-walk-foreign-seed` — a marker for another seed between round
+  `i`'s twin marker and its `Err`: NOT-EXPLAINED T1.
+
+`self-test` reads **78 cases, 0 failed** (61 before this card). X5-R52's
+and X5-R53's output lines keep their order and text: `check_mp`,
+`meta_only_eligible`, `mpa_pass_fail`, `twin_ddl_prefilter`,
+`compare_reading`, `compare_exit_code`, `format_rows`, `check_twin` and
+`walk_seed_segments` are byte-identical to `991ee5fe` (`git diff
+991ee5fe HEAD -- tools/x5r52_compare.py` touches only `read_monitor`,
+the count-tie block in `cmd_compare`, and `self_test`).
+
+**Step 3 — the mutants.** Every mutant is a scratch copy under
+`${CARGO_TARGET_DIR}/x5r52-f1-review/` (never the worktree; the card's
+Run hygiene names `~/.cache/nv3-review/…`, read-only in this container —
+the base card's judgment call), applied by an anchored replacement
+(`mutants.py` there, which asserts each anchor's occurrence count
+before applying) and run through `self-test`. Each must make `self-test`
+exit non-zero and fail at least its named case; **all 46 die, none
+UNCAUGHT** — the sixteen survivors of verdict §4, the two refusals'
+regression mutants, the base card's whole 24-row table re-applied, and
+the gate's four caught J-* re-applied:
+
+| mutant | self-test failing cases |
+|---|---|
+| J-MON-LASTFILE (`read_monitor` reads only the last run-out file) | `monitor-every-run-out-file`, `monitor-sums-every-file` |
+| J-MON-LASTLINE-ONLY (only each file's last `E4 SEEDS` line counts) | `monitor-sums-every-line` |
+| M-MON-ANYFILE (the per-file check returned to the any-file check) | `monitor-every-run-out-file` |
+| M-MON-NO-TIE (the count check removed) | `monitor-run-out-count-mismatch` |
+| J-MPA-NO-MRB (the class count drops `mrb=true`) | `mpa-cap-counts-mrb-only` (with every equal-count cap case: the tuple reads `(2, 2)`) |
+| J-MPA-NO-SERVED (the class count drops `served=true`) | `mpa-cap-counts-served-only` (and the other `(1, 1)` cap cases) |
+| J-MPA-BASE-NO-CLASS (the Base end drops `class == "MP"`) | `mpa-cap-base-mp-only` (Base counts the MW round: `(2, 1)`) |
+| J-T6A-ANY-T (`t` may be any replay start's `meta.t`) | `twin-t6a-most-recent-t` |
+| J-META-T-FIRST (`t` is the first replay start above the `Err`) | `twin-t6a-most-recent-t` |
+| J-T6A-LT (T6a requires `ts < t`) | `twin-t6a-ts-equal-t` |
+| J-T6B-NO-X33X (the short-cut drops `x33x`) | `twin-t6b-x33x-short` |
+| J-T6B-FIRST-LISTING (T6b reads the first replay listing) | `twin-t6b-last-listing` |
+| J-T6B-ANYKIND (T6b's real segment may be any class) | `twin-t6b-real-class-only` (and `twin-t6-no-real-listing`) |
+| J-T6A-ANYKIND (T6a collects from any segment) | `twin-t6a-twin-segments-only` |
+| J-T1-SEG-ANYROUND (a twin segment of any round counts) | `twin-t1-same-round-only` |
+| J-T4-K-MAX (`k` is the last divergent round start) | `twin-t4-first-k` |
+| J-T3-ANYROUND (T3 reads twin segments at any round) | `twin-t3-round-le-i` |
+| J-WALK-OTHERSEED (a marker for another seed does not end the segment) | `twin-walk-foreign-seed` |
+| G-EXIT-NOBAD (re-applied) | `exit-bad-seeds-only` |
+| G-T4-NO-SHORT (re-applied) | `twin-t4-no-short` |
+| G-TWIN-PREFILTER-ALLJ (re-applied) | `twin-prefilter-fault-at-i-only` |
+| G-T3-ANYCLASS (re-applied) | `twin-t3-mw-only`, `twin-t3-probe-only` |
+| M-T1-ORIGINAL (re-applied) | `twin-t1-probe-only`, `twin-t1-probe-no-twin-err`, `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-NO-TWIN-REQ (re-applied) | `twin-t1-probe-no-twin-err` |
+| M-T1-NO-DIFFER (re-applied) | `twin-t1-pairing-rerun-differs`, `twin-t1-probe-differs-from-twin` |
+| M-T1-DIFFER-TWIN-ONLY (re-applied) | `twin-t1-probe-differs-from-twin` |
+| M-T1-ONE-ERR (re-applied) | `twin-t1-identical-rerun-ok` |
+| M-T3-PROBE (re-applied) | `twin-t3-probe-only`, `twin-t1-probe-no-twin-err` |
+| M-T6-NO-META (re-applied) | `twin-t6-drop-above-meta` |
+| M-T6-ANY-ROUND (re-applied) | `twin-t6-drop-other-round` |
+| M-T6-NO-REAL (re-applied) | `twin-t6-real-replayed-drop`, `twin-t6-no-real-listing` |
+| M-T6-ANY-TS (re-applied) | `twin-t6-real-listed-above-frontier` |
+| M-T6-CROSS-CLOCK (re-applied) | `twin-t6-cross-clock` |
+| M-MPA-NO-CAP (re-applied) | `mpa-cap-grown-voids` |
+| M-MPA-CAP-GE (re-applied) | `mpa-cap-equal-keeps`, `mpa-cap-counts-class-mp-only`, `mpa-pass-fail` |
+| M-MPA-CAP-ANYCLASS (re-applied) | `mpa-cap-counts-class-mp-only` |
+| M-MON-NO-STOP (re-applied) | `monitor-run-stops` |
+| M-CMP-NO-PF (re-applied) | 16 cases: the eight `mpa-base-*`/`mpa-o*`/`mpa-pass-na`/`mpa-skx` set, `mpa-mw-serve`, `mpa-pass-fail` and the seven `mpa-cap-*` cases — see the note below |
+| M-CMP-MPA-NOJUDGE (re-applied) | `mpa-skx-smx-false`, `mpa-pass-na-false` |
+| M-CMP-META-ANYSLOT (re-applied) | `meta-only-some-finding` |
+| M-CMP-TWIN-NODIR (re-applied) | `twin-t2-both-dirs-lack-N` |
+| M-CMP-TWIN-ANYCLASS (re-applied) | `twin-mp-seed-prefilter-fails` |
+| J-MON-GT1 (re-applied) | `monitor-run-stops` |
+| J-MPA-LINE-ORDER (re-applied) | `mpa-class-line` |
+| J-MPA-VOID-KEEPS-ROW (re-applied) | `mpa-cap-grown-voids` |
+| J-MPA-VOID-NO-FAIL (re-applied) | `mpa-cap-grown-voids` |
+
+Two honest notes on that table. First, **M-CMP-NO-PF stops self-test
+early**: the pre-existing `mpa-class-line` case crashes inside its
+`out.index("MPA_PASS_FAIL 1 [(1, 0)]")` (the mutant removes that line),
+a deterministic `ValueError` after the 16 FAIL lines above — the exit is
+already non-zero — so `pass-fail-base-text-not-mpa`, which the base
+card's README table also named, sits behind the crash and cannot print
+FAIL. The verdict's own Mutants line recorded **12** self-test cases
+for this mutant, not the base README's 13: the same crash. The case is
+outside this card's Limits to touch, so the shape is recorded here, not
+hidden. Second, several mutants fail **more** cases than they are named
+for (the table lists every measured FAIL); the named case is always
+among them. **M-CMP-NO-PF over the real 10k**, as the verdict's row
+records: exit 0, `MPA_PASS_FAIL 0 []`, seed 7078 absent from the whole
+output, `MPA_CLASS base 11 tip 10` still printing — reproduced here on
+the scratch copy over the same recorded files.
+
+**Step 4 — the re-read of the same 10k under the hardened comparator.**
+No campaign was run; everything reads recorded files, exactly as the
+Acceptance line does (the prior comparator is `26bcee4b`'s, extracted
+with `git show`). The inputs and their sha256 (each checked by the
+line itself or measured beside it): the run JSON
+`runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json`
+`6b6862665f9609e3513a6bc7f84b2bfe3370e919a775bf9a1e91450482dc739a`,
+its `.campaign.out`
+`cf3de932fc2e82e8042e0b784c3fd071d9d3b9d9a7df543a9411152ae1e26059`
+(MONITOR=0), and the reference `X-5c-F4-F1-F1-CXX-F1/gate/tip-10k.json`
+`f4d6f1ff0c2731b9ecbb3ca862534e168a11dd2f99beb1cdb1a3828b5310c923`.
+**One `--run` and one `--run-out`, so both new checks hold on it
+unchanged.** The output, in full (exit 0):
+
+```
+DIGESTS_MOVED 2589 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 87 [(47, 1), (339, 0), (547, 0), (779, 0), (797, 0), (799, 0), (967, 0), (1299, 0), (1319, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1749, 2), (1768, 0), (1927, 1), (1939, 0), (1999, 0), (2079, 0), (2189, 0), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (2859, 1), (2979, 0), (3099, 0), (3148, 0), (3377, 0), (3759, 2), (3838, 0), (3948, 0), (4148, 0), (4179, 0), (4279, 0), (4399, 1), (4439, 0), (4499, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (4659, 1), (4749, 0), (5077, 0), (5279, 0), (5328, 1), (5418, 0), (5499, 0), (5549, 2), (5798, 1), (6178, 1), (6189, 0), (6368, 0), (6369, 0), (6387, 2), (6417, 0), (6539, 0), (6719, 0), (6877, 0), (6917, 0), (7219, 0), (7257, 0), (7368, 1), (7419, 1), (7469, 1), (7658, 0), (7669, 0), (7727, 1), (7958, 1), (8038, 0), (8139, 2), (8278, 0), (8639, 0), (8748, 2), (8788, 1), (8869, 2), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+MOVED_MP_PENDING 52 [(47, 1), (547, 0), (797, 0), (967, 0), (1367, 0), (1567, 0), (1578, 1), (1708, 1), (1747, 1), (1768, 0), (1927, 1), (2208, 0), (2258, 0), (2307, 1), (2517, 0), (3148, 0), (3377, 0), (3838, 0), (3948, 0), (4148, 0), (4537, 0), (4548, 0), (4558, 0), (4567, 1), (4647, 0), (5077, 0), (5328, 1), (5418, 0), (5798, 1), (6178, 1), (6368, 0), (6387, 2), (6417, 0), (6877, 0), (6917, 0), (7257, 0), (7368, 1), (7658, 0), (7727, 1), (7958, 1), (8038, 0), (8278, 0), (8748, 2), (8788, 1), (8898, 0), (9388, 1), (9508, 0), (9547, 0), (9637, 0), (9767, 0), (9818, 1), (9967, 1)]
+META_ONLY_ELIGIBLE 4 [(1927, 1), (7257, 0), (7658, 0), (8278, 0)]
+MPA_PASS_FAIL 1 [(7078, 0)]
+MPA_CLASS base 11 tip 10
+TWIN_DDL_PENDING 2 [(2599, 2), (2859, 1)]
+MOVED_LOST 94 [(47, 0), (179, 0), (397, 0), (579, 0), (967, 1), (1018, 0), (1107, 0), (1219, 0), (1367, 1), (1387, 0), (1578, 2), (1588, 0), (1598, 0), (1708, 2), (1747, 0), (1919, 1), (1927, 0), (1949, 0), (2099, 0), (2159, 0), (2259, 0), (2307, 0), (2389, 0), (2397, 0), (2517, 1), (2778, 0), (3029, 0), (3289, 0), (3377, 1), (3397, 0), (3548, 0), (3739, 0), (3759, 0), (3768, 0), (3947, 0), (4118, 0), (4359, 0), (4398, 0), (4399, 0), (4419, 1), (4518, 0), (4537, 1), (4567, 0), (4989, 1), (5129, 0), (5188, 0), (5328, 0), (5427, 0), (5479, 0), (5499, 1), (5619, 0), (5769, 2), (5798, 0), (6178, 0), (6387, 1), (6417, 1), (6458, 0), (6557, 0), (6909, 0), (6917, 1), (6938, 0), (7197, 0), (7219, 1), (7278, 0), (7298, 0), (7368, 0), (7419, 0), (7439, 1), (7447, 0), (7727, 2), (7889, 0), (7958, 0), (8257, 0), (8278, 1), (8307, 0), (8547, 0), (8639, 1), (8748, 0), (8788, 0), (9059, 0), (9159, 2), (9177, 0), (9329, 1), (9387, 0), (9388, 0), (9419, 0), (9429, 1), (9508, 2), (9618, 0), (9637, 1), (9717, 0), (9818, 0), (9967, 0), (9999, 0)]
+HEALED 3 [(457, 0), (1298, 1), (8777, 0)]
+TWIN_HEALED 1 [(6539, 1)]
+TEXT_CHANGED 131 [(97, 0), (117, 0), (199, 1), (527, 1), (617, 0), (678, 0), (798, 0), (857, 0), (1117, 0), (1127, 1), (1159, 0), (1197, 0), (1217, 0), (1337, 0), (1417, 0), (1447, 0), (1477, 0), (1628, 0), (1637, 0), (1798, 0), (1899, 0), (1917, 0), (1948, 1), (1959, 0), (1977, 0), (2028, 0), (2078, 0), (2097, 1), (2268, 0), (2377, 0), (2537, 0), (2567, 0), (2597, 0), (2638, 0), (2698, 0), (2757, 0), (2787, 0), (2828, 0), (2939, 0), (2977, 2), (2978, 0), (3068, 0), (3118, 0), (3227, 0), (3259, 1), (3357, 0), (3358, 0), (3438, 0), (3638, 0), (3817, 0), (3927, 0), (4038, 0), (4127, 1), (4247, 0), (4268, 0), (4297, 0), (4337, 0), (4378, 0), (4468, 0), (4489, 0), (4648, 0), (4657, 0), (4677, 0), (4699, 0), (4737, 0), (4758, 0), (5047, 1), (5078, 0), (5087, 0), (5148, 1), (5227, 1), (5298, 0), (5338, 1), (5378, 0), (5517, 0), (5618, 0), (5907, 0), (5958, 0), (6078, 0), (6138, 0), (6248, 0), (6377, 0), (6457, 0), (6517, 0), (6558, 0), (6627, 0), (6638, 0), (6677, 0), (6758, 0), (6807, 0), (6848, 0), (6977, 0), (6987, 0), (6997, 0), (7007, 0), (7098, 0), (7127, 0), (7227, 0), (7297, 0), (7317, 0), (7337, 0), (7338, 0), (7357, 0), (7399, 0), (7457, 1), (7698, 0), (7917, 0), (8098, 0), (8138, 0), (8268, 0), (8287, 0), (8309, 1), (8418, 0), (8617, 0), (8618, 0), (8638, 0), (8687, 0), (8977, 0), (8998, 0), (9028, 0), (9078, 1), (9107, 1), (9228, 0), (9398, 0), (9417, 0), (9528, 0), (9617, 0), (9657, 0), (9827, 0), (9878, 0), (9959, 0)]
+TWIN_FAILING 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)] BASE 6
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+**Byte-identical to the Base comparator's output and to the verdict's
+record.** The `grep -v '^MPA_CLASS '` diff against `26bcee4b`'s output
+on the same inputs is empty (both exits 0), the pinned
+`MPA_CLASS base 11 tip 10` line prints, and the block above is
+byte-identical to the base card's committed record (its README block
+at `bc18b545`, diffed mechanically). 0 new failing, the same exempt
+rounds — `MPA_PASS_FAIL 1 [(7078, 0)]` still exempt (the class count
+fell, 11 → 10, so the cap voids nothing), `TWIN_DDL_PENDING 2 [(2599,
+2), (2859, 1)]` unchanged, `META_ONLY_ELIGIBLE` the same four,
+`MONITOR 0` — so no `bullet3-monitor` row. **The reading did not move,
+and neither check fired on it: nothing that counts as exempt changed.**
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1   commit: (this commit; the chain 0f881a0b → 8886affd → f780694b → 1d4d4ac8 → here)
+
+The five RESULT items the card requires:
+
+1. **The mutant table** — step 3 above: all 46 rows die on at least
+   their named case; **none survives, none UNCAUGHT**. The two honest
+   notes (M-CMP-NO-PF's early stop; supersets of named cases) are
+   recorded in place.
+2. **The re-read in full, with both files' sha256, and the
+   byte-identity statement** — step 4 above: exit 0, the three sha256s
+   listed there, byte-identical to the Base comparator's output (the
+   `MPA_CLASS` line apart, which the Base lacks) and to the verdict's
+   record: 0 new failing, the same exempt rounds.
+3. **The two refusals and their four cases** — step 0 above: every
+   run-out file carries the line (`monitor-every-run-out-file`), the
+   counts are tied (`monitor-run-out-count-mismatch`), and the sum
+   reads every file (`monitor-sums-every-file`) and every line
+   (`monitor-sums-every-line`); both refusals exit 2.
+4. **No rule text changed** — X5-R51, X5-R52 and X5-R53 verbatim: this
+   card's whole README diff touches the Status paragraph and the new
+   section only (`git diff 991ee5fe HEAD -- spikes/e4-recovery/README.md`
+   deletes nothing inside any rule block); nothing that counts as
+   exempt moved, and the two refusals are cannot-check exits (2).
+5. **Post-data amendments: none.**
+
+acceptance (this attempt, every line run for real): `python3 -I
+spikes/e4-recovery/tools/x5r52_compare.py self-test` — **78 cases,
+0 failed**, exit 0; the 10k re-read line — exit 0 with the identical
+reading above (run with `R` pointing at the sha-pinned run JSON; the
+ESC parenthetical below was wrong about the card's own line —
+corrected by X-5c-PINS-1, verdict `db1e5162` §5 finding 1: the card
+names `runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc`, which exists and carries
+the pinned sha256; the nonexistent `…CXX-F1.acc` path first appeared
+in this worker's own reasoning, not in the card, and no result
+depended on it — the sha decides); `bash scripts/gate.sh` — `STEP test EXIT=0`,
+`STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`,
+`STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`,
+`STEP enforcement-tests EXIT=1` with exactly **one** FAIL row —
+`runner e2e: K: SIGTERM kills opencode and closes the ledger range` —
+so the last line reads **`GATE EXIT=1`**. This is the known, ruled,
+environmental row, not a finding of this card: the container matches
+the ruling's premise (`/proc/1/comm` = `opencode` — this container's
+PID 1 never `wait()`s, so the killed attempt's orphaned child stays a
+zombie and `dead()`'s `killpg` probe succeeds), verdict
+`verdicts/X-5c-F4-F1-F1.md`'s K ruling says "`kill_child` is correct.
+`dead()` asks the wrong question" and "The runner's Acceptance is the
+truth. Do not chase it, and do not run a subreaper to make it pass",
+and the X5-R53 card's own attempt recorded the identical reading in
+this same container shape (its verdict's fresh-gate container read
+the row ok, `GATE EXIT=0` — the row tracks the container's PID 1, not
+the tree). Nothing this card touched (a README and a Python tool) is
+exercised by that row, and the fix lives in `scripts/`/`tools/`,
+outside this card's Touch only.
+
+judgment calls (recorded in the sections above): scratch output and
+mutant copies live under `${CARGO_TARGET_DIR}/x5r52-f1-review/` — the
+card's Run hygiene names `~/.cache/nv3-review/X-5c-…-F1/`, but
+`~/.cache/nv3-review/` is read-only in this container and the card's
+own Notes direct outputs under `$CARGO_TARGET_DIR` (the base card's
+accepted judgment call); the two cmd_compare exit-1 cases capture
+`format_rows`'s stdout (`contextlib.redirect_stdout`) so the case
+lines stay one per case; `twin-t6b-real-class-only` asserts the
+specific T6b reason (`no real-class replay listing`), the established
+style for naming a check's half; the driver's anchored replacements
+assert each anchor's occurrence count before applying.
+
+ESCALATE: none. (The record originally carried one informational item
+— a claim that the card's Acceptance re-read line named a run path
+that does not exist, `runlogs/X-5c-F4-F1-F1-CXX-F1.acc`. **Corrected
+by X-5c-PINS-1, verdict `db1e5162` §5 finding 1: the claim was
+false.** The card names `R=$HOME/.cache/nv3-review/runlogs/
+X-5c-F4-F1-F1-F3-F2-F1.acc`, which exists and whose JSON carries the
+pinned `--run-sha256 6b686266…739a`; the nonexistent `…CXX-F1.acc`
+path first appeared in the worker's own reasoning, not in the card
+text it was given (the card's file time, 22:03, precedes the worker's
+commits, 22:44), and the re-read itself used the correct file, so no
+result depended on the error. The claim is withdrawn rather than kept:
+it did not deserve to stand as the record.)
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the base card's record; the commits land — the log
+and the clean tree confirm); (b) the two card files this card's Read
+list names — `cards/X-5c-F4-F1-F1-F3-F2-F1-F1-F1.local.md` and
+`cards/X-5c-F4-F1-F1-F3-F2-F1-F2.local.md` — are not present in this
+worktree (only this card's own file, PLAN, the cards README and the
+worker prompt are); their content as this card quotes it (X5-R53
+(b)–(f), the builders' log order, -F2's Limits 3 and Work 2) is
+carried by the README's verbatim rule blocks, `twin_diag`'s docstring
+and this card's own Goal/Order, which is what was used; (c) under
+M-CMP-NO-PF the pre-existing `mpa-class-line` case crashes self-test
+after its 16 FAIL lines (recorded in step 3's note — the verdict's own
+12-case record shows the same); (d) the gate's `GATE EXIT=1` on the
+single ruled `runner e2e: K` row, recorded in full in the acceptance
+note above — environmental, pre-existing on this chain in this
+container shape, and outside this card's scope.
+
+
+## Card X-5c-F4-F1-F1-F3-F2-F1-F2's record (the twin directory re-seed;
+## the C-XX recovery-Err twin family root-caused and fixed)
+
+Verdict `X-5c-F4-F1-F1-F3-F2-F1.md` (ESCALATE), finding 1, root-caused the
+C-XX "recovery-Err default" twin family. At F2-F1's 10k it has seven
+failing twin entries: 609 t1, 849 t1, 2599 t2, 2859 t1, 3449 t1, 5049 t1
+and 7179 t1. The mechanism has four steps: (1) a real MW round's WAL fault
+loses a DropTree, so the real chain still holds the tree (in 2859, real r0
+recovers to frontier 1 and loses `ts=3 DropTree 4`); (2) the twin chain is
+faultless, so it keeps the DropTree, and its directory no longer holds the
+tree; (3) the next round's script is built from the **real** model
+(`build_round(.., &ch.model, ..)`), so it writes into that tree; (4) the
+twin runs the script on its own chain — its recovery replays a record into
+a tree its image has correctly dropped, and fails with
+`Corrupt("tree N missing in directory")`. So the twin no longer runs "the
+same script, crash and F-CRASH resolutions, faultless … from the same
+base" (Work 2.5) — a harness pairing defect; the store is not involved.
+**The fix:** at round start, re-seed the twin chain from the real round's
+start whenever the two chains' directories differ — the same re-seed the
+harness already makes when the twin chain is broken. This card lands
+before F4's final run and **its 10k replaces F2-F1's as the BASE baseline
+of record**; F3-F1 (the generator card) bases on it.
+
+**Under X5-R52 (a) and (g):** every comparison here is judged by X5-R51,
+re-issued for this card, read with X5-R52; X5-R52 (c)(i) is **void**
+here, because the re-seed makes T2 impossible — the comparator runs with
+`--no-twin-exemption` (and `--max-twin-failing 0`); **any failing twin
+entry is a STOP.**
+
+### The directory re-seed (P ruling, verbatim, fixed before this card's code; any change is an ESCALATE)
+
+- **(a) The predicate.** Add `pub fn twin_dirs_differ(real: &StoreInner, twin: &StoreInner) -> bool` in `src/workload.rs`. It returns true iff the two `dir` key sets differ.
+  - The `DirEntry` values are not compared. Roots and pointers differ between any two chains.
+  - This is the set that `recover`'s replay checks when it fails with `tree N missing in directory`.
+- **(b) The call.** In `run_seed_with`, on every MP/MW round:
+  - The check runs after the existing `twin_chain.is_none()` re-seed and before `twin_chain.take()`.
+  - If the twin chain is `Some` and `twin_dirs_differ(&ch.st, &twin.st)`, replace it with a clone of the real round's start: `disk`, `st`, `model` (`harness::clone_model`) and `cut`. That is the clone the broken-chain re-seed already makes.
+- **(c) Why the directory and not the model.**
+  - The defect is a script op on a tree that the twin's directory lacks.
+  - The two models also differ whenever a real round loses ordinary commits, which is common in MW. Re-seeding on any model difference would re-pair most MW rounds and move digests far past the defect.
+  - The directory is the narrow DDL predicate.
+- **(d) Nothing else changes.**
+  - The twin still runs class C, faultless, at the same crash, F-CRASH and nested resolutions.
+  - X5-R16's NO-TWIN and NEVER-FIRED paths, X5-R21 (c)'s pairing re-run (`tch_pair`, `tch_retry`), `twin_chain_after_repair`, the twin supply and its judging are unchanged.
+  - The store, the oracle, the model, the sim, K, R, the generators, `Tuning`, every quota, `verify`, X5-R49's code, the record fields and the JSON schema are unchanged.
+  - No record field or digest input is added.
+- **(e) Expected effect (not a target).**
+  - A seed's digest moves **only** if (b) fires in at least one of its rounds. A seed in which it never fires runs bit for bit as at the Base.
+  - The seven failing twin entries above pass.
+  - Real rounds of re-seeded seeds may move, because the twin supply and pairing re-runs feed them. X5-R51 and X5-R52 judge that.
+
+**X5-R52 (g)'s note, verbatim as it governs here:** "At any commit that
+carries -F2's re-seed, the twin chain is re-seeded whenever the two
+directories differ at round start, so T2 cannot hold. Comparisons at such
+a commit run the comparator with `--no-twin-exemption`, and (i) exempts
+nothing there. After -F2 lands, a twin failure of this family is a
+recurrence of a class that a landed card claims to have fixed. Under E4's
+owner rule, F4 counts it as new."
+
+**Step 0 — the ruling (this commit's parent).** The P ruling above and
+the X5-R52 (a)/(g) note, before any code: X5-R51 is re-issued for this
+card and read with X5-R52, (c)(i) is void (the re-seed makes T2
+impossible), `--no-twin-exemption --max-twin-failing 0` applies, and any
+failing twin entry is a STOP.
+
+**Step 1 — the Base confirmation, the code, and three pins (this
+commit).** At the Base (this card's parent `db1e5162`; `Tuning::FINAL ==
+Tuning::BASE` at this tip, pinned by `x5_r37_final_equals_base_at_this_tip`),
+run singly, both seeds' twin r1 fails exactly as the verdict records —
+2859: digest `2789281219`, twin r1 `pass=false` with
+`O-1(a) at c=10: published {} != model {2, 3}`; 609: digest `887984205`,
+twin r1 `pass=false` with `O-1(a) at c=12: published {} != model {2, 3, 4}`
+(both digests equal the baseline's). The code is (a) and (b) only:
+`twin_dirs_differ` (`real.dir.keys().ne(twin.dir.keys())` — key sets,
+never `DirEntry` values; both `dir`s are `BTreeMap`s, so the comparison
+is order-deterministic) and the (b) call in `run_seed_with`, placed after
+the `twin_chain.is_none()` broken-chain re-seed and before
+`twin_chain.take()`, re-seeding from the real round's own start
+(`disk`, `st`, `harness::clone_model(&ch.model)`, `cut` — the same clone
+the broken-chain re-seed makes). Three pins in `tests/workload.rs`, all
+named `x5r52_twin_*`:
+
+- `x5r52_twin_dirs_differ_compares_directory_keys` — equal keys false
+  (fresh stores, and equal keys with different `DirEntry` values);
+  remove-a-key true; add-a-key true; value-change-with-equal-keys false.
+- `x5r52_twin_reseed_heals_2859_r1` — twin r1 `pass`, no `o1`.
+- `x5r52_twin_reseed_heals_609_r1` — the same for 609.
+
+`cargo test -q --release -p e4-recovery` at this step: **one** literal
+pin red — `x5_r37_base_tuning_reproduces_1b0ce54e`, which fails fast at
+seed 2669 (`357787865` pinned, `1374321949` measured). Re-measured singly
+against the baseline for all 54 of its seeds: **exactly one moved**
+(2669, the same two digests); every other pin in the crate is green.
+The literals are not yet edited (step 4).
+
+**Step 2 — the movement over 0..1000 under X5-R51/X5-R52, and the
+attribution (this commit).** Five 200-seed runs at the tip (16 threads,
+`ulimit -v 25165824`, output under `$CARGO_TARGET_DIR/w/`; the card's
+`~/.cache/nv3-review/X-5c-…-F2/` is read-only in this container — the
+base card's accepted judgment call, `$CARGO_TARGET_DIR` instead). Every
+run's own line: `E4 SEEDS=200 … MONITOR=0`, and
+`TWIN_FAILING_ROUNDS=0` in all five folds. The comparator exactly as the
+Acceptance line plus `--range 0..1000`, the five `.json`/`.out` pairs
+repeated through `--run`/`--run-out` (exit 0), in full:
+
+```
+DIGESTS_MOVED 2 FAILING_ROUNDS 4 MONITOR 0
+MOVED_GAINED 0 []
+MOVED_MP_PENDING 0 []
+META_ONLY_ELIGIBLE 0 []
+MPA_PASS_FAIL 0 []
+MPA_CLASS base 1 tip 1
+TWIN_DDL_PENDING 0 []
+MOVED_LOST 0 []
+HEALED 0 []
+TWIN_HEALED 2 [(609, 1), (849, 1)]
+TEXT_CHANGED 0 []
+TWIN_FAILING 0 [] BASE 2
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+- **`check-mp`:** `MOVED_MP_PENDING 0 []` — no row, so no single-seed
+  run to make (the 10k's rows are the gate's to check).
+- **`TWIN_HEALED 2 [(609, 1), (849, 1)]`**, `TWIN_FAILING 0`,
+  `NEW_FAILING 0` — exactly the expected (not a target) reading.
+
+**The attribution** (uncommitted by construction: the `eprintln!` lives
+only in a scratch export of this tip under `$CARGO_TARGET_DIR/e1/`,
+never in the worktree — `git status` clean throughout). One
+`eprintln!("X5R52 reseed seed={seed} round={round}")` added where (b)
+fires; the five 200-seed runs re-run there:
+
+- **The eprintln moved no digest:** all 1000 diag-export digests equal
+  the plain tip's, seed for seed.
+- **Re-seed events, 0..1000 (5):** 259 r1, 609 r1, 719 r1, 809 r1,
+  849 r1.
+- **Every moved digest belongs to a seed with at least one re-seed
+  event:** moved = {609, 849}; both have their event at r1. **No moved
+  digest without a re-seed event.**
+- **Re-seeded and did not move:** 259, 719, 809 (the re-seed replaced
+  the twin chain, but the twin round's own record — pass, no O-1 — was
+  the same either way: the r1 script touches no tree the old twin chain
+  lacked).
+- **X5-R37's 54 seeds, singly, the same check:** exactly one moved —
+  2669 `357787865 → 1374321949`, with its re-seed event at r1; the
+  other 53 are byte-identical with **no** re-seed event; the diag
+  digests equal the plain tip's for all 54.
+
+Beyond the required scope (evidence, singly at the tip): **all seven**
+of the verdict's failing twin entries now pass — 609 t1, 849 t1 (above),
+and 2599 t2, 2859 t1, 3449 t1, 5049 t1, 7179 t1, each of the five with
+its digest moved and its re-seed event(s) at the same round(s) the twin
+failed at the Base (2599 at r1 **and** r2, matching its t2; the others
+at r1). The 10k comparison judges them.
+
+**Step 3 — the fourth pin, the mutants, and the diag patch (two
+commits).** The kept-chain pin's selection, by the card's rule: the
+lowest MW seed in 0..1000 with at least two rounds and no step-2
+re-seed event whose digest moves under M-TWIN-RESEED-ALWAYS is **639**
+(`3366243401 → 1144734390` under the mutant, measured); the thirteen
+lower candidates (9, 129, 139, 189, 199, 309, 369, 399, 479, 509, 519,
+559, 569) are inert under it. `x5r52_twin_chain_kept_when_directories_
+agree_639` asserts the Base literal `3366243401`, unchanged.
+
+The two committed patches, each verified in the Acceptance's own form
+(fresh scratch export of HEAD, patch applied, isolated `mut-target`,
+`cargo test --test workload x5r52_twin`):
+
+- `m-twin-no-dir-reseed.patch` — (b)'s whole block (comment, predicate
+  call, re-seed) removed. rc 101, failing exactly
+  `x5r52_twin_reseed_heals_2859_r1` and `x5r52_twin_reseed_heals_609_r1`.
+- `m-twin-reseed-always.patch` — the call re-seeds every MP/MW round
+  (`twin_chain.as_ref().is_some()`). rc 101, failing exactly the
+  kept-chain pin.
+
+Honest note (the follow-up commit `d4767094`): the first generation of
+`m-twin-no-dir-reseed.patch` under-deleted — a brace-walk bug in the
+generator stopped at the condition's second line, and the patch left the
+`.is_some_and` chain behind, so the patched crate did not compile. The
+committed patch deletes the whole block, and its apply roundtrip is
+byte-exact against the intended mutant (verified by `diff` before any
+test ran).
+
+The four worker-only mutants, on the scratch export, never committed —
+each applied, shown failing, reverted, the export's `src/` verified
+byte-identical to the worktree tip afterwards and the worktree's
+`git status` clean throughout:
+
+| mutant | rc | failing pins |
+|---|---|---|
+| M-TWIN-PRED-ALWAYS (`twin_dirs_differ` returns true) | 101 | the predicate pin, the kept-chain pin |
+| M-TWIN-PRED-ENTRIES (compares `DirEntry` values too) | 101 | the predicate pin |
+| M-TWIN-RESEED-FROM-TWIN (the re-seed clones the twin chain) | 101 | the 2859 and 609 pins |
+| M-TWIN-RESEED-LATE ((b) after `twin_chain.take()`) | 101 | the 2859 and 609 pins (and the kept-chain pin — a superset; 639's first round's re-seed then lands after its twin ran, moving the digest) |
+
+(Evidence-hygiene note: every mutant run uses its own isolated
+`CARGO_TARGET_DIR`. A first attempt shared one target dir between two
+exports and a stale artifact produced a phantom reading — re-run
+isolated, the table above is the isolated truth. The first
+M-TWIN-RESEED-FROM-TWIN attempt also did not compile — `tch` unbound —
+and was redone in a compiling form; neither invalid attempt is counted
+as evidence.)
+
+**The diag patch.** `x5r52-twin-diag.patch` still applies at this tip
+(`git apply --check` on a scratch export of HEAD) — **not refreshed**.
+Its round-start hunk now lands after (b)'s re-seed block (the block's
+closing lines are the context it anchors on), so the line prints the
+effective post-re-seed twin chain. 2859, run singly in the patched
+export — every round-start line shows `real_dir == twin_dir`:
+
+```
+X5R52 round-start seed=2859 round=0 real_dir=[] twin_dir=[]
+X5R52 round-start seed=2859 round=1 real_dir=[1, 2, 3, 4] twin_dir=[1, 2, 3, 4]
+```
+
+(r1 pre-fix showed `twin_dir=[1, 2, 3]` — the divergence; the diag
+digest equals the plain tip's `429219074`, and both twin entries pass,
+so T5 holds.)
+
+**Step 4 — the literals re-derived (this commit).** Exactly one literal
+is red at the tip, re-derived with its round from step 2's events:
+
+- `x5_r37_base_tuning_reproduces_1b0ce54e`: **2669 `357787865 →
+  1374321949`**, twin directory re-seed at round 1. The other 53 seeds of
+  the 54 are byte-identical (step 2 measured them singly, against the
+  baseline and against the diag export — both readings agree).
+
+No other pin in the crate is red: `cargo test -q --release -p
+e4-recovery` after the edit is green — 266 tests, 0 failed — so `g8`
+([747, 967]) and F3's share-1000 pins keep their selections by their own
+rules (re-selection applies only to red pins, and none is). The 0..1000
+rows appended to `results/digest-stability.tsv` (its full 0..1000
+movement): 609 `887984205 → 1508388762` and 849 `3570145416 →
+2934853921`, both "twin directory re-seed
+(X-5c-F4-F1-F1-F3-F2-F1-F2), rounds r1".
+
+**Step 5 — the 10k of record, the acceptance, and this RESULT (the
+commits of this step).** The campaign ran at the code tip `7a9d72e2`
+(step 4's commit; every commit after it is this README record, which no
+build reads — the X5-R25 pattern, the same as the Base card's own
+acceptance at `eb9c4328` against its final `db1e5162`): 16 threads under
+`ulimit -v 25165824`, exit 0 in 15 m 36 s (23:57:06 → 00:12:42),
+`status_lines=0`, JSON sha256
+`41c307a470ba51e1eae7911fa7b1b7e7146e810f191ccb348bd0713a19601cd2`:
+
+```
+E4 SEEDS=10000 O1_FAIL=2309 O2_FAIL=0 O3_FAIL=19 DEADLOCK=0 PANIC=0 O1F_FAIL=2309 MONITOR=0
+E4 FOLD FAILING_SEEDS=19 FAILING_ROUNDS=19 TWIN_FAILING_ROUNDS=0 DEFECT_SEEDS=0
+```
+
+`verify --no-quotas` on it (the first attempt of this run was killed
+mid-verify; re-run whole): **`VERIFY OK (--no-quotas) seeds=10000
+digests reproduce`, `verify_exit=0`**, 15 m 26 s (01:18:03 → 01:33:29).
+The comparator against the sha-pinned F2-F1 baseline — `--ref
+runlogs/X-5c-F4-F1-F1-F3-F2-F1.acc.campaign.json --ref-sha256 6b686266…
+739a`, `--no-twin-exemption --max-twin-failing 0` — **exit 0**, in
+full:
+
+```
+DIGESTS_MOVED 9 FAILING_ROUNDS 19 MONITOR 0
+MOVED_GAINED 0 []
+MOVED_MP_PENDING 0 []
+META_ONLY_ELIGIBLE 0 []
+MPA_PASS_FAIL 0 []
+MPA_CLASS base 10 tip 10
+TWIN_DDL_PENDING 0 []
+MOVED_LOST 0 []
+HEALED 0 []
+TWIN_HEALED 7 [(609, 1), (849, 1), (2599, 2), (2859, 1), (3449, 1), (5049, 1), (7179, 1)]
+TEXT_CHANGED 0 []
+TWIN_FAILING 0 [] BASE 7
+NEW_FAILING 0 [] BAD_SEEDS 0 []
+```
+
+Exactly the card's expected (not a target) reading: all seven of the
+verdict's failing twin entries healed at their Base rounds,
+`TWIN_FAILING 0`, `NEW_FAILING 0`, no `NOT-EXPLAINED`,
+`MOVED_MP_PENDING 0 []` (the gate has no check-mp row to run at this
+tip). `MPA_CLASS base 10 tip 10` — the class is unchanged against this
+card's own baseline (the earlier `base 11 tip 10` readings compared the
+older CXX-F1 reference on the base side; this comparison's base side is
+the F2-F1 file itself, which as a tip held 10). The nine moved digests,
+each with its re-seed event (step 2's attribution, extended): 609 r1,
+849 r1, 2599 r1+r2, 2669 r1, 2859 r1, 3449 r1, 5049 r1, 7179 r1 — and
+**9059 r1**, the one move outside step 2's 0..1000 window, measured
+singly in the diag export after the compare: `X5R52 reseed seed=9059
+round=1`, diag digest `1541368872` = the plain tip's (`3239178506 →
+1541368872`, no failing round, no twin failing). Ruling (e)'s "moves
+only if (b) fires" holds on the whole 10k: nine moved digests, nine
+attributed.
+
+acceptance (every line run for real; `cargo test -q --release -p
+e4-recovery` — **266 tests, 0 failed** (18+25+28+43+47+50+55 across nine
+binaries); `cargo test -q --release -p e4-recovery --test workload
+x5r52_twin` — **4 passed, 0 failed**; the M-TWIN-NO-DIR-RESEED line —
+**rc=101**, failing exactly `x5r52_twin_reseed_heals_2859_r1` (panic
+text the Base's own `O-1(a) at c=10: published {} != model {2, 3}`) and
+`x5r52_twin_reseed_heals_609_r1` (`O-1(a) at c=12 … {2, 3, 4}`); the
+M-TWIN-RESEED-ALWAYS line — **rc=101**, failing exactly
+`x5r52_twin_chain_kept_when_directories_agree_639` (639's digest
+`1144734390` ≠ the Base literal `3366243401`, the step-3-measured
+mutant value); the diag line — `git apply --check` clean, **not
+refreshed**; the 10k run, the verify and the compare — above; and
+`bash scripts/gate.sh` — run last, at the tip this record leaves; its
+reading is the gate note beneath, added after the run.)
+
+**The gate note (`bash scripts/gate.sh`, at `22ad7841`, this run):
+`STEP test EXIT=0`** (the whole workspace, e4-recovery's 266 among
+them), **`STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`,
+`STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`,
+`STEP enforcement-tests EXIT=1` with exactly one FAIL row —
+`runner e2e: K: SIGTERM kills opencode and closes the ledger range` —
+so the last line reads `GATE EXIT=1`.** This is the known, ruled,
+environmental row, not a finding of this card: the container matches
+the ruling's premise (`/proc/1/comm` = `opencode`, re-checked this run
+— this container's PID 1 never `wait()`s, so the killed attempt's
+orphaned child stays a zombie and `dead()`'s `killpg` probe succeeds),
+verdict `verdicts/X-5c-F4-F1-F1.md`'s K ruling says "`kill_child` is
+correct. `dead()` asks the wrong question" and "The runner's
+Acceptance is the truth. Do not chase it, and do not run a subreaper
+to make it pass", and the two previous cards on this chain recorded
+the identical reading in this same container shape (their verdicts'
+fresh-gate containers read the row ok, `GATE EXIT=0` — the row tracks
+the container's PID 1, not the tree). Nothing this card touched (the
+twin re-seed block, four tests, two committed patches, the README and
+the tsv) is exercised by that row, and the fix lives in `scripts/`/
+`tools/`, outside this card's Touch only.
+
+judgment calls (this step): the campaign of the first 10k attempt —
+prov `commit=7a9d72e2…`, `exit=0`, killed only in its verify — is
+reused, per the restart rule's "reuses the scratch builds and outputs";
+the killed attempt's dangling `verify_head=… verify_start=…` half-line
+was removed from the `.prov` before this attempt's verify so the file
+tells one story (the campaign half is untouched, byte for byte); the
+acceptance lines' `git -C ../.. archive HEAD nucleus` is executed as the
+identical `git archive HEAD nucleus` from the worktree root (the
+container's shell rejects `git -C` outright — the worker prompt's own
+no-global-git-options rule — and the archive bytes are the same); the
+lines' leading `rm -rf $D` is dropped where `$D` does not exist (a
+no-op the container's shell rejects wholesale); scratch output lives
+under `$CARGO_TARGET_DIR` (the card's `~/.cache/nv3-review/<card>/` is
+read-only in this container — the base card's accepted judgment call,
+carried by every card since).
+
+ESCALATE: none in the first pass; the retry round added one item — the
+runner-rule conflict with the two mutant Acceptance lines, recorded in
+full with its reproduction and its verified fix in the section below
+(the "### ESCALATE (the retry round…)" heading).
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the base card's record; the commits land — the log
+and the clean tree confirm); (b) the Read-list card file
+`cards/X-5c-F4-F1-F1-F3-F2-F1-F1.local.md` is not present in this
+worktree (only this card's own file, PLAN, the cards README and the
+worker prompt are) — carried from the two previous cards' records; its
+content as this card quotes it is carried by the README's verbatim rule
+blocks; (c) 9059's move surfaced only in the 10k compare (outside step
+2's mandated 0..1000 attribution window) — attributed singly in the diag
+export the same hour, recorded above, not hidden; (d) this container's
+gate reading (the gate note above) — the runner's own container read
+the same tree `GATE EXIT=0` this round (see the ESCALATE section).
+
+### ESCALATE (the retry round, 2026-11-09): the runner's no-tests-ran rule cannot accept the two mutant Acceptance lines as written
+
+The runner's retry round re-ran every Acceptance line in its own
+container: all passed but the two mutant lines, each of which it failed
+with `no tests ran: a cargo test acceptance command must run at least
+one test` — **after the line's own grep chain had succeeded** (the note
+only fires at rc=0, i.e. only after `grep -qx 'rc=101'` and the
+failures-block greps proved the mutant caught). The rule
+(`tools/run_card.py`, in place since S-0 `1b1b6bd3`, 2026-10-17):
+
+```python
+if rc == 0 and "cargo test" in c and sum(int(n) for n in
+    re.findall(r"test result: ok\. (\d+) passed", out)) == 0:
+    rc, out = 1, out + "\nno tests ran: ..."
+```
+
+`out` for these lines is exactly the `tail -n 40 $D/test.out` output,
+and the run the card mandates is one `cargo test --test workload
+x5r52_twin` under the applied mutant: one exact-named target (`--test
+work` is refused — "no test target named `work` in package"), one
+libtest binary, and a binary with any failure prints exactly one
+summary — `test result: FAILED. 2 passed; 2 failed` (the no-dir-reseed
+line) / `FAILED. 3 passed; 1 failed` (the reseed-always line) — never
+`test result: ok. N passed`. The two requirements are therefore
+mutually exclusive inside one invocation: the grep chain demands the
+failing run, the checker demands a green summary in the same captured
+output. No change under this card's Touch only can satisfy both
+honestly; manufacturing a regex-matching line (a `cargo:warning`, a
+deprecated-note, an eprintln shaped like a summary) would be forging
+test output, and the card text and the runner are both outside the
+card's Touch only. This is a conflict between the card's Acceptance
+lines and the runner's rule, reported unfixed per the hard rules.
+
+Minimal deterministic reproduction (this tip; and the runner's own two
+failure notes this round are the same repro in its container):
+
+```
+D=${CARGO_TARGET_DIR:?}/esc-repro && mkdir -p $D && \
+git -C ../.. archive --format=tar HEAD nucleus | tar -x -C $D && \
+cd $D/nucleus/v3 && git apply spikes/e4-recovery/tools/m-twin-no-dir-reseed.patch && \
+CARGO_TARGET_DIR=$D/t cargo test -q --release -p e4-recovery --test workload x5r52_twin > $D/test.out 2>&1; \
+echo rc=$? >> $D/test.out; tail -n 40 $D/test.out > $D/cmd_out.txt
+grep -qx 'rc=101' $D/test.out && sed -n '/^failures:$/,$p' $D/test.out \
+  | grep -q 'x5r52_twin_reseed_heals_2859_r1' && sed -n '/^failures:$/,$p' $D/test.out \
+  | grep -q 'x5r52_twin_reseed_heals_609_r1'        # exits 0 — the mutant IS caught
+python3 -c "import re; out=open('$D/cmd_out.txt').read(); \
+print(re.findall(r'test result: \w+.*', out), \
+sum(int(n) for n in re.findall(r'test result: ok\. (\d+) passed', out)))"
+# ['test result: FAILED. 2 passed; 2 failed; …'] 0   ← ok-sum 0: the note fires on a proven-catch run
+```
+
+The fix is P's to apply on either side (both halves measured in the
+scratch exports at this tip):
+- **card side** — append one green filtered run to each mutant line,
+  after the grep chain: `&& cargo test -q --release -p e4-recovery
+  --test workload x5r52_twin_dirs_differ`. The predicate pin passes
+  under both mutants (measured: `test result: ok. 1 passed`, exit 0,
+  under m-twin-no-dir-reseed and m-twin-reseed-always alike), so the
+  line keeps rc=0, keeps the whole mutant proof in `test.out`, and
+  prints a genuine green summary into the captured output.
+- **runner side** — exempt mutant-verification lines: the rule could
+  accept a summary of either kind (`test result: (ok|FAILED)`), or skip
+  commands carrying `git apply`.
+
+Nothing else in this round's acceptance moved: the runner's fed-back
+failures list names only these two lines, so its campaign, verify,
+compare and gate lines all passed in its container (its gate read
+`GATE EXIT=0` there — the fresh-container reading of the environmental
+K row, exactly as the two prior cards' verdicts predicted; this
+container still reads the one ruled FAIL row, gate note above). The
+mutant evidence itself stands three times over: the runner's own runs
+(its note fires only after each grep chain succeeded), this round's
+re-runs here (`line3_grep_chain_exit=0`, `line4_grep_chain_exit=0`,
+summaries `FAILED. 2 passed; 2 failed` and `FAILED. 3 passed; 1
+failed`), and the committed patches' first proving in step 3.
+
+## RESULT (card X-5c-F4-F1-F1-F3-F2-F1-F2)
+
+card: X-5c-F4-F1-F1-F3-F2-F1-F2   branch: card/v3-X-5c-F4-F1-F1-F3-F2-F1-F2   commit: (this commit; the chain e1e46294 → 06b2209d → ba27e950 → 456e2afe → d4767094 → 1d0d2bcd → 7a9d72e2 → here)
+
+The seven RESULT items the card requires:
+
+1. **The ruling, verbatim, with X5-R52 (g)'s note** — the "directory
+   re-seed (P ruling, verbatim …)" block above, ((a)–(e)), committed by
+   step 0 before any code of this card, with the (g) quotation beneath
+   it. X5-R51 is re-issued for this card and read with X5-R52; (c)(i)
+   is void (the re-seed makes T2 impossible); the comparator runs with
+   `--no-twin-exemption --max-twin-failing 0`; any failing twin entry
+   is a STOP.
+2. **The Base confirmation of 2859 and 609 twin r1** — step 1: at the
+   Base (this card's parent `db1e5162`), run singly, 2859's twin r1
+   fails with `O-1(a) at c=10: published {} != model {2, 3}` (digest
+   `2789281219`, equal to the baseline's) and 609's with `O-1(a) at
+   c=12: published {} != model {2, 3, 4}` (digest `887984205`, equal to
+   the baseline's) — the verdict's mechanism confirmed before the code.
+3. **The 0..1000 movement under X5-R51/X5-R52** — step 2's comparator
+   output in full (exit 0; re-derived after the 10k from the preserved
+   five `.json`/`.out` pairs, byte-identical): `DIGESTS_MOVED 2
+   FAILING_ROUNDS 4 MONITOR 0`; `MOVED_GAINED`, `MOVED_MP_PENDING`,
+   `META_ONLY_ELIGIBLE`, `MPA_PASS_FAIL`, `TWIN_DDL_PENDING`,
+   `MOVED_LOST`, `HEALED`, `TEXT_CHANGED` all `0 []`; `MPA_CLASS base 1
+   tip 1`; `TWIN_HEALED 2 [(609, 1), (849, 1)]`; `TWIN_FAILING 0 []
+   BASE 2`; `NEW_FAILING 0 [] BAD_SEEDS 0 []`. check-mp:
+   `MOVED_MP_PENDING 0 []` — no row, so no single-seed run to make.
+4. **The attribution** — step 2: re-seed events 0..1000 = 259 r1,
+   609 r1, 719 r1, 809 r1, 849 r1 (5 events); the eprintln moved no
+   digest (all 1000 diag-export digests equal the plain tip's); moved
+   {609, 849} ⊆ re-seeded, both at r1; re-seeded and not moved = {259,
+   719, 809}; X5-R37's 54 seeds singly — only 2669 moved
+   (`357787865 → 1374321949`, event r1), the other 53 byte-identical
+   with no event. Beyond the required scope, measured singly at the
+   tip: the five remaining verdict entries (2599 r1+r2, 2859 r1, 3449
+   r1, 5049 r1, 7179 r1) each moved with its event(s) at the same
+   round(s) it failed at the Base; and from the 10k, 9059 r1 (step 5).
+   On the whole 10k: nine moved digests, nine attributed — ruling (e)
+   holds everywhere measured.
+5. **Every literal changed, the re-selections, the kept-chain pin's
+   selection** — step 4: exactly one red literal, re-derived with its
+   round — `x5_r37_base_tuning_reproduces_1b0ce54e`'s **2669
+   `357787865 → 1374321949`, twin directory re-seed at round 1**; the
+   other 53 of X5-R37's 54 keep their seeds; no other pin red, so `g8`
+   ([747, 967]) and F3's share-1000 pins keep their selections by their
+   own rules (re-selection applies only to red pins, and none is). The
+   tsv rows appended: 609 and 849, both rounds r1. The kept-chain pin —
+   step 3: **seed 639**, the card's rule's lowest MW seed in 0..1000
+   with at least two rounds, no re-seed event in step 2, and a digest
+   that moves under M-TWIN-RESEED-ALWAYS (`3366243401 → 1144734390`,
+   measured; the thirteen lower candidates 9, 129, 139, 189, 199, 309,
+   369, 399, 479, 509, 519, 559, 569 inert under it); the pin holds the
+   Base literal unchanged.
+6. **The mutant table** — step 3, all six caught, none UNCAUGHT:
+   M-TWIN-NO-DIR-RESEED → both heal pins (re-proven in the Acceptance's
+   own form above); M-TWIN-RESEED-ALWAYS → the kept-chain pin
+   (re-proven the same way); M-TWIN-PRED-ALWAYS → the predicate pin and
+   the kept-chain pin; M-TWIN-PRED-ENTRIES → the predicate pin;
+   M-TWIN-RESEED-FROM-TWIN → both heal pins; M-TWIN-RESEED-LATE → both
+   heal pins (and the kept-chain pin, a superset).
+7. **The class record: the C-XX recovery-Err twin family is
+   root-caused and fixed by this card.** Under E4's owner rule, a
+   recurrence in F4's files counts as new.
+
+**This 10k is the BASE baseline of record.** It replaces F2-F1's
+(`6b686266…739a` stays the reference this card was judged against; the
+file this card leaves — `41c307a4…01cd2`, with its `.campaign.out`,
+`.verify.out` and `.prov` — is what F4's REFRESH reads and F4's step 0
+commits, in the X5-R25 pattern). F3-F1, based on this card, moves no
+BASE digest against it.
+
+## Card X-5c-F4-F1-F1-F3-F1's record (the Slot mutant made live, F3's
+## gaps pinned, Q4-I counted before the freeze, and F3's rule applied
+## over 0..1000)
+
+Base: `card/v3-X-5c-F4-F1-F1-F3-F2-F1-F2` (tip `af5c8d63`). Step 0
+below wrote every fixed text — the owner decision, the image-arm
+ruling, the design reasoning, X5-R50 and the decision rule — verbatim,
+before any code or probe of this card.
+
+**Owner decision 2026-11-07 (QUEUE).** Fix both (-F2 has fixed the
+store). The owner delegated the image arm, and the orchestrator's
+ruling is binding on this card:
+- The rule's numbers are unchanged: Q4 ≥ 1,500 per 10k, CPU ≤ +60%,
+  the Q5a/Q7/Q18 floors, and the image arm ≥ 1,500 per 10k.
+- The image arm is **q4i**, the stricter reading: the final recovery
+  actually opened a reused image. It is counted **before the freeze**,
+  as the row text says.
+- There is no switch to imgreuse after seeing data, and no lowered
+  bar.
+- If q4i cannot reach 1,500 within the CPU limit, **change the
+  generator, never the rule.**
+- Dev probe seeds are `0..1000`. The held-out set `10000..20000` and
+  the MP-pressure set are not touched.
+
+This card repairs F3's defects (D1–D4 of verdict
+`X-5c-F4-F1-F1-F3.md`). It then applies F3's rule unchanged over
+0..1000. X5-R50 below is the generator change: its text is fixed now,
+before any measurement, and it is built only if setting S0 misses.
+
+**Why q4i misses: the design reasoning, from the gate's `m/a1k.json`
+(F3-tip numbers, context for X5-R50's design, not a prediction for
+this tip).** At share 1000 over 0..1000, q4i is 140:
+- 127 come from targeted crashes at `After5`, `Mid6` and `After6`
+  (244 rounds);
+- 7 come from targeted crashes before step 5 (542 rounds);
+- 6 come from uniform crashes (752 rounds).
+
+X5-R41 aligns the reuse into the window of the crash's own
+checkpoint, `idx`. A crash before `idx`'s step 5 recovers image
+`idx−1`, and that window was never aligned. Seven of the ten targeted
+hooks are such crashes. Only the three post-step-5 hooks open image
+`idx`. Q4 needs the crash inside window `idx`, while q4i needs the
+recovery to open an aligned image, so one aligned window serves only
+one of the two in a given round. **The fix is to align the previous
+window as well, in exactly the rounds that recover it.**
+
+**Options declined:**
+- **Selecting uniform-crash rounds.** The crash point is drawn after
+  the script is built, so which image opens is unknown when the block
+  is placed. The gate counted 6 q4i in 752 uniform rounds, and
+  selecting them all doubles the selected set's CPU against a
+  +35–41% start.
+- **Moving the block to `idx−1`.** Q4 lives in those same pre-step-5
+  rounds, and Q4's margin is only 1,770 against 1,500.
+- **Re-targeting crashes.** That moves 5.5's crash distribution and
+  Q1's per-hook coverage. It is not the generator's to move.
+
+**Expected, an estimate and not evidence.**
+- Rounds: there are 348 pre-step-5 targeted rounds per 1,000 seeds at
+  `idx` 1–2. At the post-step-5 rounds' yield (127/244 ≈ 52%, the drop
+  exclusion included), q4i should rise by ≈ 180 at `r41p_share` 1000
+  and ≈ 90 at 500. At 500 that gives ≈ 225 per 1,000 seeds (2,250 per
+  10k).
+- CPU: F3's block, in ≈ 41% of rounds, costs +35–41%. Block A, in
+  ≈ 9% of rounds at 500, should cost about +8–10% more.
+
+**X5-R50 (P ruling, verbatim, fixed before any measurement of this
+card; any change is an ESCALATE).**
+- **Knob.** A new `Tuning` field, `r41p_share` (permille), is 0 in
+  BASE and FINAL.
+- **Eligible.** A round is eligible when all of these hold:
+  - it is X5-R41-selected, by the same predicate, unchanged;
+  - its targeted hook `CKPT_HOOKS[(seed/20) % 10]` is one of
+    `Before0`, `After0`, `After1`, `Mid2`, `After2`, `After3` or
+    `After4`;
+  - `knobs.target_ckpt ≥ 1`.
+- **Pick.** One draw from a new stream, `S_R41P`, below
+  `r41p_share`. It is made only when `r41p_share > 0` and the round is
+  eligible.
+- **Block A.** All of block A's content draws come from a second new
+  stream, `S_R41PC`. Both constants are unused anywhere in the crate.
+  So X5-R41's block (block B) is bit-for-bit the same in a round with
+  block A and without it.
+- **Script.** Block A has X5-R41's block shape exactly: the same
+  counts, ceiling values, dense runs and sweep. It is paired with
+  index `idx−1`, and it goes after the barrier and before block B.
+  `R41Arm { idx: idx−1 }` goes before the barrier, beside block B's
+  arm.
+- **Hold, per armed index.** `R41Wait` and `R41Done` carry the index
+  they pair with.
+  - At `After0` of an armed checkpoint `i`, before the crash arm, the
+    hold sets `i`'s window flag. It then spin-yields until
+    `R41Done{i}`, `workload_done`, a task error, or 20,000 turns.
+  - `R41Wait{i}` spin-yields on `i`'s flag, `workload_done`,
+    `tasks_left <= 1`, or the same budget.
+  - No wall clock is used. A single-block round behaves exactly as at
+    F3.
+- **Why this is not contrived.** Under a merge-heavy steady workload,
+  every checkpoint window sees frees and reuse. One aligned window
+  per round is an artifact of the spike's short windows, which is
+  X5-R41's own note.
+- **Unchanged:** Q4, Q4-I, every quota, the crash spec, X5-R41's
+  selection and block B, and every unselected or ineligible round's
+  script.
+- **Settings, in this order, at most three.**
+  - **S0** = (`r41_share` 1000, `r41p_share` 0). This is F3's best,
+    with no X5-R50 code. If S0 meets the rule, choose it and do not
+    build X5-R50.
+  - **S1** = (1000, 500).
+  - If S1 misses only on the image arm: **S2** = (1000, 1000).
+  - If S1 misses only on CPU: **S2** = (1000, 250).
+  - If S1 misses on Q4 or on a floor, or on both the image arm and
+    CPU: no S2, ESCALATE.
+  - If S2 misses: ESCALATE.
+
+  No fourth setting, and no other knob.
+- **Measurement (fixed with the rule).**
+  - **Runs.** Each setting runs over 0..1000 as five 200-seed runs at
+    16 threads, each block run as BASE, then the candidate, back to
+    back. Record user+sys CPU (bash `time`), wall, and the load at
+    each start, and sum the counts over the five blocks.
+  - **CPU term.** The rule's CPU term is ΣCPU(candidate) / ΣCPU(BASE)
+    − 1.
+  - **Near the line.** If that term reads between +55% and +65%, run
+    two more interleaved passes and read the term as the median of the
+    three. Report every pass.
+
+**The decision rule (F3 step 5, unchanged; the owner's 2026-11-07
+readings stated).**
+- **Met:** all of the following hold.
+  - **Q4 × 10 ≥ 1,500** over 0..1000. F3's "× 50" was for 0..200; the
+    per-10k bar is the same.
+  - No Q5a, Q7 or Q18 falls below the lower of its row and BASE's own
+    count × 10 on the same seeds.
+  - **CPU ≤ +60%** of BASE.
+  - **The image arm: `q4i` × 10 ≥ 1,500.** `q4i` here is X5-R42's
+    field with the pre-freeze count of step 2.
+
+  imgreuse is reported and never decides.
+- **Seeded faults:** at the chosen setting, `seeded-faults --seeds
+  0..200` (F4's form) must read Joint CAUGHT and Slot CAUGHT.
+- **Hand off** the chosen setting for F4's REFRESH. FINAL stays BASE
+  at this card's tip.
+- **Not met, or a fault not caught: ESCALATE with the numbers, and no
+  hand-off.** Q4, Q4-I and the rule are never lowered, redefined or
+  re-read by a card, a gate or an orchestrator.
+
+**Step 1a — the Slot mutant made live (D1, D3).** `M-FREE-HOME-ALLOC`'s
+single site (`free_lpid`'s home-release) now removes the freed home
+from `used_durable`, `image_refs` **and `used_cur`**, the F3 gate's
+prototype form (`r41-prototype.patch`). The `used_cur` line is
+redundant at runtime since X5-R49 (a) (the clean free releases it
+unconditionally in the same step); it is kept anyway so the fault
+never depends on the clean release — both doc comments (`store/mod.rs`
+and `store/prims.rs`) say so, and their false cause ("a later
+`unpin_home` releases it from `used_cur`" — at F3's tip no release
+ever happened, which is why the mutant was inert) is corrected to the
+verdict's finding D1: the mutant never made a slot allocatable and no
+round record differed at all.
+
+**Correction of F3's README Slot-cause text.** F3's step-7 record says
+the Slot fault's "damage lands only in rounds that already carry
+oracle texts (MP media detections) or pass". That cause was false, as
+the F3 verdict's finding D1 established: the mutant was **inert**
+(digest-identical to clean on 400/400 seeds; 0 new failing rounds
+because nothing differed, not because the damage was masked). The F3
+gate's prototype form (with `used_cur`) read 37 new failing rounds, 6
+of them with `q4_split_merge`, CAUGHT — the machinery detects the
+fault; only the card's text had dropped the line. This card restores
+the line and re-measures (step 7 below).
+
+**D3 repaired.** The two joined doc comments — `campaign.rs`'s
+"`empty,    /// which`" (X5-R13 (d)'s pin block) and `workload.rs`'s
+"`(5.5/// step 2`" (the fired-guard doc) — are split into proper
+lines; a sweep for other `[a-zA-Z,)]///` joins over `src/` and
+`tests/` finds none.
+
+**Step 4 — S0 (probe, not evidence).** (`r41_share` 1000,
+`r41p_share` 0; scratch builds of this tip's HEAD, BASE as committed
+and the candidate with only `Tuning::FINAL.r41_share = 1000`, never
+committed.) Five 200-seed runs over 0..1000 at 16 threads, each block
+BASE then the candidate back to back, under `ulimit -v 25165824`,
+bash `time` (user+sys), load recorded at each start:
+
+| block | BASE CPU (u+s) | BASE wall | load | S0 CPU (u+s) | S0 wall | load |
+|---|---|---|---|---|---|---|
+| 0 (0..200) | 182.724 | 14.2 | 2.20 | 316.831 | 24.7 | 5.02 |
+| 1 (200..400) | 236.324 | 18.4 | 9.96 | 335.997 | 25.4 | 12.41 |
+| 2 (400..600) | 231.823 | 18.7 | 14.63 | 335.584 | 26.5 | 14.92 |
+| 3 (600..800) | 278.859 | 21.0 | 15.21 | 400.409 | 29.4 | 15.95 |
+| 4 (800..1000) | 256.796 | 19.4 | 17.07 | 377.725 | 28.9 | 17.38 |
+| **Σ** | **1186.526** | | | **1766.546** | | |
+
+Counts summed over the five blocks (0..1000; ×10 = per-10k):
+
+| quantity | BASE | ×10 | S0 | ×10 |
+|---|---|---|---|---|
+| rounds | 1537 | | 1544 | |
+| Q4 | 0 | 0 | **177** | **1,770** |
+| `q4i` (pre-freeze) | 3 | 30 | **135** | **1,350** |
+| `q4i_raw` | 3 | 30 | 135 | 1,350 |
+| imgreuse ≥ 1 (reported, never decides) | 8 | 80 | 158 | 1,580 |
+| Q5a | 25 | 250 | 26 | 260 |
+| Q7 | 19 | 190 | 19 | 190 |
+| Q18 | 99 | 990 | 500 | 5,000 |
+| failing rounds (C/MP/MW) | 0/4/0 | | 0/2/0 | |
+
+**The rule at S0, verbatim.**
+- Q4 × 10 = 1,770 ≥ 1,500 — **met**.
+- Floors: Q5a 260 ≥ min(200, 250) = 200 — met. Q7 190 ≥ min(200,
+  190) = 190 — met, exactly at the floor (BASE's own count × 10; not
+  below it). Q18 5,000 ≥ min(1,000, 990) = 990 — met.
+- CPU term = ΣCPU(S0)/ΣCPU(BASE) − 1 = 1766.546/1186.526 − 1 =
+  **+48.9%** ≤ +60% — met (not between +55% and +65%: no extra
+  passes; step 4b not called for).
+- **The image arm: `q4i` × 10 = 1,350 < 1,500 — MISSED.**
+
+**S0 misses on the image arm only.** Per X5-R50's ladder the next
+rung is **S1 = (1000, 500)** — X5-R50 is built (step 5). imgreuse
+would read 1,580 ≥ 1,500, and never decides.
+
+**Step 5 — X5-R50 built (commits 4f3fa251 and 81efe2ec).** The knob
+`r41p_share` (0 in BASE and FINAL), the streams `S_R41P` (16) and
+`S_R41PC` (17), block A (X5-R41's block shape exactly, paired with
+index `idx−1`, after the barrier and before block B, its arm beside
+block B's) and the per-index hold (`R41Wait`/`R41Done` carry their
+index; the harness state holds two armed slots with their own window
+and done flags). Inert at 0: the suite (275 tests) and every
+`x5_r41_*` pin are green at `r41p_share` 0, and X5-R37's 54 BASE
+literals hold (no BASE digest moves). The step 5b pins:
+`x5_r50_not_drawn_at_base`, `x5_r50_prior_window_round_is_q4i` (seed
+0 r0 at (1000,1000): crash `Before0@2`, so the last completed ledger
+row **is checkpoint `idx−1` = 1's window** and the recovery opens its
+meta — `imgsp`/`imgmg`/`imgreuse`/`imgreuse_pf` 4/8/3/3 exact,
+`q4i` holds; at (1000,0) the same round reads `q4i_raw` false with
+seed 0's BASE digest, and block B's ops are identical at both
+settings) and `x5_r50_ineligible_rounds_draw_nothing` (140 r0, hook
+`After5` with idx 1 — only the hook clause excludes it; 1 r0, idx 0 —
+only the idx clause; both draws hit at share 1000, both GC tasks
+identical to (1000,0)).
+
+**Step 6 — S1 = (1000, 500) (probe, not evidence).** Same protocol
+as S0: five 200-seed blocks, BASE then the candidate back to back,
+16 threads, `ulimit -v 25165824`. The CPU term read **+55.11%** on
+pass 1 — inside the rule's +55%..+65% band — so step 6b ran: two more
+interleaved passes, the term read as the median of the three.
+
+| pass | ΣCPU BASE | ΣCPU S1 | term |
+|---|---|---|---|
+| 1 | 1208.642 | 1874.765 | **+55.11%** |
+| 2 | 1180.856 | 1880.584 | +59.26% |
+| 3 | 1264.920 | 1884.028 | +48.94% |
+| **median** | | | **+55.11%** |
+
+Pass walls (BASE/S1): 16–21 s / 26–31 s; load 6.6→18.9 over the
+session. Counts summed over the five blocks (0..1000; ×10 = per-10k;
+identical in all three passes — the runs are deterministic):
+
+| quantity | BASE | ×10 | S1 | ×10 |
+|---|---|---|---|---|
+| rounds | 1537 | | 1547 | |
+| Q4 | 0 | 0 | **186** | **1,860** |
+| `q4i` (pre-freeze) | 3 | 30 | **216** | **2,160** |
+| `q4i_raw` | 3 | 30 | 216 | 2,160 |
+| imgreuse ≥ 1 (reported, never decides) | 8 | 80 | 258 | 2,580 |
+| Q5a | 25 | 250 | 25 | 250 |
+| Q7 | 19 | 190 | 19 | 190 |
+| Q18 | 99 | 990 | 527 | 5,270 |
+| failing rounds | 4 (MP 4) | | 2 (MP 2) | |
+
+The two S1 failing rounds are 178 r1 and 537 r0, both class MP with
+their expected texts (identical in all three passes; the BASE arms
+carry 4, all MP).
+
+**The rule at S1, verbatim.**
+- Q4 × 10 = 1,860 ≥ 1,500 — **met**.
+- Floors: Q5a 250 ≥ min(200, 250) = 200 — met. Q7 190 ≥ min(200,
+  190) = 190 — met, exactly at the floor (BASE's own × 10; not below
+  it). Q18 5,270 ≥ min(1,000, 990) = 990 — met.
+- CPU term: median of three passes = **+55.11%** ≤ +60% — **met**
+  (every pass reported above).
+- **The image arm: `q4i` × 10 = 2,160 ≥ 1,500 — MET.**
+
+**S1 MEETS the rule.** No S2 is called for (the ladder runs S2 only
+if S1 misses). **The chosen setting is S1 = (`r41_share` 1000,
+`r41p_share` 500)**, handed off for F4's REFRESH; `Tuning::FINAL`
+stays BASE at this card's tip (probe settings are never committed).
+The estimate in the Goal (≈ 225 per 1,000 seeds at 500) read 216
+measured; the CPU estimate (+8–10% over F3's block-B-only cost)
+read +6.2% (55.11% vs 48.9% at S0 — the same BASE/arm pairs,
+measured in one session each).
+
+**Step 7 — the seeded faults at S1 (scratch export, FINAL =
+(1000, 500)).** `seeded-faults --seeds 0..200 --threads 16` (required)
+**exits 0: both faults CAUGHT**; `--seeds 200..400` (reported) also
+exits 0, both CAUGHT.
+
+| range | arm | new-failing (≥5) | `q4_split_merge` | `q4i_raw` (≥1) | verdict |
+|---|---|---|---|---|---|
+| 0..200 | Joint | 29 | 9 | 8 | **CAUGHT** |
+| 0..200 | Slot | 41 | **10** | 4 | **CAUGHT** |
+| 200..400 | Joint | 31 | 9 | 7 | **CAUGHT** |
+| 200..400 | Slot | 38 | **13** | 9 | **CAUGHT** |
+
+By crash position (0..200): Joint — After0@2 ×1, After1@2 ×2,
+After2@1 ×1, After2@2 ×1, After3@1 ×1, After3@2 ×2, After4@0 ×1,
+After4@1 ×1, After5@1 ×3, After5@2 ×1, After6@0 ×1, After6@1 ×2,
+After6@2 ×3, Before0@2 ×1, Mid2@2 ×2, Mid6@0 ×2, Mid6@1 ×4. Slot —
+After0@2 ×1, After1@0 ×2, After1@1 ×1, After1@2 ×2, After2@0 ×1,
+After2@1 ×1, After2@2 ×1, After3@1 ×1, After3@2 ×2, After4@1 ×1,
+After5@1 ×2, After5@2 ×1, After6@0 ×1, After6@1 ×1, After6@2 ×3,
+Before0@0 ×1, Mid2@1 ×1, Mid2@2 ×2, Mid6@1 ×1, and 15 uniform-crash
+rounds. (200..400's tables are in the run outputs; the same shape.)
+
+**q4i of the new-failing rounds, by crash position and by the window
+the recovery opens** (pre-step-5 hooks open image `idx−1` — block A's
+window; the post-step-5 hooks `After4`–`After6` open image `idx` —
+block B's; "block" reads the recovered image's own aligned window):
+
+| range | arm | `q4i_raw` via A's window | via B's window | by hook |
+|---|---|---|---|---|
+| 0..200 | Joint | 11 | 16 | Before0 1, After0 1, After1 2, Mid2 2, After2 2, After3 3, After5 4, Mid6 6, After6 6 |
+| 0..200 | Slot | 4 | 9 | After1 1, After2 1, After3 2, After5 3, Mid6 1, After6 5 |
+| 200..400 | Joint | 11 | 18 | Before0 1, After0 4, After1 4, Mid2 1, After4 1, After5 3, Mid6 7, After6 8 |
+| 200..400 | Slot | 7 | 11 | After0 2, After1 3, After2 1, After4 1, After5 2, Mid6 4, After6 5 |
+
+**The mechanism is confirmed, not refuted.** Before X5-R50 the
+pre-step-5 hooks (seven of ten) contributed 7 q4i per 1,000 seeds at
+share 1000 (the Goal's `m/a1k.json` reading); at S1 the A-window
+rounds alone contribute 11 Joint and 4 Slot `q4i_raw` new-failing
+rounds in just 0..200, and every one of the Slot fault's
+`q4_split_merge` catches (10 at 0..200, 13 at 200..400) is a round
+whose crash sits inside checkpoint `idx`'s held window — block B's —
+with block A having armed `idx−1`'s, exactly the "align the previous
+window as well, in exactly the rounds that recover it" fix. The
+Step 7b pin `x5_r43_slot_caught_on_a_q4_round` (seed 20 r1, crash
+`After0@2`: clean digest 462038950 passing, Slot digest 3929895968
+failing `O-1(b)` with `q4sp` 5 / `q4mg` 8 / `q4reuse` 4 in both arms)
+pins the catch on a literal Q4 round.
+
+**Step 8 — the mutant table.** Every mutant applied to its **own
+scratch export of this tip** (its own `CARGO_TARGET_DIR`; the exports
+are fresh `git archive HEAD nucleus` copies, so "reverted" is by
+construction — nothing touched the worktree), run as `cargo test -q
+--release -p e4-recovery --no-fail-fast -- <the row's named pin>`
+under `ulimit -v 25165824`; the worktree stayed clean (`git status`
+empty of every mutant) and every row exited **rc 101** with its named
+pin failing:
+
+| mutant | rc | catching pin shown failing |
+|---|---|---|
+| **8a — this card's seven unconditional rows** | | |
+| G-SLOT-INERT (`FreeHomeAlloc`'s body emptied) | 101 | `x5_r43_free_home_alloc_is_caught` |
+| G-REUSE-ANY (the reuse site drops its `map.img` test) | 101 | `x5_r42_reuse_counts_window_frees_before_freeze` |
+| M-RUPF-NOFREEZE (`ckpt_reuse_pf` ignores `image_frozen`) | 101 | the same pin |
+| M-Q4I-WHOLEWINDOW (`q4i_raw` reads the whole-window count) | 101 | `x5_r42_post_freeze_reuse_is_not_q4i` |
+| G-SEL-NOTARGET (the selection drops `seed/10` even) | 101 | `x5_r41_uniform_round_not_selected` |
+| G-LEDGER-NOREMOVE (the harness checkpoint stays in the ledger) | 101 | `x5_r42_harness_checkpoint_image_is_not_q4i` |
+| G-SEEDED-FOLD (`passes_oracle = cr.pass`) | 101 | `x5_r43_oracle_pass_not_fold` |
+| **8b — F3's 14 rows** | | |
+| M-R41-NOHOLD | 101 | `x5_r41_aligned_round_has_q4_and_reuse` |
+| M-R41-WRONGWINDOW | 101 | the same pin |
+| M-R41-NOPREP | 101 | the same pin |
+| M-R41-DRAW | 101 | `x5_r37_base_tuning_reproduces_1b0ce54e` |
+| M-R41-AFTERCRASHARM | 101 | `x5_r41_aligned_round_has_q4_and_reuse` |
+| G-Q4MG-FROM-SPLITS | 101 | the same pin |
+| M-REUSE-DROPS-IMG | 101 | `x5_r41_completed_window_arm` |
+| M-FREE-HOME-ALLOC | 101 | `x5_r43_free_home_alloc_is_caught` — **no longer UNCAUGHT** (was inert at F3; step 1a's `used_cur` line made it live, X5-R49 (a) unmasked it) |
+| M-Q4I-LASTCKPT | 101 | `x5_r42_q4i_keys_on_the_opened_image` |
+| M-Q4I-REFUSED | 101 | `x5_r42_refused_round_is_not_q4i` |
+| M-Q4I-NOFLOOR | 101 | `campaign::x5_r42_row_at_999_and_1000` |
+| M-Q4I-NOREPRO | 101 | `campaign::x5_r42_flipped_q4i_fails_reproduction` |
+| M-SEEDED-NOBASELINE | 101 | `campaign::x5_r43_known_failures_are_not_new` |
+| M-SEEDED-NOARMRULE | 101 | `campaign::x5_r43_caught_needs_the_arm_predicate` |
+| **8c — the five X5-R50 rows** (X5-R50 was built) | | |
+| M-R50-DRAW | 101 | `x5_r37_base_tuning_reproduces_1b0ce54e` |
+| M-R50-SHAREDSTREAM (block A draws from `S_R41C`) | 101 | `x5_r50_prior_window_round_is_q4i` (block B's identity) |
+| M-R50-SHAREDFLAG (one window flag for both arms) | 101 | `x5_r50_prior_window_round_is_q4i` |
+| M-R50-ANYHOOK | 101 | `x5_r50_ineligible_rounds_draw_nothing` |
+| M-R50-IDX0 | 101 | `x5_r50_ineligible_rounds_draw_nothing` |
+
+**Re-sited mutants, said plainly** (the card's amendment requires
+naming them): X5-R50 moved three sites. **M-R41-WRONGWINDOW**'s site
+`r41_idx == Some(ck_idx)` became the per-slot
+`r41_idx[s] == Some(ck_idx)`; the mutant keys the hold on
+`r41_idx[s].is_some() && ck_idx == 0` — the same behaviour (the hold
+and gate key on checkpoint 0, not the armed index).
+**M-R41-AFTERCRASHARM** moves the now per-slot `After0` hold block to
+after the crash arm, the same code motion as at F3.
+**M-Q4I-LASTCKPT**'s site `rr.q4i_raw = q4i_raw_of(...)` became the
+fold inside `fold_ckpt_windows` (step 3b's extraction); the mutant
+reads the ledger's last row (`values().next_back()`) instead of the
+opened meta's own row — the same behaviour. **M-R50-DRAW** needed two
+edits to express its text ("`S_R41P` drawn at share 0, with its
+result fed into `S_GEN`'s order"): the pick's share-0 guard removed,
+and the pick's result fed into `rng.below(u64::from(b) + 1)` on the
+`S_GEN` stream before the `r41` selection — the M-R41-DRAW shape.
+
+## RESULT (card X-5c-F4-F1-F1-F3-F1)
+
+card: X-5c-F4-F1-F1-F3-F1   branch: card/v3-X-5c-F4-F1-F1-F3-F1   commit: (this commit; the chain 75c5e540 → 38696971 → cd34c3c0 → bf87b03a → eee3451d → 976fb7aa → 404cf52a → 85a8c05b → b6ab9750 → 4f3fa251 → 81efe2ec → f08551d2 → f78b7548 → here)
+
+The card's five RESULT items:
+
+1. **Each setting's numbers, labelled "probe, not evidence"** — S0
+   (step 4) and S1 (step 6, three CPU passes with wall and load, BASE
+   beside each): Q4 177/186 per 1,000 seeds (×10: 1,770/1,860), q4i
+   pre-freeze 135/216 (1,350/2,160), imgreuse 158/258 (1,580/2,580),
+   Q5a 25/25 (250/250), Q7 19/19 (190/190), Q18 99/527 (990/5,270),
+   failing rounds 4/2 (all MP; S1's are 178 r1 and 537 r0, identical
+   in every pass), rounds 1537/1547. CPU: S0 +48.91% (ΣCPU 1766.546
+   vs BASE 1186.526); S1 passes +55.11% / +59.26% / +48.94%, median
+   **+55.11%** (ΣCPU 1874.765/1880.584/1884.028 vs BASE
+   1208.642/1180.856/1264.920).
+2. **The rule applied verbatim** — S0: Q4 met, floors met (Q5a
+   260≥200, Q7 190≥190, Q18 5,000≥990), CPU met (+48.9%), the image
+   arm MISSED (q4i 1,350 < 1,500) → the ladder runs S1. **S1
+   (1000, 500): every term MET — Q4 1,860 ≥ 1,500; floors Q5a 250,
+   Q7 190, Q18 5,270; CPU median +55.11% ≤ +60%; the image arm q4i
+   2,160 ≥ 1,500. The chosen setting is S1 = (1000, 500)**, handed
+   off for F4's REFRESH (FINAL stays BASE at this tip; no probe
+   setting is committed). No S2 was called for.
+3. **The seeded faults' tables and each fault's X5-R43 outcome** —
+   step 7: at S1, 0..200 exits 0 with **Joint CAUGHT** (29 new
+   failing ≥ 5, 8 with `q4i_raw` ≥ 1) and **Slot CAUGHT** (41 ≥ 5,
+   **10 with `q4_split_merge`** ≥ 1); 200..400 both CAUGHT (31 and
+   38). The tables by crash position are in step 7's record.
+4. **The mutant table** — step 8: all 26 rows (7 + 14 + 5) caught,
+   rc 101 each, none UNCAUGHT; the three re-sited mutants and
+   M-R50-DRAW's two-edit form are named above.
+5. **q4i by crash position and by block, against the Goal's
+   reasoning** — step 7's table: the A-window (pre-step-5 crash)
+   rounds supply 11+4 (0..200) and 11+7 (200..400) `q4i_raw`
+   new-failing rounds per arm, the B-window rounds 16+9 and 18+11;
+   every `q4_split_merge` catch is a crash inside block B's window
+   with block A having armed the recovered image's. **The mechanism
+   the Goal states is confirmed; nothing refuted it.**
+
+Anomalies: none beyond the recorded. The one mid-card restart (the
+60-minute cap, during step 5a's test run) followed the card's restart
+rule: the uncommitted edits were discarded (`git diff | git apply
+-R`; `git checkout` is blocked in this container), re-applied as this
+attempt's step-5a work, and re-verified from scratch (build, fmt,
+clippy, the full suite) before the commit. A second cap hit landed
+during the first Acceptance 10k attempt (nothing committed between;
+the re-run below is the record).
+
+**The Acceptance record (commit 25ae82bd, status_lines=0).**
+- `cargo test -q --release -p e4-recovery` — **276 passed, 0 failed**.
+- The 10k of record (`$CARGO_TARGET_DIR/acc/X-5c-F4-F1-F1-F3-F1.acc.*`):
+  exit 0, wall 14 min 51 s, `E4 SEEDS=10000` with
+  `FOLD FAILING_SEEDS=19 FAILING_ROUNDS=19 TWIN_FAILING_ROUNDS=0
+  DEFECT_SEEDS=0`, `MONITOR=0`; JSON sha256
+  `158ce549c02d8e1367a7b44b43026e2f32450610e0338e2a7edcc353c8d6a69b`
+  (it differs from the baseline's `41c307a4…1cd2` exactly as the
+  amendment predicts: this card adds `imgrupf` and `q4i` reads the
+  pre-freeze count — neither a digest input, and the comparator reads
+  neither).
+- `verify --no-quotas` — exit 0, `VERIFY OK … seeds=10000 digests
+  reproduce` (Q18 979, as at the baseline; the Q4-I quota row reads
+  21 at this tip's FINAL == BASE — the row is frozen under Limit 1 and
+  is not this card's rule, whose image arm is the ×10 reading of
+  step 6).
+- The comparator (`--no-twin-exemption --max-twin-failing 0`) — exit
+  0, and the reading is the amendment's expected one verbatim:
+  `DIGESTS_MOVED 0 FAILING_ROUNDS 19 MONITOR 0`; `MOVED_GAINED`,
+  `MOVED_MP_PENDING`, `META_ONLY_ELIGIBLE`, `MPA_PASS_FAIL`,
+  `TWIN_DDL_PENDING`, `MOVED_LOST`, `HEALED`, `TWIN_HEALED`,
+  `TEXT_CHANGED` all `0 []`; `MPA_CLASS base 10 tip 10`;
+  `TWIN_FAILING 0 [] BASE 0`; `NEW_FAILING 0 [] BAD_SEEDS 0 []`.
+  **This card moves no BASE digest** (Limit 3 held; X5-R37's 54
+  literals stand as they are at `af5c8d63`).
+- `bash scripts/gate.sh` — **`GATE EXIT=1` on two environmental rows,
+  neither in this card's scope**: `STEP deny EXIT=1` is a **new
+  upstream advisory** (RUSTSEC-2026-0459: `libsqlite3-sys` 0.35.0
+  bundles SQLite < 3.54.0), reached only through `e0-btree`'s
+  `rusqlite` — no dependency of `e4-recovery`, and this card changed
+  no dependency (`Cargo.lock` byte-identical to the base commit,
+  `status_lines=0` in the `.prov`); the fix (upgrade or `deny.toml`)
+  sits outside this card's Touch only. `STEP enforcement-tests
+  EXIT=1` is the single ruled `runner e2e: K` row (SIGTERM/ledger
+  range), the known environmental reading of this container shape the
+  card's Notes name — the -F2-F1-F2 gate verdict records that it does
+  not recur in the runner's container, and the runner's Acceptance is
+  the truth. The other five STEP lines (`test`, `clippy`, `fmt`,
+  `wasm32`, `core-paths-selftest`) all `EXIT=0`.
+
+## Card X-5c-PINS-1's record (the six pre-final pins: RUPF's window
+## reset, R50's selection, the joint supply's freshness, the re-seed
+## predicate's two halves, the comparator's six survivors and its
+## repeated `.out`, R47's header window, and the eviction arm)
+
+Base: `card/v3-DEP-RUSQLITE-1` (tip `2e8d1b13`, the chain head; the
+branch carries the whole X-5c-F4-F1-F1 stack through the F3-F1
+re-verdict). Test-only: no code behaviour change; the one `src/` addition
+is item 2's supply-freshness diagnostic (the `twin_paired` manner).
+Scratch exports and mutant copies live under `$CARGO_TARGET_DIR/
+x5pins-scratch/` (`~/.cache/nv3-review/` is read-only in this
+container — the accepted judgment call of the -F3-F2-F1-F2 card,
+carried since). Every mutant ran on its own export with its own
+`CARGO_TARGET_DIR` (the `af5c8d63` §5 lesson).
+
+**Step 1 — the two F3-F1 pins (item 1).**
+
+- `x5_r42_second_window_reuse_pf_starts_at_zero` (a sibling beside
+  `x5_r42_reuse_counts_window_frees_before_freeze`, seed 9 over
+  `r49_setup_durable_home`): two checkpoint windows. Window 1 repeats
+  the case-2 shape (free at `After0` before the freeze, reuse there)
+  and reads `(1, 1)` at its `After5`; window 2 reads both counters at
+  its own `After0` **before any free or reuse** — `(0, 0)`, so the
+  pre-freeze half resets with the whole-window half — then repeats the
+  same free-and-reuse and reads `(1, 1)`. No `src/` change was needed:
+  `reuse_counters` already reads `ckpt_reuse_pf` at the window
+  boundary.
+- The uniform literal in `x5_r50_ineligible_rounds_draw_nothing`:
+  **seed 13 round 0** (`seed/10` odd; hook `Before0`, pre-step-5;
+  `target_ckpt` 1; not a drop round; `r41p_pick` hits at share 1000),
+  found by probing `Knobs::derive` over the uniform seeds on the
+  scratch export (candidates 11–13, 16, 17, 19, 31, …; 13 chosen). At
+  (1000, 1000) no `R41Arm/R41Wait/R41Done` for index 0 exists and the
+  GC task is bit-for-bit the (1000, 0) form's.
+  `x5_r41_uniform_round_not_selected` is untouched and still green.
+
+Mutants (each on its own scratch export, `git archive HEAD nucleus`
+copies, so the worktree never held them):
+
+| mutant | rc | the failing assertion |
+|---|---|---|
+| **GX-RUPF-NORESET** (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | 101 | `x5_r42_second_window_reuse_pf_starts_at_zero`: window 2 starts `Some((0, 1))` ≠ `Some((0, 0))` |
+| **GX-R50-NOSELECT** (`r41p` loses `r41 &&`) | 101 | `x5_r50_ineligible_rounds_draw_nothing`: seed 13 carries block A's ops for index 0 |
+
+**Step 2 — the joint-arm supply diagnostic and the CXX-F1 README fixes
+(item 2).**
+
+- The diagnostic, in the `twin_paired` manner: `SeedRec` gains
+  `twin_joint_arm` (did the R21 (c) joint arm run this round) and
+  `twin_joint_stale_reads` (the stale-read count at the joint re-run's
+  start — the reads `treads.clear()` zeroes), both doc-commented
+  diagnostic-only, never read by `SeedRec::finish`, never serialized;
+  defaults for every round without an arm. Recorded beside the
+  `twin_paired` push. The X5-R37 digest pin is unmoved.
+- **The card's premise has drifted, and the pin records it.** At the
+  CXX-F1 tip the joint arm ran at seed 7469 alone of 10000 (verdict
+  `5db63057`); at this tip (`2e8d1b13`) it has **no live seed**: a
+  0..1000 census (in-process, scratch export, 8 threads, 93.6 s) reads
+  `JOINT_ARM_SEEDS=[]`, and every seed of the re-pair family — 2669,
+  4049, 4309, 7469, 8469, 8869, 9469, 9809 — reads
+  `twin_joint_arm` all-false. At 7469 the re-paired twin now fires at
+  the first re-derived spec directly (`Mid2@3`, round 1 fired, no
+  defect — `r48_repaired_twin_fires_at_the_joint_spec` still passes),
+  so the joint draw never runs. X5-R49's slot renumbering
+  (X-5c-F4-F1-F1-F3-F2-F1) and the twin directory re-seed
+  (X-5c-F4-F1-F1-F3-F2-F1-F2) are the movers.
+- `r48_joint_supply_is_fresh_at_7469` therefore holds the honest
+  subset: one diagnostic entry per executed round, a fresh supply
+  (zero stale reads), and the arm's absence asserted as the tripwire
+  (its failure is the signal that the arm is live again and the
+  freshness assertion above is what G5-R48-TREADS-KEPT must fail).
+
+| mutant | rc | outcome |
+|---|---|---|
+| **G5-R48-TREADS-KEPT** (drop `treads.clear()`) | 0 | **UNCAUGHT at this tip** — inert: the whole `--test workload` suite passes under it (56/57 with only the pin's old premise assert, removed in the final form; 57/57 after), because no measurable round reaches the clear. Reported, not hidden; the tripwire above revives the catch the day an arm runs. ESCALATE item 1. |
+
+- README fixes (verdict `5db63057` finding 1): step 6's "pre" now
+  names O1C-F1 at `86e17a34` as the base and attributes 1066, 6555
+  and 7590 r0 to it (CXX's tip's 3-digest difference); step 4's "only
+  9469" is scoped to `r21c`'s literal list, naming 8469 and 8869.
+  No literal moved (Limit 2 held).
+
+**Step 3 — the re-seed predicate's two halves (item 3).**
+`tests/workload.rs` only; the predicate, its call site and `src/` are
+unchanged.
+
+- The equal-size case in `x5r52_twin_dirs_differ_compares_directory_keys`:
+  real `{1, 2}` vs twin `{1, 4}` — equal key counts, different key
+  sets — must read **true**. **G-PRED-LEN-ONLY** (the predicate
+  compares key counts only) fails it.
+- The cut half: the search ran exactly as the card prescribes — the
+  committed `tools/x5r52-twin-diag.patch` on a scratch export, plus a
+  scratch-only `RESEEDCUT` eprintln at the re-seed site, single seeds
+  from the README's 0..1000 event list (259, 609, 719, 809, 849).
+  **Every event seed's cuts differ** (259 r1: real 0 vs twin 5; 609/849
+  r1: real 2 vs twin 8; 719 r1: 0 vs 7; 809 r1: 0 vs 3), so the
+  premise holds. **Corrected by the rework (verdict `74f411f0` finding
+  1):** the first attempt tried 14 event seeds, saw no record move and
+  called the mutant untestable. That was wrong. The 10k has 36 event
+  seeds at BASE and the mutant moves two: 6209 (`2438621228 ->
+  870698661`) and 6849 (`3952923334 -> 1958644185`). The pin is the
+  new X5-R37 row `(6849, 3952923334)`; no existing literal moved.
+  G-RESEED-TWIN-CUT fails `x5_r37_base_tuning_reproduces_1b0ce54e` at
+  seed 6849.
+
+**Step 4 — the comparator's seven cases, the repeated-`.out` refusal
+and its README corrections (item 4).**
+
+- `cmd_compare` gains exactly one refusal, beside the count tie (after
+  the sha256 checks, before any campaign file is read): a `--run-out`
+  list with a repeated path prints `ERROR …` to stderr and returns 2.
+  Paths only; content-identical distinct paths stay out (Limit 6), and
+  the run-out↔run `E4 SEEDS=N` tie is not decided here.
+- `self_test` gains the seven cases beside the four MONITOR cases
+  (equal ref/run docs throughout, so only the named behaviour can move
+  the exit): `monitor-later-line-counts`, `monitor-last-file-counts`,
+  `monitor-empty-run-out`, `monitor-line-cut-before-monitor`,
+  `monitor-sums-not-max` (asserting the printed `MONITOR 2`),
+  `monitor-more-run-outs-than-runs` (two **distinct** out files, so
+  only the count tie can fire) and `monitor-run-out-repeated` (the
+  same path twice with two `--run`, so the counts tie and only the
+  duplicate refusal fires). `SELF-TEST 85 cases, 0 failed`; none of
+  the existing 78 case names or verdicts moved. `read_monitor`, the
+  count tie, `check_mp`, `meta_only_eligible`, `mpa_pass_fail`,
+  `twin_ddl_prefilter`, `compare_reading`, `compare_exit_code`,
+  `format_rows`, `check_twin` and `walk_seed_segments` are unchanged
+  (the diff touches `cmd_compare`'s refusal and `self_test` only).
+- The README corrections of verdict `db1e5162` §5, inside that card's
+  record: the false ESCALATE withdrawn (the card's Acceptance path
+  exists and carries the pinned sha; the wrong path was the worker's
+  own, and no result depended on it); "seventeen new cases beside the
+  refusals' four" → seventeen in all, thirteen beside the four; step
+  2's "seven knobs" → six (the `D4_TS5`/`D4_TS7` records are not
+  knobs).
+
+The seven mutants, each on its own scratch copy of the script, run
+through `self-test` (each dies on its named case):
+
+| mutant | self-test reading |
+|---|---|
+| **G-MON-FIRSTLINE** (each file's first line only) | FAIL `monitor-later-line-counts` (reads MONITOR 0, exit 0) |
+| **G-MON-FIRSTFILE** (the first file only) | FAIL `monitor-last-file-counts` (and `monitor-sums-not-max`) |
+| **G-MON-EMPTY-OK** (an empty file accepted) | FAIL `monitor-empty-run-out` (rc 0) |
+| **G-MON-NO-MONITOR-FIELD** (a line without `MONITOR=` counts as seen) | FAIL `monitor-line-cut-before-monitor` (rc 0) |
+| **G-MON-MAX** (the maximum, not the sum) | FAIL `monitor-sums-not-max` (prints MONITOR 1) |
+| **G-TIE-ONE-WAY** (refuses only too few) | FAIL `monitor-more-run-outs-than-runs` (rc 0) |
+| **M-MON-DUP-OUT** (the repeated-path refusal removed) | FAIL `monitor-run-out-repeated` (rc 0) |
+
+**Step 5 — R47's header window and the cost sentence (item 5, the
+folded O1C-F1-F1 card's Work verbatim).**
+
+- `r47_record_completed_by_a_later_write` (beside the `r47_*` pins in
+  `tests/harness.rs`): one commit at lsn 30000, len 500; the first
+  write holds its first 100 bytes (header included), the second the
+  rest from `pos + 100`; `written` holds the ts, `unparsed` is empty;
+  the control (first write only) stays unwritten and unreported.
+  **G1-HEADER-WINDOW** (`pos + 24` for `pos + (*len).max(24)`) skips
+  the second write's test and fails the pin (shown on a scratch
+  export: `written` empty, the assertion's exact text).
+- The README's "+45% CPU" sentence in "The 0..200 cost, probe, not
+  evidence" is replaced by the O1C-F1 verdict's Cost-section numbers,
+  quoted from it (derivation time 96.7 s → 63.9 s inside the 0..10000
+  run; the derivation 0.5% of a run's CPU either way; −33 s CPU over
+  10k; budget effect "none"); the worker's raw 0..200 measurements are
+  kept, labelled host state (the verdict attributes the +45% to
+  contention inflating CPU seconds — exactly what those readings
+  show).
+
+**Step 6 — the eviction arm and the gap (item 6, the folded F2-F1
+card's Work, judged against this tip's code).**
+
+- `late_copy_after_previous_epoch_eviction_drops`: the parked first
+  touch's `Img::CopyPending` is resolved by a **previous-epoch
+  eviction** — inside the window, the checkpointer's own `Mid2` hook
+  (the scan paused between its writes, so it deterministically cannot
+  win the race to B's frame) waits for the mutator's freeze and then
+  evicts B's normal frame: `evict:finish` writes it to slot `r`, moves
+  `map.cur[B] = r` and records `map.img[B] = Img::At(r)` — the same
+  `r`, so `cur == r`. The park releases at `After2` (past
+  `ckpt:freecopies`, before post-5); the re-validation skips the stale
+  record, the retry reaches the install and the guard faces
+  `Img::At(r)` with `cur == r`. B is then freed (the touch is the
+  free), so image 2 must leave it unmapped — under the mutant the
+  leaked flip-1 copy installs, checkpoint 2's scan takes it, and the
+  freed LPID is remapped: the reopened `map.cur` contains it.
+  **Two departures from the folded card's wording, both forced by this
+  tip's code and stated in the pin's doc:** (a) the parked touch is a
+  raw `free_lpid`, not a gated insert — an insert's `fetch_page` pins
+  the leaf's frame across the parked copy wait (`PinGuard`), a pinned
+  frame is not an evictable victim, so the eviction arm is unreachable
+  through a parked insert (measured: the first draft used `ins`, and
+  the eviction loop could never take B's frame while the park held);
+  the free path pins nothing, and the freed-LPID pin already states
+  this compression openly. (b) The eviction runs inside the
+  checkpointer's hook rather than a third task — a third task's
+  eviction loop loses the race to the scan at seed 3 (measured: the
+  scan resolved the `CopyPending` first, leaving `cur == None` at the
+  guard), and the hook form is deterministic.
+- `late_copy_in_the_gap_drops_for_a_gated_touch`: the parked gated
+  insert (here the real `ins`, holding the gate shared across the
+  park) releases **in the gap** — after checkpoint 1's post-5 cleared
+  the map, before checkpoint 2's flip — so the retry's install faces
+  **no entry at all**; the mutator then completes its insert, B's
+  {1,2} frame is evicted before checkpoint 2, and image 2 must hold
+  B's flip-2 cut. Both absent-entry mutants install the flip-1 copy;
+  checkpoint 2's scan maps B to it and key 2 is lost.
+- `freed_lpids_late_copy_never_remaps`'s doc comment is corrected per
+  the F2 verdict's finding 4: the two-flip crossing it describes is a
+  test compression no gated caller reaches (every `store_page` in
+  `tree.rs` runs under the gate, and a held gate stops the next flip);
+  the pin itself is kept unchanged — it still catches the two
+  absent-arm mutants, re-proven here.
+
+One code-reading correction this step forced, recorded for the gate:
+the CXX re-validation's `return Ok(())` on a cleared frame exits the
+`cx.with` **closure only** — the `record_image_copy` recursion that
+follows always runs, so the install guard stays reachable at every
+release point (past freecopies, in the gap, in the next window). A
+first-draft analysis here assumed the early return blocked the
+recursion; the `G-GUARD-ABSENT-OK` run against the existing
+`freed_lpids` pin falsified it immediately (the pin fails at this tip,
+proving the install ran).
+
+| mutant | rc | catching pin(s) |
+|---|---|---|
+| **G-GUARD-EVICT-AT** (the guard lets `Img::At(r)` with `cur == r` install) | 101 | `late_copy_after_previous_epoch_eviction_drops` (the trace shows the guard facing `At(18)` with `cur == 18`, then the freed LPID remapped); passes the gap pin and `freed_lpids` — specific |
+| **M-LATECOPY-ATONLY** (the guard tests only `Img::At`) | 101 | `late_copy_in_the_gap_drops_for_a_gated_touch` (image 2's B reads `{1}` — key 2 lost) and `freed_lpids_late_copy_never_remaps`; passes the eviction-arm pin |
+| **G-GUARD-ABSENT-OK** (an absent entry installs) | 101 | the same two as M-LATECOPY-ATONLY; passes the eviction-arm pin |
+
+**Rework (verdict `74f411f0`).** The P gate returned REWORK; every
+digest held (0 of 10000 BASE records differ). R1 landed the cut
+literal: the new X5-R37 row `(6849, 3952923334)` with its doc
+paragraph, green on the real code, and G-RESEED-TWIN-CUT shown on a
+scratch export of this commit failing
+`x5_r37_base_tuning_reproduces_1b0ce54e` at seed 6849 (`3952923334`
+against the mutant's `1958644185`, rc 101). R2 corrected
+the stale text: the `twin_joint_stale_reads` doc and the inline
+comment at the diagnostic (comment lines only in `src/` — `git diff
+74f411f0 -- spikes/e4-recovery/src/` checked), `r48_repaired`'s doc
+paragraph and its two assertion messages (the first re-derived spec
+`Mid2@3`, not the joint spec), and `r48_joint`'s doc tail (P ruling
+G5-CENSUS); no compared value changed, both `r48` tests green. R3
+added the non-adjacent repeated `--run-out` self-test case (beside
+`monitor-run-out-repeated`; `SELF-TEST 86 cases, 0 failed`), and
+OWN-DUP-ADJACENT on a scratch copy of the script fails exactly it
+(rc 0 under the mutant, the adjacent case still green). No census, no
+seed search, no campaign; no token of `src/` code changed from
+`74f411f0`.
+
+### P ruling G5-CENSUS (nv3-PINS-G5-ruling-1, 2026-11-09; binding; copy this block verbatim into the README in R4)
+- **(a) Accepted at this tip.** G5-R48-TREADS-KEPT has no must-fail case at this tip. No seed of 0..9999 reaches the R21 (c) joint arm at BASE or at S1 (verdict `74f411f0` finding 2), so on those seeds the mutant and the real code execute the same instructions. Forcing the arm needs a seam Limit 1 forbids. `twin_joint_arm`, `twin_joint_stale_reads` and the tripwire in `r48_joint_supply_is_fresh_at_7469` stay and are accepted as the whole of item 2's pin.
+- **(b) Why it cannot simply be dropped.** The mutant's direction is a false pass: a stale read in the twin's supply can only suppress an oracle failure. So the arm's liveness must be read on the runs that are judged.
+- **(c) The census is read from the judged runs, not run beside them.** A separate 0..9999 loop is not enough: S1 is not all of F4's knobs, any retune would stale it, and it would miss two of the three judged sets. Those two cannot be censused ahead of the run, because F4's REFRESH 9 says no probe, gate or diagnosis runs a seed in `10000..30000` before the final run. Therefore F4's driver, in `run`, for each of `--set main`, `held-out` and `mp-pressure`, prints exactly one stdout line, computed in memory from the `SeedRec`s that process executed:
+  `JOINT_ARM_CENSUS set=<set> seeds=<n> arm_rounds=<n> stale_reads=<n> arm_seeds=[<ascending seeds>]`
+  `seeds` is the count of seeds run by that process. `arm_rounds` counts true entries of `twin_joint_arm`. `stale_reads` sums `twin_joint_stale_reads`. The two fields stay unserialized and never digest inputs. The line does not change `verify`'s or `run`'s exit rules (REFRESH 9's list stands).
+- **(d) The result is checked, and it fails closed.** F4's Acceptance gains one line per set, before `scripts/gate.sh`, with `F` that set's run `.out` of record and `<set>`/`<n>` being `main`/`10000`, `held-out`/`10000`, `mp-pressure`/`2000`: `test "$(grep -c '^JOINT_ARM_CENSUS ' F)" = 1 && grep -Eq '^JOINT_ARM_CENSUS set=<set> seeds=<n> arm_rounds=0 stale_reads=0 arm_seeds=\[\]$' F`. The P gate and the E4 judgement read all three lines. A census line from any file other than the run of record counts for nothing.
+- **(e) What each reading means.** A failing line in (d) is a STOP. The worker does not retune, re-run, change code, widen a pattern or edit the line. It commits the three census lines to the README and ESCALATEs. A retune aimed at removing a live arm is forbidden.
+  1. **All three read `arm_rounds=0 stale_reads=0`:** G5 stays closed for this FINAL. The README records the three lines. Any later change to FINAL or MP_PRESSURE voids them with the run they came from.
+  2. **`arm_rounds > 0`, `stale_reads=0` (a live seed):** the mutant has become killable and a pin is **required**. E4 is not judged until it lands. P writes a test-only follow-up card: a literal pin at the lowest `arm_seeds` entry of the first set that has one (main, then held-out, then mp-pressure), at that set's tuning, asserting the arm ran and zero stale reads, with G5-R48-TREADS-KEPT back as a must-fail row showing a non-zero stale count. If every live seed reads zero stale reads under the mutant, P rules on those numbers. The pin moves no digest, so the run of record stands once the pin passes its gate; those rounds ran with a fresh supply.
+  3. **`stale_reads > 0`:** a defect, whatever `arm_rounds` reads. The named rounds' oracle ran on a stale supply and could have false-passed. STOP; that run is void as E4 evidence until P rules.
+  4. **Line missing, repeated, malformed, or `seeds` short of the set:** cannot-check. It is a STOP and is never read as zero.
+- **(f) The tripwire is the same rule at BASE.** If the arm assertion in `r48_joint_supply_is_fresh_at_7469` fails on any later card, the arm is live at 7469: STOP and ESCALATE to P. Do not delete or invert the assertion. The required pin in (e) 2 applies, at BASE.
+- **(g) Carried to F4.** Paragraphs (b)–(f) go into X-5c-F4's REFRESH, and `Touch only` there must cover the driver file that prints the line. That is P's or the orchestrator's edit, not this card's. This card implements none of (c)–(e).
+
+## RESULT (card X-5c-PINS-1)
+
+card: X-5c-PINS-1   branch: card/v3-X-5c-PINS-1   commit: (this commit; the chain 5a0f3ed5 → b57ca484 → 78225b95 → 249111aa → a2be7919 → 02d58b89 → f21d68f9 → fd8bf4eb → here)
+
+1. **The mutant table** (every row applied to a scratch export of the
+   real code — its own export, its own `CARGO_TARGET_DIR` — shown
+   failing, reverted by construction; the worktree never held a
+   mutant):
+
+   | mutant | catching test |
+   |---|---|
+   | GX-RUPF-NORESET (`ckpt.rs`: `st.ckpt_reuse_pf = 0` dropped) | `x5_r42_second_window_reuse_pf_starts_at_zero` |
+   | GX-R50-NOSELECT (`r41p` loses `r41 &&`) | `x5_r50_ineligible_rounds_draw_nothing` (the uniform literal 13) |
+   | G5-R48-TREADS-KEPT (drop `treads.clear()`) | `x5f4_joint_arm_live_at_1069_is_fresh` and `x5f4_joint_arm_live_at_3669_is_fresh` (X-5c-F4-F4 step 2, G5-CENSUS (e) 2's pins at FINAL, the census's live seeds; under the mutant the stale-read assertion fails with stale counts **12** at 1069 and **56** at 3669) |
+   | G-PRED-LEN-ONLY (the predicate compares key counts only) | `x5r52_twin_dirs_differ_compares_directory_keys` (the equal-size case) |
+   | G-RESEED-TWIN-CUT (the re-seeded twin keeps its own `cut`) | `x5_r37_base_tuning_reproduces_1b0ce54e` (seed 6849, `3952923334 -> 1958644185`) |
+   | G-MON-FIRSTLINE | `monitor-later-line-counts` |
+   | G-MON-FIRSTFILE | `monitor-last-file-counts` |
+   | G-MON-EMPTY-OK | `monitor-empty-run-out` |
+   | G-MON-NO-MONITOR-FIELD | `monitor-line-cut-before-monitor` |
+   | G-MON-MAX | `monitor-sums-not-max` |
+   | G-TIE-ONE-WAY | `monitor-more-run-outs-than-runs` |
+   | M-MON-DUP-OUT (the repeated-path refusal removed) | `monitor-run-out-repeated` |
+   | OWN-DUP-ADJACENT (only the first two `--run-out` paths compared) | `monitor-run-out-repeated-non-adjacent` |
+   | G1-HEADER-WINDOW (`pos + 24` for `pos + (*len).max(24)`) | `r47_record_completed_by_a_later_write` |
+   | G-GUARD-EVICT-AT (the guard lets `Img::At(r)` with `cur == r` install) | `late_copy_after_previous_epoch_eviction_drops` |
+   | M-LATECOPY-ATONLY / G-GUARD-ABSENT-OK | `late_copy_in_the_gap_drops_for_a_gated_touch` (and `freed_lpids_late_copy_never_remaps`, unchanged) |
+   | verdict `db1e5162`'s caught rows, re-applied | their cases there, unchanged — the 86-case self-test is green and none of its 78 prior case names or verdicts moved |
+
+2. **The re-read** (the Acceptance line, run for real; ref sha256
+   `41c307a4…1cd2`, run sha256 `158ce549…a69b`, both verified by the
+   comparator before any file was read), exit 0, **byte-identical to
+   `runlogs/X-5c-F4-F1-F1-F3-F1.acc.compare.out` and to verdict
+   `2e8d1b13`'s record** — `DIGESTS_MOVED 0`, 0 new failing, the same
+   exempt rounds (none):
+
+   ```
+   DIGESTS_MOVED 0 FAILING_ROUNDS 19 MONITOR 0
+   MOVED_GAINED 0 []
+   MOVED_MP_PENDING 0 []
+   META_ONLY_ELIGIBLE 0 []
+   MPA_PASS_FAIL 0 []
+   MPA_CLASS base 10 tip 10
+   TWIN_DDL_PENDING 0 []
+   MOVED_LOST 0 []
+   HEALED 0 []
+   TWIN_HEALED 0 []
+   TEXT_CHANGED 0 []
+   TWIN_FAILING 0 [] BASE 0
+   NEW_FAILING 0 [] BAD_SEEDS 0 []
+   ```
+
+3. **Item 3's cut pin used the literal form (corrected by the rework,
+   verdict `74f411f0` finding 1).** Seed 6849, class MW. The event: at
+   round 1 the twin directory re-seed fires with real `cut` 0 and twin
+   `cut` 5. The new row is `(6849, 3952923334)` in
+   `x5_r37_base_tuning_reproduces_1b0ce54e`; no existing literal
+   changed. G-RESEED-TWIN-CUT moves the digest to `1958644185` and
+   fails that test. The seed comes from the gate's run over all 36 BASE
+   event seeds, which the first attempt's 14 did not cover.
+4. **No rule text changed:** X5-R51, X5-R52 and X5-R53 verbatim; no
+   tuning, quota, threshold, literal or exemption moved (`Tuning::BASE`
+   and `Tuning::FINAL` untouched; the X5-R37 literals stand byte for
+   byte); the comparator's one new refusal is a cannot-check exit 2,
+   and `read_monitor`, the count tie and every classifier are
+   unchanged. The one `src/` addition is item 2's diagnostic pair, in
+   the `twin_paired` manner (never a digest input — `SeedRec::finish`
+   never reads it; never serialized; the X5-R37 digest pin and the
+   chain-head 10k re-read prove no digest moved).
+5. **Post-data amendments: none.**
+
+acceptance (every line run for real): `cargo test -q --release -p
+e4-recovery` — **281 tests, 0 failed** (18+25+44+55+28+54+57 across the
+binaries; 276 at the Base + this card's 5 new pins);
+`python3 -I spikes/e4-recovery/tools/x5r52_compare.py self-test` —
+**86 cases, 0 failed**, exit 0; the re-read line — **exit 0, the
+reading above, byte-identical**; `bash scripts/gate.sh` — the gate
+note beneath.
+
+**The gate note (`bash scripts/gate.sh`, at `8f1d51b6`, this run, in
+this session's container): `STEP test EXIT=0`, `STEP clippy EXIT=0`,
+`STEP fmt EXIT=0`, `STEP deny EXIT=0` (the advisory fixed on the Base
+by DEP-RUSQLITE-1), `STEP wasm32 EXIT=0`, `STEP core-paths-selftest
+EXIT=0`, `STEP enforcement-tests EXIT=1` with exactly one FAIL row —
+`runner e2e: K: SIGTERM kills opencode and closes the ledger range` —
+so the last line reads `GATE EXIT=1`.** This is the known, ruled,
+environmental row the card's own Notes name ("If you run `gate.sh` in
+your own session, `runner e2e: K` reads red (X-5c-F4-F1-F1) … The
+runner's Acceptance is the truth"): this container's PID 1 is the
+card session's own `opencode` process, which never `wait()`s, so the
+killed attempt's orphaned child stays a zombie and `dead()`'s
+`killpg` probe succeeds — verdict `verdicts/X-5c-F4-F1-F1.md`'s K
+ruling ("`kill_child` is correct. `dead()` asks the wrong question")
+says do not chase it, and the fresh-gate containers of the chain's
+verdicts read the row ok (`GATE EXIT=0` — the row tracks the
+container's PID 1, not the tree). The other 235 enforcement rows are
+green, nothing this card touched is exercised by that row, and the
+fix lives in `scripts/`/`tools/`, outside this card's Touch only.
+
+judgment calls (recorded in the steps above): scratch under
+`$CARGO_TARGET_DIR/x5pins-scratch/` (`~/.cache/nv3-review/` is
+read-only here, the carried judgment call); the joint-arm pin holds
+the honest subset with the arm's absence asserted as a tripwire; the
+eviction-arm pin's parked touch is a raw `free_lpid` and its eviction
+runs inside the `Mid2` hook (both forced by this tip's code, both
+stated in the pin's doc and step 6's record); the two new store pins
+use a 200_000 park budget (the 900_000 of the older pins, multiplied
+by the extra spinning, trips X5-R13 (b)'s 1_000_000 `YIELD_BUDGET`).
+
+ESCALATE: one item; the card's premise has drifted at the chain head;
+no code defect found. Item 2 (G-RESEED-TWIN-CUT) is withdrawn: verdict
+`74f411f0` finding 1 showed it false.
+
+1. **The R21 (c) joint arm has no live seed at this tip, so
+   G5-R48-TREADS-KEPT is uncatchable.** The card (and verdict
+   `5db63057` finding 2) prescribe the pin at seed 7469 with the arm
+   running and 17 stale reads; at `2e8d1b13` it does not run there —
+   the re-paired twin now fires at the first re-derived spec
+   (`Mid2@3`) without the joint draw. Minimal deterministic repro (the
+   census): run seeds 0..1000 plus the re-pair family (2669, 4049,
+   4309, 7469, 8469, 8869, 9469, 9809) with the diagnostic fields —
+   `twin_joint_arm` reads all-false everywhere (`JOINT_ARM_SEEDS=[]`,
+   the step 2 log); dropping `treads.clear()` leaves the whole
+   `--test workload` suite green. The movers are X5-R49's slot
+   renumbering and the twin directory re-seed, both after the CXX
+   census. The diagnostic and the tripwire pin are in place; the
+   day any seed reaches the arm again, the freshness assertion is
+   what the mutant must fail. **Ruled: P ruling G5-CENSUS, in this
+   card's record.**
+
+anomalies: (a) the benign `Unable to create …/.git/packed-refs.lock:
+Read-only file system` line from the host's git maintenance on every
+commit (known from the base chain; the commits land — the log and the
+clean tree confirm); (b) the two folded card files and
+`cards/X-5c-F4-F1-F1-F3-F1.local.md` this card's Read list names are
+not present in this worktree (only this card's own file, PLAN, the
+cards README and the worker prompt are) — their content as this card
+quotes it is carried by the verdicts and this card's own Goal/Work,
+which is what was used; (c) `cargo fmt`'s first run of step 1 exited
+loudly on the same read-only packed-refs (the formatting itself
+succeeded; `cargo fmt --check` green throughout, one follow-up commit
+for a line it reflowed); (d) the gate's `GATE EXIT` reading below.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -5726,3 +10122,2050 @@ X5-R15 (e): `examples/` keeps only what this block uses (`pin.rs`;
 `dbg-seed.rs`, which 823d4f51 called scratch, is removed), and
 `restore_probe.local.py` (untracked) is not in the tree.
 
+## Card X-5c-F4-F2's record (the final driver: OQ-1's sizing rows,
+## `--set` and `verify --set`, the probe forms, the census)
+
+Base: `card/v3-X-5c-F4` (tip `0d0f3da4`). This card changes no
+workload: it builds the driver X-5c-F4's final run needs. **FINAL still
+equals BASE** (`x5_r37_final_equals_base_at_this_tip`, unchanged), and
+**`MP_PRESSURE` equals FINAL** — it is written `Tuning { ..Tuning::FINAL }`,
+so it starts equal and follows FINAL; the final setting and the retune
+are X-5c-F4-F3's. No threshold, oracle, K, R, D17 R6 cell, X5-R14 fix,
+5.6 quota definition, `Q4I_REQUIRED`, X5-R51–R53, comparator or digest
+input changed: `szq`, `szi`, `rfs`, the `set` field and the census are
+never digest inputs, every X5-R37 literal stands byte for byte, and the
+comparator (verified on a synthetic old-vs-new pair before any code
+landed) reads `DIGESTS_MOVED 0` through the new fields.
+
+### X5-R39's table (REFRESH 5; the owner's OQ-1 ruling, PLAN §10
+### item 10)
+
+Carried verbatim by card X-5c-PINS-2 (REFRESH 5's own text; the
+transcription it replaces agreed in content, verdict `9f96f31e`
+finding 1):
+
+| Row | Counts rounds where | Minimum |
+|---|---|---|
+| `SZC` | `szq`, all classes | 1,000 |
+| `SZC-MP` | `szq`, class MP | 100 |
+| `SZC-MW` | `szq`, class MW | 50 |
+| `SZI` | `szi`, all classes (inside `SZC`, not additive) | 300 |
+
+- **`szq`:** F4-F1's `szc` (the round's own crash fired, and either `dirty_now_len ≥ 4·F`, or a checkpoint was open with `ckpt_closed_dirty ≥ 4·F`) **and** the final recovery yielded a state (Q18's `end.is_some()`). A refused round tests detection, not the recovery under pressure.
+- **`szi`:** `szq`, and `ckpt_closed_dirty ≥ 4·F`, and the crash fired in the window from the completion of step 0 until step 5's `sync_all` returns. So hooks `After0`, `After1`, `Mid2`, `After2`, `After3` and `After4`, and any uniform or window crash inside that span, count. `Before0`, `After5`, `Mid6` and `After6` do not.
+- **Never counted:** nested recovery crashes and the harness checkpoint.
+- **Why 300:** with zero failures, the rule of three bounds the failure rate at about 1% per such crash (95%), Q1's per-crash-point bar, and it asks about 2% of ~15,400 rounds.
+- The `SIZING` row stays as per-seed reporting (achieved = seed
+  misses), never an exit input; `verify` prints it `INFO` and never
+  counts it toward `missed`. `INFO` only, never exit inputs: the
+  per-seed miss count, `szc` as F4-F1 prints it, `szi` per class and
+  per hook, and poison-end `szq`.
+
+### X5-R44's table (REFRESH 9; the owner decision of 2026-11-05)
+
+Carried verbatim by card X-5c-PINS-2 (REFRESH 9's own text; the
+transcription it replaces agreed in content, verdict `9f96f31e`
+finding 1):
+
+| Set | Seeds | Tuning | Exit rows in `verify` | Budget (`run`, 16 threads) |
+|---|---|---|---|---|
+| **Main** | exactly `0..10000` | `Tuning::FINAL` | every 5.6 row and X5-R39 row **except `SZC-MP`**, plus **Q4 ≥ 1,000** (unchanged) and **Q4-I ≥ 1,000** (X5-R42) | ≤ 40 min |
+| **Held-out** | exactly `10000..20000` | `Tuning::FINAL` | none; quota rows print as `INFO` | ≤ 40 min |
+| **MP-pressure** | exactly the 2,000 seeds `s` in `20000..30000` with `s % 10 ∈ {7, 8}` | `Tuning::MP_PRESSURE` | **`SZC-MP` ≥ 100** (`szq`, class MP, refused rounds excluded), alone | ≤ 40 min, its own |
+
+- **`Tuning::MP_PRESSURE`** differs from FINAL only in the workload knobs, inside 5.1 and 5.2's ranges; `x5_r37_final_stays_in_card_ranges` covers it. The class rule, fault model, oracle, pool formula and row definition do not change. Its knobs are tuned only on the MP-class seeds of `30000..31000` (200 seeds, one run per commit), × 10, labelled "probe, not evidence". Start from REFRESH 6's table: k1 read 175 and k2 read 100 across the same 2,000 MP seeds per 10k.
+- **Untriaged means untouched.** Before the final run, no probe, gate or diagnosis runs a seed in `10000..30000`. The P gate checks commits and the README for it.
+- **MP in the main file.** `SZC-MP` prints as `INFO` there and does not count toward `missed`. Only the MP-pressure file carries the row.
+
+`MP_REFUSAL rounds=<n> refused=<n> rate=<r>` prints once per `verify`,
+class MP only, `rate` = `refused/rounds` to four decimals, reported and
+never an exit input; `refused` is the serialized per-round field `rfs`
+(`end.is_none()` at Q18's point), outside the digest and inside the
+per-round comparison.
+
+### The driver's forms
+
+- `run --set <name> [--threads N] --out F`: the set's seeds under the
+  set's tuning, the set recorded in the file
+  (`{"e4":1,"set":"main","seeds":[…]}`); `--set` with a `--seeds` that
+  differs is refused (exit 2); `mp-pressure` is not a range, so
+  `--seeds` with it is always refused; **the census prints** (below)
+  and no `PROBE_QUOTA`.
+- `run` with neither `--seeds` nor `--set` means `main`.
+- **The probe form**, `run --seeds A..B` without `--set`: records no
+  set, runs FINAL, refuses (exit 2) any range reaching 10000 or above —
+  REFRESH 10's reading of `run --seeds`, and the minimum this card adds
+  so a probe can never bypass the judged set.
+- **The MP-pressure probe form**, `run --probe mp-pressure`: the one
+  route to the `MP_PRESSURE` tuning outside the judged set — exactly
+  the 200 MP-class seeds of `30000..31000` (`s % 10 ∈ {7, 8}`),
+  records no set, refuses `--set`/`--seeds`. REFRESH 9 requires these
+  probes and `--set` cannot reach them, so this is the minimum that
+  makes them possible. Both probe forms print one `PROBE_QUOTA <id>
+  <achieved>` line per `quotas()` row and one for Q4-I, from the same
+  `quotas()` and `q4i_count` `verify` uses, and no census. **This card
+  never runs a probe seed**: the seeds this card may run are `0..10000`
+  only.
+- `verify --set <name>` (omitted means `main`): re-runs that set's
+  seeds under that set's tuning; a file whose recorded set differs, or
+  that records none, is refused (exit 2); exit rows are per set (the
+  table above), a non-exit row prints
+  `INFO <id> … achieved <n> required <n> INFO`, an exit row keeps the
+  `QUOTA <id> … achieved <n> required <n> MET|MISSED` form (X-5c-F4's
+  bars line reads it); all modes keep the digest check and the
+  per-round comparison of non-digest fields, exit non-zero only on
+  non-reproduction, a wrong seed set or a missed exit row, never on
+  oracle failures.
+
+### `JOINT_ARM_CENSUS` (P ruling G5-CENSUS (c))
+
+For each `--set` run, `cmd_run` prints exactly one stdout line
+immediately before the final `E4 SEEDS=` line, computed in memory from
+the `SeedRec`s that process executed:
+`JOINT_ARM_CENSUS set=<set> seeds=<n> arm_rounds=<n> stale_reads=<n>
+arm_seeds=[<ascending seeds>]`. The two census fields stay
+unserialized and never digest inputs; the line changes no exit rule;
+the set form prints no `PROBE_QUOTA` and the probes print no census.
+
+### The `ckpt_unflipped` observable (a judgment call, documented)
+
+The card's Work names `src/store/ckpt.rs` as the observable's home with
+set/clear sites all inside `checkpoint_inner`, but a **store**-state
+field (`StoreInner`) and a **crash-time obs** field
+(`WorkloadObs`) live in `src/store/mod.rs` and `src/harness.rs`, which
+the card's Touch-only list forbids — this card's Read list names
+neither. The observable is therefore carried by the crash-time
+checkpoint position code (`WorkloadObs::ckpt_step`, written by the
+checkpointer's hook bookkeeping **before any crash arm**):
+`ckpt::ckpt_unflipped(step)` is true exactly for codes 2..=7 — set
+immediately before `hooks(CkptHook::After0)` (the completion of step
+0), cleared where step 5 sets `meta_durable_k` (before
+`hooks(CkptHook::After5)`; codes 8, 9, 0 read false, as does 1 =
+`Before0`). This is REFRESH 6's rule held **structurally**: the
+harness-side carrier survives the sim-crash unwind into the crash-time
+`obs` snapshot because no `checkpoint()` abort path can touch it, and
+the non-crash abort clear is carried by the `ckpt_closed_dirty ≥ 4·F`
+term `szi` conjoins (the same `ckpt:abort` step zeroes it on every
+non-`Sim` failure and keeps it across a sim-crash unwind — the
+`!crash_unwind` guard). Narrowed by card X-5c-PINS-2 to what was
+measured: the two implementations agree on every round of `0..9999` at
+BASE (the scratch-build comparison, verdict `9f96f31e` finding 4 —
+zero differences, zero rounds in the gap), and the post-`meta_durable_k`,
+pre-`After5` gap is not excluded by construction, only by that
+measurement. The four sites the
+card names each carry a comment citing the observable. The step-1
+mutants map accordingly: **M-SZI-BEFORE0** = the predicate accepts
+code 1, **M-SZI-AFTER5** = it accepts code 8, and **M-SZI-ABORTRESET**
+= the `!crash_unwind` guard dropped (this implementation's carrier of
+the abort-path clear), which the After4 pin fails.
+
+### The mutant table (RESULT item 1; every row applied to its own
+### scratch export of the real code at the step's commit — its own
+### export, its own `CARGO_TARGET_DIR` under
+### `$CARGO_TARGET_DIR/x5f2-scratch/` — shown failing, reverted by
+### construction; the worktree never held a mutant)
+
+| mutant | catching test |
+|---|---|
+| M-SZQ-REFUSED (drop `end.is_some()`) | `x5_r39_a_refused_round_is_szc_but_never_szq` |
+| M-SZI-BEFORE0 (set `ckpt_unflipped` at begin) | `x5_r39_before0_crash_never_sets_szi` (and `x5_r39_ckpt_unflipped_window_edges`) |
+| M-SZI-AFTER5 (never clear it at step 5) | `x5_r39_after5_crash_never_sets_szi` (and `x5_r39_ckpt_unflipped_window_edges`) |
+| M-SZI-ABORTRESET (cleared on every abort) | `x5_r39_after4_crash_with_a_4f_fold_is_szi` (the `!crash_unwind` guard; see the judgment call above) |
+| M-SZ-EXIT (a SIZING seed miss fails the exit again) | `x5_r39_a_per_seed_sizing_miss_is_not_an_exit_input` |
+| M-SZ-NOFLOOR (the `SZI` row's minimum goes to 0) | `x5_r39_row_floors_at_the_edge` (the 299/300 pair) |
+| M-SZ-NOREPRO (remove the file-versus-re-run comparison) | `x5_r39_flipped_szi_fails_reproduction` |
+| M-MP-MAINEXIT (`SZC-MP` exits in `main`) | `x5_r45_szc_mp_99_in_each_mode` (99 in main) |
+| M-MP-NOEXIT (`SZC-MP` never exits in `mp-pressure`) | `x5_r45_szc_mp_99_in_each_mode` (99/100) |
+| M-MP-CLASS (the set takes every seed in the range) | `x5_r45_seed_set_checks_short_over_wrong_class` |
+| M-MP-TUNING (`mp-pressure` selects `TuningId::Final`) | `x5_r44_tuning_id_is_mp_pressure_for_that_set_only` |
+| M-HELD-QUOTA (held-out exits on a quota) | `x5_r45_held_out_exits_zero_with_every_quota_short` |
+| M-HELD-RANGE (held-out accepts `0..10000`) | `x5_r45_seed_set_checks_short_over_wrong_class` (the held-out half) |
+| M-SET-MISMATCH (`verify` ignores the file's set) | `x5_r45_the_recorded_set_gates_verify` |
+| M-REFUSAL-ALL (`MP_REFUSAL` counts every class) | `x5_r46_mp_refusal_counts_class_mp_only` |
+| M-PROBE-RANGE (the probe form accepts a range reaching 10000) | `x5_r44_probe_forms_seed_lists_and_refusals` |
+| M-PROBE-SET-NAME (the probe form records a set) | `x5_r44_probe_forms_seed_lists_and_refusals` (`run_form_set`) and `x5_r45_the_recorded_set_gates_verify` (the emit half) |
+| M-CENSUS-ZERO (always prints 0) | `x5f2s3_joint_arm_census_line` (the live-arm case) |
+| M-CENSUS-NOSTALE (ignores `twin_joint_stale_reads`) | `x5f2s3_joint_arm_census_line` (the stale-read case) |
+| M-CENSUS-NOTFROMRUN (`seeds` is the set's requested count) | `x5f2s3_joint_arm_census_line` (the seed-count case) |
+
+None survives. The literal-config pins' seeds (1926 r2 After4, 1005 r2
+Before0, 344 r1 After5, 9149 r2 refused) were found by a scratch-only
+diagnostic build (a `dbg_fold`/`dbg_step` field in a `git archive`
+export, never committed) sweeping `0..10000` in 200-contiguous-seed
+chunks under `Tuning::BASE`, within the attempt's run hygiene.
+
+### RESULT (card X-5c-F4-F2)
+
+card: X-5c-F4-F2   branch: card/v3-X-5c-F4-F2   commit: (step 4's; the
+chain c3688e03 → 150221e7 → 77c7d824 → here)
+
+1. **The mutant table** is above; each row was applied on its own
+   scratch export and shown failing its named test; none survives.
+2. **X5-R39's and X5-R44's tables** are above, transcribed from this
+   card's Work (REFRESH 5 and 9 live in the folded X-5c-F4 card, not
+   in this worktree — anomaly (a)); REFRESH 10's reading of
+   `run --seeds` (the probe form, refused at a bound reaching 10000 or
+   above) and the `--probe mp-pressure` form are named above as this
+   card's minimum addition.
+3. **FINAL equals BASE** (`x5_r37_final_equals_base_at_this_tip`,
+   untouched), **`MP_PRESSURE` equals FINAL**
+   (`Tuning { ..Tuning::FINAL }`), and no threshold, oracle or digest
+   input changed (`szq`/`szi`/`rfs`/`set`/the census are outside the
+   digest; `verify` compares `szq`/`szi`/`rfs` per round between the
+   file and the re-run).
+4. **Post-data amendments: none.** The Acceptance's reading is the
+   runner's.
+
+### Anomalies
+
+- **(a) The folded cards are absent.** `cards/X-5c-F4.local.md` (the
+  REFRESH 5–10 text) and `cards/X-5c-PINS-1.local.md` are not in this
+  worktree (only this card's own file, PLAN, the cards README and the
+  worker prompt are). Their content as this card quotes it is carried
+  by this card's own Goal/Work and by the verdicts
+  (`X-5c-F4-F1.md` carries REFRESH 6 and 7 verbatim; the PINS-1 README
+  block carries P ruling G5-CENSUS verbatim), which is what was used —
+  the same reading PINS-1's verdict recorded for its own folded cards.- **(b) The Acceptance's comparator `--ref` name.** The card's line
+  names `~/.cache/nv3-review/runlogs/X-5c-F4-F1-F1-F3-F1-F1-F1-F1.acc.campaign.json`,
+  which does not exist in this environment. The baseline of record it
+  pins by sha256 — `41c307a4…1cd2` — is
+  `X-5c-F4-F1-F1-F3-F2-F1-F2.acc.campaign.json` (sha256 verified
+  exactly). The worker's substitute run (the same command against that
+  file, on a synthetic old-vs-new JSON pair for the field-tolerance
+  check) reads `DIGESTS_MOVED 0` and exits 0; the whole-set run and
+  verify are the runner's, per the card's own run hygiene ("Banned in
+  the attempt: `verify` over a whole set, any wider run"), so the
+  worker never produced a `main.json` to compare. (Closing sentence,
+  card X-5c-PINS-2: the sha-pinned baseline of record is
+  `X-5c-F4-F1-F1-F3-F2-F1-F2.acc.campaign.json` (sha256
+  `41c307a4…1cd2`), the path X-5c-PINS-1's Acceptance line in fact
+  used; the mismatch was in the F4-F2 card's own line, not in any
+  comparison.)
+- **(c) The attempt cap.** Step 1's literal search overran the first
+  60-minute attempt; the restart rule's commit-then-resume discipline
+  was followed, and the refused-round pin (seed 9149) landed with step
+  2's commit, named there.
+- **(d)** The benign `Unable to create …/.git/packed-refs.lock:
+  Read-only file system` line from the host's git maintenance on every
+  commit (known from the base chain; the commits land — the log and the
+  clean tree confirm).
+
+## Card E4-SILENT-1's record (the two silent-data fixes before E4's
+## final run: E4-R1 and E4-R2, with WR-1)
+
+Owner decision 2026-11-10 (delegated, header-design-verify §1, §3),
+card `E4-SILENT-1`, base `card/v3-X-5c-F4-F2` (`9f96f31e`). Two faults
+opened with `O-3(d): silent Ok` at the Base:
+
+1. A lost, torn or misdirected **forced-checkpoint header** left a
+   bulk-loaded tree published with its loaded entries missing
+   (header-durability-design-eval §3, verified §1.1).
+2. A lost header could open an older snapshot whose **log was already
+   recycled**, so acknowledged commits were gone — the prototype could
+   open empty (header-design-verify §1.4's first row).
+
+### The two rules and WR-1 (fixed before any code, per the card)
+
+**E4-R1: a publication names the checkpoint it depends on.** The
+commit that publishes an unlogged bulk load (S-STORE §12.8 step 3)
+carries a store-level op `RequireCkpt{id}`, where `id` is the durable
+checkpoint id read after `wait_ckpt` returned (`meta_durable_k` in the
+`h:loadph1` step). It is a checkpoint id, never a WAL position: a load
+writes no WAL, so two checkpoints around it can share `wal_ckpt_end`
+and `ts_ckpt_hi`. The op's kind byte is `0x52`, not 5 — two WAL
+fixtures use raw payload bytes 5 and 6, and byte 5 would decode as the
+op. Recovery checks every `Commit` above `T` in pass 1, after the
+coverage check and before `recover:install`; `id` above the opened
+meta's `ckpt_id` prints `E4_SILENT_REFUSE rule=R1 opened=<k> need=<id>
+ts=<ts>` (stderr, unconditional, one line per refusal, never a digest
+input) and fails XX001, writing nothing. `apply_op` ignores the op;
+`commit_txn_req` (the new `commit_txn` body, with the dependency a
+parameter, never shared state) encodes it before the other ops and
+refuses `chunked` with `Some`. It deliberately over-refuses, pinned:
+a tree dropped after publication, and a tree with logged writes after
+publication (`es1_over_refusals_pinned`). It still opens an image at
+or above `id`, every commit without the op, and a publication at or
+below `T`.
+
+**E4-R2: an open needs proof its log start survives.** An open from a
+meta continues only if the segment holding its `wal_start_lsn` exists;
+the one exception is `wal_start_lsn == 0` with no `*.log` file in
+`/wal/` at all (a store that never made a segment durable; `.keep` is
+not a segment). Otherwise the open fails XX001 at G3, before the walk
+and before any write, printing `E4_SILENT_REFUSE rule=R2 opened=<k>
+start=<lsn>`. The start-above-0 `exists` probe is exactly as at the
+Base; the start-0 probe is `wal_names` — a read-only listing on
+`E4Env` built on `step` with **no yield** — so no schedule moves on
+any path a seed reaches. The proof is the listing: `wal_recycle`
+renames segments lowest first and directory operations persist as a
+prefix of issue order, so if the start segment is present, no segment
+at or above it was recycled.
+
+**WR-1 (E4-R2's precondition):** segment 0 is created, and its
+directory entry made durable, before any other segment, whenever the
+durable meta's start is 0 — in `wal_write_batch`'s creation branch
+(`wal_create_segment`, extracted unchanged), when `seg > 0`, the
+durable meta's start is 0, `segs` has no entry for 0 and `wal_names`
+has no segment 0. Without it, a batch starting in segment 1 while
+segment 0 is uncreated (two batches in flight) gave a false XX001 on a
+healthy store. It acts only in that history; no seed-reached path in
+`0..10000` moves with it in place.
+
+### The CONFLICT note (P accepted both by writing the card)
+
+1. **WR-1 is a third code change.** It takes a first batch of at least
+   64 KiB to reach, but it is reachable (`wal_wait_durable` and the
+   writer task can hold two batches). With it in place, the
+   moved-digest set in `0..10000` is the verification's 37, which had
+   no WR-1, minus its 19 `nested`-only seeds. The alternative — the
+   verification's "create segment 0 at file creation" — would change
+   every seed's schedule and belongs to Phase A.
+2. **A read-only `wal_names` is added to the sim's `E4Env`.** It
+   changes no fault or taint model. The verification's probe of
+   `exists` calls added yields, which alone moved 19 seeds' `nested`
+   draws; this form moves none of those: expect **18** moved digests,
+   not 37.
+
+### The mutant table (RESULT item 1; every row applied to its own
+### scratch export of the real code at its step's commit — its own
+### export under `$CARGO_TARGET_DIR/es1-scratch/`, its own
+### `CARGO_TARGET_DIR` — shown failing, reverted by construction; the
+### worktree never held a mutant)
+
+| mutant | catching test |
+|---|---|
+| M-R1-SKIP (the check never refuses) | `es1_lost_forced_header_refused`, `es1_refused_open_writes_nothing` |
+| M-R1-GE (refuses at `id >= meta.ckpt_id`) | `es1_faultless_every_crash_point`, `es1_lost_forced_header_refused` |
+| M-R1-ZERO (the publish records id 0) | `es1_lost_forced_header_refused` |
+| M-R1-LATE (the check moved after `truncate_wal`) | `es1_refused_open_writes_nothing` (the byte-identical arm) |
+| M-OP-TAG5 (the op's byte is 5) | `wal_exact_segment_end_hops`, `wal_tail_short_never_placed` |
+| M-R2-GUARD (the start-0 arm always reads present) | `es2_recycled_start_zero_refused` |
+| M-R2-ALWAYS (no empty-directory exception) | `es2_healthy_start_zero_every_crash_point` |
+| M-R2-ANYNAME (no `*.log` filter, so `.keep` counts) | `es2_healthy_start_zero_every_crash_point` |
+| M-SEG0-ORDER (WR-1 removed) | `es2_segment_zero_created_first` |
+
+None survives.
+
+### The moved-digest set and its reason (RESULT items 3–4)
+
+The 10k BASE baseline of record is
+`X-5c-F4-F1-F1-F3-F2-F1-F2.acc.campaign.json`, sha256
+`41c307a470ba51e1eae7911fa7b1b7e7146e810f191ccb348bd0713a19601cd2`.
+The Acceptance's comparator line reads **`DIGESTS_MOVED 18
+FAILING_ROUNDS 19 MONITOR 0`** with `NEW_FAILING 0`, `HEALED 0` and
+`MPA_CLASS base 10 tip 10`, and its 18 moved seeds are exactly
+`[53, 199, 1609, 2098, 2224, 2433, 3829, 4535, 5152, 5570, 6590,
+7013, 7373, 7692, 7776, 8132, 9215, 9674]` — the verification's 37
+minus its 19 `nested`-only seeds. Why 18 and not 37: the
+verification's probe added `exists` yields at every start-0 open,
+moving 19 seeds' `nested` draw alone; the other 18 are the same seeds
+in both runs (P infers they come from the publish record's 9 extra
+bytes and the refusals, and did not trace each one). The refusal
+counts the Acceptance greps from the run's stderr: **R1 = 0** (E4-R1
+never fired in the 10k; its evidence is the directed tests) and
+**R2 = 2**. The attempt's hygiene probe over `0..200` (ulimit
+`-v 25165824`, output under `es1-scratch/`) read `E4 SEEDS=200` with
+the same two failing rounds as the baseline (8 r0, 178 r1), moved
+digests `{53, 199}` — both in the 18 — and `R1=0 R2=0`.
+
+No existing test or literal moved: all 301 crate tests at the Base
+passed unchanged beside the 9 new ones (310 total), and
+`Tuning::FINAL` still equals `Tuning::BASE`
+(`x5_r37_final_equals_base_at_this_tip`, untouched — as are the
+oracle, the model, the fault and taint model, K, R, D17's R6 cells,
+every 5.6 quota, `Q4I_REQUIRED`, X5-R51–R53, the comparator and
+`Tuning::MP_PRESSURE`).
+
+### RESULT (card E4-SILENT-1)
+
+card: E4-SILENT-1   branch: card/v3-E4-SILENT-1   commit: (step 3's;
+the chain 70934c1b → 033fb23b → here)
+
+1. **The mutant table** is above; each row was applied on its own
+   scratch export and shown failing its named test; none survives.
+2. **The two rules and WR-1, and the CONFLICT note**, are above.
+3. **No existing test or X5-R37 literal moved, and FINAL still equals
+   BASE** (the section above).
+4. **The baseline's sha256, the `DIGESTS_MOVED` line, and the R1 and
+   R2 refusal counts** are above, as the Acceptance's lines pin them.
+5. **Post-data amendments: none.** The Acceptance's reading is the
+   runner's.
+
+## Card X-5c-F4-F3 (FINAL = S1, the pre-registered retune of Q7, Q8,
+## Q11, Q12, SZC, SZC-MW, SZI and MP_PRESSURE, and the CPU term)
+
+Base: `card/v3-E4-SILENT-1` (tip `8d679ccd`), which carries
+X-5c-F4-F2 (`9f96f31e`) and the two E4-SILENT fixes. FINAL = S1 —
+`r41_share` 1000, `r41p_share` 500, the setting of verdict `2e8d1b13`
+— then the pre-registered ladders below retune the listed knobs of
+`Tuning::FINAL` (and, in step 9, `Tuning::MP_PRESSURE`) and nothing
+else. `Tuning::BASE` is never edited. Every number this card produces
+is a **probe, not evidence**; the final run's own `verify` is the only
+quota evidence. The baseline of record is
+`~/.cache/nv3-review/runlogs/E4-SILENT-1.baseline.json`, sha256
+`fe598604e1918b9c9a15366b6b393e3711b1efd4bcddc6b6c5d0f44d2a97ede8`.
+
+### X-5c-F4-F3 ladder
+
+Pre-registered at step 0, before any probe (card Work 0). Copied from
+the card: the stop rule, every ladder table and the owner decisions.
+No threshold, ladder, rung, knob, margin or stop rule is added or
+changed after any probe; every rung tried below is in the card.
+
+**The stop rule, fixed here for every ladder.** A rung's result is
+read by the probe's `per10k`:
+
+- **Stop-and-keep** at the first rung where the ladder's rows reach
+  **required × 1.25** and the hold set and wall limit pass. The 1.25
+  is a stopping margin for a sampled probe, not a threshold:
+  `0..1000 × 10` read Q7 190 against the 10k's 172, and 0..400 × 25
+  read Q8 325 against the 10k's 90.
+- **The hold set:** Q4 ≥ 1,500 and Q4-I ≥ 1,500 (the owner's bars),
+  and no row that met its minimum at the last kept setting falls below
+  that minimum. A row whose ladder is still to come may be short.
+- **The wall limit:** `min_per_10k` ≤ 40 (`min_per_2000` ≤ 40 for
+  `MP_PRESSURE`).
+- **If no rung reaches the margin, keep the highest rung that reaches
+  the required count and passes the hold set and wall limit,** and
+  record it as `thin`.
+- **Rung order is by rising cost.** A rung over the wall limit ends
+  that ladder's walk.
+- **If no rung reaches the required count: ESCALATE with the
+  numbers.** The row and every rung's README row go to the owner, as
+  REFRESH 5, 8 and 9 require. FINAL keeps the rung of that ladder with
+  the highest count that passes the hold set and wall limit, or the
+  setting before the ladder if none does. Later steps still run, so
+  the owner gets every row and both CPU figures.
+
+**Owner decisions of 2026-11-10 (X-5c-F4 REFRESH 10, "Conflicts"; a
+scope reading made with the data known, delegated by the owner).**
+
+- CPU ≤ +60% binds the `r41` alignment setting it was set for (S1).
+  The whole run's cost is limited by the owner's existing
+  40-minute-per-campaign time box. The whole-FINAL CPU is still
+  measured and reported.
+- FINAL = S1 fixes the two `r41` knobs, and the pre-registered retune
+  raises Q7, Q8, Q11, Q12, SZC and SZI within limits.
+- **No threshold moves. A row that is unreachable returns to the owner
+  with numbers.**
+
+The ladders, in the card's order (Q7, Q8, Q11, Q12, then SZC, SZC-MW
+and SZI; then `MP_PRESSURE`). For each row, if the last kept setting
+already reaches required × 1.25, a "no retune needed" row citing the
+last probe is recorded and the ladder is skipped. Each rung changes
+only the fields listed, on top of the last kept setting; every commit
+changes FINAL's constants only to that rung.
+
+**Step 3 — Q7 ≥ 200** (required × 1.25 = 250):
+
+| Rung | Change |
+|---|---|
+| 3.1 | `drop_one_in` 2 |
+| 3.2 | `drop_one_in` 1 |
+
+**Step 4 — Q8 ≥ 100** (required × 1.25 = 125; direction per REFRESH 4:
+the SyncOff mix and the F-CRASH keep):
+
+| Rung | Change |
+|---|---|
+| 4.1 | `syncoff_table` `[0, 7, 7]` |
+| 4.2 | `syncoff_table` `[3, 7, 7]` |
+| 4.3 | 4.2 and `keep_latest_pm_table` `[100, 100, 300, 500, 700]` |
+
+**Step 5 — Q11 ≥ 100** (required × 1.25 = 125; watch Q5a). If no rung
+reaches it, also report how often a failed recycling rename (`to`
+exists) happens on FINAL (REFRESH 7), from a scratch export with a
+logging patch over `0..200`, never committed:
+
+| Rung | Change |
+|---|---|
+| 5.1 | `w11_share` 100 |
+| 5.2 | `w11_share` 150 |
+| 5.3 | `w11_share` 200 |
+
+**Step 6 — Q12 ≥ 100** (required × 1.25 = 125; watch Q5a):
+
+| Rung | Change |
+|---|---|
+| 6.1 | `w12_share` 100 |
+| 6.2 | `w12_share` 150 |
+| 6.3 | `w12_share` 200 |
+
+**Steps 7–8 — SZC ≥ 1,000, SZC-MW ≥ 50 and SZI ≥ 300** (required ×
+1.25 = 1,250 / 62.5 / 375). One ladder: all three rows read together,
+and the stop rule needs all three. Each rung is cumulative, from
+REFRESH 6's k4 and k5 directions. Wider or longer intervals and larger
+chunked sets, with the pool untouched. Step 8 (rungs 7.4–7.5) runs
+only if the stop rule has not ended the ladder:
+
+| Rung | Change |
+|---|---|
+| 7.1 | `ckpt_every` 8–12 (`ckpt_every_lo` 8, `ckpt_every_span` 5) |
+| 7.2 | 7.1 and `value_lo` 280 |
+| 7.3 | 7.2 and chunked 700–900 (`chunked_ops_lo` 700, `chunked_ops_span` 201) |
+| 7.4 | 7.3 and GC 6–8 (`gc_sweeps_lo` 6, `gc_sweeps_span` 3) |
+| 7.5 | 7.4, chunked 900–1200 (`chunked_ops_lo` 900, `chunked_ops_span` 301), budget 20–31 (`commit_budget_lo` 20, `commit_budget_span` 12) and GC 8 (`gc_sweeps_lo` 8, `gc_sweeps_span` 1) |
+
+**Step 9 — `MP_PRESSURE`: SZC-MP ≥ 100 on the 200 MP-class seeds ×
+10** (required × 1.25 = 125). These fields are set in
+`Tuning::MP_PRESSURE` only, `{ <rung's fields>, ..Tuning::FINAL }`;
+FINAL does not change. Read with `x5_probe.sh --mp`. REFRESH 6's table
+reads MP on 1–7 raw hits, so the raw count is reported. Rung 9.0 is
+`MP_PRESSURE` equal to the kept FINAL:
+
+| Rung | Change, over FINAL |
+|---|---|
+| 9.1 (k1) | chunked 900–1200, budget 20–31, GC 12 (`gc_sweeps_lo` 12, `gc_sweeps_span` 1), `ckpt_every` 4–8 (`ckpt_every_lo` 4, `ckpt_every_span` 5), `burst_frac` 600, `burst_gc_loops` 8, `w11_share` 200, `w12_share` 200 |
+| 9.2 | 9.1 with `ckpt_every` 8–12 |
+| 9.3 (k2) | 9.1 with `ckpt_every` 12–19 (`ckpt_every_lo` 12, `ckpt_every_span` 8) |
+
+**The probe and the README row.** `x5_probe.sh <name> <outdir>` is
+five 200-seed `run --seeds <b>..<b+200> --threads 16` blocks over
+`0..1000`, with the release binary run directly and user+sys taken
+from bash `time`. `x5_probe.sh --mp <name> <outdir>` is one `run
+--probe mp-pressure --threads 16`. Each prints `PROBE_ROW <id>
+raw=<sum> per10k=<sum × 10>` per `PROBE_QUOTA` row, one `PROBE_WALL
+raw_s=<s> min_per_10k=<x> load_at_start=<a b c>` (for `--mp`,
+`min_per_2000`), one `PROBE_CPU user_sys_s=<s>`, and one `PROBE_FAIL
+<class> <seed> r<n> <the round's o1, o2 or o3 text cut to 80
+characters>` per failing round, read from the JSON with `python3 -I`.
+For `--mp`, the `per10k` field holds `raw × 10`, which is the
+2,000-seed set's count. The README row per rung records: the rung, the
+knobs, every changed row's raw and per-10k count, Q4, Q4-I, Q5a, Q7,
+Q18, wall per 10k with the load, user+sys, failing rounds by class,
+and "probe, not evidence".
+
+**New classes (X5-R16).** Seeds 221, 423, 370, 151 and 190 on retuned
+knobs are C-XX (REFRESH 8) and are recorded. A class C round with an
+O-1 failure and no `XX001` in its texts, or any `PROBE_FAIL` class you
+cannot name from REFRESH 6 and 8, is a STOP: the row is committed and
+the attempt ends with an ESCALATE naming the seed. Workers do not
+triage it.
+
+**Run hygiene (X5-R31).** Tests, single seeds and the probes below,
+each process running at most 200 contiguous seeds, under `ulimit -v
+25165824`. No `verify`, no `seeded-faults`, no wider run, no stress
+loops and no `scripts/gate.sh` in the attempt; no seed in
+`10000..30000`, ever; no seed filtering. Probe output and mutant
+copies go under `$CARGO_TARGET_DIR/x5f3-scratch/`; each mutant gets
+its own scratch export and its own target directory.
+
+### X-5c-F4-F3 probe rows
+
+One row per rung tried, in walk order (the ladder above is committed
+before the first of them). Every number is a **probe, not evidence**:
+`per10k` = raw × 10 over the 0..1000 sample (for `--mp`, the 200-seed
+sample, the count of the 2,000-seed judged set). "all rows" carries
+every quota row's per10k so each hold-set decision below can be
+re-derived. Wall is the five blocks' summed wall (minutes per 10k =
+raw_s/6); cpu is their summed user+sys; fails are the pass-fold
+failing rounds (class × count, seeds listed).
+
+- **rung 2.0 — the S1 anchor** (FINAL = S1: `r41_share` 1000,
+  `r41p_share` 500; nothing else): wall **21.7** min/10k (raw 130.2 s;
+  load 2.59 6.93 7.85; cpu 1698.7 s); Q4 1860, Q4-I 2160, Q5a 250,
+  Q7 190, Q18 5270. Changed rows (from BASE's whole-file numbers,
+  which are not this file's sample): Q4 186→1860, Q4-I 216→2160,
+  Q18 527→5270, SZC 53→530. All rows (per10k): Q1 7950 (per hook
+  680–850, all 10 hooks ≥ 300), Q2 4220, Q3 1260, Q4 1860, Q5a 250,
+  Q5b 8860, Q5c 6290, Q6a 2230, Q6b 810, Q7 190, Q8 40, Q9 12550,
+  Q10 1070, Q11 0, Q12 0, Q13a 870, Q13b 930, Q13c 940, Q14 550,
+  Q15 1140, Q16 5880, Q17 9370, Q18 5270, SIZING 9200 misses, SZC
+  530, SZC-MP 0 (this file), SZC-MW 60, SZI 130. Fails: MP ×2 (178
+  r1, 537 r0 — the two known E4-SILENT-1 baseline rounds in range).
+  Hold set at 2.0: Q4 1860 ≥ 1500 ✓, Q4-I 2160 ≥ 1500 ✓; rows met at
+  this setting (Q1 all hooks, Q2, Q3, Q4, Q4-I, Q5a/b/c, Q6a/b, Q9,
+  Q10, Q13a/b/c, Q14, Q15, Q16, Q17, Q18, SZC-MW); rows short with a
+  ladder still to come: Q7, Q8, Q11, Q12, SZC, SZI (and SZC-MP, judged
+  on the MP probe). Probe, not evidence.
+
+- **rung 3.1** (`drop_one_in` 2): wall **20.6** min/10k (raw 123.8 s;
+  load 5.45 8.44 8.43; cpu 1602.5 s); Q4 1440, Q4-I 1570, Q5a 300,
+  Q7 230, Q18 4520. Changed rows vs 2.0: Q4 1860→1440, Q4-I
+  2160→1570, Q7 190→230, Q8 40→90, Q18 5270→4520, SZC 530→360,
+  SZC-MW 60→30, SZI 130→90, Q5a 250→300. All rows (per10k): Q1 7960
+  (hooks 680–890, all ≥ 300), Q2 4260, Q3 1240, Q4 1440, Q5a 300,
+  Q5b 8760, Q5c 6400, Q6a 2220, Q6b 810, Q7 230, Q8 90, Q9 12850,
+  Q10 980, Q11 0, Q12 0, Q13a 900, Q13b 920, Q13c 900, Q14 580,
+  Q15 1150, Q16 5810, Q17 9160, Q18 4520, SIZING 9360 misses, SZC
+  360, SZC-MP 0 (this file), SZC-MW 30, SZI 90. Fails: MP ×2 (178 r1,
+  537 r0). **Rejected:** Q7 230 < 250 (margin), and the hold set
+  fails — Q4 1440 < 1,500 (the owner's bar; Q4's only raise path,
+  the r41 alignment, needs no-drop rounds, so more drops shrink it).
+  SZC-MW 30 < 50 is allowed (its ladder, step 7, is still to come).
+  Not kept. Probe, not evidence.
+
+- **rung 3.2** (`drop_one_in` 1): wall **17.8** min/10k (raw 106.9 s;
+  load 6.73 9.82 9.12; cpu 1405.3 s); Q4 90, Q4-I 120, Q5a 360,
+  Q7 320, Q18 2550. Changed rows vs 3.1: Q4 1440→90, Q4-I 1570→120,
+  Q7 230→320, Q5a 300→360, Q18 4520→2550, SZC 360→230, SZC-MW 30→40,
+  SZI 90→60. All rows (per10k): Q1 7990 (hooks 680–890, all ≥ 300),
+  Q2 4250, Q3 1250, Q4 90, Q5a 360, Q5b 8510, Q5c 6810, Q6a 2220,
+  Q6b 790, Q7 320, Q8 90, Q9 13000, Q10 940, Q11 0, Q12 0, Q13a 940,
+  Q13b 960, Q13c 950, Q14 530, Q15 1080, Q16 5570, Q17 8880,
+  Q18 2550, SIZING 9460 misses, SZC 230, SZC-MP 0 (this file),
+  SZC-MW 40, SZI 60. Fails: MP ×1 (537 r0). **Rejected:** Q7 320 ≥ 250
+  and the wall passes, but the hold set fails far harder — Q4 90 and
+  Q4-I 120, both far under the owner's 1,500 bars (a no-drop-eligible
+  round is almost gone at `drop_one_in` 1, so the r41 alignment that
+  raises Q4 has nothing to align). Not kept. Probe, not evidence.
+
+- **Q7 ladder outcome: ESCALATE.** Both rungs reach Q7's required 200
+  (230, 320) and neither exceeds the wall limit, but both fail the
+  hold set (Q4 under the owner's 1,500 bar at 3.1; Q4 90 / Q4-I 120
+  at 3.2), so per the stop rule FINAL keeps the setting before the
+  ladder — the 2.0 anchor, `drop_one_in` 3, reading **Q7 190 < 200**.
+  Q7 returns to the owner with every rung's numbers (owner decision:
+  no threshold moves). Later steps still run.
+
+- **rung 4.1** (`syncoff_table` `[0, 7, 7]`, on the 2.0 anchor): wall
+  **22.3** min/10k (raw 133.9 s; load 8.19 10.77 9.69; cpu 1763.3 s);
+  Q4 1850, Q4-I 2150, Q5a 240, Q7 190, Q18 5270. Changed rows vs 2.0:
+  Q8 40→70, Q4 1860→1850, Q4-I 2160→2150, Q5a 250→240, SZC 530→540,
+  SZI 130→140. All rows (per10k): Q1 7930 (hooks 680–850, all ≥ 300),
+  Q2 4200, Q3 1260, Q4 1850, Q5a 240, Q5b 8840, Q5c 6230, Q6a 2270,
+  Q6b 770, Q7 190, Q8 70, Q9 12590, Q10 1100, Q11 0, Q12 0, Q13a 860,
+  Q13b 950, Q13c 950, Q14 590, Q15 1160, Q16 5900, Q17 9360,
+  Q18 5270, SIZING 9190 misses, SZC 540, SZC-MP 0 (this file),
+  SZC-MW 60, SZI 140. Fails: MP ×2 (178 r1, 537 r0). Hold set and
+  wall pass; Q8 70 < 125 (margin) and < 100 (required) — the walk
+  continues. Not kept. Probe, not evidence.
+
+- **rung 4.2** (`syncoff_table` `[3, 7, 7]`, on the 2.0 anchor): wall
+  **22.8** min/10k (raw 136.7 s; load 7.77 11.24 10.17; cpu 1787.4 s);
+  Q4 1810, Q4-I 2200, Q5a 230, Q7 180, Q18 5250. Changed rows vs 4.1:
+  Q8 70→100, Q4 1850→1810, Q4-I 2150→2200, Q5a 240→230, Q7 190→180,
+  SZC 540→590, SZI 140→160. All rows (per10k): Q1 7930 (hooks 680–850,
+  all ≥ 300), Q2 4200, Q3 1270, Q4 1810, Q5a 230, Q5b 8970, Q5c 6380,
+  Q6a 2300, Q6b 740, Q7 180, Q8 100, Q9 12590, Q10 1120, Q11 0, Q12 0,
+  Q13a 890, Q13b 980, Q13c 950, Q14 570, Q15 1150, Q16 5900, Q17 9300,
+  Q18 5250, SIZING 9140 misses, SZC 590, SZC-MP 0 (this file),
+  SZC-MW 60, SZI 160. Fails: MP ×2 (178 r1, 537 r0). Hold set and wall
+  pass; Q8 100 ≥ 100 (required) but < 125 (margin) — the walk
+  continues to 4.3. Probe, not evidence.
+
+- **rung 4.3** (4.2 and `keep_latest_pm_table`
+  `[100, 100, 300, 500, 700]`): wall **22.8** min/10k (raw 137.0 s;
+  load 10.30 12.49 10.95; cpu 1785.6 s); Q4 1810, Q4-I 2250, Q5a 220,
+  Q7 180, Q18 5240. Changed rows vs 4.2: Q8 100→130, Q4-I 2200→2250,
+  Q5a 230→220, Q18 5250→5240. All rows (per10k): Q1 7930 (hooks
+  680–850, all ≥ 300), Q2 4210, Q3 1270, Q4 1810, Q5a 220, Q5b 8970,
+  Q5c 6380, Q6a 2310, Q6b 740, Q7 180, Q8 130, Q9 12600, Q10 1110,
+  Q11 0, Q12 0, Q13a 880, Q13b 980, Q13c 920, Q14 560, Q15 1150,
+  Q16 5900, Q17 9330, Q18 5240, SIZING 9140 misses, SZC 590, SZC-MP 0
+  (this file), SZC-MW 60, SZI 160. Fails: MP ×2 (178 r1, 537 r0).
+  **Stop-and-keep: Q8 130 ≥ 125 (required 100 × 1.25), the hold set
+  passes (Q4 1810 and Q4-I 2250 over the owner's 1,500 bars; every row
+  that met its minimum at 4.2 still does) and the wall passes.** The
+  last kept setting is now 4.3. Probe, not evidence.
+
+- **rung 5.1** (`w11_share` 100, on 4.3): wall **22.8** min/10k (raw
+  136.8 s; load 6.74 11.74 11.08; cpu 1789.3 s); Q4 1810, Q4-I 2250,
+  Q5a 210, Q7 180, Q18 5240. Changed rows vs 4.3: Q11 0→270, Q8
+  130→300, Q5a 220→210, Q5b 8970→8630, Q5c 6380→6060. All rows
+  (per10k): Q1 7930 (hooks 680–850, all ≥ 300), Q2 4210, Q3 1280,
+  Q4 1810, Q5a 210, Q5b 8630, Q5c 6060, Q6a 2280, Q6b 810, Q7 180,
+  Q8 300, Q9 12760, Q10 1120, Q11 270, Q12 0, Q13a 890, Q13b 990,
+  Q13c 940, Q14 530, Q15 1150, Q16 5940, Q17 9420, Q18 5240, SIZING
+  9130 misses, SZC 580, SZC-MP 0 (this file), SZC-MW 60, SZI 160.
+  Fails: MP ×2 (178 r1, 537 r0). **Stop-and-keep: Q11 270 ≥ 125
+  (required 100 × 1.25), the hold set passes — Q4 1810 and Q4-I 2250
+  over the owner's bars, and Q5a (watched) 210 ≥ 200 — and the wall
+  passes.** The last kept setting is now 5.1. Probe, not evidence.
+
+- **rung 6.1** (`w12_share` 100, on 5.1): wall **23.1** min/10k (raw
+  138.7 s; load 9.41 12.24 11.48; cpu 1807.0 s); Q4 1810, Q4-I 2250,
+  Q5a 200, Q7 170, Q18 5250. Changed rows vs 5.1: Q12 0→210, Q11
+  270→330, Q5a 210→200, Q8 300→230, Q5b 8630→8020, Q5c 6060→5470.
+  All rows (per10k): Q1 7930 (hooks 680–850, all ≥ 300), Q2 4250,
+  Q3 1290, Q4 1810, Q5a 200, Q5b 8020, Q5c 5470, Q6a 2180, Q6b 960,
+  Q7 170, Q8 230, Q9 12740, Q10 1140, Q11 330, Q12 210, Q13a 890,
+  Q13b 990, Q13c 940, Q14 520, Q15 1160, Q16 5970, Q17 9560, Q18 5250,
+  SIZING 9070 misses, SZC 620, SZC-MP 0 (this file), SZC-MW 60,
+  SZI 150. Fails: MP ×2 (178 r1, 537 r0). **Stop-and-keep: Q12 210 ≥
+  125 (required 100 × 1.25), the hold set passes — Q4 1810 and Q4-I
+  2250 over the owner's bars, Q5a (watched) exactly 200 (not below its
+  minimum), Q11 330 and Q8 230 over theirs — and the wall passes.**
+  The last kept setting is now 6.1. Probe, not evidence.
+
+- **rung 7.1** (`ckpt_every` 8–12, on 6.1): wall **25.1** min/10k (raw
+  150.4 s; load 9.83 12.47 11.78; cpu 1957.7 s); Q4 1620, Q4-I 2170,
+  Q5a 120, Q7 30, Q18 4400. Changed rows vs 6.1: SZC 620→500, SZI
+  150→180, Q5a 200→120, Q4 1810→1620, Q7 170→30, Q18 5250→4400, Q9
+  12740→10020, Q10 1140→500. All rows (per10k): Q1 8060 (hooks 680–920,
+  all ≥ 300), Q2 4350, Q3 1340, Q4 1620, Q5a 120, Q5b 6800, Q5c 5300,
+  Q6a 1980, Q6b 1260, Q7 30, Q8 210, Q9 10020, Q10 500, Q11 270,
+  Q12 210, Q13a 810, Q13b 920, Q13c 930, Q14 510, Q15 1360, Q16 6140,
+  Q17 9360, Q18 4400, SIZING 9040 misses, SZC 500, SZC-MP 10 (this
+  file), SZC-MW 50, SZI 180. Fails: MP ×2 (17 r0, 787 r0 — a redraw:
+  the knobs moved every draw; both are the same known O-3(e) MP shape
+  as the baseline's 19). **Rejected:** the ladder's rows are short
+  (SZC 500 < 1,250, SZC-MW 50 < 62.5, SZI 180 < 375) and the hold set
+  fails — Q5a 120 < 200 (it met 200 at 6.1). Not kept. Probe, not
+  evidence.
+
+- **rung 7.2** (7.1 and `value_lo` 280): wall **27.0** min/10k (raw
+  161.9 s; load 9.49 12.72 12.13; cpu 2132.4 s); Q4 1630, Q4-I 2180,
+  Q5a 170, Q7 20, Q18 4360. Changed rows vs 7.1: SZC 500→890, SZC-MW
+  50→90, SZI 180→360, Q5a 120→170, Q11 270→380, Q12 210→220, Q8
+  210→330, Q14 510→410, Q6a 1980→1790, Q6b 1260→1440. All rows
+  (per10k): Q1 8000 (hooks 680–900, all ≥ 300), Q2 4290, Q3 1300,
+  Q4 1630, Q5a 170, Q5b 6460, Q5c 4890, Q6a 1790, Q6b 1440, Q7 20,
+  Q8 330, Q9 9960, Q10 650, Q11 380, Q12 220, Q13a 860, Q13b 1000,
+  Q13c 940, Q14 410, Q15 1320, Q16 6480, Q17 9740, Q18 4360, SIZING
+  8600 misses, SZC 890, SZC-MP 0 (this file), SZC-MW 90, SZI 360.
+  Fails: none in 0..1000 (the redraw moved the failing rounds out of
+  the sample; nothing new appeared). **Rejected:** SZC 890 < 1,250 and
+  SZI 360 < 375 (SZC-MW 90 ≥ 62.5), and the hold set still fails —
+  Q5a 170 < 200. Not kept. Probe, not evidence.
+
+- **rung 7.3** (7.2 and chunked 700–900): wall **41.8** min/10k (raw
+  250.7 s; load 9.45 13.17 12.56; cpu 3355.2 s); Q4 1670, Q4-I 2160,
+  Q5a 230, Q7 50, Q18 4290. Changed rows vs 7.2: SZC 890→2390, SZC-MW
+  90→140, SZI 360→810, Q5a 170→230, Q11 380→450, Q12 220→270, Q10
+  650→460, Q9 9960→10220, SIZING 8600→7110. All rows (per10k): Q1
+  7990 (hooks 680–900, all ≥ 300), Q2 4370, Q3 1310, Q4 1670, Q5a 230,
+  Q5b 6920, Q5c 5420, Q6a 2160, Q6b 1210, Q7 50, Q8 340, Q9 10220,
+  Q10 460, Q11 450, Q12 270, Q13a 890, Q13b 960, Q13c 970, Q14 400,
+  Q15 1280, Q16 6770, Q17 10420, Q18 4290, SIZING 7110 misses, SZC
+  2390, SZC-MP 0 (this file), SZC-MW 140, SZI 810. Fails: none in
+  0..1000. **Rejected:** every ladder row reaches its margin (SZC
+  2390 ≥ 1,250, SZC-MW 140 ≥ 62.5, SZI 810 ≥ 375) — but the wall
+  limit fails (41.8 > 40), which ends the ladder's walk, and the hold
+  set fails too (Q10 460 < 500, met at 6.1). Not kept. Probe, not
+  evidence.
+
+- **SZC ladder outcome (steps 7–8): ESCALATE.** Rungs 7.4–7.5 (step 8)
+  never run: 7.3 is over the wall limit, which ends the walk. No rung
+  passes the hold set and wall limit together (7.1 and 7.2 fail Q5a ≥
+  200; 7.3 fails the wall and Q10 ≥ 500), so FINAL keeps the setting
+  before the ladder — 6.1 — reading **SZC 620 < 1,000 and SZI 150 <
+  300** (SZC-MW 60 ≥ 50 is met there). Both rows return to the owner
+  with every rung's numbers, exactly the card's stated likely ESCALATE
+  (REFRESH 6's k4/k5 read Q5a short too; the sample here reads Q5a
+  120/170/230 across the rungs against the 200 it must not fall
+  below). Later steps still run. Probe, not evidence.
+
+- **rung 9.0** (`MP_PRESSURE` = the kept FINAL 6.1; read with
+  `--mp`): wall **2.9** min/2000 (raw 17.7 s; load 10.75 13.82 13.25;
+  cpu 222.2 s); SZC-MP **raw 0**, per10k 0. Other rows (per10k = raw
+  × 10, the 2,000-seed set's count, INFO here — only SZC-MP is an
+  exit row in the `mp-pressure` set): Q1 1110 (hooks 100–120), Q2 220,
+  Q3 60, Q4 240, Q4-I 70, Q5a 80, Q5b 1070, Q5c 710, Q6a 210, Q6b 140,
+  Q7 20, Q8 0 (class C only), Q9 1730, Q10 100, Q11 10, Q12 60,
+  Q13a 920, Q13b 950, Q13c 820, Q14 620, Q15 0 (MW only), Q16 860,
+  Q17 1020, Q18 220, SIZING 1980 misses, SZC 0, SZC-MW 0, SZI 0.
+  Fails: MP ×3 (30178 r0, 30528 r0, 30837 r0 — the known O-1(a)
+  MP shape). SZC-MP 0 < 125: the ladder runs. The main file's hold
+  bars (Q4/Q4-I ≥ 1,500) are unaffected by this ladder — it edits
+  `MP_PRESSURE` only, and FINAL stays the kept 6.1 (Q4 1810, Q4-I
+  2250). Probe, not evidence.
+
+- **rung 9.1 (k1)** (chunked 900–1,200, budget 20–31, GC 12,
+  `ckpt_every` 4–8, `burst_frac` 600, `burst_gc_loops` 8,
+  `w11_share` 200, `w12_share` 200 — `MP_PRESSURE` only, over FINAL):
+  wall **5.7** min/2000 (raw 34.4 s; load 5.18 11.71 12.58; cpu
+  416.0 s); SZC-MP **raw 2**, per10k 20. Changed rows vs 9.0 (per10k):
+  SZC-MP 0→20, SZC 0→20, Q11 10→30, Q18 220→250, Q5b 1070→1130,
+  Q13b 950→1050, Q14 620→530, Q2 220→180, Q3 60→50. Other rows
+  (per10k, INFO): Q1 1110 (hooks 100–130), Q2 180, Q3 50, Q4 230,
+  Q4-I 80, Q5a 70, Q5b 1130, Q5c 760, Q6a 250, Q6b 190, Q7 30, Q8 0,
+  Q9 1830, Q10 100, Q11 30, Q12 60, Q13a 950, Q13b 1050, Q13c 910,
+  Q14 530, Q15 0, Q16 920, Q17 1090, Q18 250, SIZING 1920 misses,
+  SZC 20, SZC-MW 0, SZI 0. Fails: MP ×2 (30037 r0, 30337 r0 — the
+  known O-1(a) MP shape). SZC-MP 20 < 125; the wall passes — the walk
+  continues. Probe, not evidence.
+
+- **rung 9.2** (9.1 with `ckpt_every` 8–12): wall **6.2** min/2000
+  (raw 37.4 s; load 5.91 11.02 12.30; cpu 501.0 s); SZC-MP **raw 1**,
+  per10k 10. Changed rows vs 9.1 (per10k): SZC-MP 20→10, SZC 20→10,
+  Q10 100→40, Q11 30→70, Q12 60→80, Q2 180→240, Q3 50→80, Q13b
+  1050→1130, Q5b 1130→890. Other rows (per10k, INFO): Q1 1130 (hooks
+  100–130), Q2 240, Q3 80, Q4 230, Q4-I 90, Q5a 70, Q5b 890, Q5c 710,
+  Q6a 210, Q6b 230, Q7 60, Q8 0, Q9 1420, Q10 40, Q11 70, Q12 80,
+  Q13a 970, Q13b 1130, Q13c 950, Q14 500, Q15 0, Q16 960, Q17 1070,
+  Q18 220, SIZING 1950 misses, SZC 10, SZC-MW 0, SZI 0. Fails: MP ×3
+  (30098 r1, 30337 r0, 30697 r0 — the known O-1(a)/O-3(e) MP shapes).
+  SZC-MP 10 < 125 — lower than 9.1's 20; the wall passes, the walk
+  continues. Probe, not evidence.
+
+- **rung 9.3 (k2)** (9.1 with `ckpt_every` 12–19): wall **7.1**
+  min/2000 (raw 42.9 s; load 7.66 10.86 12.18; cpu 553.7 s); SZC-MP
+  **raw 2**, per10k 20. Changed rows vs 9.2 (per10k): SZC-MP 10→20,
+  SZC 10→20, Q10 40→0, Q11 70→20, Q12 80→100, Q16 960→1010, Q17
+  1070→1140, Q18 220→170, Q4 230→180, Q4-I 90→110, Q5a 70→40, Q6a
+  210→270. Other rows (per10k, INFO): Q1 1180 (hooks 100–150), Q2 230,
+  Q3 90, Q4 180, Q4-I 110, Q5a 40, Q5b 880, Q5c 720, Q6a 270, Q6b 250,
+  Q7 20, Q8 0, Q9 1440, Q10 0, Q11 20, Q12 100, Q13a 950, Q13b 1100,
+  Q13c 940, Q14 470, Q15 0, Q16 1010, Q17 1140, Q18 170, SIZING 1900
+  misses, SZC 20, SZC-MW 0, SZI 0. Fails: MP ×4 (30297 r0, 30337 r0,
+  30368 r0, 30697 r0 — the known O-1(a)/O-3(e) MP shapes). SZC-MP 20 <
+  125. Probe, not evidence.
+
+- **MP ladder outcome (step 9): ESCALATE.** No rung reaches SZC-MP's
+  required 100 per-2000 (raw counts 0, 2, 1, 2 — REFRESH 6's warning
+  that MP rests on 1–7 raw hits is what the sample shows); every wall
+  passes. `MP_PRESSURE` keeps the rung with the highest count: 9.1
+  and 9.3 tie at raw 2 (20 per10k) and 9.1 is the earlier rung by
+  rising cost, so the kept setting is 9.1's (chunked 900–1,200, budget
+  20–31, GC 12, `ckpt_every` 4–8, `burst_frac` 600, `burst_gc_loops`
+  8, `w11_share` 200, `w12_share` 200). The row returns to the owner
+  with every rung's numbers. Probe, not evidence.
+
+## Card X-5c-F4-F3's record
+
+card: X-5c-F4-F3   branch: card/v3-X-5c-F4-F3   commit: (step 11's;
+the chain step 0 `47997218` → step 1 `84d3af0f` → step 2 `618249b9` →
+3.1 `3ebbd4ff` → 3.2 `13b44794` → 4.1 `99755181` → 4.2 `36d5af11` →
+4.3 `e86e4ee0` → 5.1 `7431485b` → 6.1 `0775b735` → 7.1 `e245dc0d` →
+7.2 `6b260312` → 7.3 `db572b5f` → the 7 outcome `b2734406` → 9.0
+`fa22795f` → 9.1 `e4a0b4ed` → 9.2 `2bf64b9d` → 9.3 `2150ba9d` → the
+9 outcome `6f81f253` → step 10 `025b148e` + its archive fix `7b8ca47a`
+→ here)
+
+**1. The retune list** (every number a probe over 0..1000 × 10, or the
+200-seed MP set × 10 — never evidence; the probe rows above carry each
+rung's full table):
+
+| ladder | rungs tried | outcome |
+|---|---|---|
+| Q7 ≥ 200 (margin 250) | 3.1 (230), 3.2 (320) | **ESCALATE** — both fail the hold set (Q4 1440 / 90 under the owner's 1,500 bar); kept the 2.0 anchor, which reads Q7 **170** (corrected by X-5c-F4-F4 from "190": rungs 4.2 and 6.1 moved the kept setting off the anchor's 190) |
+| Q8 ≥ 100 (margin 125) | 4.1 (70), 4.2 (100), 4.3 (130) | **stop-and-keep at 4.3** (130 ≥ 125, hold and wall pass) |
+| Q11 ≥ 100 (margin 125) | 5.1 (270) | **stop-and-keep at 5.1** (Q5a watched: 210) |
+| Q12 ≥ 100 (margin 125) | 6.1 (210) | **stop-and-keep at 6.1** (Q5a watched: exactly 200, not below) |
+| SZC ≥ 1,000, SZC-MW ≥ 50, SZI ≥ 300 (margins 1,250 / 62.5 / 375) | 7.1 (500/50/180), 7.2 (890/90/360), 7.3 (2390/140/810) | **ESCALATE** — 7.3 reaches every margin but the wall limit fails (41.8 min/10k > 40, which ends the walk) and Q10 460 < 500; 7.1/7.2 fail Q5a ≥ 200; kept the pre-ladder 6.1 reading SZC 620, SZC-MW 60, SZI 150. Rungs 7.4–7.5 (step 8) never ran |
+| SZC-MP ≥ 100 per-2000 (margin 125) | 9.0 (raw 0), 9.1 (raw 2), 9.2 (raw 1), 9.3 (raw 2) | **ESCALATE** — no rung reaches 100 (raw counts 0–2, as REFRESH 6 warned); kept 9.1 (highest count, earliest by rising cost; 9.3 ties it at raw 2) |
+
+**No `thin` rows**: no ladder ended in the "reaches the required count
+but never the margin" branch — every ladder either stopped at the
+margin (Q8, Q11, Q12) or kept a rung under the ESCALATE rule's
+fallback (SZC: the pre-ladder setting, since no rung passed the hold
+set and wall limit; MP: the highest-count rung 9.1).
+
+**2. New classes (X5-R16): none appeared.** Across all 13 probes'
+JSONs, every failing round is class MP with the two known baseline
+shapes (O-3(e) slot-reported and O-1(a) published≠model) — 24 failing
+rounds in total, listed rung by rung in the probe rows. No class C
+round failed anywhere, so the "class C round with an O-1 failure and
+no XX001" STOP never fired, and none of REFRESH 8's C-XX seeds (221,
+423, 370, 151, 190) appears as a failing round on any rung's sample.
+
+**3. The final setting** (all numbers are the kept setting's probe
+reading, per 10k, against the row's minimum):
+
+- `Tuning::FINAL` = S1 on the 6.1 kept rung: BASE with
+  `syncoff_table` `[3, 7, 7]`, `keep_latest_pm_table`
+  `[100, 100, 300, 500, 700]`, `w11_share` 100, `w12_share` 100,
+  `r41_share` 1000, `r41p_share` 500 — every other field is BASE's
+  (`drop_one_in` 3, `ckpt_every` 4–5, chunked 320–701, `value_lo` 8,
+  budget 18–20, GC 2–5, no bursts).
+- `Tuning::MP_PRESSURE` = FINAL with the kept 9.1 ladder fields:
+  chunked 900–1,201, budget 20–32, GC 12, `ckpt_every` 4–8 (equal to
+  FINAL's own here), `burst_frac` 600, `burst_gc_loops` 8,
+  `w11_share` 200, `w12_share` 200.
+- Kept probe numbers (minimum): Q4 1,810 (1,000; owner bar 1,500 ✓),
+  Q4-I 2,250 (1,000; owner bar 1,500 ✓), Q5a 200 (200, at it), Q7 170
+  (**200 — ESCALATE**; corrected by X-5c-F4-F4 from "190"), Q8 130
+  (100 ✓), Q11 330 (100 ✓), Q12 210 (100 ✓), Q18 5,250 (1,000 ✓),
+  SZC 620 (**1,000 — ESCALATE**), SZC-MW 60 (50 ✓), SZI 150
+  (**300 — ESCALATE**), SZC-MP 20 = raw 2
+  (**100 — ESCALATE**, per-2000), and every other row over its
+  minimum (the 6.1 and 9.1 probe rows above hold each one).
+
+**4. The MP-pressure tuning** (the 200-seed `--probe mp-pressure`
+sample; `per10k` = raw × 10 = the 2,000-seed set's count): rung 9.1
+reads SZC-MP **raw 2 → 20**, wall 5.7 min per 2,000, cpu 416.0 s; the
+other rungs read raw 0 (9.0), 1 (9.2), 2 (9.3). MP rests on 1–7 raw
+hits per row, as REFRESH 6's table warned — the raw counts are the
+numbers to read.
+
+**5. CPU, both figures — corrected by X-5c-F4-F4 (see the Corrections
+list): both figures are VOID, and no usable CPU figure exists for S1
+or for FINAL.** The lines below are the runner's real Acceptance lines
+(`$CARGO_TARGET_DIR/x5f3/cpu.out`, 13:35), quoted in the F3 verdict:
+
+```
+CPU_TERM passes=3 terms=[57.90,56.45,54.93] term=56.45 foreign_pct=53.93 verdict=VOID
+CPU_WHOLE_FINAL passes=3 terms=[59.81,63.70,62.59] term=62.03 wall_ratio=61.36
+```
+
+Both runs are VOID (the load wait timed out; foreign CPU read
+53.93%). The `+48.58` and `+51.71` this record previously pasted came
+from a measuring run made inside the attempt, which the card banned,
+and the claim that "this attempt never ran the measuring form" was
+false — both withdrawn. The arms of the runner's run were checked in
+the F3 verdict (BASE the base's FINAL, S1 only the two `r41` knobs,
+FINAL HEAD's). The orchestrator's idle-host run is pending.
+X-5c-F4-F4's FINAL (7.3) changes the whole-FINAL figure, and not the
+S1 term. The +60% bar binds only the first (`CPU_TERM`, the S1 term);
+`CPU_WHOLE_FINAL` is reported and is never an exit input.
+
+**6. ESCALATE** — four rows return to the owner with every rung's
+numbers (the probe rows above): **Q7** (kept reading **170** < 200 —
+corrected by X-5c-F4-F4 from "190"; rungs 3.1/3.2 reach 230/320 but
+both fail the hold set — Q4 1,440/90 against
+the owner's 1,500 bar), **SZC** (620 < 1,000) and **SZI** (150 < 300)
+(their ladder's 7.3 reaches 2,390/810 but at 41.8 min/10k over the
+40-minute wall limit, which ends the walk — measured with the host's
+1-minute load at 9.5–15.3 during the blocks, our own 16 threads
+included — and with Q10 460 < 500; 7.1/7.2 fail Q5a ≥ 200), and
+**SZC-MP** (raw 2 → 20 < 100 per-2000; no rung of 9.0–9.3 reaches it,
+raw 0–2). Per the owner decisions of 2026-11-10, no threshold moved.
+
+**7. Post-data amendments: none.** No threshold, ladder, rung, knob,
+margin or stop rule changed after any probe; every rung tried is in
+the card, and the ladder section above was committed before the first
+probe row.
+
+### Judgment calls (documented)
+
+- **Step 1's commit changes exactly the two constants and the docs of
+  exactly those two constants.** The `r41_share`/`r41p_share` field
+  docs and the `FINAL`/`Tuning` doc lines that said "0 in this card's
+  FINAL" would have read false after S1; they now name S1 and the
+  ruling. No other `src/` line changed (the worktree diff of step 1's
+  commit is the two values plus those doc lines).
+- **Two X-5c-F4-F2-era pins updated where this card's Goal breaks
+  their invariant**: `x5_r44_tuning_id_is_mp_pressure_for_that_set_only`
+  pinned `FINAL == BASE` (step 1's whole point is to end that) and
+  `MP_PRESSURE == FINAL` (step 9's ladder fields end that). Both keep
+  their M-MP-TUNING id half; the replacements pin FINAL ≠ BASE and
+  hand the constants' relationship to
+  `x5_r37_mp_pressure_differs_only_in_ladder_fields`.
+- **`x5_probe.sh` prints `PROBE_HOOK` lines beyond the card's four
+  line kinds**: `PROBE_QUOTA` prints every Q1 row as "Q1" with no hook
+  name, so the hold set's per-hook Q1 rows ("no row that met its
+  minimum falls below it") cannot be read from the named lines alone;
+  the hooks are counted from the same probe JSONs. The four named line
+  kinds print exactly as the card writes them.
+- **The MP ladder's hold set**: the owner's Q4/Q4-I ≥ 1,500 bars are
+  main-file bars — the step 9 ladder edits `MP_PRESSURE` only, so
+  FINAL's 6.1 reading (1,810/2,250) carries them untouched; within the
+  MP probe only SZC-MP is an exit row of the `mp-pressure` set, and no
+  other row's minimum is defined against the 2,000-seed MP set, so the
+  ladder's rows read SZC-MP alone (the rung rows still record every
+  other row as INFO).
+- **9.1 vs 9.3 tie-break**: both read SZC-MP raw 2; 9.1 is kept as the
+  earlier rung, per "rung order is by rising cost".
+- **`x5_probe.sh`'s time capture**: bash 5.2 prints no `time` report
+  for `time ( exec … )` — measured, and the child's user+sys is
+  counted correctly without `exec` (verified against a CPU burner).
+  The script's blocks therefore run `( ulimit …; "$BIN" … >out 2>err )`.
+- **The first anchor probe's wall/cpu lines read 0.0** (that bash
+  quirk) before any row was committed; the tool was fixed and the
+  anchor re-run — its quota rows were identical both times. No
+  committed row was ever re-run.
+- **Attempt 2 reconstructed rung 9.3's commit**: the 9.3 probe had
+  run and been recorded when the 60-minute cap killed the attempt
+  before its commit; the restart rule found 9.3 uncommitted, its
+  constants were re-set and its row committed from the recorded probe,
+  then the outcome commit reverted `MP_PRESSURE` to 9.1. No probe was
+  re-run.
+- **The first mutant pass (mut3-*) was a false positive**: exports
+  archived from `nucleus/v3` omit `nucleus/v2`, so workspace manifest
+  loading failed and every "caught" was a build error. All seven code
+  mutants were re-run (mut4-*) from worktree-root archives with the
+  named test's failure verified in the output. The same root-archive
+  rule is now in `x5_cpu_term.sh` (its own arms had the same bug —
+  fixed before any measuring run, self-test unchanged).
+
+### Mutants (each row applied to its own scratch copy under
+### `$CARGO_TARGET_DIR/x5f3-scratch/` — its own export and target
+### directory for the code rows, its own script copy for the CPU rows;
+### the worktree never held a mutant)
+
+| mutant | catching test |
+|---|---|
+| M-FINAL-R41 (`Tuning::FINAL`'s `r41_share` 999) | `x5_r37_final_r41_is_s1` (mut4) |
+| M-FINAL-R41P (`r41p_share` 499) | `x5_r37_final_r41_is_s1` (mut4) |
+| M-BASE-EDIT (`Tuning::BASE`'s `r41_share` 1000) | `x5_r37_base_tuning_reproduces_1b0ce54e` (mut4) |
+| M-RANGE-VALUE (`Tuning::FINAL`'s `value_lo` 7) | `x5_r37_final_stays_in_card_ranges` (mut4) |
+| M-RANGE-SHARE (`w11_share` 300 in `MP_PRESSURE`) | `x5_r37_final_stays_in_card_ranges` (mut4) |
+| M-MP-R41 (`MP_PRESSURE`'s `r41_share` 500) | `x5_r37_mp_pressure_r41_equals_final` (mut4) |
+| M-MP-OTHERFIELD (`MP_PRESSURE`'s `delete_one_in` 3) | `x5_r37_mp_pressure_differs_only_in_ladder_fields` (mut4) |
+| M-CPU-TERM-FROM-FINAL (the bar's term from the FINAL arm) | `--self-test` (mut/) |
+| M-CPU-WHOLE-FROM-S1 (`CPU_WHOLE_FINAL` from the S1 arm) | `--self-test` (mut/) |
+| M-CPU-WHOLE-EXITS (`CPU_WHOLE_FINAL` above +60 fails the exit) | `--self-test` (mut/) |
+| M-CPU-NOMEDIAN (the first pass, not the median of three) | `--self-test` (mut/) |
+| M-CPU-BOUNDARY (+60.00 reads `OVER`) | `--self-test` (mut/) |
+| M-CPU-NOFOREIGN (the foreign check removed) | `--self-test` (mut/) |
+
+None survives. Each code row's sed and each CPU row's sed were
+verified to apply (the mutated literal greps present) before the test
+ran, and each code row's output was checked for the named test's
+`FAILED` line, not just a non-zero exit.
+
+### RESULT (card X-5c-F4-F3)
+
+1. The retune list is above (item 1); the probe rows section holds
+   every rung's full numbers.
+2. New classes: none appeared (item 2).
+3. The final setting is above (item 3).
+4. The MP-pressure tuning is above (item 4), raw counts included.
+5. CPU, both figures: the two Acceptance lines, pasted in the block
+   in item 5 (this host's re-run of the Acceptance line; P's gate
+   re-runs it); the +60% bar binds only `CPU_TERM`.
+6. ESCALATE: Q7, SZC, SZI, SZC-MP (item 6), with every rung's numbers.
+7. Post-data amendments: none.
+
+### Anomalies
+
+- **Step 11's first commit subject reads "neutronus v3:"** — a typo
+  for the required `nucleus v3:` prefix (no amend and no rebase, so it
+  stands); this commit carries the correction note. No Acceptance
+  line greps that subject; the one subject an Acceptance line greps
+  (step 1's) is exact.
+- **The folded parent card is absent**: `cards/X-5c-F4.local.md`
+  (REFRESH 4–10) is not in this worktree, as in X-5c-F4-F2's and
+  E4-SILENT-1's runs before it; the card's own Goal/Work text and the
+  verdicts (`X-5c-F4-F1.md` carries REFRESH 6 and 7 verbatim) were
+  used, which is the reading F4-F2's verdict recorded for its own
+  folded cards.
+- **`gate.sh` in this session reads `GATE EXIT=1`** on
+  `enforcement-tests` alone — `runner e2e: K` (SIGTERM kills opencode
+  and closes the ledger range), the exact red the card predicts for a
+  worker session ("the runner's Acceptance is the truth"; the
+  X-5c-F4-F1-F1-F3-F1 verdict measured the same step green outside
+  the worker container). Every other step (test, clippy, fmt, deny,
+  wasm32, core-paths-selftest) is EXIT=0.
+- **The 7.3 wall reading is load-context-dependent**: 41.8 min/10k
+  against a 40 limit, measured with the host's 1-minute load at
+  9.5–15.3 across the blocks (this card's own 16 threads included).
+  The stop rule was applied mechanically, as fixed; the owner reads
+  the number with its context.
+- **The benign `Unable to create …/.git/packed-refs.lock: Read-only
+  file system` line** appears on every commit (known from the base
+  chain; every commit lands — the log and the clean tree confirm).
+- **The run-hygiene breach of attempt 2 (recorded by X-5c-F4-F4, from
+  the F3 verdict's "Hygiene breach"; absent from this record until
+  now).** In attempt 2 the F3 worker ran `seeded-faults --seeds
+  0..200`, the measuring form of `x5_cpu_term.sh` and
+  `scripts/gate.sh`, all banned in the attempt (the card's Run
+  hygiene and "Do not" list them). No forbidden seed was touched. The
+  record cost is item 5's correction above.
+
+### Corrections (X-5c-F4-F4)
+
+Folding X-5c-F4-F3-F1 (the F3 verdict's "Record defects"). Each entry
+quotes the old text it replaces or corrects; the ladder section and
+the probe rows stay byte-identical (Limit 4: they are history).
+
+1. **Q7 at the kept 6.1 setting is 170, not 190.** Corrected above in
+   item 1's Q7 row (old text: "kept the 2.0 anchor reading Q7 190"),
+   item 3's kept numbers (old: "Q7 190 (**200 — ESCALATE**)") and
+   item 6 (old: "**Q7** (kept reading 190 < 200"). The ladder record's
+   Q7 outcome block — "**Q7 ladder outcome: ESCALATE.** … the 2.0
+   anchor, `drop_one_in` 3, reading **Q7 190 < 200**" — stays
+   byte-identical, so the correction lives here: at the KEPT setting
+   (6.1) Q7 reads **170**; the drift from the 2.0 anchor's own 190
+   came from rungs 4.2 (180) and 6.1 (170) — 2 raw rounds. 170 is
+   also under REFRESH 10's Q7 floor of 190 (S1's count).
+2. **Item 5 (CPU) replaced.** Old opening: "**5. CPU, both figures** —
+   this attempt never ran the measuring form while tuning (card Work
+   10: it is the Acceptance's). The Acceptance line was re-run at the
+   end of the card on this host and produced the lines below, pasted
+   verbatim"; the old pasted block read
+   `CPU_TERM passes=1 terms=[48.58] term=48.58 foreign_pct=48.39
+   verdict=VOID` and
+   `CPU_WHOLE_FINAL passes=1 terms=[51.71] term=51.71 wall_ratio=41.29`.
+   The replacement carries the runner's real Acceptance lines, both
+   VOID: no usable CPU figure exists for S1 or for FINAL.
+3. **The hygiene breach, now recorded under Anomalies** (old text:
+   absent). In attempt 2 the F3 worker ran `seeded-faults --seeds
+   0..200`, the measuring form of `x5_cpu_term.sh` and
+   `scripts/gate.sh`, all banned in the attempt. No forbidden seed
+   was touched.
+
+## Card X-5c-F4-F4's record
+
+card: X-5c-F4-F4   branch: card/v3-X-5c-F4-F4   commit: (step 5's;
+the chain step 0 `b3834a41` → step 1 `3df80afe` → step 2 `ad2ea24c`
+→ step 3 `5b73db6d` → step 4 `abcfd9cb` → here)
+
+**1. The kept setting's constants** (the step 1 literal, both
+tunings, pinned by `x5_r37_final_is_the_kept_setting`):
+
+- `Tuning::FINAL` = rung 7.3: `committers` 2/3, `trees` 2/3,
+  `keyspace` 1200/1801, `syncoff_table` [3, 7, 7],
+  `map_leaf_cap_table` [8, 16, 254], `freeset_leaf_bits_table`
+  [128, 512, 32_576], `r_epoch_table` [1, 2, 4],
+  `keep_latest_pm_table` [100, 100, 300, 500, 700], `tear_pm_table`
+  [100, 300, 500, 700, 900], `rounds_weights`
+  [1, 1, 1, 1, 1, 2, 2, 2, 3, 3], `target_ckpt_span` 3,
+  `ckpt_every` 8/5, `commit_budget` 18/20, `commit_ops` 1/20,
+  `chunked_ops` 700/201, `value_lo` 280, `value_hi` 400,
+  `delete_one_in` 4, `gc_sweeps` 2/3, `bulk_load_one_in` 4,
+  `drop_one_in` 3, `burst_frac` 0, `burst_gc_loops` 0, `w11_share`
+  100, `w12_share` 100, `r41_share` 1000, `r41p_share` 500.
+- `Tuning::MP_PRESSURE` = FINAL with the kept 9.1 ladder fields:
+  `ckpt_every` 4/5, `commit_budget` 20/12, `chunked_ops` 900/301,
+  `gc_sweeps` 12/1, `burst_frac` 600, `burst_gc_loops` 8,
+  `w11_share` 200, `w12_share` 200 — every other field FINAL's, so
+  its **`value_lo` is 280 by following FINAL** (recorded, not tuned;
+  X-5c-F4-F5 re-anchors MP on it).
+- **The `db572b5f` field check** (before step 1's commit): HEAD's
+  `pub const FINAL` block diffed against `db572b5f`'s over the 35
+  field lines — **identical**; only doc lines differ.
+
+**2. Rung 7.3's whole-10k reading from the F3 gate, labelled "the F3
+gate's probe, not evidence"**: SZC 2,491, SZI 779, SZC-MW 130, Q10
+615, Q5a 210 (thin), Q4 1,713, Q4-I 1,922, Q7 50, Q8 335, Q11 342,
+Q12 260, Q18 4,405.
+
+**3. X5-R54 and its derivation** — the decision section above carries
+them in full: the per-run box is 3,000 s (50 minutes) for the main
+and held-out sets, from 7.3's 45.4 min per 10k on an idle host (the
+F3 gate's probe form) with a 10% margin for run-to-run variance
+(45.4 × 1.10 = 49.94, rounded up to the whole minute); the
+MP-pressure set keeps 2,400 s. An owner-approved parameter, not a
+threshold.
+
+**4. The pins and their mutant counts** — measured at FINAL first
+(step 2's scratch run, single seeds only): 1069 `rounds.len()` 2,
+`twin_joint_arm` [false, true], `twin_joint_stale_reads` [0, 0];
+3669 `rounds.len()` 2, `twin_joint_arm` [false, true],
+`twin_joint_stale_reads` [0, 0] — the arm runs in round 1 alone of
+each seed, zero stale reads, exactly the census's `arm_rounds=2`.
+Pins `x5f4_joint_arm_live_at_1069_is_fresh` and
+`x5f4_joint_arm_live_at_3669_is_fresh`;
+`r48_joint_supply_is_fresh_at_7469` (BASE) unchanged. Under
+**G5-R48-TREADS-KEPT** (drop `treads.clear()`, scratch export) both
+pins fail their stale-read assertion with stale counts **12** (1069)
+and **56** (3669).
+
+**5. Rows still short at 7.3:** **Q7** (50, against row 200 and floor
+190) and **SZC-MP** (14 over the 2,000 MP seeds of `0..10000` at
+9.1, against 100). Both are X-5c-F4-F5's. Q7 is a 5.6 exit row of
+`verify --set main`: until -F5 lands a fix, the final run's main
+`verify` would exit on it.
+
+**6. The mutant table** (each row on its own scratch export of the
+worktree root or its own script copy under
+`$CARGO_TARGET_DIR/x5f4-scratch/`, each shown failing by its FAILED
+or panic line, not just a non-zero exit; the worktree never held a
+mutant):
+
+| mutant | catching test |
+|---|---|
+| G-FINAL-SYNCOFF-BASE (FINAL's `syncoff_table` [0, 3, 7]) | `x5_r37_final_is_the_kept_setting` |
+| G-FINAL-W11-OFF (FINAL's `w11_share` 0) | `x5_r37_final_is_the_kept_setting` |
+| M-FINAL-NOT-73 (FINAL's `value_lo` 8) | `x5_r37_final_is_the_kept_setting` |
+| M-MP-GC (MP_PRESSURE's `gc_sweeps_lo` 11) | `x5_r37_final_is_the_kept_setting` |
+| M-BASE-EDIT (BASE's `value_lo` 280) | `x5_r37_base_tuning_reproduces_1b0ce54e` |
+| G5-R48-TREADS-KEPT (drop `treads.clear()`) | `x5f4_joint_arm_live_at_1069_is_fresh` and `x5f4_joint_arm_live_at_3669_is_fresh` (stale 12 and 56) |
+| G-CPU-S1-IS-HEAD (the S1 arm resolves to HEAD) | `x5_cpu_term.sh --self-test` (case b, `dry-run-resolves`) |
+| G-CPU-BAND-FROM-FINAL (the band decision reads the FINAL column) | `x5_cpu_term.sh --self-test` (case a, `band-decision-one-pass` and `band-decision-three-passes`) |
+| M-CPU-DRYRUN-MULTI (the dry-run takes the first of two S1 matches) | `x5_cpu_term.sh --self-test` (case c, `dry-run-two-s1`) |
+| M-GUARD-NOFOREIGN (`foreign_pct` from busy alone) | `x5_guard.sh --self-test` (`foreign-5-00-clean`, `foreign-5-01-void`) |
+| M-GUARD-BOUNDARY (5.00% reads `VOID`) | `x5_guard.sh --self-test` (`foreign-5-00-clean`) |
+| M-GUARD-TIMEOUT-CLEAN (a wait timeout reads `CLEAN`) | `x5_guard.sh --self-test` (`wait-timeout-void`) |
+| M-GUARD-EXIT0 (the guard exits 0 whatever the command's code) | `x5_guard.sh --self-test` (`wrapped-exit-3`) |
+
+**7. The Acceptance's 10k: the `GUARD` line, the census line and the
+file's sha256, copied by P's gate.** The attempt ends at this commit;
+the Acceptance runs after it. The lines of record live in that card's
+verdict (`verdicts/X-5c-F4-F4.md`), in its "Acceptance lines of
+record" section (pointer replaces the old promise of a following
+commit, card X-5c-PINS-2 item 3 (d)).
+
+## Card X-5c-F4-F4 (FINAL = rung 7.3, the 50-minute box X5-R54, the
+## live joint-arm pins at 1069 and 3669, and the F3 follow-ups)
+
+Base: `card/v3-X-5c-F4-F3` (tip `2c041aae`, whose verdict file is
+`X-5c-F4-F3.md`, ESCALATE; the card folds that verdict's follow-ups
+X-5c-F4-F3-F1 and X-5c-F4-F3-F2). Class: experiment. Every count this
+card produces is a **probe, not evidence**.
+
+### X-5c-F4-F4: owner decision and X5-R54
+
+Pre-registered at step 0, before any measurement (card Work 0). The
+owner decisions and Goal items 1–3 as the card carries them.
+
+**Owner decisions (2026-11-10, QUEUE "OWNER 2026-11-10 (F4-F3
+ESCALATE 2c041aae)").** The F3 verdict escalated Q7, SZC, SZI and
+SZC-MP. The owner chose, with the numbers known:
+
+1. **Take rung 7.3 for SZC and SZI,** and raise the per-run box for
+   the main and held-out sets to about 50 minutes. This card.
+2. **Fix SZC-MP's cause in E4 now,** confined to the MP-pressure set.
+   Card X-5c-F4-F5.
+3. **Try a targeted Q7 change that keeps Q4 ≥ 1,500.** Q7 is a stated
+   gap only if that fails. Card X-5c-F4-F5.
+
+**No threshold moves.** No quota, bar, floor or exit row changes in
+this card or the next.
+
+**Goal 1 — `Tuning::FINAL` = rung 7.3:** the kept 6.1 setting plus
+7.1–7.3's fields, `ckpt_every_lo` 8, `value_lo` 280, `chunked_ops_lo`
+700 and `chunked_ops_span` 201. These four fields are exactly what
+`db572b5f` changed over `0775b735`. Nothing else in FINAL changes.
+`Tuning::MP_PRESSURE` keeps its 9.1 fields and follows FINAL in every
+other field, so its `value_lo` becomes 280. That is recorded, not
+tuned. X-5c-F4-F5 re-anchors MP on it.
+
+**Goal 2 — X5-R54, the per-run box: 3,000 s (50 minutes) per `run`,
+for the main and held-out sets.** This is an owner-approved parameter,
+recorded as **X5-R54**. It is not a threshold.
+
+- **Derivation.** Rung 7.3 measured **45.4 min per 10k** on an idle
+  host. That is the F3 gate's probe form: five 200-seed blocks,
+  272.5 s, load 1.87 at start, foreign CPU 8.1%. The margin is **10%**
+  (4.54 min) for run-to-run variance on a host kept idle:
+  45.4 × 1.10 = 49.94, rounded up to the whole minute, gives
+  **50 min = 3,000 s**.
+- **Readings not used.** The single-process run that read 52.8 min
+  carried 37.5% foreign CPU. The worker's 41.8 was taken under load.
+  Neither is a clean reading.
+- **The MP-pressure set keeps its own 40 minutes (2,400 s).** Its 9.1
+  probe used about 6 of them.
+- **Where REFRESH 10's 40 becomes 50.** This card edits none of these
+  places, because `cards/` is outside its Touch list. P's next
+  REFRESH of X-5c-F4 carries the change:
+  - REFRESH 9, X5-R46 "The box" ("Each `run` has its 40-minute
+    budget") and "When the box misses" ("a `run` over 40 min"), for
+    main and held-out.
+  - REFRESH 10's final-run table, rows Main and Held-out ("≤ 40 min").
+  - REFRESH 10's "The time box" bullet: the expected total grows from
+    about 4.5 h to about 5 h. The "Any other failure" and "Launch /
+    The 60-minute caps" bullets ("`run` over 40 minutes", "A `run`
+    budget is 40 minutes") change likewise.
+  - Conflicts answer 1 ("the owner's existing 40-minute-per-campaign
+    time box").
+  - **X-5c-F4's own Acceptance lines 431 (main `run`) and 434
+    (held-out `run`):** `test $((e-s)) -le 2400` becomes `-le 3000`.
+    Line 436 (MP-pressure) stays `-le 2400`.
+  - Every later probe's wall limit for FINAL: `min_per_10k` ≤ 50.
+- **What the new box does not cover.** `verify` re-runs every seed, so
+  the main and held-out `verify` take about as long as their `run`.
+  Neither is box-limited, but each runs under the runner's 60-minute
+  kill. At 7.3 that leaves about 10–14 minutes. X-5c-F4's own text
+  (line 296, "so that `verify` stays inside the runner's" kill)
+  should say so when P refreshes it.
+
+**Goal 3 — the live joint arm (P ruling G5-CENSUS (e) 2).** At 7.3 the
+F3 gate's whole-10k census read `JOINT_ARM_CENSUS set=main seeds=10000
+arm_rounds=2 stale_reads=0 arm_seeds=[1069,3669]`. A live seed is a
+STOP, and a pin is required before E4 is judged. This card adds
+literal pins at **both** seeds, at FINAL, with G5-R48-TREADS-KEPT as
+their must-fail mutant.
+
+## Card X-5c-F4-F5 (X5-R55 the round-0 fill, X5-R56 the drop-walk
+## window; ladders A on SZC-MP and B on Q7)
+
+Base: `card/v3-X-5c-F4-F4` (tip `18d2530f`; its verdict's 10k file of
+record is `~/.cache/nv3-review/runlogs/X-5c-F4-F4.main.json`, sha256
+`549495c5c59aa0c6f605164aec6683f26363165a3b78a641cb470045f229e330`).
+Class: experiment. Every count this card produces is a **probe, not
+evidence**; the final run's own `verify` is the only quota evidence.
+
+### X-5c-F4-F5 rules and ladders
+
+Pre-registered at step 0, before any measurement (card Work 0). Copied
+from the card: the owner decisions, Goal items 1–2 (X5-R55 and X5-R56
+as rules), Limit 4, the wall rule, the stop rule, the new-classes
+rule, and both ladder tables with their hold sets. No rung, knob,
+ladder, margin or stop rule is added or changed after any probe.
+
+**Owner decisions (2026-11-10, QUEUE "OWNER 2026-11-10 (F4-F3 ESCALATE
+2c041aae)").**
+
+- **(2) Fix SZC-MP's cause in E4 now,** confined to the MP-pressure
+  set, so the main baseline stays.
+- **(3) Try a targeted Q7 change that keeps Q4 ≥ 1,500,** as `r41` did
+  for Q4, with a pre-registered ladder. Q7 is a stated gap only if
+  that fails.
+- **No threshold moves.** A ladder that fails returns to the owner
+  with every rung's numbers.
+
+**X5-R55 — the round-0 fill (a 5.2 amendment, owner decision (2)).**
+
+- Knobs: `r0_fill_txns` (0–3) and `r0_fill_ops` (0, or 300–1,500). **0
+  in BASE and FINAL.** Only `Tuning::MP_PRESSURE` ever sets them, so
+  only the MP-pressure set and `--probe mp-pressure` run a fill.
+- What runs: in **round 0 only**, task 0 runs `r0_fill_txns` sync-on
+  chunked transactions of `r0_fill_ops` Puts each, directly after its
+  setup commit and before its other ops.
+  - Each transaction has unique `(tree, key)` pairs. Trees are uniform
+    over the round's write range `2..=write_max`. Keys are uniform
+    over `0..keyspace`. Every value is `value_hi` bytes of one
+    constant.
+  - Each transaction stays inside 5.2's chunked range (300–1,500 ops)
+    and the 8–400 B values. Its amendment is only that round 0 may
+    hold more than one chunked transaction.
+- Draws: all of them come from a new stream tag that no other stream
+  uses, through a pure function that returns `None` **without
+  constructing the stream** when `r0_fill_txns == 0` or
+  `round != 0`. So the rest of every script, and every FINAL and BASE
+  script, is bit-for-bit unchanged.
+
+**X5-R56 — the drop-walk window (a 5.5 amendment, owner decision (3)).**
+
+- Knob: `w7_share` (permille; 0 or 50–300; with
+  `w7_share + w11_share + w12_share` ≤ 1000). It is 0 in BASE and set
+  explicitly to **0 in `MP_PRESSURE`**, which does not follow FINAL
+  here. Only FINAL's ladder sets it.
+- The window: the counting pass records the scheduler-yield indices at
+  which a DropTree walk is in flight
+  (`harness::WorkloadObs::drop_walk_yields`). This is a diagnostic,
+  never a digest input.
+- The pick:
+  - It applies only in a **uniform-mode round with `knobs.drop_tree`**
+    and `w7_share > 0`. One draw from a **new stream tag** selects the
+    round with probability `w7_share` permille, and then the crash
+    point is uniform over that list. The label is `w7`.
+  - An empty list falls back to the plain uniform point, labelled
+    `w7-`.
+  - An unselected round, a targeted round and a non-drop round make no
+    such draw. Their point is exactly X5-R38's `window_crash_point`,
+    with its `S_CWIN` draw unchanged.
+  - The label rides the existing window-pick field. It is a digest
+    input only when it is `Some`, so only selected rounds move.
+- `r41` rounds are targeted-mode and have no drop, so this change
+  cannot reach them.
+
+**Limit 4 — the ranges.** Every Limit 4 range of X-5c-F4-F3 still
+holds (committers 2–4, trees 2–4, keys ≤ 3,000, values 8–400 B,
+commits 1–20 ops, SyncOff from {0, 3, 7} tenths, chunked 300–1,500
+ops, `bulk_load_one_in` 4, each of `w11_share`/`w12_share` 0 or in
+[50, 200]), and also:
+
+- `r0_fill_txns` ≤ 3;
+- `r0_fill_ops` is 0 or in [300, 1,500];
+- `w7_share` is 0 or in [50, 300];
+- `w7_share + w11_share + w12_share` ≤ 1000.
+
+**The wall rule, for both ladders.**
+
+- **Load can only lengthen wall.** A rung passes its wall limit if
+  `PROBE_WALL` is at or under it, whether the `GUARD` verdict is
+  `CLEAN` or `VOID`.
+- A `VOID` reading over the limit is undecided. Re-run that probe once
+  after the guard's wait, before committing its row. The counts must
+  be identical, and a difference is a STOP.
+- If the second reading is still `VOID` and over the limit, the row
+  says `wall undecided`, and the walk treats the rung as over the
+  limit. P's gate re-reads it on an idle host.
+- A `CLEAN` reading over the limit is over.
+
+**The stop rule, for both ladders** (X-5c-F4-F3's shape; the 1.25 is a
+stopping margin for a sampled probe, not a threshold):
+
+- **Stop-and-keep** at the first rung that reaches **required × 1.25**
+  and passes the hold set and the wall limit.
+- **Else keep `thin`:** the highest rung that reaches the required
+  count and passes the hold set and wall limit.
+- **Rung order is by rising cost.** A rung over its wall limit ends
+  the walk.
+- **If no rung reaches the required count: ESCALATE with the
+  numbers.**
+  - The ladder keeps the rung, or the anchor, with the highest count
+    that passes the hold set and wall limit. A tie goes to the earlier
+    one.
+  - The later steps still run, so the owner gets every row.
+
+**New classes (X5-R16).** The fill changes MP's round 0, and new
+failure shapes are possible. **STOP** on any of these:
+
+- a failing round outside REFRESH 6's and 8's named classes;
+- an MP round whose shape is not one of the known O-1(a) or O-3(e) MP
+  shapes;
+- a class C round with an O-1 failure and no `XX001`.
+
+On a STOP, the row is committed and the attempt ends with an ESCALATE
+naming the seed and round. Workers do not triage.
+
+**Ladder A — `SZC-MP` ≥ 100 per 2,000** (raw ≥ 10 on the 200-seed
+probe; margin 125, so raw ≥ 13). Rungs A.0–A.2 (A.3–A.4 only if the
+stop rule has not ended the ladder). Each rung is set in
+`Tuning::MP_PRESSURE` only, cumulative, over X-5c-F4-F4's MP_PRESSURE
+(9.1's fields over FINAL 7.3).
+
+- **Hold set:** none. The MP-pressure set has no other exit row. The
+  main set is untouched by construction, held by
+  `x5f5_final_digests_unmoved` and the Acceptance.
+- **Wall limit:** `min_per_2000` ≤ 40. That is the MP set's own box,
+  which X5-R54 does not change.
+
+| Rung | Change |
+|---|---|
+| A.0 | none: the anchor (MP_PRESSURE as X-5c-F4-F4 left it; its `value_lo` is now 280) |
+| A.1 | `r0_fill_txns` 1, `r0_fill_ops` 1,000 |
+| A.2 | `r0_fill_txns` 2, `r0_fill_ops` 1,500 |
+| A.3 | `r0_fill_txns` 3, `r0_fill_ops` 1,500 |
+| A.4 | A.3 and `ckpt_every` 12–19 (`ckpt_every_lo` 12, `ckpt_every_span` 8), the k2 interval width of rung 9.3 |
+
+**Ladder B — Q7 ≥ 200 per 10k** (margin 250). Rungs B.0–B.2 (B.3 only
+if the stop rule has not ended the ladder). Each rung is set in
+`Tuning::FINAL`'s `w7_share` only.
+
+- **Hold set:**
+  - Q4 ≥ 1,500 and Q4-I ≥ 1,500 (the owner's bars);
+  - every row that met its minimum at B.0 stays at or above that
+    minimum. This covers each Q1 hook, Q5a, Q8, Q10 if met, Q11, Q12,
+    Q18, SZC, SZC-MW and SZI.
+- **Wall limit:** `min_per_10k` ≤ 50 (X5-R54).
+- **B.0 must equal X-5c-F4-F3's rung 7.3 probe row** count for count.
+  It is the same FINAL, and counts are deterministic. A difference is
+  a STOP.
+- **Watch Q5a.** The whole 10k at 7.3 reads 210 against its 200 row,
+  and a crash point moved into a walk is one taken from Q5a's windows.
+
+| Rung | Change |
+|---|---|
+| B.0 | none: the anchor (FINAL = 7.3 at this tip) |
+| B.1 | `w7_share` 100 |
+| B.2 | `w7_share` 200 |
+| B.3 | `w7_share` 300 |
+
+**The outcome commits.** Ladder A's outcome commit sets MP_PRESSURE to
+the kept rung (or states that the last rung tried is kept); its
+subject begins exactly `nucleus v3: X-5c-F4-F5 A-end - `. At that
+commit FINAL is X-5c-F4-F4's, field for field, and no X5-R56 code
+exists: the Acceptance builds the main set from it and requires
+`DIGESTS_MOVED 0` against X-5c-F4-F4's 10k. Ladder B's outcome commit
+sets FINAL to the kept rung; its subject begins exactly
+`nucleus v3: X-5c-F4-F5 B-end - `. X5-R56 moves main digests **by
+design** whenever ladder B keeps a non-zero `w7_share` — limited to
+uniform-mode seeds, which the pins hold.
+
+### X-5c-F4-F5 probe rows
+
+One row per rung tried, in walk order (the ladders above committed
+before the first of them). Every number is a **probe, not evidence**:
+`per10k` = raw × 10 over the 0..1000 sample (for `--mp`, the
+200-seed judged MP set, `per10k` = the 2,000-seed set's count).
+
+- **ladder A rung A.0 — the anchor** (`MP_PRESSURE` exactly as
+  X-5c-F4-F4 left it: the 9.1 fields over FINAL 7.3, so its
+  `value_lo` is 280 by following FINAL — recorded, not tuned; no
+  constant changes at this rung): `GUARD wait=ok load_at_start=9.76
+  12.97 14.86 wall_s=41.374 cpu_s=530.811 busy_s=522.410
+  foreign_pct=-1.58 verdict=CLEAN` (the negative foreign share is the
+  host's /proc/stat busy undercounting against the process's own CPU;
+  the verdict rule reads it CLEAN and the wall is the number either
+  way); `PROBE_WALL raw_s=41.3 min_per_2000=6.9 load_at_start=1.84
+  8.90 13.10`; `PROBE_CPU user_sys_s=530.8`; **SZC-MP raw 19,
+  per10k 190**. `MP_REFUSAL rounds=232 refused=159 rate=0.6853`
+  (computed from the probe JSON with the same fold `verify`'s line
+  uses — the attempt never runs `verify`). Round-index table (the
+  fill's premise check — round 0 now carries the condition at the
+  anchor, before any fill):
+
+  | round | rounds | refused | szc | szq |
+  |---|---|---|---|---|
+  | 0 | 200 | 137 | 40 | 17 |
+  | 1 | 29 | 21 | 7 | 2 |
+  | 2 | 3 | 1 | 0 | 0 |
+
+  All rows (per10k = raw × 10, the 2,000-seed set's count): Q1 1150
+  (hooks, per hook: Before0 110, After0 110, Mid2 100, After1 110,
+  After2 110, After3 120, Mid6 110, After4 110, After5 140, After6
+  130), Q2 310, Q3 90, Q4 250, Q4-I 130, Q5a 130, Q5b 1080, Q5c 660,
+  Q6a 300, Q6b 180, Q7 10, Q8 0 (class C only), Q9 1780, Q10 100,
+  Q11 60, Q12 70, Q13a 1020, Q13b 1120, Q13c 870, Q14 520, Q15 0 (MW
+  only), Q16 970, Q17 1310, Q18 370, SIZING 1330 misses, SZC 190,
+  **SZC-MP 190**, SZC-MW 0, SZI 30. Fails: MP ×3 (30037 r0, 30337 r0,
+  30837 r0 — all `O-1(a) … published {} != model {…}`, the known
+  O-1(a) MP shape; new classes: none). **Stop-and-keep at A.0:** raw
+  19 ≥ 13 (required 100 per 2,000 × 1.25 = 125 = raw 12.5 → 13), the
+  hold set is empty by pre-registration, and the wall passes (6.9 ≤
+  40). The anchor's own reading — FINAL 7.3's `value_lo` 280 flowing
+  into MP_PRESSURE — already puts the ≥ 4·F condition into round 0
+  (17 of the 19 szq rounds are round 0), which is what the card's
+  "its `value_lo` is now 280 … re-anchors MP on it" anticipated; the
+  fill rungs A.1–A.4 never run (rung order is by rising cost, and the
+  first rung reached the margin). The fill knobs stay 0 in every
+  tuning. Probe, not evidence.
+
+- **Ladder A outcome: stop-and-keep at A.0 (the anchor).** The anchor
+  reaches the margin on its own (SZC-MP raw 19 ≥ 13), the hold set is
+  empty and the wall passes, so per the stop rule the walk ends at the
+  first rung: rungs A.1–A.4 never run, `MP_PRESSURE` keeps exactly
+  X-5c-F4-F4's fields (the 9.1 fields over FINAL 7.3) with both fill
+  knobs 0, and FINAL is X-5c-F4-F4's, field for field — the state
+  this commit's tree already holds (the A-end constants are the
+  anchor's own: no rung changed a constant). No X5-R56 code exists at
+  this commit; the Acceptance builds the main 10k from it and requires
+  `DIGESTS_MOVED 0` against X-5c-F4-F4's file of record. The row
+  returns to the owner with the anchor's table: SZC-MP 190 per 2,000
+  (raw 19 on the 200-seed probe) against required 100, margin 125.
+  Probe, not evidence.
+
+- **ladder B rung B.0 — the anchor** (FINAL = 7.3 at this tip, with
+  X5-R55's and X5-R56's knobs all 0; no constant changes at this
+  rung): `GUARD wait=ok load_at_start=6.67 4.34 8.30 wall_s=245.322
+  cpu_s=3265.218 busy_s=3245.740 foreign_pct=-0.60 verdict=CLEAN` (the
+  benign negative again: /proc/stat busy undercounting against the
+  process's own CPU); `PROBE_WALL raw_s=245.3 min_per_10k=40.9
+  load_at_start=1.98 3.39 7.63` (≤ 50, X5-R54's box); `PROBE_CPU
+  user_sys_s=3265.2`. **The B.0 STOP check passes: this row equals
+  X-5c-F4-F3's rung 7.3 probe row count for count** — Q7 50, Q5a 230,
+  Q4 1670, Q4-I 2160, Q18 4290, SZC 2390, SZC-MW 140, SZI 810, Q10
+  460, and every other row below — the same FINAL with X5-R55 (0
+  everywhere) and X5-R56 (0 everywhere) on top, deterministic. All
+  rows (per10k): Q1 7990 (hooks, per hook: Before0 840, After0 740,
+  Mid2 810, After1 780, After2 680, After3 820, Mid6 900, After4 770,
+  After5 810, After6 840), Q2 4370, Q3 1310, Q4 1670, Q4-I 2160, Q5a
+  230, Q5b 6920, Q5c 5420, Q6a 2160, Q6b 1210, **Q7 50** (the
+  ladder's row: 50 < 200 required), Q8 340, Q9 10220, Q10 460 (< 500
+  — **not met at B.0**, so "Q10 if met" does not hold it), Q11 450,
+  Q12 270, Q13a 890, Q13b 960, Q13c 970, Q14 400, Q15 1280, Q16 6770,
+  Q17 10420, Q18 4290, SIZING 7110 misses, SZC 2390, SZC-MP 0 (this
+  file), SZC-MW 140, SZI 810. Fails: none in 0..1000 (F3's 7.3 row
+  read the same). Rows met at B.0 (the hold set's floors, each the
+  row's own minimum): every Q1 hook 300, Q2 2000, Q3 200, Q4
+  1000/owner 1500, Q4-I 1000/owner 1500, Q5a 200 (watched), Q5b 200,
+  Q5c 200, Q6a 200, Q6b 200, Q8 100, Q9 500, Q11 100, Q12 100, Q13a
+  300, Q13b 300, Q13c 300, Q14 50, Q15 300, Q16 5000, Q17 100, Q18
+  1000, SZC 1000, SZC-MW 50, SZI 300. Q7 50 < 200: the ladder runs.
+  Probe, not evidence.
+
+- **ladder B rung B.1** (FINAL's `w7_share` 100, nothing else):
+  `GUARD wait=ok load_at_start=4.77 7.15 8.51 wall_s=283.938
+  cpu_s=3458.285 busy_s=4051.350 foreign_pct=17.15 verdict=VOID`
+  (foreign load arrived during the run; the wall rule reads the
+  number — load can only lengthen it); `PROBE_WALL raw_s=283.9
+  min_per_10k=47.3 load_at_start=1.83 5.88 7.99` (≤ 50, passes);
+  `PROBE_CPU user_sys_s=3458.2`; **Q7 200** (raw 20 — exactly the
+  required 200, under the 250 margin). Changed rows vs B.0: Q7
+  50→200, Q5a 230→340 (up: a walk is a shorter window than the W11
+  picks it displaced), Q8 340→330, Q5b 6920→6830, Q5c 5420→5330, Q6a
+  2160→2140, Q6b 1210→1220, Q9 10220→10160, Q11 450→420, Q16
+  6770→6730, Q17 10420→10340, SZC 2390→2350, SIZING 7110→7160. All
+  rows (per10k): Q1 7990 (hooks unchanged from B.0: Before0 840,
+  After0 740, Mid2 810, After1 780, After2 680, After3 820, Mid6 900,
+  After4 770, After5 810, After6 840 — the targeted half never
+  moves), Q2 4370, Q3 1310, Q4 1670, Q4-I 2160, Q5a 340, Q5b 6830,
+  Q5c 5330, Q6a 2140, Q6b 1220, **Q7 200**, Q8 330, Q9 10160, Q10 460
+  (not held), Q11 420, Q12 270, Q13a 890, Q13b 960, Q13c 970, Q14
+  400, Q15 1280, Q16 6730, Q17 10340, Q18 4290, SIZING 7160 misses,
+  SZC 2350, SZC-MP 0 (this file), SZC-MW 140, SZI 810. Fails: none in
+  0..1000. Hold set: Q4 1670 ≥ 1500 ✓, Q4-I 2160 ≥ 1500 ✓, Q5a
+  (watched) 340 ≥ 200 ✓, every B.0-met row at or above its minimum ✓
+  (Q2 4370, Q3 1310, Q5b 6830, Q5c 5330, Q6a 2140, Q6b 1220, Q8 330,
+  Q9 10160, Q11 420, Q12 270, Q13a/b/c 890/960/970, Q14 400, Q15
+  1280, Q16 6730, Q17 10340, Q18 4290, SZC 2350, SZC-MW 140, SZI 810;
+  every Q1 hook 680–900). Wall passes. **Q7 200 < 250 (margin) — not
+  stop-and-keep; `thin` candidate (reaches required 200 with hold and
+  wall passing); the walk continues to B.2.** Probe, not evidence.
+
+- **ladder B rung B.2** (FINAL's `w7_share` 200, nothing else):
+  `GUARD wait=ok load_at_start=6.88 12.36 10.84 wall_s=239.711
+  cpu_s=3194.415 busy_s=3168.000 foreign_pct=-0.83 verdict=CLEAN`;
+  `PROBE_WALL raw_s=239.6 min_per_10k=39.9 load_at_start=1.89 9.47
+  9.95` (≤ 50); `PROBE_CPU user_sys_s=3194.3`; **Q7 410** (raw 41 —
+  ≥ 250, the margin). Changed rows vs B.1: Q7 200→410, Q5a 340→470
+  (up again), Q8 330→310, Q11 420→390, Q12 270→260, Q5b 6830→6770,
+  Q5c 5330→5270, Q9 10160→10120, Q13a 890→880, Q14 400→420, Q16
+  6730→6690, Q17 10340→10250, SZC 2350→2320, Q10 460→450 (not held),
+  SIZING 7160→7190. All rows (per10k): Q1 7990 (hooks unchanged:
+  Before0 840, After0 740, Mid2 810, After1 780, After2 680, After3
+  820, Mid6 900, After4 770, After5 810, After6 840), Q2 4380, Q3
+  1310, Q4 1670, Q4-I 2160, Q5a 470, Q5b 6770, Q5c 5270, Q6a 2140,
+  Q6b 1220, **Q7 410**, Q8 310, Q9 10120, Q10 450 (not held), Q11
+  390, Q12 260, Q13a 880, Q13b 960, Q13c 970, Q14 420, Q15 1280, Q16
+  6690, Q17 10250, Q18 4290, SIZING 7190 misses, SZC 2320, SZC-MP 0
+  (this file), SZC-MW 140, SZI 810. Fails: none in 0..1000. Hold set:
+  Q4 1670 ≥ 1500 ✓, Q4-I 2160 ≥ 1500 ✓, Q5a (watched) 470 ≥ 200 ✓,
+  every B.0-met row at or above its minimum ✓ (Q2 4380, Q3 1310, Q5b
+  6770, Q5c 5270, Q6a 2140, Q6b 1220, Q8 310, Q9 10120, Q11 390, Q12
+  260, Q13a/b/c 880/960/970, Q14 420, Q15 1280, Q16 6690, Q17 10250,
+  Q18 4290, SZC 2320, SZC-MW 140, SZI 810; every Q1 hook 680–900).
+  Wall passes, CLEAN. **Stop-and-keep at B.2: Q7 410 ≥ 250 (required
+  200 × 1.25), the hold set passes and the wall passes — the walk
+  ends here; rung B.3 never runs.** Probe, not evidence.
+
+- **Ladder B outcome: stop-and-keep at B.2.** FINAL keeps
+  `w7_share` 200 — the first rung to reach the margin (410 ≥ 250)
+  with the hold set and the wall limit passing. B.1 read Q7 exactly
+  200 (a `thin` candidate, under the margin); B.2's 410 clears it
+  with the owner's Q4 bar intact (1670 ≥ 1,500) and Q5a watched
+  upward (470 ≥ 200). No ESCALATE: the ladder met its row. The main
+  digests move by design at this setting (every moved seed is
+  uniform-mode — the pins at 7, 8, 27, 28, 1069 and 3669 are
+  targeted-mode and cannot move; P's gate reads the whole-10k
+  moves). Probe, not evidence.
+
+## Card X-5c-F4-F5's record
+
+card: X-5c-F4-F5   branch: card/v3-X-5c-F4-F5   commit: (step 8's;
+the chain step 0 `ccecb0cd` → step 1 `81e323ab` → step 2 `c29566f4`
+→ A.0 `fd9adddd` → A-end `632a9e93` → step 5 `06a9dc01` → B.0
+`7a6f9bfe` → B.1 `819f035e` → B.2 `e78db1fa` → B-end `7f64cad1` →
+the mutant-rework pin commit `0bc00c6a` → here)
+
+**1. Both ladders** (every number a probe over the 200-seed judged MP
+set × 10, or 0..1000 × 10 — never evidence; the GUARD lines, walls and
+CPUs are each rung's own, in the probe rows above):
+
+- **Ladder A (SZC-MP ≥ 100 per 2,000; margin 125 = raw ≥ 13):**
+  **A.0** (the anchor, fill knobs 0) — GUARD CLEAN (wall_s 41.374,
+  foreign −1.58%), SZC-MP **raw 19 / per10k 190**, wall 6.9 min/2,000,
+  cpu 530.8 s, MP refusal rate 0.6853, fails MP ×3 (the known O-1(a)
+  shape). Rungs A.1–A.4 never ran: the anchor reached the margin
+  (19 ≥ 13), the hold set is empty and the wall passed, so the walk
+  stopped at the first rung. **Kept: A.0 — the fill knobs stay 0 in
+  every tuning.** No `thin` row (the margin was reached). Round-index
+  table (A.0's, the only rung): r0 200 rounds / 137 refused / szc 40 /
+  szq 17; r1 29 / 21 / 7 / 2; r2 3 / 1 / 0 / 0 — round 0 alone carries
+  17 of the 19 szq rounds: FINAL 7.3's `value_lo` 280 flowing into
+  MP_PRESSURE already puts the ≥ 4·F condition into round 0, before
+  any fill, which is what the card's "re-anchors MP on it"
+  anticipated.
+- **Ladder B (Q7 ≥ 200 per 10k; margin 250):** **B.0** (the anchor,
+  w7 0) — GUARD CLEAN (wall_s 245.322, foreign −0.60%), Q7 **50**,
+  wall 40.9 min/10k, cpu 3265.2 s; the STOP check passed (equal to
+  F3's rung 7.3 row count for count). **B.1** (w7 100) — GUARD VOID
+  (foreign 17.15%), Q7 **200** (exactly required, under margin), wall
+  47.3 ≤ 50, cpu 3458.2 s: a `thin` candidate, walk continued.
+  **B.2** (w7 200) — GUARD CLEAN (wall_s 239.711, foreign −0.83%),
+  Q7 **410** ≥ 250, wall 39.9, cpu 3194.3 s: **stop-and-keep at
+  B.2**; rung B.3 never ran. FINAL keeps `w7_share` 200.
+
+**2. New classes (X5-R16): none.** Across all four probes' JSONs
+(A.0, B.0, B.1, B.2): A.0's three failing rounds are all class MP
+with the known O-1(a) shape (`published {} != model {…}`); B.0, B.1
+and B.2 read **zero** failing rounds in 0..1000. No class C round
+failed anywhere, and no MP round outside the two known shapes
+appeared. The fill never ran (ladder A stopped at the anchor), so the
+fill's new-failure-shape risk never materialized.
+
+**3. The final constants** (the kept-setting literal of
+`x5_r37_final_is_the_kept_setting`, field for field):
+
+- `Tuning::FINAL` = X-5c-F4-F4's 7.3 **plus `w7_share` 200 alone**:
+  committers 2/3, trees 2/3, keyspace 1200/1801, syncoff [3, 7, 7],
+  map_leaf_cap [8, 16, 254], freeset_leaf_bits [128, 512, 32_576],
+  r_epoch [1, 2, 4], keep_latest [100, 100, 300, 500, 700], tear
+  [100, 300, 500, 700, 900], rounds weights [1,1,1,1,1,2,2,2,3,3],
+  target_ckpt_span 3, ckpt_every 8/5, commit_budget 18/20,
+  commit_ops 1/20, chunked 700/201, value_lo 280, value_hi 400,
+  delete_one_in 4, gc_sweeps 2/3, bulk_load_one_in 4, drop_one_in 3,
+  burst_frac 0, burst_gc_loops 0, w11_share 100, w12_share 100,
+  r41_share 1000, r41p_share 500, **r0_fill_txns 0, r0_fill_ops 0,
+  w7_share 200**.
+- `Tuning::MP_PRESSURE` = X-5c-F4-F4's own, unchanged by ladder A:
+  the 9.1 fields over FINAL (ckpt_every 4/5, budget 20/12, chunked
+  900/301, gc_sweeps 12/1, burst 600/8, w11 200, w12 200) with
+  **r0_fill_txns 0, r0_fill_ops 0, w7_share 0 explicit** and every
+  other field FINAL's (so its value_lo is 280).
+
+**4. Per row against its minimum** (the kept rungs' probes):
+
+| row | kept reading | minimum | |
+|---|---|---|---|
+| SZC-MP (ladder A, per 2,000) | **190** (raw 19 on the 200-seed probe) | 100 (margin 125) | ✓ at the anchor |
+| MP refusal (A.0) | rounds 232, refused 159, rate 0.6853 | reported, never an exit input | — |
+| Q7 (ladder B, per 10k) | **410** (B.2) | 200 (margin 250) | ✓ |
+| Q4 (B.2) | 1670 | owner bar 1500 (row 1000) | ✓ |
+| Q4-I (B.2) | 2160 | owner bar 1500 (row 1500) | ✓ |
+| Q5a (B.2, watched) | 470 | 200 | ✓ (up from B.0's 230: a walk is a shorter window than the W11 picks it displaced) |
+| Q10 (B.2) | 450 | 500 | not met at B.0 (460), so "Q10 if met" does not hold it; the whole-10k read at 7.3 was 615 (F4-F4's record) |
+
+**5. The Acceptance's A-end 10k** (the `GUARD` line, census and
+compare lines): **RUNNER** — the A-end commit is `632a9e93`, whose
+FINAL is X-5c-F4-F4's field for field with both fill knobs 0 and no
+X5-R56 code; the Acceptance builds the main set from it and compares
+against `runlogs/X-5c-F4-F4.main.json` (sha256
+`549495c5…`), requiring `DIGESTS_MOVED 0` and the census's
+`arm_seeds=[1069,3669]`. The lines are the runner's to produce; this
+attempt ran none of the campaign forms (the card's Run hygiene bans
+them in the attempt). HEAD's own main digests move by design at
+`w7_share` 200 — limited to uniform-mode seeds; every moved seed the
+gate finds must be uniform-mode, and the pins at 7, 8, 27, 28, 1069
+and 3669 (all targeted-mode) cannot move.
+
+**6. The mutant table** (each row on its own scratch export under
+`$CARGO_TARGET_DIR/x5f5-scratch/mut-*/` — a `git archive` of HEAD
+from the worktree root, its own target dir, one python patch; the
+worktree never held a mutant):
+
+| mutant | catching test |
+|---|---|
+| M-FILL-IN-FINAL (FINAL's fill 1/1000) | `x5f5_final_digests_unmoved` — FAILED at seed 7 |
+| M-FILL-EVERY-ROUND (the `round == 0` condition dropped) | `x5r55_fill_not_drawn_at_zero` — FAILED at the round-1 half |
+| M-FILL-MAIN-STREAM (the fill drawn from the round's `S_GEN` stream, inline in `build_round`) | `x5r55_fill_leaves_the_rest_of_the_script` — FAILED ("task 0 op 1 must be fill op 0") |
+| M-FILL-DUP-KEY (a transaction may repeat a `(tree, key)`) | `x5r55_fill_shape` — FAILED at the uniqueness count |
+| M-FILL-LATE (the fill appended at task 0's end) | `x5r55_fill_shape` — FAILED ("exactly two Chunked ops … directly after the setup commit") |
+| M-MP-FILL-OFF (MP_PRESSURE's fill off) | **equivalent at the kept constants**: ladder A kept the anchor, so MP_PRESSURE's `r0_fill_txns` is already 0 — the mutant is a no-op (the card's own equivalent-mutant clause) |
+| M-W7-NONDROP (the pick drawn in non-drop rounds) | `x5r56_w7_not_drawn_at_zero` — FAILED |
+| M-W7-TARGETED (the pick applied in targeted rounds) | `x5r56_w7_not_drawn_at_zero` — FAILED |
+| M-W7-SHARED-STREAM (the selection drawn from `S_CWIN`) | `x5r56_unselected_round_keeps_its_point` — FAILED at seed 111 (after the rework below) |
+| M-W7-W11-LIST (the pick from `w11_yields`) | `x5r56_w7_pick_lands_in_the_walk` — FAILED ("must pick the w7 window") |
+| M-W7-IN-MP (MP_PRESSURE's `w7_share` follows FINAL) | `x5_r37_final_is_the_kept_setting` — FAILED |
+| M-BASE-EDIT (BASE's `r0_fill_txns` 1) | `x5_r37_base_tuning_reproduces_1b0ce54e` — FAILED at seed 0 |
+
+**7. ESCALATE: none.** Both ladders met their rows by the
+pre-registered stop rule (A at the anchor's 190 ≥ 125 per 2,000; B at
+B.2's 410 ≥ 250), with every hold-set row and wall limit passing.
+
+**8. Post-data amendments: none.** No rung, knob, ladder, margin or
+stop rule was added, reordered or re-tuned after any probe, and no
+probe row was re-run. One test-only rework happened after the
+mutants: `x5r56_unselected_round_keeps_its_point` gained seed 111
+(commit `0bc00c6a`) because its first literal (seed 30) is one where
+M-W7-SHARED-STREAM is equivalent (that seed's `S_CWIN` draw is ≥ 300);
+seed 111's plain FINAL point is a w12 pick, proving its `S_CWIN` draw
+< 100 < the share, and the mutant now selects there and fails. The
+card fixed no literal seed for this pin (unlike the lands-in-the-walk
+pin), so this closes a free choice, it does not retune one; the pin
+was only ever strengthened.
+
+**9. Anomalies.**
+
+- Both `GUARD` CLEAN lines of the A.0, B.0 and B.2 probes carry a
+  **negative `foreign_pct`** (−1.58, −0.60, −0.83): the host's
+  /proc/stat busy delta undercounted against the process's own
+  user+sys — foreign = busy − cpu goes negative. The verdict rule
+  (VOID iff > 5.00 or wait timeout) reads these CLEAN, and the wall
+  is the wall either way; recorded as measured, never adjusted.
+- B.1's guard read VOID (foreign 17.15%): load arrived during the
+  run. The wall rule reads the number (load can only lengthen it);
+  47.3 ≤ 50 passes without a re-read, because the rule's single
+  re-read applies only to a VOID reading **over** the limit.
+- Attempt 1 of this card was killed by the runner's 60-minute
+  watchdog mid-mutant-work (no campaign form was running in it); this
+  attempt resumed at the mutant rework per the restart rule, with the
+  tree clean at `7f64cad1`.
+- The known benign `packed-refs.lock: Read-only file system` line
+  appears on every commit (from the base chain); every commit lands.
+- Attempt 1 briefly created scratch measurement files under `tests/`
+  and the mutant-runner script under `tools/`; each was moved out to
+  `$CARGO_TARGET_DIR/x5f5-scratch/` before its commit, so the tree
+  stayed clean. None was ever committed (Limit 3 freezes `tools/*`).
+
+
+## Card X-5c-PINS-2's record (the seven pre-final pins: the w7 window's
+## edges, the cwin read-back, the guard's load fields and self-test
+## gaps, the BAND value, the verbatim REFRESH tables, OWN-SZI-NOFOLD's
+## sweep, OWN-TUNING-ARM, the malformed `--seeds` refusal, and the
+## two-publications refusal)
+
+Base: `card/v3-X-5c-F4-F5` (tip `ec9f84a6`, the chain head). Class:
+test. **No behaviour change**: tests, the `cwin` label reader's
+display, the two tools' report fields and self-tests, the `--seeds`
+refusal, and README text. Every main digest stays unchanged — the
+runner's fresh main 10k against `X-5c-F4-F5.head.main.json` (sha256
+`cb947c…a45`) proves it (RESULT item 2). No tuning constant, literal,
+quota, threshold, `Q4I_REQUIRED`, census expectation, `verify`
+comparison, exit rule, oracle, model, sim, K or R changed; `Tuning::
+BASE`, `FINAL` and `MP_PRESSURE` are byte for byte `ec9f84a6`'s; every
+existing literal stands.
+
+**1. The mutant table** (each Rust row on its own `git archive` export
+with its own `CARGO_TARGET_DIR` under `$CARGO_TARGET_DIR/
+x5pins2-scratch/`, each tool row on its own script copy there; the
+worktree never held a mutant, `git status` clean after every step):
+
+| mutant | catching case |
+|---|---|
+| OWN-W7-END-LATE (the walk-window fold runs `last + 1`, one yield past `h:dropdone`) | `x5r56_w7_window_edges_hold` — FAILED at seed 239 (`q7_drop_walk` false on a w7 pick; 1 of the 78 picks lands after the walk, the verdict's own count) |
+| OWN-W7-START-EARLY (`yields` for `yields + 1` at `h:dropwalk`) | **no observable effect at this tip**: the pin PASSES under it — measured 78 w7 rounds, all 78 `q7_drop_walk ∧ fired`, 0 anomalies (0 of 78 picks move, verdict `ec9f84a6` §6). The gate re-applies it; a catch is welcome, never a rework |
+| M-CWIN-W7-NONE (the reader's two new arms reverted) | `cwin_round_trips_every_window_label` — FAILED at the `w7` label (`left: Some(None), right: Some(Some("w7"))`) |
+| OWN-SZI-NOFOLD (`szi` drops the `ckpt_closed_dirty ≥ 4·F` conjunct) | **UNCAUGHT — equivalent at BASE over the whole seed range; ESCALATE (below)**. The card's Work 3 STOP rule fired: no round in `0..10000` distinguishes it, so no pin exists and P rules on it |
+| OWN-TUNING-ARM (`TuningId::MpPressure` resolves to `&Tuning::FINAL`) | `x5_r44_mp_pressure_runs_its_own_tuning` — FAILED at the value assertion (the mutant serves FINAL's fields: `ckpt_every` 8/5, `gc_sweeps` 2/3, `w11`/`w12` 100/100, `w7_share` 200 … where MP_PRESSURE reads 4/5, 12/1, 200/200, 0) |
+| M-SEEDS-SKIPPED (the old skip: a `--seeds` value with no `..` reads as absent) | `x5_r44_malformed_seeds_refuse_in_every_run_form` — FAILED at the pure assertion (`--seeds "5" must refuse`), before any command-level case could run |
+| OWN-GUARD-WAIT-IGNORED (`wait_load` returns `ok` at once) | `x5_guard.sh --self-test`, `wait-injectable-timeout` (a fixture load above 2 with step 0 and cap 0 reads `wait=timeout` after one check, no sleep) |
+| OWN-GUARD-NO-STEAL (busy drops `/proc/stat` field 9, steal) | `x5_guard.sh --self-test`, `busy-in-nice-irq-softirq-steal` (the fixture pair's busy sits entirely in nice, irq, softirq and steal; the mutant reads busy 75.000 and foreign -25.00) |
+| M-GUARD-PREWAIT-LOAD (`load_at_start` read before the wait again) | `x5_guard.sh --self-test`, `prewait-load-read-after-wait` (the FIFO load source: pre-wait 5.00, the wait's check 1.10, post-wait 0.90; the mutant's line carries 1.10) |
+| M-BAND-SUBSHELL (`np=$(band_passes)` — the term lost to the subshell) | `x5_cpu_term.sh --self-test`, `band-logged-term` (the BAND line reads `pass1_term=` empty, not 58.00; the two band-decision cases fail too) |
+| OWN-FIRSTONLY (the open check stops at the first `RequireCkpt` op) | `es1_two_publications_each_checked` — FAILED at seed 4242 n=6 kmax=3: `O-3(d): silent Ok with O-1 failing: tree 6: scan mismatch`, opened meta 2 (B served over an image older than its dependency, exactly the gate's 12-silent-cell shape) |
+
+**2. The re-run: RUNNER.** The fresh main 10k behind the load guard
+(the new `load_before_wait` shape), its census line, both files'
+sha256 and the compare against `X-5c-F4-F5.head.main.json` (`cb947c…a45`)
+are the runner's Acceptance lines 4–6, reported as `DIGESTS_MOVED 0`
+with the same census `arm_seeds=[1069,3669]` or a STOP for P.
+
+**3. The OWN-SZI-NOFOLD sweep — STOP, no pin (ESCALATE).** Both sides
+swept all 50 blocks of `0..10000` (200-seed blocks, at `Tuning::BASE`,
+scratch exports `x5pins2-scratch/sweep-mut` and `sweep-clean`, each
+with its own target dir, block lists `sweep-blocks.txt` and
+`sweep-clean-blocks.txt`): **141 rounds read `szq` true; 58 read
+`szi` true under the mutant (`szq ∧ ckpt_unflipped`); 58 read `szi`
+true on the clean export — the two sets are identical (every
+mutant-true candidate read true clean too), zero distinguishing
+rounds.** No round in `0..10000` reads `szq` true with the crash
+inside the `ckpt_unflipped` window and `ckpt_closed_dirty < 4·F`, so
+the mutant is equivalent at BASE and the literal pin the card asked
+for cannot exist without a seam or a withdrawal — P's to rule on
+(Work 3's explicit STOP rule; nothing was widened and no existing
+literal was edited).
+
+**4. The w7 edge pin's count.** `x5r56_w7_window_edges_hold` measured
+**78 `w7` rounds over the uniform seeds of `0..400` at
+`Tuning { w7_share: 1000, w11_share: 0, w12_share: 0, ..Tuning::FINAL }`,
+every one `q7_drop_walk` set and fired, and **0 `w7-` fallback
+rounds** — beside the verdict's own 78 picks. (23 s wall across the
+worker pool.)
+
+**5. Both tool self-tests' readings.**
+`x5_guard.sh --self-test` → `GUARD_SELFTEST OK` (cases:
+`foreign-5-00-clean`, `foreign-5-01-void`, `wait-timeout-void`,
+`foreign-is-busy-minus-cpu`, `line-shape-loads-in-order`,
+`wait-injectable-timeout`, `wait-injectable-ok`, `wait-nowait-skips`,
+`prewait-load-read-after-wait`, `busy-in-nice-irq-softirq-steal`,
+`wrapped-exit-3`).
+`x5_cpu_term.sh --self-test` → `CPU_SELFTEST OK` (cases:
+`term-from-s1-not-final`, `median-of-three`, `boundary-60-ok`,
+`boundary-60-01-over`, `foreign-above-5-void`, `wait-timeout-void`,
+`band-decision-one-pass`, `band-decision-three-passes`,
+`band-logged-term` (new), `dry-run-resolves`, `dry-run-two-s1`,
+`dry-run-no-s1`, `band-edges`).
+
+**6. No rule text changed.** `src/` differs from `ec9f84a6` only in
+`src/campaign.rs`'s two `cwin` arms and the malformed-`--seeds`
+refusal (`parse_seeds_opt` now `pub` and `Result`-returning — the
+judgment call that lets the pure pin refuse fast, so M-SEEDS-SKIPPED
+can never start a run); the tools only as Limits 3–4 allow (the guard:
+one new `load_before_wait` field before `load_at_start`, the
+injectable load source and step/cap, new self-test cases; the CPU
+tool: `band_passes`' global-and-status contract with its one shared
+`band_decide` call site); no accepted invocation of any command
+changed — every previously-accepted `run` form reads the same, and
+every previously-refused one still refuses.
+
+**7. Post-data amendments: none.** The pin's literal readings (78
+picks, the sweep's 141/58/58, the two-pub matrix's 30 refusing cells
+of 96) were measured once and recorded as measured. One test-only
+rework after the gate's first run: the OWN-TUNING-ARM pin compared
+constant addresses (`std::ptr::eq`), which is not build-stable — the
+test binary and the library each promote `&Tuning::MP_PRESSURE` to
+their own static, the gate's `--workspace` build does not merge them,
+and the real code failed the pin there (`STEP test EXIT=101`) while
+the `-p e4-recovery` build passed it. The pin now compares the tuning
+**values** (`assert_eq!(*tuning(), Tuning::MP_PRESSURE)`), pins the
+same rule, fails the mutant in both builds (shown above), and was the
+card's own suggestion only in its mechanism, not its rule.
+
+### ESCALATE (X-5c-PINS-2)
+
+- **OWN-SZI-NOFOLD is equivalent at BASE over `0..10000`** — verdict
+  `9f96f31e` finding 5's first follow-up item cannot be pinned by a
+  literal seed at this tip. Reproduction: on one scratch export apply
+  the mutant (`src/workload.rs`: `rr.szi = rr.szq && ckpt_unflipped(
+  obs.ckpt_step)`), on another leave the code clean; run every seed of
+  `0..10000` at `Tuning::BASE` on both (200-seed blocks); every round
+  with `szq` true prints its `szi` — the mutant reads 58 true, the
+  clean build the same 58, and no round differs. The conjunct is
+  therefore unobservable at BASE today (every in-window `szq` round's
+  begin-step fold is already ≥ 4·F); a seam (a test-local workload
+  with a small fold inside the window) or a withdrawal is P's ruling,
+  per the card's Work 3 STOP rule.
+
+## Card X-5c-F4-F6's record (the held-out joint-arm pin: G5-CENSUS
+## (e) 2 at seed 10669, and the final run's three census lines)
+
+card: X-5c-F4-F6   branch: card/v3-X-5c-F4-F6   base: card/v3-X-5c-F4
+(tip `cb2aca0d`, the commit the final run judged)
+
+Class: test. **Test and README only** — no behaviour change, no digest
+moves: `src/` is byte for byte `cb2aca0d`'s; no tuning, literal, quota,
+threshold, class table, matcher, tool, existing assertion or existing
+literal changed (`Tuning::FINAL` and `MP_PRESSURE` untouched; every
+digest input identical, so no campaign re-runs).
+
+The final run's three census lines, verbatim from the run of record's
+own stdout (one line per set; the held-out line is what made the run's
+Acceptance fail — it expected `arm_rounds=0`):
+
+```
+JOINT_ARM_CENSUS set=main seeds=10000 arm_rounds=2 stale_reads=0 arm_seeds=[1069,3669]
+JOINT_ARM_CENSUS set=held-out seeds=10000 arm_rounds=3 stale_reads=0 arm_seeds=[10669,13469,16669]
+JOINT_ARM_CENSUS set=mp-pressure seeds=2000 arm_rounds=0 stale_reads=0 arm_seeds=[]
+```
+
+held-out's live joint arms (10669, 13469, 16669) read zero stale reads;
+G5-CENSUS (e) 2 discharged by `x5f4_joint_arm_live_at_10669_is_fresh`
+(X-5c-F4-F6). Main's arms (1069, 3669) were pinned the same way by
+X-5c-F4-F4; mp-pressure reads `arm_seeds=[]`, so it owes no pin.
+
+**1. The pin.** `x5f4_joint_arm_live_at_10669_is_fresh`
+(`tests/workload.rs`, right after `x5f4_joint_arm_live_at_3669_is_fresh`,
+in that pin's exact form): `workload::run_seed_with(10669, None,
+&workload::Tuning::FINAL)` — held-out's tuning is FINAL — asserting
+`twin_joint_arm.len() == rounds.len()`, `twin_joint_arm == [false,
+true]`, and every `twin_joint_stale_reads` entry zero. Measured
+literals: 2 rounds, `twin_joint_arm` `[false, true]`, stale `[0, 0]`,
+digest 3149242640 (the final run's own reading; the gate re-runs seed
+10669 alone at FINAL and confirms it — the pin itself needs no digest
+assertion, same as the 1069/3669 pins). PASSES at this tip (release,
+4.61 s). **No pin at 13469 or 16669** — the rule's minimum is 10669,
+and the test binary is already slow in debug. A failing pin is a
+**STOP for P, never an edit** (Limits 2, G5-CENSUS (f) at FINAL): no
+re-picking the seed, no retune, no loosened assertion.
+
+**2. G5-R48-TREADS-KEPT** — delete the one `treads.clear();`
+immediately before `joint_arm_ran = true;` (`src/workload.rs` about
+line 2661) — applied on a scratch export under
+`$CARGO_TARGET_DIR/x5f4f6-scratch/` (`git archive` of `nucleus/v2` +
+`nucleus/v3` from `cb2aca0d` plus this card's new
+`tests/workload.rs`, its own `CARGO_TARGET_DIR`, `cargo test -q
+--release -p e4-recovery x5f4_joint_arm_live_at`). The worktree never
+held the mutant; `git status` showed only the test edit throughout,
+and the worktree's `src/workload.rs` still has its `treads.clear();`.
+All three pins fail their stale-read assertion, exactly the card's
+predicted counts:
+
+- `x5f4_joint_arm_live_at_10669_is_fresh` — `seed 10669: every joint-arm re-run must start from a fresh supply — zero stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): [0, 24]`
+- `x5f4_joint_arm_live_at_1069_is_fresh` — `seed 1069: every joint-arm re-run must start from a fresh supply — zero stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): [0, 12]`
+- `x5f4_joint_arm_live_at_3669_is_fresh` — `seed 3669: every joint-arm re-run must start from a fresh supply — zero stale reads (G5-R48-TREADS-KEPT, dropping treads.clear(), reverts this): [0, 56]`
+
+**3. No rule text changed; no `src/` change; post-data amendments:
+none.** The diff against `cb2aca0d` is exactly
+`spikes/e4-recovery/tests/workload.rs` (the one new pin and its doc
+comment) and this README section; the mutant and all scratch output
+stayed out of the worktree and out of the commit. Not closed by this
+card: E4 itself — the held-out and MP-pressure class-match readings
+(seeds 17948, 26018, 26958) stay with the owner.
+
+## Card X-5c-F4-F7's record (the twin re-seed heal of the owner ruling
+## 2026-11-14, held-out 17948's pin and the five unmoved digests, and
+## MP-A's post-data amendment to any `rlen`)
+
+Class: experiment. **The two owner rulings of 2026-11-14** (delegated
+to the orchestrator: "go"), in substance verbatim from the card:
+
+1. **Held-out 17948, twin 2 is a harness defect** (P's Work 2.5 ruling,
+   `~/.cache/nv3-review/E4-final-diagnostics.md` §A.1): a twin rebuilt
+   from the real chain's disk inherits that chain's earlier media
+   damage, so it is not Work 2.5's twin ("the same seed, schedule and
+   F-CRASH resolutions, **with the media faults removed**, judged as
+   class C — from the same base the real round runs"). The harness is
+   fixed **now**, before E4 is judged, and re-checked under the fixed
+   harness: main must reproduce exactly; held-out must differ in seed
+   17948 only, with every twin of 17948 passing. No fresh final run:
+   the diagnostics replayed all 8,000 twin-bearing seeds and found no
+   false pass.
+2. **MP-pressure 26018 r0 and 26958 r0 are the refusals MP-A already
+   accepts** (diagnostics §B): the store refused to open, no caller
+   received data, and `rlen` is not causal (§B.3: across all 26
+   class-1/2 refusals no R slot was ever accepted, and the failing
+   page lies in R only when it happens to be untainted). **MP-A's
+   narrow form is extended to any `rlen`** — a post-data amendment to
+   the frozen class table, recorded as such.
+
+Not judged by this card: E4 itself. After this card's P gate, P
+re-runs the class match on all three sets and writes the E4 judgement.
+
+**The fix (P's §A.3), `src/sim/disk.rs` + `src/workload.rs`.**
+`SimDisk::heal_media()` — harness-only, the store never calls it —
+walks the clone's fault history (`disk.media`); for each fault's every
+damaged range (its own `[off, off+len)` and a MISDIRECTED's landing
+`[to_off, to_off+len)`) that is still live (`range_tainted`: the
+durable bytes differ from the last bytes the store issued there), it
+restores **the in-order composition of that file's durable writes over
+the range** (`dwrites_of`) — the bytes a run without media faults holds
+there. A range with no live damage is untouched, so **with no live
+range anywhere the heal is a no-op** (Limit 1): no seed without a
+damaged re-seed start runs different code — the 86 re-seeds of the
+final run that carried a fault history but no live damage write
+nothing. Both re-seed arms (`workload.rs`, the broken-chain re-seed and
+the directory re-seed) build the twin chain through
+`reseeded_twin_chain`, which heals the clone **after `ch.disk.clone()`
+and before the twin runs**; the real chain, the store, the oracle, the
+model, K, R, every tuning, quota and threshold are unchanged.
+
+**The self-check (§A.3 step 2; a violation is a seed defect, loud,
+never a pass).** After the heal, no media-fault range of the clone may
+still be `range_tainted` — `heal_media` re-checks every fault's ranges
+at the end, healed or not, because one range's heal can overlap
+another's — and the cloned store may not be poisoned (`ch.st.poisoned`).
+On violation `rec.defect` is set (the seed can never pass; the digest
+moves). Measured on all six damaged-start seeds: **the self-check never
+fired** (`defect: null` on 17948 and on the five below).
+
+**The `disk.media` choice: kept.** The heal acts on bytes, not on the
+bookkeeping list; the oracle paths that read `disk.media[..media_base]`
+(X5-R32 (a) 1's `prior_page_slots`) are class-MP arms a class-C twin
+never takes, `meta_slot_fault` needs the round's own faults (a twin has
+none), and P's data shows all 86 history-carrying damage-free re-seeds
+passed. Pinned by the unit pin's `disk.media.len() == 3` assertion
+below. The twin chain's own rounds apply no media faults
+(`MediaDraw::None`), so a healed chain stays healed through its carried
+rounds.
+
+**1. 17948 healed, and the five unmoved** (`tests/workload.rs`;
+`Tuning::FINAL`; measured at this tip, release).
+
+- `x5f4f7_twin_reseed_heals_17948`: seed 17948 (held-out MP, 3 rounds,
+  twin re-seeded at round 2 `dirs-differ`) reads **every twin passing**
+  — `[true, true, true]` — with the self-check clean. **The new digest
+  of record is 2541279735** (the unfixed harness read **2914550144**;
+  they differ, as the card requires). Unhealed, twin 2 is
+  `pass=false`, `o1 = "O-1(a) at c=25: published {} != model {2, 3, 4}"`
+  (the diagnostics' §A.1 record, reproduced by the mutant below).
+- `x5f4f7_damaged_start_digests_unmoved`: the five other damaged-start
+  seeds all reproduce their digests of record with every twin passing —
+  main 2399 → **642331466**, 5359 → **1958172881**; held-out 15249 →
+  **914096547**, 18119 → **3724720501**, 18689 → **4019746642** — P's
+  §A.3 prediction (the five twins never observed their damage) holds.
+
+**2. The unit pin** (`tests/directed.rs`,
+`x5f4f7_heal_media_restores_the_no_fault_bytes`): a synthetic page file
+with four twice-written slots and one LOST (slot 3), one TORN (slot 5)
+and one MISDIRECTED (slot 9's write, stray bytes landing on slot 7).
+Healing returns empty; the healed disk equals the no-fault clone **byte
+for byte** over the whole extent (durable and current view — no other
+byte touches); all four damaged ranges lose their taint; the fault
+history is kept (3 faults); and a damaged range that is **not live**
+(a synced rewrite after the fault) is untouched — the newer bytes
+survive, no revert to the faulted write or its pre-image.
+
+**3. M-TWIN-NO-HEAL** — skip the heal (`let still = disk.heal_media();`
+→ `let still: Vec<(usize, u64, u64)> = Vec::new();` in
+`reseeded_twin_chain`) — applied on a scratch `git archive` export
+under `$CARGO_TARGET_DIR/x5f4f7-scratch/m-no-heal/` (its own
+`CARGO_TARGET_DIR`, `cargo test -q --release -p e4-recovery --test
+workload x5f4f7_twin_reseed_heals_17948`). **Caught**, failing message
+verbatim:
+
+```
+seed 17948: every twin must pass under the heal (X-5c-F4-F7; twin 2 inherited slots 4/80/122 unhealed): [TwinRound { pass: true, o1_fail: None }, TwinRound { pass: true, o1_fail: None }, TwinRound { pass: false, o1_fail: Some("O-1(a) at c=25: published {} != model {2, 3, 4}") }]
+```
+
+The worktree never held the mutant; `git status` showed only this
+README uncommitted throughout, and the worktree's `src/workload.rs`
+still has its `disk.heal_media()` call.
+
+**4. The table amendment (Work 4)** — a **post-data amendment**, the
+card's one: `refused_old_page`'s `"rlen": {"eq": 0}` → `{"ge": 0}` and
+`refused_old_header`'s `"rlen": {"ge": 1}` → `{"ge": 0}`; class 3's
+`"rlen": {"eq": 0}` and every other byte unchanged. The table's
+sha256 moves from **`55ae4734…1158`** to
+**`a05534c7a34c1daa243eb2f2dc23f5f0776abe6c84af8c205af393d00e10fdea`**
+(measured, equals the card's constant). `e4_class_match.py` changes
+only `TABLE_SHA256`, the `unmatched-ge-below` literal (`rlen 0` →
+`rlen -1`, so M-GATE-GE-OFF1 `>= want - 1` is still caught) and two
+new cases pinning the amendment: `page-any-rlen` (the 1257 record with
+`rlen 1` reads class 1) and `header-any-rlen` (the 2927 record with
+`rlen 0` reads class 2). **self-test: 132 cases, 0 failed** (was 130).
+No matching logic changed. P's dry run on scratch copies (diagnostics
+§B.4) moved exactly 26018 into class 1 and 26958 into class 2 and
+nothing else in any of the three files; the runner's class match
+re-run settles it on the real files.
+
+**5. P's counts, for the record** (diagnostics §A.2, all 9,806 twin
+rounds replayed): **92 rebuilt twins** (every one `dirs-differ`;
+`broken-chain` never fired), **6 damaged starts** (main 2399, 5359;
+held-out 15249, 17948, 18119, 18689), of which **5 passed** and
+**17948 failed**; **0 false passes** (no passing twin ever observed
+inherited damage).
+
+**6. The runner's Acceptance lines 4–7 are `RUNNER`** (never run
+inside this attempt): the release build of `e4-campaign`; the main
+reproduction run (must stay byte-identical, `cb947c19…` — P predicts
+2399 and 5359 do not move; a failure is a STOP for P, not something to
+tune); the fresh held-out run (its JOINT_ARM_CENSUS line
+`arm_seeds=[10669,13469,16669]`; exactly seed
+17948's record may move, with every twin of 17948 passing — the fresh
+file becomes held-out's file of record for the class match once this
+card's gate passes, and the final run's `e655a61b…` stays as the record
+of what the unfixed harness produced); and the class-match comparison
+against the final run's held-out file. Line 8 is `scripts/gate.sh`,
+also the runner's.
+
+**7. Post-data amendments: one** — the class table's two `rlen`
+conditions (owner ruling 2026-11-14), item 4 above. Nothing else in
+this card is post-data: the heal implements P's pre-registered fix
+(§A.3) and the pins record what it measures.

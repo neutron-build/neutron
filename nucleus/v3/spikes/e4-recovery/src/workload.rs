@@ -35,8 +35,8 @@ use crate::harness::{
 use crate::model::{CATALOG, Model, Op, PUBLIC, to_be64};
 use crate::rng::{Rng, derive};
 use crate::sim::{FaultClass, FaultKnobs, MediaKind};
-use crate::store::ckpt::CKPT_HOOKS;
-use crate::store::{Mutant, StoreCfg, WAL_SEG};
+use crate::store::ckpt::{CKPT_HOOKS, CkptHook};
+use crate::store::{Mutant, StoreCfg, StoreInner, WAL_SEG};
 
 /// Stream tags (independent splitmix64 derivations per concern; 1–6 are
 /// the harness's, 7+ are the generator's).
@@ -52,6 +52,57 @@ const S_HOOK: u64 = 11;
 /// `w11_share + w12_share > 0`, never drawn (and never constructed)
 /// when both shares are 0, so BASE consumes no stream state on it.
 const S_CWIN: u64 = 12;
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+/// before this card's probes): the alignment selection stream.** One
+/// draw per round when `r41_share > 0` **and** the round is eligible (a
+/// targeted crash, no drop this round), never drawn (and never
+/// constructed) when the share is 0, so BASE consumes no stream state
+/// on it and every BASE round's script is bit-for-bit the pre-X5-R41
+/// generator's. Independent of `S_GEN` and of `S_R41C`.
+const S_R41: u64 = 14;
+/// **X5-R41:** the selected block's content stream — the merge tree
+/// `tm`, the split tree `ts`, and the two dense runs' bases. Drawn only
+/// inside a selected round, so an unselected round consumes nothing on
+/// it (the card's Limit 3).
+const S_R41C: u64 = 15;
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a; a 5.2 amendment, fixed
+/// before any measurement of this card): the prior-window alignment
+/// selection stream.** One draw per round when `r41p_share > 0` **and**
+/// the round is eligible (X5-R41-selected, a pre-step-5 targeted hook,
+/// `target_ckpt ≥ 1`), never drawn (and never constructed) when the
+/// share is 0, so BASE consumes no stream state on it and every BASE
+/// round's script is bit-for-bit the pre-X5-R50 generator's.
+/// Independent of `S_GEN`, `S_R41` and `S_R41PC`.
+const S_R41P: u64 = 16;
+/// **X5-R50:** block A's content stream — the prior-window alignment
+/// block's merge tree, split tree and dense-run bases (block B keeps
+/// `S_R41C`, so block B is bit-for-bit the same in a round with block
+/// A and without it). Drawn only inside an eligible selected round at
+/// `r41p_share > 0`.
+const S_R41PC: u64 = 17;
+/// **X5-R55 (card X-5c-F4-F5; a 5.2 amendment, owner decision
+/// 2026-11-10 (2)): the round-0 fill's content stream.** Drawn only
+/// inside `r0_fill_block`, which returns `None` — never constructing
+/// the stream — when `r0_fill_txns == 0` or `round != 0`, so BASE,
+/// FINAL and every MP round other than round 0 consume no stream state
+/// on it and their scripts are bit-for-bit the generator's.
+/// Independent of every other tag.
+const S_R55F: u64 = 18;
+/// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment, owner decision
+/// 2026-11-10 (3)): the drop-walk window pick's stream.** Drawn only
+/// inside `w7_pick` (the selection draw) and `w7_drop_walk_point` (the
+/// index draw, from the same construction so the two draws are one
+/// sequence), and only in a uniform-mode round with a drop at
+/// `w7_share > 0` — never drawn (and never constructed) elsewhere, so
+/// BASE, FINAL at share 0, every targeted round and every non-drop
+/// round consume no stream state on it and their scripts and crash
+/// points are bit-for-bit X5-R38's. Independent of every other tag
+/// (in particular of `S_CWIN`).
+const S_W7: u64 = 19;
+/// **X5-R55:** the one constant byte of every fill value ("every value
+/// is `value_hi` bytes of one constant"). Fixed, never drawn, so the
+/// fill's only stream consumption is its `(tree, key)` draws.
+const R55_FILL_BYTE: u8 = 0x37;
 
 /// **X5-R37 (P ruling nv3-X-5c-F4-esc-1; card X-5c-F4-F1 step 1): the
 /// frozen tuning.** Every generator constant the X-5c-F4 retune may
@@ -64,9 +115,11 @@ const S_CWIN: u64 = 12;
 ///   updates that digest literal in its own commit, naming the seeds
 ///   and why — X5-R37's moved-digest rule). Every seed pin runs BASE.
 /// - [`Tuning::FINAL`] — the campaign's generator (`run`/`verify`
-///   re-run seeds under it). At this card's tip `FINAL == BASE`: this
-///   card builds the machinery and does no retune. X-5c-F4's relaunch
-///   changes FINAL only.
+///   re-run seeds under it). X-5c-F4-F3 sets it to S1 and runs the
+///   pre-registered retune ladders on it; every other card keeps
+///   `FINAL == BASE`.
+/// - [`Tuning::MP_PRESSURE`] — X5-R44's MP-pressure tuning, written
+///   over FINAL so it follows it (step 9 may set its ladder fields).
 ///
 /// The knob-derivation streams and the draw order are unchanged by this
 /// refactor: with `Tuning::BASE` every draw consumes the same stream
@@ -159,6 +212,66 @@ pub struct Tuning {
     /// list (a `wal_recycle` rename returned, its `sync_dir` not yet
     /// complete). 0 in BASE.
     pub w12_share: u32,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+    /// before this card's probes): the window-targeted alignment share**
+    /// (permille). In a round selected by the `S_R41` stream with this
+    /// probability — a targeted-crash round with no drop — the GC task
+    /// runs the alignment block of step 1 inside the target checkpoint's
+    /// own window (the checkpointer holds it open at `After0`), so the
+    /// block's splits, merges and LPID reuses land in that window's own
+    /// counters (Q4's halves, and the reuse Q4-I keys on). 0 in BASE;
+    /// **1000 in FINAL (X-5c-F4-F3 step 1: S1, the setting of verdict
+    /// `2e8d1b13` — no other value without a new ruling)**.
+    pub r41_share: u64,
+    /// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a; a 5.2 amendment,
+    /// fixed before any measurement of this card): the prior-window
+    /// alignment share** (permille). In a round selected by this
+    /// probability — an X5-R41-selected round whose targeted hook is
+    /// one of `Before0`–`After4` (a crash before step 5 recovers image
+    /// `idx−1`) with `target_ckpt ≥ 1` — the GC task runs a second
+    /// alignment block (block A) inside checkpoint `idx−1`'s own held
+    /// window, so the reuse the recovery opens lands in that window's
+    /// own counts (the image arm Q4-I keys on). Block B and every other
+    /// round's script are unchanged; block A's content draws come from
+    /// `S_R41PC`, so block B is bit-for-bit the same with or without
+    /// it. 0 in BASE; **500 in FINAL (X-5c-F4-F3 step 1: S1, the
+    /// setting of verdict `2e8d1b13` — no other value without a new
+    /// ruling)**.
+    pub r41p_share: u64,
+    /// **X5-R55 (card X-5c-F4-F5; a 5.2 amendment, owner decision
+    /// 2026-11-10 (2)): the round-0 fill's transaction count.** In
+    /// round 0 only, task 0 runs this many extra sync-on chunked
+    /// transactions of `r0_fill_ops` Puts each, directly after its
+    /// setup commit and before its other ops — so round 0 can dirty
+    /// enough distinct LPIDs to cut a ≥ 4·F interval before its crash
+    /// (the SZC-MP cause, verdict `2c041aae` §4: MP seeds rarely get
+    /// past round 0, and the plain round-0 workload stays well under
+    /// 4·F). 0 in BASE and FINAL; **only `Tuning::MP_PRESSURE` ever
+    /// sets it** (ladder A), so only the MP-pressure set and
+    /// `--probe mp-pressure` run a fill. Range: 0–3 (Limit 4).
+    pub r0_fill_txns: u64,
+    /// **X5-R55:** the fill's ops per transaction (each transaction
+    /// stays inside 5.2's chunked range 300–1,500, with unique
+    /// `(tree, key)` pairs, trees uniform over the round's write
+    /// range, keys uniform over the keyspace, every value `value_hi`
+    /// bytes of one constant). 0 in BASE and FINAL; only
+    /// `Tuning::MP_PRESSURE` ever sets it (ladder A). Range: 0, or
+    /// 300–1,500 (Limit 4).
+    pub r0_fill_ops: u64,
+    /// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment, owner decision
+    /// 2026-11-10 (3)): the drop-walk window share** (permille). In a
+    /// uniform-mode round with `knobs.drop_tree` and a non-zero share,
+    /// one draw from the round's own `S_W7` stream selects the round
+    /// with this probability, and the selected round's crash point is
+    /// uniform over the counting pass's `drop_walk_yields` list (the
+    /// scheduler-yield indices at which a DropTree walk is in flight)
+    /// — the way X5-R38 moves the uniform point into the W11 and W12
+    /// windows. An empty list falls back to the plain uniform point
+    /// (label `w7-`). 0 in BASE; **0 in FINAL until ladder B sets it**;
+    /// **0 explicitly in `MP_PRESSURE`, which does not follow FINAL
+    /// here**. Range: 0 or 50–300, with
+    /// `w7_share + w11_share + w12_share` ≤ 1000 (Limit 4).
+    pub w7_share: u32,
 }
 
 impl Tuning {
@@ -197,12 +310,30 @@ impl Tuning {
         burst_gc_loops: 0,
         w11_share: 0,
         w12_share: 0,
+        r41_share: 0,
+        r41p_share: 0,
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
+        w7_share: 0,
     };
 
     /// The campaign's generator (`run`/`verify` re-run under it).
-    /// **Equal to [`Tuning::BASE`] at this card's tip** (this card does
-    /// no retune); X-5c-F4's relaunch changes it — pinned by
-    /// `x5_r37_final_equals_base_at_this_tip`.
+    /// **X-5c-F4-F4: FINAL = rung 7.3** (owner decision 2026-11-10,
+    /// QUEUE "OWNER 2026-11-10 (F4-F3 ESCALATE 2c041aae)"; verdict
+    /// `2c041aae` option A): the kept 6.1 setting of X-5c-F4-F3 —
+    /// S1's `r41_share` 1000 and `r41p_share` 500 (the setting of
+    /// verdict `2e8d1b13`), `syncoff_table` `[3, 7, 7]`,
+    /// `keep_latest_pm_table` `[100, 100, 300, 500, 700]`,
+    /// `w11_share` 100, `w12_share` 100 — plus 7.1–7.3's fields:
+    /// `ckpt_every_lo` 8, `value_lo` 280, `chunked_ops_lo` 700 and
+    /// `chunked_ops_span` 201, exactly what `db572b5f` changed over
+    /// `0775b735`, and nothing else. The per-run box that pays for it
+    /// is **X5-R54** (3,000 s per main/held-out `run`). Every field
+    /// of FINAL and of MP_PRESSURE is pinned by
+    /// `x5_r37_final_is_the_kept_setting`; the S1 halves, the card
+    /// ranges and the MP ladder fields by `x5_r37_final_r41_is_s1`,
+    /// `x5_r37_final_stays_in_card_ranges` and
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`.
     pub const FINAL: Tuning = Tuning {
         committers_lo: 2,
         committers_span: 3,
@@ -210,23 +341,23 @@ impl Tuning {
         trees_span: 3,
         keyspace_lo: 1200,
         keyspace_span: 1801,
-        syncoff_table: [0, 3, 7],
+        syncoff_table: [3, 7, 7],
         map_leaf_cap_table: [8, 16, 254],
         freeset_leaf_bits_table: [128, 512, 32_576],
         r_epoch_table: [1, 2, 4],
-        keep_latest_pm_table: [100, 300, 500, 700, 900],
+        keep_latest_pm_table: [100, 100, 300, 500, 700],
         tear_pm_table: [100, 300, 500, 700, 900],
         rounds_weights: [1, 1, 1, 1, 1, 2, 2, 2, 3, 3],
         target_ckpt_span: 3,
-        ckpt_every_lo: 4,
+        ckpt_every_lo: 8,
         ckpt_every_span: 5,
         commit_budget_lo: 18,
         commit_budget_span: 20,
         commit_ops_lo: 1,
         commit_ops_span: 20,
-        chunked_ops_lo: 320,
-        chunked_ops_span: 381,
-        value_lo: 8,
+        chunked_ops_lo: 700,
+        chunked_ops_span: 201,
+        value_lo: 280,
         value_hi: 400,
         delete_one_in: 4,
         gc_sweeps_lo: 2,
@@ -235,8 +366,75 @@ impl Tuning {
         drop_one_in: 3,
         burst_frac: 0,
         burst_gc_loops: 0,
-        w11_share: 0,
-        w12_share: 0,
+        w11_share: 100,
+        w12_share: 100,
+        r41_share: 1000,
+        r41p_share: 500,
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
+        // **Ladder B rung B.2:** the drop-walk window share, 200
+        // permille of the uniform-mode drop rounds.
+        w7_share: 200,
+    };
+
+    /// **X5-R44 (card X-5c-F4-F2 step 2; REFRESH 9; owner decision
+    /// 2026-11-05, PLAN §10 item 11): the MP-pressure tuning**, written
+    /// as `Tuning { ..Tuning::FINAL }` so it starts equal to FINAL and
+    /// follows it — this card edits neither BASE nor FINAL (Limit 2),
+    /// and the retune is X-5c-F4-F3's. Only the judged mp-pressure set
+    /// and the `--probe mp-pressure` form select it, through
+    /// `TuningId::MpPressure`; because it equals FINAL at this tip,
+    /// only the id can show which one a set selects.
+    ///
+    /// **X-5c-F4-F3 step 9: the MP ladder's fields** (the card's
+    /// rung 9.1, "k1" — over FINAL): chunked 900–1,200, budget
+    /// 20–31, GC 12 (`gc_sweeps_lo` 12, `gc_sweeps_span` 1),
+    /// `ckpt_every` 4–8, `burst_frac` 600, `burst_gc_loops` 8,
+    /// `w11_share` 200, `w12_share` 200. Every field not in that
+    /// table equals FINAL's (`..Tuning::FINAL` below), pinned by
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`; the two
+    /// `r41` knobs come from FINAL (S1),
+    /// `x5_r37_mp_pressure_r41_equals_final`.
+    ///
+    /// **X-5c-F4-F5 step 2 (X5-R55): the fill's two knobs are also MP
+    /// ladder fields** — explicit `0`s over FINAL's own `0`s here, so
+    /// the constant does not silently follow a later FINAL that sets
+    /// them (Limit 2: a fill in FINAL is banned); ladder A (rungs
+    /// A.1–A.4) is the only writer of them, still pinned by
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields` and
+    /// `x5_r37_final_is_the_kept_setting`.
+    ///
+    /// **X-5c-F4-F5 step 5 (X5-R56): `w7_share` is also an explicit 0**
+    /// — the MP-pressure set never runs the drop-walk window, whatever
+    /// ladder B keeps in FINAL (the card's Goal 2). Pinned by
+    /// `x5_r37_mp_pressure_differs_only_in_ladder_fields`'s zero
+    /// assertion and by `x5_r37_final_is_the_kept_setting`
+    /// (**M-W7-IN-MP** reverts this).
+    pub const MP_PRESSURE: Tuning = Tuning {
+        ckpt_every_lo: 4,
+        ckpt_every_span: 5,
+        commit_budget_lo: 20,
+        commit_budget_span: 12,
+        chunked_ops_lo: 900,
+        chunked_ops_span: 301,
+        gc_sweeps_lo: 12,
+        gc_sweeps_span: 1,
+        burst_frac: 600,
+        burst_gc_loops: 8,
+        w11_share: 200,
+        w12_share: 200,
+        // **X5-R55 (card X-5c-F4-F5 step 2): explicit 0, not FINAL's
+        // to follow** — the fill knob lives in this constant alone,
+        // and ladder A (rungs A.1–A.4) is the only writer of it.
+        r0_fill_txns: 0,
+        r0_fill_ops: 0,
+        // **X5-R56 (card X-5c-F4-F5 step 5): explicit 0 too — this
+        // constant does not follow FINAL here** (the card's Goal 2:
+        // "set explicitly to 0 in `MP_PRESSURE`"), so ladder B's
+        // `w7_share` in FINAL can never reach the MP-pressure set.
+        // Ladder A holds no `w7` rung, so nothing ever writes it.
+        w7_share: 0,
+        ..Tuning::FINAL
     };
 }
 
@@ -507,6 +705,18 @@ pub fn build_round(
             ops: setup,
         });
     }
+    // **X5-R55 (card X-5c-F4-F5): the round-0 fill** — task 0's extra
+    // sync-on chunked transactions, directly after its setup commit
+    // and before its other ops. `None` (and no draw) everywhere the
+    // fill is off: BASE, FINAL, every round other than round 0, and
+    // every MP_PRESSURE round before ladder A sets the knobs — so
+    // every such script is bit-for-bit the pre-X5-R55 generator's.
+    // Round 0 always has a setup commit (it starts from an empty
+    // model, so `setup` always holds the trees' `CreateTree`s), which
+    // is what "directly after its setup commit" names.
+    if let Some(fill) = r0_fill_block(seed, round, tun, knobs, write_max) {
+        committers[0].extend(fill);
+    }
     // The chunked transaction (5.2): one large chunked txn per round, on
     // a seeded committer, spanning ≥ 2 segments by value sizing.
     let chunked_task = 1 + rng.below(knobs.committers as u64) as usize;
@@ -627,20 +837,242 @@ pub fn build_round(
         barrier(ops);
     }
     // ---- the GC sweeper task: sweeps concurrent with checkpoints ----
-    let mut gc_ops: Vec<ScriptOp> = Vec::new();
-    barrier(&mut gc_ops);
+    // The draws run in F4's fixed order (base sweeps, then the burst's).
+    let mut base_sweep_ops: Vec<ScriptOp> = Vec::new();
     for _ in 0..tun.gc_sweeps_lo + rng.below(tun.gc_sweeps_span) {
         let tree = 2 + rng.below(write_max - 1);
-        gc_ops.push(ScriptOp::Yields(1 + rng.below(4)));
-        gc_ops.push(ScriptOp::Gc { tree, w: None });
+        base_sweep_ops.push(ScriptOp::Yields(1 + rng.below(4)));
+        base_sweep_ops.push(ScriptOp::Gc { tree, w: None });
     }
     // The burst's extra GC sweeps on its own tree (empty in BASE).
+    let mut burst_sweep_ops: Vec<ScriptOp> = Vec::new();
     for _ in 0..tun.burst_gc_loops {
-        gc_ops.push(ScriptOp::Yields(2 + rng.below(6)));
-        gc_ops.push(ScriptOp::Gc {
+        burst_sweep_ops.push(ScriptOp::Yields(2 + rng.below(6)));
+        burst_sweep_ops.push(ScriptOp::Gc {
             tree: burst_tree,
             w: None,
         });
+    }
+    // **X5-R41 (card X-5c-F4-F1-F1-F3 step 1; a 5.2 amendment, fixed
+    // before this card's probes): the window-targeted SMO alignment.**
+    // A round is selected when all hold: a targeted crash (`seed / 10`
+    // even — the crash hooks of checkpoint index 0–2 are the reachable
+    // early windows), no drop this round (`!knobs.drop_tree` — the
+    // block's dense runs and sweep must not race the DDL task's drop
+    // walk), and a draw from the round's own `S_R41` stream below
+    // `r41_share` permille. Nothing is drawn at share 0 (BASE and this
+    // card's FINAL); every content draw of the block comes from the
+    // second new stream `S_R41C`, so an unselected round consumes no
+    // stream state and its script is bit-for-bit the generator's.
+    //
+    // The block (at the front of the GC task, after the barrier):
+    // - two sync-on commits of 20 Puts each at the value ceiling, a
+    //   dense run of 40 keys in tree `tm` — the run overfills whatever
+    //   leaf holds it, so splits land wherever it runs;
+    // - two sync-on commits of Deletes of those keys — the deletes
+    //   leave tombstones whose elision empties the run's leaves;
+    // - `R41Wait` (spins until the checkpointer's hold opens the
+    //   window — see the op's arm);
+    // - `Gc { tree: tm }` — the sweep elides the tombstones and merges
+    //   the emptied leaves, freeing their LPIDs **inside the window**
+    //   (X5-R40's design took its merge material from the chunked
+    //   txn's own keys, which stay above `w` until that txn's marker
+    //   applies — the block's deletes are in their own commits, so
+    //   their ts is below the sweep's watermark the moment they
+    //   apply);
+    // - one sync-on commit of 20 Puts at the ceiling, a dense run in a
+    //   tree other than `tm` when one exists — the run's splits
+    //   allocate LPIDs, and `alloc_lpid` reuses the freed ones in the
+    //   same window (the reuse Q4-I keys on);
+    // - `R41Done`, which releases the checkpointer's hold.
+    // A `R41Arm { idx: knobs.target_ckpt }` goes before the barrier:
+    // the checkpointer holds the window of exactly that checkpoint
+    // index — the crash's own.
+    let r41 = (seed / 10).is_multiple_of(2)
+        && !knobs.drop_tree
+        && r41_pick(seed, round, tun) == Some(true);
+    let r41_block: Vec<ScriptOp> = if r41 {
+        let mut g = Rng::new(derive(seed * 100 + round as u64, S_R41C));
+        let span = write_max - 1; // |2..=write_max|
+        let tm = 2 + g.below(span);
+        let ts = if span >= 2 {
+            2 + (tm - 2 + 1 + g.below(span - 1)) % span
+        } else {
+            tm
+        };
+        let ks = knobs.keyspace;
+        let n = 40u64.min(ks);
+        let base = g.below(ks - n + 1);
+        let hi = tun.value_hi as usize;
+        let mut block: Vec<ScriptOp> = Vec::new();
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Put {
+                        tree: tm,
+                        key: to_be64(k),
+                        value: vec![0x5A; hi],
+                    })
+                    .collect(),
+            });
+        }
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Delete {
+                        tree: tm,
+                        key: to_be64(k),
+                    })
+                    .collect(),
+            });
+        }
+        block.push(ScriptOp::R41Wait {
+            idx: knobs.target_ckpt,
+        });
+        block.push(ScriptOp::Gc { tree: tm, w: None });
+        let rl = 20u64.min(ks);
+        let b2 = g.below(ks - rl + 1);
+        block.push(ScriptOp::Commit {
+            sync_on: true,
+            ops: (b2..b2 + rl)
+                .map(|k| Op::Put {
+                    tree: ts,
+                    key: to_be64(k),
+                    value: vec![0xA5; hi],
+                })
+                .collect(),
+        });
+        block.push(ScriptOp::R41Done {
+            idx: knobs.target_ckpt,
+        });
+        block
+    } else {
+        Vec::new()
+    };
+    // **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the prior-window
+    // alignment.** A round is eligible when all hold: it is
+    // X5-R41-selected (the same predicate, unchanged); its targeted
+    // hook `CKPT_HOOKS[(seed/20) % 10]` is one of `Before0`, `After0`,
+    // `After1`, `Mid2`, `After2`, `After3` or `After4` — a crash
+    // before step 5 recovers image `idx−1`, whose window X5-R41 never
+    // aligned (seven of the ten targeted hooks are such crashes; only
+    // the three post-step-5 hooks open image `idx`); and
+    // `knobs.target_ckpt ≥ 1` (index `idx−1` exists). One draw from
+    // the round's own `S_R41P` stream below `r41p_share` permille
+    // decides; nothing is drawn at share 0 (BASE and this card's
+    // FINAL) and nothing in an ineligible round.
+    //
+    // Block A has X5-R41's block shape exactly — the same counts
+    // (two sync-on commits of 20 Puts, two of Deletes, one sweep, one
+    // 20-Put commit), ceiling values, dense runs and sweep — paired
+    // with index `idx−1`, and its content draws all come from the
+    // second new stream `S_R41PC`, so block B is bit-for-bit the same
+    // in a round with block A and without it. Under a merge-heavy
+    // steady workload every checkpoint window sees frees and reuse;
+    // one aligned window per round is an artifact of the spike's
+    // short windows (X5-R41's own note).
+    let r41p = r41
+        && knobs.target_ckpt >= 1
+        && matches!(
+            CKPT_HOOKS[((seed / 20) % 10) as usize],
+            CkptHook::Before0
+                | CkptHook::After0
+                | CkptHook::After1
+                | CkptHook::Mid2
+                | CkptHook::After2
+                | CkptHook::After3
+                | CkptHook::After4
+        )
+        && r41p_pick(seed, round, tun) == Some(true);
+    let r41p_block: Vec<ScriptOp> = if r41p {
+        let mut ga = Rng::new(derive(seed * 100 + round as u64, S_R41PC));
+        let span = write_max - 1; // |2..=write_max|
+        let tm = 2 + ga.below(span);
+        let ts = if span >= 2 {
+            2 + (tm - 2 + 1 + ga.below(span - 1)) % span
+        } else {
+            tm
+        };
+        let ks = knobs.keyspace;
+        let n = 40u64.min(ks);
+        let base = ga.below(ks - n + 1);
+        let hi = tun.value_hi as usize;
+        let mut block: Vec<ScriptOp> = Vec::new();
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Put {
+                        tree: tm,
+                        key: to_be64(k),
+                        value: vec![0x5A; hi],
+                    })
+                    .collect(),
+            });
+        }
+        for chunk in [base..base + n / 2, base + n / 2..base + n] {
+            block.push(ScriptOp::Commit {
+                sync_on: true,
+                ops: chunk
+                    .map(|k| Op::Delete {
+                        tree: tm,
+                        key: to_be64(k),
+                    })
+                    .collect(),
+            });
+        }
+        block.push(ScriptOp::R41Wait {
+            idx: knobs.target_ckpt - 1,
+        });
+        block.push(ScriptOp::Gc { tree: tm, w: None });
+        let rl = 20u64.min(ks);
+        let b2 = ga.below(ks - rl + 1);
+        block.push(ScriptOp::Commit {
+            sync_on: true,
+            ops: (b2..b2 + rl)
+                .map(|k| Op::Put {
+                    tree: ts,
+                    key: to_be64(k),
+                    value: vec![0xA5; hi],
+                })
+                .collect(),
+        });
+        block.push(ScriptOp::R41Done {
+            idx: knobs.target_ckpt - 1,
+        });
+        block
+    } else {
+        Vec::new()
+    };
+    // Assemble: the barrier, then (in a selected round) block A (the
+    // prior window's — checkpoint `idx−1` opens first) and block B,
+    // then the base sweeps and the burst's; the arms go at the very
+    // front, before the barrier, **only in a selected round** — an
+    // unselected round's GC task is bit-for-bit the generator's. Block
+    // B's arm is op 0 (slot 0), block A's beside it (slot 1).
+    let mut gc_ops: Vec<ScriptOp> = Vec::new();
+    barrier(&mut gc_ops);
+    gc_ops.extend(r41p_block);
+    gc_ops.extend(r41_block);
+    gc_ops.extend(base_sweep_ops);
+    gc_ops.extend(burst_sweep_ops);
+    if r41 {
+        gc_ops.insert(
+            0,
+            ScriptOp::R41Arm {
+                idx: knobs.target_ckpt,
+            },
+        );
+    }
+    if r41p {
+        gc_ops.insert(
+            1,
+            ScriptOp::R41Arm {
+                idx: knobs.target_ckpt - 1,
+            },
+        );
     }
     // ---- the DDL/bulk task ----
     let mut ddl_ops: Vec<ScriptOp> = Vec::new();
@@ -892,6 +1324,212 @@ pub fn window_crash_point(
     }
 }
 
+/// **X5-R56 (card X-5c-F4-F5; a 5.5 amendment, owner decision
+/// 2026-11-10 (3)): the drop-walk window's selection.** One draw from
+/// the round's own `S_W7` stream, true with probability `w7_share`
+/// permille. Returns `None` — **no draw made, the stream never
+/// constructed** — when `w7_share == 0` (BASE, and FINAL until ladder
+/// B), when the round is targeted-mode (`uniform == false`: an `r41`
+/// round is targeted and has no drop, so the change cannot reach it),
+/// or when the round has no drop (`drop == false`: there is no walk to
+/// crash inside). The `None`/`Some` split is the draw-count contract
+/// (`x5r56_w7_not_drawn_at_zero`); an unselected round's point is
+/// exactly [`window_crash_point`]'s, its `S_CWIN` draw unchanged
+/// (`x5r56_unselected_round_keeps_its_point`).
+pub fn w7_pick(seed: u64, round: u32, tun: &Tuning, uniform: bool, drop: bool) -> Option<bool> {
+    if tun.w7_share == 0 || !uniform || !drop {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_W7));
+    Some(r.below(1000) < tun.w7_share as u64)
+}
+
+/// **X5-R56: a selected round's crash point** — uniform over the
+/// counting pass's `drop_walk_yields` list, labelled `w7`; an empty
+/// list falls back to the plain uniform point, labelled `w7-` (the
+/// card's Goal 2 fallback). The index draw comes from the **same
+/// `S_W7` construction** [`w7_pick`] drew the selection from — the
+/// stream is a pure function of `(seed, round)`, so re-deriving it
+/// replays the identical sequence; the first `below(1000)` here is
+/// that already-made selection draw (burned, its outcome known), and
+/// the `below(len)` after it is the index. Never called unless
+/// `w7_pick` returned `Some(true)`.
+pub fn w7_drop_walk_point(
+    seed: u64,
+    round: u32,
+    obs: &harness::WorkloadObs,
+    counted: u64,
+) -> (u64, Option<&'static str>) {
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_W7));
+    let _selection = r.below(1000);
+    let list = &obs.drop_walk_yields;
+    if list.is_empty() {
+        return (uniform_yield_point(seed, round, counted), Some("w7-"));
+    }
+    let k = list[r.below(list.len() as u64) as usize];
+    (k, Some("w7"))
+}
+
+/// **X5-R41 (card X-5c-F4-F1-F1-F3 step 1): the alignment selection.**
+/// One draw from the round's own `S_R41` stream, true with probability
+/// `r41_share` permille. Returns `None` — **no draw made** — when
+/// `r41_share == 0` (BASE and this card's FINAL): the stream is never
+/// constructed, so no stream state is consumed (the card's Limit 3) and
+/// the round's script is bit-for-bit the pre-X5-R41 generator's. The
+/// `None`/`Some` split is the draw-count contract the
+/// `x5_r41_not_drawn_at_base` pin asserts (drawing at `r41_share == 0`
+/// would return `Some(false)`, observable here and nowhere else — the
+/// stream is independent, so no digest can see it); the caller draws
+/// only for eligible rounds (a targeted crash, no drop), so a uniform
+/// or drop round consumes nothing even at a non-zero share.
+pub fn r41_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
+    if tun.r41_share == 0 {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_R41));
+    Some(r.below(1000) < tun.r41_share)
+}
+
+/// **X5-R50 (card X-5c-F4-F1-F1-F3-F1 step 5a): the prior-window
+/// alignment selection.** One draw from the round's own `S_R41P`
+/// stream, true with probability `r41p_share` permille. Returns
+/// `None` — **no draw made** — when `r41p_share == 0` (BASE and this
+/// card's FINAL): the stream is never constructed, so no stream state
+/// is consumed (the card's Limit 2) and the round's script is
+/// bit-for-bit the pre-X5-R50 generator's — pinned by
+/// `x5_r50_not_drawn_at_base` (BASE pinned by X5-R37's digest
+/// literals). The caller draws only for eligible rounds (X5-R41
+/// selected, a pre-step-5 targeted hook, `target_ckpt ≥ 1`), so an
+/// ineligible round consumes nothing even at a non-zero share — pinned
+/// by `x5_r50_ineligible_rounds_draw_nothing`.
+pub fn r41p_pick(seed: u64, round: u32, tun: &Tuning) -> Option<bool> {
+    if tun.r41p_share == 0 {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_R41P));
+    Some(r.below(1000) < tun.r41p_share)
+}
+
+/// **X5-R55 (card X-5c-F4-F5; a 5.2 amendment, owner decision
+/// 2026-11-10 (2)): the round-0 fill.** `r0_fill_txns` sync-on
+/// chunked transactions of `r0_fill_ops` Puts each, for task 0,
+/// directly after its setup commit and before its other ops — round 0
+/// starts from empty trees, and its whole plain workload (chunked
+/// 900–1,200 ops plus 20–31 small commits under `MP_PRESSURE`) dirties
+/// well under 4·F distinct LPIDs (verdict `2c041aae` §4), so the fill
+/// is what puts the ≥ 4·F condition into round 0, before the crash.
+///
+/// Each transaction: unique `(tree, key)` pairs (one op per entry key
+/// per transaction, I-ENTRY-UNIQUE's shape, like every other
+/// transaction the generator builds); trees uniform over the round's
+/// write range `2..=write_max` (`2 + below(write_max - 1)`); keys
+/// uniform over `0..keyspace`; every value `tun.value_hi` bytes of
+/// the one constant [`R55_FILL_BYTE`]. Each transaction stays inside
+/// 5.2's chunked range (300–1,500 ops) and the 8–400 B values; the
+/// amendment is only that round 0 may hold more than one chunked
+/// transaction.
+///
+/// Returns `None` — **no draw made, the stream never constructed** —
+/// when `r0_fill_txns == 0` or `round != 0` (the card's draw-count
+/// contract, `x5r55_fill_not_drawn_at_zero`): BASE, FINAL and every
+/// round other than round 0 consume no stream state on `S_R55F` and
+/// their scripts are bit-for-bit the pre-X5-R55 generator's. All
+/// content draws come from `S_R55F` alone, so no other stream's order
+/// moves (`x5r55_fill_leaves_the_rest_of_the_script`). Pure in
+/// `(seed, round, tun, knobs, write_max)` (W-DET).
+pub fn r0_fill_block(
+    seed: u64,
+    round: u32,
+    tun: &Tuning,
+    knobs: &Knobs,
+    write_max: u64,
+) -> Option<Vec<ScriptOp>> {
+    if tun.r0_fill_txns == 0 || round != 0 {
+        return None;
+    }
+    let mut r = Rng::new(derive(seed * 100 + round as u64, S_R55F));
+    let n = tun.r0_fill_ops as usize;
+    let v = vec![R55_FILL_BYTE; tun.value_hi as usize];
+    let mut ops = Vec::new();
+    for _ in 0..tun.r0_fill_txns {
+        let mut seen: BTreeSet<(u64, Vec<u8>)> = BTreeSet::new();
+        let mut puts: Vec<Op> = Vec::new();
+        while puts.len() < n {
+            let tree = 2 + r.below(write_max - 1);
+            let key = to_be64(r.below(knobs.keyspace));
+            if !seen.insert((tree, key.clone())) {
+                continue;
+            }
+            puts.push(Op::Put {
+                tree,
+                key,
+                value: v.clone(),
+            });
+        }
+        ops.push(ScriptOp::Chunked {
+            sync_on: true,
+            ops: puts,
+        });
+    }
+    Some(ops)
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3 step 6): `q4i_raw`** — did the
+/// window of the checkpoint whose meta the final recovery opened hold a
+/// pre-freeze reuse? Pure in the per-seed ledger (`ckpt_id →
+/// (splits, merges, whole-window reuses, pre-freeze reuses)`, last
+/// write wins: the row for an id is always the most recent checkpoint
+/// with that id, which is exactly the checkpoint whose meta bytes sit
+/// in that id's slot) and the opened meta's `ckpt_id`. Reads the
+/// **pre-freeze** element (X-5c-F4-F1-F1-F3-F1 step 2a, the owner's
+/// row text: "reused before its step 2 froze the table"); the
+/// whole-window count stays the Q4 arm's. `None` (a refused or failed
+/// open — no opened meta) or a missing row (the harness checkpoint's
+/// id, never recorded) is false.
+pub fn q4i_raw_of(
+    windows: &BTreeMap<u64, (u64, u64, u64, u64)>,
+    opened_ckpt_id: Option<u64>,
+) -> bool {
+    opened_ckpt_id.is_some_and(|k| windows.get(&k).is_some_and(|w| w.3 >= 1))
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 3b): the per-round ledger
+/// fold, pure** — the exact steps the driver took inline before this
+/// card: insert this attempt's ledger rows, key `q4i_raw` on the
+/// opened meta's own id, then drop the harness checkpoint's id (a
+/// later round's recovery can open its meta, and its window is not
+/// recorded; without the removal a stale row from an older checkpoint
+/// of the same id could answer for its meta). Pure over the ledger, so
+/// the harness-checkpoint removal is pinnable directly
+/// (`x5_r42_harness_checkpoint_image_is_not_q4i`; no 0..1000 round
+/// exercises the divergence, measured — the pure case is the card's
+/// named fallback). **G-LEDGER-NOREMOVE** (the harness checkpoint
+/// stays in the ledger) drops the removal here and fails that pin.
+pub fn fold_ckpt_windows(
+    ckpt_windows: &mut BTreeMap<u64, (u64, u64, u64, u64)>,
+    rows: &[(u64, u64, u64, u64, u64)],
+    opened_ckpt_id: Option<u64>,
+    harness_ckpt_id: Option<u64>,
+) -> bool {
+    for &(k, sp, mg, ru, rupf) in rows {
+        ckpt_windows.insert(k, (sp, mg, ru, rupf));
+    }
+    let raw = q4i_raw_of(ckpt_windows, opened_ckpt_id);
+    if let Some(hk) = harness_ckpt_id {
+        ckpt_windows.remove(&hk);
+    }
+    raw
+}
+
+/// **X5-R42: `q4i`** — the Q4-I row's per-round predicate:
+/// `q4i_raw` ∧ the round's own crash fired ∧ Q18's `end.is_some()`
+/// (excluded like SIZING: nested recovery crashes — only the final
+/// recovery's opened meta is read — the harness checkpoint, and refused
+/// or failed opens).
+pub fn q4i_of(q4i_raw: bool, fired: bool, end_some: bool) -> bool {
+    q4i_raw && fired && end_some
+}
+
 /// A round whose crash spec never fired is a **harness defect** (5.5
 /// step 2: every round crashes). A silent no-crash round would leave
 /// every downstream field — faults, recovery, the oracle inputs —
@@ -1069,6 +1707,55 @@ pub struct RoundRec {
     pub task_error: Option<String>,
     /// The quota flags (5.6), one per named quota.
     pub q4_split_merge: bool,
+    /// **X-5c-F4-F1-F1 step 1 (the Q4 halves):** splits inside the
+    /// crash-time checkpoint window (the store's `ckpt_splits` counter
+    /// at the `obs` snapshot — reset at each `ckpt:begin`, counting only
+    /// while a checkpoint is open; at the crash it reads the current or
+    /// last-opened window's count). A record diagnostic serialized in
+    /// `campaign.json`, never a digest input and never a quota input.
+    pub q4sp: u64,
+    /// **X-5c-F4-F1-F1 step 1:** the same for merges (`ckpt_merges`).
+    pub q4mg: u64,
+    /// **X5-R41 (card X-5c-F4-F1-F1-F3 step 2): window reuses in the
+    /// crash's window** — `alloc_lpid` handed out an LPID freed since
+    /// this flip (the store's `ckpt_reuse` at the crash snapshot, reset
+    /// per window like `q4sp`/`q4mg`). A record diagnostic serialized in
+    /// `campaign.json`, never a digest input and never a quota input.
+    pub q4reuse: u64,
+    /// **X5-R41/R42 (step 2): the splits of the window of the last
+    /// checkpoint whose step 5 returned** (the last ledger row at the
+    /// crash snapshot; 0 when none returned). Diagnostics, never digest
+    /// inputs.
+    pub imgsp: u64,
+    /// **X5-R41/R42:** the same window's merges.
+    pub imgmg: u64,
+    /// **X5-R41/R42:** the same window's reuses.
+    pub imgreuse: u64,
+    /// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2a): the same window's
+    /// pre-freeze reuses** — `alloc_lpid` reuses of the last completed
+    /// window counted only before its step 2 froze the table (the store
+    /// observable `ckpt_reuse_pf`). The Q4-I row's `q4i_raw` reads this
+    /// count through the per-seed ledger; `imgreuse` above keeps the
+    /// whole window for the Q4 arm. A record diagnostic serialized in
+    /// `campaign.json` as `imgrupf`, never a digest input.
+    pub imgreuse_pf: u64,
+    /// **X5-R42 (step 2): the opened image's own window held a reuse** —
+    /// the window of the checkpoint whose meta this round's **final
+    /// recovery opened** (by that meta's `ckpt_id`, from the per-seed
+    /// ledger: a meta rollback reads the older image's window, never the
+    /// last step-5 checkpoint's; the harness checkpoint's windows are
+    /// not recorded, so its id has no row). Excluded like SIZING:
+    /// nested recovery crashes (only the final recovery's opened meta is
+    /// read), the harness checkpoint, and refused or failed opens (no
+    /// opened meta). A record diagnostic, never a digest input.
+    pub q4i_raw: bool,
+    /// **X5-R42:** `q4i_raw` ∧ the round's own crash fired ∧ Q18's
+    /// `end.is_some()` — the Q4-I row's per-round predicate (X5-R42's
+    /// row counts it over the campaign's whole 10k). Never a digest
+    /// input: it stays out of the digest so X5-R37's BASE literals
+    /// cannot move, and `verify` compares it per round between the file
+    /// and the re-run instead.
+    pub q4i: bool,
     /// Q5: a ≥ 2-segment chunked txn open at the crash (no marker).
     pub q5_open: bool,
     /// Q5: a chunked txn marked, its marker above the flips so far.
@@ -1119,6 +1806,35 @@ pub struct RoundRec {
     /// changes to count crash-cut intervals is the owner's question);
     /// never a digest input, never an exit input.
     pub szc: bool,
+    /// **X5-R39 (card X-5c-F4-F2 step 1; OQ-1's ruling, PLAN §10 item
+    /// 10): `szq`** — the crash cut a ≥ 4·F interval (`szc`) **and the
+    /// round's final recovery opened a store** (Q18's `end.is_some()`,
+    /// read at the same point). PLAN §10 item 10's exclusion: "rounds
+    /// whose final recovery yields no state (refused or failed open,
+    /// Q18's condition)" never count — "a refused round tests
+    /// detection, not the recovery under pressure". The SZC, SZC-MP and
+    /// SZC-MW rows count it. A record diagnostic serialized as `szq`,
+    /// never a digest input; `verify` compares it per round between the
+    /// file and the re-run.
+    pub szq: bool,
+    /// **X5-R39: `szi`** — `szq`, the open checkpoint's begin-step fold
+    /// ≥ 4·F (`ckpt_closed_dirty`), and the crash inside the
+    /// [`crate::store::ckpt::ckpt_unflipped`] window (from the
+    /// completion of step 0 until step 5's `sync_all` returned): the
+    /// interrupted-checkpoint floor — "the same, but only from the
+    /// completion of step 0 until step 5's `sync_all` returns" (PLAN
+    /// §10 item 10) — counted **inside** the 1,000, not on top of it.
+    /// The SZI row counts it. A record diagnostic serialized as `szi`,
+    /// never a digest input; compared per round like `szq`.
+    pub szi: bool,
+    /// **X5-R46 (card X-5c-F4-F2 step 2; REFRESH 9): `rfs`** — the
+    /// round's final recovery produced no store (`end.is_none()`, read
+    /// at the same point as Q18's `end.is_some()`): a refused or
+    /// failed-open round. The MP refusal rate (`MP_REFUSAL`) counts it
+    /// over class MP only, reported and never an exit input. A record
+    /// diagnostic serialized as `rfs`, never a digest input; compared
+    /// per round between the file and the re-run like `szq`/`szi`.
+    pub rfs: bool,
 }
 
 /// The twin's per-round outcome (judged as class C; Work 2.5).
@@ -1153,6 +1869,26 @@ pub struct SeedRec {
     /// for uniform rounds (whose twin may legitimately wrap its `k`
     /// into its own measured total; 4fedc648).
     pub twin_paired: Vec<bool>,
+    /// **Diagnostic only** (X-5c-PINS-1 item 2, the `twin_paired`
+    /// manner; never a digest input — [`SeedRec::finish`] does not
+    /// read it — and never serialized): per executed round, whether
+    /// the R21 (c) **joint arm** ran — the re-paired twin's re-run at
+    /// the joint spec (`reachable_hook_spec` over the per-index AND of
+    /// the two complete mask lists, X5-R48). `false` for every round
+    /// without one.
+    pub twin_joint_arm: Vec<bool>,
+    /// **Diagnostic only** (beside [`SeedRec::twin_joint_arm`]): the
+    /// stale-read count at the joint re-run's start — the reads the
+    /// re-paired twin's unfired attempt left in the collector, which
+    /// `treads.clear()` zeroes so the joint arm's supply (`supply2`'s
+    /// `recovery_reads`) holds only the final attempt's reads (verdict
+    /// X-5c-F4-F1-F1-CXX-F1 finding 2: an extra read can only suppress
+    /// an oracle failure). `0` in clean code and for every round
+    /// without a joint arm; the unfired attempt's read count when the
+    /// clear is dropped (**G5-R48-TREADS-KEPT**; 17 stale reads at
+    /// seed 7469 at CXX-F1's tip, verdict `5db63057`; no seed of
+    /// 0..9999 reaches the arm at `2e8d1b13`, verdict `74f411f0`).
+    pub twin_joint_stale_reads: Vec<usize>,
     /// A DEADLOCK occurred in some round.
     pub deadlock: bool,
     /// A task panicked in some round.
@@ -1294,6 +2030,77 @@ pub fn twin_chain_after_repair(tout: &harness::RoundOutcome) -> Option<Chain> {
     })
 }
 
+/// **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (a); the directory re-seed):**
+/// true iff the two chains' `dir` **key sets** differ. The `DirEntry`
+/// values are not compared — roots and pointers differ between any two
+/// chains — and this is exactly the set `recover`'s replay checks when
+/// it fails with `Corrupt("tree N missing in directory")` (the narrow
+/// DDL predicate of the twin re-seed; the two models also differ
+/// whenever a real round loses ordinary commits, which is common in MW,
+/// so re-seeding on a model difference would re-pair most MW rounds and
+/// move digests far past the defect). Both `dir`s are `BTreeMap`s, so
+/// the key comparison is order-deterministic.
+pub fn twin_dirs_differ(real: &StoreInner, twin: &StoreInner) -> bool {
+    real.dir.keys().ne(twin.dir.keys())
+}
+
+/// **X-5c-F4-F7 (owner ruling 2026-11-14; P's Work 2.5 ruling,
+/// `E4-final-diagnostics.md` §A.1 and §A.3): the twin chain a re-seed
+/// runs from — the real round's own start, with the real chain's
+/// earlier media damage healed off the cloned disk.**
+///
+/// Both re-seed arms (the broken-chain re-seed and the directory
+/// re-seed below) rebuild the twin from `ch.disk.clone()`, and that
+/// clone carries every earlier real round's media fault that is still
+/// live on the real disk. Work 2.5's twin is "the same seed, schedule
+/// and F-CRASH resolutions, **with the media faults removed**, judged
+/// as class C — from the same base the real round runs", so a
+/// damaged clone is not that twin (held-out 17948 twin 2: the clone
+/// inherited three damaged page slots from rounds 0–1 and class C's
+/// rules failed the round on them — a false failure; the store had
+/// detected and refused exactly as its real round, which passes, does).
+///
+/// The heal ([`crate::sim::SimDisk::heal_media`], P's fix §A.3) acts
+/// **only on the clone**: the real chain, the store state, the model
+/// and the cut are untouched, and with no live damaged range the heal
+/// is a no-op — so no seed without a damaged re-seed start runs
+/// different code (card Limit 1).
+///
+/// The self-check (§A.3 step 2; a violation is a seed defect, loud,
+/// never a pass): after the heal no media-fault range of the clone may
+/// still be `range_tainted`, and the cloned store may not be poisoned.
+/// On violation `rec.defect` is set — the seed can never pass and the
+/// digest moves — the harness tells P, it never hides it.
+fn reseeded_twin_chain(ch: &Chain, rec: &mut SeedRec, round: u32) -> Chain {
+    let mut disk = ch.disk.clone();
+    // Step 1, the heal. `still` holds every damaged range that remains
+    // tainted after it (healed or not — one range's heal can overlap
+    // another's).
+    let still = disk.heal_media();
+    if !still.is_empty() && rec.defect.is_none() {
+        rec.defect = Some(format!(
+            "twin round {round}: re-seed heal left {} media-fault range(s) tainted: {:?}",
+            still.len(),
+            still
+        ));
+    }
+    // Step 2's other half: a poisoned cloned store is not the base
+    // Work 2.5 names — the twin would inherit a stopped store through
+    // no read of its own.
+    if ch.st.poisoned.is_some() && rec.defect.is_none() {
+        rec.defect = Some(format!(
+            "twin round {round}: re-seeded from a poisoned store: {:?}",
+            ch.st.poisoned
+        ));
+    }
+    Chain {
+        disk,
+        st: ch.st.clone(),
+        model: harness::clone_model(&ch.model),
+        cut: ch.cut,
+    }
+}
+
 /// Run one seed: create, then 1–3 rounds (each with its twin first for
 /// MP/MW), collecting the record. Pure in `(seed, mutant)` (W-DET).
 /// Runs `Tuning::FINAL` — the campaign's generator (X5-R37).
@@ -1342,6 +2149,17 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
     // starting frontier, its append end) is appended after the round.
     let mut x33_lives: Vec<harness::X33Life> = Vec::new();
     let mut x33_prev_frontier = 0u64;
+    // **X5-R42 (card X-5c-F4-F1-F1-F3 step 2): the per-seed checkpoint
+    // window ledger** — every checkpoint's window counts for the whole
+    // seed, keyed by `ckpt_id` (last write wins), each row
+    // `(splits, merges, whole-window reuses, pre-freeze reuses)` (the
+    // pre-freeze element added by X-5c-F4-F1-F1-F3-F1 step 2a: Q4-I
+    // reads it, the Q4 arm keeps the whole-window count). A round's
+    // `q4i_raw` looks up the opened meta's own id in it; the round's
+    // harness checkpoint's id is removed after the round (its windows
+    // are not recorded, and without the removal a stale row from an
+    // older checkpoint of the same id could answer for its meta).
+    let mut ckpt_windows: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
     for round in 0..round_counts {
         let Some(ch) = chain.take() else {
             break;
@@ -1403,7 +2221,19 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
             // that picks a W11/W12 window yield list recorded by the
             // counting pass. BASE (shares 0) draws nothing here: the
             // plain uniform point stands and no digest moves.
-            let (k, cwin) = window_crash_point(seed, round, &out.obs, tun, out.sched_yields.max(1));
+            //
+            // **X5-R56 (card X-5c-F4-F5) sits in front of it:** in a
+            // uniform-mode drop round at `w7_share > 0`, one S_W7
+            // draw may select the round, and a selected round's point
+            // is uniform over the counting pass's `drop_walk_yields`
+            // (label `w7`; empty list → the plain uniform point,
+            // `w7-`). Every other round — share 0, targeted-mode,
+            // unselected, no drop — runs exactly X5-R38's
+            // `window_crash_point` with its S_CWIN draw unchanged.
+            let (k, cwin) = match w7_pick(seed, round, tun, uniform, knobs.drop_tree) {
+                Some(true) => w7_drop_walk_point(seed, round, &out.obs, out.sched_yields.max(1)),
+                _ => window_crash_point(seed, round, &out.obs, tun, out.sched_yields.max(1)),
+            };
             cwin_pick = cwin;
             script_twin = Script {
                 crash: Some(CrashSpec::Yield(k)),
@@ -1457,13 +2287,37 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // from the real round's own start (Work 2.5: the twin is the
         // same script, crash and F-CRASH resolutions, faultless, judged
         // as class C — from the same base the real round runs).
+        // **X-5c-F4-F7:** the re-seeded clone is healed of the real
+        // chain's earlier media damage first (`reseeded_twin_chain`),
+        // or it is not faultless and not Work 2.5's twin.
         if twin_chain.is_none() && class != FaultClass::C {
-            twin_chain = Some(Chain {
-                disk: ch.disk.clone(),
-                st: ch.st.clone(),
-                model: harness::clone_model(&ch.model),
-                cut: ch.cut,
-            });
+            twin_chain = Some(reseeded_twin_chain(&ch, &mut rec, round));
+        }
+        // **X-5c-F4-F1-F1-F3-F2-F1-F2 (P ruling, (b); the directory
+        // re-seed):** a real MW round whose WAL fault loses a DropTree
+        // keeps the tree in the real chain's directory while the
+        // faultless twin's drops it, and the next round's script — built
+        // from the real model (`build_round(.., &ch.model, ..)`) — then
+        // writes into a tree the twin's image no longer holds: the
+        // twin's recovery replays a record into a missing tree and
+        // fails with `Corrupt("tree N missing in directory")` (verdict
+        // X-5c-F4-F1-F1-F3-F2-F1, finding 1). That twin no longer runs
+        // "the same script, crash and F-CRASH resolutions, faultless …
+        // from the same base" (Work 2.5), so whenever the two chains'
+        // directory key sets differ at round start it is re-seeded from
+        // the real round's own start — the same clone the broken-chain
+        // re-seed above makes. `twin_chain` is `Some` only on MP/MW
+        // seeds (class C never builds one), which is the ruling's "every
+        // MP/MW round"; nothing else changes (the twin still runs class
+        // C, faultless, at the same crash and resolutions, and no record
+        // field or digest input is added). **X-5c-F4-F7:** this clone is
+        // healed the same way (`reseeded_twin_chain`) — the real chain's
+        // earlier media damage must not ride the re-seed into the twin.
+        if twin_chain
+            .as_ref()
+            .is_some_and(|tch| twin_dirs_differ(&ch.st, &tch.st))
+        {
+            twin_chain = Some(reseeded_twin_chain(&ch, &mut rec, round));
         }
         // The targeted draw of a class C round retries on its own
         // (no twin exists); keep the round's start for the re-run. The
@@ -1708,6 +2562,13 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // and re-runs from the same start; the failed attempt is
         // discarded (the fired-guard never records it).
         let mut real_final_spec: Option<CrashSpec> = script.crash.clone();
+        // X-5c-PINS-1 item 2's diagnostic locals (the `twin_paired`
+        // manner; recorded per round after the retry block): whether
+        // the joint arm ran, and the stale-read count at its re-run's
+        // start. Defaults for every round whose retry never reaches
+        // the joint arm.
+        let mut joint_arm_ran = false;
+        let mut joint_stale_reads = 0usize;
         if let (Some(retry), false, true, Some(crash)) = (
             ch_retry.take(),
             out.obs.crash_fired,
@@ -1735,11 +2596,12 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                             break 'derive;
                         }
                     };
-                    let spec2 = CrashSpec::Hook {
+                    let real_masks = out.obs.ckpt_hooks_hit.clone();
+                    let mut spec2 = CrashSpec::Hook {
                         ckpt_index: idx2,
                         hook: hook2,
                     };
-                    let script2 = Script {
+                    let mut script2 = Script {
                         crash: Some(spec2.clone()),
                         ..script
                     };
@@ -1761,6 +2623,16 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                     let mut supply2 = None;
                     let mut twin_points2 = Vec::new();
                     if let Some(tch) = tch_pair.take() {
+                        // **X5-R48:** the twin's own start for the joint
+                        // re-run below (the first re-pair attempt
+                        // consumes `tch`'s parts, as the first attempt
+                        // consumed the chain's).
+                        let tch_joint = Chain {
+                            disk: tch.disk.clone(),
+                            st: tch.st.clone(),
+                            model: harness::clone_model(&tch.model),
+                            cut: tch.cut,
+                        };
                         let tscript = Script {
                             nested: Vec::new(),
                             ..script2.clone()
@@ -1776,7 +2648,7 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                             probe_pass: false,
                         };
                         let mut treads = Vec::new();
-                        let tout = harness::run_round(
+                        let mut tout = harness::run_round(
                             seed,
                             round,
                             &tscript,
@@ -1789,6 +2661,87 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                             Some(&mut treads),
                             None,
                         );
+                        // **X5-R48 (amends X5-R21 (c)): the joint
+                        // re-derive.** The re-paired twin ran at a spec
+                        // derived only from the REAL round's masks, and
+                        // the chains can diverge, so its crash may never
+                        // fire — the fired-guard would then fail the
+                        // seed for a crash point no checkpoint of the
+                        // twin's chain reaches (7469: the R21 (c)
+                        // re-pair was the one arm with no re-derive).
+                        // Both unfired attempts — the real round's
+                        // first, the re-paired twin — ran to completion,
+                        // so both mask lists are complete: their
+                        // per-index AND over the shorter length names
+                        // the hooks BOTH chains reach, and one
+                        // [`reachable_hook_spec`] draw on it (the same
+                        // drawn `(hook, ckpt_index)`, the same `(seed,
+                        // round)`) re-pairs the round at a spec both can
+                        // fire. The twin re-runs at that spec from its
+                        // own start; the real round then runs at the
+                        // same one (`script2`/`spec2` name it below).
+                        // A refused re-derive (union 0, or an empty
+                        // list) draws nothing and changes nothing: the
+                        // unfired attempt's fired-guard defect stands,
+                        // exactly as before — and a twin that still does
+                        // not fire at the joint spec trips the guard the
+                        // same way. There is no third attempt.
+                        if !tout.obs.crash_fired {
+                            let joint: Vec<u16> = tout
+                                .obs
+                                .ckpt_hooks_hit
+                                .iter()
+                                .zip(real_masks.iter())
+                                .map(|(a, b)| a & b)
+                                .collect();
+                            if let Ok((i3, h3)) =
+                                reachable_hook_spec(&joint, hook, ckpt_index, seed, round)
+                            {
+                                spec2 = CrashSpec::Hook {
+                                    ckpt_index: i3,
+                                    hook: h3,
+                                };
+                                script2 = Script {
+                                    crash: Some(spec2.clone()),
+                                    ..script2.clone()
+                                };
+                                crash_desc = format!("{h3:?}@{i3}");
+                                let t3 = Script {
+                                    nested: Vec::new(),
+                                    ..script2.clone()
+                                };
+                                treads.clear();
+                                // X-5c-PINS-1 item 2 diagnostic: the
+                                // stale-read count at the joint
+                                // re-run's start. The clear above is
+                                // what zeroes it — without it (the
+                                // G5-R48-TREADS-KEPT shape) the
+                                // collector still holds the unfired
+                                // re-paired attempt's reads here, and
+                                // the supply below carries them into
+                                // the real round's oracle (17 at seed
+                                // 7469 at CXX-F1's tip; no seed of
+                                // 0..9999 reaches this arm at
+                                // `2e8d1b13`). Never a digest input,
+                                // never serialized; `SeedRec::finish`
+                                // never reads it.
+                                joint_arm_ran = true;
+                                joint_stale_reads = treads.len();
+                                tout = harness::run_round(
+                                    seed,
+                                    round,
+                                    &t3,
+                                    &tf_pair,
+                                    cfg.clone(),
+                                    tch_joint.disk,
+                                    tch_joint.st,
+                                    &tch_joint.model,
+                                    tch_joint.cut,
+                                    Some(&mut treads),
+                                    None,
+                                );
+                            }
+                        }
                         if let Some(d) = crash_fired_defect(&tout, &crash_desc)
                             && rec.defect.is_none()
                         {
@@ -1875,6 +2828,11 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
                 }
                 _ => true,
             });
+        // X-5c-PINS-1 item 2's diagnostic (the twin_paired manner):
+        // one entry per executed round, defaulting to no-joint-arm and
+        // zero stale reads.
+        rec.twin_joint_arm.push(joint_arm_ran);
+        rec.twin_joint_stale_reads.push(joint_stale_reads);
 
         // **G8 (X5-R16's conditional fill):** a poisoned store ended the
         // workload — the crash was delivered at the poison point, and
@@ -1900,6 +2858,18 @@ pub fn run_seed_with(seed: u64, mutant: Option<Mutant>, tun: &Tuning) -> SeedRec
         // X5-R38: the window pick of record (a digest input only when
         // set — see `RoundRec::cwin`).
         rr.cwin = cwin_pick;
+        // **X5-R42 (step 2): the image arm.** Fold this (final)
+        // attempt's ledger rows into the per-seed ledger, key `q4i_raw`
+        // on the opened meta's own id, then drop the harness
+        // checkpoint's id — all in [`fold_ckpt_windows`], pure for the
+        // X-5c-F4-F1-F1-F3-F1 step 3b pin.
+        rr.q4i_raw = fold_ckpt_windows(
+            &mut ckpt_windows,
+            &out.obs.ckpt_windows,
+            out.opened_ckpt_id,
+            out.harness_ckpt_id,
+        );
+        rr.q4i = q4i_of(rr.q4i_raw, rr.fired, out.end_store.is_some());
         rec.deadlock |= rr.deadlock;
         rec.panic |= rr.panic;
         rec.baton |= rr.baton;
@@ -2022,6 +2992,23 @@ fn round_rec(
     // window's own counters.
     rr.q4_split_merge =
         obs.crash_fired && (1..=6).contains(&obs.ckpt_step) && obs.splits >= 1 && obs.merges >= 1;
+    // X-5c-F4-F1-F1 step 1: the halves themselves, beside the combined
+    // flag (diagnostics only — see RoundRec::q4sp/q4mg).
+    rr.q4sp = obs.splits;
+    rr.q4mg = obs.merges;
+    // X5-R41/R42 (card X-5c-F4-F1-F1-F3 step 2): the reuse half in the
+    // crash's window, and the completed-window arm — the counts of the
+    // last checkpoint whose step 5 returned (the last ledger row at the
+    // crash snapshot). X-5c-F4-F1-F1-F3-F1 step 2a adds the pre-freeze
+    // companion `imgreuse_pf` (Q4-I's reading); `imgreuse` keeps the
+    // whole window (the Q4 arm's).
+    rr.q4reuse = obs.reuses;
+    if let Some(&(_, sp, mg, ru, rupf)) = obs.ckpt_windows.last() {
+        rr.imgsp = sp;
+        rr.imgmg = mg;
+        rr.imgreuse = ru;
+        rr.imgreuse_pf = rupf;
+    }
     // Q5: the chunked cases. Open: a txn with chunks enqueued and no
     // marker, spanning ≥ 2 segments. Marked: a marker enqueued on a txn
     // still open (no flip has covered it — the marker sits above the
@@ -2110,6 +3097,19 @@ fn round_rec(
     rr.sizing_ok = sizing_ok_of(obs, four_f);
     // SIZING-C (step 4): the crash cut a ≥ 4·F interval.
     rr.szc = szc_of(obs, four_f);
+    // X5-R39 (card X-5c-F4-F2 step 1): the sizing rows' predicates.
+    // `szq` is `szc` and Q18's `end.is_some()` (a refused or failed-open
+    // round tests detection, not the recovery under pressure); `szi` is
+    // `szq`, the open checkpoint's folded interval ≥ 4·F, and the crash
+    // inside the `ckpt_unflipped` window (the interrupted-checkpoint
+    // floor). Record diagnostics, never digest inputs.
+    rr.szq = rr.szc && out.end_store.is_some();
+    rr.szi = rr.szq
+        && obs.ckpt_closed_dirty >= four_f
+        && crate::store::ckpt::ckpt_unflipped(obs.ckpt_step);
+    // X5-R46 (card X-5c-F4-F2 step 2): the refusal flag, at the same
+    // point Q18 reads its `end.is_some()`.
+    rr.rfs = out.end_store.is_none();
     rr
 }
 
@@ -2146,7 +3146,8 @@ fn class_name(class: FaultClass) -> &'static str {
 /// numbers.
 #[derive(Debug, Clone)]
 pub struct QuotaRow {
-    /// The quota id (Q1…Q18, or SIZING for Work 5.3's assertion).
+    /// The quota id (Q1…Q18, SIZING for Work 5.3's per-seed reporting,
+    /// or X5-R39's SZC/SZC-MP/SZC-MW/SZI sizing rows).
     pub id: &'static str,
     /// What the row counts.
     pub what: String,
@@ -2177,6 +3178,9 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
     let mut q16 = 0u64;
     let mut q17 = 0u64;
     let mut q18 = 0u64;
+    // **X5-R39 (card X-5c-F4-F2 step 1): the sizing rows' round
+    // counters** — `szq` per class and overall, and the `szi` floor.
+    let (mut szc_all, mut szc_mp, mut szc_mw, mut szi) = (0u64, 0u64, 0u64, 0u64);
     // **X5-R17: the SIZING row counts seeds, not rounds** — Work 5.3
     // asserts per seed ("every seed must reach, in at least one
     // checkpoint interval, ≥ 4·F distinct dirtied LPIDs"), so a seed
@@ -2200,6 +3204,24 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
         }
         if rec.rounds.iter().any(|r| r.q16_map_depth2) {
             q16 += 1;
+        }
+        // X5-R39: the per-class `szq` counts (SZC-MP/SZC-MW read them;
+        // SZC counts every class).
+        let mp = rec.class == "MP";
+        let mw = rec.class == "MW";
+        for r in &rec.rounds {
+            if r.szq {
+                szc_all += 1;
+                if mp {
+                    szc_mp += 1;
+                }
+                if mw {
+                    szc_mw += 1;
+                }
+            }
+            if r.szi {
+                szi += 1;
+            }
         }
         for r in &rec.rounds {
             if r.fired && !r.hook.is_empty() {
@@ -2405,9 +3427,42 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
         },
         QuotaRow {
             id: "SIZING",
-            what: "seeds missing Work 5.3's ≥ 4·F dirtied LPIDs (harness defects)".into(),
+            what: "seeds missing Work 5.3's >= 4*F dirtied LPIDs (per-seed reporting)".into(),
             achieved: sizing_miss,
             required: 0,
+        },
+        // **X5-R39 (card X-5c-F4-F2 step 1; OQ-1's ruling, PLAN §10
+        // item 10): the four sizing rows.** SZC is the ≥ 1,000 quota
+        // ("≥ 1,000 crash rounds whose crash cuts an interval of
+        // ≥ 4·F or interrupts the checkpoint that closes one"), with
+        // MP ≥ 100 and MW ≥ 50 beside it; SZI is the
+        // interrupted-checkpoint floor (≥ 300, counted inside the
+        // 1,000, not on top of it). The SIZING row above stays
+        // per-seed reporting (PLAN item 10: "The per-seed count stays
+        // reported … and is no longer an exit input").
+        QuotaRow {
+            id: "SZC",
+            what: "crash rounds cutting a >= 4*F interval, recovery opened (szq)".into(),
+            achieved: szc_all,
+            required: 1000,
+        },
+        QuotaRow {
+            id: "SZC-MP",
+            what: "MP crash rounds cutting a >= 4*F interval, recovery opened".into(),
+            achieved: szc_mp,
+            required: 100,
+        },
+        QuotaRow {
+            id: "SZC-MW",
+            what: "MW crash rounds cutting a >= 4*F interval, recovery opened".into(),
+            achieved: szc_mw,
+            required: 50,
+        },
+        QuotaRow {
+            id: "SZI",
+            what: "crash rounds interrupting the checkpoint closing a >= 4*F interval".into(),
+            achieved: szi,
+            required: 300,
         },
     ]);
     rows

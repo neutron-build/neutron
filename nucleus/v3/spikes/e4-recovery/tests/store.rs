@@ -22,7 +22,9 @@ use e4_recovery::sim::{
 };
 use e4_recovery::store::ckpt::{self, CkptHook};
 use e4_recovery::store::wal;
-use e4_recovery::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims, tree};
+use e4_recovery::store::{
+    Cx, Fail, HasStore, Img, Mutant, StoreCfg, StoreInner, amcheck, prims, tree,
+};
 
 /// The test world: scheduling, disk and store slices plus a small shared
 /// flag board (and a numeric board, X-5c-F3-F3b step 1's After4 record)
@@ -756,6 +758,910 @@ fn step2_fixpoint_writes_late_epoch_copies() {
         assert!(
             findings.is_empty(),
             "seed {seed}: reopened amcheck findings: {findings:?}"
+        );
+    }
+}
+
+/// **X-5c-F4-F1-F1-F2 step 0: the late epoch copy's literal schedule**
+/// (verdict X-5c-F4-F1-F1, finding 1 — a silent class-C loss, no
+/// injected fault). `freeze_first_touch` parks a first touch's copy in
+/// the exhausted reserve path (the `epochcopy:prewrite` park) while the
+/// checkpointer's step 2 writes the page's *normal* frame — the mutator
+/// is the parked task, so the frame still holds its epoch-`k` bytes and
+/// the scan writes them, resolving `Img::CopyPending` to `Img::At` —
+/// then `ckpt:freecopies` frees the reserve and the checkpoint
+/// completes. The copy then installs **late**: a dirty, `is_epoch_copy`
+/// frame with `f.epoch = e − 1` that its own checkpoint never cleaned.
+/// The next checkpoint's scan accepts it (`f.is_epoch_copy || f.epoch
+/// <= k`) and its record path maps the LPID to the old content while
+/// `T` says replay need not restore it — image k+1 is silently stale.
+///
+/// The schedule (one world seed, flags and the park budget are the only
+/// coordination): P's first touch — performed by the first Mid2 hook,
+/// deterministically, while the scan cursor is still at the bottom of
+/// the pool — fills the `R_EPOCH = 1` reserve; B's first touch (the
+/// mutator task) takes the exhausted path and parks; step 2 writes P's
+/// copy (the fixpoint re-scan) and B's normal frame; the `After2` hook
+/// (past `ckpt:freecopies`) releases the parked copy; between the
+/// checkpoints, B's frame is evicted so checkpoint 2's scan cannot
+/// overwrite the leaked entry with the frame's newer content; crash
+/// after checkpoint 2's meta (`crash_clean` — its step 5 synced), then
+/// reopen from meta 2 and from meta 1 (reverted).
+///
+/// At the pre-fix tip this pin **fails**: image 2 maps B's page to the
+/// leaked copy's flip-1 bytes, so the reopen's B scan misses the key
+/// inserted during window 1. The fix (the install guard at
+/// `epoch_copy:install`) drops the late copy — B's page comes from the
+/// evicted home and both scans read the right cut.
+#[test]
+fn late_epoch_copy_must_not_enter_the_next_image() {
+    // The world seed is pinned: the schedule's races (the mutator's two
+    // first touches before the scan cursor reaches B's frame; the late
+    // install between `ckpt:freecopies` and step 5) are deterministic
+    // per seed and this one lands them (verified at the pre-fix tip,
+    // where the pin must fail).
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // ---- phase A (the harness pre-pass): three one-page trees,
+        // each with one dirty entry. Creation order fixes frame order
+        // (dir, A, P, B), so the step-2 scan reaches B's frame last —
+        // the mutator's two touches land while the cursor is still
+        // below them.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    // P (the filler, tree 11) and B (the victim, tree
+                    // 12) carry one dirty entry and own the two highest
+                    // frames; trees 1..10 are empty padding — a dozen
+                    // writes — so the lottery scheduler cannot race the
+                    // cursor past B before the mutator's touch parks.
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            // Hold any exhausted-path copy until the After2 hook
+            // releases it (freecopies has run by then).
+            cx.with("late:budget", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 900_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        // ---- phase B: the mutator (task 1) and the checkpointer
+        // (task 2). The reserve is filled deterministically: the first
+        // Mid2 hook (inside the checkpointer, after step 2's first
+        // write) performs P's first touch, whose copy takes the free
+        // reserve frame. The mutator then performs B's first touch —
+        // the reserve is full, so the copy takes the exhausted path and
+        // parks at `epochcopy:prewrite`, several writes below the
+        // cursor (the padding trees keep it there).
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("late:wait-fill").map_err(fail_of)?;
+                    }
+                    ins(&cx, 12, root_b, &2u64.to_be_bytes(), 2, &val(2, 2));
+                    set_flag(sched, "m1_done");
+                    while !flag(sched, "ckpt1_done") {
+                        cx.yield_now("late:wait-ckpt1").map_err(fail_of)?;
+                    }
+                    // Evict B's frame (the post-park store placed the
+                    // {1, 2} leaf in it): checkpoint 2's scan must find
+                    // no eligible frame for B whose record could
+                    // overwrite the leaked copy's image entry.
+                    loop {
+                        let gone = cx
+                            .with("late:chk", |c| {
+                                Ok(!c
+                                    .store()
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root_b && !f.is_epoch_copy))
+                            })
+                            .map_err(fail_of)?;
+                        if gone {
+                            break;
+                        }
+                        if !prims::evict_one(&cx, false).map_err(fail_of)? {
+                            cx.wait_for(e4_recovery::sim::WaitKey::Pin)
+                                .map_err(fail_of)?;
+                        }
+                        cx.yield_now("late:evict").map_err(fail_of)?;
+                    }
+                    set_flag(sched, "evicted");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            // Step 2's first write is done and the
+                            // cursor sits just above it: P's frame (and
+                            // B's, above the padding) are still dirty
+                            // and unscanned. P's first touch fills the
+                            // reserve inside this hook — deterministically.
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        if hook == CkptHook::After2 {
+                            // Past freecopies: release the parked copy —
+                            // its install is now late.
+                            let mut g = sched.lock();
+                            g.st.parks.insert("epochcopy:prewrite", 0);
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    while !flag(sched, "evicted") {
+                        cx.yield_now("late:wait-evict").map_err(fail_of)?;
+                    }
+                    // Nobody touches B in window 2: the only frame its
+                    // scan could take for B is the leaked copy.
+                    ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("late:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the late-copy literal schedule");
+        assert!(flag(&sched, "m1_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        let no_served = g.disk.served.is_empty();
+        let no_uncovered = g.disk.uncovered_accepts.is_empty();
+        drop(g);
+        assert!(
+            no_served,
+            "seed {seed}: served corruption in an uncrashed round"
+        );
+        assert!(
+            no_uncovered,
+            "seed {seed}: uncovered accepts in an uncrashed round"
+        );
+        // The crash after checkpoint 2's meta: everything synced stays
+        // (step 5 synced the meta), nothing volatile does.
+        crash_clean(&mut disk_after, seed + 50);
+        // ---- reopen from meta 2: image 2 holds the flip-2 cut — both
+        // of P's entries and both of B's. At the pre-fix tip B reads the
+        // leaked copy's flip-1 leaf and loses key 2 (the pin's
+        // failure).
+        let want_two = |i: u64, j: u64| -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+            [
+                (1u64.to_be_bytes().to_vec(), Some(val(i, 1)[1..].to_vec())),
+                (2u64.to_be_bytes().to_vec(), Some(val(j, 2)[1..].to_vec())),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let want_b2 = want_two(1, 2);
+        {
+            let sched2 = pass_world(
+                1,
+                seed + 100,
+                disk_after.clone(),
+                StoreInner::empty(cfg.clone(), 0),
+            );
+            let cx2 = Cx {
+                w: &sched2,
+                t: HARNESS,
+            };
+            let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+            assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+            cx2.with("late:install2", |c| {
+                *c.store() = opened;
+                Ok(())
+            })
+            .expect("install2");
+            let scan_p = tree::tree_scan(&cx2, root_p, 10).expect("scan P after meta 2");
+            assert_eq!(
+                scan_p, want_b2,
+                "seed {seed}: image 2 holds P's flip-2 cut (both entries)"
+            );
+            let scan_b = tree::tree_scan(&cx2, root_b, 10).expect("scan B after meta 2");
+            assert_eq!(
+                scan_b, want_b2,
+                "seed {seed}: image 2 must hold B's flip-2 cut — a late epoch copy \
+                 must not enter the next image (the leaked copy maps B to its \
+                 flip-1 content and key 2 is lost)"
+            );
+        }
+        // ---- reopen from meta 1 (its durable write reverts): image 1
+        // is the flip-1 cut — one entry per tree. This half also pins
+        // the copy machinery itself: with every copy dropped
+        // (M-LATECOPY-DROPALWAYS), P's `CopyPending` never resolves,
+        // image 1 leaves P's page unmapped, and this reopen fails.
+        {
+            revert_meta_write(&mut disk_after, 2);
+            crash_clean(&mut disk_after, seed + 60);
+            let sched1 = pass_world(
+                1,
+                seed + 101,
+                disk_after.clone(),
+                StoreInner::empty(cfg.clone(), 0),
+            );
+            let cx1 = Cx {
+                w: &sched1,
+                t: HARNESS,
+            };
+            let (opened, meta) = ckpt::open(&cx1, cfg.clone()).expect("reopen meta 1");
+            assert_eq!(meta.ckpt_id, 1, "seed {seed}: meta 1 after the revert");
+            cx1.with("late:install1", |c| {
+                *c.store() = opened;
+                Ok(())
+            })
+            .expect("install1");
+            let want_one = |i: u64| -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+                [(1u64.to_be_bytes().to_vec(), Some(val(i, 1)[1..].to_vec()))]
+                    .into_iter()
+                    .collect()
+            };
+            let scan_p = tree::tree_scan(&cx1, root_p, 10).expect("scan P after meta 1");
+            assert_eq!(
+                scan_p,
+                want_one(1),
+                "seed {seed}: image 1 holds P's flip-1 cut (the epoch copy resolved)"
+            );
+            let scan_b = tree::tree_scan(&cx1, root_b, 10).expect("scan B after meta 1");
+            assert_eq!(
+                scan_b,
+                want_one(1),
+                "seed {seed}: image 1 holds B's flip-1 cut (step 2 wrote the normal frame)"
+            );
+        }
+    }
+}
+
+/// **X-5c-F4-F1-F1-F2: the freed-LPID form of the late copy**
+/// (M-LATECOPY-ATONLY's pin: a guard that tests only `Img::At` —
+/// dropping exactly the installs whose override resolved to `At` —
+/// still installs a copy whose LPID left the map entirely). The same
+/// park holds B's first touch across **two** flips: the release comes
+/// at checkpoint 2's `After0`, so by then checkpoint 1 has completed
+/// (its post-5 cleared the map), B's LPID has been freed, and window 2
+/// is open with `map.img` holding nothing for B. The late install then
+/// finds **no entry at all**: the real guard drops it (an absent entry
+/// is not `Img::CopyPending`), and image 2 leaves the freed LPID
+/// unmapped — the free-set bitmap marks it, and the reopened store's
+/// current map has no entry for it. Under the mutant the copy still
+/// installs; checkpoint 2's scan takes it (`f.is_epoch_copy`), and its
+/// record path maps the freed LPID to epoch-`k` bytes — the reopened
+/// store's `map.cur` contains a page no tree reaches.
+///
+/// Two schedule compressions, stated plainly. (1) B's LPID is freed
+/// directly (`prims::free_lpid`) between the checkpoints: the tree
+/// layer's own free paths hold the tree mutex, which a *bounded* copy
+/// wait would release and re-acquire around — the park stands in for
+/// that wait, so the free is done the way it would land in that gap.
+/// (2) The exhausted path's write-out of the **oldest** copy (P's)
+/// lands with the late install, and its own `record_image_at` for P is
+/// then stale (window 2's map gets P's flip-1 content) — a sibling
+/// deviation this card's prescribed fix does not touch, reported under
+/// ESCALATE with its own reproduction; this pin therefore asserts only
+/// the late copy's own LPID (B) and an untouched padding tree.
+/// (Doc comment corrected by X-5c-PINS-1, verdict
+/// X-5c-F4-F1-F1-F2 finding 4: the two-flip crossing this schedule
+/// describes is a test compression — every `store_page` in
+/// `src/store/tree.rs` runs under the gate, a held gate stops the next
+/// flip, so no gated caller crosses a second flip in the real system.
+/// The pin itself is kept: it still catches the mutant through the raw
+/// `store_page`'s compression, and X-5c-PINS-1's
+/// `late_copy_in_the_gap_drops_for_a_gated_touch` adds the reachable
+/// gated form.)
+#[test]
+fn freed_lpids_late_copy_never_remaps() {
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // The same phase A as the main pin: P (tree 11) fills the
+        // reserve, B (tree 12) is the victim above ten padding trees.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            cx.with("late:budget2", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 900_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        let pad_roots: Vec<u64> = roots.iter().take(10).copied().collect();
+        // B's own bytes, taken in the pre-pass (the raw `store_page`
+        // below re-stores them; the freeze fires on the dirty frame
+        // either way — the content is not what this pin asserts).
+        let b_bytes = {
+            let sched = pass_world(1, seed + 3, disk.clone(), st.clone());
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let (bytes, _) = prims::fetch_page(&cx, root_b, false).expect("fetch B");
+            prims::unpin(&cx, root_b);
+            bytes
+        };
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("late2:wait-fill").map_err(fail_of)?;
+                    }
+                    // A raw `store_page`, deliberately: a tree insert
+                    // would hold the epoch gate across the parked copy
+                    // wait and the next flip could not start until the
+                    // park ended. The raw touch parks holding nothing,
+                    // so checkpoint 2's flip runs while the copy waits —
+                    // the shape a bounded copy wait reaches in the real
+                    // system when the freeing operation is not on the
+                    // gated path that produced the copy.
+                    prims::store_page(&cx, root_b, b_bytes.clone()).map_err(fail_of)?;
+                    set_flag(sched, "m_done");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    // Free B's LPID between the checkpoints: at the next
+                    // flip B is unmapped, and a late copy of it must not
+                    // put it back. (The raw touch above holds no gate,
+                    // so this checkpoint's flip does not wait on the
+                    // parked copy; the After0 hook that releases it is
+                    // reachable.)
+                    prims::free_lpid(&cx, root_b).map_err(fail_of)?;
+                    // Dirty the padding trees so checkpoint 2's data
+                    // phase is a dozen writes long: the released copy
+                    // must land behind the scan cursor (the re-scan
+                    // then takes it), not after the final pass.
+                    for (id, root) in pad_roots.iter().enumerate() {
+                        let id = id as u64 + 1;
+                        ins(&cx, id, *root, &2u64.to_be_bytes(), 2, &val(2, 2));
+                    }
+                    ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            // Window 2 is open and the map holds nothing
+                            // for B: release the parked copy now.
+                            let mut g = sched.lock();
+                            g.st.parks.insert("epochcopy:prewrite", 0);
+                        }
+                        Ok(())
+                    })
+                    .map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("late2:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the freed-LPID late-copy schedule");
+        assert!(flag(&sched, "m_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        drop(g);
+        crash_clean(&mut disk_after, seed + 70);
+        let sched2 = pass_world(1, seed + 102, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+        assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+        cx2.with("late2:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        // A padding tree carries exactly its between-checkpoints entry
+        // (pre-flip-2, so image 2 legitimately holds it): the image
+        // itself is structurally readable.
+        let scan_pad = tree::tree_scan(&cx2, roots[0], 10).expect("scan pad 1");
+        let want_pad: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            [(2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec()))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            scan_pad, want_pad,
+            "seed {seed}: the padding tree holds its pre-flip-2 entry"
+        );
+        // The pin: the freed LPID must not re-enter the image's map.
+        let mapped = cx2
+            .with("late2:chk", |c| Ok(c.store().map.cur.contains_key(&root_b)))
+            .expect("map check");
+        assert!(
+            !mapped,
+            "seed {seed}: a freed LPID's late copy must not remap it in the next \
+             image (the copy installs onto an absent entry and the scan's \
+             is_epoch_copy arm records it — M-LATECOPY-ATONLY)"
+        );
+        let freed = cx2
+            .with("late2:free", |c| {
+                Ok(c.store().slots.free_lpids.contains(&root_b))
+            })
+            .expect("free check");
+        assert!(
+            freed,
+            "seed {seed}: the freed LPID stays in the free set (the bitmap marks \
+             every LPID the image leaves unmapped)"
+        );
+    }
+}
+
+/// **X-5c-PINS-1 item 6 (folded card X-5c-F4-F1-F1-F2-F1; verdict
+/// X-5c-F4-F1-F1-F2 finding 3): the install guard's eviction arm.**
+/// The same parked first touch as the main pin, but the page's
+/// `Img::CopyPending` is resolved by a **previous-epoch eviction**
+/// while the copy is on its way: inside the window, once the touch has
+/// frozen B's `CopyPending`, an eviction of B's normal frame (its
+/// content epoch is `k`, so `evict:finish` writes it to a fresh slot
+/// `r`, moves `map.cur[B] = r` and records `map.img[B] = Img::At(r)` —
+/// the same `r`, so `cur == r`). The park releases past
+/// `ckpt:freecopies` (at `After2`, before post-5): the re-validation
+/// skips the stale record, the retry reaches the install, and the
+/// guard faces `Img::At(r)` with `cur == r` — an entry whose content
+/// is already recorded, so the copy must drop. **G-GUARD-EVICT-AT**
+/// (the guard lets `Img::At(r)` with `cur == r` install) installs B's
+/// flip-1 copy into the freed reserve frame past its checkpoint's
+/// cleanup; checkpoint 2's scan takes it (`f.is_epoch_copy`) and maps
+/// B to the flip-1 bytes, and the reopened store's current map
+/// contains a page no tree reaches — this pin fails.
+///
+/// Two schedule compressions, stated plainly (the freed-LPID pin's
+/// own). (1) The parked touch is a raw `prims::free_lpid`, not a
+/// gated tree insert: an insert's `fetch_page` pins the leaf's frame
+/// across the parked copy wait, and a pinned frame is not an
+/// evictable victim — the eviction arm needs the page's frame
+/// evictable while the copy is on its way, which the free path (no
+/// fetch, no pin) provides; the tree layer's own free paths hold the
+/// tree mutex and the gate, which a *bounded* copy wait would release
+/// and re-acquire around, so the raw free is the shape that wait
+/// reaches. (2) The eviction runs inside the checkpointer's own Mid2
+/// hook (the scan paused between its writes), so the scan cannot win
+/// the race to B's frame and resolve the `CopyPending` itself — the
+/// deterministic form of the race.
+#[test]
+fn late_copy_after_previous_epoch_eviction_drops() {
+    // The world seed is pinned for the same reason as the main pin's:
+    // the schedule's interleavings are deterministic per seed, and this
+    // one lands them — verified by the mutant failing the pin (the
+    // record in the README's step 6).
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // The same phase A as the main pin: P (tree 11) fills the
+        // reserve, B (tree 12) is the victim above ten padding trees;
+        // no checkpoint yet, so B's frame is dirty at the flip.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            cx.with("evict-arm:budget", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 200_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("evict-arm:wait-fill").map_err(fail_of)?;
+                    }
+                    // The parked first touch: a raw free of B (the
+                    // compression the doc states — no fetch, so no pin
+                    // holds B's frame across the parked copy wait, and
+                    // the eviction below can take it). Its freeze sets
+                    // B's CopyPending and its copy parks in the
+                    // exhausted path once P's fill took the reserve;
+                    // the park releases inside checkpoint 1 (After2).
+                    prims::free_lpid(&cx, root_b).map_err(fail_of)?;
+                    set_flag(sched, "m_done");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        if hook == CkptHook::Mid2
+                            && flag(sched, "filled")
+                            && !flag(sched, "evict1_done")
+                        {
+                            // The window-1 eviction, deterministically
+                            // inside the hook (the scan is paused between
+                            // its writes, so it cannot reach B's frame
+                            // first): wait for the mutator's freeze to
+                            // set B's CopyPending, then evict B's normal
+                            // frame — a previous-epoch victim whose
+                            // `evict:finish` moves `map.cur[B] = r` and
+                            // records `map.img[B] = Img::At(r)` (the same
+                            // r, so `cur == r`), resolving the pending
+                            // copy the way the eviction arm names.
+                            let cxh = Cx { w: sched, t };
+                            loop {
+                                let cp = {
+                                    let g = sched.lock();
+                                    g.st.map.img.get(&root_b) == Some(&Img::CopyPending)
+                                };
+                                if cp {
+                                    break;
+                                }
+                                cxh.yield_now("evict-arm:wait-copy").map_err(fail_of)?;
+                            }
+                            loop {
+                                let gone = cxh
+                                    .with("evict-arm:chk1", |c| {
+                                        Ok(!c
+                                            .store()
+                                            .pool
+                                            .frames
+                                            .iter()
+                                            .any(|f| f.key == root_b && !f.is_epoch_copy))
+                                    })
+                                    .map_err(fail_of)?;
+                                if gone {
+                                    break;
+                                }
+                                if !prims::evict_one(&cxh, false).map_err(fail_of)? {
+                                    cxh.wait_for(e4_recovery::sim::WaitKey::Pin)
+                                        .map_err(fail_of)?;
+                                }
+                                cxh.yield_now("evict-arm:evict1").map_err(fail_of)?;
+                            }
+                            set_flag(sched, "evict1_done");
+                        }
+                        if hook == CkptHook::After2 {
+                            // The hook eviction must have resolved B's
+                            // CopyPending before the park releases.
+                            while !flag(sched, "evict1_done") {
+                                cx.yield_now("evict-arm:wait-evict1").map_err(fail_of)?;
+                            }
+                            // Past freecopies, before post-5: release
+                            // the parked copy — its install is late and
+                            // the map holds B's eviction entry.
+                            let mut g = sched.lock();
+                            g.st.parks.insert("epochcopy:prewrite", 0);
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    while !flag(sched, "m_done") {
+                        cx.yield_now("evict-arm:wait-m").map_err(fail_of)?;
+                    }
+                    // Nobody touches B in window 2 (it is freed): the
+                    // only frame checkpoint 2's scan could take for B
+                    // is a leaked copy.
+                    ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("evict-arm:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the eviction-arm late-copy schedule");
+        assert!(flag(&sched, "m_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "evict1_done"),
+            "seed {seed}: the window-1 eviction ran"
+        );
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        drop(g);
+        crash_clean(&mut disk_after, seed + 80);
+        let sched2 = pass_world(1, seed + 103, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+        assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+        cx2.with("evict-arm:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        // The pin: B is freed, so image 2 must leave it unmapped — a
+        // late copy whose LPID a previous-epoch eviction already
+        // recorded (Img::At(r), cur == r) must not install and re-map
+        // it through checkpoint 2's scan.
+        let mapped = cx2
+            .with("evict-arm:chk-map", |c| {
+                Ok(c.store().map.cur.contains_key(&root_b))
+            })
+            .expect("map check");
+        assert!(
+            !mapped,
+            "seed {seed}: a freed LPID whose copy a previous-epoch eviction resolved \
+             (Img::At(r) with cur == r) must not be remapped in the next image \
+             (G-GUARD-EVICT-AT reverts this: the leaked flip-1 copy installs and \
+             checkpoint 2's scan maps it)"
+        );
+        let freed = cx2
+            .with("evict-arm:chk-free", |c| {
+                Ok(c.store().slots.free_lpids.contains(&root_b))
+            })
+            .expect("free check");
+        assert!(
+            freed,
+            "seed {seed}: the freed LPID stays in the free set (the bitmap marks every \
+             LPID the image leaves unmapped)"
+        );
+        // The control: P — filled by the window-1 hook, untouched in
+        // window 2 — holds both entries in image 2 either way.
+        let want_p2: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
+            (1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec())),
+            (2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec())),
+        ]
+        .into_iter()
+        .collect();
+        let scan_p = tree::tree_scan(&cx2, root_p, 10).expect("scan P after meta 2");
+        assert_eq!(
+            scan_p, want_p2,
+            "seed {seed}: image 2 holds P's flip-2 cut (both entries)"
+        );
+    }
+}
+
+/// **X-5c-PINS-1 item 6 (folded card X-5c-F4-F1-F1-F2-F1; verdict
+/// X-5c-F4-F1-F1-F2 finding 3): a gated touch's late copy in the gap
+/// between the checkpoints.** The parked gated insert releases **after
+/// its checkpoint's post-5 and before the next flip** — the gap — when
+/// post-5 has cleared the map entirely, so the retry's install faces
+/// **no entry at all** for B: the copy's condition stopped holding
+/// (the image is resolved; the window is over) and the guard drops it
+/// on the absent entry exactly as on a resolved one. The mutator then
+/// finishes its insert (B's {1,2} frame lands in the gap), B's frame
+/// is evicted before checkpoint 2, and image 2 must hold B's flip-2
+/// cut. **M-LATECOPY-ATONLY** (the guard tests only `Img::At`) and
+/// **G-GUARD-ABSENT-OK** (an absent entry installs) both install the
+/// flip-1 copy in the gap; checkpoint 2's scan takes it and maps B to
+/// the flip-1 bytes — key 2 is lost and this pin fails.
+#[test]
+fn late_copy_in_the_gap_drops_for_a_gated_touch() {
+    for seed in [3u64] {
+        let cfg = tcfg(8, 18, 1);
+        // The same phase A: P (tree 11) fills the reserve, B (tree 12)
+        // is the victim above ten padding trees; park budget; no
+        // checkpoint yet.
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let (disk, st, roots) = {
+            let sched = pass_world(1, seed, disk, st);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let mut roots = Vec::new();
+            for id in 1u64..=12 {
+                tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+                let root =
+                    tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+                if id == 11 || id == 12 {
+                    ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+                }
+                roots.push(root);
+            }
+            cx.with("gap:budget", |c| {
+                c.store().parks.insert("epochcopy:prewrite", 200_000);
+                Ok(())
+            })
+            .expect("park budget");
+            let (d, s) = {
+                let g = sched.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            (d, s, roots)
+        };
+        let root_p = roots[10];
+        let root_b = roots[11];
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                        cx.yield_now("gap:wait-fill").map_err(fail_of)?;
+                    }
+                    // The gated insert parks in the exhausted path; it
+                    // resumes in the gap, below, and completes there.
+                    ins(&cx, 12, root_b, &2u64.to_be_bytes(), 2, &val(2, 2));
+                    set_flag(sched, "m_done");
+                    // Evict B's normal frame (holding the gap-completed
+                    // insert) before checkpoint 2: the scan must find no
+                    // eligible frame whose record could overwrite a
+                    // leaked entry.
+                    loop {
+                        let gone = cx
+                            .with("gap:chk", |c| {
+                                Ok(!c
+                                    .store()
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root_b && !f.is_epoch_copy))
+                            })
+                            .map_err(fail_of)?;
+                        if gone {
+                            break;
+                        }
+                        if !prims::evict_one(&cx, false).map_err(fail_of)? {
+                            cx.wait_for(e4_recovery::sim::WaitKey::Pin)
+                                .map_err(fail_of)?;
+                        }
+                        cx.yield_now("gap:evict").map_err(fail_of)?;
+                    }
+                    set_flag(sched, "evicted");
+                    Ok(())
+                }
+                2 => {
+                    let r = ckpt::checkpoint(&cx, &mut |hook| {
+                        if hook == CkptHook::After0 {
+                            set_flag(sched, "flipped1");
+                        }
+                        if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                            let cxh = Cx { w: sched, t };
+                            ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                            set_flag(sched, "filled");
+                        }
+                        Ok(())
+                    });
+                    set_flag(sched, "ckpt1_done");
+                    r.map_err(fail_of)?;
+                    // The gap: post-5 has cleared the map (no entry for
+                    // B at all) and the next flip has not started — the
+                    // mutator still holds the gate shared across its
+                    // parked copy wait. Release the park now.
+                    {
+                        let mut g = sched.lock();
+                        g.st.parks.insert("epochcopy:prewrite", 0);
+                    }
+                    while !flag(sched, "evicted") {
+                        cx.yield_now("gap:wait-evict").map_err(fail_of)?;
+                    }
+                    ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                    set_flag(sched, "ckpt2_done");
+                    cx.yield_now("gap:end").map_err(fail_of)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (sched, report) = run_world(3, seed, disk, st, body);
+        report.assert_clean("the gap late-copy schedule");
+        assert!(flag(&sched, "m_done"), "seed {seed}: the mutator ran");
+        assert!(
+            flag(&sched, "ckpt2_done"),
+            "seed {seed}: both checkpoints ran"
+        );
+        let g = sched.lock();
+        let mut disk_after = g.disk.clone();
+        drop(g);
+        crash_clean(&mut disk_after, seed + 90);
+        let sched2 = pass_world(1, seed + 104, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+        assert_eq!(meta.ckpt_id, 2, "seed {seed}: meta 2 is the image");
+        cx2.with("gap:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        let want_b2: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
+            (1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec())),
+            (2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec())),
+        ]
+        .into_iter()
+        .collect();
+        let scan_b = tree::tree_scan(&cx2, root_b, 10).expect("scan B after meta 2");
+        assert_eq!(
+            scan_b, want_b2,
+            "seed {seed}: image 2 must hold B's flip-2 cut — a copy released in the \
+             gap finds no entry at all (post-5 cleared the map) and must drop exactly \
+             as on a resolved one (M-LATECOPY-ATONLY and G-GUARD-ABSENT-OK revert \
+             this: the leaked flip-1 copy maps B and key 2 is lost)"
+        );
+        // The control: P holds both entries in image 2.
+        let scan_p = tree::tree_scan(&cx2, root_p, 10).expect("scan P after meta 2");
+        assert_eq!(
+            scan_p, want_b2,
+            "seed {seed}: image 2 holds P's flip-2 cut (both entries)"
         );
     }
 }
@@ -2274,7 +3180,13 @@ fn ack_prefix_two_batches_in_flight() {
             // entering its wait (which its own observation shows cannot
             // be satisfied — `mid_wait_open`); A is held at
             // writer:prewrite (effectively indefinitely; see above).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            // The poll backs off 1 ms between checks: each `flag` takes
+            // the world lock, and a tight loop starves the tasks it is
+            // waiting for under host load (X-5c-F4-F1-F1-F2 verdict,
+            // finding 2: 12-44 s wall on a loaded host against this
+            // deadline). The deadline is 300 s for the same reason; a
+            // hung world still fails, it just fails slowly.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             let mut timed_out = false;
             loop {
                 if flag(&sched, "b_wrote") {
@@ -2287,6 +3199,7 @@ fn ack_prefix_two_batches_in_flight() {
                     timed_out = true;
                     break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             if timed_out {
                 if let Some(h) = h0.take() {
@@ -2339,7 +3252,10 @@ fn ack_prefix_two_batches_in_flight() {
                 // The clean arm: release A; both waits must return and
                 // durable must cover batch 2's end.
                 sched.lock().st.parks.insert("writer:prewrite", 0);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // Same backoff and deadline scale as the first poll
+                // (above): no world-lock contention with the tasks whose
+                // acks this waits for, and headroom for a loaded host.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
                 loop {
                     if flag(&sched, "a_acked") && flag(&sched, "b_acked") {
                         break;
@@ -2351,6 +3267,7 @@ fn ack_prefix_two_batches_in_flight() {
                         flag(&sched, "a_acked"),
                         flag(&sched, "b_acked")
                     );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 let g = sched.lock();
                 assert!(
@@ -4140,6 +5057,7 @@ fn wal_loss_below_ckpt_end_fails_closed() {
                         },
                         2,
                         false,
+                        false,
                     )
                     .expect("apply c");
                     target = (l, l + n);
@@ -4925,6 +5843,92 @@ fn g8_wal_sync_error_poisons() {
     }
 }
 
+/// **The re-gate's finding 2, second half (verdict X-5c-F4-F1,
+/// MERGE-WITH-FOLLOWUPS; card X-5c-F4-F1-F1 step 0 (c)): a checkpoint
+/// that fails with a non-`Sim` error resets the SIZING-C fold —
+/// `ckpt_closed_dirty` ends at 0.** Rework 1 keeps the folded `n`
+/// across a **sim-crash** unwind (the crash-time `obs` snapshot must
+/// see it); the non-crash half of the same abort rule — no checkpoint
+/// is open once the abort path has run, so the observable is 0 — is
+/// what G-SZC-ABORTNORESET removes. The verdict measured the reset as
+/// latent (no effect across the file's 67 poison rounds) but REFRESH 6
+/// tells X-5c-F4 to copy this rule for `ckpt_unflipped`, so it is
+/// pinned here. Literal schedule (the `wal_io_fail` shape the card
+/// names): a store with a dirtied tree — the begin step folds `n` ≥ 1,
+/// which `dirty_max` (never reset) proves — and one
+/// enqueued-but-unsynced WAL batch whose group `sync_data` the one
+/// store test hook fails; the checkpoint's step 1 drains the buffer
+/// into the hooked batch and fails `Fail::Io` (a non-`Sim` error no
+/// real disk error can produce in this sim), the WAL path poisons the
+/// store, and the abort path resets `ckpt_closed_dirty` to 0 with
+/// `ckpt_open` false. Under G-SZC-ABORTNORESET (the
+/// `if !crash_unwind { st.ckpt_closed_dirty = 0; }` reset removed) the
+/// fold survives the abort and this pin fails.
+#[test]
+fn szc_non_crash_abort_resets_the_fold() {
+    let seed = 6566u64;
+    let cfg = tcfg(8, 8, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, Some(2));
+    let sched = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Dirty ≥ 1 pool LPID: inserts into tree 2 (every store_page adds
+    // its LPID to dirty_now — the interval the checkpoint's begin step
+    // folds).
+    let root = tree::dir_root_of(&cx, 2).expect("root");
+    for i in 0..40u64 {
+        ins(&cx, 2, root, &i.to_be_bytes(), 10 + i, &val(i, 1));
+    }
+    // One enqueued commit, left unsynced: the checkpoint's step 1 must
+    // drain it, and the hook fails the batch's group sync.
+    let batch_start = cx
+        .with("pin:append0", |c| Ok(c.store().wal.append))
+        .expect("append position");
+    let mut payload = Vec::new();
+    wal::enc_op(&op_put_key(b"Z", 1), &mut payload);
+    wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 100, &payload).expect("enqueue");
+    cx.with("pin:hook", |c| {
+        c.store().cfg.wal_io_fail = Some(e4_recovery::store::WalIoFail {
+            op: e4_recovery::store::WalIoOp::SyncData,
+            batch_start,
+        });
+        Ok(())
+    })
+    .expect("set the io hook");
+    let mut hooks = |_hook: CkptHook| Ok(());
+    let r = ckpt::checkpoint(&cx, &mut hooks);
+    assert!(
+        matches!(r, Err(Fail::Io(_))),
+        "the checkpoint must fail with the hook's non-Sim I/O error: {r:?}"
+    );
+    let (fold, dmax, open, poisoned) = cx
+        .with("pin:after", |c| {
+            let st = c.store();
+            Ok((
+                st.ckpt_closed_dirty,
+                st.dirty_max,
+                st.ckpt_open,
+                st.poisoned.is_some(),
+            ))
+        })
+        .expect("read the fold");
+    assert!(
+        dmax >= 1,
+        "the begin step folded ≥ 1 dirtied LPID (dirty_max, never reset, proves it: {dmax})"
+    );
+    assert_eq!(
+        fold, 0,
+        "a non-crash abort resets ckpt_closed_dirty to 0 (G-SZC-ABORTNORESET keeps the fold)"
+    );
+    assert!(!open, "no checkpoint is open after the abort path");
+    assert!(
+        poisoned,
+        "the WAL-path I/O failure poisons the store (G8, 9.2 W8)"
+    );
+}
+
 /// **X-5c-F3-F3a-F2 Work 4 pin (S-STORE §10.5; a literal config).**
 /// `gc_w_used` starts at the recovered meta's `gc_w` at open, so a
 /// checkpoint taken before the first GC mutation of the new boot — the
@@ -5163,5 +6167,1990 @@ fn q11_mid_segment_stale_does_not_count() {
     assert_eq!(
         st.wal.append, mid,
         "the valid end is the stale record's start — the walk shape is unchanged"
+    );
+}
+
+/// **X-5c-F4-F1-F1-CXX step 0, pin 4 (verdict X-5c-F4-F1-F1-F2): the
+/// exhausted path's record must not outlive its checkpoint.** A gated
+/// tree insert (the real caller, gate and tree mutex held) parks writing
+/// the oldest copy out of a one-frame reserve while its checkpoint runs
+/// to the end: step 2 writes that copy, `ckpt:freecopies` clears its
+/// frame, post-5 clears the map. It resumes in the gap before the next
+/// flip. At the tip before CXX its `epoch_copy:record` inserts
+/// `Img::At(flip-1 bytes)` into the cleared map; nothing clears it, the
+/// next freeze lets it override `cur`, and image 2 maps P to its flip-1
+/// leaf with key 2 lost and no XX001. Evicting P's frame between the
+/// checkpoints stops the next scan rewriting the entry.
+#[test]
+fn exhausted_record_stays_out_of_the_next_window() {
+    let seed = 3u64;
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    let (disk, st, roots) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut roots = Vec::new();
+        for id in 1u64..=12 {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+            let root = tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+            if id == 11 || id == 12 {
+                ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+            }
+            roots.push(root);
+        }
+        cx.with("rec:budget", |c| {
+            c.store().parks.insert("epochcopy:prewrite", 900_000);
+            Ok(())
+        })
+        .expect("park budget");
+        let (d, s) = {
+            let g = sched.lock();
+            (g.disk.clone(), g.st.clone())
+        };
+        (d, s, roots)
+    };
+    let root_p = roots[10];
+    let root_b = roots[11];
+    let pads: Vec<u64> = roots.iter().take(10).copied().collect();
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                    cx.yield_now("rec:wait-fill").map_err(fail_of)?;
+                }
+                // The gated touch: tree_insert holds the gate and tree
+                // 12's mutex across the park.
+                ins(&cx, 12, root_b, &2u64.to_be_bytes(), 2, &val(2, 2));
+                set_flag(sched, "m_done");
+                Ok(())
+            }
+            2 => {
+                let r = ckpt::checkpoint(&cx, &mut |hook| {
+                    if hook == CkptHook::After0 {
+                        set_flag(sched, "flipped1");
+                    }
+                    if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                        let cxh = Cx { w: sched, t };
+                        ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                        set_flag(sched, "filled");
+                    }
+                    Ok(())
+                });
+                r.map_err(fail_of)?;
+                for (id, root) in pads.iter().enumerate() {
+                    ins(
+                        &cx,
+                        id as u64 + 1,
+                        *root,
+                        &2u64.to_be_bytes(),
+                        2,
+                        &val(2, 2),
+                    );
+                }
+                loop {
+                    let gone = cx
+                        .with("rec:chk", |c| {
+                            Ok(!c
+                                .store()
+                                .pool
+                                .frames
+                                .iter()
+                                .any(|f| f.key == root_p && !f.is_epoch_copy))
+                        })
+                        .map_err(fail_of)?;
+                    if gone {
+                        break;
+                    }
+                    if !prims::evict_one(&cx, false).map_err(fail_of)? {
+                        cx.wait_for(e4_recovery::sim::WaitKey::Pin)
+                            .map_err(fail_of)?;
+                    }
+                    cx.yield_now("rec:evict").map_err(fail_of)?;
+                }
+                // Past post-5, before the next flip: release the park.
+                {
+                    let mut g = sched.lock();
+                    g.st.parks.insert("epochcopy:prewrite", 0);
+                }
+                while !flag(sched, "m_done") {
+                    cx.yield_now("rec:wait-m").map_err(fail_of)?;
+                }
+                ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                set_flag(sched, "ckpt2_done");
+                cx.yield_now("rec:end").map_err(fail_of)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the late-record schedule");
+    assert!(flag(&sched, "ckpt2_done"), "both checkpoints ran");
+    let g = sched.lock();
+    let mut disk_after = g.disk.clone();
+    drop(g);
+    crash_clean(&mut disk_after, seed + 50);
+    let sched2 = pass_world(1, seed + 100, disk_after, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &sched2,
+        t: HARNESS,
+    };
+    let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen meta 2");
+    assert_eq!(meta.ckpt_id, 2, "meta 2 is the image");
+    cx2.with("rec:install", |c| {
+        *c.store() = opened;
+        Ok(())
+    })
+    .expect("install");
+    let want: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
+        (1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec())),
+        (2u64.to_be_bytes().to_vec(), Some(val(2, 2)[1..].to_vec())),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        tree::tree_scan(&cx2, root_p, 10).expect("scan P"),
+        want,
+        "image 2 must hold P's flip-2 cut: a late record for the oldest copy maps its flip-1 leaf"
+    );
+    assert_eq!(
+        tree::tree_scan(&cx2, root_b, 10).expect("scan B"),
+        want,
+        "image 2 must hold B's flip-2 cut"
+    );
+}
+
+/// **X-5c-F4-F1-F1-CXX step 0, pins 1–2: the DropTree straddle (S-1-F7,
+/// §6.8 as amended; cause A of the 51 C-XX rounds).** At this tip the
+/// walk's last step frees the root and `dir_remove_entry` removes the
+/// entry in its **own** gate hold, so a flip can land between them:
+/// image `dropping tree → root` with the root unmapped (310 r0's shape,
+/// pin 1), or — when another tree's split took the freed LPID before
+/// the flip, §4.2's immediate reuse — an opened image that reaches one
+/// LPID from two trees' references (8010 r1's shape, pin 2). Pin 1
+/// reopens and the resumed walk dies on the unmapped root (`[Open]`
+/// XX001); pin 2's resumed walk frees the other tree's live page and
+/// the survivor's scan loses it (the silent O-1(b)/AmcheckIi shape).
+///
+/// The schedule (one world, flags only): t1 drops tree 2 (a leaf root —
+/// the first walk step is the last); t2, the checkpointer, waits for the
+/// straddle (pin 1) or the reuse (pin 2) and flips inside the gap; pin
+/// 2's t3 waits for the freed LPID and splits tree 4 onto it. Then a
+/// clean crash (every unsynced write reverts; both checkpoints' metas
+/// are synced) and `ckpt::recover`.
+fn drop_cut_body(seed: u64, reuse: bool) -> Result<(), String> {
+    drop_cut_body_m(seed, reuse, None)
+}
+
+fn drop_cut_body_m(seed: u64, reuse: bool, m: Option<Mutant>) -> Result<(), String> {
+    let cfg = StoreCfg {
+        mutant: m,
+        ..tcfg(8, 18, 1)
+    };
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // ---- phase A: tree 2 (the victim, a leaf root) and tree 4 (the
+    // reuser), one durable checkpoint. Tree 4 holds eight of the ~10
+    // 400-byte cells a leaf holds: t3's pre-positioned ninth cell does
+    // not split, and the one that follows splits onto the freed LPID
+    // (the lowest free LPID at that moment).
+    let (disk, st, root2, root4) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 4] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let root4 = tree::dir_root_of(&cx, 4).expect("root 4");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        for i in 0..8u64 {
+            ins(&cx, 4, root4, &i.to_be_bytes(), 1, &[0u8; 400]);
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2, root4)
+    };
+    // ---- phase B: the drop (t1), the flip (t2) and the reuse (t3).
+    let ntasks = if reuse { 4 } else { 3 };
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                // Wait for the gap: at this tip the straddle — the
+                // entry present with the root freed — is exactly the
+                // window a flip must cut. Under the fix the state never
+                // exists, so the fallbacks are the reuse (pin 2) or the
+                // drop's own completion; the flip then lands harmlessly.
+                loop {
+                    let elsewhere = flag(sched, "d_done") || flag(sched, "reused");
+                    let straddle = cx
+                        .with("cut:t2wait", |c| {
+                            let st = c.store();
+                            Ok(st.dir.contains_key(&2)
+                                && !st.map.cur.contains_key(&root2)
+                                && !st
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root2 && !f.is_epoch_copy))
+                        })
+                        .map_err(fail_of)?;
+                    if elsewhere || straddle {
+                        break;
+                    }
+                    cx.yield_now("cut:t2spin").map_err(fail_of)?;
+                }
+                ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                set_flag(sched, "ckpt1");
+                Ok(())
+            }
+            3 if reuse => {
+                // Pre-position: the ninth cell (no split yet) goes in
+                // as soon as tree 2 is `dropping` — before the gap
+                // opens — so a single insert is all that remains.
+                loop {
+                    let marked = cx
+                        .with("cut:t3mark", |c| {
+                            Ok(c.store().dir.get(&2).is_some_and(|e| e.dropping))
+                        })
+                        .map_err(fail_of)?;
+                    if marked || flag(sched, "d_done") {
+                        break;
+                    }
+                    cx.yield_now("cut:t3mspin").map_err(fail_of)?;
+                }
+                if flag(sched, "d_done") {
+                    // The drop finished before the mark was seen; there
+                    // is no gap to race. The flip (t2) falls back to
+                    // this flag too, so the world still terminates.
+                    set_flag(sched, "reused");
+                    return Ok(());
+                }
+                ins(&cx, 4, root4, &8u64.to_be_bytes(), 1, &[0u8; 400]);
+                // The gap: the freed LPID. The next insert splits tree
+                // 4, and its first allocation is the lowest free LPID —
+                // root2.
+                loop {
+                    let freed = cx
+                        .with("cut:t3wait", |c| {
+                            Ok(c.store().slots.free_lpids.contains(&root2))
+                        })
+                        .map_err(fail_of)?;
+                    if freed {
+                        break;
+                    }
+                    cx.yield_now("cut:t3spin").map_err(fail_of)?;
+                }
+                ins(&cx, 4, root4, &9u64.to_be_bytes(), 1, &[0u8; 400]);
+                set_flag(sched, "reused");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(ntasks, seed, disk, st, body);
+    report.assert_clean(if reuse {
+        "the drop-reuse straddle schedule"
+    } else {
+        "the drop straddle schedule"
+    });
+    if !flag(&sched, "d_done") {
+        return Err(format!("seed {seed}: the drop never completed"));
+    }
+    if !flag(&sched, "ckpt1") {
+        return Err(format!("seed {seed}: the checkpoint never completed"));
+    }
+    if reuse && !flag(&sched, "reused") {
+        return Err(format!(
+            "seed {seed}: tree 4 never split onto the freed LPID"
+        ));
+    }
+    let g = sched.lock();
+    let mut disk_after = g.disk.clone();
+    drop(g);
+    crash_clean(&mut disk_after, seed + 50);
+    // ---- the reopen: recovery must succeed and must not walk an
+    // unmapped root (pin 1) or free another tree's page (pin 2).
+    let sched2 = pass_world(1, seed + 100, disk_after, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &sched2,
+        t: HARNESS,
+    };
+    let (opened, _frontier) =
+        ckpt::recover(&cx2, cfg.clone()).map_err(|e| format!("seed {seed}: recover: {e:?}"))?;
+    cx2.with("cut:install", |c| {
+        *c.store() = opened;
+        Ok(())
+    })
+    .expect("install");
+    let gone = cx2
+        .with("cut:dir2", |c| Ok(!c.store().dir.contains_key(&2)))
+        .expect("dir read");
+    if !gone {
+        return Err(format!("seed {seed}: tree 2's entry survived recovery"));
+    }
+    if reuse {
+        // Tree 4 must be whole: the resumed walk of a straddling entry
+        // must not have freed the page the split reused. The image
+        // holds the flip-time cut, so the ninth and tenth cells may or
+        // may not be in it — but the eight phase-A cells were durably
+        // checkpointed before the world began and must all read back
+        // (rework 7: the assertion matches this comment — eight cells,
+        // not nine; the ninth is the pre-positioned insert above the
+        // flip's cut, unlogged at the image).
+        let scan = tree::tree_scan(&cx2, root4, 1000).map_err(|e| {
+            format!("seed {seed}: tree 4 scan after recovery: {e:?} (a reused page was freed)")
+        })?;
+        let n = scan.len();
+        if n < 8 {
+            return Err(format!("seed {seed}: tree 4 lost durable pages: {n} of 8"));
+        }
+        for i in 0..8u64 {
+            if !scan.contains_key(i.to_be_bytes().as_slice()) {
+                return Err(format!("seed {seed}: tree 4 lost durable key {i}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pin 1: the flip between the root free and the entry removal, then a
+/// crash and an open — the image must never name a freed root.
+#[test]
+fn drop_cut_never_names_a_freed_root() {
+    drop_cut_body(1, false).expect("pin 1");
+}
+
+/// Pin 2: the same cut with another tree's split on the freed LPID —
+/// the image must never name a reused root.
+#[test]
+fn drop_cut_never_names_a_reused_root() {
+    drop_cut_body_m(77, true, None).expect("pin 2");
+}
+
+/// **X-5c-F4-F1-F1-CXX step 0, pin 3: the exhausted reserve's double
+/// evict (cause B1, 3534 r1's shape).** With a one-frame reserve, two
+/// first touches both read `oldest = frame 0` holding the filler's copy
+/// and both proceed into `write_fresh`; the first task's
+/// `epoch_copy:record` records the write and clears the frame, and its
+/// retry installs its own copy there; the second task's
+/// `epoch_copy:record` — with no re-validation after its yield — then
+/// clears the frame **again**, destroying the first task's copy
+/// unwritten: `map.img` keeps its `CopyPending`, `ckpt:freeze` maps the
+/// LPID to nothing, and the reopened image has lost the page (the
+/// `[Open]`/`[AmcheckIi]` XX001 of the 18 B1 rounds). The fix re-validates
+/// the frame in `epoch_copy:record` (Work 1); then the second task's
+/// retry finds the frame occupied and its own exhaustion writes the
+/// first copy out, so **both** copies reach the image.
+fn exhausted_reserve_body(seed: u64) -> Result<(), String> {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // ---- phase A: P (tree 11) fills the reserve; L1 (tree 12) and L2
+    // (tree 13) are the two exhausting first touches; trees 1..10 pad
+    // the scan so both mutators land before the cursor reaches them.
+    let (disk, st, roots) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut roots = Vec::new();
+        for id in 1u64..=13 {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+            let root = tree::dir_root_of(&cx, id).unwrap_or_else(|e| panic!("root {id}: {e:?}"));
+            if id >= 11 {
+                ins(&cx, id, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+            }
+            roots.push(root);
+        }
+        let (d, s) = {
+            let g = sched.lock();
+            (g.disk.clone(), g.st.clone())
+        };
+        (d, s, roots)
+    };
+    // The phase-A baseline of "used but unreferenced" slots (the
+    // store's own structural pages — the map radix's, the free set's,
+    // the directory's — sit in `used_cur` outside `map.cur`): the
+    // world below must not add to it. That is exactly the orphan's
+    // signature: a slot the exhausted path's write-out allocated and
+    // then failed to release (G2) is new, and nothing else allocates
+    // without referencing in the same step.
+    let baseline_unreferenced: Vec<u64> = {
+        let mut referenced = st.slots.image_refs.clone();
+        referenced.extend(st.slots.used_durable.iter().copied());
+        referenced.extend(st.map.cur.values().map(|r| r.slot));
+        st.slots
+            .used_cur
+            .iter()
+            .filter(|s| !referenced.contains(*s))
+            .copied()
+            .collect()
+    };
+    let root_p = roots[10];
+    let root_l1 = roots[11];
+    let root_l2 = roots[12];
+    // The After2 capture: at `ckpt:freeze` neither exhausting LPID may
+    // still be `CopyPending`, and the frozen image must map both.
+    type After2Capture = std::sync::Arc<std::sync::Mutex<Option<(bool, bool, bool, bool)>>>;
+    let at_after2: After2Capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cap = std::sync::Arc::clone(&at_after2);
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                    cx.yield_now("ex:wait-fill").map_err(fail_of)?;
+                }
+                ins(&cx, 12, root_l1, &2u64.to_be_bytes(), 2, &val(2, 2));
+                set_flag(sched, "m1_done");
+                Ok(())
+            }
+            2 => {
+                let r = ckpt::checkpoint(&cx, &mut |hook| {
+                    if hook == CkptHook::After0 {
+                        set_flag(sched, "flipped1");
+                    }
+                    if hook == CkptHook::Mid2 && !flag(sched, "filled") {
+                        // The fill: P's first touch takes the free
+                        // reserve frame deterministically, inside the
+                        // checkpointer, while the cursor is still low.
+                        let cxh = Cx { w: sched, t };
+                        ins(&cxh, 11, root_p, &2u64.to_be_bytes(), 2, &val(2, 2));
+                        set_flag(sched, "filled");
+                    }
+                    if hook == CkptHook::After2 {
+                        let g = sched.lock();
+                        let st = &g.st;
+                        let l1_res = !matches!(
+                            st.map.img.get(&root_l1),
+                            Some(&e4_recovery::store::Img::CopyPending) | None
+                        );
+                        let l2_res = !matches!(
+                            st.map.img.get(&root_l2),
+                            Some(&e4_recovery::store::Img::CopyPending) | None
+                        );
+                        let l1_map = st
+                            .image_frozen
+                            .as_ref()
+                            .and_then(|f| f.entries.get(&root_l1))
+                            .is_some_and(|e| e.is_some());
+                        let l2_map = st
+                            .image_frozen
+                            .as_ref()
+                            .and_then(|f| f.entries.get(&root_l2))
+                            .is_some_and(|e| e.is_some());
+                        *cap.lock().unwrap() = Some((l1_res, l2_res, l1_map, l2_map));
+                    }
+                    Ok(())
+                });
+                set_flag(sched, "ckpt1");
+                r.map_err(fail_of)?;
+                Ok(())
+            }
+            3 => {
+                while !(flag(sched, "flipped1") && flag(sched, "filled")) {
+                    cx.yield_now("ex:wait-fill3").map_err(fail_of)?;
+                }
+                ins(&cx, 13, root_l2, &2u64.to_be_bytes(), 2, &val(2, 2));
+                set_flag(sched, "m3_done");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(4, seed, disk, st, body);
+    report.assert_clean("the exhausted-reserve schedule");
+    assert!(
+        flag(&sched, "ckpt1"),
+        "seed {seed}: the checkpoint completed"
+    );
+    assert!(flag(&sched, "m1_done"), "seed {seed}: the first touch ran");
+    assert!(flag(&sched, "m3_done"), "seed {seed}: the second touch ran");
+    let (l1_res, l2_res, l1_map, l2_map) = at_after2
+        .lock()
+        .unwrap()
+        .ok_or_else(|| format!("seed {seed}: After2 never fired"))?;
+    if !(l1_res && l2_res) {
+        return Err(format!(
+            "seed {seed}: a CopyPending survived to ckpt:freeze (l1_res={l1_res} l2_res={l2_res})"
+        ));
+    }
+    if !(l1_map && l2_map) {
+        return Err(format!(
+            "seed {seed}: the image left an exhausting LPID unmapped (l1={l1_map} l2={l2_map})"
+        ));
+    }
+    // ---- rework 6: the orphan's slot left `used_cur`. At world end
+    // (both mutators done, the checkpoint complete) the used-but-
+    // unreferenced slots are exactly phase A's baseline plus slot 5 —
+    // a stale flip-window write-out of a live page, pinned in
+    // `image_refs` while the window was open and left in `used_cur`
+    // when post-5 cleared the pins (measured, deterministic at this
+    // seed). The exhausted path's orphaned write-out must leave **no**
+    // such slot: its allocation was never referenced by anything, and
+    // under G2 (the release removed) exactly one more appears — slot
+    // 13 at this seed, the write-out of the copy the first task had
+    // already recorded — leaking until the next open.
+    let g = sched.lock();
+    let mut referenced = g.st.slots.image_refs.clone();
+    referenced.extend(g.st.slots.used_durable.iter().copied());
+    referenced.extend(g.st.map.cur.values().map(|r| r.slot));
+    let orphaned_end: Vec<u64> =
+        g.st.slots
+            .used_cur
+            .iter()
+            .filter(|s| !referenced.contains(*s))
+            .copied()
+            .collect();
+    drop(g);
+    let mut want_unreferenced = baseline_unreferenced.clone();
+    want_unreferenced.push(5);
+    want_unreferenced.sort_unstable();
+    if orphaned_end != want_unreferenced {
+        let new_orphans: Vec<u64> = orphaned_end
+            .iter()
+            .filter(|s| !want_unreferenced.contains(s))
+            .copied()
+            .collect();
+        return Err(format!(
+            "seed {seed}: slots {new_orphans:?} entered used_cur referenced by nothing - the \
+             exhausted path's orphaned write-out must release its slot (Work 1, G2)"
+        ));
+    }
+    // ---- the reopen: image 1 holds each exhausting page's flip cut.
+    let g = sched.lock();
+    let mut disk_after = g.disk.clone();
+    drop(g);
+    crash_clean(&mut disk_after, seed + 50);
+    let sched2 = pass_world(1, seed + 100, disk_after, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &sched2,
+        t: HARNESS,
+    };
+    let (opened, _frontier) =
+        ckpt::recover(&cx2, cfg.clone()).map_err(|e| format!("seed {seed}: recover: {e:?}"))?;
+    let (_om, meta) =
+        ckpt::open(&cx2, cfg.clone()).map_err(|e| format!("seed {seed}: open: {e:?}"))?;
+    assert_eq!(meta.ckpt_id, 1, "seed {seed}: meta 1 is the image");
+    cx2.with("ex:install", |c| {
+        *c.store() = opened;
+        Ok(())
+    })
+    .expect("install");
+    let want: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+        [(1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec()))]
+            .into_iter()
+            .collect();
+    for (name, root) in [("L1", root_l1), ("L2", root_l2), ("P", root_p)] {
+        let scan = tree::tree_scan(&cx2, root, 10)
+            .map_err(|e| format!("seed {seed}: scan {name}: {e:?}"))?;
+        if scan != want {
+            return Err(format!(
+                "seed {seed}: image 1 lost {name}'s flip cut: {scan:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pin 3: a one-frame-exhausted reserve and two first touches in
+/// `write_fresh` — both copies must reach the image, and (rework 6)
+/// the orphaned write-out's slot must have left `used_cur`: at world
+/// end the used-but-unreferenced slots are exactly the phase-A
+/// baseline plus the one stale flip-window write-out (slot 5),
+/// nothing more — G2 (the release removed) leaks the orphan's slot
+/// (13 at this seed) and fails the pin.
+#[test]
+fn exhausted_reserve_keeps_both_copies() {
+    exhausted_reserve_body(1).expect("pin 3");
+}
+
+// ---- X5-R49 (card X-5c-F4-F1-F1-F3-F2, step 1): a freed LPID's home
+// slot is released (S-STORE §4.4's last paragraph, §6.5 item 3 and
+// §13 step 6; the pins read `prims::slot_free` — the allocator's one
+// test — directly off the world, so each instant is observed without
+// allocating). ----
+
+/// The current home slot of `lpid`, off the world (test helper).
+fn home_slot(sched: &Sched<TestWorld>, lpid: u64) -> Option<u64> {
+    let g = sched.lock();
+    g.st.map.cur.get(&lpid).map(|r| r.slot)
+}
+
+/// `slot_free(s)` off the world (test helper).
+fn slot_free_at(sched: &Sched<TestWorld>, s: u64) -> bool {
+    let g = sched.lock();
+    prims::slot_free(&g.st.slots, s)
+}
+
+/// A one-page tree (id 2) checkpointed once: its root leaf's home is
+/// adopted by image 1 and durable. Returns the world and the leaf's
+/// post-checkpoint home slot `s` (image 1 — the next checkpoint's
+/// image k−1 — references it).
+fn r49_setup_durable_home(seed: u64, cfg: StoreCfg) -> (Sched<TestWorld>, u64, u64) {
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    let sched = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    tree::dir_create_tree(&cx, 2).expect("CreateTree");
+    let root = tree::dir_root_of(&cx, 2).expect("root");
+    ins(&cx, 2, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+    cx_checkpoint(&sched, |_| Ok(()));
+    let lpid = tree::dir_root_of(&cx, 2).expect("root after ckpt");
+    let s = home_slot(&sched, lpid).expect("the leaf keeps a home");
+    {
+        let g = sched.lock();
+        assert!(
+            g.st.slots.used_durable.contains(&s),
+            "seed {seed}: image 1 must reference the leaf's home {s} (the pin's premise)"
+        );
+    }
+    (sched, lpid, s)
+}
+
+/// **X5-R49 pin 1: `x5_r49_freed_home_frees_at_step6`.** A page whose
+/// home `s` image k−1 references, freed **outside** a window in epoch
+/// k (§6.5 item 3's merge shape, S-STORE §4.2/§4.4): `slot_free(s)` is
+/// false before checkpoint k's flip (the durable image's reference),
+/// false at its `After5` (the slot is `pending_free`, released only at
+/// step 6 — §13 step 6, X5-R49 (b)), true at its `Mid6`, and the next
+/// allocation that scans `s` gets it. M-FREE-LEAK (the Base's code: no
+/// release at the free) fails the `Mid6` and allocation checks;
+/// M-STEP6-AT-POST5 fails the `After5` check; M-FREE-RELEASE-DURABLE
+/// fails the before-the-flip check.
+#[test]
+fn x5_r49_freed_home_frees_at_step6() {
+    let seed = 1u64;
+    let (sched, lpid, s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // The free, outside any window (no checkpoint is running).
+    prims::free_lpid(&cx, lpid).expect("free outside the window");
+    assert!(
+        !slot_free_at(&sched, s),
+        "seed {seed}: slot {s} must not be free before the flip (image 1 references it)"
+    );
+    // Checkpoint k=2: the image leaves the LPID unmapped, so `s` drops
+    // from the durable set at post-5 into `pending_free` (After5), and
+    // step 6 (Mid6) is the release point.
+    let mut after5 = false;
+    let mut mid6 = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After5 {
+            after5 = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6 = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !after5,
+        "seed {seed}: slot {s} must be pending (not free) at After5 — step 6, not post-5, \
+         releases it (X5-R49 (b))"
+    );
+    assert!(
+        mid6,
+        "seed {seed}: slot {s} must be free at Mid6 — the freed home left `used_cur` at the \
+         free and the durable set at post-5 (X5-R49 (a)/(b))"
+    );
+    // The next allocation that scans `s` takes it (lowest-free-first,
+    // §4.5): every free slot below `s` is handed out first, then `s`
+    // itself — never a skip past it.
+    let mut got_s = false;
+    for _ in 0..=s {
+        let a = prims::alloc_slot(&cx).expect("alloc");
+        if a == s {
+            got_s = true;
+            break;
+        }
+        if a > s {
+            break;
+        }
+    }
+    assert!(
+        got_s,
+        "seed {seed}: the allocation that scans {s} must take it (it is free and the lowest)"
+    );
+}
+
+/// **X5-R49 pin 2: `x5_r49_window_freed_home_frees_at_next_step6`.** A
+/// clean page freed **inside** checkpoint k's window: the first-touch
+/// freeze records `Img::At(s)`, so the image being built (image k)
+/// references `s` and keeps it out of `pending_free` at k's own step 6
+/// — the slot stays not-free through checkpoint k's `Mid6` (it is in
+/// the new durable set), and becomes free at checkpoint k+1's `Mid6`
+/// (post-5 of k+1 moves it to `pending_free`; step 6 releases it).
+/// M-FREE-UNPIN-ONLY (the release through `unpin_home`, the gate's
+/// scratch form) returns early on the `image_refs` pin and leaves `s`
+/// in `used_cur` past k+1's step 6, failing the last check.
+#[test]
+fn x5_r49_window_freed_home_frees_at_next_step6() {
+    let seed = 2u64;
+    let (sched, lpid, s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Checkpoint k=2: the free lands at After0 — inside the flip
+    // window, on a clean frame (checkpoint 1 wrote it out), so the
+    // freeze records Img::At(s) and pins `s` in image_refs.
+    let mut in_window = false;
+    let mut mid6_k = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After0 {
+            prims::free_lpid(&cx, lpid).expect("free inside the window");
+            in_window = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6_k = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !in_window,
+        "seed {seed}: the window free's Img::At({s}) pins the slot (image 2 references it)"
+    );
+    assert!(
+        !mid6_k,
+        "seed {seed}: slot {s} must not be free through checkpoint k's Mid6 — image k \
+         references it (it is in the new durable set)"
+    );
+    // Checkpoint k+1=3: the image leaves the LPID unmapped; `s` drops
+    // to `pending_free` at post-5 and is released at step 6.
+    let mut after5_k1 = false;
+    let mut mid6_k1 = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After5 {
+            after5_k1 = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6_k1 = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !after5_k1,
+        "seed {seed}: slot {s} must be pending at checkpoint k+1's After5"
+    );
+    assert!(
+        mid6_k1,
+        "seed {seed}: slot {s} must be free at checkpoint k+1's Mid6 — the unconditional \
+         release (X5-R49 (a)) left no `used_cur` pin behind"
+    );
+}
+
+/// **X5-R49 pin 3: `x5_r49_unimaged_home_frees_at_once`.** A page whose
+/// home was written by an eviction in this epoch and never adopted by
+/// an image (§4.4's last paragraph): the home is in `used_cur` alone,
+/// so a free outside a window makes it allocatable **at once** — no
+/// pending transition, because neither image references it.
+/// M-FREE-LEAK (no release at the free) fails this pin outright.
+#[test]
+fn x5_r49_unimaged_home_frees_at_once() {
+    let seed = 3u64;
+    let (sched, lpid, _s_old) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Dirty the page again (epoch 2) and evict it: the write-out moves
+    // the home to a fresh slot no image ever adopted.
+    ins(&cx, 2, lpid, &2u64.to_be_bytes(), 2, &val(2, 2));
+    let mut s_new = None;
+    for _ in 0..64 {
+        if !prims::evict_one(&cx, true).expect("evict") {
+            break;
+        }
+        let h = home_slot(&sched, lpid);
+        if h.is_some_and(|h| h != _s_old) {
+            s_new = h;
+            break;
+        }
+    }
+    let s = s_new.unwrap_or_else(|| {
+        let h = home_slot(&sched, lpid).expect("the page keeps a home");
+        panic!("seed {seed}: the eviction never moved the home (still {h})");
+    });
+    {
+        let g = sched.lock();
+        assert!(
+            !g.st.slots.used_durable.contains(&s),
+            "seed {seed}: the eviction's home {s} must not be in an image (the pin's premise)"
+        );
+    }
+    assert!(
+        !slot_free_at(&sched, s),
+        "seed {seed}: the eviction home {s} is the current home (not free before the free)"
+    );
+    prims::free_lpid(&cx, lpid).expect("free outside the window");
+    assert!(
+        slot_free_at(&sched, s),
+        "seed {seed}: an unimaged home must be free at once (§4.4's last paragraph, X5-R49 (a))"
+    );
+}
+
+/// **X5-R49 pin 4:
+/// `x5_r49_window_freed_unimaged_home_held_by_image_refs`** (verdict
+/// X-5c-F4-F1-F1-F3-F2 finding 4's follow-up -F2, folded into this
+/// card's step 3). Pin 2's window-freed home is *also* in
+/// `used_durable` (image k−1 adopted it), which masks the verdict's
+/// mutant O-FREE-DROP-IMGREFS: even with the `image_refs` pin dropped
+/// at the free, the durable set still refuses the slot. This pin
+/// removes the mask. The page's home `s` was written by an **eviction
+/// in epoch k before the flip** (checkpoint k's `Before0`), so no
+/// image ever adopted it — `s` is in `used_cur` alone; the page is
+/// then **touched clean inside checkpoint k's window** (a fetch plus a
+/// `store_page` of the same bytes at `After0`), whose first-touch
+/// freeze records `Img::At(s)` and pins `s` in `image_refs`; and the
+/// page is **freed inside the same window** (`After1`). From the free
+/// through checkpoint k's `Mid6` the slot's only remaining reference
+/// is that `image_refs` pin (post-5 carries it into the new durable
+/// set), so `slot_free(s)` must be false there and true first at
+/// checkpoint k+1's `Mid6`. O-FREE-DROP-IMGREFS (the release also
+/// removes the freed home from `image_refs`) leaves `s` referenced by
+/// nothing at the free — allocatable while image k still references
+/// it, before meta k is synced — and fails the at-the-free check.
+#[test]
+fn x5_r49_window_freed_unimaged_home_held_by_image_refs() {
+    let seed = 5u64;
+    let (sched, lpid, s_old) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Dirty the page in epoch k (outside the checkpoint), as pin 3 does.
+    ins(&cx, 2, lpid, &2u64.to_be_bytes(), 2, &val(2, 2));
+    // Checkpoint k=2. Before0 — before the flip — evict the dirty page:
+    // the write-out gives it a fresh home `s` no image adopted.
+    let mut evicted = None;
+    let mut pinned = false;
+    let mut not_durable = false;
+    let mut img_at_s = false;
+    let mut free_point = None;
+    let mut mid2_free = false;
+    let mut after5_k = None;
+    let mut mid6_k = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::Before0 {
+            for _ in 0..64 {
+                if !prims::evict_one(&cx, true).expect("evict") {
+                    break;
+                }
+                let h = home_slot(&sched, lpid);
+                if h.is_some_and(|h| h != s_old) {
+                    evicted = h;
+                    break;
+                }
+            }
+        }
+        if hook == CkptHook::After0
+            && let Some(s) = evicted
+        {
+            // The clean touch inside the window: load the page clean and
+            // write it back; the first-touch freeze records Img::At(s)
+            // and pins `s` in `image_refs`. The premises are read here,
+            // inside the window (post-5 clears both sets).
+            let (bytes, _) = prims::fetch_page(&cx, lpid, true).expect("clean fetch");
+            prims::store_page(&cx, lpid, bytes).expect("clean touch");
+            let g = sched.lock();
+            pinned = g.st.slots.image_refs.contains(&s);
+            not_durable = !g.st.slots.used_durable.contains(&s);
+            img_at_s = matches!(g.st.map.img.get(&lpid), Some(Img::At(r)) if r.slot == s);
+        }
+        if hook == CkptHook::After1
+            && let Some(s) = evicted
+        {
+            prims::free_lpid(&cx, lpid).expect("free inside the window");
+            free_point = Some(slot_free_at(&sched, s));
+        }
+        if hook == CkptHook::Mid2
+            && let Some(s) = evicted
+            && free_point.is_some()
+        {
+            mid2_free |= slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::After5
+            && let Some(s) = evicted
+            && free_point.is_some()
+        {
+            after5_k = Some(slot_free_at(&sched, s));
+        }
+        if hook == CkptHook::Mid6
+            && let Some(s) = evicted
+            && free_point.is_some()
+        {
+            mid6_k = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    let s = evicted.unwrap_or_else(|| {
+        let h = home_slot(&sched, lpid).expect("the page keeps a home");
+        panic!("seed {seed}: the eviction never moved the home (still {h})");
+    });
+    assert!(
+        pinned,
+        "seed {seed}: the clean touch must have pinned {s} in image_refs (the premise)"
+    );
+    assert!(
+        not_durable,
+        "seed {seed}: the eviction home {s} must never have entered an image (the premise)"
+    );
+    assert!(
+        img_at_s,
+        "seed {seed}: the image being built must hold the page at its eviction home {s} (Img::At)"
+    );
+    {
+        let g = sched.lock();
+        assert!(
+            !g.st.slots.used_cur.contains(&s),
+            "seed {seed}: the free must have released {s} from used_cur (X5-R49 (a))"
+        );
+    }
+    assert_eq!(
+        free_point,
+        Some(false),
+        "seed {seed}: slot {s} must not be free at the free itself — image k references it \
+         (image_refs); this is the check O-FREE-DROP-IMGREFS breaks"
+    );
+    assert!(
+        !mid2_free,
+        "seed {seed}: slot {s} must stay not-free at every Mid2 after the free (image_refs)"
+    );
+    assert_eq!(
+        after5_k,
+        Some(false),
+        "seed {seed}: slot {s} must be durable (not free) at checkpoint k's After5"
+    );
+    assert!(
+        !mid6_k,
+        "seed {seed}: slot {s} must not be free through checkpoint k's Mid6 — image k \
+         references it (it entered the new durable set at post-5)"
+    );
+    // Checkpoint k+1=3: the image leaves the LPID unmapped, so `s`
+    // drops to `pending_free` at post-5 and step 6 releases it.
+    let mut after5_k1 = false;
+    let mut mid6_k1 = false;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After5 {
+            after5_k1 = slot_free_at(&sched, s);
+        }
+        if hook == CkptHook::Mid6 {
+            mid6_k1 = slot_free_at(&sched, s);
+        }
+        Ok(())
+    });
+    assert!(
+        !after5_k1,
+        "seed {seed}: slot {s} must be pending at checkpoint k+1's After5"
+    );
+    assert!(
+        mid6_k1,
+        "seed {seed}: slot {s} must be free at checkpoint k+1's Mid6 — the image_refs \
+         pin was the only reference from the free to here"
+    );
+}
+
+// ---- X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2b): the two window reuse
+// counters split at the step-2 freeze (`ckpt_reuse` whole-window for
+// the Q4 arm, `ckpt_reuse_pf` pre-freeze for the Q4-I row) — three
+// directed frees/reuses, one per counting case. ----
+
+/// The two window reuse counters off the world (test helper).
+fn reuse_counters(sched: &Sched<TestWorld>) -> (u64, u64) {
+    let g = sched.lock();
+    (g.st.ckpt_reuse, g.st.ckpt_reuse_pf)
+}
+
+/// Whether `lpid` is in the current window's image map (test helper):
+/// the "freed since this flip" premise the whole-window counter keys on.
+fn in_img_map(sched: &Sched<TestWorld>, lpid: u64) -> bool {
+    let g = sched.lock();
+    g.st.map.img.contains_key(&lpid)
+}
+
+/// Allocate until `alloc_lpid` hands out `lpid` (test helper). The
+/// scan is lowest-free-first, so every free-set entry below `lpid` is
+/// handed out first; the bound is `next_lpid`, which never shrinks
+/// (§4.3) and dominates every free-set entry.
+fn alloc_until(cx: &Cx<'_, TestWorld>, lpid: u64) {
+    let bound = {
+        let g = cx.w.lock();
+        g.st.meta.next_lpid
+    };
+    for _ in 0..=bound {
+        let a = prims::alloc_lpid(cx).expect("alloc");
+        if a == lpid {
+            return;
+        }
+    }
+    panic!("alloc_lpid never handed out {lpid} within {bound} allocations");
+}
+
+/// **X5-R42 (card X-5c-F4-F1-F1-F3-F1 step 2b): the window reuse
+/// counters split at the freeze.** Three directed cases over
+/// `r49_setup_durable_home`'s one-page tree, each in its own world:
+///
+/// - freed **before the flip** (`Before0`, `flip_window` still false)
+///   and reused in the window (`After0`): the LPID never entered this
+///   window's `map.img`, so it is not a reuse of an LPID freed since
+///   the flip — **neither counter** moves;
+/// - freed **in the window before the freeze** (`After0`; the freeze
+///   is step 2's map phase, after `After1`) and reused there: **both
+///   counters** move;
+/// - freed **in the window after the freeze** (`After2`;
+///   `image_frozen` is `Some` from the freeze to post-5) and reused
+///   there: **only the whole-window counter** moves — the Q4-I row
+///   reads the pre-freeze count.
+///
+/// **G-REUSE-ANY** (the reuse site drops its `map.img` test) counts
+/// the first case; **M-RUPF-NOFREEZE** (`ckpt_reuse_pf` ignores
+/// `image_frozen`) counts the third — each fails this pin.
+#[test]
+fn x5_r42_reuse_counts_window_frees_before_freeze() {
+    // Case 1: freed before the flip, reused in the window — neither.
+    {
+        let seed = 6u64;
+        let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut not_imaged_at_reuse = false;
+        let mut counts = None;
+        cx_checkpoint(&sched, |hook| {
+            if hook == CkptHook::Before0 {
+                prims::free_lpid(&cx, lpid).expect("free before the flip");
+            }
+            if hook == CkptHook::After0 {
+                not_imaged_at_reuse = !in_img_map(&sched, lpid);
+                alloc_until(&cx, lpid);
+            }
+            if hook == CkptHook::After5 {
+                counts = Some(reuse_counters(&sched));
+            }
+            Ok(())
+        });
+        assert!(
+            not_imaged_at_reuse,
+            "seed {seed}: a pre-flip free must not be in this window's map.img (the premise)"
+        );
+        assert_eq!(
+            counts,
+            Some((0, 0)),
+            "seed {seed}: an LPID freed before the flip, reused in the window, counts in \
+             neither counter (G-REUSE-ANY reverts this)"
+        );
+    }
+    // Case 2: freed in the window before the freeze, reused there — both.
+    {
+        let seed = 7u64;
+        let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut imaged_at_free = false;
+        let mut frozen_at_reuse = false;
+        let mut counts = None;
+        cx_checkpoint(&sched, |hook| {
+            if hook == CkptHook::After0 {
+                prims::free_lpid(&cx, lpid).expect("free inside the window, before the freeze");
+                imaged_at_free = in_img_map(&sched, lpid);
+                frozen_at_reuse = {
+                    let g = sched.lock();
+                    g.st.image_frozen.is_none()
+                };
+                alloc_until(&cx, lpid);
+            }
+            if hook == CkptHook::After5 {
+                counts = Some(reuse_counters(&sched));
+            }
+            Ok(())
+        });
+        assert!(
+            imaged_at_free,
+            "seed {seed}: the window free's first touch must enter map.img (the premise)"
+        );
+        assert!(
+            frozen_at_reuse,
+            "seed {seed}: the reuse at After0 is before step 2's freeze (the premise)"
+        );
+        assert_eq!(
+            counts,
+            Some((1, 1)),
+            "seed {seed}: an LPID freed in the window and reused before the freeze counts in \
+             both counters"
+        );
+    }
+    // Case 3: freed in the window after the freeze, reused there —
+    // whole-window only.
+    {
+        let seed = 8u64;
+        let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let mut imaged_at_free = false;
+        let mut frozen_at_reuse = false;
+        let mut counts = None;
+        cx_checkpoint(&sched, |hook| {
+            if hook == CkptHook::After2 {
+                prims::free_lpid(&cx, lpid).expect("free inside the window, after the freeze");
+                imaged_at_free = in_img_map(&sched, lpid);
+                frozen_at_reuse = {
+                    let g = sched.lock();
+                    g.st.image_frozen.is_some()
+                };
+                alloc_until(&cx, lpid);
+            }
+            if hook == CkptHook::After5 {
+                counts = Some(reuse_counters(&sched));
+            }
+            Ok(())
+        });
+        assert!(
+            imaged_at_free,
+            "seed {seed}: the window free's first touch must enter map.img (the premise)"
+        );
+        assert!(
+            frozen_at_reuse,
+            "seed {seed}: the reuse at After2 is after step 2's freeze (the premise)"
+        );
+        assert_eq!(
+            counts,
+            Some((1, 0)),
+            "seed {seed}: an LPID freed in the window and reused after the freeze counts only \
+             in the whole-window counter (M-RUPF-NOFREEZE reverts this)"
+        );
+    }
+}
+
+/// **X-5c-PINS-1 item 1 (verdict X-5c-F4-F1-F1-F3-F1 §5's follow-up,
+/// GX-RUPF-NORESET): the pre-freeze reuse counter starts at 0 in the
+/// second window.** Two checkpoint windows over
+/// `r49_setup_durable_home`'s one-page tree: the first performs a
+/// pre-freeze window free and reuse (the case-2 shape — both counters
+/// read 1 at its `After5`), then the second window reads both counters
+/// at its own `After0`, **before any of its frees or reuses**, and
+/// again after repeating the same pre-freeze free-and-reuse there. The
+/// second window's start must read `(0, 0)` and its end `(1, 1)`:
+/// `ckpt:begin` resets `ckpt_reuse_pf` beside `ckpt_reuse` (card
+/// X-5c-F4-F1-F1-F3-F1 step 2a), so the pre-freeze half never carries
+/// one window's count into the next — carrying it would inflate `q4i`
+/// across windows. **GX-RUPF-NORESET** (`ckpt.rs`: drop `st.
+/// ckpt_reuse_pf = 0`) leaves the first window's pre-freeze count in
+/// place, so the second window starts at `(0, 1)` and ends at `(1, 2)`
+/// — each fails this pin.
+#[test]
+fn x5_r42_second_window_reuse_pf_starts_at_zero() {
+    let seed = 9u64;
+    let (sched, lpid, _s) = r49_setup_durable_home(seed, tcfg(8, 8, 1));
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Window 1 (checkpoint 2): the case-2 shape — freed inside the
+    // window before the freeze, reused there — both counters move.
+    let mut w1_imaged_at_free = false;
+    let mut w1_counts = None;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After0 {
+            prims::free_lpid(&cx, lpid).expect("free inside window 1, before the freeze");
+            w1_imaged_at_free = in_img_map(&sched, lpid);
+            alloc_until(&cx, lpid);
+        }
+        if hook == CkptHook::After5 {
+            w1_counts = Some(reuse_counters(&sched));
+        }
+        Ok(())
+    });
+    assert!(
+        w1_imaged_at_free,
+        "seed {seed}: window 1's free must enter this window's map.img (the premise)"
+    );
+    assert_eq!(
+        w1_counts,
+        Some((1, 1)),
+        "seed {seed}: window 1's pre-freeze free-and-reuse counts in both counters (the \
+         premise that leaves a non-zero ckpt_reuse_pf behind)"
+    );
+    // Window 2 (checkpoint 3): read both counters at its After0 before
+    // any free or reuse — the second window's start — then repeat the
+    // pre-freeze free-and-reuse and read them at its After5.
+    let mut w2_start = None;
+    let mut w2_imaged_at_free = false;
+    let mut w2_frozen_at_reuse = false;
+    let mut w2_counts = None;
+    cx_checkpoint(&sched, |hook| {
+        if hook == CkptHook::After0 {
+            w2_start = Some(reuse_counters(&sched));
+            prims::free_lpid(&cx, lpid).expect("free inside window 2, before the freeze");
+            w2_imaged_at_free = in_img_map(&sched, lpid);
+            w2_frozen_at_reuse = {
+                let g = sched.lock();
+                g.st.image_frozen.is_none()
+            };
+            alloc_until(&cx, lpid);
+        }
+        if hook == CkptHook::After5 {
+            w2_counts = Some(reuse_counters(&sched));
+        }
+        Ok(())
+    });
+    assert_eq!(
+        w2_start,
+        Some((0, 0)),
+        "seed {seed}: the second window's counters must start at (0, 0) — the pre-freeze \
+         half resets with the whole-window half (GX-RUPF-NORESET reverts this)"
+    );
+    assert!(
+        w2_imaged_at_free,
+        "seed {seed}: window 2's free must enter this window's map.img (the premise)"
+    );
+    assert!(
+        w2_frozen_at_reuse,
+        "seed {seed}: window 2's reuse is before step 2's freeze (the premise)"
+    );
+    assert_eq!(
+        w2_counts,
+        Some((1, 1)),
+        "seed {seed}: window 2's own pre-freeze free-and-reuse counts once in each counter, \
+         not once beside window 1's carried count (GX-RUPF-NORESET reverts this)"
+    );
+}
+
+/// **X-5c-F4-F1-F1-CXX Work 2: `drop_entry_gone_before_root_free`.**
+/// I-LINK-ATOMIC's cut side (§6.8 as amended by S-1-F7): a directory
+/// entry must never name an unmapped root — not even between two
+/// atomic steps of the last gated operation, because §4.2's immediate
+/// reuse can hand the LPID to another tree inside the same hold. The
+/// fix removes the entry **before** freeing the path; M-DROP-FREE-FIRST
+/// (inside the one gate hold, the root is freed before the entry is
+/// removed) opens exactly that window. A watcher task asserts, at each
+/// of its steps, that no unmapped root has an entry — in the persisted
+/// directory tree or in the in-memory `dir` — while the dropper walks
+/// tree 2 (a leaf root: the last step at once) and tree 3 (an inner
+/// root: one bounded step first, so the Stepped arm is exercised too).
+#[test]
+fn drop_entry_gone_before_root_free() {
+    drop_entry_gone_body(4);
+}
+
+fn drop_entry_gone_body(seed: u64) {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // Phase A: tree 2 = one page; tree 3 = an inner root over two
+    // leaves (twelve 400-byte cells split it once).
+    let (disk, st) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 3] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let root3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        for i in 0..12u64 {
+            ins(&cx, 3, root3, &i.to_be_bytes(), 1, &[0u8; 400]);
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone())
+    };
+    // Phase B: the dropper and the watcher. The watcher's check: every
+    // entry the directory holds (persisted and in memory) names a root
+    // that is still mapped (in the current map or resident in a pool
+    // frame).
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                tree::dir_drop_tree(&cx, 3).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                let mut checks = 0u64;
+                while !flag(sched, "d_done") {
+                    let dir_root = cx
+                        .with("watch:dr", |c| Ok(c.store().meta.dir_root))
+                        .map_err(fail_of)?;
+                    // The persisted directory's entries.
+                    let cells = tree::raw_cells(&cx, dir_root, false).map_err(|e| {
+                        SimFail::Internal(Box::leak(
+                            format!("watch raw_cells: {e:?}").into_boxed_str(),
+                        ))
+                    })?;
+                    let bad = cx
+                        .with("watch:chk", |c| {
+                            let st = c.store();
+                            let mapped = |lpid: u64| {
+                                st.map.cur.contains_key(&lpid)
+                                    || st
+                                        .pool
+                                        .frames
+                                        .iter()
+                                        .any(|f| f.key == lpid && !f.is_epoch_copy)
+                            };
+                            // In memory: no entry may name an unmapped root.
+                            for (id, en) in st.dir.iter() {
+                                if !mapped(en.root) {
+                                    return Ok(Some(format!(
+                                        "dir entry {id} names unmapped root {}",
+                                        en.root
+                                    )));
+                                }
+                            }
+                            // Persisted: no directory cell may either.
+                            for (k, v) in cells.iter() {
+                                if k.len() != 8 || v.len() != 9 {
+                                    continue;
+                                }
+                                let mut rb = [0u8; 8];
+                                if let Some(sb) = v.get(0..8) {
+                                    rb.copy_from_slice(sb);
+                                }
+                                let root = u64::from_le_bytes(rb);
+                                if !mapped(root) {
+                                    let id = u64::from_be_bytes(
+                                        k.as_slice().try_into().unwrap_or([0; 8]),
+                                    );
+                                    return Ok(Some(format!(
+                                        "directory cell {id} names unmapped root {root}"
+                                    )));
+                                }
+                            }
+                            Ok(None)
+                        })
+                        .map_err(fail_of)?;
+                    if let Some(what) = bad {
+                        panic!("watcher: {what}");
+                    }
+                    checks += 1;
+                    cx.yield_now("watch:spin").map_err(fail_of)?;
+                }
+                eprintln!("watcher made {checks} clean checks");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the drop watcher schedule");
+    assert!(flag(&sched, "d_done"), "seed {seed}: both drops ran");
+}
+
+/// **X-5c-F4-F1-F1-CXX rework 2 (the REWORK verdict's finding 1:
+/// §6.8 step 3 — the last step holds its pins through the one hold).**
+/// The walk's `PinGuard` covers the root and every page the step
+/// empties, noted before its first mutation; dropped at the step's
+/// edge (M-DROP-UNPIN-EARLY, f703c08d's code), the root's dirty frame
+/// was a legal eviction victim during the directory descent's I/O: the
+/// evictor latches it and yields in `write_fresh`, `free_lpid` clears
+/// the frame and puts the LPID in the free set, and `evict:finish` —
+/// which runs `map.cur.insert(key, r)` unconditionally — resurrects
+/// the freed root at its write's fresh slot: mapped and in the free
+/// set, referenced by nothing (444 r1 and 3005 r1 at BASE, faultless
+/// class C XX001 the census never saw). With the guard live across the
+/// hold the frame is not evictable (`evict:pick` demands `pins == 0`),
+/// so the store can never end a drop with the root both mapped and
+/// free. A dropper over a dirty leaf root races an evictor looping
+/// `evict_one(&cx, false)`; seed 38 is the literal (of 1..=500 the
+/// gate measured 38, 85, 444 and 467 failing at f703c08d, 0 with the
+/// pins held). **X-5c-F4-F1-F1-CXX-F1 (that verdict's finding 3, this
+/// card's step 5): seed 467 joins 38.** The narrower G6 form — the
+/// guard released after the directory descent, before the tree mutex
+/// is re-taken (the frees themselves run unpinned) — passes at 38 and
+/// fails at 7, 467, 488, 542, 589, 595, 693, 817 of 1..=1000 (the
+/// gate's measurement); 467 is its literal here, and it fails under
+/// the f703c08d code too. The body is unchanged.
+#[test]
+fn drop_last_step_keeps_its_pages_pinned() {
+    drop_last_step_pins_body(38).expect("the last step keeps its pages pinned");
+    drop_last_step_pins_body(467).expect("the last step keeps its pages pinned");
+}
+
+fn drop_last_step_pins_body(seed: u64) -> Result<(), String> {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // Phase A: trees 2–5, tree 2 durably checkpointed and then dirtied
+    // — a leaf root whose frame is dirty when the drop begins.
+    let (disk, st, root2) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 3, 4, 5] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        cx_checkpoint(&sched, |_| Ok(()));
+        ins(&cx, 2, root2, &2u64.to_be_bytes(), 2, &val(2, 2));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2)
+    };
+    // Phase B: the dropper (t1) and an evictor (t2) looping outside
+    // any gated operation, so it takes the gate shared per attempt —
+    // exactly the background evictor of §5.2.
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                while !flag(sched, "d_done") {
+                    let _ = prims::evict_one(&cx, false).map_err(fail_of)?;
+                    cx.yield_now("gate:evict").map_err(fail_of)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the gate evict schedule");
+    let g = sched.lock();
+    let mapped = g.st.map.cur.contains_key(&root2);
+    let free = g.st.slots.free_lpids.contains(&root2);
+    if mapped && free {
+        return Err(format!(
+            "seed {seed}: root {root2} is mapped and in the free set — the last step \
+             freed a page whose frame an evictor had already latched (evict:finish \
+             resurrected it)"
+        ));
+    }
+    Ok(())
+}
+
+/// **X-5c-F4-F1-F1-CXX rework 5 (the one hold; the REWORK verdict's
+/// finding 3, first rule): a flip that waits for "entry absent, root
+/// mapped" must never find it.** The last step removes the directory
+/// entry and frees the path inside **one** gate hold; the transient
+/// state between the entry's removal and the root's free (nothing
+/// names the root, the map still holds it) exists only while the
+/// dropper holds the gate, so a flip — which needs the gate exclusive
+/// and drains every holder first — can never cut there. A checker
+/// that asserts, at each of its steps, the flip's own opportunity
+/// (the straddle state **and** the gate free: `holders == 0`, not
+/// exclusive, no flip pending) therefore never fires. G3 (the gate
+/// released and re-taken between the entry removal and the frees —
+/// the frees in a second hold) opens exactly that window: the flip
+/// finds the straddle with the gate free, and the pin fails. Seed 5
+/// is the literal (the scan's first failures: 4, 5, 7, 8, … — 105 of
+/// 1..=200 fail under the hand-applied G3, and 0 clean).
+#[test]
+fn drop_one_hold_the_flip_never_finds_the_straddle() {
+    drop_one_hold_body(5).expect("the one hold shields the straddle");
+}
+
+fn drop_one_hold_body(seed: u64) -> Result<(), String> {
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // Phase A: tree 2, a leaf root with one durably checkpointed
+    // entry — the drop's first walk step is the last step.
+    let (disk, st, root2) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        tree::dir_create_tree(&cx, 2).unwrap_or_else(|e| panic!("CreateTree 2: {e:?}"));
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2)
+    };
+    // Phase B: the dropper (t1) and the flip (t2). The flip task
+    // spins at yield granularity; each of its steps checks, in one
+    // atomic step, whether a flip that started now would cut the
+    // straddle: the entry gone (in-memory `dir`, which lags the
+    // persisted removal never — the persisted leaf is rewritten
+    // first), the root still mapped (in `map.cur` or a resident
+    // frame), and the gate free. Finding it is the violation; after
+    // the drop completes the flip runs for real (a clean cut).
+    let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        match t {
+            1 => {
+                tree::dir_drop_tree(&cx, 2).map_err(fail_of)?;
+                set_flag(sched, "d_done");
+                Ok(())
+            }
+            2 => {
+                loop {
+                    cx.yield_now("straddle:spin").map_err(fail_of)?;
+                    let hit = cx
+                        .with("straddle:chk", |c| {
+                            let st = c.store();
+                            let mapped = st.map.cur.contains_key(&root2)
+                                || st
+                                    .pool
+                                    .frames
+                                    .iter()
+                                    .any(|f| f.key == root2 && !f.is_epoch_copy);
+                            let entry_gone = !st.dir.contains_key(&2);
+                            let gate_free =
+                                st.gate.holders == 0 && !st.gate.exclusive && !st.gate.flip_pending;
+                            Ok(entry_gone && mapped && gate_free)
+                        })
+                        .map_err(fail_of)?;
+                    if hit {
+                        panic!(
+                            "seed {seed}: the flip found the straddle: entry absent, root {root2} mapped, gate free"
+                        );
+                    }
+                    if flag(sched, "d_done") {
+                        break;
+                    }
+                }
+                ckpt::checkpoint(&cx, &mut |_| Ok(())).map_err(fail_of)?;
+                set_flag(sched, "ckpt1");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    let (sched, report) = run_world(3, seed, disk, st, body);
+    report.assert_clean("the one-hold straddle schedule");
+    if !flag(&sched, "d_done") {
+        return Err(format!("seed {seed}: the drop never completed"));
+    }
+    if !flag(&sched, "ckpt1") {
+        return Err(format!("seed {seed}: the checkpoint never ran"));
+    }
+    Ok(())
+}
+
+/// **X-5c-F4-F1-F1-CXX Work 3 (§14 step 4, as amended by S-1-F7): a
+/// replayed drop leaves its pages mapped until step 6.** Pass 2's
+/// `DropTree` sets `dropping` only — it runs no walk; the walk is step
+/// 6's, after replay has finished allocating. The fixture: a durable
+/// image of trees 2 and 3, then a WAL (above `T`, never applied live)
+/// holding a committed `DropTree(2)` and a commit of eight 400-byte
+/// cells into tree 3 — enough to split it during replay. Under the fix,
+/// tree 3's split allocates fresh LPIDs and step 6's walk frees tree
+/// 2's pages afterwards: the recovered map holds none of them. Under
+/// M-REPLAY-DROP-WALK (pass 2 walks), tree 2's pages are freed during
+/// replay and tree 3's split takes the lowest of them — the recovered
+/// map still holds it, and tree 3's scan sits partly on the freed page.
+#[test]
+fn drop_replay_only_marks() {
+    let seed = 1u64;
+    let cfg = tcfg(8, 18, 1);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    // ---- phase A: tree 2 (a leaf root, one entry) and tree 3 (eight
+    // of the ~10 400-byte cells a leaf holds), one durable checkpoint.
+    let (disk, st, root2, root3) = {
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        for id in [2u64, 3] {
+            tree::dir_create_tree(&cx, id).unwrap_or_else(|e| panic!("CreateTree {id}: {e:?}"));
+        }
+        let root2 = tree::dir_root_of(&cx, 2).expect("root 2");
+        let root3 = tree::dir_root_of(&cx, 3).expect("root 3");
+        ins(&cx, 2, root2, &1u64.to_be_bytes(), 1, &val(1, 1));
+        for i in 0..8u64 {
+            ins(&cx, 3, root3, &i.to_be_bytes(), 1, &[0u8; 400]);
+        }
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        (g.disk.clone(), g.st.clone(), root2, root3)
+    };
+    // ---- phase B: the WAL only — a committed DropTree above T, then a
+    // commit that splits tree 3 during replay. Nothing is applied live.
+    let mut disk_after = {
+        let sched = pass_world(1, seed + 10, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        enqueue_commit(&cx, (0, 1), 1, &[wal::WOp::DropTree { tree: 2 }]);
+        let puts: Vec<wal::WOp> = (8..16u64)
+            .map(|i| wal::WOp::Put {
+                tree: 3,
+                key: i.to_be_bytes().to_vec(),
+                value: [0u8; 400].to_vec(),
+            })
+            .collect();
+        enqueue_commit(&cx, (0, 2), 2, &puts);
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    crash_clean(&mut disk_after, seed + 50);
+    // ---- the recovery: both records replay; then step 6 walks.
+    let world = pass_world(1, seed + 20, disk_after, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, _frontier) = ckpt::recover(&cx, cfg.clone()).expect("replay recovery");
+    assert!(
+        !rec_st.dir.contains_key(&2),
+        "the replayed drop completed at step 6: tree 2's entry is gone"
+    );
+    let root2_mapped = rec_st.map.cur.contains_key(&root2)
+        || rec_st
+            .pool
+            .frames
+            .iter()
+            .any(|f| f.key == root2 && !f.is_epoch_copy);
+    assert!(
+        !root2_mapped,
+        "a replayed drop must leave its pages mapped until step 6 - tree 2's root \
+         mapped again in the recovered store means pass 2's records allocated it \
+         (M-REPLAY-DROP-WALK)"
+    );
+    cx.with("replay:install", |c| {
+        *c.store() = rec_st;
+        Ok(())
+    })
+    .expect("install");
+    let scan = tree::tree_scan(&cx, root3, 1000).expect("tree 3 scan after recovery");
+    assert_eq!(
+        scan.len(),
+        16,
+        "tree 3 holds all sixteen replayed cells across its split"
+    );
+}
+
+/// **X5-R39 pin (card X-5c-F4-F2 step 1): the `ckpt_unflipped` window's
+/// edges.** The observable is true exactly "from the completion of step
+/// 0 until step 5's `sync_all` returned" (PLAN §10 item 10), carried by
+/// the crash-time hook position code: false before step 0 completes
+/// (`none` = 0 and `Before0` = 1 — **M-SZI-BEFORE0**, set at begin,
+/// reverts the 1), true from `After0` (2) through `After4` (7), and
+/// false again from `After5` (8, `sync_all` returned and
+/// `meta_durable_k` is set) through `Mid6` (9) and `After6`/none (0) —
+/// **M-SZI-AFTER5**, never cleared at step 5, reverts the 8. The
+/// sim-crash-unwind half of REFRESH 6's abort rule is structural for
+/// this carrier (the harness-side position code is written before any
+/// crash arm, so no store abort path can clear it); the non-crash half
+/// is carried by the `ckpt_closed_dirty` reset `szi` conjoins (pinned
+/// by the After4 literal-config pin in `tests/workload.rs`, which
+/// **M-SZI-ABORTRESET** fails).
+#[test]
+fn x5_r39_ckpt_unflipped_window_edges() {
+    assert!(
+        !ckpt::ckpt_unflipped(0),
+        "no hook passed yet: nothing of the checkpoint has happened"
+    );
+    assert!(
+        !ckpt::ckpt_unflipped(1),
+        "Before0: the flip has not run — nothing of the checkpoint has happened \
+         (M-SZI-BEFORE0 reverts this)"
+    );
+    for step in 2..=7 {
+        assert!(
+            ckpt::ckpt_unflipped(step),
+            "codes 2..=7 (After0..After4) are inside the window: step {step}"
+        );
+    }
+    assert!(
+        !ckpt::ckpt_unflipped(8),
+        "After5: step 5's sync_all returned and the meta is durable (M-SZI-AFTER5 reverts this)"
+    );
+    assert!(
+        !ckpt::ckpt_unflipped(9),
+        "Mid6: past the checkpoint's close"
+    );
+}
+
+// ---- card E4-SILENT-1 (E4-R1's refused open writes nothing) ----
+
+/// **E4-R1 (card E4-SILENT-1 step 1; S-STORE §12.8 step 3):** the
+/// refused open writes nothing. From the `n` = 5 LOST round's
+/// `crashed_disk` (the eval appendix's script, the directed `Lost` on
+/// the forced meta 2, seed 4242), 16 non-zero bytes are written 64
+/// bytes past the last non-zero byte of segment 0, durably. `ckpt::
+/// recover` on a `pass_world` must return `Fail::Corrupt` (the
+/// publication's `RequireCkpt{2}` over the opened meta 1), and every
+/// `/wal/` file must read back byte-identical: the check sits in pass
+/// 1, before `recover:install`, pass 2, any eviction write and
+/// `truncate_wal` (M-R1-LATE, the check moved after `truncate_wal`,
+/// keeps the `Corrupt` but zeroes the injected bytes — the
+/// byte-identical comparison is its catcher; M-R1-SKIP fails the
+/// `Corrupt` itself).
+#[test]
+fn es1_refused_open_writes_nothing() {
+    use e4_recovery::harness::{
+        self, CrashSpec, MediaDraw, RoundFaults, Script, ScriptOp, ScriptTask,
+    };
+    use e4_recovery::model::{CATALOG, Model, Op, PUBLIC, to_be64};
+    let seed = 4242u64;
+    let cfg = tcfg(8, 16, 2);
+    let wal_seg = e4_recovery::store::WAL_SEG;
+    let commit = |ops: Vec<Op>| ScriptOp::Commit { sync_on: true, ops };
+    // The es1 script (the eval appendix): the crash at task 1's yield 5
+    // — after the publication, with the forced meta 2 the newest.
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![
+                commit(vec![
+                    Op::CreateTree { tree: 2 },
+                    Op::CreateTree { tree: CATALOG },
+                    Op::Put {
+                        tree: CATALOG,
+                        key: to_be64(2),
+                        value: PUBLIC.to_vec(),
+                    },
+                ]),
+                commit(
+                    (0..8u64)
+                        .map(|i| Op::Put {
+                            tree: 2,
+                            key: i.to_be_bytes().to_vec(),
+                            value: vec![1u8; 8],
+                        })
+                        .collect(),
+                ),
+                ScriptOp::Checkpoint,
+                ScriptOp::BulkLoad {
+                    tree: 5,
+                    entries: (0..20u64)
+                        .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                        .collect(),
+                },
+                commit(
+                    (8..12u64)
+                        .map(|i| Op::Put {
+                            tree: 2,
+                            key: i.to_be_bytes().to_vec(),
+                            value: vec![3u8; 8],
+                        })
+                        .collect(),
+                ),
+                ScriptOp::Yields(4),
+            ],
+        }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 5)),
+        nested: Vec::new(),
+    };
+    // The faultless class C round supplies the crashed disk; the
+    // directed LOST on its newest meta write (the forced meta 2) is the
+    // n = 5 LOST round's crashed disk (F-CRASH then the fault, exactly
+    // as run_round applies them).
+    let (disk0, st0) = harness::create_store(cfg.clone(), seed, 7).expect("create");
+    let base = harness::run_round(
+        seed,
+        0,
+        &script,
+        &RoundFaults {
+            class: e4_recovery::sim::FaultClass::C,
+            knobs: e4_recovery::sim::FaultKnobs {
+                keep_latest_pm: 0,
+                tear_pm: 0,
+            },
+            directed: Vec::new(),
+            no_r_taint: false,
+            media: MediaDraw::None,
+            twin_supply: None,
+            nested_draw: 0,
+            probe_pass: false,
+        },
+        cfg.clone(),
+        disk0,
+        st0,
+        &Model::new(),
+        0,
+        None,
+        None,
+    );
+    assert!(
+        base.pass && base.opened_ckpt_id.is_some(),
+        "es1 writes-nothing: the faultless round passes (pass={}, o1={:?})",
+        base.pass,
+        base.o1
+    );
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("es1: the page file");
+    let mut best: Option<(u64, e4_recovery::sim::MediaFault)> = None;
+    for w in base.crashed_disk.dwrites_of(pf).iter() {
+        if (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = e4_recovery::store::page::parse_meta(&w.bytes)
+            && best.as_ref().is_none_or(|(k, _)| m.ckpt_id >= *k)
+        {
+            best = Some((
+                m.ckpt_id,
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: w.off,
+                    len: 4096,
+                    bytes: w.bytes.clone(),
+                    pre: w.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Lost,
+                },
+            ));
+        }
+    }
+    let (_, fault) = best.expect("es1: a durable meta write exists");
+    let mut disk = base.crashed_disk.clone();
+    disk.apply_one_media_fault(&fault);
+    // 16 non-zero bytes 64 past the last non-zero byte of segment 0,
+    // durably.
+    let seg0 = disk
+        .stat("/wal/0000000000000000.log")
+        .expect("es1: segment 0 holds the round's records");
+    {
+        let bytes = disk.durable_read(seg0, 0, wal_seg);
+        let last = bytes
+            .iter()
+            .rposition(|b| *b != 0)
+            .expect("es1: segment 0 is not empty");
+        let off = last as u64 + 1 + 64;
+        disk.write_at(seg0, off, &[0xA5u8; 16])
+            .expect("es1: the injected write");
+        disk.sync_data(seg0).expect("es1: the injected sync");
+    }
+    // Every /wal/ file's durable bytes (zero-padded to the segment
+    // size), before the recovery.
+    let before: Vec<(String, usize, Vec<u8>)> = disk
+        .list_dir("/wal/")
+        .into_iter()
+        .map(|(name, fid)| (name, fid, disk.durable_read(fid, 0, wal_seg)))
+        .collect();
+    assert!(
+        before
+            .iter()
+            .any(|(name, _, b)| name == "0000000000000000.log" && b.iter().any(|x| *x != 0)),
+        "es1: segment 0 holds the round's records"
+    );
+    // The refused open: XX001, and nothing written.
+    let world = pass_world(1, seed + 3, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let r = ckpt::recover(&cx, cfg.clone());
+    assert!(
+        matches!(&r, Err(Fail::Corrupt(_))),
+        "es1: recover must refuse with XX001 (E4-R1), got {}",
+        r.is_ok()
+    );
+    {
+        let g = world.lock();
+        for (name, fid, b) in before {
+            let now = g.disk.durable_read(fid, 0, wal_seg);
+            assert_eq!(
+                now, b,
+                "es1: /wal/{name} must read back byte-identical after the refused open"
+            );
+        }
+    }
+}
+
+/// **WR-1 (card E4-SILENT-1 step 2; E4-R2's precondition, S-STORE
+/// §2.3's shape):** segment 0 is created, and its directory entry made
+/// durable, before any other segment, whenever the durable meta's start
+/// is 0. One task on a `TestWorld`: after `ckpt::create` (meta 0,
+/// start 0), `wal.append`, `wal.written` and `wal.durable` are seated
+/// at `WAL_SEG` — a boot whose next batch starts in segment 1 while
+/// segment 0 is uncreated — then one record is enqueued and
+/// `wal_wait_durable`d. Segment 0 must exist (WR-1 created it ahead of
+/// segment 1, with the same create-or-open, `set_len`, bind and
+/// `sync_dir` steps), and after `apply_crash` (both segments' directory
+/// entries durable) `ckpt::recover` is `Ok`: meta 0's start-0 open
+/// finds segment 0 present, the walk stops on its zeros, and the empty
+/// stream is a legal recovery. With WR-1 removed (M-SEG0-ORDER),
+/// segment 0 never exists, the start-0 open sees segment 1 alone, and
+/// E4-R2 refuses — the recovery is `Err` and this pin fails.
+#[test]
+fn es2_segment_zero_created_first() {
+    use e4_recovery::store::WAL_SEG;
+    let seed = 4343u64;
+    let cfg = tcfg(8, 16, 2);
+    let (disk, st) = create_store(cfg.clone(), seed, None);
+    let world = pass_world(1, seed, disk, st);
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    // Seat the writer frontiers at segment 1's first LSN: the next
+    // enqueue lands in segment 1, and the batch that writes it creates
+    // segment 1 — the WR-1 history.
+    cx.with("es2:seat", |c| {
+        let wal = &mut c.store().wal;
+        wal.append = WAL_SEG;
+        wal.written = WAL_SEG;
+        wal.durable = WAL_SEG;
+        Ok(())
+    })
+    .expect("seat the WAL frontiers");
+    let (lsn, len) = wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 1), 1, &[9u8; 8]).expect("enqueue");
+    assert_eq!(lsn, WAL_SEG, "the record starts segment 1");
+    wal::wal_wait_durable(&cx, lsn + len).expect("the record is durable");
+    // Segment 0 exists — created before segment 1, its directory entry
+    // synced by the same steps.
+    assert!(
+        world
+            .lock()
+            .disk
+            .stat("/wal/0000000000000000.log")
+            .is_some(),
+        "es2: WR-1 must create segment 0 before segment 1"
+    );
+    assert!(
+        world
+            .lock()
+            .disk
+            .stat("/wal/0000000000010000.log")
+            .is_some(),
+        "es2: segment 1 holds the enqueued record"
+    );
+    // After the crash (both segments' entries durable), the start-0
+    // open recovers: the walk stops on segment 0's zeros and the empty
+    // stream is legal.
+    let mut d2 = g_of(&world);
+    crash_clean(&mut d2, seed + 1);
+    assert!(
+        d2.stat("/wal/0000000000000000.log").is_some(),
+        "es2: segment 0's directory entry is durable across the crash"
+    );
+    let world2 = pass_world(1, seed + 2, d2, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &world2,
+        t: HARNESS,
+    };
+    let r = ckpt::recover(&cx2, cfg.clone());
+    assert!(
+        r.is_ok(),
+        "es2: the start-0 open over the WR-1-created segment 0 recovers (got {:?})",
+        r.map_err(|_| "Err")
     );
 }

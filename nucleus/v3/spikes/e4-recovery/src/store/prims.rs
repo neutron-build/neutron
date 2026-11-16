@@ -27,11 +27,21 @@
 //! - PR-RESERVE (§5.6): the first `R_EPOCH` frames of the pool are the
 //!   epoch-copy reserve; normal pages never occupy them; exhaustion
 //!   writes the oldest copy out and reuses its frame.
+//! - PR-LATECOPY (§5.6, X-5c-F4-F1-F1-F2): an epoch copy installs only
+//!   while its ordering freeze (`Img::CopyPending`) still holds — §5.6's
+//!   copy condition, re-tested after the exhausted path's wait; a late
+//!   copy is dropped, never installed past its own checkpoint.
+//! - PR-EXHAUST-REVALIDATE (§5.6, X-5c-F4-F1-F1-CXX): the exhausted
+//!   path's write-out records only while its reserve frame still holds
+//!   the copy it read as oldest — re-validated after the write-out's
+//!   yield, in the record's own atomic step (Work 11 rule 1); an
+//!   orphaned write releases its slot and touches neither the image
+//!   map nor the frame.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::page::{self, Ref};
-use super::{Cx, Fail, Frame, FrozenImage, Img, Mutant, StoreHost, StoreInner};
+use super::{Cx, Fail, Frame, FrozenImage, Img, Mutant, SlotState, StoreHost, StoreInner};
 use crate::sim::{E4Env, Sched, SimFail, TaskId, WaitKey};
 
 /// Record a world-acquisition failure observed where it cannot be
@@ -363,6 +373,30 @@ pub fn alloc_lpid<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
         let st = c.store();
         if let Some(l) = st.slots.free_lpids.iter().next().copied() {
             st.slots.free_lpids.remove(&l);
+            // **X5-R41/X5-R42 (card X-5c-F4-F1-F1-F3 steps 2/7): a
+            // window reuse of an LPID freed since this flip.** During a
+            // flip window, `map.img` holds every LPID first-touched
+            // since the flip began — a free-set entry that is in it was
+            // freed inside this window, so handing it out reuses an
+            // LPID the image being built still maps. Counted as a store
+            // observable (`ckpt_reuse`, reset per window like
+            // `ckpt_splits`; never a behaviour input), plus its
+            // pre-freeze half `ckpt_reuse_pf` while `image_frozen` is
+            // still `None` (X5-R42, X-5c-F4-F1-F1-F3-F1 step 2a: Q4-I
+            // reads the pre-freeze count, the Q4 arm the whole window).
+            // M-REUSE-DROPS-IMG (X5-R43's Joint fault) drops the image
+            // entry here.
+            if st.flip_window && st.map.img.contains_key(&l) {
+                if st.ckpt_open {
+                    st.ckpt_reuse += 1;
+                    if st.image_frozen.is_none() {
+                        st.ckpt_reuse_pf += 1;
+                    }
+                }
+                if matches!(st.cfg.mutant, Some(Mutant::ReuseDropsImg)) {
+                    st.map.img.remove(&l);
+                }
+            }
             // X-5c-F3-F1 step 7 diagnostic (`E4_CXX_DIAG`, stderr only,
             // never a digest input): a free-set reuse whose lpid the
             // current map still references (P's lead (i): an allocation
@@ -450,7 +484,43 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
                 f.evicting = false;
             }
         }
-        st.map.cur.remove(&lpid);
+        // **X5-R43 (card X-5c-F4-F1-F1-F3 step 7; M-FREE-HOME-ALLOC,
+        // I-FREE-SAFE's shape; the `used_cur` line restored by
+        // X-5c-F4-F1-F1-F3-F1 step 1a, the F3 gate's prototype form):
+        // the freed LPID's durable home leaves `used_durable`,
+        // `image_refs` and `used_cur`**, so `alloc_slot` can hand it
+        // out at once while meta k−1 still references it. The
+        // `used_cur` removal is redundant at runtime since X5-R49 (a)
+        // below releases it unconditionally in the clean free; it is
+        // kept anyway so the fault never depends on the clean release.
+        // Inert when `cfg.mutant` is `None`. The home is read
+        // **before** the map drops the LPID.
+        if matches!(st.cfg.mutant, Some(Mutant::FreeHomeAlloc))
+            && let Some(r) = st.map.cur.get(&lpid).copied()
+        {
+            st.slots.used_durable.remove(&r.slot);
+            st.slots.image_refs.remove(&r.slot);
+            st.slots.used_cur.remove(&r.slot);
+        }
+        // **X5-R49 (a) (card X-5c-F4-F1-F1-F3-F2; S-STORE §4.2, §4.4,
+        // §6.5 item 3): the freed LPID's current home leaves `used_cur`
+        // in the same atomic step that removes the map entry,
+        // unconditionally** — the home is read before the map drops it.
+        // Unconditional, not `unpin_home`: `free_lpid` ran
+        // `freeze_first_touch` above, so during a flip window the image
+        // being built already holds its own reference (an `Img::At`
+        // whose slot is in `image_refs`, or an epoch copy at another
+        // slot) and the durable image's is in `used_durable` — neither
+        // needs `used_cur`'s third reference, and `unpin_home`'s early
+        // return on an `image_refs` slot would keep a window-freed home
+        // pinned past post-5 (the same leak, only rarer). Outside a
+        // window no image can still gain the slot, so §4.4's last
+        // paragraph makes it reusable at once; inside one it stays
+        // refused until the image that references it is superseded and
+        // §13 step 6 runs (X5-R49 (b)).
+        if let Some(r) = st.map.cur.remove(&lpid) {
+            st.slots.used_cur.remove(&r.slot);
+        }
         // S-STORE §4.2/§4.3 (card X-5c-F3, class C-XX): a freed LPID
         // goes to the free set — `next_lpid` never shrinks. The
         // draft's `next_lpid -= 1` on freeing the highest LPID let the
@@ -475,12 +545,29 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
     Ok(())
 }
 
+/// **X5-R49 (b) (card X-5c-F4-F1-F1-F3-F2 step 1): `alloc_slot`'s only
+/// test, as one pure predicate.** A slot is allocatable iff referenced
+/// by none of §4.4's three references — the current map (`used_cur`),
+/// the durable image (`used_durable`) and the image being built
+/// (`image_refs`, plus the `used_cur` homes it shares) — **and not in
+/// `pending_free`** (§13 step 6): a slot image k−1 references and image
+/// k does not moves to `pending_free` at post-5 and is released only
+/// when step 6 clears the set, so a free between the two is never
+/// handed out before the freeing meta is synced (I-FREE-SAFE).
+/// Pure over [`SlotState`], so a test can read the allocator's decision
+/// at any instant without allocating (X5-R49's pins).
+pub fn slot_free(slots: &SlotState, slot: u64) -> bool {
+    !slots.used_cur.contains(&slot)
+        && !slots.used_durable.contains(&slot)
+        && !slots.image_refs.contains(&slot)
+        && !slots.pending_free.contains(&slot)
+}
+
 /// Allocate the lowest free slot (§4.5), growing the file by
 /// `max(16, slot_count/16)` when none is free (the card's test-scale
-/// override of §4.5's `max(1 MiB, n/16)`). A slot is allocatable only if
-/// referenced by none of: the current map (`used_cur`), the durable image
-/// (`used_durable`), the image being built (`image_refs` + `used_cur`,
-/// §4.4's three references). The slot is marked used on allocation.
+/// override of §4.5's `max(1 MiB, n/16)`). A slot is allocatable only
+/// per [`slot_free`] (§4.4's three references). The slot is marked used
+/// on allocation.
 pub fn alloc_slot<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
     let mut s = 3u64;
     loop {
@@ -497,10 +584,7 @@ pub fn alloc_slot<H: StoreHost>(cx: &Cx<'_, H>) -> Result<u64, Fail> {
             if s >= st.slots.slot_count {
                 return Ok(Scan::Grow);
             }
-            if !st.slots.used_cur.contains(&s)
-                && !st.slots.used_durable.contains(&s)
-                && !st.slots.image_refs.contains(&s)
-            {
+            if slot_free(&st.slots, s) {
                 st.slots.used_cur.insert(s);
                 return Ok(Scan::Allocated(s));
             }
@@ -814,6 +898,26 @@ pub fn store_page<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Re
 /// a reserve frame, or — when the `R_EPOCH` reserve is exhausted — by
 /// writing the oldest copy out to a fresh slot recorded in the image map
 /// (the EVICT-SKIP-IMAGE-MAP site) and reusing its frame.
+///
+/// **X-5c-F4-F1-F1-F2 (verdict finding 1): the install re-tests §5.6's
+/// copy condition after the wait.** §5.6 says `write_guard` copies a
+/// page's epoch-`k` bytes only while that content "is not yet at a slot
+/// the image map references" — and the copy's journey can outlast the
+/// condition: the exhausted path's write-out is the only yield between
+/// the freeze that ordered the copy (`Img::CopyPending`) and the
+/// install, so step 2 can write the page's normal frame (resolving the
+/// override to `Img::At`) and `ckpt:freecopies` can free the reserve
+/// while the copy is still on its way. A copy whose condition stopped
+/// holding has no business being installed: it would sit in the
+/// reserve, dirty, `is_epoch_copy`, with content epoch `e − 1`, past
+/// its own checkpoint's cleanup, and the next checkpoint's scan
+/// (`f.is_epoch_copy || f.epoch <= k`) would take it and map the LPID
+/// to epoch-`k` content while `T` says replay need not restore it — a
+/// silent class-C loss (the `late_epoch_copy_must_not_enter_the_next_
+/// image` pin holds the whole schedule). So the install drops the
+/// bytes unless `map.img[lpid]` is still `CopyPending` — the image's
+/// content is already recorded elsewhere (step 2's write, a
+/// previous-epoch eviction's `Img::At`, or a closed window).
 fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) -> Result<(), Fail> {
     // An exhausted reserve writes the oldest copy out (frame order =
     // issue order) and frees its frame, then retries the install.
@@ -826,6 +930,13 @@ fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) ->
     if let Some(i) = free_idx {
         cx.with("epoch_copy:install", |c| {
             let st = c.store();
+            if st.map.img.get(&lpid) != Some(&Img::CopyPending) {
+                // The copy condition stopped holding while this copy
+                // was on its way: the bytes are not installed (the
+                // image's content is already recorded). One atomic
+                // step — nothing is written, no frame is taken.
+                return Ok(());
+            }
             let e = st.e;
             if let Some(f) = st.reserve_frames_mut().get_mut(i) {
                 f.key = lpid;
@@ -861,9 +972,49 @@ fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) ->
             .ok_or_else(|| Fail::Invalid("frame".to_owned()))?;
         Ok((f.key, f.bytes.clone()))
     })?;
+    // X-5c-F4-F1-F1-F2: the exhausted path's named park point. This
+    // write-out is the only yield between a first touch's freeze and
+    // its install (the free-reserve path is two atomic steps), so it is
+    // exactly where a copy can still be "on its way" while step 2
+    // writes the page's normal frame and `ckpt:freecopies` frees the
+    // reserve — the late-copy leak of verdict X-5c-F4-F1-F1 finding 1.
+    // A directed test holds a copy here by setting a budget; with no
+    // budget (every run but those tests) this returns at once.
+    cx.park("epochcopy:prewrite")?;
     let r = write_fresh(cx, &bytes_out)?;
     cx.with("epoch_copy:record", |c| {
         let st = c.store();
+        // **X-5c-F4-F1-F1-CXX Work 1 (cause B1): re-validate the frame
+        // after the write-out's yield, in the same atomic step as the
+        // record.** Two exhausted tasks can both read `oldest = idx`
+        // and both proceed into `write_fresh`; the first one's record
+        // clears the frame and its retry installs its own LPID's copy
+        // there, so by the time the second one records, the frame no
+        // longer holds `(key, is_epoch_copy)` — another task resolved
+        // it. Recording anyway would clear the frame a second time and
+        // destroy the first task's copy unwritten (`map.img` keeps its
+        // `CopyPending`, `ckpt:freeze` maps the LPID to nothing — the
+        // 18 B1 rounds), and a record landing past its checkpoint's
+        // post-5 inserts `Img::At(flip-k bytes)` into the cleared map,
+        // which the next freeze takes over `cur` (the silent sibling
+        // of verdict X-5c-F4-F1-F1-F2: `ckpt:freecopies` has already
+        // cleared the frame). So the write is an orphan: release its
+        // slot from `used_cur` and touch neither `map.img` nor the
+        // frame. M-EXHAUST-NO-REVALIDATE (the unconditional clear,
+        // today's code) skips exactly this test; M-EXHAUST-RECORD-FIRST
+        // guards only the frame clear and still records.
+        let no_revalidate = matches!(st.cfg.mutant, Some(Mutant::ExhaustNoRevalidate));
+        if !no_revalidate {
+            let same = st
+                .reserve_frames_mut()
+                .get(idx)
+                .map(|f| f.key == key && f.is_epoch_copy)
+                .unwrap_or(false);
+            if !same {
+                st.slots.used_cur.remove(&r.slot);
+                return Ok(());
+            }
+        }
         record_image_at(st, key, r);
         if let Some(f) = st.reserve_frames_mut().get_mut(idx) {
             f.key = 0;

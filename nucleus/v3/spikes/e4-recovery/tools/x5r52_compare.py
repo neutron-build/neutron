@@ -1,0 +1,1949 @@
+#!/usr/bin/env python3
+"""The X5-R51/X5-R52/X5-R53 comparator for E4 campaign JSON files
+(cards X-5c-F4-F1-F1-F3-F2-F1-F1 and
+X-5c-F4-F1-F1-F3-F2-F1-F1-F1).
+
+This script owns three invariants, and nothing else:
+
+1. `compare` reads a Base (reference) campaign JSON and one or more tip
+   (run) campaign JSONs plus their `.campaign.out` files, and classifies
+   every per-seed difference under X5-R51 (the step-4 movement
+   exemption, quoted in the crate README) as amended by X5-R52 (the
+   post-data amendment: twin DDL divergence, meta-only detections, MP-A
+   under X5-R30 (c), and bullet 1 made testable) and by X5-R53 (the
+   post-data amendment: `check-twin`'s attribution made exact, the
+   ts-level link T6, the MP-A class cap, and MONITOR as a stop). Its
+   exit code is 0 only if nothing outside the rule is found —
+   necessary, never sufficient: the single-seed checks (`check-mp`,
+   `check-twin`) belong to the gate, per X5-R51 (f) and X5-R52 (f).
+2. `check-mp` and `check-twin` re-read one recorded single-seed
+   diagnostic run (stderr, JSON and stdout) against one row of the run
+   JSON and decide X5-R51 (b)5 / X5-R52 (c)(ii) (b)5' and X5-R52 (c)(i)
+   T1–T5 as X5-R53 (b)/(c) amends them (segments; the sixth check T6),
+   exactly as the rules write them, from recorded fields only.
+3. `self-test` runs embedded synthetic records and diag lines through
+   the same engines and fails (non-zero exit) if any case reads
+   differently.
+
+Every classification is computed from recorded JSON fields, from the
+`E4 SEEDS=… MONITOR=` lines of the run-out files, and from the recorded
+diag stderr — never from a store, a model or a re-run. Deterministic:
+seeds are iterated in sorted order and every list is printed in full.
+Standard library only; run as `python3 -I`.
+
+Usage:
+  x5r52_compare.py compare --ref F [--ref-sha256 H] --run F ... \
+      --run-out F ... [--run-sha256 H] [--range A..B] \
+      [--no-twin-exemption] [--max-twin-failing N]
+  x5r52_compare.py check-mp --json F --seed S --round I \
+      --diag-err F --diag-json F --diag-out F
+  x5r52_compare.py check-twin --json F --seed S --twin-round I \
+      --diag-err F --diag-json F --diag-out F
+  x5r52_compare.py self-test
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+
+# ---------------------------------------------------------------------------
+# Recorded-field readers (shared by every subcommand).
+# ---------------------------------------------------------------------------
+
+#: The exact O-3 text of X5-R52 (c)(iii); anything else is a new failure.
+MPA_O3 = "O-3(a): served corruption"
+
+#: Page-file offsets of the two meta slots (S-STORE §2.2); a fault on
+#: page slot 1 or 2 by `off`, or a MISDIRECTED `to_off` of these on
+#: inode 0, is a meta-slot fault in `FaultTargets::collect`'s sense
+#: (X5-R5's condition 1, counted by Q14/q[15]).
+META_SLOT_OFFS = (4096, 8192)
+
+
+def seed_index(doc):
+    """Index a campaign JSON document by seed id.
+
+    Raises ``ValueError`` on a duplicate seed (two run files covering the
+    same seed cannot be merged and must stop the comparison).
+    """
+    out = {}
+    for s in doc.get("seeds", ()):
+        if s["seed"] in out:
+            raise ValueError(f"duplicate seed {s['seed']}")
+        out[s["seed"]] = s
+    return out
+
+
+def round_texts(r):
+    """The round's (o1, o2, o3) triple as recorded."""
+    return (r.get("o1"), r.get("o2"), r.get("o3"))
+
+
+def round_has_text(r):
+    """True iff any O-1/O-2/O-3 text is recorded on the round."""
+    return any(t is not None for t in round_texts(r))
+
+
+def round_o1a_only(r):
+    """X5-R51 (b)3: o2 and o3 null and o1 begins with O-1(a)."""
+    return (
+        r.get("o2") is None
+        and r.get("o3") is None
+        and (r.get("o1") or "").startswith("O-1(a)")
+    )
+
+
+def media_fault_count(r):
+    """The round's media-fault total: lost + mis + torn."""
+    return r.get("lost", 0) + r.get("mis", 0) + r.get("torn", 0)
+
+
+def seed_is_bad(s):
+    """A bullet-3 seed shape: deadlock, panic, baton or a defect text."""
+    return bool(
+        s.get("deadlock")
+        or s.get("panic")
+        or s.get("baton")
+        or s.get("defect") is not None
+    )
+
+
+def read_monitor(run_out_texts):
+    """Sum the ``E4 SEEDS=… MONITOR=n`` counts over the run-out texts.
+
+    X5-R51 (b)4: a non-zero count exempts nothing in that run. Each
+    run-out must carry at least one E4 SEEDS line, else (b)4 cannot be
+    checked and the comparison stops (exit 2) — the per-file check is
+    verdict X-5c-F4-F1-F1-F3-F2-F1-F1-F1 §3's hole: a truncated run-out
+    must not hide that run's MONITOR. Every line of every file is
+    summed.
+    """
+    total = 0
+    for text in run_out_texts:
+        seen = 0
+        for m in re.finditer(r"E4 SEEDS=\d+ .*?MONITOR=(\d+)", text):
+            total += int(m.group(1))
+            seen += 1
+        if seen == 0:
+            raise ValueError("a run-out file carries no E4 SEEDS line")
+    return total
+
+
+def sha256_of(path):
+    """The file's sha256 hex digest (for --ref-sha256/--run-sha256)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# The compare engine (X5-R51 as amended by X5-R52).
+# ---------------------------------------------------------------------------
+
+
+def meta_only_eligible(r):
+    """X5-R52 (c)(ii) JSON prefilter on a MOVED_MP_PENDING round row.
+
+    `c` null and `frontier` 0 (recovery failed), `mrb=false`,
+    `served=false`, q[15] (Q14, a meta-slot fault) 1, and q[12], q[13],
+    q[14] (Q13: a fault on a referenced slot) all 0. The q order is the
+    campaign JSON writer's (`campaign.rs`): q[12..14] is Q13, q[15] is
+    Q14.
+    """
+    q = r.get("q", [])
+    return (
+        r.get("c") is None
+        and r.get("frontier") == 0
+        and r.get("mrb") is False
+        and r.get("served") is False
+        and len(q) > 15
+        and q[15] == 1
+        and q[12] == 0
+        and q[13] == 0
+        and q[14] == 0
+    )
+
+
+def mpa_pass_fail(base_r, tip_r, klass, monitor):
+    """X5-R52 (c)(iii): the MP-A pass→fail check, exact from the JSON.
+
+    The Base round was already a meta-rollback detected loss (pass=true,
+    mrb=true, c null, q[15]=1, O-1(a) only); the tip round is its
+    recorded-failure form (pass=false, served=true, mrb=true, c null,
+    q[15]=1, o3 exactly `O-3(a): served corruption`, `(skx ∨ smx)` and
+    `pass_na` exactly true — X5-R30 (c) rule 4's judgement); MONITOR 0.
+    """
+    if monitor != 0:
+        return False
+    if klass != "MP" or base_r is None:
+        return False
+    b = base_r
+    t = tip_r
+    q_ok = lambda r: len(r.get("q", [])) > 15 and r["q"][15] == 1
+    return bool(
+        b.get("pass") is True
+        and b.get("mrb") is True
+        and b.get("c") is None
+        and q_ok(b)
+        and b.get("o2") is None
+        and b.get("o3") is None
+        and (b.get("o1") or "").startswith("O-1(a)")
+        and t.get("pass") is False
+        and t.get("served") is True
+        and t.get("mrb") is True
+        and t.get("c") is None
+        and q_ok(t)
+        and t.get("o2") is None
+        and t.get("o3") == MPA_O3
+        and (t.get("skx") or t.get("smx"))
+        and t.get("pass_na") is True
+    )
+
+
+def twin_ddl_prefilter(tip_twin_o1, klass, tip_rounds_before, monitor):
+    """X5-R52 (c)(i) JSON prefilter on a bullet-1 twin entry.
+
+    Class MW; the tip twin entry failed with an O-1(a) failed-recovery
+    text that contains `published {}`; some real round `j < i` has
+    lost+mis+torn ≥ 1 and either `cover_err` or `frontier < hi`; the
+    run's MONITOR count is 0.
+    """
+    if monitor != 0 or klass != "MW":
+        return False
+    if not (tip_twin_o1 or "").startswith("O-1(a)"):
+        return False
+    if "published {}" not in (tip_twin_o1 or ""):
+        return False
+    for r in tip_rounds_before:
+        if media_fault_count(r) >= 1 and (
+            r.get("cover_err") or r.get("frontier", 0) < r.get("hi", 0)
+        ):
+            return True
+    return False
+
+
+def compare_reading(ref_seeds, run_seeds, monitor, twin_exemption=True):
+    """Classify every per-seed difference; returns a row dict.
+
+    Rows, per X5-R51 (d) and X5-R52 (d): moved_gained, moved_mp_pending,
+    meta_only_eligible, mpa_pass_fail, twin_ddl_pending, moved_lost,
+    healed, twin_healed, text_changed, twin_failing (tip), twin_failing
+    base count, new_failing, bad_seeds, digests_moved, failing_rounds —
+    plus X5-R53's `mpa_class` (the Base and tip MP-A counts) and, when
+    `monitor` > 0, the `(-1, "run", None, "bullet3-monitor")` new-failure
+    row (X5-R53 (e)); when the tip's MP-A count is greater than the
+    Base's, every `MPA_PASS_FAIL` row becomes a
+    `bullet1-mpa-cap` new failure (X5-R53 (d)). Never netted; a row
+    either exempts (its single-seed check decides), reports, or fails.
+    """
+    rows = {
+        "digests_moved": [],
+        "failing_rounds": 0,
+        "monitor": monitor,
+        "moved_gained": [],
+        "moved_mp_pending": [],
+        "meta_only_eligible": [],
+        "mpa_pass_fail": [],
+        "twin_ddl_pending": [],
+        "moved_lost": [],
+        "healed": [],
+        "twin_healed": [],
+        "text_changed": [],
+        "twin_failing": [],
+        "twin_failing_base": [],
+        "new_failing": [],
+        "bad_seeds": [],
+        "mpa_class": (0, 0),
+    }
+    for s in sorted(run_seeds):
+        tip = run_seeds[s]
+        base = ref_seeds.get(s)
+        if base is None:
+            # The range check (cmd_compare) makes this unreachable; a
+            # run seed the ref lacks is still a new failure, never
+            # silently dropped.
+            rows["new_failing"].append((s, "seed", None, "not in ref"))
+            continue
+        if tip.get("digest") != base.get("digest"):
+            rows["digests_moved"].append(s)
+        if seed_is_bad(tip):
+            rows["bad_seeds"].append(s)
+            if not seed_is_bad(base):
+                rows["new_failing"].append((s, "seed", None, "bullet3"))
+        klass = tip.get("class")
+        brounds = base.get("rounds", [])
+        trounds = tip.get("rounds", [])
+        rows["failing_rounds"] += sum(1 for r in trounds if not r.get("pass"))
+        for i in range(max(len(brounds), len(trounds))):
+            tr = trounds[i] if i < len(trounds) else None
+            br = brounds[i] if i < len(brounds) else None
+            if tr is None:
+                # X5-R51 (c): a Base round with a text whose tip round
+                # is missing — the reverse direction, classified on the
+                # Base round alone.
+                if br is not None and round_has_text(br):
+                    c123 = klass in ("MP", "MW") and br.get("pass") is True and round_o1a_only(br)
+                    mw5 = klass != "MW" or (br.get("x33x") and br.get("cover_err"))
+                    (rows["moved_lost"] if (c123 and mw5) else rows["healed"]).append((s, i))
+                continue
+            b_pass = br.get("pass") if br is not None else True
+            b_text = round_has_text(br) if br is not None else False
+            # X5-R52 (b): bullet 1 first — pass true at the Base and
+            # false at the tip, whatever text the Base round carried.
+            if b_pass and not tr.get("pass"):
+                if mpa_pass_fail(br, tr, klass, monitor):
+                    rows["mpa_pass_fail"].append((s, i))
+                else:
+                    rows["new_failing"].append((s, "round", i, "bullet1"))
+                continue
+            # X5-R51 (a) bullet 2: text-free at the Base, a text here.
+            if not b_text and round_has_text(tr):
+                ok124 = (
+                    klass in ("MP", "MW")
+                    and tr.get("pass") is True
+                    and round_o1a_only(tr)
+                    and monitor == 0
+                )
+                if not ok124:
+                    rows["new_failing"].append((s, "round", i, "bullet2-checks"))
+                    continue
+                if klass == "MP":
+                    rows["moved_mp_pending"].append((s, i))
+                    rows["moved_gained"].append((s, i))
+                    if meta_only_eligible(tr):
+                        rows["meta_only_eligible"].append((s, i))
+                else:
+                    if tr.get("x33x") and tr.get("cover_err"):
+                        rows["moved_gained"].append((s, i))
+                    else:
+                        rows["new_failing"].append((s, "round", i, "bullet2-mw-json5"))
+                continue
+            # Reverse and text-change shapes (a tip round that exists).
+            if b_text:
+                if not round_has_text(tr) and tr.get("pass"):
+                    c123 = klass in ("MP", "MW") and br.get("pass") is True and round_o1a_only(br)
+                    mw5 = klass != "MW" or bool(br.get("x33x") and br.get("cover_err"))
+                    (rows["moved_lost"] if (c123 and mw5) else rows["healed"]).append((s, i))
+                    continue
+                if br.get("pass") is False and tr.get("pass") is True and round_has_text(tr):
+                    rows["healed"].append((s, i))
+                    continue
+                if tr.get("pass") is True and round_has_text(tr) and round_texts(br) != round_texts(tr):
+                    rows["text_changed"].append((s, i))
+                    continue
+        # Twin entries: X5-R52 (b) extends bullet 1 to twins, and (c)(i)
+        # is its only exemption; TWIN_HEALED is the reverse shape.
+        btwins = base.get("twin", [])
+        twins = tip.get("twin", [])
+        for i, tt in enumerate(twins):
+            if not tt.get("pass"):
+                rows["twin_failing"].append((s, i))
+            bt = btwins[i] if i < len(btwins) else None
+            b_pass = bt.get("pass") if bt is not None else True
+            if b_pass and not tt.get("pass"):
+                if twin_exemption and twin_ddl_prefilter(
+                    tt.get("o1"), klass, trounds[:i], monitor
+                ):
+                    rows["twin_ddl_pending"].append((s, i))
+                else:
+                    rows["new_failing"].append((s, "twin", i, "bullet1-twin"))
+        for i, bt in enumerate(btwins):
+            if not bt.get("pass"):
+                tt = twins[i] if i < len(twins) else None
+                if tt is None or tt.get("pass"):
+                    rows["twin_healed"].append((s, i))
+    # X5-R53 (e): a MONITOR hit above 0 is a new failure by itself,
+    # beside the (b)4 voiding inside the prefilters above (unchanged).
+    if monitor > 0:
+        rows["new_failing"].append((-1, "run", None, "bullet3-monitor"))
+    # X5-R53 (d): the MP-A class cap. The class is the rounds entries of
+    # seeds with class MP where `served` and `mrb` are both true, over
+    # the compared seeds, counted the same way at both ends; if the
+    # tip's count is greater than the Base's, (iii) exempts nothing.
+    base_mpa = sum(
+        1
+        for s in ref_seeds.values()
+        if s.get("class") == "MP"
+        for r in s.get("rounds", ())
+        if r.get("served") is True and r.get("mrb") is True
+    )
+    tip_mpa = sum(
+        1
+        for s in run_seeds.values()
+        if s.get("class") == "MP"
+        for r in s.get("rounds", ())
+        if r.get("served") is True and r.get("mrb") is True
+    )
+    rows["mpa_class"] = (base_mpa, tip_mpa)
+    if tip_mpa > base_mpa:
+        for s, i in rows["mpa_pass_fail"]:
+            rows["new_failing"].append((s, "round", i, "bullet1-mpa-cap"))
+        rows["mpa_pass_fail"] = []
+    return rows
+
+
+def compare_exit_code(rows, max_twin_failing=None):
+    """0 only if nothing outside the rule is found (X5-R52 (f))."""
+    if rows["new_failing"] or rows["bad_seeds"]:
+        return 1
+    if max_twin_failing is not None and len(rows["twin_failing"]) > max_twin_failing:
+        return 1
+    return 0
+
+
+def format_rows(rows, max_twin_failing=None):
+    """The compare output: counts and full lists, rows in fixed order."""
+    out = []
+    out.append(
+        "DIGESTS_MOVED %d FAILING_ROUNDS %d MONITOR %d"
+        % (len(rows["digests_moved"]), rows["failing_rounds"], rows["monitor"])
+    )
+    names = [
+        ("moved_gained", "MOVED_GAINED"),
+        ("moved_mp_pending", "MOVED_MP_PENDING"),
+        ("meta_only_eligible", "META_ONLY_ELIGIBLE"),
+        ("mpa_pass_fail", "MPA_PASS_FAIL"),
+        ("twin_ddl_pending", "TWIN_DDL_PENDING"),
+        ("moved_lost", "MOVED_LOST"),
+        ("healed", "HEALED"),
+        ("twin_healed", "TWIN_HEALED"),
+        ("text_changed", "TEXT_CHANGED"),
+    ]
+    for key, label in names:
+        out.append("%s %d %s" % (label, len(rows[key]), rows[key]))
+        if key == "mpa_pass_fail":
+            # X5-R53 (d): the class sizes, printed on every run,
+            # directly after MPA_PASS_FAIL.
+            out.append("MPA_CLASS base %d tip %d" % rows["mpa_class"])
+    out.append(
+        "TWIN_FAILING %d %s BASE %d"
+        % (len(rows["twin_failing"]), rows["twin_failing"], len(rows["twin_failing_base"]))
+    )
+    if max_twin_failing is not None and len(rows["twin_failing"]) > max_twin_failing:
+        out.append("TWIN_FAILING_BUDGET_EXCEEDED max=%d" % max_twin_failing)
+    out.append(
+        "NEW_FAILING %d %s BAD_SEEDS %d %s"
+        % (
+            len(rows["new_failing"]),
+            rows["new_failing"],
+            len(rows["bad_seeds"]),
+            rows["bad_seeds"],
+        )
+    )
+    return "\n".join(out)
+
+
+def cmd_compare(args):
+    """The compare subcommand (files, hashes, range, then the engine)."""
+    # Hash checks come before any reading (a mismatch exits 2).
+    if args.ref_sha256 and sha256_of(args.ref) != args.ref_sha256:
+        print("ERROR ref sha256 mismatch: %s" % args.ref, file=sys.stderr)
+        return 2
+    if args.run_sha256:
+        if len(args.run) != 1:
+            print("ERROR --run-sha256 needs exactly one --run", file=sys.stderr)
+            return 2
+        if sha256_of(args.run[0]) != args.run_sha256:
+            print("ERROR run sha256 mismatch: %s" % args.run[0], file=sys.stderr)
+            return 2
+    # The count tie (verdict X-5c-F4-F1-F1-F3-F2-F1-F1-F1 §3): one
+    # .campaign.out per run file. A cannot-check exit 2, like the hash
+    # checks above, and checked before any campaign file is read.
+    if len(args.run) != len(args.run_out):
+        print(
+            "ERROR --run count %d does not match --run-out count %d"
+            % (len(args.run), len(args.run_out)),
+            file=sys.stderr,
+        )
+        return 2
+    # The repeated-path refusal (card X-5c-PINS-1, Limit 3): the same
+    # --run-out path twice would read one run's MONITOR twice and hide
+    # another run's behind the duplicate — the same hole the count tie
+    # closes on counts. Paths only: content-identical distinct paths
+    # stay out (a run-out↔run tie, `E4 SEEDS=N` against that run's
+    # seed count, is a new refusal of its own and is not added here).
+    # A cannot-check exit 2 with an ERROR stderr line, exactly like the
+    # count tie, and like it checked before any campaign file is read.
+    if len(set(args.run_out)) != len(args.run_out):
+        dup = sorted(
+            {p for p in args.run_out if args.run_out.count(p) > 1}
+        )
+        print(
+            "ERROR a repeated --run-out path hides a run's MONITOR behind a duplicate: %s"
+            % dup,
+            file=sys.stderr,
+        )
+        return 2
+    ref_doc = json.load(open(args.ref))
+    ref_all = seed_index(ref_doc)
+    run_seeds = {}
+    for path in args.run:
+        run_seeds.update(seed_index(json.load(open(path))))
+    run_out_texts = [open(p).read() for p in args.run_out]
+    try:
+        monitor = read_monitor(run_out_texts)
+    except ValueError as e:
+        print("ERROR %s" % e, file=sys.stderr)
+        return 2
+    lo, hi = args.range if args.range else (0, 10000)
+    ref_seeds = {s: v for s, v in ref_all.items() if lo <= s < hi}
+    if set(run_seeds) != set(ref_seeds):
+        only_run = sorted(set(run_seeds) - set(ref_seeds))
+        only_ref = sorted(set(ref_seeds) - set(run_seeds))
+        print(
+            "ERROR range mismatch (%d..%d): run-only %d %s ref-only %d %s"
+            % (lo, hi, len(only_run), only_run[:20], len(only_ref), only_ref[:20]),
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        rows = compare_reading(ref_seeds, run_seeds, monitor, not args.no_twin_exemption)
+    except ValueError as e:
+        print("ERROR %s" % e, file=sys.stderr)
+        return 2
+    # The base twin-failing count (class size at the Base end).
+    rows["twin_failing_base"] = [
+        (s, i)
+        for s in sorted(ref_seeds)
+        for i, t in enumerate(ref_seeds[s].get("twin", []))
+        if not t.get("pass")
+    ]
+    rows["monitor"] = monitor
+    print(format_rows(rows, args.max_twin_failing))
+    return compare_exit_code(rows, args.max_twin_failing)
+
+
+# ---------------------------------------------------------------------------
+# Diag-line parsers (check-mp, check-twin).
+# ---------------------------------------------------------------------------
+
+#: One `MPE diag: === seed S round R class K … ===` block header.
+BLOCK_RE = re.compile(
+    r"=== seed (\d+) round (\d+) class (\w+) .*===\s*$"
+)
+#: The amcheck (i) findings line inside a block.
+FINDINGS_LINE_RE = re.compile(r"amcheck_i findings (.*?) image_slots \{.*?\} tainted (\{[^}]*\}) meta_k (\S+)")
+#: One Rust-debug `Finding { slot: …, what: "…" }` entry.
+FINDING_RE = re.compile(r"Finding \{ slot: (Some\((\d+)\)|None), what: \"(.*?)\" \}")
+#: One `MPE diag: media[i] KIND inode N off O len L (page slot S)` line;
+#: the kind is captured whole (`Lost`, `Torn { sectors: […] }`,
+#: `Misdirected { to_off: N }`), and `to_off` is picked out separately.
+MEDIA_RE = re.compile(r"media\[(\d+)\] (.*?) inode (\d+) off (\d+) len (\d+)")
+TO_OFF_RE = re.compile(r"to_off: (\d+)")
+
+
+def mpe_blocks(diag_text):
+    """Split MPE diag stderr into `{(seed, round, class): [lines]}`.
+
+    A block runs from its `=== seed s round i class K ===` header to the
+    next header; every amcheck/media line inside belongs to it.
+    """
+    blocks = {}
+    current = None
+    for line in diag_text.splitlines():
+        m = BLOCK_RE.search(line)
+        if m:
+            current = (int(m.group(1)), int(m.group(2)), m.group(3))
+            blocks.setdefault(current, [])
+            continue
+        if current is not None:
+            blocks[current].append(line)
+    return blocks
+
+
+def parse_findings(line):
+    """Parse the findings of one amcheck_i line into `(slot, what)` pairs.
+
+    `slot` is `None` or the int inside `Some(n)`; `what` is the raw
+    diagnostic text.
+    """
+    out = []
+    for m in FINDING_RE.finditer(line):
+        slot = int(m.group(2)) if m.group(2) is not None else None
+        out.append((slot, m.group(3)))
+    return out
+
+
+def parse_set(text):
+    """Parse a Rust `{:?}` BTreeSet (`{1, 2}` / `{}`) into a list of ints."""
+    inner = text.strip().lstrip("{").rstrip("}").strip()
+    return [int(x) for x in inner.split(",")] if inner else []
+
+
+def media_lines(block_lines):
+    """The block's media fault lines, as parsed tuples.
+
+    Each is `(kind, to_off_or_None, inode, off, len)`; `kind` is the raw
+    kind text (``Misdirected { to_off: N }`` for a misdirected fault).
+    """
+    out = []
+    for line in block_lines:
+        m = MEDIA_RE.search(line)
+        if m:
+            kind = m.group(2)
+            tm = TO_OFF_RE.search(kind)
+            to_off = int(tm.group(1)) if tm else None
+            out.append((kind, to_off, int(m.group(3)), int(m.group(4)), int(m.group(5))))
+    return out
+
+
+def meta_slot_fault_on_page_1_or_2(media):
+    """X5-R52 (c)(ii) (b)5′ media check, `FaultTargets::collect`'s rule.
+
+    At least one fault on page slot 1 or 2: `off` 4096 or 8192, or a
+    Misdirected `to_off` of 4096 or 8192 on inode 0 (the page file).
+    """
+    for _kind, to_off, inode, off, _len in media:
+        if inode == 0 and off in META_SLOT_OFFS:
+            return True
+        if inode == 0 and to_off in META_SLOT_OFFS:
+            return True
+    return False
+
+
+def t5_checks(run_seed, diag_seed, diag_out_text):
+    """X5-R52 (c)(i)/(ii) T5: digest equality and the run's MONITOR=0.
+
+    Returns ``None`` when both hold, else a reason string.
+    """
+    if run_seed is None:
+        return "T5 seed missing from run json"
+    if diag_seed is None:
+        return "T5 seed missing from diag json"
+    if run_seed.get("digest") != diag_seed.get("digest"):
+        return "T5 digest %s != %s" % (diag_seed.get("digest"), run_seed.get("digest"))
+    try:
+        monitor = read_monitor([diag_out_text])
+    except ValueError:
+        return "T5 no E4 SEEDS line"
+    if monitor != 0:
+        return "T5 monitor=%d" % monitor
+    return None
+
+
+def check_mp(run_seeds, seed, rnd, diag_err_text, diag_seeds, diag_out_text):
+    """X5-R51 (b)5 / X5-R52 (c)(ii) (b)5′ for one MOVED_MP_PENDING row.
+
+    Returns ``(verdict, detail)`` where verdict is ``"EXPLAINED (b)5"``,
+    ``"EXPLAINED (b)5'"`` or ``"NOT-EXPLAINED"``; (b)5′ is allowed only
+    when the JSON row is META_ONLY_ELIGIBLE.
+    """
+    run_seed = run_seeds.get(seed)
+    reason = t5_checks(run_seed, diag_seeds.get(seed), diag_out_text)
+    if reason:
+        return ("NOT-EXPLAINED", reason)
+    rounds = run_seed.get("rounds", [])
+    if rnd >= len(rounds):
+        return ("NOT-EXPLAINED", "no round %d in run json" % rnd)
+    row = rounds[rnd]
+    if row.get("pass") is not True:
+        return ("NOT-EXPLAINED", "pass is not true")
+    blocks = mpe_blocks(diag_err_text)
+    block = blocks.get((seed, rnd, "Mp"))
+    if block is None:
+        return ("NOT-EXPLAINED", "no `=== seed %d round %d class Mp ===` block" % (seed, rnd))
+    flines = [l for l in block if "amcheck_i findings" in l]
+    if not flines:
+        return ("NOT-EXPLAINED", "no amcheck_i findings line in the block")
+    m = FINDINGS_LINE_RE.search(flines[0])
+    if not m:
+        return ("NOT-EXPLAINED", "unparsable amcheck_i findings line")
+    findings = parse_findings(flines[0])
+    tainted = parse_set(m.group(2))
+    meta_k = m.group(3)
+    if meta_only_eligible(row):
+        # (b)5′: every finding None with `no valid meta`, empty tainted,
+        # meta_k None, and a meta-slot fault among the media lines.
+        if not findings:
+            return ("NOT-EXPLAINED", "(b)5' empty findings")
+        for slot, what in findings:
+            if slot is not None:
+                return ("NOT-EXPLAINED", "(b)5' finding slot Some(%d)" % slot)
+            if not what.startswith("no valid meta"):
+                return ("NOT-EXPLAINED", "(b)5' finding what %r" % what)
+        if tainted != []:
+            return ("NOT-EXPLAINED", "(b)5' tainted %s" % tainted)
+        if meta_k != "None":
+            return ("NOT-EXPLAINED", "(b)5' meta_k %s" % meta_k)
+        if not meta_slot_fault_on_page_1_or_2(media_lines(block)):
+            return ("NOT-EXPLAINED", "(b)5' no meta-slot fault on page slot 1 or 2")
+        return ("EXPLAINED (b)5'", "%d finding(s), media %s" % (len(findings), media_summary(block)))
+    # (b)5 exactly as X5-R51 wrote it.
+    if not findings:
+        return ("NOT-EXPLAINED", "(b)5 empty findings")
+    if not tainted:
+        return ("NOT-EXPLAINED", "(b)5 empty tainted")
+    for slot, _what in findings:
+        if slot is None:
+            return ("NOT-EXPLAINED", "(b)5 finding slot None")
+        if slot not in tainted:
+            return ("NOT-EXPLAINED", "(b)5 finding slot %d outside tainted %s" % (slot, tainted))
+    return (
+        "EXPLAINED (b)5",
+        "%d finding(s) slots %s tainted %s" % (len(findings), [s for s, _ in findings], tainted),
+    )
+
+
+def media_summary(block_lines):
+    """A short deterministic summary of the block's media fault lines."""
+    out = []
+    for kind, to_off, inode, off, _len in media_lines(block_lines):
+        if to_off is not None:
+            out.append("Misdirected to_off=%d inode=%d off=%d" % (to_off, inode, off))
+        else:
+            out.append("%s inode=%d off=%d" % (kind, inode, off))
+    return "[%s]" % ", ".join(out)
+
+
+#: The recovery-Err diag line (the GATEDIAG patch, applied to a scratch
+#: export only): `GATEDIAG recovery Err seed=S round=R class=K … e=ERR`.
+RECOVERY_ERR_RE = re.compile(
+    r"GATEDIAG recovery Err seed=(\d+) round=(\d+) class=(\w+) nested=(\d+) e=(.*)"
+)
+#: The X5R52 round-start line (same patch).
+ROUND_START_RE = re.compile(
+    r"X5R52 round-start seed=(\d+) round=(\d+) real_dir=\[([0-9, ]*)\] twin_dir=\[([0-9, ]*)\]"
+)
+#: The X5R52 run marker (same patch).
+RUN_MARKER_RE = re.compile(r"X5R52 run seed=(\d+) round=(\d+) class=(\w+)")
+#: One replay-listing record line: `GATEDIAG   rec lsn=L kind=K ts=T
+#: txn=(…) ddl=[…] trees={…}`.
+REC_LINE_RE = re.compile(r"GATEDIAG   rec lsn=(\d+) kind=(\d+) ts=(\d+) txn=\([^)]*\) ddl=(\[.*?\])")
+#: One `GATEDIAG replay start meta.t=…` line (same patch); X5-R53 (c)
+#: T6a reads the failing recovery's `meta.t` from it.
+REPLAY_START_RE = re.compile(r"GATEDIAG replay start meta\.t=(\d+)")
+
+
+def parse_dir_list(text):
+    """Parse the round-start lines' `[1, 2, 3]` directory key lists."""
+    inner = text.strip()
+    return [int(x) for x in inner.split(",")] if inner else []
+
+
+def walk_seed_segments(diag_text, seed):
+    """Yield `(line, seg_id, seg)` for every diag line, per X5-R53 (b).
+
+    A line belongs to the most recent `X5R52 run seed=<s> round=<r>
+    class=<K>` marker for `seed`; a marker for another seed ends that
+    segment, and lines before the first such marker belong to no segment
+    (`seg_id` None). `seg` is the tuple `(klass, round, is_twin,
+    meta_t)`: the marker's class and round; `is_twin` — the marker is
+    class C and follows this seed's `X5R52 round-start` line for that
+    round (the twin chain: its first run, its NEVER-FIRED re-runs and
+    the X5-R21 (c) pairing re-runs; a class-C marker **before** that
+    line is the uniform probe on the real chain, never a twin segment);
+    and `meta_t`, the `meta.t` of the most recent `GATEDIAG replay
+    start` line **above** this one in the same segment, or None. Each
+    marker for `seed` gets a fresh `seg_id` (stable across that
+    segment's `meta_t` updates) so callers can compare segments.
+
+    One walk feeds T1, T3 and T6 (card
+    X-5c-F4-F1-F1-F3-F2-F1-F1-F1 Work 1 — one helper, not three scans).
+    """
+    started = set()
+    next_id = 0
+    seg_id = None
+    seg = None
+    for line in diag_text.splitlines():
+        m = RUN_MARKER_RE.search(line)
+        if m:
+            if int(m.group(1)) != seed:
+                # A marker for another seed ends this seed's segment.
+                seg_id = None
+                seg = None
+                continue
+            next_id += 1
+            seg_id = next_id
+            seg = (
+                m.group(3),
+                int(m.group(2)),
+                m.group(3) == "C" and int(m.group(2)) in started,
+                None,
+            )
+            yield line, seg_id, seg
+            continue
+        rs = ROUND_START_RE.search(line)
+        if rs and int(rs.group(1)) == seed:
+            started.add(int(rs.group(2)))
+        yield line, seg_id, seg
+        ps = REPLAY_START_RE.search(line)
+        if ps and seg_id is not None:
+            seg = (seg[0], seg[1], seg[2], int(ps.group(1)))
+
+
+def check_twin(run_seeds, seed, twin_round, diag_err_text, diag_seeds, diag_out_text):
+    """X5-R52 (c)(i) T1–T5 as amended by X5-R53 (b)/(c), for one
+    TWIN_DDL_PENDING row.
+
+    Returns ``(verdict, detail)``; verdict is ``"EXPLAINED"`` (detail
+    ``N=<n> k=<k> …``) or ``"NOT-EXPLAINED"`` (detail names the failed
+    check). The order is T5, T1, T2, T3, T4, T6; T6 failures read
+    ``NOT-EXPLAINED T6a/T6b <reason>``.
+    """
+    run_seed = run_seeds.get(seed)
+    reason = t5_checks(run_seed, diag_seeds.get(seed), diag_out_text)
+    if reason:
+        return ("NOT-EXPLAINED", reason)
+    # One walk for T1, T3 and T6 (X5-R53 (b): segments, and which are
+    # the twin's own runs).
+    walk = list(walk_seed_segments(diag_err_text, seed))
+    # T1 (X5-R53 (b)): at least one class-C recovery Err line for this
+    # round inside a twin segment of this round, and every class-C Err
+    # line for this round — in any segment — the same text, exactly
+    # `Corrupt("tree N missing in directory")`.
+    err_lines = []
+    for line, _seg_id, seg in walk:
+        m = RECOVERY_ERR_RE.search(line)
+        if not m:
+            continue
+        if int(m.group(1)) != seed or int(m.group(2)) != twin_round or m.group(3) != "C":
+            continue
+        in_twin = seg is not None and seg[2] and seg[1] == twin_round
+        err_lines.append((m.group(5), in_twin, seg[3] if seg is not None else None))
+    if not any(in_twin for _t, in_twin, _mt in err_lines):
+        return (
+            "NOT-EXPLAINED",
+            "T1 no class-C recovery Err for round %d inside a twin segment (saw %s)"
+            % (twin_round, [t for t, _i, _m in err_lines][:3] or "nothing"),
+        )
+    texts = sorted({t for t, _i, _m in err_lines})
+    if len(texts) != 1:
+        return (
+            "NOT-EXPLAINED",
+            "T1 class-C Err texts for round %d differ: %s" % (twin_round, texts),
+        )
+    cm = re.fullmatch(r'Corrupt\("tree (\d+) missing in directory"\)', texts[0])
+    if not cm:
+        return (
+            "NOT-EXPLAINED",
+            "T1 class-C Err text for round %d is %s" % (twin_round, texts[0]),
+        )
+    n = int(cm.group(1))
+
+    def twin_drop_records(round_pred):
+        """`(ts, seg_round)` of kind=1 records with `D<n>` in `ddl`,
+        from the twin segments (this seed's) whose round satisfies
+        `round_pred`."""
+        out = []
+        for line, _seg_id, seg in walk:
+            if seg is None or not seg[2] or not round_pred(seg[1]):
+                continue
+            rm = REC_LINE_RE.search(line)
+            if rm and int(rm.group(2)) == 1 and ('"D%d"' % n) in rm.group(4):
+                out.append((int(rm.group(3)), seg[1]))
+        return out
+
+    # T2: the round-start line for this round has N in real_dir and N
+    # absent from twin_dir.
+    starts = []
+    for line in diag_err_text.splitlines():
+        m = ROUND_START_RE.search(line)
+        if m and int(m.group(1)) == seed:
+            starts.append((int(m.group(2)), parse_dir_list(m.group(3)), parse_dir_list(m.group(4))))
+    line_i = [x for x in starts if x[0] == twin_round]
+    if not line_i:
+        return ("NOT-EXPLAINED", "T2 no round-start line for round %d" % twin_round)
+    real_dir, twin_dir = line_i[0][1], line_i[0][2]
+    if n not in real_dir or n in twin_dir:
+        return (
+            "NOT-EXPLAINED",
+            "T2 round %d real_dir=%s twin_dir=%s (N=%d)" % (twin_round, real_dir, twin_dir, n),
+        )
+    # T3 (X5-R53 (b)): the twin chain dropped N itself — a replay
+    # listing of a twin segment of this seed, at a round ≤ i, shows a
+    # commit record with `ddl` containing `D<N>`.
+    if not twin_drop_records(lambda r: r is not None and r <= twin_round):
+        return (
+            "NOT-EXPLAINED",
+            "T3 no class-C commit record with D%d in a twin segment at a round <= %d" % (n, twin_round),
+        )
+    # T4: k is the first round start at which N is in real_dir and not in
+    # twin_dir; k ≥ 1, and real round k−1 has a recorded media fault and
+    # a recovery that stopped short.
+    div = [r for r, rd, td in starts if n in rd and n not in td]
+    if not div:
+        return ("NOT-EXPLAINED", "T4 no divergent round start")
+    k = min(div)
+    if k < 1:
+        return ("NOT-EXPLAINED", "T4 k=%d" % k)
+    rounds = run_seed.get("rounds", [])
+    if k - 1 >= len(rounds):
+        return ("NOT-EXPLAINED", "T4 no real round %d in run json" % (k - 1))
+    prev = rounds[k - 1]
+    if media_fault_count(prev) < 1:
+        return ("NOT-EXPLAINED", "T4 real round %d has no media fault" % (k - 1))
+    if not (prev.get("cover_err") or prev.get("frontier", 0) < prev.get("hi", 0)):
+        return (
+            "NOT-EXPLAINED",
+            "T4 real round %d cover_err=%s frontier=%d hi=%d"
+            % (k - 1, prev.get("cover_err"), prev.get("frontier"), prev.get("hi")),
+        )
+    # T6a (X5-R53 (c)), the twin side: the drop is in the twin segments
+    # of round k−1, at a ts at or below the failing recovery's meta.t.
+    t6a_ts = [ts for ts, _r in twin_drop_records(lambda r: r == k - 1)]
+    if not t6a_ts:
+        return (
+            "NOT-EXPLAINED",
+            "T6a no D%d commit record in the twin segments of round %d" % (n, k - 1),
+        )
+    t6a_t = []
+    for _t, in_twin, meta_t in err_lines:
+        if not in_twin:
+            continue
+        if meta_t is None:
+            return (
+                "NOT-EXPLAINED",
+                "T6a twin-segment Err of round %d has no replay-start meta.t above it" % twin_round,
+            )
+        t6a_t.append(meta_t)
+    if any(ts > t for ts in t6a_ts for t in t6a_t):
+        return (
+            "NOT-EXPLAINED",
+            "T6a drop ts %s above the failing recovery's meta.t %s"
+            % (sorted(set(t6a_ts)), sorted(set(t6a_t))),
+        )
+    # T6b (X5-R53 (c)), the real side, on the real chain's own clock:
+    # cover_err or x33x; or a real-class replay listing of round k−1
+    # with no D<N> commit at a ts at or below that round's frontier.
+    t6b_nrec = 0
+    if prev.get("cover_err") or prev.get("x33x"):
+        t6b = "cover_err/x33x"
+    else:
+        last_id = None
+        listing = []
+        for line, seg_id, seg in walk:
+            ps = REPLAY_START_RE.search(line)
+            if ps and seg is not None and seg[0] in ("Mw", "Mp") and seg[1] == k - 1:
+                last_id = seg_id
+                listing = []
+                continue
+            rm = REC_LINE_RE.search(line)
+            if rm and seg_id is not None and seg_id == last_id:
+                listing.append(rm)
+        if last_id is None:
+            return (
+                "NOT-EXPLAINED",
+                "T6b no real-class replay listing for round %d and no cover_err/x33x" % (k - 1),
+            )
+        replayed = [
+            int(rm.group(3))
+            for rm in listing
+            if int(rm.group(2)) == 1 and ('"D%d"' % n) in rm.group(4) and int(rm.group(3)) <= prev.get("frontier", 0)
+        ]
+        if replayed:
+            return (
+                "NOT-EXPLAINED",
+                "T6b real round %d replayed D%d at ts %s <= frontier %d"
+                % (k - 1, n, replayed, prev.get("frontier")),
+            )
+        t6b_nrec = len(listing)
+        t6b = "no D%d at or below frontier" % n
+    return (
+        "EXPLAINED",
+        "N=%d k=%d (real round %d: lost=%d mis=%d torn=%d cover_err=%s frontier=%d hi=%d; T6a ts=%s meta.t=%s; T6b %s, real_nrec=%d)"
+        % (
+            n,
+            k,
+            k - 1,
+            prev.get("lost", 0),
+            prev.get("mis", 0),
+            prev.get("torn", 0),
+            prev.get("cover_err"),
+            prev.get("frontier"),
+            prev.get("hi"),
+            sorted(set(t6a_ts)),
+            sorted(set(t6a_t)),
+            t6b,
+            t6b_nrec,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand entry points.
+# ---------------------------------------------------------------------------
+
+
+def cmd_check_mp(args):
+    """The check-mp subcommand."""
+    run_seeds = seed_index(json.load(open(args.json)))
+    diag_seeds = seed_index(json.load(open(args.diag_json)))
+    diag_err_text = open(args.diag_err).read()
+    diag_out_text = open(args.diag_out).read()
+    verdict, detail = check_mp(run_seeds, args.seed, args.round, diag_err_text, diag_seeds, diag_out_text)
+    print("%s %s" % (verdict, detail))
+    return 0 if verdict.startswith("EXPLAINED") else 1
+
+
+def cmd_check_twin(args):
+    """The check-twin subcommand."""
+    run_seeds = seed_index(json.load(open(args.json)))
+    diag_seeds = seed_index(json.load(open(args.diag_json)))
+    diag_err_text = open(args.diag_err).read()
+    diag_out_text = open(args.diag_out).read()
+    verdict, detail = check_twin(run_seeds, args.seed, args.twin_round, diag_err_text, diag_seeds, diag_out_text)
+    print("%s %s" % (verdict, detail))
+    return 0 if verdict.startswith("EXPLAINED") else 1
+
+
+# ---------------------------------------------------------------------------
+# self-test: embedded synthetic records and diag lines, through the same
+# engines. One PASS/FAIL line per case; non-zero exit on any FAIL.
+# ---------------------------------------------------------------------------
+
+
+def round_rec(**kw):
+    """A minimal round record with test-friendly defaults (pass=true)."""
+    base = {
+        "crash": "uniform@y:1",
+        "lost": 0,
+        "mis": 0,
+        "torn": 0,
+        "lo": 1,
+        "hi": 1,
+        "c": 1,
+        "frontier": 1,
+        "o1": None,
+        "o2": None,
+        "o3": None,
+        "served": False,
+        "mrb": False,
+        "skx": False,
+        "smx": False,
+        "pass_na": None,
+        "cover_err": False,
+        "x33x": False,
+        "pass": True,
+        "q": [0] * 21,
+    }
+    base.update(kw)
+    return base
+
+
+def seed_rec(seed, klass, rounds, twin=None):
+    """A minimal seed record."""
+    return {
+        "seed": seed,
+        "class": klass,
+        "knobs": 0,
+        "digest": 1000 + seed,
+        "deadlock": False,
+        "panic": False,
+        "baton": False,
+        "stopped": False,
+        "defect": None,
+        "rounds": rounds,
+        "twin": twin if twin is not None else [],
+    }
+
+
+def self_test():
+    """Run every still-caught bullet of X5-R52 (c) and X5-R53 (b)–(e)
+    through the engines."""
+    failures = []
+    cases = [0]
+
+    def check(name, ok, why=""):
+        cases[0] += 1
+        print("%s %s%s" % ("PASS" if ok else "FAIL", name, "" if ok else " " + why))
+        if not ok:
+            failures.append(name)
+
+    def rows_of(ref_seeds, run_seeds, monitor=0, twin_exemption=True):
+        return compare_reading(ref_seeds, run_seeds, monitor, twin_exemption)
+
+    o1a = "O-1(a) at c=5: published {} != model {2, 3}"
+
+    # --- X5-R51 bullet-2 MW gains, with and without the JSON half of (b)5.
+    ref = {1: seed_rec(1, "MW", [round_rec()])}
+    run = {1: seed_rec(1, "MW", [round_rec(o1=o1a, x33x=True, cover_err=True, crash="uniform@y:2")], twin=[{"pass": True, "o1": None}])}
+    r = rows_of(ref, run)
+    check("mw-gain-explained", r["moved_gained"] == [(1, 0)] and r["new_failing"] == [], str(r))
+
+    run = {1: seed_rec(1, "MW", [round_rec(o1=o1a, x33x=False, cover_err=False)], twin=[{"pass": True, "o1": None}])}
+    r = rows_of(ref, run)
+    check("mw-gain-unexplained", r["moved_gained"] == [] and r["new_failing"] == [(1, "round", 0, "bullet2-mw-json5")], str(r))
+
+    # --- MONITOR > 0 exempts nothing: the gain is a new failure.
+    run = {1: seed_rec(1, "MW", [round_rec(o1=o1a, x33x=True, cover_err=True)], twin=[{"pass": True, "o1": None}])}
+    r = rows_of(ref, run, monitor=2)
+    check("monitor-nonzero-gain-is-new", r["moved_gained"] == [] and (1, "round", 0, "bullet2-checks") in r["new_failing"], str(r))
+
+    # --- X5-R52 (c)(iii): MP-A pass→fail, and every still-caught bullet.
+    mpa_base = round_rec(o1=o1a, mrb=True, c=None, frontier=0)
+    mpa_base["q"][15] = 1
+    mpa_tip = round_rec(
+        o1="O-1(a) at c=15: published {} != model {2, 3, 4}",
+        o3=MPA_O3,
+        pass_na=True,
+        smx=True,
+        served=True,
+        mrb=True,
+        c=None,
+        frontier=0,
+    )
+    mpa_tip["pass"] = False
+    mpa_tip["q"][15] = 1
+    # X5-R53 (d): without the second seed the class reads Base 0, tip 1
+    # and the cap voids the row, so the Base file gains a second MP
+    # seed holding an MP-A round (served and mrb) that heals at the tip.
+    mpa_heal_base = round_rec(o1=o1a, o3=MPA_O3, mrb=True, c=None, frontier=0, served=True, skx=True, pass_na=True)
+    mpa_heal_base["q"][15] = 1
+    ref = {1: seed_rec(1, "MP", [mpa_base]), 2: seed_rec(2, "MP", [mpa_heal_base])}
+    run = {1: seed_rec(1, "MP", [mpa_tip]), 2: seed_rec(2, "MP", [round_rec()])}
+    r = rows_of(ref, run)
+    check("mpa-pass-fail", r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [], str(r))
+
+    for name, mutate in (
+        ("mpa-skx-smx-false", lambda t: t.update(skx=False, smx=False)),
+        ("mpa-pass-na-false", lambda t: t.update(pass_na=False)),
+        ("mpa-o2-text", lambda t: t.update(o2="O-2: store diverged")),
+        ("mpa-o3-other", lambda t: t.update(o3="O-3(b): uncovered accept")),
+    ):
+        tip = json.loads(json.dumps(mpa_tip))
+        mutate(tip)
+        run = {1: seed_rec(1, "MP", [tip])}
+        r = rows_of(ref, run)
+        check(name, r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1") in r["new_failing"], str(r))
+
+    for name, mutate in (
+        ("mpa-base-text-free", lambda b: b.update(o1=None)),
+        ("mpa-base-mrb-false", lambda b: b.update(mrb=False)),
+        ("mpa-base-c-nonnull", lambda b: b.update(c=5)),
+    ):
+        base = json.loads(json.dumps(mpa_base))
+        mutate(base)
+        ref2 = {1: seed_rec(1, "MP", [base])}
+        run = {1: seed_rec(1, "MP", [json.loads(json.dumps(mpa_tip))])}
+        r = rows_of(ref2, run)
+        check(name, r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1") in r["new_failing"], str(r))
+
+    # A class MW serve never moves (X5-R30 (c) rule 3).
+    ref2 = {1: seed_rec(1, "MW", [json.loads(json.dumps(mpa_base))])}
+    run = {1: seed_rec(1, "MW", [json.loads(json.dumps(mpa_tip))])}
+    r = rows_of(ref2, run)
+    check("mpa-mw-serve", r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1") in r["new_failing"], str(r))
+
+    # --- X5-R53 (d): the MP-A class cap on (iii).
+    mpa_ref = {1: seed_rec(1, "MP", [mpa_base]), 2: seed_rec(2, "MP", [mpa_heal_base])}
+    mpa_run = {1: seed_rec(1, "MP", [mpa_tip]), 2: seed_rec(2, "MP", [round_rec()])}
+    r = rows_of(mpa_ref, mpa_run)
+    check(
+        "mpa-cap-equal-keeps",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # Base 2, tip 1: a second MP-A round heals at the tip.
+    fewer_ref = dict(mpa_ref)
+    fewer_ref[3] = seed_rec(3, "MP", [json.loads(json.dumps(mpa_heal_base))])
+    fewer_run = dict(mpa_run)
+    fewer_run[3] = seed_rec(3, "MP", [round_rec()])
+    r = rows_of(fewer_ref, fewer_run)
+    check(
+        "mpa-cap-fewer-keeps",
+        r["mpa_class"] == (2, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # Base 0, tip 1: the cap voids (iii); the row is a bullet-1 failure.
+    r = rows_of({1: seed_rec(1, "MP", [mpa_base])}, {1: seed_rec(1, "MP", [mpa_tip])})
+    check(
+        "mpa-cap-grown-voids",
+        r["mpa_class"] == (0, 1) and r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1-mpa-cap") in r["new_failing"],
+        str(r),
+    )
+
+    # An MW seed's served+mrb round does not count toward the class:
+    # the class reads 1 -> 1 and the row stays exempt.
+    any_ref = dict(mpa_ref)
+    any_ref[3] = seed_rec(3, "MW", [round_rec()])
+    any_run = dict(mpa_run)
+    any_run[3] = seed_rec(3, "MW", [round_rec(served=True, mrb=True)])
+    r = rows_of(any_ref, any_run)
+    check(
+        "mpa-cap-counts-class-mp-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # The cap's three unpinned filters (verdict §2: served-only,
+    # mrb-only and Base MW rounds do not count): the class count needs
+    # class MP and served=true AND mrb=true, at both ends.
+    mrb_ref = dict(mpa_ref)
+    mrb_ref[3] = seed_rec(3, "MP", [round_rec(served=True, mrb=False)])
+    mrb_run = dict(mpa_run)
+    mrb_run[3] = seed_rec(3, "MP", [round_rec(served=True, mrb=False)])
+    r = rows_of(mrb_ref, mrb_run)
+    check(
+        "mpa-cap-counts-mrb-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    served_ref = dict(mpa_ref)
+    served_ref[3] = seed_rec(3, "MP", [round_rec(served=False, mrb=True)])
+    served_run = dict(mpa_run)
+    served_run[3] = seed_rec(3, "MP", [round_rec(served=False, mrb=True)])
+    r = rows_of(served_ref, served_run)
+    check(
+        "mpa-cap-counts-served-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    basemw_ref = dict(mpa_ref)
+    basemw_ref[3] = seed_rec(3, "MW", [round_rec(served=True, mrb=True)])
+    basemw_run = dict(mpa_run)
+    basemw_run[3] = seed_rec(3, "MW", [round_rec()])
+    r = rows_of(basemw_ref, basemw_run)
+    check(
+        "mpa-cap-base-mp-only",
+        r["mpa_class"] == (1, 1) and r["mpa_pass_fail"] == [(1, 0)] and r["new_failing"] == [],
+        str(r),
+    )
+
+    # format_rows prints MPA_CLASS directly after MPA_PASS_FAIL.
+    out = format_rows(rows_of(mpa_ref, mpa_run)).splitlines()
+    check(
+        "mpa-class-line",
+        "MPA_CLASS base 1 tip 1" in out
+        and out.index("MPA_CLASS base 1 tip 1") == out.index("MPA_PASS_FAIL 1 [(1, 0)]") + 1,
+        str(out),
+    )
+
+    # --- X5-R52 (b): a pass→fail with a Base text that is not MP-A
+    # (the gap of the original comparator: bullet 1 for rounds that
+    # already carried a text).
+    base = round_rec(o1=o1a, mrb=False, c=None, frontier=0)
+    tip = round_rec(o1="O-1(a) at c=9: published {} != model {2}", c=None, frontier=0)
+    tip["pass"] = False
+    ref = {1: seed_rec(1, "MP", [base])}
+    run = {1: seed_rec(1, "MP", [tip])}
+    r = rows_of(ref, run)
+    check("pass-fail-base-text-not-mpa", r["mpa_pass_fail"] == [] and (1, "round", 0, "bullet1") in r["new_failing"], str(r))
+
+    # --- X5-R52 (c)(i) prefilter and its still-caught bullets.
+    def twin_case(klass, real_rounds, twin, base_twin=None):
+        ref = {7: seed_rec(7, klass, [round_rec() for _ in real_rounds], twin=base_twin or [{"pass": True, "o1": None} for _ in real_rounds])}
+        run = {7: seed_rec(7, klass, real_rounds, twin=twin)}
+        return ref, run
+
+    faulted = round_rec(lost=1, mis=0, torn=1, frontier=1, hi=5, cover_err=False)
+    twins_ok = [{"pass": True, "o1": None}, {"pass": False, "o1": "O-1(a) at c=12: published {} != model {2}"}]
+    ref, run = twin_case("MW", [faulted, round_rec()], twins_ok)
+    r = rows_of(ref, run)
+    check("twin-pending", r["twin_ddl_pending"] == [(7, 1)] and r["new_failing"] == [], str(r))
+    r = rows_of(ref, run, twin_exemption=False)
+    check("no-twin-exemption-pending-is-new", r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"], str(r))
+
+    ref, run = twin_case("MP", [faulted, round_rec()], twins_ok)
+    r = rows_of(ref, run)
+    check("twin-mp-seed-prefilter-fails", r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"], str(r))
+
+    ref, run = twin_case("MW", [faulted, round_rec()], [{"pass": True, "o1": None}, {"pass": False, "o1": "O-2: store diverged"}])
+    r = rows_of(ref, run)
+    check("twin-o2-text-prefilter-fails", r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"], str(r))
+
+    ref, run = twin_case("MW", [faulted, round_rec()], [{"pass": True, "o1": None}, {"pass": False, "o1": "O-1(a) at c=3: checksum mismatch on slot 9"}])
+    r = rows_of(ref, run)
+    check("twin-o1-not-recovery-prefilter-fails", r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"], str(r))
+
+    clean = round_rec(lost=0, mis=0, torn=0, frontier=5, hi=5)
+    ref, run = twin_case("MW", [clean, round_rec()], twins_ok)
+    r = rows_of(ref, run)
+    check("twin-no-media-fault-prefilter-fails", r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"], str(r))
+
+    # --- A tip seed with deadlock is a BAD_SEED (bullet 3).
+    ref = {1: seed_rec(1, "C", [round_rec()])}
+    bad = seed_rec(1, "C", [round_rec()])
+    bad["deadlock"] = True
+    run = {1: bad}
+    r = rows_of(ref, run)
+    check("deadlock-tip-seed", r["bad_seeds"] == [1] and (1, "seed", None, "bullet3") in r["new_failing"], str(r))
+
+    # --- X5-R53 (e): MONITOR > 0 stops the comparison by itself.
+    same = {1: seed_rec(1, "C", [round_rec()])}
+    r = rows_of(same, {1: seed_rec(1, "C", [round_rec()])}, monitor=1)
+    check(
+        "monitor-run-stops",
+        r["new_failing"] == [(-1, "run", None, "bullet3-monitor")] and compare_exit_code(r) == 1,
+        str(r),
+    )
+
+    # A deadlock seed at both ends: no new failure, but the exit is 1.
+    bad_base = seed_rec(1, "C", [round_rec()])
+    bad_base["deadlock"] = True
+    bad_tip = seed_rec(1, "C", [round_rec()])
+    bad_tip["deadlock"] = True
+    r = rows_of({1: bad_base}, {1: bad_tip})
+    check(
+        "exit-bad-seeds-only",
+        r["new_failing"] == [] and r["bad_seeds"] == [1] and compare_exit_code(r) == 1,
+        str(r),
+    )
+
+    # --- The twin prefilter reads real rounds j < i only: the only
+    # media-faulted short real round at j = i is not a prefilter hit.
+    faulted_i = round_rec(lost=1, mis=0, torn=1, frontier=1, hi=5, cover_err=False)
+    ref, run = twin_case("MW", [round_rec(), faulted_i], twins_ok)
+    r = rows_of(ref, run)
+    check(
+        "twin-prefilter-fault-at-i-only",
+        r["twin_ddl_pending"] == [] and (7, "twin", 1, "bullet1-twin") in r["new_failing"],
+        str(r),
+    )
+
+    # --- check-mp: (b)5, and (b)5′ with its still-caught bullets.
+    def mp_case(row_mutate=None, findings="Finding { slot: Some(9), what: \"§3.3 fail on mapped page\" }", tainted="{9}", meta_k="Some(1)", media="MPE diag: media[0] Lost inode 0 off 589824 len 4096 (page slot 144)"):
+        row = round_rec(o1=o1a)
+        if row_mutate:
+            row_mutate(row)
+        run_seed = seed_rec(3, "MP", [row])
+        diag_seed = seed_rec(3, "MP", [dict(row)])
+        block = [
+            "MPE diag: === seed 3 round 0 class Mp crash Some(Hook { ckpt_index: 1, hook: After1 }) ===",
+            media,
+            "MPE diag: amcheck_i findings [%s] image_slots {1, 9} tainted %s meta_k %s" % (findings, tainted, meta_k),
+        ]
+        diag = "\n".join(block) + "\nMPE diag: === seed 3 round 1 class C crash None ===\n"
+        out_text = "E4 SEEDS=1 O1_FAIL=1 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=1 MONITOR=0\n"
+        return run_seed, diag_seed, diag, out_text
+
+    def q15(row):
+        row["q"][15] = 1
+        row["c"] = None
+        row["frontier"] = 0
+
+    run_seed, diag_seed, diag, out_text = mp_case()
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("mp-b5-explained", v == "EXPLAINED (b)5", "%s %s" % (v, d))
+
+    run_seed, diag_seed, diag, out_text = mp_case(row_mutate=q15, findings="Finding { slot: None, what: \"no valid meta (G7: a misplaced valid meta outranks every placed one)\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Misdirected { to_off: 4096 } inode 0 off 8192 len 4096 (page slot 2)")
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("meta-only-eligible", v == "EXPLAINED (b)5'", "%s %s" % (v, d))
+
+    # q[15]=0 with the same diag: not eligible, (b)5 applies and fails.
+    run_seed, diag_seed, diag, out_text = mp_case(row_mutate=lambda r: r.update(c=None, frontier=0), findings="Finding { slot: None, what: \"no valid meta\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Lost inode 0 off 4096 len 4096 (page slot 1)")
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("meta-only-q15-zero", v == "NOT-EXPLAINED" and d.startswith("(b)5"), "%s %s" % (v, d))
+
+    # A referenced-slot fault (q[12] non-zero) makes it ineligible too.
+    def q12_15(row):
+        row["q"][12] = 1
+        row["q"][15] = 1
+        row["c"] = None
+        row["frontier"] = 0
+
+    run_seed, diag_seed, diag, out_text = mp_case(row_mutate=q12_15, findings="Finding { slot: None, what: \"no valid meta\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Lost inode 0 off 4096 len 4096 (page slot 1)")
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("meta-only-referenced-slot", v == "NOT-EXPLAINED" and d.startswith("(b)5"), "%s %s" % (v, d))
+
+    # mrb=true / served=true are not eligible either.
+    for name, mut in (
+        ("meta-only-mrb-true", lambda r: r.update(mrb=True)),
+        ("meta-only-served-true", lambda r: r.update(served=True)),
+    ):
+        def m(row, mut=mut):
+            q15(row)
+            mut(row)
+        run_seed, diag_seed, diag, out_text = mp_case(row_mutate=m, findings="Finding { slot: None, what: \"no valid meta\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Lost inode 0 off 4096 len 4096 (page slot 1)")
+        v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+        check(name, v == "NOT-EXPLAINED" and d.startswith("(b)5"), "%s %s" % (v, d))
+
+    # Eligible but the diag disagrees: a Some(n) finding, or a None
+    # finding whose text is not "no valid meta".
+    run_seed, diag_seed, diag, out_text = mp_case(row_mutate=q15, findings="Finding { slot: Some(9), what: \"§3.3 fail on mapped page\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Lost inode 0 off 4096 len 4096 (page slot 1)")
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("meta-only-some-finding", v == "NOT-EXPLAINED" and "slot Some(9)" in d, "%s %s" % (v, d))
+
+    run_seed, diag_seed, diag, out_text = mp_case(row_mutate=q15, findings="Finding { slot: None, what: \"checksum mismatch on meta\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Lost inode 0 off 4096 len 4096 (page slot 1)")
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("meta-only-other-none-text", v == "NOT-EXPLAINED" and "what" in d, "%s %s" % (v, d))
+
+    # Eligible but no media fault on page slot 1 or 2.
+    run_seed, diag_seed, diag, out_text = mp_case(row_mutate=q15, findings="Finding { slot: None, what: \"no valid meta\" }", tainted="{}", meta_k="None", media="MPE diag: media[0] Lost inode 0 off 589824 len 4096 (page slot 144)")
+    v, d = check_mp({3: run_seed}, 3, 0, diag, {3: diag_seed}, out_text)
+    check("meta-only-no-meta-slot-fault", v == "NOT-EXPLAINED" and "no meta-slot fault" in d, "%s %s" % (v, d))
+
+    # pass=false is bullet 1 at compare level, never (ii).
+    row = round_rec(o1=o1a)
+    q15(row)
+    row["pass"] = False
+    run = {3: seed_rec(3, "MP", [row])}
+    ref = {3: seed_rec(3, "MP", [round_rec()])}
+    r = rows_of(ref, run)
+    check("meta-only-pass-false-is-bullet1", (3, "round", 0, "bullet1") in r["new_failing"] and r["meta_only_eligible"] == [], str(r))
+
+    # --- check-twin: T1–T6 and the still-caught bullets.
+    D4 = 'GATEDIAG   rec lsn=4183 kind=1 ts=3 txn=(0, 3) ddl=["D4"] trees={1, 4}'
+    C1234 = 'GATEDIAG   rec lsn=0 kind=1 ts=1 txn=(0, 1) ddl=["C1", "C2", "C3", "C4"] trees={1, 2, 3, 4}'
+    D4_TS1 = 'GATEDIAG   rec lsn=100 kind=1 ts=1 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    D4_TS2 = 'GATEDIAG   rec lsn=100 kind=1 ts=2 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    D4_TS5 = 'GATEDIAG   rec lsn=100 kind=1 ts=5 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    D4_TS7 = 'GATEDIAG   rec lsn=100 kind=1 ts=7 txn=(0, 2) ddl=["D4"] trees={1, 4}'
+    C1 = 'GATEDIAG   rec lsn=10 kind=1 ts=2 txn=(0, 2) ddl=["C1"] trees={1}'
+    TREE4 = 'Corrupt("tree 4 missing in directory")'
+    WALLOSS = "WalLoss { valid_end: 1, wal_ckpt_end: 2, t: 3, ts_ckpt_hi: 4 }"
+    #: A round-1 recovery Err line, as `twin_diag` emits it (for cases
+    #: that place it in another round's segment).
+    ERR1 = "GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % TREE4
+
+    def fmt_dir(keys):
+        return "[%s]" % ", ".join(str(k) for k in keys)
+
+    def twin_diag(
+        err=TREE4,
+        starts=None,
+        listings=None,
+        digest=1004,
+        probe_err=None,
+        rerun_err=None,
+        probe0_recs=(),
+        twin0_recs=None,
+        real0_recs=None,
+        real0_start=True,
+        twin0_meta_t=0,
+        twin1_meta_t=5,
+        twin1_meta_t2=None,
+        twin1_recs=(),
+        foreign_seed=None,
+        real0_extra=(),
+        tail_lines=(),
+    ):
+        """A diag log in the harness's real order (card
+        X-5c-F4-F1-F1-F3-F2-F1-F1-F1 Work 1), per round: the probe
+        marker (class C, before the round-start line), the round-start
+        line, the twin marker (class C, after it), the twin's lines, the
+        real marker (class Mw) and the real run's listing. `err` is the
+        twin segment's recovery `Err` for round 1 (None: none);
+        `probe_err` adds one to round 1's probe segment and `rerun_err`
+        to a class-C pairing re-run after the real marker; `listings`
+        overrides round 0's twin-segment records (default the D4 drop
+        at ts=3), `twin0_recs`/`real0_recs`/`probe0_recs` override the
+        segments individually; `real0_start=False` gives round 0's real
+        run no replay listing at all.
+
+        The knobs card X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 adds (defaults
+        keep the original log byte for byte): `twin0_meta_t` sets round
+        0's twin replay-start `meta.t` (0 as before); `twin1_meta_t2`
+        adds an older second replay start to round 1's twin segment, so
+        `twin1_meta_t` stays the most recent above the `Err`;
+        `twin1_recs` are records inside round 1's own twin segment;
+        `foreign_seed` puts a run marker for another seed between round
+        1's twin replay start and its `Err`; `real0_extra` appends extra
+        lines (a second real segment of round 0) after round 0's real
+        run; `tail_lines` are appended after round 1's blocks (a later
+        round's segments).
+        """
+        starts = starts if starts is not None else [(0, [1, 2, 3, 4], [1, 2, 3, 4]), (1, [1, 2, 3, 4], [1, 2, 3])]
+        if twin0_recs is not None:
+            twin0 = twin0_recs
+        else:
+            twin0 = listings if listings is not None else [D4]
+        real0 = real0_recs if real0_recs is not None else [C1234]
+        lines = []
+        # round 0: probe, round-start, twin (the drop listing), real.
+        lines.append("X5R52 run seed=4 round=0 class=C")
+        lines.extend(probe0_recs)
+        lines.append("X5R52 round-start seed=4 round=0 real_dir=%s twin_dir=%s" % (fmt_dir(starts[0][1]), fmt_dir(starts[0][2])))
+        lines.append("X5R52 run seed=4 round=0 class=C")
+        lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin0_meta_t)
+        lines.extend(twin0)
+        lines.append("X5R52 run seed=4 round=0 class=Mw")
+        if real0_start:
+            lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
+            lines.extend(real0)
+        lines.extend(real0_extra)
+        # round 1: probe, round-start, twin (the Err), real, re-run.
+        lines.append("X5R52 run seed=4 round=1 class=C")
+        if probe_err is not None:
+            lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % probe_err)
+        lines.append("X5R52 round-start seed=4 round=1 real_dir=%s twin_dir=%s" % (fmt_dir(starts[1][1]), fmt_dir(starts[1][2])))
+        lines.append("X5R52 run seed=4 round=1 class=C")
+        if twin1_meta_t2 is not None:
+            lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t2)
+        lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t)
+        lines.extend(twin1_recs)
+        if foreign_seed is not None:
+            lines.append("X5R52 run seed=%d round=0 class=C" % foreign_seed)
+        if err is not None:
+            lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % err)
+        lines.append("X5R52 run seed=4 round=1 class=Mw")
+        lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
+        lines.append(C1234)
+        if rerun_err is not None:
+            lines.append("X5R52 run seed=4 round=1 class=C")
+            lines.append("GATEDIAG replay start meta.t=%d ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26" % twin1_meta_t)
+            lines.append("GATEDIAG recovery Err seed=4 round=1 class=C nested=0 e=%s" % rerun_err)
+        lines.extend(tail_lines)
+        diag_seed = {"seed": 4, "class": "MW", "digest": digest, "rounds": [], "twin": []}
+        out_text = "E4 SEEDS=1 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+        return "\n".join(lines) + "\n", diag_seed, out_text
+
+    def twin_diag3(digest=1004, div_rounds=(2,)):
+        """A three-round log in the real order: k=2 (round 2's start
+        diverges on N=4) and D4 listed only in the twin segment of
+        round 0 — never in a twin segment of round k−1 = 1. Card
+        X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1's `div_rounds` names the rounds
+        whose round-start diverges on N=4 (default `(2,)`, the original
+        shape; every other start is `[1, 2, 3, 4]/[1, 2, 3, 4]`)."""
+        lines = []
+        for rnd in (0, 1):
+            lines.append("X5R52 run seed=4 round=%d class=C" % rnd)
+            lines.append("X5R52 round-start seed=4 round=%d real_dir=%s twin_dir=%s" % (rnd, fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3] if rnd in div_rounds else [1, 2, 3, 4])))
+            lines.append("X5R52 run seed=4 round=%d class=C" % rnd)
+            lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
+            lines.extend([D4] if rnd == 0 else [C1])
+            lines.append("X5R52 run seed=4 round=%d class=Mw" % rnd)
+            lines.append("GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1")
+            lines.append(C1234)
+        lines.append("X5R52 run seed=4 round=2 class=C")
+        lines.append("X5R52 round-start seed=4 round=2 real_dir=%s twin_dir=%s" % (fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3] if 2 in div_rounds else [1, 2, 3, 4])))
+        lines.append("X5R52 run seed=4 round=2 class=C")
+        lines.append("GATEDIAG replay start meta.t=5 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26")
+        lines.append("GATEDIAG recovery Err seed=4 round=2 class=C nested=0 e=%s" % TREE4)
+        lines.append("X5R52 run seed=4 round=2 class=Mw")
+        diag_seed = {"seed": 4, "class": "MW", "digest": digest, "rounds": [], "twin": []}
+        out_text = "E4 SEEDS=1 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+        return "\n".join(lines) + "\n", diag_seed, out_text
+
+    run_seed = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag()
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-explained", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(err='Corrupt("checksum mismatch")')
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-other-err", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(starts=[(0, [1, 2, 3, 4], [1, 2, 3, 4]), (1, [1, 2, 3], [1, 2, 3])])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t2-both-dirs-lack-N", v == "NOT-EXPLAINED" and d.startswith("T2"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(listings=["GATEDIAG   rec lsn=10 kind=1 ts=2 txn=(0, 2) ddl=[\"C1\"] trees={1}"])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-no-drop", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    clean_seed = seed_rec(4, "MW", [round_rec(lost=0, mis=0, torn=0, frontier=7, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag()
+    v, d = check_twin({4: clean_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t4-no-media-fault", v == "NOT-EXPLAINED" and d.startswith("T4"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(digest=999)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t5-digest-mismatch", v == "NOT-EXPLAINED" and d.startswith("T5"), "%s %s" % (v, d))
+
+    # X5-R53 (b): the twin's own Err decides T1, and every class-C Err
+    # line for the round must carry the same text.
+    diag, diag_seed, out_text = twin_diag(err=WALLOSS, probe_err=TREE4)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-probe-only", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(err=None, probe_err=TREE4)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-probe-no-twin-err", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(rerun_err=WALLOSS)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-pairing-rerun-differs", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(probe_err='Corrupt("checksum mismatch")')
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-probe-differs-from-twin", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(rerun_err=TREE4)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-identical-rerun-ok", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # X5-R53 (b): T3 reads twin segments only — never a probe segment,
+    # never a real-class segment.
+    diag, diag_seed, out_text = twin_diag(probe0_recs=[D4], twin0_recs=[C1])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-probe-only", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[C1], real0_recs=[C1234, D4_TS1])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-mw-only", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    # T4's short-recovery half (cover_err or frontier < hi).
+    no_short = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=7, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag()
+    v, d = check_twin({4: no_short}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t4-no-short", v == "NOT-EXPLAINED" and d.startswith("T4"), "%s %s" % (v, d))
+
+    cover_short = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=7, hi=7, cover_err=True), round_rec()])
+    diag, diag_seed, out_text = twin_diag(real0_start=False)
+    v, d = check_twin({4: cover_short}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t4-cover-err-short", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # X5-R53 (c): T6a and T6b.
+    diag, diag_seed, out_text = twin_diag(twin1_meta_t=2)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-drop-above-meta", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    run3 = seed_rec(4, "MW", [round_rec(), round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag3()
+    v, d = check_twin({4: run3}, 4, 2, diag, {4: diag_seed}, out_text)
+    check("twin-t6-drop-other-round", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(real0_recs=[C1234, D4_TS1])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-real-replayed-drop", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(real0_recs=[C1234, D4_TS2])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-real-listed-above-frontier", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    diag, diag_seed, out_text = twin_diag(real0_start=False)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-no-real-listing", v == "NOT-EXPLAINED" and d.startswith("T6"), "%s %s" % (v, d))
+
+    cross = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=5, hi=7), round_rec()])
+    diag, diag_seed, out_text = twin_diag()
+    v, d = check_twin({4: cross}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6-cross-clock", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # --- X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1: the verdict's sixteen
+    # survivors (its §4), each killed by its own case.
+    # T6a's t is the MOST RECENT replay start above the Err: with an
+    # older start at 9 above the newer 5, the drop at ts=7 is above t=5
+    # and T6a refuses — any other start's meta.t (or the first) reads 9
+    # and wrongly passes.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[D4_TS7], twin1_meta_t2=9)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6a-most-recent-t", v == "NOT-EXPLAINED" and d.startswith("T6a"), "%s %s" % (v, d))
+
+    # T6a's bound is <=: a drop at a ts exactly equal to t passes.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[D4_TS5])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6a-ts-equal-t", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T6b's short-cut half keeps its x33x arm beside cover_err: x33x
+    # with no real listing at all still explains.
+    x33x_short = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7, x33x=True), round_rec()])
+    diag, diag_seed, out_text = twin_diag(real0_start=False)
+    v, d = check_twin({4: x33x_short}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6b-x33x-short", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T6b reads the listing after the LAST real replay start: the first
+    # real segment's replayed drop does not matter when the last
+    # segment's listing does not replay it.
+    diag, diag_seed, out_text = twin_diag(
+        real0_recs=[D4_TS1],
+        real0_extra=[
+            "X5R52 run seed=4 round=0 class=Mw",
+            "GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=1",
+            C1234,
+        ],
+    )
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6b-last-listing", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T6b's replay start must sit in a real-class segment: the twin
+    # segment's own start (meta.t=2, so T6a holds) whose listing replays
+    # D4 at ts <= frontier does not serve — with no real-class start of
+    # round k-1, T6b refuses.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[D4_TS1], twin0_meta_t=2, real0_start=False)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check(
+        "twin-t6b-real-class-only",
+        v == "NOT-EXPLAINED" and d.startswith("T6b no real-class replay listing"),
+        "%s %s" % (v, d),
+    )
+
+    # T6a collects from the twin segments of round k-1 only: a drop in
+    # round k-1's real listing above the frontier, with round i's own
+    # twin listing carrying D4 so T3 holds, leaves T6a without its drop.
+    diag, diag_seed, out_text = twin_diag(twin0_recs=[C1], real0_recs=[C1234, D4_TS2], twin1_recs=[D4])
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t6a-twin-segments-only", v == "NOT-EXPLAINED" and d.startswith("T6a"), "%s %s" % (v, d))
+
+    # T1 reads twin segments of round i only: round 1's Err inside
+    # round 0's twin segment (that segment's start at meta.t=5, D4 in
+    # its listing) is not round 1's own twin Err.
+    diag, diag_seed, out_text = twin_diag(err=None, twin0_recs=[D4, ERR1], twin0_meta_t=5)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t1-same-round-only", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    # T4's k is the FIRST divergent round start: with round-starts 1
+    # and 2 both divergent, real round 0 faulted and short and real
+    # round 1 clean, only k=1 explains (the last divergent start, 2,
+    # has no faulted round before it).
+    first_k = seed_rec(4, "MW", [round_rec(lost=0, mis=1, torn=0, frontier=1, hi=7), round_rec(), round_rec()])
+    diag, diag_seed, out_text = twin_diag3(div_rounds=(1, 2))
+    v, d = check_twin({4: first_k}, 4, 2, diag, {4: diag_seed}, out_text)
+    check("twin-t4-first-k", v == "EXPLAINED" and d.startswith("N=4 k=1"), "%s %s" % (v, d))
+
+    # T3 reads twin segments at rounds <= i: D4 listed only in round
+    # 2's twin segment (i=1, k=1) does not serve.
+    diag, diag_seed, out_text = twin_diag(
+        twin0_recs=[C1],
+        tail_lines=[
+            "X5R52 run seed=4 round=2 class=C",
+            "X5R52 round-start seed=4 round=2 real_dir=%s twin_dir=%s" % (fmt_dir([1, 2, 3, 4]), fmt_dir([1, 2, 3, 4])),
+            "X5R52 run seed=4 round=2 class=C",
+            "GATEDIAG replay start meta.t=0 ckpt_id=0 dir_root=1 wal_start=0 dir_keys=[] nrec=26",
+            D4,
+        ],
+    )
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-t3-round-le-i", v == "NOT-EXPLAINED" and d.startswith("T3"), "%s %s" % (v, d))
+
+    # A marker for another seed ends the segment (X5-R53 (b)): round
+    # 1's Err after one is in no twin segment, so T1 refuses.
+    diag, diag_seed, out_text = twin_diag(foreign_seed=5)
+    v, d = check_twin({4: run_seed}, 4, 1, diag, {4: diag_seed}, out_text)
+    check("twin-walk-foreign-seed", v == "NOT-EXPLAINED" and d.startswith("T1"), "%s %s" % (v, d))
+
+    # --- compare-level errors: a range mismatch and a sha256 mismatch
+    # are exercised through cmd_compare on scratch files.
+    import tempfile
+    import os
+
+    tmp = tempfile.mkdtemp(prefix="x5r52-selftest-")
+    ref_path = os.path.join(tmp, "ref.json")
+    run_path = os.path.join(tmp, "run.json")
+    out_path = os.path.join(tmp, "run.out")
+    ref_doc = {"e4": 1, "seeds": [seed_rec(s, "C", [round_rec()]) for s in range(3)]}
+    run_doc = {"e4": 1, "seeds": [seed_rec(s, "C", [round_rec()]) for s in range(2)]}
+    json.dump(ref_doc, open(ref_path, "w"))
+    json.dump(run_doc, open(run_path, "w"))
+    open(out_path, "w").write("E4 SEEDS=2 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n")
+
+    class A:
+        pass
+
+    a = A()
+    a.ref = ref_path
+    a.ref_sha256 = None
+    a.run = [run_path]
+    a.run_out = [out_path]
+    a.run_sha256 = None
+    a.range = (0, 3)
+    a.no_twin_exemption = False
+    a.max_twin_failing = None
+    rc = cmd_compare(a)
+    check("range-mismatch", rc == 2, "rc=%d" % rc)
+
+    a.range = None
+    a.ref_sha256 = "0" * 64
+    rc = cmd_compare(a)
+    check("sha256-mismatch", rc == 2, "rc=%d" % rc)
+
+    # --- X-5c-F4-F1-F1-F3-F2-F1-F1-F1-F1 (verdict §3): every run-out
+    # file carries its own E4 SEEDS line, --run/--run-out counts are
+    # tied, and the MONITOR sum reads every line of every file. The
+    # ref/run docs are equal here, so only MONITOR can move the exit.
+    import contextlib
+    import io
+
+    eq_path = os.path.join(tmp, "eq.json")
+    eq1_path = os.path.join(tmp, "eq1.json")
+    eq2_path = os.path.join(tmp, "eq2.json")
+    json.dump(ref_doc, open(eq_path, "w"))
+    json.dump({"e4": 1, "seeds": [seed_rec(0, "C", [round_rec()])]}, open(eq1_path, "w"))
+    json.dump({"e4": 1, "seeds": [seed_rec(s, "C", [round_rec()]) for s in (1, 2)]}, open(eq2_path, "w"))
+    ok_out = os.path.join(tmp, "ok.out")
+    none_out = os.path.join(tmp, "none.out")
+    mon1_out = os.path.join(tmp, "mon1.out")
+    two_out = os.path.join(tmp, "two.out")
+    open(ok_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n")
+    open(none_out, "w").write("a truncated run-out with no marker line\n")
+    open(mon1_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n")
+    open(two_out, "w").write(
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n"
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+    )
+
+    a.ref_sha256 = None
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [none_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-every-run-out-file", rc == 2, "rc=%d" % rc)
+
+    a.run_out = [mon1_out, ok_out]
+    a.run = [eq1_path, eq2_path]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    mon = read_monitor([open(p).read() for p in a.run_out])
+    r = compare_reading(seed_index(json.load(open(ref_path))), seed_index(json.load(open(eq_path))), mon)
+    check(
+        "monitor-sums-every-file",
+        rc == 1
+        and mon == 1
+        and r["new_failing"] == [(-1, "run", None, "bullet3-monitor")]
+        and compare_exit_code(r) == 1,
+        "rc=%d mon=%s %s" % (rc, mon, r["new_failing"]),
+    )
+
+    a.run = [eq_path]
+    a.run_out = [two_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    mon = read_monitor([open(two_out).read()])
+    r = compare_reading(seed_index(json.load(open(ref_path))), seed_index(json.load(open(eq_path))), mon)
+    check(
+        "monitor-sums-every-line",
+        rc == 1
+        and mon == 1
+        and r["new_failing"] == [(-1, "run", None, "bullet3-monitor")]
+        and compare_exit_code(r) == 1,
+        "rc=%d mon=%s %s" % (rc, mon, r["new_failing"]),
+    )
+
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [ok_out]
+    rc = cmd_compare(a)
+    check("monitor-run-out-count-mismatch", rc == 2, "rc=%d" % rc)
+
+    # --- X-5c-PINS-1 item 4 (verdict db1e5162 §3's six survivors and
+    # the repeated-path refusal): seven more cases, each built so only
+    # the named behaviour can move the exit (the ref/run docs are
+    # equal throughout).
+    later_out = os.path.join(tmp, "later.out")
+    open(later_out, "w").write(
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n"
+        "E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n"
+    )
+    cut_out = os.path.join(tmp, "cut.out")
+    open(cut_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0\n")
+    empty_out = os.path.join(tmp, "empty.out")
+    open(empty_out, "w").write("")
+    ok2_out = os.path.join(tmp, "ok2.out")
+    open(ok2_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=0\n")
+
+    # G-MON-FIRSTLINE: every line of one file counts — MONITOR=0 then
+    # MONITOR=1 must read 1 (the row is present, the exit is 1).
+    a.run = [eq_path]
+    a.run_out = [later_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    out_lines = buf.getvalue().splitlines()
+    check(
+        "monitor-later-line-counts",
+        rc == 1
+        and any("bullet3-monitor" in ln for ln in out_lines)
+        and any(ln.startswith("DIGESTS_MOVED 0 FAILING_ROUNDS 0 MONITOR 1") for ln in out_lines),
+        "rc=%d %s" % (rc, out_lines[:2]),
+    )
+
+    # G-MON-FIRSTFILE: every run-out file counts — MONITOR=1 in the
+    # last file only must read 1.
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [ok_out, mon1_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    out_lines = buf.getvalue().splitlines()
+    check(
+        "monitor-last-file-counts",
+        rc == 1
+        and any("bullet3-monitor" in ln for ln in out_lines)
+        and any(ln.startswith("DIGESTS_MOVED 0 FAILING_ROUNDS 0 MONITOR 1") for ln in out_lines),
+        "rc=%d %s" % (rc, out_lines[:2]),
+    )
+
+    # G-MON-EMPTY-OK: an empty run-out file is a cannot-check exit 2.
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [empty_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-empty-run-out", rc == 2, "rc=%d" % rc)
+
+    # G-MON-NO-MONITOR-FIELD: an E4 SEEDS line cut before MONITOR= is
+    # no E4 SEEDS line at all — a cannot-check exit 2.
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [cut_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-line-cut-before-monitor", rc == 2, "rc=%d" % rc)
+
+    # G-MON-MAX: the total is the sum, not the maximum — two files each
+    # MONITOR=1 print MONITOR 2.
+    mon1b_out = os.path.join(tmp, "mon1b.out")
+    open(mon1b_out, "w").write("E4 SEEDS=3 O1_FAIL=0 O2_FAIL=0 O3_FAIL=0 DEADLOCK=0 PANIC=0 O1F_FAIL=0 MONITOR=1\n")
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [mon1_out, mon1b_out]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_compare(a)
+    out_lines = buf.getvalue().splitlines()
+    check(
+        "monitor-sums-not-max",
+        rc == 1
+        and any(ln.startswith("DIGESTS_MOVED 0 FAILING_ROUNDS 0 MONITOR 2") for ln in out_lines)
+        and any("bullet3-monitor" in ln for ln in out_lines),
+        "rc=%d %s" % (rc, out_lines[:2]),
+    )
+
+    # G-TIE-ONE-WAY: more run-outs than runs is as much a count mismatch
+    # as too few — two distinct out files against one run.
+    a.run = [eq_path]
+    a.run_out = [ok_out, ok2_out]
+    rc = cmd_compare(a)
+    check("monitor-more-run-outs-than-runs", rc == 2, "rc=%d" % rc)
+
+    # M-MON-DUP-OUT: the same --run-out path twice (the counts tie, so
+    # only the repeated-path refusal fires).
+    a.run = [eq1_path, eq2_path]
+    a.run_out = [ok_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-run-out-repeated", rc == 2, "rc=%d" % rc)
+
+    # OWN-DUP-ADJACENT (verdict 74f411f0 finding 5): a repeat that is
+    # not adjacent, three distinct runs so the count tie holds.
+    a.run = [eq_path, eq1_path, eq2_path]
+    a.run_out = [ok_out, ok2_out, ok_out]
+    rc = cmd_compare(a)
+    check("monitor-run-out-repeated-non-adjacent", rc == 2, "rc=%d" % rc)
+
+    print("SELF-TEST %d cases, %d failed" % (cases[0], len(failures)))
+    return 1 if failures else 0
+
+
+def main(argv):
+    """Argument parsing for the four subcommands."""
+    ap = argparse.ArgumentParser(prog="x5r52_compare.py", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("compare", help="classify a run against the reference")
+    c.add_argument("--ref", required=True)
+    c.add_argument("--ref-sha256")
+    c.add_argument("--run", action="append", required=True)
+    c.add_argument("--run-out", action="append", required=True)
+    c.add_argument("--run-sha256")
+    c.add_argument("--range", type=lambda x: (int(x.split("..")[0]), int(x.split("..")[1])))
+    c.add_argument("--no-twin-exemption", action="store_true")
+    c.add_argument("--max-twin-failing", type=int)
+    m = sub.add_parser("check-mp", help="X5-R51 (b)5 / X5-R52 (b)5' for one row")
+    m.add_argument("--json", required=True)
+    m.add_argument("--seed", type=int, required=True)
+    m.add_argument("--round", type=int, required=True)
+    m.add_argument("--diag-err", required=True)
+    m.add_argument("--diag-json", required=True)
+    m.add_argument("--diag-out", required=True)
+    t = sub.add_parser("check-twin", help="X5-R52 (c)(i) T1-T5 for one twin row")
+    t.add_argument("--json", required=True)
+    t.add_argument("--seed", type=int, required=True)
+    t.add_argument("--twin-round", type=int, required=True)
+    t.add_argument("--diag-err", required=True)
+    t.add_argument("--diag-json", required=True)
+    t.add_argument("--diag-out", required=True)
+    sub.add_parser("self-test", help="embedded synthetic cases")
+    args = ap.parse_args(argv)
+    if args.cmd == "compare":
+        return cmd_compare(args)
+    if args.cmd == "check-mp":
+        return cmd_check_mp(args)
+    if args.cmd == "check-twin":
+        return cmd_check_twin(args)
+    return self_test()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
