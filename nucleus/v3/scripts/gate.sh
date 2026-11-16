@@ -29,5 +29,6 @@ step deny cargo deny --log-level error check
 step wasm32 cargo build -q --target wasm32-unknown-unknown "${wasm_crates[@]}"
 step core-paths-selftest bash scripts/check-core-paths.sh --self-test
 step enforcement-tests bash scripts/test-enforcement.sh
+step api-surface bash scripts/check-api-surface.sh
 echo "GATE EXIT=$gate"
 exit "$gate"

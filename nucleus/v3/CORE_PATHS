@@ -12,5 +12,8 @@ clippy.toml
 rust-toolchain.toml
 crates/nucleus-store/
 crates/nucleus-env/
+# The API-surface lint (card A-1a; PLAN-v3 §6.1): its allowlist and parser.
+api-allowlist.txt
+xtask/
 # verdicts/ is protected from workers by the runner; enforce-lib.sh lets a card
 # change only its own verdicts/<ID>.md.
