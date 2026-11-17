@@ -1172,6 +1172,100 @@ fn t_meta_copies() {
         OpenDecision::Corrupt(OpenCorrupt::EqualBootIds { parity: 1 }),
         "part 4 (c): equal boot ids with wal_start_prev_crc differing fail the open"
     );
+    // (c′) The tie rule over every field (RW2-1 of verdicts/A-2-0.md): two
+    // copies of one meta that differ in a byte other than `copy` and `crc`,
+    // in whatever field, are a tie, and equal `boot_id`s fail the open with
+    // XX001 in both parities. G2-TIE-IGNORES-GCW and G2-TIE-IGNORES-FREEROOT
+    // call copies that differ only in `gc_w` or `free_root` equal and open
+    // the primary; G2-TIE-BYTES-NO-BOOTID leaves `boot_id` out of the byte
+    // comparison (its case is tried after the table).
+    // Completeness guard: every field of `Meta` is named below, with no
+    // `..`, so a field added to `Meta` later fails to compile until the
+    // table below names it.
+    let Meta {
+        identity: _,
+        ckpt_id: _,
+        t: _,
+        gc_w: _,
+        epoch: _,
+        map_root: _,
+        map_level: _,
+        free_root: _,
+        dir_root: _,
+        next_lpid: _,
+        slot_count: _,
+        wal_start_lsn: _,
+        wal_start_prev: _,
+        wal_start_prev_crc: _,
+        wal_ckpt_end: _,
+        ts_ckpt_hi: _,
+        boot_id: _,
+    } = v(10);
+    // Every field except `identity` (another static field makes the copy
+    // foreign: (b)), `ckpt_id` and `epoch` (whose change makes another
+    // meta, or a malformed record: `epoch` is `ckpt_id`'s low 32 bits) and
+    // `boot_id` (alone, below); each bump changes one field alone and stays
+    // in the domain Work 3 pins. The array form, not a Vec: a
+    // `Vec<(&str, fn(&mut Meta))>` fails clippy's `type_complexity`.
+    type Bump = fn(&mut Meta);
+    let fields: [(&str, Bump); 17] = [
+        ("t", |m| m.t += 1),
+        ("gc_w", |m| m.gc_w += 1),
+        ("map_root.slot", |m| m.map_root.slot += 1),
+        ("map_root.epoch", |m| m.map_root.epoch += 1),
+        ("map_root.crc", |m| m.map_root.crc ^= 1),
+        ("map_level", |m| m.map_level += 1),
+        ("free_root.slot", |m| m.free_root.slot += 1),
+        ("free_root.epoch", |m| m.free_root.epoch += 1),
+        ("free_root.crc", |m| m.free_root.crc ^= 1),
+        ("dir_root", |m| m.dir_root += 1),
+        ("next_lpid", |m| m.next_lpid += 1),
+        ("slot_count", |m| m.slot_count += 1),
+        ("wal_start_lsn", |m| m.wal_start_lsn += 1),
+        ("wal_start_prev", |m| m.wal_start_prev += 1),
+        ("wal_start_prev_crc", |m| m.wal_start_prev_crc ^= 1),
+        ("wal_ckpt_end", |m| m.wal_ckpt_end += 1),
+        ("ts_ckpt_hi", |m| m.ts_ckpt_hi += 1),
+    ];
+    for (name, bump) in &fields {
+        let mut m10 = v(10);
+        bump(&mut m10);
+        assert_eq!(
+            run4(&v(10), &m10, &v(9), &v(9), Block::Read(&page0)),
+            OpenDecision::Corrupt(OpenCorrupt::EqualBootIds { parity: 0 }),
+            "parity 0, {name}"
+        );
+        let mut m9 = v(9);
+        bump(&mut m9);
+        assert_eq!(
+            run4(&v(10), &v(10), &m9, &v(9), Block::Read(&page0)),
+            OpenDecision::Corrupt(OpenCorrupt::EqualBootIds { parity: 1 }),
+            "parity 1, {name}"
+        );
+    }
+    // `boot_id` alone is a tie byte too, with the tie rule's other side:
+    // the copy with the newer `boot_id`, in serial-number order (§12.5), is
+    // the candidate, in either place and in the previous meta's parity.
+    let b6 = Meta {
+        boot_id: 6,
+        ..v(10)
+    };
+    assert_eq!(
+        outcome_of(&run4(&v(10), &b6, &v(9), &v(9), Block::Read(&page0))),
+        open(b6.clone(), Some(v(9))),
+        "boot_id alone, replica newer"
+    );
+    assert_eq!(
+        outcome_of(&run4(&b6, &v(10), &v(9), &v(9), Block::Read(&page0))),
+        open(b6.clone(), Some(v(9))),
+        "boot_id alone, primary newer"
+    );
+    let b6p = Meta { boot_id: 6, ..v(9) };
+    assert_eq!(
+        outcome_of(&run4(&v(10), &v(10), &v(9), &b6p, Block::Read(&page0))),
+        open(v(10), Some(b6p.clone())),
+        "boot_id alone, parity 1"
+    );
     // (d) The top of u64: the newest is 2^64−1, whose `k + 1` no ckpt_id
     // exceeds and no addition overflows, and the last place's copy is
     // misplaced: G-MISPLACED-WRAPPING-ADD wraps `k + 1` to 0 and fails the
