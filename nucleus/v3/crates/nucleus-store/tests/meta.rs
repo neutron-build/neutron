@@ -219,10 +219,20 @@ fn page0_codec() {
         assert!(is_corrupt(&decode_page0(&b)), "byte {i} flipped decodes");
     }
     // Out-of-domain fields with a correct crc: the domain check refuses
-    // them.
+    // them. `format_version` 0 and `u32::MAX`, and `checksum_alg` 0 and
+    // 255, are the rework's (RW-2 of verdicts/A-2-0.md): below the pinned
+    // value, not only above it.
     let bad = [
         Identity {
+            format_version: 0,
+            ..own()
+        },
+        Identity {
             format_version: 2,
+            ..own()
+        },
+        Identity {
+            format_version: u32::MAX,
             ..own()
         },
         Identity {
@@ -230,7 +240,15 @@ fn page0_codec() {
             ..own()
         },
         Identity {
+            checksum_alg: 0,
+            ..own()
+        },
+        Identity {
             checksum_alg: 2,
+            ..own()
+        },
+        Identity {
+            checksum_alg: 255,
             ..own()
         },
         Identity {
@@ -326,8 +344,20 @@ fn meta_malformed_fields() {
         reseal(&mut b, META_CRC_AT);
         assert!(is_corrupt(&decode_meta(&b)), "copy byte {copy} decodes");
     }
+    // The magic, re-sealed with a correct crc so the magic check is what
+    // refuses it (RW-2 of verdicts/A-2-0.md: otherwise only the random
+    // driver covers the meta magic).
+    let mut wrong_magic = encode_meta(&v(10), MetaCopy::Primary);
+    wrong_magic[7] = b'X';
+    reseal(&mut wrong_magic, META_CRC_AT);
+    assert!(
+        is_corrupt(&decode_meta(&wrong_magic)),
+        "meta magic with byte 7 'X' decodes"
+    );
     // Each out-of-domain field, written by the encoder, whose crc is
-    // correct, so the domain check is what refuses it.
+    // correct, so the domain check is what refuses it. `format_version` 0
+    // and `u32::MAX`, and `checksum_alg` 0 and 255, are the rework's
+    // (RW-2): below the pinned value, not only above it.
     let malformed = [
         (
             "map_level 0",
@@ -338,10 +368,30 @@ fn meta_malformed_fields() {
         ),
         ("epoch != ckpt_id as u32", Meta { epoch: 11, ..v(10) }),
         (
+            "format_version 0",
+            Meta {
+                identity: Identity {
+                    format_version: 0,
+                    ..own()
+                },
+                ..v(10)
+            },
+        ),
+        (
             "format_version 2",
             Meta {
                 identity: Identity {
                     format_version: 2,
+                    ..own()
+                },
+                ..v(10)
+            },
+        ),
+        (
+            "format_version u32::MAX",
+            Meta {
+                identity: Identity {
+                    format_version: u32::MAX,
                     ..own()
                 },
                 ..v(10)
@@ -358,10 +408,30 @@ fn meta_malformed_fields() {
             },
         ),
         (
+            "checksum_alg 0",
+            Meta {
+                identity: Identity {
+                    checksum_alg: 0,
+                    ..own()
+                },
+                ..v(10)
+            },
+        ),
+        (
             "checksum_alg 2",
             Meta {
                 identity: Identity {
                     checksum_alg: 2,
+                    ..own()
+                },
+                ..v(10)
+            },
+        ),
+        (
+            "checksum_alg 255",
+            Meta {
+                identity: Identity {
+                    checksum_alg: 255,
                     ..own()
                 },
                 ..v(10)
@@ -977,6 +1047,152 @@ fn t_meta_copies() {
         let d = tie(&base(10, b, 1), &base(10, a, 0));
         assert_eq!(outcome_of(&d), Outcome::Corrupt, "{b:#x} and {a:#x}");
     }
+
+    // Part 4 (RW-1 of verdicts/A-2-0.md): hand-checked cases outside the
+    // cross product and its alphabet, each killing a gate mutant that
+    // survived the whole suite (the verdict's "Mutation evidence"). Blocks
+    // come from `encode_page0(&own())` and `encode_meta` with each place's
+    // own copy byte, in the order P0, R0, P1, R1, run through
+    // `locate_page_size` then `select_meta`, page 0 valid unless stated.
+    let mut page0_torn = page0;
+    page0_torn[TORN_PAGE0_BYTE] ^= 0xFF;
+    let run4 = |p0: &Meta, r0: &Meta, p1: &Meta, r1: &Meta, page0: Block| {
+        let blocks = [
+            encode_meta(p0, MetaCopy::Primary),
+            encode_meta(r0, MetaCopy::Replica),
+            encode_meta(p1, MetaCopy::Primary),
+            encode_meta(r1, MetaCopy::Replica),
+        ];
+        let replicas = [Block::Read(&blocks[1]), Block::Read(&blocks[3])];
+        let slots = locate_page_size(&page0, &replicas)
+            .map(|_| [Block::Read(&blocks[0]), Block::Read(&blocks[2])]);
+        select_meta(&HeaderBlocks {
+            page0,
+            replicas,
+            slots,
+        })
+    };
+    // (a) A foreign copy in a place of the other parity is ignored:
+    // G-FOREIGN-AS-MISPLACED classes it misplaced and fails the open (the
+    // alphabet's F is always in its own parity).
+    assert_eq!(
+        outcome_of(&run4(
+            &v(10),
+            &v(10),
+            &v(9),
+            &foreign(16),
+            Block::Read(&page0)
+        )),
+        open(v(10), Some(v(9))),
+        "part 4 (a): a foreign copy in the other parity's place is ignored"
+    );
+    // (b) A copy with the file's `creation_uuid` but another static field
+    // is foreign: G-IDENTITY-UUID-ONLY compares the uuid only.
+    let uuid_page8k = Meta {
+        identity: Identity {
+            page_size: 8192,
+            ..own()
+        },
+        ..v(15)
+    };
+    assert_eq!(
+        outcome_of(&run4(
+            &v(10),
+            &v(10),
+            &v(9),
+            &uuid_page8k,
+            Block::Read(&page0)
+        )),
+        open(v(10), Some(v(9))),
+        "part 4 (b): the file's uuid with another page size is foreign"
+    );
+    let uuid_wal32m = Meta {
+        identity: Identity {
+            wal_seg_size: 32 << 20,
+            ..own()
+        },
+        ..v(15)
+    };
+    assert_eq!(
+        outcome_of(&run4(
+            &v(10),
+            &v(10),
+            &uuid_wal32m,
+            &v(9),
+            Block::Read(&page0)
+        )),
+        open(v(10), Some(v(9))),
+        "part 4 (b): the file's uuid with another wal_seg_size is foreign"
+    );
+    // The same with page 0 torn (byte 20): the identity is the copies',
+    // and they conflict.
+    assert_eq!(
+        run4(
+            &v(10),
+            &v(10),
+            &v(9),
+            &uuid_page8k,
+            Block::Read(&page0_torn)
+        ),
+        OpenDecision::Corrupt(OpenCorrupt::IdentityConflict),
+        "part 4 (b): page 0 torn, the uuid match does not mend the page size"
+    );
+    assert_eq!(
+        run4(
+            &v(10),
+            &v(10),
+            &uuid_wal32m,
+            &v(9),
+            Block::Read(&page0_torn)
+        ),
+        OpenDecision::Corrupt(OpenCorrupt::IdentityConflict),
+        "part 4 (b): page 0 torn, the uuid match does not mend wal_seg_size"
+    );
+    // (c) A tie whose copies have equal `boot_id`s and equal `t` but differ
+    // in another byte is still a tie: G-TIE-T-AND-BOOT-ONLY calls the
+    // copies equal and opens the primary.
+    let tie_map_crc = Meta {
+        map_root: Ref {
+            crc: 0x1234_5678,
+            ..v(10).map_root
+        },
+        ..v(10)
+    };
+    assert_eq!(
+        run4(&v(10), &tie_map_crc, &v(9), &v(9), Block::Read(&page0)),
+        OpenDecision::Corrupt(OpenCorrupt::EqualBootIds { parity: 0 }),
+        "part 4 (c): equal boot ids with map_root crc differing fail the open"
+    );
+    let tie_prev_crc = Meta {
+        wal_start_prev_crc: 1,
+        ..v(9)
+    };
+    assert_eq!(
+        run4(&v(10), &v(10), &tie_prev_crc, &v(9), Block::Read(&page0)),
+        OpenDecision::Corrupt(OpenCorrupt::EqualBootIds { parity: 1 }),
+        "part 4 (c): equal boot ids with wal_start_prev_crc differing fail the open"
+    );
+    // (d) The top of u64: the newest is 2^64−1, whose `k + 1` no ckpt_id
+    // exceeds and no addition overflows, and the last place's copy is
+    // misplaced: G-MISPLACED-WRAPPING-ADD wraps `k + 1` to 0 and fails the
+    // open, G-MISPLACED-PLAIN-ADD overflows. The fixture's `base`
+    // overflows there, so `top` bends `v(9)` instead.
+    let top = |c: u64| Meta {
+        ckpt_id: c,
+        epoch: c as u32,
+        ..v(9)
+    };
+    assert_eq!(
+        outcome_of(&run4(
+            &top(u64::MAX - 1),
+            &top(u64::MAX - 1),
+            &top(u64::MAX),
+            &top(u64::MAX - 1),
+            Block::Read(&page0)
+        )),
+        open(top(u64::MAX), Some(top(u64::MAX - 1))),
+        "part 4 (d): a misplaced copy at the top of u64 fails nothing"
+    );
 
     // Part 3: the cross product, 11^4 symbol combinations with page 0
     // valid, torn and unreadable, each against the oracle.
