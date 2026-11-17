@@ -1,0 +1,555 @@
+Card: R-1-SPEC
+Class: spec
+Card-gate: P
+Verdict: REWORK
+Gate-tier: P
+Gate-model: claude-opus-5-5
+Gate-session: T3 review sub-agent, Claude Code session d36e5b00-a57c-4ef7-b43c-283e6f9e735c (an independent P gate: this agent wrote neither the card, its implementation 32f68472, nor S-ZETA, S-ETA or S-THETA, and is not the orchestrator)
+Date: 2026-11-17
+Gate-exit: GATE EXIT=0
+Commit: 32f68472b4155671f5418f0fb633b0859958c89a
+Mutants: spec text, none in code; the card's 20 spec mutants walked as text on their tests: MIN-RMAP-DENSE -> t_pool_minimum caught; MIN-RESERVE-NO-STEP2 -> t_pool_minimum caught; RESERVE-PER-THREAD-ONLY -> t_epoch_reserve_two_exhausters floor variant caught (A-3c, A-7a); CLAIM-DEPTH-TWO -> the floor variant through write_guard caught; MAPPIN-KEPT -> t_pool_floor_scattered caught (correct build O = 33 >= 21; mutant leaves 3); HEIGHT-SPLIT-UNCHECKED -> t_height_bound (a) caught by the root-split hook (its stated failure is wrong, K6); HEIGHT-DESCENT-UNCHECKED -> t_height_bound (b) caught; UNCHARGED-CONSUMER -> t_mem_heap_accounted caught; STORE-PATH-SHARED-CHARGE -> t_mem_store_paths_saturated caught; CAP-WAITS, CAP-POISONS, OP-NO-SPILL, CONN-WHOLE-MESSAGE, PLAN-NO-EVICT -> t_mem_caps caught; ACCOUNT-NOT-CREDITED -> t_mem_account_returns caught; OPEN-NO-FILE-TERM, POOL-SIZED-BEFORE-TABLE -> t_mem_open_sizes caught, but that test fails a correct build at B_min as committed (D1); FALLBACK-SET-KEPT -> the fall-back form caught only when no open of the form grows the file (D5); ALLOWANCE-UNRESERVED -> t_mem_growth_allowance caught; ADMIT-OVER-COUNT -> t_mem_admission caught. Gate's own: G1 RO-BUDGET-DIRTY-ONLY (a read-only open's budget counts its dirty frames only, as committed) -> UNCAUGHT by t_ro_open and t_ro_open_disk_full (D2; K2, F1); G2 WALK-BUFFER-UNCHARGED (recovery reads a record into an uncharged buffer) -> UNCAUGHT, no test samples an open that replays (D4; K7, F6); G3 CREATE-ABORT-KEEPS-RFILE (an aborted CREATE leaves its entry's bytes in R_file) -> UNCAUGHT by t_mem_account_returns (D8; K10, F6). Mechanical: omitting any one of the 50 blocks fails Acceptance in both locales (50/50 caught); 13 of 16 planted errors caught, the 3 uncaught all in R-1-memory prose that no line pins, as Limit 1 intends
+Followups: R-1-SPEC-F1, R-1-SPEC-F2, R-1-SPEC-F3, R-1-SPEC-F4, R-1-SPEC-F5, R-1-SPEC-F6, R-1-SPEC-F7
+
+## Verdict in brief
+
+**REWORK.** The mechanics are clean and most of the design holds. My own derivations agree with the card's for the claim depth (1), `R_EPOCH_min = n + s + 1`, `R_MAP = n(H + 2) + R_EPOCH` with §5.3's reworded premise, `H` from the pool, `F_min`, and every worked number. "Charge as built, size last" is right, and so are points (a) and (b). Four defects still meet this gate's REWORK standard:
+
+1. **D1. `B_min` cannot open with the default caps.** R-1-memory §7.3 fails the open with 22023 for "a per-account cap above `S`". At every mode's `B_min`, `S` is `S_min`, and several §7.1 caps are above it: embedded `ws_mem` is 16 MiB against 5 MiB, browser `ws_mem` is 4 MiB against 2 MiB, and server `lock_mem` is 128 MiB against 5 MiB. So the defaults do not open at their own `B_min`. That contradicts §7.2 ("the least budget that opens the file"), §4.6's browser-minimum row and §2.2, and it makes `t_mem_open_sizes` ("an open at `B_min` succeeds") fail on a build that follows the text.
+2. **D2. A read-only open's budget is too small once `R_MAP` is settled.** Draft 7.16's `R_MAP` leaves out the MapLeafs that §4.1 pins for unpinned dirty pages, because a frame acquisition releases them by evicting those pages. A read-only open never evicts a dirty page, so it can never release them. S-STORE §14.1 ("`F` minus the dirty frames") and R-1-memory §3 and §5.3 still count only the dirty frames, so a read-only replay that passes the check can run out of frames it can obtain. It then waits for an unpin that never comes, instead of returning 53200, and this is the salvage path that must work on a full volume.
+3. **D3. R-1-memory contradicts C-T0 on SSI memory.** C-T0 v8 §8.5 keeps v7.8 §8.5: SSI state "is never summarised in 2.0; it spills to disk under memory pressure". R-1-memory §3 and §6.2 give SIREADs "escalation, then 53200" and keep retained SIREADs charged until retention ends, with no spill. By R-1-memory's own precedence rule, the mechanism is C-T0's.
+4. **D4. Some consumers have no account.** §2.1 says "The table of §3 lists every consumer; nothing else allocates." Four consumers are missing:
+   - recovery's record buffer, for records of up to `wal_seg_size / 4` (16 MiB at the default segment size, against an embedded `B_min` of 8.29 MiB);
+   - amcheck's file-proportional sets;
+   - a statement's working memory (its parse and plan, rows in flight, detoasted datums);
+   - C-T0 §9.4's per-tree garbage estimates.
+
+Five smaller defects come with them. Each is listed below with its fix.
+- **D5.** The fall-back form's exact budget fails a correct build if pass 2 grows the file, and §5.3 never says to credit `R_file`'s terms from meta `k`.
+- **D6.** `t_mem_store_paths_saturated`'s budget does not give "a pool 32 frames above its minimum".
+- **D7.** HEIGHT-SPLIT-UNCHECKED's stated failure is wrong, and nothing says that a gated operation descending a taller tree poisons the store.
+- **D8.** A CreateTree that is never applied leaves its bytes in `R_file`.
+- **D9.** The growth residual is wider than "three growths".
+
+The corrections are one list of 25 exact Old/New pairs, K1 to K10, each tried in scratch. With them applied to the committed files, every Acceptance line passes except 38 and 39, whose new values are given below, and two new lines pin the corrected text.
+
+## Mechanics (all checked by this gate; nothing taken from the implementer's report)
+
+- **Fresh gate.** I extracted the scaffold's `fresh-gate.sh` through the shallow `--no-local` clone. The scaffold id printed was `71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`, with no EXTRACT FAILED line. The run's lines were:
+  - `fresh-gate: commit 32f68472b4155671f5418f0fb633b0859958c89a`
+  - `fresh-gate: base 71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`
+  - `fresh-gate: checks passed (4875 files hashed in 2.22 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - steps test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests and api-surface, each `EXIT=0`
+  - last line `GATE EXIT=0`, with stderr empty. The extract was removed afterwards.
+- **Scope.** `git diff nucleus/v3-scaffold...HEAD` names four files, all in Touch only: R-1-memory.md +462, S-STORE.md +36/−17, C-T0 +9/−8 and README +2/−1. Nothing is in a protected path. The worktree is clean, and no worker log for R-1-SPEC exists in `cards/logs/`.
+- **Bytes.** My own parser (scratch `~/.cache/nv3-review/gate-R-1-SPEC/tools/apply.py`; the other scripts named here sit beside it) takes doc blocks 0–14, E1–E25, T1–T9 and X1 from the card and applies them to 71ecf3e6's files. Every Old occurs exactly once at its turn. With the date 2026-11-17, the four results equal the committed files byte for byte. With 2026-11-16 they equal the card's recorded dry-run sha256s (`0c7c2313…`, `286c85d6…`, `191f528f…`, `be06c4f8…`). The base files are the card's (S-STORE `a1376c94…`, C-T0 `96caa6cb…`), and 48e52d3b's three docs equal 71ecf3e6's.
+- **Acceptance.** I ran the 49 commands before the gate line in a fresh clone at 32f68472, with `nucleus/v3-scaffold` at 71ecf3e6, under `en_CA.UTF-8` and under `LC_ALL=C`: 49 of 49 pass in each. The checkers print `7 invariants; 20 rows` / `OK` and `162 rows; 233 mutants; 24 judged only on Phase B cards; 47 invariants; 50 tests` / `OK`. Line 50 is the fresh gate above.
+- **Omit one block.** I built 50 variants, each the result with one block omitted (D0–D14, E1–E25, T1–T9, X1), committed each and ran it in both locales. Every one fails at least one line in both locales. Doc blocks 1–14 fail line 4 (the headings) and the lines for their own text, and doc block 0 fails lines 2 and 3. Every E block fails line 39, most also 38 and their own lines. The T blocks fail lines among 40–43, and 48. X1 fails 44, 45 and 49.
+- **Planted errors.** I planted 16 errors, each a one-fault result run in both locales. 13 are caught:
+  - `F_min` with `3 × n` (line 7);
+  - §4.6's embedded `R_MAP` changed (13);
+  - `R_MAP` with `2 × n` (10);
+  - a stray word in E3's New (39);
+  - the draft 7.17 (22, 39);
+  - `t_pool_floor_scattered`'s A-4a row moved to B-3 (37, 39);
+  - "the last form" added to that row (37, 39);
+  - a stray edit in T4 (42, 48) and in T6 (48);
+  - X1 shortened (49);
+  - `H_min = 6` (12);
+  - E5's "`H + 1`" made "`H + 2`" (39);
+  - a stray edit of an untouched S-STORE line (38, 39).
+
+  The other 3 are uncaught: FALLBACK-SET-KEPT dropped from I-MEM-OPEN's mutant cell (line 17 checks invariant → row, not row → invariant), "credited" made "kept" in §5.3's fall-back bullet, and the allowance halved. All three are R-1-memory prose that no line pins, which Limit 1 allows; the gate reads that prose.
+- **The checker's "last form" rule** (point (b)). Line 37 refuses "last form" outside `t_epoch_reserve_two_exhausters` (planted above: caught), a full form that names a stand-in, a change to §15's parenthetical, and an A-7f row without A-7d.
+
+## The design, re-derived
+
+### What holds
+- **The claim depth is 1** (doc §4.3). At 7.15 a claim takes no map latch, calls no `write_guard` and records into the image-record list, a leaf lock. Slot allocation takes no free-set lock and obtains no frame (S-STORE §4.2, §4.4, §4.5). So nothing done under a reserve frame's latch draws or claims again. The dirty eviction's `write_guard` on its victim's MapLeaf is a frame acquisition, which never runs inside a draw or a claim. With the others holding at most `(n − 1) + s` latches, `R_EPOCH > (n − 1) + s` is enough, and `n + s + 1` keeps one frame of slack. The history checks out: c4397471's "two claims" counted a claim that recorded into the copy's MapLeaf.
+- **`R_MAP`** (doc §4.4). The five classes partition `N = F − R_EPOCH`. I checked every pin §5.4 counts:
+  - the path, with the pack step's `L` and `R` and a restart's cold page;
+  - the reservation's pages, which lie under the reservation's MapLeafs (T);
+  - a chain build's or free's two pages, with both MapLeafs held (T);
+  - a free's MapLeaf (T);
+  - a load's MapLeaf pin under S-THETA, which falls in the path term;
+  - the checkpointer and the evictors, which latch and do not pin.
+
+  Only a path page can be dirty under a MapLeaf the thread does not pin, so `|Mp| ≤ n(H + 2)`. `O = N − |T| − |Mp| − |Mc| ≥ ΣQ_t` plus each class's own remaining room, so every pin, and every (Mp) or (Mc) MapLeaf a thread still needs, has a frame it can obtain. In a read-write store an (Mu) MapLeaf is obtainable: evicting its unpinned dirty pages, each a (U) frame, ends its pins. A dirty MapLeaf's own eviction sets a ref in a MapInner, outside the pool. E3's premise is what §5.3's argument uses. The 7.15 wording would need `3n(H + 2) + R_EPOCH`. P-1's three paths are short whenever path pages lie under MapLeafs of their own, and six paths buy nothing.
+- **`H`** (doc §4.5). `H = ⌊(F − 2R_EPOCH)/(4n)⌋ − 2` is the largest height the minimum holds for. The 15/16 inequality gives `H ≥ H_min` for every `F ≥ F_min` at the 1/32 slope. Both places where the bound is enforced are sound: the descent checks before its pin, and the root split is decided in the reservation, before the first mutation (S-STORE §6.4). A fixed engine limit would be worse, since apply cannot fail logically (S-STORE §9.1).
+- **Numbers.** I recomputed every figure:
+  - `F_min`: 64, 244 and 604.
+  - Embedded: `F` 5,878, `R_EPOCH` 186, `H` 170, `R_MAP` 1,562, with 2 frames of slack.
+  - Server: `F` 916,452, `R_EPOCH` 28,642, `H` 10,737, `R_MAP` 243,422, with 48 frames of slack.
+  - Browser: 64, 4, 5 and 18, exact.
+  - `R_file`'s parts: the MapInners are 1 page and 52 pages, the allowances 74,240 and 935,936 bytes, and `L` is 9, 8, 7, 6 and 6.
+  - `o_frame` = 64 + 40 + 24 bytes.
+  - `B_min`: 3,114,176 B (2.97 MiB), 8,697,344 B (8.29 MiB) and 35,797,504 B (34.14 MiB).
+  - Units are frames throughout §4 and bytes in §5 and §7.
+
+  The per-thread terms and `R_MAP` are counts, not reservations; only `R_EPOCH`'s frames are set aside. So the floor is a worst-case pin count, not grossly more than needed: `S_min` dominates every `B_min`.
+- **The WAL path.** Record bytes are charged with their layers until `written_end` passes them, so `COMMIT` charges nothing new to `S`. Appenders wait on `written_end`.
+- **Pass 1's set.** About 24 bytes per marker, at most one marker per `min(preapply_rows × 16, preapply_bytes)` of span.
+- **SSI.** A per-transaction cap, and the right account. Its behaviour at memory pressure is D3.
+- **Hash tables and rehash.** §2.3's "capacity included" and §5.2's "at any instant, its growth included" make the rule govern rather than the provisional 64 or 128 bytes. The page table is sized for `F` and never rehashed.
+- **Allocator overhead** is the base, measured by D-13, not budgeted.
+
+### The floor's sufficiency
+For a read-write store I looked for an operation that needs one frame more than the floor grants, and found none. The worst cases I checked:
+- a root split of an `(H − 1)`-level tree: path ≤ `H + 2`, `H` new pages, ≤ `H` MapLeafs for its LPIDs, and its path pages' MapLeafs in (Mp);
+- a restart that keeps its cold page and its reservation's pins while it waits on the gate;
+- an eviction that must set its victim's entry: the MapLeaf is resident by §4.1, and its copy comes from `R_EPOCH`;
+- a dirty MapLeaf's own eviction: its parent MapInner is outside the pool, and that MapInner's copy comes from `R_EPOCH`;
+- a chain build or free;
+- a checkpoint flip, which takes no frame (restarted allocations wait on it with counted pins);
+- pass 2 of a read-write open, which may evict.
+
+This depends on the Q-MAPLEAF-DIRTY mechanism (whoever makes a path page's MapLeaf resident must do it before the first mutation). The card counts that frame either way and routes the mechanism to S-STORE before A-3c. **The exception is a read-only open (D2).** There no dirty page is ever evicted, so (Mu) is not obtainable, and the stuck frames are the dirty frames plus up to as many clean MapLeafs.
+
+Take one caller (`n = 1`, `s = 1`, `H = 5`), so `F_min = 34`, and give the open `F = 34 + D`, which the committed check accepts. The replay's thread can then obtain `31 − D_m` frames, where `D_m` is the number of clean MapLeafs pinned for the dirty pages. A root-split cascade needs up to 28 pins and (Mp) MapLeafs, so it stalls once `D_m ≥ 4`, and any operation stalls once `D_m` nears 30. At any `F`, a replay whose dirty pages lie under MapLeafs of their own runs out at about half the dirty frames the check allows. Nothing then ends a pin, so the open waits instead of returning 53200.
+
+### Exhaustion, point by point
+- **At open.** Every charge is made before its allocation, against `B`: `R_fixed`, `R_file`'s terms from the meta and the file's length, the root table and CreateTree entries, and `M`. A 53200 comes before the open's first write, or after a fall-back with nothing written beyond the fence and image `k`'s pass-2 evictions. D1 makes `B_min` itself fail, with 22023 (K1). D4's record buffer is uncharged (K7).
+- **Pass 1** charges `M`. **Pass 2**, read-write, runs in the sized pool. Read-only is D2 (K2).
+- **After a fall-back**, see point (a).
+- **A client operation before its first mutation** charges `S`, never waits, and fails with 53200 without poisoning anything (M3). **After its first mutation**, inside apply, a gated operation, it charges nothing to `S` (M2). Its frames wait only as §5.3 and §5.4 bound them, and only the two stated fail-stops remain: the height bound and the growth residual. The residual is wider than stated (D9, K8).
+- **A checkpoint** uses `R_fixed`'s list and buffers and `R_file`. Whether step 2 holds image `k`'s bitmaps beside the current ones is open (F3).
+- **Background jobs** use a job slot, frames and `R_file`, and have the same two fail-stops. A gated operation that descends a tree taller than `H` poisons the store, which T8 and §4.5 did not say (D7, K9).
+
+With the corrections, no path turns memory exhaustion into data loss or a wrong result. The fail-stops recover under a larger budget, since recovery replays the commit, and a read-only open fails with 53200 instead of waiting.
+
+### Point (a): pass 1 after a fall-back (ruling: correct, with K4)
+The sizing's place agrees with S-STORE §14 step 4a items 2–4, the retire paragraph and the explicit rollback: after step 3b, before the proof's retire write and before pass 2. "Nothing written" after a fall-back means the fence and image `k`'s pass-2 evictions, each into a slot neither image references. That is exactly §14.2's phrase. A 53200 in the second pass 1, the second root table or the second sizing leaves meta `k` in its places and image `k−1` with its WAL intact (I-TWO-GEN). A later open with a larger budget falls back as this one would have, by itself, by rollback or as a salvage, so no state is left that it cannot recover.
+
+There are two gaps. First, §5.3 credits the root table, the CreateTree entries and `M`, but not `R_file`'s terms computed from meta `k` (K4a). Second, the fall-back form's `B′` is exact only if image `k`'s pass 2 grows no file. A growth makes `R_file` larger than the read-only reports give, and a correct build then fails (i) and the final open of (ii) with 53200 (K4b). With both fixed, FALLBACK-SET-KEPT's extra `M` leaves `F` exactly one frame short at `B′`.
+
+### Point (b): no new "last form" (ruling: honest)
+`t_pool_floor_scattered` uses a stand-in at A-3c only for the fill's MapLeafs (S3's growth call). Its threads use the pool's own calls in both forms, in a layout no operation's pins reach. I checked the correct-build arithmetic: `F` = 94, `R_EPOCH` = 5, `R_MAP` = 26, `|T|` = 42, `|Mp|` = 14, `O` = 33 ≥ 21. MAPPIN-KEPT leaves 3 obtainable frames, so G's fourth acquisition fires the wait hook.
+
+`t_height_bound` (a) is full at A-4a, where fail-stop is A-3c's, in its closure. Its (b) runs at A-4a on S3 and S5, and in full at A-7f after a checkpoint, a close and a reopen with the smaller pool. That reopen descends no tree: there is nothing to replay and no amcheck, and step 2 reads only the directory. Every Needs cell is in its card's closure.
+
+### Point (c): "charge as built, size last" (ruling: correct, and the best of the six)
+The design cannot under-reserve, because there is no estimate. It never over-commits, because every allocation, the frames used before the sizing included, is charged against `B` first. The frames used before the sizing hold only clean pages and are dropped before a charge fails. The provisional `H` for step 2 is the one for the largest pool the budget allows, so step 2 refuses nothing the sized pool serves. The five rejected alternatives cost what the Notes say. One nit: (4)'s "about four times `B_min`" is about 2.4–2.7 times at §7.1's values.
+
+- **More trees after the open.** A CreateTree moves its bytes from `S` to `R_file` at its DDL statement, which is not a poisoning context. But a CreateTree that is never applied (an abort, or `ROLLBACK TO`) never returns them (D8, K10).
+- **A directory read error or integrity failure.** The entries charged so far go with image `k`, and a fall-back credits them (§5.2).
+
+### The height bound's new wording, and the directory at open
+"No descent passes `H` and no root split exceeds it" is right: "no tree is ever taller than `H`" is false for a tree written under a larger pool. It is applied consistently in E5, E14, R26, T8 and §4.5. Two things are missing: HEIGHT-SPLIT-UNCHECKED's failure text (K6), and the fact that writes, their replay, GC sweep steps and drop-walk steps into such a tree poison the store (K9).
+
+The author's open note on the directory is an **acceptable residual, not a hole.** A directory taller than the sized pool's `H` would need billions of trees ever created at `H_min` = 5, since no directory page is ever packed or freed. Only a test build with a lower `H_min` reaches it. Its effect would be a fail-stop at the first directory change or replayed CreateTree, recovered with a larger budget, with nothing lost. F4 makes the open refuse it up front.
+
+## Defects
+- **D1** (REWORK): §7.3 against §7.2, §4.6, §2.2 and `t_mem_open_sizes`, as above. Fix: K1. A cap above `S` is lowered to `S` at open, and `lock_escalate_rows` with it where §6.2's order needs it; `S_min < preapply_bytes` becomes the 22023 that keeps C-T0 §2.1's `ws_mem ≥ preapply_bytes` true after the lowering.
+- **D2** (REWORK): the read-only budget. Fix: K2a–K2f, in R-1-memory §3, §4.4 and §5.3 and S-STORE §5.4, §14.1 and the Changelog. A test and mutant follow as F1.
+- **D3** (REWORK): SSI spill. Fix: K3a and K3b, which point to C-T0 §8's spill under pressure on `S` and keep the per-transaction cap's 53200.
+- **D4** (REWORK): unaccounted consumers. Fix: K7a–K7f, plus K10a's row name.
+  - The walk's record buffer joins `M`, so `S ≥ M` and `B_min` count it.
+  - Two §3 rows are added: a statement's working memory, and amcheck's sets.
+  - C-T0 §9.4's per-tree garbage estimate and entry count ride on the root-table entry.
+- **D5**: the fall-back form (K4a, K4b).
+- **D6**: `t_mem_store_paths_saturated`'s budget. `B_min + 4 MiB` gives `S = S_min`, since `σ × B` is below it, and a pool about 504 frames above the minimum, not 32 (K5).
+- **D7**: K6 and K9a/K9b.
+- **D8**: K10a and K10b. A ledger leak, unbounded over repeated aborted DDL until a reopen.
+- **D9**: K8a and K8b. The allowance is drawn without any file growth when LPID allocation outruns the file: free slots outnumber free LPIDs after two checkpoint intervals of rewrites, since each page can hold three homes. One growth step also needs more MapInner pages than one path above about 127 GiB at 8 KiB pages. So the residual comes sooner than the third growth. K8 states it as it is, and F2 proposes the sizing that would make "the third growth" exact.
+
+## Corrections (one complete list; each Old occurs exactly once in the committed file named, and at its turn)
+
+In the card these become the named doc blocks' text and E6's, E8's, E24's and E25's News, plus one new S-STORE block for K2d. Its Old is §14.1's "Pool budget" sentence, which occurs once in 7.15 and once after E1–E25. It sits between E12 and E13 in file order (call it E12a, or renumber). Applied in order to 32f68472's files in scratch, the 25 entries give `docs/R-1-memory.md` sha256 `2eb26225667fd8575f9430c01382b3e3e68f76632073c5c9c0d0495178995d66` and `docs/S-STORE.md` sha256 `07b9b0406671d0f1eeea1b692608123f416e9317e1796491d199e813339c7e34`, both at the date 2026-11-17. C-T0 and README do not change. The S-STORE entries also compose with S-ZETA's, S-ETA's and S-THETA's blocks in all 24 orders of the four cards.
+
+**K1.** `docs/R-1-memory.md` — R-1-memory §7.3 (Doc block 7).
+
+Old:
+```text
+Every §7.1 value is an open option. Options that contradict each other fail the open with 22023 and write nothing: `ws_mem < preapply_bytes`; a per-account cap above `S`; `n_c = 0`; `σ` outside `(0, 1)`. A budget below `B_min` fails it with 53200 (§7.2).
+```
+New:
+```text
+Every §7.1 value is an open option. Options that contradict each other fail the open with 22023 and write nothing: `ws_mem < preapply_bytes`; `S_min < preapply_bytes`; `n_c = 0`; `σ` outside `(0, 1)`. A budget below `B_min` fails it with 53200 (§7.2). A per-account cap above `S` is not an error: once the open has sized `S` (§2.2), it lowers every such cap to `S`, and `lock_escalate_rows` to `⌊lock_mem / e_lock⌋` where the lowered `lock_mem` needs it, so that §6.2's order holds, and reports both (§8). At `B_min`, `S` is `S_min` or `M`, below several of §7.1's caps, so without the lowering no mode's defaults would open at their own `B_min`; `ws_mem ≥ preapply_bytes` still holds, since `S ≥ S_min ≥ preapply_bytes`.
+```
+
+**K2a.** `docs/R-1-memory.md` — R-1-memory §3, the read-only replay row (Doc block 3).
+
+Old:
+```text
+| a read-only open's replay | frames inside `F` | its dirty frames | 53200 at open, nothing written | S-STORE §14.1 | A-7d |
+```
+New:
+```text
+| a read-only open's replay | frames inside `F` | its dirty frames and the MapLeafs that S-STORE §4.1's pins hold for them | 53200 at open, nothing written | S-STORE §14.1 | A-7d |
+```
+
+**K2b.** `docs/R-1-memory.md` — R-1-memory §4.4, "Obtainable frames" (Doc block 4).
+
+Old:
+```text
+and `O ≥ 1` implies `|U| ≥ 1`, since an (Mu) MapLeaf has an unpinned dirty page: a thread that may still pin always finds a (U) frame, and waits at most for its brief latch holder (S-STORE §5.3).
+```
+New:
+```text
+and `O ≥ 1` implies `|U| ≥ 1`, since an (Mu) MapLeaf has an unpinned dirty page: a thread that may still pin always finds a (U) frame, and waits at most for its brief latch holder (S-STORE §5.3). A read-only open evicts no dirty page (S-STORE §14.1), so there no (Mu) MapLeaf is obtainable, and its budget counts those MapLeafs with the replay's dirty frames instead (§5.3).
+```
+
+**K2c.** `docs/R-1-memory.md` — R-1-memory §5.3, "Pass 2 runs in the pool" (Doc block 5).
+
+Old:
+```text
+- **Pass 2 runs in the pool** (S-STORE §14.1). A read-only open keeps the replay's dirty frames, so its `F` must exceed `F_min` by them, or it fails with 53200 and writes nothing (S-STORE §14.1; `t_ro_open`). The detail names the dirty frames at the failure, so the caller can size a larger read-only budget.
+```
+New:
+```text
+- **Pass 2 runs in the pool** (S-STORE §14.1). A read-only open keeps the replay's dirty frames, and with them the MapLeafs that S-STORE §4.1's pins hold for them: it evicts no dirty page, so it releases neither, and §4.4's (Mu) frames are obtainable only through such evictions. So its `F` must exceed `F_min` by both, or it fails with 53200 and writes nothing (S-STORE §14.1; `t_ro_open`); with scattered LPIDs that is up to twice the dirty frames. The detail names the dirty frames and those MapLeafs at the failure, so the caller can size a larger read-only budget.
+```
+
+**K2d.** `docs/S-STORE.md` — S-STORE §14.1, "Pool budget" (a new block, E12a, between E12 and E13; file order).
+
+Old:
+```text
+- **Pool budget.** The evictable part of the pool (`F` minus the dirty frames) must meet §5.4's minimum, both during pass 2 and after it.
+```
+New:
+```text
+- **Pool budget.** The evictable part of the pool (`F` minus the dirty frames and the MapLeafs that §4.1's pins hold for them, which a read-only open never releases, since it evicts no dirty page, and which §5.4's `R_MAP` does not count; R-1-memory §4.4, §5.3) must meet §5.4's minimum, both during pass 2 and after it.
+```
+
+**K2e.** `docs/S-STORE.md` — S-STORE §5.4, R_MAP's bullet (E6's New).
+
+Old:
+```text
+A MapLeaf whose dirty pages no thread pins is not counted: evicting those pages, which a frame acquisition does (§5.2), ends its pins.
+```
+New:
+```text
+A MapLeaf whose dirty pages no thread pins is not counted: evicting those pages, which a frame acquisition does (§5.2), ends its pins; a read-only open, which evicts no dirty page, counts such MapLeafs with its dirty frames instead (§14.1).
+```
+
+**K2f.** `docs/S-STORE.md` — S-STORE Changelog, 7.16's R_MAP bullet (E25's New).
+
+Old:
+```text
+A MapLeaf whose dirty pages no thread pins is not counted, since a frame acquisition releases it by evicting them;
+```
+New:
+```text
+A MapLeaf whose dirty pages no thread pins is not counted, since a frame acquisition releases it by evicting them, but a read-only open, which evicts no dirty page, counts such MapLeafs with its dirty frames (§14.1);
+```
+
+**K3a.** `docs/R-1-memory.md` — R-1-memory §3, the SIREADs row (Doc block 3).
+
+Old:
+```text
+| SIREADs | per transaction, `ssi_mem` | §6.2 | v7.8's escalation (kept by C-T0 §8), then 53200 | C-T0 §8 | B-2c |
+```
+New:
+```text
+| SIREADs | per transaction, `ssi_mem` | §6.2 | v7.8's escalation (kept by C-T0 §8), then 53200; under pressure on `S`, the spill to disk of SSI state that C-T0 §8 keeps from v7.8 §8.5 | C-T0 §8 | B-2c |
+```
+
+**K3b.** `docs/R-1-memory.md` — R-1-memory §6.2 (Doc block 6).
+
+Old:
+```text
+A committed transaction's retained SIREADs (C-T0 §8.6) stay charged to it until retention ends.
+```
+New:
+```text
+A committed transaction's retained SIREADs (C-T0 §8.6) stay charged to it until retention ends, or until C-T0 §8's spill moves them to disk: v7.8 §8.5, which C-T0 §8 keeps, says SSI state "is never summarised in 2.0; it spills to disk under memory pressure", and S-2b states that spill. Its temp-file buffers are charged as §6.4's are; this file does not replace the spill with a 53200.
+```
+
+**K4a.** `docs/R-1-memory.md` — R-1-memory §5.3, "After a fall-back" (Doc block 5).
+
+Old:
+```text
+its frames are dropped unwritten, and its root table, its CreateTree entries and its `M` are credited. Steps 2–3b from meta `k−1` then charge their own,
+```
+New:
+```text
+its frames are dropped unwritten, and `R_file`'s terms from meta `k` (§2.2 item 2), its root table, its CreateTree entries and its `M` are credited. `R_file`'s terms from meta `k−1`, at the file's length then, and steps 2–3b from meta `k−1` then charge their own,
+```
+
+**K4b.** `docs/R-1-memory.md` — R-1-memory §9, t_mem_open_sizes' fall-back form (Doc block 9).
+
+Old:
+```text
+come before the leaf's in the WAL that pass 2 from image `k` evicts before it reaches the leaf.
+```
+New:
+```text
+come before the leaf's in the WAL that pass 2 from image `k` evicts before it reaches the leaf, each into a free slot that neither image references, so that no open of the form grows the file (a SimEnv hook sees no extension): a growth would make `R_file` larger than the read-only reports give, and `B′` short by it on a correct build.
+```
+
+**K5.** `docs/R-1-memory.md` — R-1-memory §9, t_mem_store_paths_saturated (Doc block 9).
+
+Old:
+```text
+Embedded mode with `B = B_min + 4 MiB`, a pool 32 frames above its minimum so that applies evict,
+```
+New:
+```text
+Embedded mode with `B = B_min + 32 × (page_size + o_frame)`, so that `S` is `S_min` (`σ × B` is below it) and the pool 32 frames above its minimum, so that applies evict,
+```
+
+**K6.** `docs/S-STORE.md` — S-STORE §5.4, t_height_bound (E8's New).
+
+Old:
+```text
+HEIGHT-SPLIT-UNCHECKED fails (a): the tree reaches `H + 1` levels and no insert fails.
+```
+New:
+```text
+HEIGHT-SPLIT-UNCHECKED fails (a): the root-split hook sees the tree reach `H + 1` levels, and the insert that fails is a later one, at its descent, not the one whose reservation includes the root split.
+```
+
+**K7a.** `docs/R-1-memory.md` — R-1-memory §1, `M` (Doc block 1).
+
+Old:
+```text
+| `M` | Pass 1's set at open: what recovery's pass 1 collects (§5.3); credited when pass 2 ends. |
+```
+New:
+```text
+| `M` | Pass 1's set at open: what recovery's pass 1 collects, with the recovery walk's record buffer (§5.3); credited when pass 2 ends. |
+```
+
+**K7b.** `docs/R-1-memory.md` — R-1-memory §3, the recovery row (Doc block 3).
+
+Old:
+```text
+| recovery's pass 1 | the open's charge, `M` | §5.3 |
+```
+New:
+```text
+| recovery's pass 1 and its walk's record buffer | the open's charge, `M` | §5.3 |
+```
+
+**K7c.** `docs/R-1-memory.md` — R-1-memory §5.3, "Pass 1's set M" (Doc block 5).
+
+Old:
+```text
+since every chunked transaction wrote at least that much. It is credited when pass 2 ends, before any session exists.
+```
+New:
+```text
+since every chunked transaction wrote at least that much. `M` also holds the walk's record buffer, charged before each allocation it makes (M1): at most the longest record that pass 1, step 3b or pass 2 holds whole, itself at most `wal_seg_size / 4` (S-STORE §12.2), or the fixed buffer of a reader that takes a record in pieces. It is credited when pass 2 ends, before any session exists.
+```
+
+**K7d.** `docs/R-1-memory.md` — R-1-memory §7.2 (Doc block 7).
+
+Old:
+```text
+`M` pass 1's set (§5.3), 0 when the open replays no chunked transaction, as in every row below.
+```
+New:
+```text
+`M` pass 1's set with the walk's record buffer (§5.3), 0 when the walk reads no record, as in every row below.
+```
+
+**K7e.** `docs/R-1-memory.md` — R-1-memory §3, two rows after "temp-file buffers" (Doc block 3).
+
+Old:
+```text
+| temp-file buffers | the spilling consumer's account | per spill | charged with the spill | — | B-1a, C-4a–g |
+```
+New:
+```text
+| temp-file buffers | the spilling consumer's account | per spill | charged with the spill | — | B-1a, C-4a–g |
+| a statement's working memory: its parse and plan, rows in flight, expression results and detoasted datums | the statement's account (§2.3), in `S` | what it holds at once | 53200 for a value or a row that does not fit; the wire streams what it sends (§6.4) | executor | C-4a–g |
+| amcheck's sets (S-STORE §14 step 7) | at open, `S`, before any session; on a call, the calling session's | `⌈next_lpid / 8⌉ + ⌈slot_count / 8⌉` bytes, beside its walk's pins | 53200 to its caller, never a poison: it is a read path (S-STORE §9.2) | S-STORE §4.3 (I-FREE-EXACT), §6.8 (I-LPID-EXACT) | A-8 |
+```
+
+**K7f.** `docs/R-1-memory.md` — R-1-memory §12, the root-table row (Doc block 12).
+
+Old:
+```text
+| a root-table entry | 64 bytes | tree id, root LPID, kind and state, and a map node's share | A-7b |
+```
+New:
+```text
+| a root-table entry | 64 bytes | tree id, root LPID, kind and state, a map node's share, and C-T0 §9.4's per-tree garbage estimate and entry count, which live with it | A-7b |
+```
+
+**K10a.** `docs/R-1-memory.md` — R-1-memory §3, the root-table row (Doc block 3).
+
+Old:
+```text
+| the root table | `R_file` | `O(trees)`, about 64 bytes per tree | the open charges each entry as step 2 builds it, and one per CreateTree op that pass 2 will apply, before it sizes `S` and `F` (§2.2, §5.2); after the open, a CreateTree moves its entry's bytes from `S` into `R_file` before its gated operation, or its DDL statement fails with 53200; a DropTree's last step returns them | S-STORE §6.8, §14 step 2 | A-7b |
+```
+New:
+```text
+| the root table, with C-T0 §9.4's per-tree garbage estimate and entry count | `R_file` | `O(trees)`, about 64 bytes per tree | the open charges each entry as step 2 builds it, and one per CreateTree op that pass 2 will apply, before it sizes `S` and `F` (§2.2, §5.2); after the open, a CreateTree moves its entry's bytes from `S` into `R_file` before its gated operation, or its DDL statement fails with 53200; a DropTree's last step returns them, and so does the end of a transaction whose CreateTree is not applied | S-STORE §6.8, §14 step 2; C-T0 §9.4 | A-7b |
+```
+
+**K10b.** `docs/R-1-memory.md` — R-1-memory §5.2, "The root table" (Doc block 5).
+
+Old:
+```text
+a DropTree's last step returns them to `S`, a credit, which M2 allows.
+```
+New:
+```text
+a DropTree's last step returns them to `S`, a credit, which M2 allows, and so does the end of a transaction whose CreateTree is not applied (an abort, or a `ROLLBACK TO` before it), so that no unapplied DDL leaves bytes in `R_file`.
+```
+
+**K8a.** `docs/R-1-memory.md` — R-1-memory §5.2, "The residual" (Doc block 5).
+
+Old:
+```text
+- **The residual.** The allowance covers two growths. If sessions hold every free byte of `S` while the file grows three times, the third growth finds the allowance short, raises 53200 inside a gated operation and poisons the store (S-STORE §9.2). The remedy is a larger budget (§14, RM-T2).
+```
+New:
+```text
+- **The residual.** The allowance covers two growth steps' bitmaps and one MapInner path. If sessions hold every free byte of `S` while the store draws more than that on it, the draw that finds it short raises 53200 inside a gated operation and poisons the store (S-STORE §9.2): at the latest the third growth, and sooner where LPID allocation outruns the file, which extends the LPID bitmap and the MapInner pages with no growth (a file whose free slots outnumber its free LPIDs, as after rewrites in two checkpoint intervals), or where one step's LPIDs need more MapInner pages than one path (files above about 127 GiB at 8 KiB pages). The remedy is a larger budget (§14, RM-T2).
+```
+
+**K8b.** `docs/R-1-memory.md` — R-1-memory §14, RM-T2 (Doc block 14).
+
+Old:
+```text
+Three file growths while sessions hold every free byte of `S` poison the store with 53200 at the third.
+```
+New:
+```text
+Draws on the growth allowance past two growth steps' bitmaps and one MapInner path, while sessions hold every free byte of `S`, poison the store with 53200: at the latest at the third growth, sooner where LPID allocation outruns the file or one step needs more MapInner pages than one path (§5.2).
+```
+
+**K9a.** `docs/R-1-memory.md` — R-1-memory §4.5, "What it bounds" (Doc block 4).
+
+Old:
+```text
+A tree written under a larger pool may be taller; a read of it gets 53200 (S-STORE §19 T8).
+```
+New:
+```text
+A tree written under a larger pool may be taller; a read of it gets 53200, and a gated operation that descends it (a write, recovery's replay of one, a GC sweep step or a drop-walk step) poisons the store (S-STORE §19 T8).
+```
+
+**K9b.** `docs/S-STORE.md` — S-STORE §19 T8 (E24's New).
+
+Old:
+```text
+a read of a taller tree, written under a larger pool, gets 53200 and poisons nothing.
+```
+New:
+```text
+a read of a taller tree, written under a larger pool, gets 53200 and poisons nothing, while a gated operation that descends it (a write, recovery's replay of one, a GC sweep step or a drop-walk step) poisons the store (§5.4).
+```
+
+## Acceptance-line changes (card numbering; tried in scratch)
+
+- **Line 38** becomes:
+```text
+cd nucleus/v3 && test "$(git diff --numstat nucleus/v3-scaffold...HEAD -- docs/S-STORE.md | cut -f1,2 | tr '\t' ' ')" = '37 18'
+```
+- **Line 39** keeps its command, and its hash becomes `ea04fa141a4d008cec75aafbaec46567119baa0c4960e371f9732cd9d384c363`.
+- **Two new lines**, inserted after line 49, so the gate line becomes line 52. Neither contains a backtick.
+```text
+cd nucleus/v3 && grep -q 'A per-account cap above .S. is not an error: once the open has sized .S. (§2\.2), it lowers every such cap to .S.' docs/R-1-memory.md && grep -q 'A read-only open keeps the replay.s dirty frames, and with them the MapLeafs that S-STORE §4\.1.s pins hold for them' docs/R-1-memory.md && grep -q 'or until C-T0 §8.s spill moves them to disk' docs/R-1-memory.md && grep -q '^| SIREADs | per transaction, .ssi_mem. | §6\.2 | v7\.8.s escalation (kept by C-T0 §8), then 53200; under pressure on .S., the spill to disk' docs/R-1-memory.md && grep -q '.M. also holds the walk.s record buffer' docs/R-1-memory.md && grep -q '^| amcheck.s sets (S-STORE §14 step 7) |' docs/R-1-memory.md && grep -q '^| a statement.s working memory: ' docs/R-1-memory.md && grep -q 'and so does the end of a transaction whose CreateTree is not applied' docs/R-1-memory.md && grep -q 'R_file..s terms from meta .k. (§2\.2 item 2), its root table' docs/R-1-memory.md && grep -q 'so that no open of the form grows the file' docs/R-1-memory.md && grep -q 'so that .S. is .S_min. (.σ × B. is below it) and the pool 32 frames above its minimum' docs/R-1-memory.md && grep -q 'at the latest the third growth, and sooner where LPID allocation outruns the file' docs/R-1-memory.md && grep -q 'a gated operation that descends it (a write, recovery.s replay of one, a GC sweep step or a drop-walk step) poisons the store (S-STORE §19 T8)' docs/R-1-memory.md
+cd nucleus/v3 && ! grep -n 'a per-account cap above .S.; .n_c = 0.\|so its .F. must exceed .F_min. by them, or\|(kept by C-T0 §8), then 53200 | C-T0 §8 |\|while the file grows three times, the third growth finds\|Three file growths while sessions hold\|0 when the open replays no chunked transaction\|B = B_min + 4 MiB' docs/R-1-memory.md && grep -q 'the MapLeafs that §4\.1.s pins hold for them, which a read-only open never releases' docs/S-STORE.md && grep -q 'a read-only open, which evicts no dirty page, counts such MapLeafs with its dirty frames instead (§14\.1)\.' docs/S-STORE.md && grep -q 'the root-split hook sees the tree reach .H + 1. levels, and the insert that fails is a later one, at its descent' docs/S-STORE.md && grep -q 'while a gated operation that descends it (a write, recovery.s replay of one, a GC sweep step or a drop-walk step) poisons the store (§5\.4)\.' docs/S-STORE.md && ! grep -q 'the tree reaches .H + 1. levels and no insert fails' docs/S-STORE.md
+```
+- **Tried.** I committed the corrected files in scratch on 71ecf3e6 (scratch commit 42bcf9c0, a throwaway). There, all 51 non-gate lines pass under both locales: the 49 old ones with 38 and 39 changed as above, plus the two new ones. At 32f68472 the two new lines fail, and so do 38 and 39 with the new values. Line 37's checker is unchanged: K adds no row, test or mutant. The rework recomputes the Notes' dry-run sha256s and the author's evidence, and its count of Acceptance commands becomes 52.
+
+## Card text the rework must update (beyond the blocks)
+- **Blocks.**
+  - K1–K10's R-1-memory text goes into doc blocks 1, 3, 4, 5, 6, 7, 9, 12 and 14.
+  - E6's, E8's, E24's and E25's News take K2e, K6, K9b and K2f.
+  - The new block for K2d is added; Limit 2's and Work 3's "E1–E25" name it.
+- **Findings, Decisions and "For the gate"** gain D1–D4's points:
+  - the caps are lowered at open;
+  - a read-only open counts the MapLeafs its dirty frames pin;
+  - SSI spills, as C-T0 says;
+  - four more consumers are listed.
+- **Mutation evidence.** HEIGHT-SPLIT-UNCHECKED's row reads like K6. The author's evidence, the Notes' hashes and the command count are recomputed.
+- **Sources.** "Item 22, P-1 (accepted 2026-11-16)" overstates the plan's record. The plan says P-1 was "accepted by the conditional reply" and that "the reply's condition is not shown to be met for this point", and that the 16:0x delegation did not cover it. Say that instead. The committed docs say only "owner point P-1's figure", which is accurate.
+- **Open points.** P-R2's and P-R5's plain words take this verdict's facts (below).
+- **Notes.**
+  - Add "If S-ZETA, S-ETA or S-THETA merges first", as those cards' Notes describe for R-1-SPEC.
+  - Correct the (c)(4) nit: about 2.4–2.7 times `B_min`, not four.
+- **"For the plan card"** gains F1–F7.
+
+## Tests and mutants, test by test
+Every test below names its hooks and held locks and waits on a hook or a count, never on time. Each is judged on the card that builds its code: line 37 for the Phase A rows, and my own reading.
+- **`t_pool_minimum`** (A-3b) is deterministic, and the test computes R-1's minimum itself. Under MIN-RMAP-DENSE the build's minimum is `n(H_min + 2) + R_EPOCH` frames smaller, and under MIN-RESERVE-NO-STEP2 `2s` frames smaller. Both accept the pool one frame below the minimum: caught.
+- **`t_pool_floor_scattered`** (A-3c on S3; A-4a in full) passes on a correct build, as point (b) shows. Its wait hook sits where every build blocks for an unpin, and MAPPIN-KEPT fires it.
+- **`t_height_bound`** (A-4a; A-7f in full) passes on a correct build. HEIGHT-SPLIT-UNCHECKED is caught by the root-split hook. Its stated failure, "no insert fails", is false: the next insert's descent check returns 53200 (K6). HEIGHT-DESCENT-UNCHECKED is caught by the read in (b), in both forms.
+- **The floor variant of `t_epoch_reserve_two_exhausters`** (A-3c, A-7a). A correct build has two unlatched reserve frames. RESERVE-PER-THREAD-ONLY leaves none, and the run fails by the step budget. CLAIM-DEPTH-TWO fails through the reserve's latch hook. The hooks release no one before the last first touch completes.
+- **R-1's own tests.**
+  - `t_mem_heap_accounted`, `t_mem_caps` and `t_mem_admission` pass on a conforming build, and each named mutant fails them.
+  - `t_mem_account_returns` passes and catches its mutant. It has no case for an aborted CREATE (G3, F6).
+  - `t_mem_store_paths_saturated` passes, given K5 and, at `S = S_min`, K1's lowering.
+  - `t_mem_growth_allowance` passes, reading the allowance's size as recomputed for the next two steps after each growth.
+  - `t_mem_open_sizes` fails a correct build as committed (D1) and passes with K1. Its fall-back form passes with K4.
+  - No test samples an open that replays records (G2), and none checks the read-only budget with scattered dirty pages (G1). F1 and F6 add them.
+
+## Rulings on P-R1 to P-R6 (the gate's part)
+- **P-R1.** Technically right. `R_MAP = n(H + 2) + R_EPOCH`, with E3's premise, is enough for a read-write store and is needed in the worst case the card names. Three paths per thread are too few, and six buy nothing. A read-only open needs K2. The memory cost is the owner's (below).
+- **P-R2.** The rule is enforceable and consistent with S-STORE §9.2. Recovery replays the failed commit under a larger budget. A fixed limit would be worse. The text needs K6 and K9. The directory note is an acceptable residual, with F4.
+- **P-R3 and P-R4** are the owner's. The gate's only technical point is D1: the default caps must be lowered at small budgets or `B_min` does not open (K1).
+- **P-R5.** The residual is real, and recovery under a larger budget clears it, but its stated trigger was too narrow (D9). K8 states it as it is. Accepting it is the owner's choice.
+- **P-R6.** Technically required: `n_c` is a term of `F_min`, so an uncapped count would make the floor false. The default numbers are the owner's.
+
+## Owner points, in plain words (stated here, not decided)
+- **P-1 and P-R1, memory per connection.** Each thread or connection that can hold pages needs room for four tree paths of pages: about 224 KiB per thread at 8 KiB pages and a height floor of 5. P-1, the earlier and smaller figure (168 KiB, three paths), has no answer in the owner's own words. The plan records it as accepted only by a conditional reply whose condition "is not shown to be met", and the 16:0x delegation did not cover it. At 8 embedded connections the floor is about 2 MiB of pages. The total minimum is about 8.3 MiB for a 1 GiB file.
+- **P-R2, the height bound.** The memory budget decides how tall an index tree may grow. A tree that would grow past the bound stops the database. It is reopened with a larger budget and nothing committed is lost. At the default budgets the bound is far beyond any real table. Near the minimum budget it is 5 levels, and three things follow:
+  - A table whose keys are near the maximum size and share long prefixes can reach it after a few hundred to a few thousand rows.
+  - A database reopened with a smaller budget than it was written under answers "out of memory" when a tall tree is read.
+  - It stops on the first write, recovery replay, garbage-collection pass or drop cleanup of that tree, even with no client write.
+
+  The alternative, letting fewer connections into the store as trees grow, never stops it, but costs a shared counter on every storage call.
+- **P-R3 and P-R4, budgets and thresholds per mode.**
+  - Budgets: server 25% of memory (at least 256 MiB), embedded 64 MiB, browser 32 MiB, a quarter of each for sessions.
+  - Per-transaction caps as listed in R-1-memory §7.1.
+  - With K1, at small budgets the store lowers any per-session or per-transaction cap above the session pool to fit it, and reports that. So a small database fails a very large transaction sooner, with "out of memory", instead of refusing to open.
+  - Embedded and browser databases switch big transactions to coarse locks sooner.
+- **P-R5, the growth residual.** The database stops if sessions hold every byte of session memory while the file's bookkeeping grows past its reserve. That is the third file growth in a row at the latest. It can come sooner: when the file has more free space than free page ids, as after heavy rewrites, or on files above about 127 GiB at 8 KiB pages. Nothing committed is lost, and a reopen with a larger budget clears it. F2 would make it exactly "three growths".
+- **P-R6, the connection cap.** An embedded app can open 8 connections by default, a browser 2. One more gets "too many connections". The cap is what keeps the memory floor true, and the app can raise it.
+
+## Merge order with S-ZETA, S-ETA and S-THETA, and S-THETA's pool rules
+- **Their Notes are right.** Only the status head and the Changelog head overlap with R-1-SPEC, by design, and the shared anchors work in either order.
+  - I parsed all four cards' S-STORE blocks with my own code and composed them on 7.15 in all 24 orders. Every Old applies once at its turn in every order.
+  - Each pair's two orders differ only at line 3 and the top Changelog entries.
+  - With K2d, K2e, K2f, K6 and K9b added to R-1-SPEC's set, all 24 orders still apply. No block of the other three mentions "Pool budget", the evictable part, `R_MAP`, or the other sentences K changes.
+  - Whichever card merges later takes the mechanical rebase that card's Notes describe: draft 7.17 or 7.18, the base hash, the status chain, its counts, its checker's mutant set and base, and its numstat and hash lines.
+  - R-1-SPEC's own card has no such Note for S-ZETA, S-ETA or S-THETA (it predates them). The rework adds one, as listed above.
+- **S-THETA's pool rules change nothing in R-1's accounting.**
+  - A load's MapLeaf pin is in the path term, as S-THETA argues.
+  - A frame being loaded is pinned, so it is (T).
+  - A freed frame is clean and unpinned, so it is (U), and its MapLeaf pin ends, which only shrinks (Mu).
+  - A creation that waits for a load under its tree latches waits for no page read and obtains no frame.
+  - "One frame per page" removes duplicate frames.
+  - R-1-memory §5.3's "drops every frame" at a fall-back is S-THETA's (b) exactly.
+- **One pointer is due after both merge:** R-1-memory's "step budget" (`t_mem_caps` (x)) should point to S-THETA's definition in S-STORE §15 (F5).
+- **S-ETA.** Its 22023 for invalid parameters matches R-1-memory's use, and its `wal_seg_size` floor needs nothing more from R-1. R-1-memory §6.1 already lowers `preapply_bytes` to `wal_seg_size / 4`.
+
+## Merge timing (for the record)
+By P0 re-check 1 this card may be built and gated on a branch but may NOT merge before P0 PASS unless the owner says so in their own words.
+
+## Follow-ups
+- **R-1-SPEC-F1 (S-STORE spec card, before A-7d is cut).** The read-only budget gets a test and a mutant.
+  - `t_ro_open`, or `t_ro_open_disk_full`, gains a form whose replay dirties pages under MapLeafs of their own.
+  - A pool at `F_min` plus the dirty frames plus those MapLeafs opens. One frame below fails with 53200 and writes nothing.
+  - Mutant **RO-BUDGET-DIRTY-ONLY** (the budget counts the dirty frames only): the replay waits for an unpin within the step budget, or the open succeeds at a budget the rule refuses.
+  - Judged on A-7d. The rework may instead carry it now, with line 37's counts updated.
+- **R-1-SPEC-F2 (R-1 spec, before R-1's Phase B card).** Size the growth allowance so that "the third growth" is exact:
+  - size `R_file`'s LPID bitmap and MapInner terms for `max(next_lpid, slot_count)` LPIDs, plus a bound for the pool's never-written pages (at most `F`, bounded before the sizing by the largest pool);
+  - make the allowance's MapInner term follow each step's LPIDs (`⌈g / (page_size × f²)⌉` plus a path per step) rather than one path;
+  - recompute §4.6 and §7.2.
+- **R-1-SPEC-F3 (R-1 and A-7c, before A-7c is cut).** S-STORE §13 step 2 derives image `k`'s slot bitmap "from its built map" and then serialises "both bitmaps of image `k`". If that needs a copy of the two bitmaps beside the current ones, about `⌈slot_count / 8⌉ + ⌈next_lpid / 8⌉` bytes inside a checkpoint step (a poisoning context), reserve it in `R_file`. Otherwise state how step 2 avoids it, for example by building it in the pending-free generation that is idle between step 6s. Today neither is said.
+- **R-1-SPEC-F4 (R-1 spec, before R-1's Phase B card).** The open refuses with 53200, writing nothing, when the directory, which step 2 has descended, is taller than the sized pool's `H`. Today it opens, and the store fails at the first directory change or replayed CreateTree.
+- **R-1-SPEC-F5 (the next S-STORE card; pointers only).**
+  - S-STORE §14 step 3b names only `RequireCkpt`. Point it to R-1-memory §5.2, which counts the CreateTree ops while step 3b reads the records, and point §6.8's CreateTree to §5.2's move of bytes from `S` to `R_file`.
+  - After S-THETA merges, R-1-memory's "step budget" points to S-STORE §15.
+- **R-1-SPEC-F6 (R-1 spec, with or before R-1's Phase B card).** Tests for the corrections that have none:
+  - `t_mem_open_sizes`' report shows every cap at most `S` at `B_min` (K1);
+  - a `t_mem_heap_accounted` form samples after an open whose replay reads a record of `wal_seg_size / 4` (K7, G2), and another after amcheck;
+  - `t_mem_account_returns` gains an aborted CREATE TABLE and a `ROLLBACK TO` past one, after which `R_file` is back at its value (K10, G3).
+- **R-1-SPEC-F7 (S-STORE question; depends on P-R2).** A GC sweep step or a drop-walk step whose descent would pass `H` could skip the tree with a report rather than poison the store. §9.2's reason for poisoning before a mutation, a job retrying forever, does not hold for a skip that waits for a reopen with a larger budget. Today a store reopened under a smaller budget can stop by itself (K9).
+
+## Not verified
+- No code exists. Every test and mutant above was walked as text, and the Phase B tests' passability rests on reading.
+- The provisional constants are not measured: `o_frame` 128, 64 bytes per root-table entry, `e_lock` 128, the 1/32 slope. I checked that the rules, not these numbers, govern.
+- Whether step 2 at a checkpoint holds image `k`'s bitmaps beside the current ones (F3) is undecided here.
+- That S-2b will state SSI's spill as v7.8 §8.5 promises: S-2b is not written.
+- The "billions of trees" estimate for a directory of height 6 is arithmetic on assumed cell sizes, not measured.
+- Which two files fresh-gate matched "through their eol conversion" (the script prints only a count); the check passed.
+- The implementer's own log: none exists for R-1-SPEC in `cards/logs/`. Its reported results were checked against the commit, not against a log.
+- C-T6-rehost and C-T0 v7.8 were read only where cited.
