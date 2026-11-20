@@ -1,17 +1,189 @@
 Card: S-ZETA
 Class: spec
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session 1fd0c91e-03e0-4018-a9b8-755bfca21238 (independent P gate 1 of S-ZETA; it wrote neither the card, its implementation 5c62470b, nor any verdict of A-2-0, and is not the orchestrator)
-Date: 2026-11-17
+Gate-session: T3 review sub-agent, Claude Code session fe4ac879-18e5-48b7-ac50-9730f0dfc01c (independent P gate 2 of S-ZETA, a narrow re-gate after rework 1; it wrote neither the card, its implementation 5c62470b, the rework b84d5c03, nor gate 1's verdict 6d4465ca, and is not the orchestrator)
+Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: 5c62470b7bf66431f2976b28836449cf60f7c32c
-Mutants: spec text, none in code; each walked on the committed text, and the A-2 ones also run in the gate's own executable model of the table form exactly as Z6 lists it (16 symbols, 4 page-0 states, 262,144 cases; ~/.cache/nv3-review/gate-S-ZETA/tools/mutants.py), numbers = cases whose outcome changes: MALFORMED-AS-TORN -> table form (65,876) and fault form later-format runs 1 and 2, IDENTITY-NO-FV-ALG -> table form (36,786), STATICS-AS-FOREIGN -> table form (4,860), IDENTITY-DOMAIN-SKIP -> table form (896) and later-format run 3, FOREIGN-MALFORMED-REFUSES -> table form (3,860) and the foreign copy's second run, UNLOCATED-AS-CORRUPT -> table form (256) and the unlocated variant, META-RANGE-SKIP -> table form (16,193) and t_cover_ts_cross_check, FENCE-BEFORE-REFUSAL -> fault form unlocated variant (byte identity), WRITE-MALFORMED -> write form (forged meta, forged page 0). Gate's own: G-REFUSE-NEWER-ONLY (a refused copy whose ckpt_id is below the newest valid meta's is ignored as stale) -> UNCAUGHT by every test the card specifies (0 of 262,144; 10,124 after RW-3), G-58030-FIRST (the all-unreadable 58030 check runs before page 0's refusal) -> table form (1 case: page 0 format_version 2, U U U U), G2-IDENTITY-NO-FV-ALG (gate 2's code edit, the domain checks kept) -> equivalent (0 cases), G-PAGE0-UUID-FOREIGN (an intact page 0 that is not well-formed is ignored when its uuid is not the replicas') -> UNCAUGHT (no foreign page-0 state; not blocking, RW-1 removes its textual support). Text mutants: each of the 22 blocks left out, and 14 planted errors, each fails its own Acceptance line(s) and line 30 in both locales. All in scratch clones; the worktree was never written
-Followups: S-ZETA-F1, S-ZETA-F2
+Commit: b84d5c03ba3314c31626a93cb391f852390b7ef1
+Mutants: spec text, none in code; the A-2 ones run in this gate's own model of the table form, written from the reworked text and independent of gate 1's (16 symbols, 4 page-0 states, 262,144 cases; ~/.cache/nv3-review/gate2-S-ZETA/tools/model2.py), numbers = cases whose outcome changes with RW-3a's alphabet: G-REFUSE-NEWER-ONLY -> table form (13,952; 0 with 5c62470b's alphabet, gate 1's finding reproduced), MALFORMED-AS-TORN -> table form (61,098), IDENTITY-NO-FV-ALG -> table form (15,222), STATICS-AS-FOREIGN -> table form (4,394), IDENTITY-DOMAIN-SKIP -> table form (1,120), FOREIGN-MALFORMED-REFUSES -> table form (3,446), UNLOCATED-AS-CORRUPT -> table form (256), META-RANGE-SKIP -> table form (14,838), TIE-NO-BOOT-ID -> table form (3,109), TIE-EQUAL-OPENS -> table form (2,092), MISPLACED-SHADOWS -> table form (3,124), IDENTITY-SKIP -> table form (24,302), PAGE0-REQUIRED -> table form (9,664), META-WRONG-SLOT -> table form (19,388), MISPLACED-NEXT-REFUSES -> table form (2,712), MISPLACED-IGNORED -> table form (12,996), G-58030-FIRST -> table form (2), FENCE-BEFORE-REFUSAL -> fault form unlocated variant (byte identity; text unchanged by the rework), WRITE-MALFORMED -> write form (text unchanged by the rework). Text mutants: each RW block left out (RW-1, RW-2, RW-3a, RW-3b, RW-4) fails its own Acceptance line and line 30 in both locales; 5c62470b's file fails lines 8, 9, 12, 14 and 30. All in a scratch clone; the worktree was never written before this verdict
+Followups: S-ZETA-F1, S-ZETA-F2, S-ZETA-F3
 
 ## Verdict in brief
+
+**MERGE-WITH-FOLLOWUPS.** Rework 1 (b84d5c03) applies gate 1's RW-1 to RW-4 exactly and changes nothing else. The card now matches gate 1's lists and rebuilds the file byte for byte. The fresh gate gives `GATE EXIT=0`. All 31 non-gate Acceptance lines pass in both locales, and the checker prints `OK`. The test gap behind RW-3 is closed: G-REFUSE-NEWER-ONLY changes 0 of 262,144 table-form cases with 5c62470b's alphabet and 13,952 with the reworked one, in this gate's own model, and every named mutant is still caught.
+
+One new non-blocking finding comes from re-reading the text, and it predates the rework (S-ZETA-F3). §2.2's first 58030 sentence, which RW-2 rewrote, still reads as 58030 for a **torn** page 0 with all four meta places unreadable. The identity bullet and the table form's explicit expectation give XX001 there. §14.2's 58030 row overlaps in the same way. In both cases the open refuses and writes nothing, and the table form's own sentence decides what the test expects. Only the error code is at stake, never a rollback or a refused covered single fault. So this does not block. An exact Old/New list, tried in scratch, is in S-ZETA-F3.
+
+## Gate run
+
+- **Extract.** GATE-PROMPT step 1's shallow `--no-local` clone was made under `~/.cache/nv3-review/gate2-S-ZETA/`. It printed scaffold id `71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`, with no `EXTRACT FAILED` line. The directory was removed afterwards.
+- **Run.** From `~/Workspace/neutron-v3`: `PATH=$HOME/.cargo/bin:$PATH CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate2-S-ZETA bash "$fg/fresh-gate.sh" b84d5c03ba3314c31626a93cb391f852390b7ef1`, with stdout and stderr in separate files. Stderr was empty, and the script exited 0.
+- **`fresh-gate:` lines.**
+  - `commit b84d5c03ba3314c31626a93cb391f852390b7ef1`
+  - `base 71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`
+  - `checks passed (4875 files hashed in 2.40 s)`
+  - `2 file(s) matched through their eol conversion`
+- **STEP lines.** `test`, `clippy`, `fmt`, `deny`, `wasm32`, `core-paths-selftest`, `enforcement-tests` and `api-surface`, each `EXIT=0`. The literal last line was `GATE EXIT=0`.
+- **The flake.** The known spike flake (`readers_never_see_past_their_snapshot_during_apply`) did not occur: one run, green.
+- **Scope.**
+  - b84d5c03 has one parent, 6d4465ca (gate 1's verdict), and changes only `nucleus/v3/docs/S-STORE.md`, +4/−4.
+  - Against the scaffold, the diff is `docs/S-STORE.md` (numstat `36 19`) plus `verdicts/S-ZETA.md`.
+  - Nothing touches a protected path. The worktree was clean before this verdict.
+
+## 1. The rework is RW-1 to RW-4, exactly
+
+- **The spec.** My own script (`apply_rw.py`) took the five Old/New pairs from gate 1's verdict (RW-1, RW-2, RW-3a, RW-3b, RW-4) and applied them to `docs/S-STORE.md` at 5c62470b. Each Old occurs once at its turn.
+  - The result equals b84d5c03's file byte for byte: sha256 `6c186f8975845278151c2f34465a38d5f13ec847f51609ed63a092b1d80025c4`, the result gate 1 stated (`6c186f89…25c4`).
+- **The card** (`cards/S-ZETA.local.md`, sha256 `cbf75339…2495` at gating) against its pre-rework backup:
+  - **The blocks.** Lines 131, 142, 175 and 208 are Z2's, Z3's, Z6's and Z9's New blocks. E1, Z1–Z20 and E2, parsed fence-aware and applied in order to the base's 7.15 (`a1376c94…700f`) with the commit's date, rebuild b84d5c03's file byte for byte. With 2026-11-16 they give `70b49911…1bbb`, the dry-run hash the card now states (line 415). The backup's blocks rebuild 5c62470b's file.
+  - **Acceptance.** Lines 8, 9, 12, 14 and 30 are character for character gate 1's replacements. No other Acceptance line changed, and line 29 stays `36 19`.
+  - **The other edits match gate 1's "Card text the rework must update", item by item:**
+    - case 6's cell ("XX001 at 7.15's and this card's reading; A-2-0's reading opens");
+    - "For the plan card" item 3's alphabet (`format_version` 2 and `T` above `ts_ckpt_hi` higher, in their own parity; `map_level` 0 and `page_size` 8192 two below);
+    - the Notes "S-ETA: a semantic overlap", "S-THETA: overlaps", "If S-ETA merges first" (with Z2's 212 change) and "If S-THETA merges first".
+  - **No stale card prose.** No pre-rework form of RW-1 to RW-4 (the higher-only symbol list, "naming a place and", "is foreign (below).", the unconditional 58030 clause, the old hash `1d086ffd…`) is left in the card. The mutant table's claims (MALFORMED-AS-TORN past `map_level` 0, STATICS-AS-FOREIGN past `page_size` 8192, IDENTITY-NO-FV-ALG and META-RANGE-SKIP on the higher symbols) stay true with the stale symbols.
+
+## 2. Acceptance, both locales; omit-one per RW
+
+- **Acceptance.** The 32 commands were extracted from the card by my own scan of the "## Acceptance" section, with no backtick inside any command.
+  - The 31 before `gate.sh` were run as `/bin/sh -c` in a `--shared` scratch clone at b84d5c03, with a local `nucleus/v3-scaffold` at 71ecf3e6. They ran once under `LANG=en_CA.UTF-8` and once under `LC_ALL=C`.
+  - Result: 31/31 in each locale. Line 32 is the fresh gate above.
+- **The checker (line 28).** It prints `158 rows; 234 mutants; 24 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`, `65 new since 7.10 (31 at 7.11, 11 at 7.12, 4 at 7.13, 10 at 7.14, 1 at 7.15, 8 here), 65 of them judged on a Phase A row; 47 invariants, 48 tests`, then `OK`, in both locales.
+- **Omit one.** For each RW block, I committed on a scratch branch the 5c62470b file with every RW block but that one, and ran it in both locales. The locales agree every time.
+
+  | Left out | Failing lines |
+  |---|---|
+  | RW-1 | 8, 30 |
+  | RW-2 | 9, 30 |
+  | RW-3a | 12, 30 |
+  | RW-3b | 12, 30 |
+  | RW-4 | 14, 30 |
+  | all five (5c62470b's file) | 8, 9, 12, 14, 30 |
+
+## 3. G-REFUSE-NEWER-ONLY and the named mutants, re-run
+
+**The model.** I wrote it from the reworked §2.2, not from gate 1's model (`tools/model2.py`).
+- **Places.** Slot 1 and replica 0 are parity 0, whose newest is `k` = 10. Slot 2 and replica 1 are parity 1, whose newest is 9.
+- **The 16 symbols:**
+  - valid newest, and the same copy written for the other place;
+  - valid stale (two below);
+  - torn, zeros and unreadable;
+  - two misplaced copies: one `ckpt_id` above `k`, and one two or more above it, or in parity 1 a copy of `k` itself;
+  - a foreign copy at a higher `ckpt_id`, and a foreign copy with `format_version` 2;
+  - the newer-`boot_id` tie copy and the equal-`boot_id` tie copy;
+  - the four refused copies.
+- **The refused copies.** With RW-3a's form, `format_version` 2 and `T` above `ts_ckpt_hi` sit two above their parity's newest, in their own parity, and `map_level` 0 and `page_size` 8192 sit two below it. With 5c62470b's form, all four sit higher.
+- **Page 0** is valid, torn, unreadable, or intact with `format_version` 2.
+- **Cases.** 262,144 per alphabet.
+- **Spot checks.** Healthy opens 10 with previous 9. Page 0 and both replicas unreadable gives 58030. Page 0 valid with every place unreadable gives 58030. Page 0 `format_version` 2 with every place unreadable gives XX001. Page 0 torn with every place unreadable gives XX001, by the identity bullet (see S-ZETA-F3).
+- **Outcomes, the same with either alphabet:** open 20,483, XX001 241,404, 58030 257.
+
+**G-REFUSE-NEWER-ONLY** is a build that defers each refusal and refuses only when the refused copy's `ckpt_id` is at least the newest valid meta's.
+- With 5c62470b's alphabet it changes **0** cases, so gate 1's RW-3 finding reproduces.
+- With RW-3a's alphabet it changes **13,952**; for example, page 0 valid with `map_level` 0 stale in slot 1 and valid copies elsewhere opens meta 10 where the rule gives XX001.
+- So it is now caught by the table form. Gate 1 counted 10,124 with its own model. The two models differ in their misplaced and foreign symbol choices, so the counts differ while the conclusion is the same.
+
+**Every named A-2 mutant is still caught**, with the same count under either alphabet except IDENTITY-SKIP (28,115 with the old one, 24,302 with the new):
+
+| Mutant | Cases changed |
+|---|---|
+| MALFORMED-AS-TORN | 61,098 |
+| IDENTITY-NO-FV-ALG | 15,222 |
+| STATICS-AS-FOREIGN | 4,394 |
+| IDENTITY-DOMAIN-SKIP | 1,120 |
+| FOREIGN-MALFORMED-REFUSES | 3,446 |
+| UNLOCATED-AS-CORRUPT | 256 |
+| META-RANGE-SKIP | 14,838 |
+| TIE-NO-BOOT-ID | 3,109 |
+| TIE-EQUAL-OPENS | 2,092 |
+| MISPLACED-SHADOWS | 3,124 |
+| IDENTITY-SKIP | 24,302 |
+| PAGE0-REQUIRED | 9,664 |
+| META-WRONG-SLOT | 19,388 |
+| MISPLACED-NEXT-REFUSES | 2,712 |
+| MISPLACED-IGNORED | 12,996 |
+| G-58030-FIRST (gate 1's) | 2 |
+
+- **G-58030-FIRST.** Its two cases are page 0 `format_version` 2 and page 0 torn, each with every place unreadable.
+- **FENCE-BEFORE-REFUSAL and WRITE-MALFORMED** are judged on A-7d and A-7c by text the rework did not touch. Gate 1's walk of them stands.
+
+## 4. The reworked text, re-read
+
+- **RW-1.** A misdirect from another file over page 0 now "fails the open, as another file's well-formed page 0 does". This is consistent:
+  - an intact page 0 that is not well-formed is refused (XX001);
+  - a well-formed foreign page 0 makes every copy of this file foreign, so no candidate remains (XX001);
+  - §14.2's rows match.
+- **RW-2.** The page-0 refusal now precedes the all-unreadable 58030, as the identity bullet and §14.2's refusal row say. But the new "unless" reads as a complete list of exceptions, and it is not: see S-ZETA-F3.
+- **RW-3a and RW-3b.** The other places that list the table's symbols or restate the expectation (§15.1's A-2 row, the mutant entries at lines 152–157, the card's mutant table) name no `ckpt_id`, so none is stale. "whatever its `ckpt_id`" states what the rule's "in any place … its `ckpt_id` cannot be relied on" already requires.
+- **RW-4.** "naming page 0 or a place" matches the identity bullet's detail ("detail: page 0, the field and its value") and the copy refusal's ("the place, the field and its value").
+- **The restatement search.** Outside the Changelog, I searched the whole spec for "58030", "every place's read fails", "Every meta place unreadable", "unlocated", "higher `ckpt_id`", "`map_level` 0", "four symbols", "naming", "is foreign" and "over page 0", and read each hit in context.
+  - None states a pre-rework form of RW-1, RW-3 or RW-4.
+  - The one 58030 overlap is S-ZETA-F3.
+  - §14 step 1's range-check sentence ("in any place, the open fails with XX001") agrees with RW-3b.
+- **The S-ETA, S-THETA and R-1-SPEC cards** contain neither "every place's read fails" nor "Every meta place unreadable", so S-ZETA-F3's Olds are outside their blocks.
+
+**Gate 1's rulings, carried unchanged:**
+- **The P0 fact.** At 7.15, under the events 7.15 covers, the text is not defective: no covered fault or crash makes an intact record of the file with an out-of-range field. 7.15 is under-specified, because §2.2 and §14 step 1 are two-minded. It lacks future-proofing: a later format version gets a silent rollback with loss after a downgrade. That is a due point before A-7d and before 2.0 ships, not a 7.15 failure under its own model. The table is in History, gate 1 §4.
+- **The owner points** OP-1 (55000 instead of XX001 for a newer-version file) and OP-2 (refuse, read-only included, with no override in 2.0) are in History, gate 1, "Owner points". They are not decided here.
+- **"For the plan card"** is as gate 1 left it. In particular, A-2-0-F1's gate re-runs G-REFUSE-NEWER-ONLY and G-58030-FIRST and keeps the new symbols in their own parity.
+
+## Merge timing (for the record)
+
+This card may not merge before P0 PASS unless the owner says so in their own words.
+
+## Not verified
+
+- **No code.** The 7.16 rule has no implementation yet; that is A-2-0-F1's work. Every count above comes from this gate's model of the text, which abstracts each record to its fields and does not reproduce A-2-0's byte layouts or exact `ckpt_id`s.
+- **The A-7c and A-7d forms.** They were not re-walked, beyond RW-4's detail wording; the rework did not touch them.
+- **Gate 1's other claims.** I did not re-run them: the 22-block omission and the 14 planted errors on 5c62470b, the 200-case covered-fault enumeration, and the PostgreSQL citation.
+- **Merge orders.** S-ZETA-F3's Olds were checked against the S-ETA, S-THETA and R-1-SPEC cards by grep only, not by composing the files.
+- **The flake.** It was not met, so it was not reproduced.
+
+## Follow-ups
+
+- **S-ZETA-F1. O-1's spec card, before A-7d.** Carried from gate 1, unchanged; the full text is in History, gate 1, "Follow-ups". A page of image `k` that passes §3.3's four checks but that its decoder refuses counts as failing at open. The fall-back, the explicit rollback and the read-only salvage then reach image `k−1`. The card changes §14 step 4a, I-FALLBACK, §14.2's fall-back rows and R18 together, and adds a body-corrupting hook and the mutant FALLBACK-CHECKS-ONLY.
+- **S-ZETA-F2. The later-version rule's limits, for D-8 and §17.** Carried from gate 1, unchanged; the full text is in History. It covers §17's D-8 rider (its Old still occurs once at b84d5c03) and D-8's plan row with the three upgrade facts.
+- **S-ZETA-F3. §2.2's 58030 sentence and §14.2's 58030 row: a torn page 0 with every meta place unreadable is XX001.**
+  - **The conflict.** §2.2 "At open" says: "if every place's read fails, the open fails with 58030 unless page 0 is intact but not well-formed (below)". Read literally, a torn page 0 with all four meta places unreadable gives 58030. The identity bullet gives XX001 there ("if neither holds an intact copy … XX001"), and so does the table form's explicit "page 0 torn with both replica blocks' reads failing gives XX001". That is also the stated rationale for 58030: "the open has seen no damage" is false when page 0 is torn. §14.2's row "Every meta place unreadable, or page 0 and both replica blocks unreadable | 58030" overlaps the row "page 0 and both replicas invalid, not all three unreadable | XX001" in the same case. The summary defers to §2.2 ("where it and they differ, they rule"), but §2.2 is itself two-minded here.
+  - **Why it does not block.** The conflict is pre-existing: 7.15 and 5c62470b have it in their 58030 sentence and identity bullet, and gate 1's §2 table lists "page 0 torn with both replicas unreadable → XX001" as pre-existing (card O-3). Both outcomes refuse and write nothing. The table form's own sentence decides what the test expects. A build that follows the literal sentence (58030) is caught by the table form in exactly that case, as one of G-58030-FIRST's two.
+  - **The fix,** with the next S-STORE spec card. Each Old occurs once at b84d5c03. The result, tried in scratch, changes exactly those two lines and nothing else. This card's Acceptance line 9 pins the current §2.2 sentence, so it is the fixing card's to update.
+    - §2.2:
+
+      Old: `if every place's read fails, the open fails with 58030 unless page 0 is intact but not well-formed (below), and so it does when page 0's read and both replica blocks' reads fail`
+
+      New: `if every place's read fails and page 0 is intact and well-formed, the open fails with 58030, and so it does when page 0's read and both replica blocks' reads fail`
+    - §14.2:
+
+      Old: `| Every meta place unreadable, or page 0 and both replica blocks unreadable (§2.2) | 58030 | 58030 |`
+
+      New: `| Every meta place unreadable with page 0 intact and well-formed, or page 0 and both replica blocks unreadable (§2.2) | 58030 | 58030 |`
+  - **A-2-0-F1's table form** should assert XX001 for the case of page 0 torn with every place unreadable, by name.
+
+## History
+
+The verdicts of record before this one, newest first. Each keeps its header with every line prefixed by "- ", so `vfield` reads only the header at the top of this file.
+
+### Gate 1 (verdict commit 6d4465ca4693451a1e496d6a5d5610ac0fe60b53, on 5c62470b7bf66431f2976b28836449cf60f7c32c)
+
+Gate 1's verdict, verbatim except that each header line is prefixed with "- " and each "## " heading is demoted to "#### ":
+
+- Card: S-ZETA
+- Class: spec
+- Card-gate: P
+- Verdict: REWORK
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent, Claude Code session 1fd0c91e-03e0-4018-a9b8-755bfca21238 (independent P gate 1 of S-ZETA; it wrote neither the card, its implementation 5c62470b, nor any verdict of A-2-0, and is not the orchestrator)
+- Date: 2026-11-17
+- Gate-exit: GATE EXIT=0
+- Commit: 5c62470b7bf66431f2976b28836449cf60f7c32c
+- Mutants: spec text, none in code; each walked on the committed text, and the A-2 ones also run in the gate's own executable model of the table form exactly as Z6 lists it (16 symbols, 4 page-0 states, 262,144 cases; ~/.cache/nv3-review/gate-S-ZETA/tools/mutants.py), numbers = cases whose outcome changes: MALFORMED-AS-TORN -> table form (65,876) and fault form later-format runs 1 and 2, IDENTITY-NO-FV-ALG -> table form (36,786), STATICS-AS-FOREIGN -> table form (4,860), IDENTITY-DOMAIN-SKIP -> table form (896) and later-format run 3, FOREIGN-MALFORMED-REFUSES -> table form (3,860) and the foreign copy's second run, UNLOCATED-AS-CORRUPT -> table form (256) and the unlocated variant, META-RANGE-SKIP -> table form (16,193) and t_cover_ts_cross_check, FENCE-BEFORE-REFUSAL -> fault form unlocated variant (byte identity), WRITE-MALFORMED -> write form (forged meta, forged page 0). Gate's own: G-REFUSE-NEWER-ONLY (a refused copy whose ckpt_id is below the newest valid meta's is ignored as stale) -> UNCAUGHT by every test the card specifies (0 of 262,144; 10,124 after RW-3), G-58030-FIRST (the all-unreadable 58030 check runs before page 0's refusal) -> table form (1 case: page 0 format_version 2, U U U U), G2-IDENTITY-NO-FV-ALG (gate 2's code edit, the domain checks kept) -> equivalent (0 cases), G-PAGE0-UUID-FOREIGN (an intact page 0 that is not well-formed is ignored when its uuid is not the replicas') -> UNCAUGHT (no foreign page-0 state; not blocking, RW-1 removes its textual support). Text mutants: each of the 22 blocks left out, and 14 planted errors, each fails its own Acceptance line(s) and line 30 in both locales. All in scratch clones; the worktree was never written
+- Followups: S-ZETA-F1, S-ZETA-F2
+
+#### Verdict in brief
 
 **REWORK, four small text corrections.** The rule is right. Magic and CRC decide that a record exists, the domains decide whether the open may use it, and an intact record of this file that it may not use fails the open in any place. That is the safe long-term design, and nothing below changes it.
 
@@ -32,7 +204,7 @@ What blocks is narrow:
 
 **Point 4 (the P0 question).** At 7.15, under the events 7.15 covers, the text is **not defective**: no covered fault or crash makes the record in question. It is **under-specified**: §2.2 and §14 step 1 are two-minded about intact records with an out-of-range field. It **lacks future-proofing**: a later format version gets a silent rollback with loss after a downgrade. The section below gives the facts the P0 review needs.
 
-## Gate run
+#### Gate run
 
 - **Extract.** The scaffold's `fresh-gate.sh` and `git-env.sh` came out through GATE-PROMPT step 1's shallow `--no-local` clone.
   - The printed scaffold id was `71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`, with no `EXTRACT FAILED` line.
@@ -54,7 +226,7 @@ What blocks is narrow:
   - The commit has one parent, 71ecf3e6.
   - The worktree `~/.cache/nv3-cards/S-ZETA` was clean before and after. Every Acceptance run used a separate `--shared` scratch clone at 5c62470b.
 
-## 1. Mechanics
+#### 1. Mechanics
 
 - **Bytes.**
   - My parser is fence-aware, since E2's Old holds a `## Changelog` line. It took E1, Z1–Z20 and E2 from the card (sha256 `17638fb0…741b` at gating) and applied them in order to the base's 7.15 (`a1376c94…a700f`).
@@ -124,7 +296,7 @@ What blocks is narrow:
     - with S-THETA: `160 rows; 247 mutants; …; 48 invariants, 49 tests`, failing only on S-THETA's names, as S-THETA's Notes say.
   - S-ETA's Notes were checked against an older S-ZETA card (`a63bc7bc…6539`). The rechecks here use the current one.
 
-## 2. The rule, judged independently
+#### 2. The rule, judged independently
 
 **Method.** I wrote my own executable model of §2.2 at 7.16 from the committed text (`tools/model.py`), beside a model of card A-2-0's "decodes" reading. That second model is A-2-0's code at 53484986 plus A-7d's later range check on the selected meta. I then judged two things:
 
@@ -205,7 +377,7 @@ So one fault leaves it no copy in its own parity, and the open selects the meta 
 
 That is an exception to I-META-COPIES' wording "never changes which meta opens", not to "what it recovers". Whether a build writes the whole slot is unspecified. It is the same at 7.15 and under A-2-0.
 
-## 3. Future-proofing
+#### 3. Future-proofing
 
 **The later-version rule is necessary, correctly stated, and sufficient for what it claims:**
 - every build can tell whether a header record of any version is intact;
@@ -230,7 +402,7 @@ None of these changes what a 2.0 build does. They are what D-8 must do with the 
 - The creation hook must inject after any configuration check, or WRITE-MALFORMED's creation half is masked. That is a note for A-7c.
 - `gc_w ≤ T` stays a writer-only check (§10.5) and is not in the open's list. That is consistent with 7.15 and not this card's.
 
-## 4. The P0 question: is draft 7.15 defective here?
+#### 4. The P0 question: is draft 7.15 defective here?
 
 **Ruling.** Under the events 7.15 claims to cover, **no**:
 - 7.15 followed either way has no silent rollback or lost acknowledged data because of an intact malformed record;
@@ -258,7 +430,7 @@ Event by event:
 - Review 3 §4.3 ruled two comparable items (S-ALPHA-F4, O-3) not defects. The A-2-0 gates called the readings' agreement "on everything I-META-COPIES covers", and this gate confirms that by enumeration.
 - The 58030 sub-case changes the code of a refusal, not a safety outcome.
 
-## 5. The card's differences from the A-2-0 gate's text
+#### 5. The card's differences from the A-2-0 gate's text
 
 - **G-1, "another static field": the card is right.** "Another field" would also read as `ckpt_id`.
 - **G-2, the domains in §2.2: the card is right.** A refusal now depends on the list, and A-7c's writers must use the same one. It cannot live in a code card.
@@ -285,7 +457,7 @@ Event by event:
 - **The code's home, A-2-0-F1 before A-7c: right.** A-2's Touch only excludes `meta.rs` and `open.rs`, so a dedicated card is "the first card after that spec card that edits `open.rs` or `meta.rs`", which gate 1 allowed. A-7c's writer check needs the shared definition.
 - **O-3, a wider 58030 rule: not in this card.** A diagnostics and availability matter (both outcomes refuse, and write nothing); its own card can weigh it.
 
-## 6. Tests, mutants, restatements, merge orders
+#### 6. Tests, mutants, restatements, merge orders
 
 **Each test passes on a correct build.** All three forms are deterministic, and no form waits on time:
 - **The table form** is a pure function of bytes. On the model, a correct rule gives 24,311 opens, 237,576 XX001 and 257 58030 across 262,144 cases.
@@ -325,7 +497,7 @@ The hooks are named by what they do.
 - This card's own Notes cover only R-1-SPEC, and should mirror S-ETA's and S-THETA's (card text, below).
 - Until S-ETA merges, "not 0" is right for 7.15's format.
 
-## Rework: the one list of corrections
+#### Rework: the one list of corrections
 
 Apply in this order to `nucleus/v3/docs/S-STORE.md` as committed at 5c62470b. Each Old occurs exactly once at its turn, and nothing else changes.
 
@@ -425,7 +597,7 @@ Line 30:
 - The dry-run hashes.
 - Notes, "If S-ETA merges first" and "If S-THETA merges first", mirroring those cards' Notes, with S-ETA's Z2 change.
 
-## For the plan card
+#### For the plan card
 
 The card's "For the plan card" stands, with these changes:
 
@@ -435,7 +607,7 @@ The card's "For the plan card" stands, with these changes:
 - **A-7c.** The creation hook of the write form injects after any configuration check.
 - **D-8's row** gains S-ZETA-F2.
 
-## Owner points, in plain words (not decided here)
+#### Owner points, in plain words (not decided here)
 
 - **OP-1. A file written by a newer version of the database.** When this version opens a file that a newer version has written to, should it refuse with its own error code, 55000 ("object not in prerequisite state"; the card reports that PostgreSQL uses it for incompatible data files), instead of XX001 ("data corrupted")?
   - Either way the open refuses and writes nothing. Only the code differs.
@@ -448,11 +620,11 @@ The card's "For the plan card" stands, with these changes:
   - The writer check added here (WRITE-MALFORMED) is meant to stop this version ever writing such a record.
   - The card recommends yes, with no override in 2.0.
 
-## Merge timing (for the record)
+#### Merge timing (for the record)
 
 By P0 re-check 1, this card may be built and gated on a branch, but may NOT merge before P0 PASS unless the owner says so in their own words.
 
-## Not verified
+#### Not verified
 
 - **No code.** No implementation of the 7.16 rule exists yet; it is A-2-0-F1's. Every mutant count above comes from this gate's own model of the text, not from the crate.
   - The model abstracts each record to its fields. It does not reproduce A-2-0's byte layouts or its alphabet's exact `ckpt_id`s.
@@ -462,7 +634,7 @@ By P0 re-check 1, this card may be built and gated on a branch, but may NOT merg
 - **Four-card merge orders.** Only the orders named were composed, not all 24.
 - **The flake.** The implementer's flake (E1C-FLAKE-1) was not reproduced; this gate's single run was green.
 
-## Follow-ups
+#### Follow-ups
 
 - **S-ZETA-F1. O-1's spec card, before A-7d.** A page of image `k` that passes §3.3's four checks but that its decoder refuses (§3.1) counts as failing at open. The proof-guarded fall-back, the explicit rollback and the read-only salvage then reach image `k−1`, where 7.15 leaves no path at all.
   - The card must change, together:
