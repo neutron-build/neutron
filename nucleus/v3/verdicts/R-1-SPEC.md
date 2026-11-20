@@ -4,12 +4,271 @@ Card-gate: P
 Verdict: REWORK
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session d36e5b00-a57c-4ef7-b43c-283e6f9e735c (an independent P gate: this agent wrote neither the card, its implementation 32f68472, nor S-ZETA, S-ETA or S-THETA, and is not the orchestrator)
-Date: 2026-11-17
+Gate-session: T3 review sub-agent, Claude Code session c2c35c7c-b073-4464-9a1e-0c7e47f1942b (an independent P gate 2, a narrow re-gate after rework 1: this agent wrote neither the card, its implementation 32f68472, rework 1 98c85aca, nor gate 1's verdict 7fb18902, and is not the orchestrator)
+Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: 32f68472b4155671f5418f0fb633b0859958c89a
-Mutants: spec text, none in code; the card's 20 spec mutants walked as text on their tests: MIN-RMAP-DENSE -> t_pool_minimum caught; MIN-RESERVE-NO-STEP2 -> t_pool_minimum caught; RESERVE-PER-THREAD-ONLY -> t_epoch_reserve_two_exhausters floor variant caught (A-3c, A-7a); CLAIM-DEPTH-TWO -> the floor variant through write_guard caught; MAPPIN-KEPT -> t_pool_floor_scattered caught (correct build O = 33 >= 21; mutant leaves 3); HEIGHT-SPLIT-UNCHECKED -> t_height_bound (a) caught by the root-split hook (its stated failure is wrong, K6); HEIGHT-DESCENT-UNCHECKED -> t_height_bound (b) caught; UNCHARGED-CONSUMER -> t_mem_heap_accounted caught; STORE-PATH-SHARED-CHARGE -> t_mem_store_paths_saturated caught; CAP-WAITS, CAP-POISONS, OP-NO-SPILL, CONN-WHOLE-MESSAGE, PLAN-NO-EVICT -> t_mem_caps caught; ACCOUNT-NOT-CREDITED -> t_mem_account_returns caught; OPEN-NO-FILE-TERM, POOL-SIZED-BEFORE-TABLE -> t_mem_open_sizes caught, but that test fails a correct build at B_min as committed (D1); FALLBACK-SET-KEPT -> the fall-back form caught only when no open of the form grows the file (D5); ALLOWANCE-UNRESERVED -> t_mem_growth_allowance caught; ADMIT-OVER-COUNT -> t_mem_admission caught. Gate's own: G1 RO-BUDGET-DIRTY-ONLY (a read-only open's budget counts its dirty frames only, as committed) -> UNCAUGHT by t_ro_open and t_ro_open_disk_full (D2; K2, F1); G2 WALK-BUFFER-UNCHARGED (recovery reads a record into an uncharged buffer) -> UNCAUGHT, no test samples an open that replays (D4; K7, F6); G3 CREATE-ABORT-KEEPS-RFILE (an aborted CREATE leaves its entry's bytes in R_file) -> UNCAUGHT by t_mem_account_returns (D8; K10, F6). Mechanical: omitting any one of the 50 blocks fails Acceptance in both locales (50/50 caught); 13 of 16 planted errors caught, the 3 uncaught all in R-1-memory prose that no line pins, as Limit 1 intends
+Commit: 98c85acadefe95d62badb88856eaff989727099e
+Mutants: spec text, none in code; K1–K10 add no test or mutant, so gate 1's walk stands (see History), with HEIGHT-SPLIT-UNCHECKED now stated as K6 has it -> t_height_bound (a) caught by the root-split hook, the failing insert a later one at its descent. Gate 2's own: G4 RO-SIZED-FROM-F (a read-only open sizes `R_EPOCH` and `H` from `F`, as committed) -> UNCAUGHT by t_ro_open and t_ro_open_disk_full (D10; K11, F1). Mechanical: omitting any one of the ten K groups from the corrected files fails Acceptance in both locales (10/10 caught); omitting one K entry alone is caught for 18 of 25, the 7 uncaught (K2a, K2b, K7a, K7b, K7f, and K10a and K10b each alone; the pair is caught) all R-1-memory prose that no line pins, which Limit 1 allows; with K11 applied, omitting any one of its five entries fails line 52 in both locales (5/5 caught)
 Followups: R-1-SPEC-F1, R-1-SPEC-F2, R-1-SPEC-F3, R-1-SPEC-F4, R-1-SPEC-F5, R-1-SPEC-F6, R-1-SPEC-F7
+
+## Verdict in brief
+
+**REWORK (rework 2, one defect, five exact entries).** Rework 1 is exactly K1–K10, nothing else, and the card reproduces all four files byte for byte. D1, D3 and D4 are closed, as are D5–D9. The owner's memory decision is now worded accurately. **D2 is not closed.** K2 added the pinned MapLeafs to the read-only budget, but in a read-only open the epoch reserve `R_EPOCH` and the height bound `H` are still sized from the whole pool `F`, and both grow with frames the replay holds and never releases.
+
+The two specs now state two different checks, and neither is safe:
+- **R-1-memory §5.3** checks the evictable part `F_e` (`F` minus the dirty frames and those MapLeafs) against `F_min`. That bound was built with `R_EPOCH_min` and `H_min`, but the open sets aside `R_EPOCH(F)` frames and lets descents reach `H(F)`.
+  - At §4.6's server default (`F` 916,452, `R_EPOCH` 28,642, `F_min` 604), the check admits `F_e` down to 604. Once `F_e` drops below about 28,670, no frame outside the reserve is left for the replay.
+  - At the embedded default (`F` 5,878, `R_EPOCH` 186), `F_e = 244` leaves 58 frames outside the reserve. One replayed write into a 13-level tree, which `H(F) = 170` allows, can need 60.
+  - A read-only open evicts no dirty page and runs no checkpoint, so nothing ever frees a frame. The replay waits for an unpin that never comes instead of returning 53200, which is D2's failure exactly, on the full-volume salvage path.
+- **S-STORE §14.1** (E12a) checks `F_e` against "§5.4's minimum", which is computed at the open's `H` and `R_EPOCH`. §4.5 makes `H` the largest height whose minimum fits `F`, so that minimum lies within `4n` frames of `F`. A read-only replay whose dirty frames and MapLeafs reach `4n` (80 on the server) then fails with 53200 at every budget. "A read-only open with a larger pool budget" stops being a remedy, and the salvage of a full volume is stranded.
+
+K11 fixes this by sizing a read-only open from its evictable part: `R_EPOCH` and `H` come from `F_e`, re-set before each replayed op (`F_e` only falls), and fixed when pass 2 ends. A descent past that `H`, or `F_e < F_min`, fails the open with 53200 and writes nothing. That makes R-1-memory §5.3's `F_min` check and S-STORE §14.1's "§5.4's minimum" the same condition. I tried K11 in scratch: with it, 52 of 52 non-gate Acceptance lines pass in both locales; without it, at 98c85aca, lines 39 and 52 fail.
+
+## Mechanics (all checked by this gate; nothing taken from the implementer's or gate 1's report)
+
+- **Fresh gate.** I extracted the scaffold's `fresh-gate.sh` through the shallow `--no-local` clone. The scaffold id printed was `71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`, with no EXTRACT FAILED line. The run, on `98c85acadefe95d62badb88856eaff989727099e`, printed:
+  - `fresh-gate: commit 98c85acadefe95d62badb88856eaff989727099e`
+  - `fresh-gate: base 71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`
+  - `fresh-gate: checks passed (4876 files hashed in 3.64 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - steps test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests and api-surface, each `EXIT=0`
+  - last line `GATE EXIT=0`, with exit status 0 and stderr empty. The known `undo_order.rs` flake did not occur, and nothing was re-run. The extract was removed afterwards.
+- **Scope.** Over the verdict commit 7fb18902, rework 1 changes two files: `docs/R-1-memory.md` (+21/−19) and `docs/S-STORE.md` (+5/−5). C-T0 and README are 32f68472's. Over the scaffold the branch touches the four Touch-only docs and this verdict file, and nothing in a protected path. The worktree was clean.
+- **Exactly K1–K10.** My own script (`~/.cache/nv3-review/gate2-R-1-SPEC/tools/kapply.py`) reads the 25 entries from gate 1's verdict and applies them, in its order, to 32f68472's files. Every Old occurs exactly once at its turn. The results equal 98c85aca's files byte for byte: R-1-memory `2eb26225…5d66` and S-STORE `07b9b040…7e34`. These are also the sha256s of gate 1's scratch `corrected/` files.
+- **The card's blocks.** A second script of mine (`tools/cardapply.py`), written independently of gate 1's and the implementer's, parses the reworked card's Doc blocks 0–14, E1–E25 with E12a, T1–T9 and X1, and applies them to 71ecf3e6's files. Every Old occurs exactly once at its turn.
+  - With `<date>` 2026-11-17, all four results equal 98c85aca's files byte for byte: R-1-memory `2eb26225…`, S-STORE `07b9b040…`, C-T0 `8a826331…9149` and README `191f528f…ab82`.
+  - With 2026-11-16, they give the Notes' dry-run sha256s: `3d8e5b40…32b7`, `286c85d6…a0c0`, `191f528f…ab82` and `07a80689…286a`.
+  - 48e52d3b's three base docs equal 71ecf3e6's. S-STORE is `a1376c94…700f` and C-T0 `96caa6cb…a0c0`, the card's Base hashes.
+- **The card's prose against gate 1's lists.** I diffed the card against its pre-rework backup (`~/.cache/nv3-review/R-1-SPEC.card-backup-pre-rework1.local.md`). Every change is one that gate 1's "Card text the rework must update" names:
+  - Sources, item 22: P-1 is no longer "accepted".
+  - Finding 12 and D-12.
+  - The blocks and E12a; Work 2 and 3.
+  - HEIGHT-SPLIT-UNCHECKED's row.
+  - The runner's count of 52, and rework 1's evidence.
+  - Acceptance 38, 39 and the two new lines, each equal to gate 1's text.
+  - "For the gate" item 11.
+  - "For the plan card" item 11, carrying F1–F7.
+  - P-R2's and P-R5's plain words.
+  - The dry-run hashes.
+  - (c)(4)'s "2.4–2.7 times".
+  - The S-ZETA/S-ETA/S-THETA Note.
+
+  I found no other change.
+- **Acceptance.** I ran the 51 commands before the gate line in a fresh `--no-local` clone at 98c85aca, with `nucleus/v3-scaffold` at 71ecf3e6, as `/bin/sh -c` from the clone root. All 51 pass under `en_CA.UTF-8` and all 51 under `LC_ALL=C`. Line 17 prints `7 invariants; 20 rows` / `OK`, and line 37 prints `162 rows; 233 mutants; 24 judged only on Phase B cards; 47 invariants; 50 tests` / `OK`. Line 52 is the fresh gate above. The clone stayed clean.
+- **Omit one K group.** I built ten scratch commits on 98c85aca, each with the corrected files minus one K group. Every one fails in both locales:
+
+  | Group omitted | Lines that fail |
+  |---|---|
+  | K1, K3, K5, K7, K8 | 50, 51 |
+  | K2 | 38, 39, 50, 51 |
+  | K4, K10 | 50 |
+  | K6 | 39, 51 |
+  | K9 | 39, 50, 51 |
+
+  The card's evidence says K6 fails line 51. It fails 39 too: incomplete, not wrong. Omitting single entries: see the Mutants line.
+- **The owner's word.** The card's Sources now say that P-1 rests on "the conditional reply, whose condition 'is not shown to be met' for this point, and the 16:0x delegation did not cover it". PLAN-v3 says the same, at §9 A's card PL-14 pointer ("P-1 before A-3b … still rest on the owner's conditional reply, whose condition is not shown to be met") and at §10's "Not covered by the exchange" ("O-3, O-2 and P-1"). No line of the card or the docs now calls P-1 accepted.
+  - The docs say "owner point P-1's figure".
+  - P-R1 says "than owner point P-1 said".
+  - P-R1 to P-R6 stay "Recommended".
+
+## The corrected accounting, re-read
+
+- **D1, closed.** At `B = B_min`, §2.2's `B − R_fixed − R_file − F_min(page_size + o_frame)` is `max(S_min, M)`. So `S = max(S_min, M)` and `F = F_min` exactly, as §7.3 now says.
+  - With §7.1's defaults, `S_min = preapply_bytes + 1 MiB` in every mode, so `S_min < preapply_bytes` is never a default's 22023.
+  - The lowering gives these values:
+    - embedded: `ws_mem` 16 → 5 MiB, `lock_mem` 16 → 5 MiB with `lock_escalate_rows` 100,000 → 40,960, `op_mem` and `cat_mem` 8 → 5 MiB;
+    - browser: `ws_mem` 4 → 2 MiB, with `lock_mem`, `op_mem` and `cat_mem` already at most 2 MiB;
+    - server: `ws_mem` 64 → 5 MiB, `lock_mem` 128 → 5 MiB with 1,000,000 → 40,960 rows, `op_mem` 16 → 5 MiB and `cat_mem` 64 → 5 MiB.
+  - Every lowered `ws_mem` stays ≥ `preapply_bytes` (4, 4 and 1 MiB), so C-T0 §2.1's constraint holds. `n_c × sess_floor` (8 × 16 KiB, 2 × 16 KiB, 16 × 64 KiB) fits every `S_min`. Every mode's defaults open at their own `B_min`, and `t_mem_open_sizes` passes there.
+  - One nit, not a defect: the 22023 check compares the option values before the open lowers `preapply_bytes` to `wal_seg_size / 4` (§6.1), so it can refuse a user's `S_min` that the lowered value would allow. It refuses before any write, so nothing is lost.
+- **D2, not closed: D10 below.** K2's MapLeaf term is right. In a read-only open no (Mu) MapLeaf is obtainable, and K2a–K2f state that in all six places without counting anything twice. A dirty MapLeaf that §4.1 also pins is counted in both terms, which only over-requires. The reserve and the height bound are not addressed.
+- **D3, closed.** C-T0 v8 §8 keeps v7.8 §8 "with §0.2" and leaves the text to S-2b. R-1-memory §3's row and §6.2 now defer to that spill under pressure on `S` and keep only `ssi_mem`'s per-transaction cap, after v7.8's escalation. "This file does not replace the spill with a 53200" matches R-1-memory §0's precedence rule. Whether S-2b states the spill stays unverified, as gate 1 said.
+- **D4, closed.** Each of the four accounts is bounded and charged where it allocates:
+  - The walk's record buffer is inside `M`, charged per allocation (M1), at most `wal_seg_size / 4` or a reader's fixed buffer. `S ≥ M` and `B_min`'s `max(S_min, M)` count it.
+  - A statement's working memory is in its statement account, nested in `S`. A value or row that does not fit gets 53200, and what goes to the wire streams.
+  - amcheck's sets are `⌈next_lpid / 8⌉ + ⌈slot_count / 8⌉` bytes, charged to `S` at open, before any session, or to the caller's session. A shortfall is 53200 on a read path, never a poison.
+  - C-T0 §9.4's per-tree estimate and count ride on the 64-byte root-table entry, which §12 measures (provisional).
+- **D5–D9, closed.** K4a credits `R_file`'s meta-`k` terms and recharges from meta `k−1` at the file's length then. K4b's no-growth condition makes `B′` exact on a correct build. K5's `B_min + 32 × (page_size + o_frame)` gives `σB` ≈ 2.1 MiB < `S_min`, so `S = S_min` and `F = F_min + 32`. K6's failing insert is the next one, at its descent. K10's credit at a transaction's end bounds the unapplied CreateTree leak. K8 states the residual's real triggers, and K9 the poison.
+- **Stale restatements.** I grepped all three docs for the old wordings (the 7.15 "Pool budget" text, "exceed `F_min` by them", "three file growths", "replays no chunked transaction", "`B_min + 4 MiB`" and "no insert fails"), and none remains. S-STORE §5.4's "which an open sets from its pool" still reads true after K11, since the evictable part is part of the pool. C-T0 is unchanged and restates nothing K changes.
+
+## D10 (REWORK): a read-only open is sized from all of `F`
+
+- **Where.** R-1-memory §4.3 sizes `R_EPOCH = R_EPOCH_min + ⌊(F − F_min)/32⌋` for "the open", and §4.5 sets `H` "from its pool". Neither excepts a read-only open.
+  - S-STORE §5.3's premise and §5.6 keep the reserve for draws and claims, so a frame acquisition takes no reserve frame. A read-only open runs no checkpoint, so it never draws or claims.
+  - R-1-memory §5.3 then checks `F_e ≥ F_min`, and S-STORE §14.1 checks `F_e ≥` "§5.4's minimum". That minimum is `4n(H + 2) + 2R_EPOCH`, at the open's `H` and `R_EPOCH`.
+- **R-1's check is insufficient.** At `F_e = F_min` the frames outside the reserve number `F_min − R_EPOCH(F)`. That is fewer than §4.4's classes need once `F ≥ F_min + 32`, and negative at the server default. And `H(F)` lets the replay descend trees taller than `F_e` can serve.
+  - Embedded default: a replayed write into a 13-level tree can need `4 × 15 = 60` frames, against 58.
+  - Nothing frees a frame: no dirty eviction, no unpin, the replay alone. The open hangs and never returns 53200.
+- **S-STORE's check is unmeetable.** `H` is the largest height whose minimum fits `F`, so the minimum is above `F − 4n`. At the server default it is 916,404 of 916,452.
+  - `F_e ≥` that minimum needs fewer than `4n` dirty frames and MapLeafs, at any budget.
+  - So `t_ro_open_disk_full` passes only on a replay that small, and §14.1's remedy, "a read-only open with a larger pool budget", never works.
+- **Class.** The floor is insufficient (a wait for an unpin that never comes) under one text, and the store's salvage path is stranded under the other. This is D2's own failure mode, and the scope makes it blocking.
+- **What it is not.**
+  - It is not new in rework 1. The divergence is in 32f68472's text: "exceed `F_min` by them" against "§5.4's minimum", once E5 made `max tree height` the open's `H`. K2 restated both checks without reconciling them.
+  - It does not touch a read-write open, which evicts dirty pages and draws on its reserve: §4.4's proof holds there.
+
+## Corrections (one complete list; each Old occurs exactly once in 98c85aca's file named, at its turn)
+
+In the card these become Doc block 4's (K11a, K11b) and Doc block 5's (K11c) text, E12a's New (K11d) and E25's New (K11e). Applied in this order to 98c85aca's files in scratch, they give `docs/R-1-memory.md` sha256 `e3956d031df63032e3e8a39b6bc573fb524a914aaab6d01f71e1b3c95dabbc5d` and `docs/S-STORE.md` sha256 `63c4b6e9d58d7e25f469348c9eee67a878f208479af2723856c64fc03824bc25`, at the date 2026-11-17, which K11 does not touch. Applied to the card's 2026-11-16 dry run, they give `154b17f2503929106ea62802f15e44415c8ad2b7e3d1388780f9affc2e6f6981` and `1a0d9afd5bb8d913333fd07c83d0ac5a3cd38da9b7cf84d380d9863e0bcec2ce`. C-T0 and README do not change. No block of S-ZETA, S-ETA or S-THETA contains "Pool budget", K11d's or K11e's Old, or §4.3's or §4.5's sentence that K11a and K11b anchor on (searched by grep in the three cards), so the 24 merge orders gate 1 composed still apply with K11 added.
+
+
+**K11a.** `docs/R-1-memory.md` — R-1-memory §4.3, "Above the minimum" (Doc block 4).
+
+Old:
+```text
+which never lowers `H` below `H_min` (§4.5). The slope `1/32` is provisional; A-7e measures it (§12).
+```
+New:
+```text
+which never lowers `H` below `H_min` (§4.5). The slope `1/32` is provisional; A-7e measures it (§12). A read-only open sizes it with its evictable part in place of `F` (§5.3): it runs no checkpoint (S-STORE §14.1), so it draws and claims nothing, and a reserve sized for `F` would only take frames from its replay.
+```
+
+**K11b.** `docs/R-1-memory.md` — R-1-memory §4.5, "Its value" (Doc block 4).
+
+Old:
+```text
+  `H = ⌊(F − 2 × R_EPOCH) / (4 × n)⌋ − 2`
+
+- **Its floor.**
+```
+New:
+```text
+  `H = ⌊(F − 2 × R_EPOCH) / (4 × n)⌋ − 2`
+
+  A read-only open sets it with its evictable part in place of `F`, and with `R_EPOCH` sized the same way (§4.3, §5.3).
+
+- **Its floor.**
+```
+
+**K11c.** `docs/R-1-memory.md` — R-1-memory §5.3, "Pass 2 runs in the pool" (Doc block 5; K2c's New).
+
+Old:
+```text
+So its `F` must exceed `F_min` by both, or it fails with 53200 and writes nothing (S-STORE §14.1; `t_ro_open`); with scattered LPIDs that is up to twice the dirty frames.
+```
+New:
+```text
+What is left, its evictable part `F_e` (`F` minus both), stands for `F` in its sizing: it sets `R_EPOCH` (§4.3) and `H` (§4.5) from `F_e`, at open and again before each op that pass 2 replays, since `F_e` only falls as pass 2 dirties pages, and keeps the last values once pass 2 ends, when nothing dirties a page any more; a descent past the current `H` fails the open with 53200. So `F_e` must stay at least `F_min`, or the open fails with 53200 and writes nothing (S-STORE §14.1; `t_ro_open`); with scattered LPIDs the two together are up to twice the dirty frames. Sized from `F`, the open would be wrong either way: a reserve and a height bound that grow with frames the replay holds would leave a pool whose `F_e` is `F_min` with `F_min − R_EPOCH` frames outside the reserve, fewer than §4.4 counts once `F ≥ F_min + 32` and none at §4.6's server default, so the replay could wait for an unpin that never comes; and §5.4's minimum at `F`'s own `H` lies within `4n` frames of `F`, so a replay whose dirty frames and MapLeafs reach `4n` would fail at every budget.
+```
+
+**K11d.** `docs/S-STORE.md` — S-STORE §14.1, "Pool budget" (E12a's New).
+
+Old:
+```text
+must meet §5.4's minimum, both during pass 2 and after it. When it would not, the open fails with 53200, having written nothing.
+```
+New:
+```text
+must meet §5.4's minimum, both during pass 2 and after it, with the height bound `H` and the reserve `R_EPOCH` that R-1-memory §5.3 sets from that evictable part rather than from `F`: sized from `F`, they would grow with frames the replay holds. When it would not, or when a descent would pass that `H`, the open fails with 53200, having written nothing.
+```
+
+**K11e.** `docs/S-STORE.md` — S-STORE Changelog, 7.16's R_MAP bullet (E25's New; K2f's text).
+
+Old:
+```text
+but a read-only open, which evicts no dirty page, counts such MapLeafs with its dirty frames (§14.1);
+```
+New:
+```text
+but a read-only open, which evicts no dirty page, counts such MapLeafs with its dirty frames and sets its height bound and `R_EPOCH` from the evictable part that is left (§14.1);
+```
+
+
+## Acceptance-line changes (card numbering; tried in scratch)
+
+- **Line 38** stays `'37 18'`: K11d and K11e rewrite lines that the diff already holds.
+- **Line 39** keeps its command, and its hash becomes `25151f2bc932b13c320a174c24105c054ae7cb291f0a3243cd21225a43653e30`.
+- **One new line**, inserted after line 51, so the gate line becomes line 53. It contains no backtick.
+```text
+cd nucleus/v3 && grep -q 'What is left, its evictable part .F_e. (.F. minus both), stands for .F. in its sizing' docs/R-1-memory.md && grep -q 'A read-only open sizes it with its evictable part in place of .F. (§5\.3)' docs/R-1-memory.md && grep -q 'A read-only open sets it with its evictable part in place of .F., and with .R_EPOCH. sized the same way' docs/R-1-memory.md && grep -q 'fewer than §4\.4 counts once .F ≥ F_min + 32. and none at §4\.6.s server default' docs/R-1-memory.md && ! grep -q 'So its .F. must exceed .F_min. by both' docs/R-1-memory.md && grep -q 'with the height bound .H. and the reserve .R_EPOCH. that R-1-memory §5\.3 sets from that evictable part rather than from .F.' docs/S-STORE.md && grep -q 'sets its height bound and .R_EPOCH. from the evictable part that is left (§14\.1);' docs/S-STORE.md
+```
+- **Tried.** I committed K11's files on 98c85aca in a scratch clone (scratch commit 945a291d, a throwaway). There, all 52 non-gate lines pass under both locales: the 51 current ones, with 39 changed as above, plus the new one. At 98c85aca, line 39 with the new hash and line 52 fail. Omitting any one K11 entry fails line 52, and K11d and K11e also fail 39, in both locales. Line 37's checker is unchanged, because K11 adds no row, test or mutant. The rework recomputes the Notes' hashes and the author's evidence, and its count of Acceptance commands becomes 53.
+
+## Card text the rework must update (beyond the blocks)
+- **Findings, Decisions and "For the gate"** gain D10's point. A read-only open sizes `R_EPOCH` and `H` from its evictable part `F_e`, re-set before each replayed op and fixed once pass 2 ends. A descent past that `H`, or `F_e < F_min`, is 53200 with nothing written. This makes R-1-memory §5.3's `F_min` check and S-STORE §14.1's "§5.4's minimum" one condition.
+- **"For the plan card" item 11's F1** takes the extended F1 below.
+- **The Notes** take the K11 hashes above, rework 2's evidence and the command count, 53.
+
+## Tests and mutants
+- K1–K10 change no test's pass condition except as gate 1 walked them (History). With K, `t_mem_open_sizes` passes at `B_min` (D1) and its fall-back form at `B′` (K4). `t_mem_store_paths_saturated` passes at K5's budget with K1's lowering. HEIGHT-SPLIT-UNCHECKED is caught as K6 states.
+- **`t_ro_open` and `t_ro_open_disk_full`, as committed.**
+  - Under S-STORE §14.1's literal check, a correct build passes them only while their replays stay below `4n` dirty frames and MapLeafs (D10).
+  - Under R-1-memory §5.3's check, a correct build can hang on a pool whose `F_e` is near `F_min` with `F ≫ F_min`.
+  - K11 makes both pass on any fixture whose `F_e` stays at least `F_min`. G4 RO-SIZED-FROM-F is caught only by F1's extended form.
+
+## Rulings on P-R1 to P-R6 (the gate's part)
+Gate 1's rulings stand (History). K11 changes no owner point: it is how a read-only open uses the budget the owner sets, not a new cost. A read-only open now needs `F_min` plus its dirty frames plus their MapLeafs, as R-1-memory §5.3 already said.
+
+## Owner points, in plain words (stated here, not decided)
+- **P-1 and P-R1, memory per connection.** Each connection that can hold pages needs room for four tree paths of pages: about 224 KiB at 8 KiB pages and a height floor of 5. P-1, the earlier figure (168 KiB, three paths), has no answer in the owner's own words. The plan records only a conditional reply whose condition is not shown to be met, and the 16:0x delegation did not cover it. At 8 embedded connections the floor is about 2 MiB of pages, and the total minimum is about 8.3 MiB for a 1 GiB file.
+- **P-R2, the height bound.** The memory budget decides how tall an index tree may grow. A tree that would grow past it stops the database. The database is reopened with a larger budget, and nothing committed is lost. Near the minimum budget the bound is 5 levels, and three things follow:
+  - long, prefix-sharing keys can reach it within a few hundred to a few thousand rows;
+  - a database reopened with less memory than it was written under answers "out of memory" when a tall tree is read;
+  - the first write, recovery replay, cleanup pass or drop of such a tree stops it.
+
+  The alternative, letting fewer connections in as trees grow, never stops the database but costs a shared counter on every storage call.
+- **P-R3 and P-R4, budgets and thresholds per mode.**
+  - Budgets: server 25% of memory (at least 256 MiB), embedded 64 MiB, browser 32 MiB, a quarter of each for sessions.
+  - Per-transaction caps as R-1-memory §7.1 lists them.
+  - At small budgets the database lowers any cap above the session pool to fit it, and reports that. So a small database fails a very large transaction sooner, with "out of memory", instead of refusing to open.
+  - Embedded and browser databases switch big transactions to coarse locks sooner.
+- **P-R5, the growth residual.** The database stops if sessions hold all session memory while the file's bookkeeping outgrows its reserve: at the third file growth in a row at the latest, sooner after heavy rewrites or on files above about 127 GiB. Nothing committed is lost, and a reopen with more memory clears it.
+- **P-R6, the connection cap.** An embedded app may open 8 connections at once by default, a browser 2. One more gets "too many connections". The cap is what keeps the memory floor true, and the app can raise it.
+
+## Merge timing
+This card may not merge before P0 PASS unless the owner says so in their own words.
+
+## Follow-ups (gate 1's, carried; F1 extended)
+- **R-1-SPEC-F1 (S-STORE spec card, before A-7d is cut).** The read-only budget gets a test and mutants.
+  - `t_ro_open`, or `t_ro_open_disk_full`, gains a form whose replay dirties pages under MapLeafs of their own: a pool at `F_min` plus the dirty frames plus those MapLeafs opens, and one frame below fails with 53200 and writes nothing. Mutant **RO-BUDGET-DIRTY-ONLY** (the budget counts the dirty frames only): the replay waits for an unpin within the step budget, or the open succeeds at a budget the rule refuses.
+  - Gate 2 adds a second form, run at a pool well above `F_min` (at least `F_min + 64`), whose replay drives `F_e` to `F_min` and then replays a write into a tree as tall as `F_e`'s `H` allows. With K11 it completes, and one more dirty page fails it with 53200. Mutant **RO-SIZED-FROM-F** (G4: `R_EPOCH` and `H` from `F`): the replay waits for an unpin within the step budget.
+  - Judged on A-7d.
+- **R-1-SPEC-F2 (R-1 spec, before R-1's Phase B card).** Size the growth allowance so that "the third growth" is exact:
+  - size `R_file`'s LPID bitmap and MapInner terms for `max(next_lpid, slot_count)` LPIDs, plus a bound for the pool's never-written pages;
+  - make the allowance's MapInner term follow each step's LPIDs;
+  - recompute §4.6 and §7.2.
+- **R-1-SPEC-F3 (R-1 and A-7c, before A-7c is cut).** Either reserve S-STORE §13 step 2's copy of image `k`'s two bitmaps in `R_file`, if step 2 makes one, or state how step 2 avoids it.
+- **R-1-SPEC-F4 (R-1 spec, before R-1's Phase B card).** The open refuses with 53200, writing nothing, when the directory step 2 descended is taller than the sized pool's `H`. With K11 that includes a read-only open's `H` from `F_e`.
+- **R-1-SPEC-F5 (the next S-STORE card; pointers only).**
+  - S-STORE §14 step 3b and §6.8's CreateTree point to R-1-memory §5.2.
+  - After S-THETA merges, R-1-memory's "step budget" points to S-STORE §15.
+- **R-1-SPEC-F6 (R-1 spec, with or before R-1's Phase B card).** Tests for the corrections that have none:
+  - `t_mem_open_sizes`' report shows every cap at most `S` at `B_min` (K1);
+  - `t_mem_heap_accounted` samples after an open whose replay reads a `wal_seg_size / 4` record, and after amcheck (K7);
+  - `t_mem_account_returns` gains an aborted CREATE TABLE and a `ROLLBACK TO` past one (K10).
+- **R-1-SPEC-F7 (S-STORE question; depends on P-R2).** A GC sweep or drop-walk step whose descent would pass `H` could skip the tree with a report rather than poison the store.
+
+Full descriptions of F2–F7 are gate 1's (History, "Follow-ups"), unchanged.
+
+## Not verified
+- No code exists. Every test and mutant was walked as text.
+- The provisional constants are unmeasured: `o_frame`, 64 bytes per root-table entry, `e_lock`, and the 1/32 slope. D10's figures use §4.6's worked values.
+- That S-2b will state SSI's spill as v7.8 §8.5 promises.
+- The implementer's log: none exists for R-1-SPEC in `cards/logs/`. Rework 1's reported results were checked against the commit and the card, not a log.
+- K11 is tried mechanically (bytes, Acceptance, omit-one, composition by grep against the three sibling cards' text). Its design rests on this gate's reading of S-STORE §5.3, §5.6 and §14.1 alone, so a gate 3 should re-read it.
+
+## History
+
+- **Gate 1: REWORK, verdict commit 7fb189020418b1700928486fd8d84d3aba4a5358, judging 32f68472b4155671f5418f0fb633b0859958c89a.** It was a P gate in Claude Code session d36e5b00-a57c-4ef7-b43c-283e6f9e735c, with GATE EXIT=0. It found defects D1–D9 and gave K1–K10 (25 exact entries), two new Acceptance lines and follow-ups F1–F7.
+- **Rework 1: commit 98c85acadefe95d62badb88856eaff989727099e,** by a GLM 5.3 implementer. It applied K1–K10 to `docs/R-1-memory.md` and `docs/S-STORE.md`. The card was updated in the main checkout (cards are local), with its pre-rework copy at `~/.cache/nv3-review/R-1-SPEC.card-backup-pre-rework1.local.md`.
+- **Gate 2 (this verdict): REWORK on 98c85aca,** for D10, with K11.
+
+**Gate 1's verdict, as committed at 7fb18902, verbatim.** Its header lines are prefixed with "- ", so that no tool reads them as this verdict's fields. Everything after them is unchanged, headings included. Where its sections differ from the ones above (owner points, follow-up F1, Acceptance numbering), the sections above are current. The same text is at `git show 7fb18902:nucleus/v3/verdicts/R-1-SPEC.md`.
+
+<!-- gate 1's verdict (7fb18902), verbatim but for its header lines, begins -->
+
+- Card: R-1-SPEC
+- Class: spec
+- Card-gate: P
+- Verdict: REWORK
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent, Claude Code session d36e5b00-a57c-4ef7-b43c-283e6f9e735c (an independent P gate: this agent wrote neither the card, its implementation 32f68472, nor S-ZETA, S-ETA or S-THETA, and is not the orchestrator)
+- Date: 2026-11-17
+- Gate-exit: GATE EXIT=0
+- Commit: 32f68472b4155671f5418f0fb633b0859958c89a
+- Mutants: spec text, none in code; the card's 20 spec mutants walked as text on their tests: MIN-RMAP-DENSE -> t_pool_minimum caught; MIN-RESERVE-NO-STEP2 -> t_pool_minimum caught; RESERVE-PER-THREAD-ONLY -> t_epoch_reserve_two_exhausters floor variant caught (A-3c, A-7a); CLAIM-DEPTH-TWO -> the floor variant through write_guard caught; MAPPIN-KEPT -> t_pool_floor_scattered caught (correct build O = 33 >= 21; mutant leaves 3); HEIGHT-SPLIT-UNCHECKED -> t_height_bound (a) caught by the root-split hook (its stated failure is wrong, K6); HEIGHT-DESCENT-UNCHECKED -> t_height_bound (b) caught; UNCHARGED-CONSUMER -> t_mem_heap_accounted caught; STORE-PATH-SHARED-CHARGE -> t_mem_store_paths_saturated caught; CAP-WAITS, CAP-POISONS, OP-NO-SPILL, CONN-WHOLE-MESSAGE, PLAN-NO-EVICT -> t_mem_caps caught; ACCOUNT-NOT-CREDITED -> t_mem_account_returns caught; OPEN-NO-FILE-TERM, POOL-SIZED-BEFORE-TABLE -> t_mem_open_sizes caught, but that test fails a correct build at B_min as committed (D1); FALLBACK-SET-KEPT -> the fall-back form caught only when no open of the form grows the file (D5); ALLOWANCE-UNRESERVED -> t_mem_growth_allowance caught; ADMIT-OVER-COUNT -> t_mem_admission caught. Gate's own: G1 RO-BUDGET-DIRTY-ONLY (a read-only open's budget counts its dirty frames only, as committed) -> UNCAUGHT by t_ro_open and t_ro_open_disk_full (D2; K2, F1); G2 WALK-BUFFER-UNCHARGED (recovery reads a record into an uncharged buffer) -> UNCAUGHT, no test samples an open that replays (D4; K7, F6); G3 CREATE-ABORT-KEEPS-RFILE (an aborted CREATE leaves its entry's bytes in R_file) -> UNCAUGHT by t_mem_account_returns (D8; K10, F6). Mechanical: omitting any one of the 50 blocks fails Acceptance in both locales (50/50 caught); 13 of 16 planted errors caught, the 3 uncaught all in R-1-memory prose that no line pins, as Limit 1 intends
+- Followups: R-1-SPEC-F1, R-1-SPEC-F2, R-1-SPEC-F3, R-1-SPEC-F4, R-1-SPEC-F5, R-1-SPEC-F6, R-1-SPEC-F7
 
 ## Verdict in brief
 
