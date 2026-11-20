@@ -1,15 +1,231 @@
 Card: S-THETA
 Class: spec
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session 9e03f3bb-fc0b-44d3-9f64-30a72223b690 (an independent P gate: this agent wrote neither the card, its implementation 718333fb, nor any earlier verdict, and is not the orchestrator)
-Date: 2026-11-17
+Gate-session: T3 review sub-agent, Claude Code session 52cdbc6a-abd4-4e4a-a3cf-5f26921ea464 (gate 2, a narrow re-gate after rework 1: this agent wrote neither the card, its implementation 718333fb, the rework fd48b983, nor gate 1's verdict 0fe12a46, and is not the orchestrator)
+Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: 718333fb6e2f3f8afce2044244c84eea777f126b
-Mutants: spec text, none in code. The card's 13, walked as text on their tests at 718333fb, each caught deterministically by the case the card names: LOAD-REF-BEFORE-PUBLISH -> t_pin_load_race (a) (A-3a, A-3c); LOADING-SERVED -> (b); FAILED-LOAD-KEPT -> (c); MISS-TWO-FRAMES -> (e); CREATE-OVER-LOADING -> (f); CREATE-BESIDE-FREED -> (g); PAGE-KEY-MERGED -> (i) (all A-3a); EVICT-UNLINK-BEFORE-ENTRY -> (h) (A-3c); FREED-FRAME-WRITTEN -> I-LPID-EXACT's row test after an eviction of every unpinned frame (A-4b); MAPLEAF-EXISTS-BY-REF -> t_alloc_restart_progress race run (1) (A-4a, A-7f); MAPLEAF-WAIT-UNDER-INNER -> run (3), a deadlock the harness reports (A-4a); INVARIANT-NOT-POISON -> t_poison_before_unlatch invariant and read variants, PANIC-UNPOISONED -> its panic variant (A-3c); ROOT-PIN-MAP-FIRST -> (j) (A-3a). Gate's own: G1 LOAD-KEPT-ACROSS-RESTART (a loader that holds no gate keeps its frame in the page table while it restarts for a pending flip) -> UNCAUGHT at 718333fb, no case has a flip (finding F1), caught after the rework by t_pin_load_race (k); G2 a reader that waits for a load under its parent's latch instead of restarting -> UNCAUGHT (READER-IO-UNDER-LATCH's hook watches reads, not waits; S-THETA-F2); G3 an LPID creation that waits for a load while holding that LPID's MapLeaf latch -> UNCAUGHT, on no row (S-THETA-F2); G4 step 2 writes a freed frame that eviction drops -> not caught at A-4b, which runs no checkpoint (S-THETA-F2). Text mutants on the tip, judged by the card's 34 non-gate Acceptance lines: each of the 30 blocks left out -> its own line(s) plus 33 (all 30 in the default locale, 8 also under LC_ALL=C); 9 one-word plants (in P3, P6, P7, P18, L1, L2, L4, P23, and one outside the blocks) -> each its own line plus 33 (32 and 33 for the outside one). The correction list below was tried the same way: each of C1-C14 left out fails its own line plus 33. All in scratch clones; the worktree was never written
+Commit: fd48b9832cd3347dfa44f58247c3218975191185
+Mutants: spec text, none in code. Gate 1's G1, now the card's LOAD-KEPT-ACROSS-RESTART -> t_pin_load_race (k) (A-3c, under the interleaving harness), caught deterministically when walked on the text at fd48b983: the fixture forces T1's restart in every schedule, and at the *restarting* hook `L` is still in the page table, against the case's "where `L` is not in the page table"; past that check T2, T1 and the flip wait on one another, a deadlock the harness reports. The card's other 13, unchanged by the rework, as gate 1 walked them (History). Gate 2's own: G5 RELOAD-BEFORE-FLIP (a loader that ended its load for a pending flip republishes the page before the flip has run) -> UNCAUGHT by (k), because the controller holds T1 at *restarting* until the flip has run (S-THETA-F2 (v)); G6 END-WITHOUT-WAKE (the load ends for the restart but wakes none of its waiters) -> (k), where T2 never wakes, S1 never flips and the controller never releases T1, a deadlock the harness reports. Text mutants at fd48b983, judged by the card's 34 non-gate Acceptance lines in both locales: each of C1-C14 left out fails its own line(s) plus 33 (C1: 14; C2: 15, 30; C3-C6: 23; C7: 23, 30; C8: 23, 30, 31; C9: 27, 30, 31; C10, C11: 1; C12-C14: 6). C15 left out fails no line, as expected, since no line sees dates. Two plants: C1's "only once the flip has run" clause dropped fails 14 and 33; (k)'s "where `L` is not in the page table" dropped fails 23 and 33. All in a scratch --no-local clone; the worktree was never written
 Followups: S-THETA-F1, S-THETA-F2, S-THETA-F3, S-THETA-F4
+
+## Verdict in brief
+
+**MERGE-WITH-FOLLOWUPS** on the rework `fd48b9832cd3347dfa44f58247c3218975191185`. Gate 1's blocking F1 is closed. The rework is exactly C1 to C15. I found no new deadlock or stall. The four follow-ups carry, and S-THETA-F2 gains a part (v).
+
+- **The bytes.**
+  - The rework's `docs/S-STORE.md` is sha256 `2c2351e58855a126a36f1d0eee7f9e2a5b1140eec787b7de2a22dfd7d86f3875`.
+  - My own parser built the same bytes from 718333fb's file and gate 1's C1 to C15 (15 corrections, 16 Old/New pairs, each Old once). It also equals gate 1's `corr/corrected.md`.
+  - The rework commit changes only that file: +9/−9 on 718333fb, and +36/−18 on the scaffold.
+  - The reworked card's 30 blocks, applied to the base with `<date>` = 2026-11-17, reproduce it byte for byte.
+- **The card's Acceptance** equals the pre-rework card's 35 lines with gate 1's 24 edits applied, and nothing else changed. I checked that by script.
+- **Fresh gate:** `GATE EXIT=0`.
+- **Acceptance:** 34 of 34 non-gate lines pass at fd48b983 under `en_CA.UTF-8` and under `LC_ALL=C`. The checker prints `160 rows; 240 mutants; …`, `71 new since 7.10 (…, 14 here) …` and `OK`.
+- **The five stale card-prose spots** the implementer named, and three more I found, are all non-blocking. The card is local-only (gitignored), so none ships, and in every case the committed spec row says the right thing. The exact fixes for the orchestrator are under "The card's stale prose" below.
+- **Merge timing:** this card may not merge before P0 PASS unless the owner says so in their own words.
+
+## Gate run
+
+- **Extract.** A shallow `--no-local` clone of `nucleus/v3-scaffold` gave scaffold id `71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`. `fresh-gate.sh` and `git-env.sh` were extracted, with no `EXTRACT FAILED`.
+- **Run.** From `~/Workspace/neutron-v3`, `bash "$fg/fresh-gate.sh" fd48b9832cd3347dfa44f58247c3218975191185`, with `CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate2-S-THETA`, stdout and stderr captured separately (`~/.cache/nv3-review/gate2-S-THETA/fresh-gate.{out,err}`):
+  - `fresh-gate: commit fd48b9832cd3347dfa44f58247c3218975191185`
+  - `fresh-gate: base 71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`
+  - `fresh-gate: checks passed (4875 files hashed in 1.49 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - every step `EXIT=0`: test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests and api-surface;
+  - stderr empty, exit 0, and the literal last line `GATE EXIT=0`.
+- `$fg` was removed afterwards.
+- **The worktree.** Before this verdict's commit, `~/.cache/nv3-cards/S-THETA` was at fd48b983 on `card/v3-S-THETA` and clean. fd48b983's parent is gate 1's verdict commit 0fe12a46, whose parent is 718333fb, one commit on 71ecf3e6.
+
+## Point 1: the rework is exactly C1 to C15
+
+- **Scope.** `git diff 718333fb fd48b983 --stat` lists only `nucleus/v3/docs/S-STORE.md` (+9/−9). `git diff nucleus/v3-scaffold...fd48b983` lists that file (+36/−18) and gate 1's verdict, which line 34 allows. No protected path is touched.
+- **C1 to C15, re-applied by my own script.** I parsed gate 1's "Spec corrections" from 0fe12a46's verdict and applied each Old/New pair to 718333fb's file. Each Old occurs exactly once, and C15 is two pairs. The result equals fd48b983's file byte for byte, so nothing outside C1 to C15 moved.
+- **C15, the date.** Both positions read 2026-11-17: line 3's `(card S-THETA, 2026-11-17: ` and the Changelog's `- **Draft 7.16** (2026-11-17, card S-THETA`. That is the rework commit's own date (`2026-11-17T02:31:31-07:00`), as Work 2 asks.
+- **The card's blocks.** My own fence-aware parser took E1, P1 to P24, L1 to L4 and E2 from the reworked card (`cards/S-THETA.local.md`) in listed order. Each Old occurs once at its turn, and with `<date>` = 2026-11-17 the result equals the committed file byte for byte.
+- **The card's Acceptance.** The card's 35 Acceptance commands equal the backup's (`~/.cache/nv3-review/S-THETA.card-backup-pre-rework1.local.md`) with gate 1's 24 Acceptance edits applied: each Old once in its line, both occurrences in line 27. They also equal gate 1's `corr/accept_new.json`.
+- **The card's other text.** `diff` against the backup shows these changes and no others:
+  - "The draft target";
+  - blocks E1, P6, P18, P23 and E2;
+  - the Mutation evidence row for LOAD-KEPT-ACROSS-RESTART;
+  - the dry run's file hash;
+  - the Acceptance lines;
+  - "What the checker does" (14; nine new on `t_pin_load_race`; LOAD-KEPT-ACROSS-RESTART on A-3c);
+  - "For the gate" items 3 and 5, which walk (k);
+  - "For the plan card" item 5, with (k) under the harness and the frame acquisition that ends a load before a restart for a pending flip;
+  - the Notes' counts, now +1 everywhere, with S-ETA's numbers added.
+
+  Those match gate 1's "Card text that follows" list, except where the next section says otherwise.
+
+## Point 2: the fresh gate, Acceptance and omit-one
+
+- **Acceptance**, run as `tools/run_card.py` runs it: `/bin/sh -c` from the root of a `--no-local` clone checked out at fd48b983, with `nucleus/v3-scaffold` at 71ecf3e6 and GNU grep.
+  - At fd48b983, lines 1 to 34 all pass under the default locale (`en_CA.UTF-8`) and under `LC_ALL=C`.
+  - At 718333fb, exactly lines 1, 6, 14, 15, 23, 27, 30, 31 and 33 fail, as gate 1 recorded.
+  - At the base, all 34 fail.
+- **The checker** (line 31) gives identical output in both locales:
+  - `160 rows; 240 mutants; 24 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`
+  - `71 new since 7.10 (31 at 7.11, 11 at 7.12, 4 at 7.13, 10 at 7.14, 1 at 7.15, 14 here), 71 of them judged on a Phase A row; 48 invariants, 49 tests`
+  - `OK`
+- **Omit-one per correction.** Each variant is built by my script from 718333fb's file with one correction left out, committed on 71ecf3e6 in the scratch clone, and run in both locales. The two locales agree everywhere:
+
+  | Left out | Lines that fail |
+  |---|---|
+  | C1 | 14, 33 |
+  | C2 | 15, 30, 33 |
+  | C3, C4, C5, C6 | 23, 33 |
+  | C7 | 23, 30, 33 |
+  | C8 | 23, 30, 31, 33 |
+  | C9 | 27, 30, 31, 33 |
+  | C10, C11 | 1, 33 |
+  | C12, C13, C14 | 6, 33 |
+  | C15 | none (no line sees dates; expected) |
+
+  Each matches gate 1's record.
+- **Two plants of my own** fail their lines:
+  - dropping C1's ", and that thread loads the page again only once the flip has run" fails 14 and 33;
+  - dropping (k)'s ", where `L` is not in the page table," fails 23 and 33.
+- **Compositions** (card "For the gate" item 9).
+  - I used gate 1's composer (`tools/compose.py`, reviewed: a fence-aware block parser and a plain apply) on the reworked card. S-THETA, R-1-SPEC, S-ZETA and S-ETA compose in all 24 orders with no Old-count error, and give one result once line 3 and the top Changelog entries are normalised.
+  - This card's checker on R-1-SPEC then S-THETA prints `164 rows; 247 mutants; …; 48 invariants, 51 tests`, and fails only on R-1-SPEC's seven mutants and `A-7f rows: 11, not 10`.
+  - On S-ZETA then S-THETA: `160 rows; 248 mutants; …; 49 tests`, failing only on S-ZETA's eight.
+  - On S-ETA then S-THETA: `168 rows; 248 mutants; …; 53 tests`, failing only on S-ETA's eight.
+  - On R-1-SPEC, S-ZETA then S-THETA: `164 rows; 255 mutants; …; 51 tests`.
+  - On all four: `172 rows; 263 mutants; …; 55 tests`.
+  - The Notes' figures match these.
+
+## Point 3: is F1 closed, with no new wait?
+
+**The new rule** (§5.4 "The load", C1): "A load also ends so, serving nothing, before its thread restarts or waits for the flip, as a thread that holds no gate does when a flip is pending and every frame it could take for the page's MapLeaf is dirty (§5.2), and that thread loads the page again only once the flip has run". It is restated in the I-PIN-CURRENT row (C3), line 3 (C10) and the Changelog (C12).
+
+**Gate 1's cycle, re-walked.**
+1. R, holding no gate, has `r` published as being loaded.
+2. A, holding the gate shared, waits for that load.
+3. The flip waits for A.
+4. R cannot take a frame for `m`: its try of the gate fails, and no victim is clean.
+
+Under the rule:
+- R now takes its frame out of the page table and serves nothing before it restarts. A load's end wakes its waiters, as for a failed load.
+- A looks again and finds no frame. It obtains frames for `r` and `m` by evictions run under its own hold, which §5.2 lets write dirty victims without touching the gate, and it finishes.
+- The flip then runs.
+- R, holding no latch, no gate and no page being loaded, loads again after the flip. Its eviction's try of the gate now succeeds, or a clean frame exists.
+
+So the flip waits only on gated holders, and no gated holder waits on R. **F1 is closed.** The creation's form, a creation under its tree's latches waiting for a stale root name's load, closes the same way. That loader is also a thread that would restart for a pending flip, so it ends first.
+
+**No new wait.** The rule adds one wait: a gateless thread with no load in progress waits for a pending flip to run. I checked it against each of these.
+- **§5.3's latch order and §5.2.** R reaches the wait having released its latches (§5.2: "releases its latches and restarts"). "A thread that holds latches and no gate never blocks on the gate" therefore does not bar it. It holds no frame latch, map latch, page-table entry or gate that anything else waits on.
+- **The flip.** The flip waits for gate holders. R holds no gate, and no gate holder waits on R: R has no load in progress, which is the content of the rule. A pending flip always runs once its holders end, and a holder can end, because its frame acquisitions run under its own hold (§5.2), or wait for an unpin past its first mutation (§5.3). The pool floor keeps those finite.
+- **Nested loads.** R's load can need a second frame only for the MapLeaf, before it reads the reference. After that it reads into the frame it already holds, so no load restarts after it has read. If R's MapLeaf pin finds the MapLeaf being loaded by a second gateless thread R2, then R2's MapLeaf load needs no further frame: only the always-resident MapInner's latch and its own slot read. So R2 never meets the rule's case and finishes. The chain of load waits stays acyclic, as gate 1 found.
+- **§5.6 "Restart".** A gated operation's restart releases the gate and "pins what it needs, keeping no pin but the page it found cold". If pinning that cold page meets the rule's case, the cold page's unfinished load ends. The restart keeps no page being loaded, and pins the page again after the flip. It keeps only finished pins, as §5.6 says. Consistent.
+- **R-1-SPEC's pool floor** (`cards/R-1-SPEC.local.md`, I-POOL-BOUND and R-1-memory §4.4). The floor counts per thread every pin a thread may hold at once, including "the MapLeaf pins a restarted allocation keeps while it holds no latch and waits on the gate". A thread waiting for the flip under the new rule holds at most what that clause already counts: its finished cold page and reservation pins. It holds one frame fewer than before the rule, the abandoned load's. The rule makes no thread wait for an unpin. R-1-SPEC's `t_pool_floor_scattered` hook ("a frame acquisition is about to wait for an unpin; it must not fire") is untouched. No premise of the floor is contradicted.
+- **Progress.** A gateless reader can be sent round again only by a new pending flip each time. That is checkpoint cadence, the same as 7.15's §5.2 restart for gateless evictors, so it is not a new stall. Commits never wait on it.
+- **The poison path.** §9.2 item 3's broadcast wakes "gate and pin waiters". A gateless thread waiting for the flip is a gate waiter in substance. Making a build treat it as one belongs to S-THETA-F4's panic-clause work, if anywhere. It is not a stall a correct build can reach without a poison.
+
+**Is LOAD-KEPT-ACROSS-RESTART killable by (k) deterministically under the harness? Yes.**
+- The fixture forces the path in every schedule. `L`'s MapLeaf is not resident, every frame a thread could take is dirty, and T2 is at *waiting* before S1 requests the gate and the gate's hook reports it. So T1, released from *published*, finds its try of the gate failing (§5.2: a waiting flip blocks new shared holders), finds no clean victim, and reaches *restarting*.
+- The case's assertion there, "where `L` is not in the page table", fails under the mutant in that execution. Past the assertion, the mutant's T2, T1 and the flip wait on one another, and the controller's "until T2 has ended and S1 has flipped" never comes, which the harness reports as a deadlock.
+- The correct build passes every schedule: T1's ended load wakes T2; T2 takes T1's returned frame and a dirty victim under its hold; S1 flips; T1's retry is served `L`.
+- A-3c's row Needs A-4c0, the harness, and the checker confirms A-4c0 is in A-3c's Depends closure. The hooks (*published*, *waiting*, *restarting*, the gate's exclusive-request report) are all named, with what each paused party holds (C5).
+- The case is designed, not run: no A-3b/A-3c/A-4c0 code exists.
+
+**One judge missing (non-blocking, S-THETA-F2 (v)).** The clause "loads the page again only once the flip has run", which gate 1 added to stop R republishing ahead of A forever, has no judge.
+- Under G5 (RELOAD-BEFORE-FLIP), T1 would republish at once. But (k)'s controller holds T1 at *restarting* until the flip has run, which hides it.
+- Without the clause, a correct build cannot deadlock, since every republish ends again the same way. It can only spin while a scheduler favours R.
+- No named mutant is affected and no test is unpassable, so this does not block.
+
+**Stale restatements.** I grepped the whole committed file for: "being loaded"; "found cold" and "cold page"; "waits for that load"; "wait(s) for a load"; "wait(s) for the flip"; "restarts"; and the old counts 239, 70 and "thirteen".
+- No normative restatement contradicts the new rule. The hits are:
+  - the rule itself and its restatements (line 3, the I-PIN-CURRENT row, the 7.16 Changelog);
+  - §5.6 "Restart"'s "keeping no pin but the page it found cold", which is consistent as shown above;
+  - `t_alloc_restart_progress`'s pool-floor variant's "a restart's cold page", a pin count, which is consistent;
+  - the pre-existing §5.2 sentence that is the rule's trigger.
+- §5.2's "If no victim is clean, the thread releases its latches and restarts (§5.3)" does not itself point back to §5.4 "The load". An implementer of A-3b's frame acquisition reads both, and "For the plan card" item 5 states the duty. That cross-reference goes into S-THETA-F2 (iv) with the rest of §5.3's argument.
+- The old figures 239 mutants, 70 new and "thirteen mutants" survive only in the 7.15 and earlier Changelog entries, which are history. Lines 3 and 1682 say fourteen.
+
+## The card's stale prose: rulings
+
+The card is `nucleus/v3/cards/S-THETA.local.md`, which `.gitignore` (`**/*.local.*`) keeps out of the repository. So it never ships, no Acceptance line reads these spots, and in each case the committed spec states the right thing. **None blocks.** The orchestrator fixes the card in place with no gate. The exact fixes:
+
+1. **"ten cases"** (§15 and §15.1 summary, first bullet, line 520): **stale.** It becomes "eleven cases". The same sentence's "and nine mutants: the eight new ones of (a) and (b) and ROOT-PIN-MAP-FIRST" is also stale, which the implementer did not name. It becomes "and ten mutants: the nine new ones of (a) and (b) and ROOT-PIN-MAP-FIRST". The committed I-PIN-CURRENT row lists ten.
+2. **P23's A-3c row "Needs A-3b"** (same section, the §15.1 bullet, line 525): **stale.** "A-3c (Needs A-3b)" becomes "A-3c (Needs A-3b, A-4c0, for case (k) under the harness)". The committed §15.1 row says "A-3b, A-4c0" (Acceptance 27, and the checker's closure).
+3. **The dry run's checker lines** (Mutation evidence, "The author's dry run", lines 577 and 578, `239 mutants`, `70 new … 13 here`): **stale, and now self-contradictory.** The paragraph above them was updated to the rework's hash `2c2351e5…3875`, but its checker output, the base run's "the thirteen names missing" (line 580) and plant P6 ("240 mutants" as a fault, line 582, now the correct figure) are still 718333fb's dry run. The fix is to restore that paragraph's hash to the author's `38428ea9…7f90`, so the dry run reads as the record of 718333fb, and to add one bullet: "Rework 1 (fd48b983): C1 to C15 of gate 1's verdict; the file is `2c2351e5…3875`, the checker prints `160 rows; 240 mutants; …`, `71 new since 7.10 (…, 14 here)` and `OK` (verified by gate 2)". Rewriting the old run's figures in place would describe a run nobody made.
+4. **Composition counts** (the dry run's "R-1-SPEC and S-ZETA, every merge order", line 590: 246, 247, 254): **stale, the same way as 3**, a record of 718333fb. They are covered by the same added bullet: "on the rework, R-1-SPEC first 247, S-ZETA first 248, S-ETA first 248, R-1-SPEC and S-ZETA 255, all four 263 (gate 2)". The Notes (line 712) already carry the current figures, and they match my runs.
+5. **"The one harness run"** (Mutation evidence, after the table, line 572): **stale.** It becomes "The two harness runs, `t_alloc_restart_progress`'s run (3) and `t_pin_load_race` (k), are placed by the same hooks; the harness only reports the deadlock each one's mutant makes."
+6. **Not named by the implementer: "The reverse"** (line 685), "the thirteen mutants". **Stale.** It becomes "fourteen".
+7. **Not named by the implementer: "For the gate" item 6** (line 649). It lists the racing calls for (a) to (h) and omits (k)'s T2 and S1. It should add "T2's and S1's in (k), where T2 takes the gate shared and S1 requests it exclusively".
+8. **Not named by the implementer: "Composition counts" in the Notes** (line 712). This one is correct: +1 on each total, and S-ETA's added. No change.
+
+## Follow-ups (non-blocking; carried from gate 1, one part added)
+
+- **S-THETA-F1. N10's cooperative mode: a load never yields.** As gate 1 wrote it (History): state in §5.4 "The load" or §5.3 that no storage call yields while it holds a page being loaded (A-3a's OBL-7). C1's new wait is for the flip, holding nothing, so it adds no yielding hazard.
+- **S-THETA-F2. Judge the new waits' untested halves, and complete §5.3's argument.** Parts (i) to (iv) are as gate 1 wrote them (History). In (iv), C1 is now in place, so the argument to write is: "a load waits on no tree latch, no gate, and no other thread's call for a frame, and a load whose thread must restart or wait for the flip ends first". Also add a cross-reference from §5.2's "If no victim is clean, the thread releases its latches and restarts" to §5.4 "The load".
+  - **(v), new:** judge C1's second clause, "loads the page again only once the flip has run". Add a mutant RELOAD-BEFORE-FLIP (G5), and a variant of `t_pin_load_race` (k) at A-3c in which the *restarting* hook releases T1 at once. A hook at T1's next *published* then asserts that S1 has flipped. Under the mutant T1 republishes before the flip, and the assertion fails, or T2 waits on T1 again within the step budget.
+- **S-THETA-F3. Exploration and budgets.** As gate 1 wrote it (History). `t_pin_load_race` (k) joins `t_alloc_restart_progress` run (3) among the harness runs whose gate shows the exploration and budget. Both are hook-steered, so neither is a sampled kill.
+- **S-THETA-F4. The panic clause on its targets.** As gate 1 wrote it (History). Add: a gateless thread waiting for the flip under C1 must be among the waiters §9.2 item 3's broadcast wakes. Name it as a gate waiter.
+
+Each needs a QUEUE entry (`- S-THETA-F<n> | …`) before `merge-card.sh` accepts this verdict. That is the orchestrator's step.
+
+## Carried rulings (gate 1, unchanged)
+
+- **The P0 facts.** These are as gate 1 established them in its Point 2 (History). I re-read them and found nothing wrong:
+  - **(a)**, a stale load installs superseded bytes: DEFECT, an acked commit is lost silently;
+  - **(a′)**, a MapLeaf position colliding with an LPID: UNDER-SPECIFICATION;
+  - **(c)**, a freed page's dirty frame written into the next image: DEFECT, by self-contradiction only;
+  - **(d)**, a second restart replacing an unwritten MapLeaf: DEFECT, a literal build loses an LPID's mapping.
+
+  They state facts for the next P0 review. They do not rule on what that review should conclude.
+- **Owner points.** OP-1 (XX000 against XX001 for an engine invariant violation), OP-2 (the store's own count-fair latch against `parking_lot`) and OP-3 (a client read's engine invariant violation stops the store) are carried as gate 1 wrote them, undecided. The rework does not touch them.
+- **The split.** Not needed, as gate 1 found. The rework lands only in the P half.
+
+## Merge timing
+
+By P0 re-check 1, this card may be built and gated on a branch, but may not merge before P0 PASS unless the owner says so in their own words.
+
+## Not verified
+
+- **Case (k) and every other case are designed, not run.** No A-3b frame acquisition, A-3c gate seam or A-4c0 harness code exists. The determinism and kill claims above are walks on the text.
+- **shuttle's behaviour** is still the card's unverified item, left to A-4c0's Work 0: its version, partial-order reduction, `yield_now` spins and caught panics.
+- **No code mutant was applied**, and no cargo test beyond the fresh gate's `gate.sh` was run.
+- **The composition runs used gate 1's composer.** I read it before running it, but did not rewrite it.
+- **The fresh gate ran under heavy host load** (load average above 120). Every step passed on the first run, the known `undo_order.rs` flake included, so no re-run was needed.
+
+## History
+
+- **Gate 1: REWORK, verdict commit 0fe12a461d1d6eb122307c5eac7e3a83173c706a, on 718333fb6e2f3f8afce2044244c84eea777f126b.**
+  - **The gate.** A P gate in Claude Code session 9e03f3bb-fc0b-44d3-9f64-30a72223b690, on 2026-11-17, with GATE EXIT=0 (scaffold 71ecf3e6).
+  - **Bytes.** It found the commit exactly the card's 30 blocks with `<date>` = 2026-11-16 (sha256 `1d99e0af…4434`). With 2026-11-17 the result is the card's `38428ea9…7f90`.
+  - **The P0 facts.** It established (a) DEFECT, (a′) UNDER-SPECIFICATION, (c) DEFECT by self-contradiction only, and (d) DEFECT.
+  - **The blocking finding.** F1: a gated operation waits for a load that nothing ends when the loader must restart for a pending flip. The flip waits for the operation, which waits for the load, and the loader waits for the flip, so commits stall.
+  - **The fix.** One list: C1 to C15 against the committed file, with 24 Acceptance edits, tried in scratch. The dry run is sha256 `2c2351e5…3875`, and the checker prints 240 mutants and 71 new (14 here).
+  - **Follow-ups and owner points.** It named S-THETA-F1 to F4 and owner points OP-1 to OP-3.
+- **The rework: commit fd48b9832cd3347dfa44f58247c3218975191185** (2026-11-17, a GLM 5.3 implementer).
+  - **The spec.** It applied C1 to C15 to `docs/S-STORE.md`: +9/−9 on 718333fb, giving `2c2351e5…3875`.
+  - **The card.** It was updated in the main checkout, where cards are local. Its pre-rework copy is at `~/.cache/nv3-review/S-THETA.card-backup-pre-rework1.local.md`.
+  - **Reported.** It reported 35 of 35 in both locales and GATE EXIT=0. It named five stale card-prose spots, which are ruled above.
+- **Gate 2 (this verdict): MERGE-WITH-FOLLOWUPS on fd48b983.**
+
+**Gate 1's verdict, as committed at 0fe12a46, verbatim.**
+- **How it is kept.** It is kept whole below, so that the card's and the follow-ups' citations of "verdicts/S-THETA.md" (C1 to C15, F1, the P0 facts, OP-1 to OP-3, S-THETA-F1 to F4) still resolve to this file.
+- **Its header lines** are prefixed "- ", so that no tool reads them as this verdict's fields. Everything after them is unchanged, headings included.
+- **What is current.** Where its "Verdict in brief", its merge advice or its follow-up texts differ from the sections above, the sections above are current.
+- **Elsewhere.** The same text is at `git show 0fe12a46:nucleus/v3/verdicts/S-THETA.md`.
+
+<!-- gate 1's verdict (0fe12a46), verbatim, begins -->
+
+- Card: S-THETA
+- Class: spec
+- Card-gate: P
+- Verdict: REWORK
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent, Claude Code session 9e03f3bb-fc0b-44d3-9f64-30a72223b690 (an independent P gate: this agent wrote neither the card, its implementation 718333fb, nor any earlier verdict, and is not the orchestrator)
+- Date: 2026-11-17
+- Gate-exit: GATE EXIT=0
+- Commit: 718333fb6e2f3f8afce2044244c84eea777f126b
+- Mutants: spec text, none in code. The card's 13, walked as text on their tests at 718333fb, each caught deterministically by the case the card names: LOAD-REF-BEFORE-PUBLISH -> t_pin_load_race (a) (A-3a, A-3c); LOADING-SERVED -> (b); FAILED-LOAD-KEPT -> (c); MISS-TWO-FRAMES -> (e); CREATE-OVER-LOADING -> (f); CREATE-BESIDE-FREED -> (g); PAGE-KEY-MERGED -> (i) (all A-3a); EVICT-UNLINK-BEFORE-ENTRY -> (h) (A-3c); FREED-FRAME-WRITTEN -> I-LPID-EXACT's row test after an eviction of every unpinned frame (A-4b); MAPLEAF-EXISTS-BY-REF -> t_alloc_restart_progress race run (1) (A-4a, A-7f); MAPLEAF-WAIT-UNDER-INNER -> run (3), a deadlock the harness reports (A-4a); INVARIANT-NOT-POISON -> t_poison_before_unlatch invariant and read variants, PANIC-UNPOISONED -> its panic variant (A-3c); ROOT-PIN-MAP-FIRST -> (j) (A-3a). Gate's own: G1 LOAD-KEPT-ACROSS-RESTART (a loader that holds no gate keeps its frame in the page table while it restarts for a pending flip) -> UNCAUGHT at 718333fb, no case has a flip (finding F1), caught after the rework by t_pin_load_race (k); G2 a reader that waits for a load under its parent's latch instead of restarting -> UNCAUGHT (READER-IO-UNDER-LATCH's hook watches reads, not waits; S-THETA-F2); G3 an LPID creation that waits for a load while holding that LPID's MapLeaf latch -> UNCAUGHT, on no row (S-THETA-F2); G4 step 2 writes a freed frame that eviction drops -> not caught at A-4b, which runs no checkpoint (S-THETA-F2). Text mutants on the tip, judged by the card's 34 non-gate Acceptance lines: each of the 30 blocks left out -> its own line(s) plus 33 (all 30 in the default locale, 8 also under LC_ALL=C); 9 one-word plants (in P3, P6, P7, P18, L1, L2, L4, P23, and one outside the blocks) -> each its own line plus 33 (32 and 33 for the outside one). The correction list below was tried the same way: each of C1-C14 left out fails its own line plus 33. All in scratch clones; the worktree was never written
+- Followups: S-THETA-F1, S-THETA-F2, S-THETA-F3, S-THETA-F4
 
 ## Verdict in brief
 
@@ -835,3 +1051,5 @@ These are in the card, not the spec file. No Acceptance line reads them:
   - E0's `locate` was read, and is quoted above.
 - **`parking_lot`'s timer fairness and PostgreSQL's behaviour** (PANIC promotion, publish-before-read) were not re-read. The card takes them from memory. No ruling here depends on them.
 - **What I did not run.** The card's mutants are spec text: no code mutant was applied, and no cargo test beyond the fresh gate's `gate.sh` was run. The `Mutants:` line is a walk on the text.
+
+<!-- gate 1's verdict (0fe12a46), verbatim, ends -->
