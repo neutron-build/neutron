@@ -1,15 +1,190 @@
 Card: S-ETA
 Class: spec
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session 40cbaf78-508d-49e9-b95d-3edb21da8347 (an independent P gate; this agent wrote neither the card S-ETA, its implementation becd0afc, card A-6b nor its findings, and is not the orchestrator)
-Date: 2026-11-17
+Gate-session: T3 review sub-agent, Claude Code session ecdca529-1b7a-462a-800b-23873858d62d (gate 2, a narrow re-gate after rework 1: this agent wrote neither the card S-ETA, its implementation becd0afc, the rework 901e85dd nor gate 1's verdict, and is not the orchestrator)
+Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: becd0afcd40d6d18252606a989c48f62c5eb0d67
-Mutants: spec text, none in code; each named mutant walked as text against its test: WAL-READ-ERROR-AS-END -> t_wal_read_error (A-6b hook; A-7d (a)-(c)), caught; WAL-MALFORMED-AS-END -> t_wal_malformed (A-6b streams; A-7d first run), caught; START-SEG-SHORT-AS-END -> t_wal_start (A-6b short start; A-7d (e)), caught; SHORT-READ-AS-END -> t_wal_short_read (A-6b damage cases; A-7d (a)), caught; SHORT-HOP-AS-DAMAGE -> t_wal_short_read (A-6b stop cases; A-7d (b)), caught; SEG-LEN-NOT-DURABLE -> t_seg_ack_durable (A-6b P3 rounds), caught; SEG-SIZE-UNCHECKED -> t_wal_seg_size (A-7c creation form caught; A-7d open form caught only if the walk's own Invalid is not mapped to XX001, S-ETA-F2); RECYCLE-TARGET-LOW -> t_wal_start (A-6b two runs; A-7d (f)), caught; COVER-AT-EOF -> t_wal_loss_below_ckpt_end short-segment variant as committed: UNCAUGHT when the lost record is the main fixture's c (the coverage check's second condition gives XX001 for build and mutant alike), caught after RW-4. Gate's own: G1 a read-only open that serves salvage at a WAL read error -> t_wal_read_error (b), caught; G2 an explicit rollback that answers 55000 when pass 1 from meta k meets a read error -> (b), caught; G3 a hopped segment's first record whose body runs past the end-of-file taken as a stop -> t_wal_short_read A-6b, caught; G4 a step 5 that shortens the valid end's segment and grows it back -> UNCAUGHT (no named test crashes inside step 5; S-ETA-F1 (e)). Text mutants, judged by the card's 44 non-gate Acceptance lines in both locales in scratch clones: 35 of 35 omit-one-block variants fail their own lines and line 43; 12 of 12 planted errors fail; on the reworked file each of RW-1 to RW-7 left out fails its own lines and line 43. The worktree was never written
-Followups: S-ETA-F1, S-ETA-F2, S-ETA-F3, S-ETA-F4, S-ETA-F5
+Commit: 901e85ddf94dd4d68dc8652795c880b5a8451582
+Mutants: spec text, none in code. Omit-one per rework block, each committed off 71ecf3e6 and judged by the card's 44 non-gate Acceptance lines in both locales: RW-1 -> lines 20, 22, 43, caught; RW-2 -> 32, 42, 43, caught; RW-3 -> 22, 32, 43, caught; RW-4 -> 22, 33, 43, caught; RW-5 -> 22, 34, 43, caught; RW-6 -> 6, 43, caught; RW-7 -> 6, 43, caught. Gate 2's own planted errors, same method: G2-1 W22's lost record back to c's Commit record (D1's unkillable fixture) -> 33, 43, caught; G2-2 the retire write dropped from §14.2's read-error row -> 32, 43, caught; G2-3 the retire write dropped from §12.5 "Read errors" -> 20, 43, caught; G2-4 SHORT-SEG-ERROR's gloss back to "short" -> 34, 43, caught; G2-5 I-WAL-STALE's read-error clause reworded -> 35, 43, caught; G2-6 the wal_seg_size row moved below its neighbour -> 32, caught. Named mutants re-walked as text on the reworked fixtures: COVER-AT-EOF -> t_wal_loss_below_ckpt_end short-segment variant (RW-4), caught; SHORT-SEG-ERROR -> t_ro_open_disk_full under the corrected gloss, caught; the rest unchanged from gate 1 (History). Gate 2's own design mutant: G2-7 a pass 2 that takes a WAL read error as the end of its walk and opens -> UNCAUGHT (no named test makes a read error that only pass 2 meets; S-ETA-F6 (c)). The worktree was never written before this commit
+Followups: S-ETA-F1, S-ETA-F2, S-ETA-F3, S-ETA-F4, S-ETA-F5, S-ETA-F6
+
+## Verdict in brief
+
+**MERGE-WITH-FOLLOWUPS.** The rework is exactly RW-1 to RW-7 and nothing else, the card now matches gate 1's lists, and D1 to D4 are closed. Nothing found here meets the blocking bar: no text leads a builder to a wrong build, no test is made unpassable, and no named mutant is left unkillable.
+
+One new non-blocking finding, S-ETA-F6. RW-1 fixed the bound on what a read error leaves written in §12.5, §14.2 and the Changelog. Two summaries this card wrote still say "writing nothing" without the bound: §15 I-WAL-STALE's row and the head status line. §14 step 4 names no read error, and no test makes a read error that only pass 2 meets. The normative text (§12.5 "Read errors", §14.2's row, §14 step 4a "Retiring meta `k`") is right and agrees with itself, so a builder who follows it builds the right thing. F6 gives exact riders for the next S-STORE card.
+
+**Merge timing.** This card may not merge before P0 PASS unless the owner says so in their own words.
+
+## Gate run
+- **Scaffold extract** (GATE-PROMPT step 1): a shallow `--no-local` clone of `nucleus/v3-scaffold` printed **71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b**. `fresh-gate.sh` and `git-env.sh` were extracted with no `EXTRACT FAILED`.
+- **The run:** `bash "$fg/fresh-gate.sh" 901e85ddf94dd4d68dc8652795c880b5a8451582`, from `~/Workspace/neutron-v3`, with `CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate2-S-ETA` and both streams captured to files. Its lines:
+  - `fresh-gate: commit 901e85ddf94dd4d68dc8652795c880b5a8451582`
+  - `fresh-gate: base 71ecf3e6cd4b328494f6055ad7014efd6d5b2a9b`
+  - `fresh-gate: checks passed (4875 files hashed in 6.04 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - `STEP test EXIT=0`, `STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=0`, `STEP api-surface EXIT=0`
+  - The literal last line was `GATE EXIT=0`, the exit status 0, and stderr empty. The known `spikes/e1-arm-c` `undo_order.rs` flake did not fire, so no re-run was needed. `$fg` was removed afterwards.
+- **The worktree** `~/.cache/nv3-cards/S-ETA`, branch `card/v3-S-ETA`, was clean at tip 901e85dd before this commit. `git status` was empty, and `git ls-files -v` showed no assume-unchanged or skip-worktree entry. Every Acceptance run and mutant used a `--no-local` scratch clone under `~/.cache/nv3-review/gate2-S-ETA/`.
+- **The branch:** 71ecf3e6 → becd0afc (the card) → 3e6e999c (gate 1's REWORK verdict) → 901e85dd (rework 1, `docs/S-STORE.md` only, 7 lines changed) → this verdict.
+
+## Scope 1: the rework is RW-1 to RW-7 and nothing else
+- **The diff.** `git diff --stat becd0afc 901e85dd` shows `docs/S-STORE.md` (+7/−6) and gate 1's verdict file, which 3e6e999c added. 901e85dd itself touches only `nucleus/v3/docs/S-STORE.md`. Against the scaffold, `docs/S-STORE.md` is +63/−28.
+- **The bytes.** I wrote my own parser for gate 1's "Corrections RW-1 to RW-7" section. I applied the seven blocks to becd0afc's committed `docs/S-STORE.md` (sha256 `91b40716…11e4b8`). Each Old occurred exactly once, in file order. The result is byte-identical to 901e85dd's file: sha256 `3a75fb626065ff4b8081ecbc6eba3105c6e0fff06d92809512026ed47ecb9b79`. That matches gate 1's dry run `~/.cache/nv3-review/gate-S-ETA/corrected.md` and the implementer's report.
+- **The card's Acceptance.** I parsed the list with `tools/run_card.py`'s `parse_card` regex from the reworked card and from the pre-rework backup (`~/.cache/nv3-review/S-ETA.card-backup-pre-rework1.local.md`). Both have 45 commands. Replacing lines 6, 20, 22, 32, 33, 34, 42 and 43 of the backup with gate 1's eight lines gives the reworked list exactly: 0 mismatches. The last command is `cd nucleus/v3 && bash scripts/gate.sh`, which is `GATE_CMD`.
+- **The card's own blocks.** My fence-aware parser of the card's `## Edits` section read 37 blocks: E1, W1 to W20, W20a, W21 to W23, W23a, W24 to W33, E2. Applied in order to the base 7.15 (sha256 `a1376c94…700f`), with `<date>` = 2026-11-17 (the commit date of both becd0afc and 901e85dd), they give sha256 `3a75fb62…9b79`, 901e85dd's file.
+  - Every Old occurs once in the base.
+  - Every New occurs once in the result.
+  - The reverse (E2 down to E1, New to Old) gives the base byte for byte.
+  - O1 to O12 (OP-1's riders) each occur once, at their turn, in the result.
+- **The card's prose** carries every point of gate 1's "Card text the rework must update":
+  - The Edits order line, with W20a and W23a.
+  - R-1's "What has been written by then", now with pass 2's walk and the retire write.
+  - R-7's fix, "For the gate" item 4 and the Mutation evidence, now naming the `Chunk` after the last commit.
+  - Limits 2, now with W20a and W23a.
+  - The draft target, +63/−28.
+  - The reverse, the dry run, the omit-one table and the merge-order note, each marked as re-checked after rework 1.
+  - The card's "What changes, in plain words" and the cases list did not need to change: gate 1 kept R-1's cases 1 to 4 for pass 1.
+
+## Scope 2: Acceptance, checker and omit-one
+- **Acceptance.** All 44 commands before `gate.sh` were run as the runner runs them: `/bin/sh -c` from the root of a clean `--no-local` clone at 901e85dd, with `env -i`, `PATH=/usr/bin:/bin`, and a local `nucleus/v3-scaffold` at 71ecf3e6. They pass **44 of 44 under `LANG=en_CA.UTF-8` and 44 of 44 under `LC_ALL=C`**. Line 45, `gate.sh`, is the fresh gate above.
+- **The checker** (line 41) prints:
+  - `166 rows; 234 mutants; 24 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`
+  - `65 new since 7.10 (31 at 7.11, 11 at 7.12, 4 at 7.13, 10 at 7.14, 1 at 7.15, 8 here), 65 of them judged on a Phase A row; 47 invariants, 52 tests`
+  - `OK`
+- **The new list rejects becd0afc.** On becd0afc as it stands, lines 6, 20, 22, 32, 33, 34, 42 and 43 fail, in both locales.
+- **Omit-one, for each RW.** Each variant was built with my parser from becd0afc's file, leaving one block out, and committed on its own branch off 71ecf3e6. It was run in both locales, and the locales agreed every time:
+
+  | Left out | Lines that fail |
+  |---|---|
+  | RW-1 | 20, 22, 43 |
+  | RW-2 | 32, 42, 43 |
+  | RW-3 | 22, 32, 43 |
+  | RW-4 | 22, 33, 43 |
+  | RW-5 | 22, 34, 43 |
+  | RW-6 | 6, 43 |
+  | RW-7 | 6, 43 |
+
+  This is gate 1's table exactly.
+- **Planted errors** (gate 2's own), on the reworked file, each committed off 71ecf3e6 and run in both locales:
+
+  | # | Fault | Lines that failed |
+  |---|---|---|
+  | G2-1 | RW-4's lost record back to "`c`'s `Commit` record", the fixture D1 showed cannot fail COVER-AT-EOF | 33, 43 |
+  | G2-2 | §14.2's read-error row without "once meta `k` is retired (step 4a), the retire write" | 32, 43 |
+  | G2-3 | §12.5 "Read errors" without the retire write | 20, 43 |
+  | G2-4 | SHORT-SEG-ERROR's gloss back to "missing, or short" | 34, 43 |
+  | G2-5 | I-WAL-STALE's read-error clause reworded | 35, 43 |
+  | G2-6 | the `wal_seg_size` row swapped with the row below it | 32 |
+
+  G2-6 escapes line 43, because swapping an added line with an unchanged neighbour leaves the `-U0` diff body the same. Line 32's adjacency check catches it, which is what that check is for.
+
+## Scope 3: the reworked text as recovery design
+I re-read §12.5 "Short segments", "Read errors" and "Malformed records", §14 steps 1 to 5 with the fence, step 4a, "Retiring meta `k`" and the explicit rollback, §14.1, §14.2, and the §15 rows I-WAL-COVER, I-RO-OPEN and I-WAL-STALE. Then I searched the whole file for each changed rule: "writing nothing" and "writes nothing", 58030, "nothing written beyond", SHORT-SEG-ERROR, "short or missing", "short-segment variant", `**short segment**`, 212 and `wal_seg_size`, and the retire write.
+
+- **D1, closed.** The variant's lost record is now a `Chunk` of a transaction that never commits, appended after the last `Commit` or `CommitMarker` before the flip. I walked it through both coverage conditions:
+  - The walk reads every commit up to the one that carries `ts_ckpt_hi`, so `max(T, largest commit_ts) ≥ ts_ckpt_hi`, and the second condition holds.
+  - It stops on the lost record's zeros by the magic check, at a position below `wal_ckpt_end`. It never reads past the end-of-file, so no §12.5 short-read damage fires.
+  - So the build gives XX001 from the first condition. COVER-AT-EOF compares the end-of-file, which the test placed at or above `wal_ckpt_end`, so the check passes and the open succeeds. The mutant is caught.
+  - The fixture is buildable. A never-committing transaction's chunk is below `wal_ckpt_end` and synced by checkpoint `k`'s step 1, and an open chunked transaction only lowers `wal_start_lsn` (§12.6), so the walk still starts at or before the lost record.
+  - I-WAL-COVER's row ("under COVER-AT-EOF, the short-segment variant opens"), §12.5's mutant line and the Changelog bullet agree with it.
+- **D2, closed.** SHORT-SEG-ERROR's only gloss, I-RO-OPEN's, now says a hopped segment that is missing or too short for a header at its first LSN. That matches §12.5 "Short segments" and line 932 ("even when that segment is short or missing", which is about a hop).
+  - `t_ro_open_disk_full` stops a writer with 53100 at a segment's creation and at its preallocation, which leaves exactly such a hopped segment, so the mutant stays killed.
+  - The only other "short or missing" texts are the 7.x Changelog history and R21's quoted plan wording. Both are history.
+- **D3, closed in the normative text.**
+  - **§12.5 "Read errors"** (RW-1) now bounds the writes for every open:
+    - Pass 1 from meta `k` writes nothing. Step 1's fence is lazy ("an open refused before its first write fence[s] nothing"), and pass 1 evicts nothing.
+    - A fall-back's or a rollback's pass 1 from meta `k−1` can follow the fence and image `k`'s pass-2 evictions. The retire write comes after pass 1, because item 4 retires after the proof, and a rollback "falls back as a proven fall-back does".
+    - Pass 2 from meta `k` can follow the fence and its own evictions.
+    - Pass 2 from meta `k−1` can follow both passes' evictions and the retire write.
+  - Each case fits "at most the fence, pass 2's evictions and, once … retired, the retire write". This agrees with step 4a's "Only the fence (step 1) and the pass-2 evictions made from image `k` before it failed can precede the retire write".
+  - "An open that later reads those bytes recovers as if the error had not happened" holds after a retire too. The next open selects meta `k−1` as the newest, and its walk is the one the proof, or the rollback, had already accepted.
+  - §14.2's row (RW-3) and the Changelog (RW-6) say the same.
+  - §14 step 3's own sentence ("writes nothing, or, in a fall-back from an image `k` that failed in pass 2, nothing more than the fence and that pass 2's evictions") is about pass 1, and it is true for pass 1.
+  - Two summaries still say "writing nothing" without the bound: §15 I-WAL-STALE's row and the head status line. Step 4 names no read error. No test makes a read error that only pass 2 meets. Each is non-blocking (below), and S-ETA-F6 covers them.
+- **D4, closed.** §14.2 now has the `wal_seg_size < 212` row right after step 1's range-check row: XX001 with nothing written, read-write and read-only. That matches W5's open check. The scaffold is still at 71ecf3e6, so S-ZETA has not merged. If it merges first, its well-formed row and this row agree, as gate 1 said.
+- **No new defect in R-1 to R-7.** The rework changed only sentences about write bounds, one fixture and one gloss. None of R-1 to R-6's rules moved. Gate 1's walk of them (History) stands.
+
+### Why F6 is not blocking
+- **"Writing nothing" in I-WAL-STALE's row and the status line.**
+  - Both are summaries that point to §12.5. §12.5, §14.2, step 4a and "Retiring meta `k`" all state the bound explicitly and agree with each other.
+  - No build can honour the literal summary after pass 2 has evicted. Pass 2 must evict at a minimum pool (§5.4), and the retire write must precede pass 2 from meta `k−1`. So the summary cannot steer a builder toward a different correct-looking build.
+  - No named test asserts byte-identity after a pass-2-only read error. `t_wal_read_error` (c) asserts "nothing more than the fence and the pass-2 evictions", which agrees with RW-1.
+  - The same phrase was in becd0afc's I-WAL-STALE row (W26), where it was also loose for a fall-back's pass 1. Gate 1's search did not list it.
+- **A read error that only pass 2 meets** (G2-7).
+  - A build whose pass 2 takes the walk's error for an end and opens would lose acked commits behind it. Its boot checkpoint would move `wal_start_lsn` past them.
+  - RW-1's sentence forbids this. But every named case of `t_wal_read_error` fails the read in pass 1 first, so that form is uncaught.
+  - It is not a named mutant: WAL-READ-ERROR-AS-END is killed by its pass-1 cases.
+  - A-6b's walk is the one walk both passes use, and its hook test pins that the walk returns the error. Only an A-7d pass-2 driver that swallows the error escapes.
+  - The test belongs to A-7d's card or the next S-STORE card (F6 (c)).
+
+## The P0 question
+Gate 1's P0 facts (History) are carried unchanged. Rework 1 changed no rule they rest on:
+- (i) F-3 is not a defect under the given definition, but an under-specification with an inconsistency.
+- (ii) The recycling target is a defect at the level of the spec's claims, reachable only under a reading no planned build takes.
+- (iii) F-1 is an under-specification only.
+
+I did not re-derive the two-copy-fault lowest-free-name path; gate 1 marked it as reasoned, not modelled. This gate does not rule on what P0 should conclude.
+
+## Owner point OP-1 (not decided here)
+Carried from gate 1 unchanged: should a read-only open serve salvage before a WAL read error? The card and this verdict keep 58030 for every open.
+- O1 to O12 still apply once each, at their turn, to 901e85dd's file.
+- If the owner says yes, S-ETA-F6 (a)'s I-WAL-STALE rider and O11 rewrite the same clause. Whichever lands second must carry the other's text: O11's "writing nothing" then also takes RW-1's bound.
+
+## Follow-ups
+S-ETA-F1 to S-ETA-F5 are gate 1's and are carried unchanged (History, "Follow-ups"). I re-checked each against 901e85dd:
+- F1 (a)'s "at the first LSN of" wording is still in step 3, W17's exception and R21.
+- F1 (b) still holds: (c)'s hooked record lies past meta `k`'s `wal_ckpt_end`.
+- F2 to F5 are untouched by the rework.
+
+- **S-ETA-F6, riders for the next S-STORE card (none blocks).** Each Old below occurs exactly once in 901e85dd's `docs/S-STORE.md`. Applied in this order in a scratch copy, they apply once each, in file order.
+  - (a) §15 I-WAL-STALE: the read error's write bound.
+    Old: `a read error fails the open with 58030 in both modes, writing nothing, and`
+    New: ``a read error fails the open with 58030 in both modes, writing nothing more than the open had written when the read failed (nothing in pass 1 from meta `k`), and``
+  - (b) The head status line, if the next card keeps 7.16's entry in it.
+    Old: `fails the open with 58030 in both modes, writing nothing;`
+    New: `fails the open with 58030 in both modes, writing nothing more than it had written when the read failed;`
+  - (c) §14 step 4 and `t_wal_read_error`: pass 2's read error.
+    - Text. Old: ``A chunk whose transaction has no marker is ignored. Records with `commit_ts ≤ T` are skipped: they are in the image.`` New: the same, then `A read error in this walk fails the open with **58030** as in step 3, after no more than the fence, pass 2's own evictions and any retire write before it (§12.5, "Read errors").`
+    - Test. Add to `t_wal_read_error` at A-7d a case (d): a hook that lets pass 1 read one synced record past `wal_ckpt_end` and fails pass 2's read of it, with a pool small enough that pass 2 evicts first. The read-write open fails with 58030, every meta place and WAL file is byte-identical, every slot written is one that neither image references, and the next open, without the hook, recovers every acked commit. In a fall-back form, the same is done after the retire write, and the next open selects meta `k−1` and recovers every acked commit.
+    - The case kills G2-7, a pass 2 that takes the read error as its walk's end and opens. The test addition is A-7d's, or the next S-STORE card's if it adds a mutant name.
+  - (d) §14 step 3's sentence covers an explicit rollback that a pass-2 read error let proceed only through "falls back as a proven fall-back does". Optional wording: "a fall-back from an image `k` that failed in pass 2, or a rollback that a read error in pass 2 let proceed". If OP-1 lands, O4 rewrites that sentence and must carry this too.
+  - Before the merge, S-ETA-F6 needs a QUEUE entry (`- S-ETA-F6 | …`), as F1 to F5 do; `merge-card.sh` checks each named follow-up against QUEUE.
+
+## Not verified
+- No A-6b, A-7c, A-7d or A-7f code exists. Every "caught" for a named test was walked as text, as in gate 1.
+- **Merge orders.** I did not re-run the S-ZETA or R-1-SPEC orders. The card says its author re-checked all six after rework 1; gate 1 checked the S-ZETA-first and R-1-SPEC-first paths with RW-1 to RW-7. RW-2's row and S-ZETA's well-formed row were not checked together on a composed file here.
+- **OP-1's riders' semantics** against RW-1's new pass-2 sentence. I checked only that they apply.
+- Gate 1's P0 point (ii) two-copy-fault path, OPFS length durability (F4), E4's `truncate_wal` and A-6b-0's `DirLoss` remain as gate 1 left them.
+
+## History
+
+- **Gate 1: REWORK, verdict commit 3e6e999cddef9d052f99d11b49f40f36815f8f38, on becd0afcd40d6d18252606a989c48f62c5eb0d67.**
+  - **The gate.** A P gate in Claude Code session 40cbaf78-508d-49e9-b95d-3edb21da8347, with GATE EXIT=0 on becd0afc.
+  - **Findings.** D1, COVER-AT-EOF unkillable under the variant's natural fixture; D2, a stale SHORT-SEG-ERROR gloss; D3, "writes nothing" false for pass 2 and after a retire write; D4, no §14.2 row for the `wal_seg_size` floor.
+  - **The fix.** RW-1 to RW-7 and eight replaced Acceptance lines (6, 20, 22, 32, 33, 34, 42, 43), with dry-run sha256 `3a75fb62…9b79`. Follow-ups S-ETA-F1 to S-ETA-F5, owner point OP-1, and the P0 facts (i) to (iii).
+- **The rework: commit 901e85ddf94dd4d68dc8652795c880b5a8451582** (a GLM 5.3 implementer). It applied RW-1 to RW-7 to `docs/S-STORE.md` only, giving sha256 `3a75fb62…9b79`. The card was updated in the main checkout (cards are local); its pre-rework copy is `~/.cache/nv3-review/S-ETA.card-backup-pre-rework1.local.md`. Reported: 45 of 45 Acceptance in both locales, `GATE EXIT=0`.
+- **Gate 2 (this verdict): MERGE-WITH-FOLLOWUPS on 901e85dd.**
+
+**Gate 1's verdict, as committed at 3e6e999c, verbatim.** Its header lines carry a "- " prefix, so that no tool reads them as this verdict's fields. Everything after them is unchanged, headings included. Where its sections ("Merge timing", "Follow-ups", "Owner point OP-1", "The P0 question") differ from the sections above, the sections above are current. The same text is at `git show 3e6e999c:nucleus/v3/verdicts/S-ETA.md`.
+
+<!-- gate 1's verdict (3e6e999c), verbatim, begins -->
+
+- Card: S-ETA
+- Class: spec
+- Card-gate: P
+- Verdict: REWORK
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent, Claude Code session 40cbaf78-508d-49e9-b95d-3edb21da8347 (an independent P gate; this agent wrote neither the card S-ETA, its implementation becd0afc, card A-6b nor its findings, and is not the orchestrator)
+- Date: 2026-11-17
+- Gate-exit: GATE EXIT=0
+- Commit: becd0afcd40d6d18252606a989c48f62c5eb0d67
+- Mutants: spec text, none in code; each named mutant walked as text against its test: WAL-READ-ERROR-AS-END -> t_wal_read_error (A-6b hook; A-7d (a)-(c)), caught; WAL-MALFORMED-AS-END -> t_wal_malformed (A-6b streams; A-7d first run), caught; START-SEG-SHORT-AS-END -> t_wal_start (A-6b short start; A-7d (e)), caught; SHORT-READ-AS-END -> t_wal_short_read (A-6b damage cases; A-7d (a)), caught; SHORT-HOP-AS-DAMAGE -> t_wal_short_read (A-6b stop cases; A-7d (b)), caught; SEG-LEN-NOT-DURABLE -> t_seg_ack_durable (A-6b P3 rounds), caught; SEG-SIZE-UNCHECKED -> t_wal_seg_size (A-7c creation form caught; A-7d open form caught only if the walk's own Invalid is not mapped to XX001, S-ETA-F2); RECYCLE-TARGET-LOW -> t_wal_start (A-6b two runs; A-7d (f)), caught; COVER-AT-EOF -> t_wal_loss_below_ckpt_end short-segment variant as committed: UNCAUGHT when the lost record is the main fixture's c (the coverage check's second condition gives XX001 for build and mutant alike), caught after RW-4. Gate's own: G1 a read-only open that serves salvage at a WAL read error -> t_wal_read_error (b), caught; G2 an explicit rollback that answers 55000 when pass 1 from meta k meets a read error -> (b), caught; G3 a hopped segment's first record whose body runs past the end-of-file taken as a stop -> t_wal_short_read A-6b, caught; G4 a step 5 that shortens the valid end's segment and grows it back -> UNCAUGHT (no named test crashes inside step 5; S-ETA-F1 (e)). Text mutants, judged by the card's 44 non-gate Acceptance lines in both locales in scratch clones: 35 of 35 omit-one-block variants fail their own lines and line 43; 12 of 12 planted errors fail; on the reworked file each of RW-1 to RW-7 left out fails its own lines and line 43. The worktree was never written
+- Followups: S-ETA-F1, S-ETA-F2, S-ETA-F3, S-ETA-F4, S-ETA-F5
 
 ## Verdict in brief
 
@@ -477,3 +652,5 @@ The card is not this gate's to edit; these points are for the author or orchestr
 - **The lowest-free-name path at two copy-faults** (P0 point (ii)) is reasoned, not modelled.
 - **Merge orders.** I checked S-ETA's blocks, and then RW-1 to RW-7, on S-ZETA's and on R-1-SPEC's committed files, not all six three-card orders. I did not run the S-ZETA or R-1-SPEC checkers.
 - **E4's `truncate_wal` zeroing** (the card's D-9 source) and **A-6b-0's `DirLoss`** were not read. The `DirLoss` code is not on the scaffold yet, and SimEnv's current directory loss is prefix-only.
+
+<!-- gate 1's verdict (3e6e999c), verbatim, ends -->
