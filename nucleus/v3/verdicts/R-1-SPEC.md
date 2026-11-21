@@ -1,15 +1,315 @@
 Card: R-1-SPEC
 Class: spec
 Card-gate: P
-Verdict: MERGE-WITH-FOLLOWUPS
+Verdict: REWORK
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent for thread 45584af2-e651-490e-862c-3402320cffa3, Claude Code session df6338c5-4202-4216-a68d-447224f3dcc6 (an independent P gate 3, a narrow re-gate after rework 2 with a design re-read of K11: this agent wrote neither the card, its implementation 32f68472, rework 1 98c85aca, rework 2 a8486ede, nor gate 1's or gate 2's verdict, and is not the orchestrator)
+Gate-session: T3 review sub-agent for thread 45584af2-e651-490e-862c-3402320cffa3, Claude Code session c0435d3e-bb96-47e9-a5d9-ab45ffb866ab (an independent P gate 4, a narrow re-gate after the card was moved onto S-ZETA's draft 7.18: this agent wrote neither the card, its implementation 32f68472, rework 1 98c85aca, rework 2 a8486ede, the move ecdae5d9, nor gate 1's, gate 2's or gate 3's verdict, and is not the orchestrator)
 Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: a8486ede087555faa2c55f86c6417c28063419d0
-Mutants: spec text, none in code; K11 adds no test or mutant, so gate 1's and gate 2's walks stand (History). G4 RO-SIZED-FROM-F (gate 2's) -> UNCAUGHT by t_ro_open and t_ro_open_disk_full as they stand, caught by F1's second form. Gate 3's own: G5 RO-FLOOR-PER-OP (a read-only open checks `F_e ≥ F_min` only before each replayed op, so a replayed insert whose overflow chain build takes `F_e` below `F_min` mid-op waits for an unpin) -> UNCAUGHT by t_ro_open, t_ro_open_disk_full and F1's two forms (F8); G6 RO-H-SET-ONCE (`R_EPOCH` re-set before each op but `H` kept at the open's value) -> UNCAUGHT by the same, since no form descends a tree taller than the current `H` and no taller than the open's (F8). Mechanical: K11 applied by this gate's own script to 98c85aca's files equals a8486ede's byte for byte; the card's blocks applied by this gate's own parser reproduce all four files at both dates; omitting any one K11 entry fails Acceptance in both locales (5/5 caught: K11a, K11b, K11c line 52; K11d, K11e lines 39 and 52)
+Commit: ecdae5d93c33dcde53d59ad98a282a1044b6a2fb
+Mutants: spec text, none in code; the move changes no test, mutant or judging row, so gates 1–3's walks stand (History). Omit-one on 12 of the 36 edit blocks, each built by my own parser on 1cd6d482's files with one block left out, committed in a scratch clone and judged by the card's 52 non-gate Acceptance lines in both locales: E3 -> 26, 36, 39; E5 -> 27, 38, 39; E8 -> 30, 38, 39, 51; E9 -> 31, 36, 39; E12a -> 38, 39, 51, 52; E14 -> 37, 38, 39; E18 -> 37, 38, 39; E21 -> 34, 38, 39; E24 -> 35, 38, 39, 51; E25 -> 24, 38, 39, 52; T5 -> 42, 43, 48; X1 -> 44, 45, 49; 12/12 caught, the two locales agreeing. K12 (this verdict's corrections) in scratch: at ecdae5d9 the new line 53 and line 48 with its new hash fail; omitting any one K12 entry fails line 53 (and K12d line 48 too), in both locales
 Followups: R-1-SPEC-F1, R-1-SPEC-F2, R-1-SPEC-F3, R-1-SPEC-F4, R-1-SPEC-F5, R-1-SPEC-F6, R-1-SPEC-F7, R-1-SPEC-F8
+
+## Verdict in brief
+
+**REWORK**, narrow, on the merge commit `ecdae5d93c33dcde53d59ad98a282a1044b6a2fb`, which moves R-1-SPEC onto S-ZETA's draft 7.18 and makes S-STORE draft 7.19. The S-STORE resolution is exact, and the checks pass. But the move left four cross-references in the two other edited spec files naming "S-STORE draft 7.16". On the merged scaffold, draft 7.16 is **S-THETA's** draft, not R-1-SPEC's, so those references are now wrong. One of them makes a false statement. The fix is four one-number replacements (K12), the C-T0 diff hash and one new Acceptance line, all tried in scratch.
+
+- **The S-STORE resolution is exact.**
+  - My own parser applies the card's 26 S-STORE blocks to 1cd6d482's 7.18 (`79cd8027…bcb9`), with `<date>` 2026-11-20. The result is the merge commit's file byte for byte (`a9978ac5…24b8`), and the reverse gives 7.18 back.
+  - The blocks are gate 3's, unchanged: all 36 Olds and 34 of the 36 News are byte-identical to the pre-move card's. E1 changes only its draft number. E25 changes only its number and its Counts bullet, and the counts are right (below).
+  - No S-THETA, S-ETA or S-ZETA text is altered.
+  - `docs/R-1-memory.md`, `docs/C-T0-txn-protocol.md`, `docs/README.md` and `verdicts/R-1-SPEC.md` are byte-identical to gate 3's commit e7703ea2.
+- **The checks pass.** Fresh gate: `GATE EXIT=0` (below). All 52 non-gate Acceptance lines pass at ecdae5d9 under `en_CA.UTF-8` and under `LC_ALL=C`, and all 52 fail at 1cd6d482. Both checkers print `OK`. Omit-one catches 12 of the 12 blocks I sampled.
+- **The defect (D11, blocking): the R-1-memory and C-T0 cross-references now name the wrong S-STORE draft.** Four places say "S-STORE draft 7.16":
+  - R-1-memory's status line ("derived against S-STORE draft 7.16");
+  - R-1-memory §4.4 ("S-STORE §5.3's premise, as draft 7.16 words it, is `O ≥ Σ Q_t`");
+  - R-1-memory's Changelog ("With S-STORE draft 7.16 and C-T0 draft 8.8");
+  - C-T0's 8.8 Changelog entry ("with S-STORE draft 7.16 and the new `docs/R-1-memory.md` draft 1").
+
+  Gate 3 judged these when draft 7.16 *was* R-1-SPEC's S-STORE. On the merged scaffold, draft 7.16 is S-THETA's (6e3423f6). Its §5.3 still has draft 7.15's premise, "a frame outside `R_EPOCH` that no pin holds" (E3's Old occurs once in it, E3's New not at all), and it never mentions R-1-memory.
+  - So §4.4's sentence is now false of the draft it names.
+  - The three version pairings contradict S-STORE's own 7.19 status line and Changelog, which pair *7.19* with R-1-memory draft 1 and C-T0 8.8.
+  - This happens just as P0 is to be judged on the merged spec (the owner's decision of 2026-11-20). A reader who opens S-STORE 7.16 to check R-1's numbers finds none of them.
+
+  The move changed these references' meaning without touching their bytes. Neither the card's Notes ("If S-ZETA, S-ETA or S-THETA merges first") nor the move updated them. K12 fixes them.
+- **Nothing else blocks.** I compared R-1's rules in 7.19 and R-1-memory against S-THETA's pool rules (I-PIN-CURRENT, pages being loaded, freed frames kept for reuse, waits under tree latches, the flip wait), S-ETA's WAL-walk rules and S-ZETA's open refusal. They neither restate nor contradict any of them in a way that matters (Scope 4).
+
+**Merge timing.** The owner's own words of 2026-11-20 (QUEUE head, `# OWNER DECISION 2026-11-20 17:00 MST`) say: "The spec cards S-ETA, S-THETA, S-ZETA and R-1-SPEC may merge before P0 passes, and P0 is then judged on the merged spec." So once K12 is applied and re-gated, R-1-SPEC may merge before P0 PASS. That replaces gate 3's "may not merge before P0 PASS unless the owner says so in their own words".
+
+## Gate run
+
+- **Load check.** At 23:35:21 the load average was 21.09 / 21.99 / 24.43, on a 16-CPU host with other projects' jobs running. I waited, polling every 30 s (`loadwait.log`), until the 1-minute average fell below 16: 14.56 / 20.03 / 23.53 at 23:36:51.
+- **Scaffold extract** (GATE-PROMPT step 1): the shallow `--no-local` clone of `nucleus/v3-scaffold` printed **1cd6d48271566110e5af19d89f2435f26512885e**. `fresh-gate.sh` and `git-env.sh` were extracted with no `EXTRACT FAILED`.
+- **The run:** `bash "$fg/fresh-gate.sh" ecdae5d93c33dcde53d59ad98a282a1044b6a2fb`, from `~/Workspace/neutron-v3`, with `PATH=$HOME/.cargo/bin:$PATH` and `CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate4-R-1-SPEC`. Stdout and stderr went to separate files under `~/.cache/nv3-review/gate4-R-1-SPEC/` (`gate1.out`, `gate1.err`). It ran from 23:37:15 (load 12.19 / 19.03 / 23.11) to 23:52:39 (load 11.81 / 13.20 / 18.45). The 1-minute load, sampled each minute (`load1.log`), peaked at 29.89 during the run. Its lines:
+  - `fresh-gate: commit ecdae5d93c33dcde53d59ad98a282a1044b6a2fb`
+  - `fresh-gate: base 1cd6d48271566110e5af19d89f2435f26512885e`
+  - `fresh-gate: checks passed (4892 files hashed in 2.82 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - `STEP test EXIT=0`, `STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=0`, `STEP api-surface EXIT=0`
+  - The literal last line was **`GATE EXIT=0`**, the exit status 0, and stderr was empty (0 bytes).
+- **Flakes.** None of the known flakes occurred. The test step exited 0, so neither `undo_order.rs` `readers_never_see_past_their_snapshot_during_apply` nor `sim_env.rs` `sim_halted_off_task` failed. The enforcement self-tests printed `ok   premise: GUC: a -c core.untrackedCache=true beats the environment` and `ok   runner refs: RV cost ten honest moved refs verify in under 2 s`. There was no SIGTERM and no re-run. `$fg` was removed afterwards.
+- **The worktree** `~/.cache/nv3-cards/R-1-SPEC`, branch `card/v3-R-1-SPEC`, was clean at tip ecdae5d9 before this commit (`git status --short` empty), and nothing but this verdict was written to it. The omit-one variants and the K12 trial used a `--shared` scratch clone, `~/.cache/nv3-review/gate4-R-1-SPEC/sc`.
+- **The branch:** 71ecf3e6 → 32f68472 (the card) → 7fb18902 (gate 1's REWORK) → 98c85aca (rework 1) → 22722c9d (gate 2's REWORK) → a8486ede (rework 2) → e7703ea2 (gate 3's MERGE-WITH-FOLLOWUPS) → ecdae5d9 (the merge of 1cd6d482, the move) → this verdict.
+
+## Scope 1: the merge commit
+
+- **Its parents and tree.** The parents of ecdae5d9 are e7703ea2 (gate 3's verdict commit, on rework 2 a8486ede) and 1cd6d482 (the scaffold tip after S-ZETA's merge, pass 172). `git diff --stat 1cd6d482 ecdae5d9` lists exactly five files:
+  - `docs/S-STORE.md` (+37/−18, as against 7.15 at gate 3);
+  - `docs/R-1-memory.md` (+466, new);
+  - `docs/C-T0-txn-protocol.md` (+9/−8);
+  - `docs/README.md` (+2/−1);
+  - `verdicts/R-1-SPEC.md`.
+
+  The four docs are Touch only, and the verdict file is gate 3's, unchanged (blob `99f2b8de` at both commits). No protected path is touched.
+- **C-T0 and README did not move.** `git diff 71ecf3e6 1cd6d482` on `docs/C-T0-txn-protocol.md`, `docs/README.md` and `docs/R-1-memory.md` is empty, and 1cd6d482's C-T0 is still the card's Base hash `96caa6cb…a0c0`. So T1–T9 and X1 apply unchanged.
+  - The merge commit's R-1-memory (`e3956d03…bc5d`), C-T0 (`8a826331…9149`) and README (`191f528f…ab82`) have the same blob ids as at e7703ea2: `41e7a967`, `6bb2754a` and `273949d4`.
+- **The S-STORE resolution, by my own parser.** I wrote a line-based parser (`~/.cache/nv3-review/gate4-R-1-SPEC/g4parse.py`) without reading the implementer's `apply719.py` or gate 3's. It reads 15 Doc blocks and 36 edits from the card: E1–E25 with E12a, T1–T9 and X1. That is 87 fenced blocks, matching the card's 87 `text` fences.
+  - **7.18 to 7.19.** Every E-block Old occurs exactly once in 1cd6d482's untouched 7.18 and exactly once at its turn. Applied in order with `<date>` 2026-11-20, the date in 7.19's status clause and Changelog head, the result equals the merge commit's `docs/S-STORE.md` byte for byte (sha256 `a9978ac53a81d499764cb162302da723d1e1cd1cc55e934b4afe39239d2824b8`).
+  - **The reverse.** E25 down to E1, New to Old, each New found exactly once, gives 1cd6d482's 7.18 byte for byte.
+  - **The other three files.** T1–T9 on 1cd6d482's C-T0, X1 on its README, and the Doc blocks joined, all with `<date>` 2026-11-17, give the merge commit's three files byte for byte. With 2026-11-20 they differ only in their dates.
+- **Meaning unchanged from what gate 3 judged.** I parsed the pre-move backup (`~/.cache/nv3-review/R-1-SPEC.card-backup-pre-718.local.md`, sha256 `602470e9…ac58`) with the same parser and compared it block by block with the moved card (`cards/R-1-SPEC.local.md`, sha256 `67ab3ef2…eb1f`).
+  - The 15 Doc blocks are identical, and so are all 36 Olds.
+  - 34 of the 36 News are identical. The two that differ, word by word:
+    - **E1:** `Status: draft 7.16 (card R-1-SPEC,` → `7.19`.
+    - **E25:** the heading `**Draft 7.16**` → `**Draft 7.19**`. In its Counts bullet: `47` → `48` rows, `233` → `263` mutants, `50` → `55` tests and `162` → `172` §15.1 rows; "as at drafts 7.14 and 7.15" → "7.17 and 7.18"; and "every mutant of draft 7.15" → "7.18".
+  - **The counts are right.** My own counter on each file gives:
+
+    | File | §15.1 rows | mutants | judged only on Phase B | invariants | tests |
+    |---|---|---|---|---|---|
+    | 7.15 (71ecf3e6) | 158 | 226 | 24 | 47 | 48 |
+    | 7.16, R-1's (e7703ea2) | 162 | 233 | 24 | 47 | 50 |
+    | 7.17 (adbe6a16) | 168 | 248 | 24 | 48 | 53 |
+    | 7.18 (1cd6d482) | 168 | 256 | 24 | 48 | 53 |
+    | 7.19 (ecdae5d9) | 172 | 263 | 24 | 48 | 55 |
+
+    R-1's delta is +4 rows, +7 mutants and +2 tests, the same on 7.18 as on 7.15. "24 … as at drafts 7.17 and 7.18" is true.
+- **No S-THETA, S-ETA or S-ZETA text is altered.** Every R-1 Old occurs once in 7.15 and once in 7.18, unchanged, so no Old spans a line those cards changed.
+  - Nine of R-1's 22 hunks sit within three lines of a line that S-THETA, S-ETA or S-ZETA changed: line 3, the status line; lines 288, 328/329, 1277, 1386, 1394 and 1665, in §5 and the §15/§15.1 tables; and 1718, the Changelog head.
+  - In each case R-1's hunk replaces only its own Old's text. E1 replaces only the prefix `Status: draft 7.1`, and the tail after `) on draft 7.18 (card S-ZETA, ` is the scaffold's. E25 inserts above S-ZETA's `- **Draft 7.18**`, which it keeps.
+  - The reverse application above shows this byte for byte.
+
+## Scope 2: the card's updates
+
+`diff` of the pre-move backup against the moved card shows 15 changed hunks, and every change is one that the base change needs:
+- **Draft and base.** The title; the Base line (1cd6d482, pass 172; 7.18's sha256 `79cd8027…bcb9`); Edits' preamble (a sentence on the three cards merging first); Touch only item 2; Read; and Work 1, 3 and 4 (Work 4 reports the drafts used as S-STORE 7.19, C-T0 8.8 and R-1-memory 1).
+- **E1 and E25**, as in Scope 1.
+- **Acceptance.**
+  - Lines 22 to 24: the draft number and the chain, `) on draft 7\.18 (card S-ZETA, ` and `Draft 7\.19.*card R-1-SPEC.*Draft 7\.18.*card S-ZETA`.
+  - Line 37's checker: base `48e52d3b` → `1cd6d482`, and counts 162/47/50 → 172/48/55. Its mutant set `W` (R-1's seven) and every placement are unchanged. That is right, because it tests `M − Mo` and moves against the base, so S-THETA's, S-ETA's and S-ZETA's mutants enter through `Mo` and need no names.
+  - Line 39's hash → `9b305768…4228`.
+  - Line 38's numstat stays `'37 18'`, which is right: the diff on 7.18 is +37/−18 (`git diff --numstat`).
+- **Left out by the implementer**, who hit its usage limit before running `gate.sh` or reporting. These are card text only, and the card does not merge. The rework updates them (below, "Card text the rework must update"):
+  - "Mutation evidence" still says "every mutant that S-STORE 7.15 judges on a Phase A row is judged on the same rows at 7.16".
+  - There is no record of the move's dry run.
+  - The Notes' "Dry-run results" are still rework 2's, on 7.15.
+  - The Notes' "If S-ZETA, S-ETA or S-THETA merges first" does not say it has happened. It also lists only E1, the status chain, the counts, the checker and lines 38–39, which misses the four 7.16 references (D11).
+  - The Notes' "Not carried here" says each Old of S-EPSILON-F2's five riders "still occurs once on this card's 7.16 result". That is no longer true: F2-b's Old ("**A corrupt meta**, and a newest image that fails at open with no previous image, fail as they do for a read-write open …") occurs 0 times in 7.18 and 7.19, because S-ETA's 7.17 (adbe6a16) rewrote that sentence. F2-a, F2-c, F2-d and F2-e still occur once. That is not R-1-SPEC's doing, but the S-EPSILON-F2 card must re-anchor F2-b.
+- **The runner.** The branch's `tools/run_card.py` `parse_card` and `validate_card` read `R-1-SPEC`, four Touch only paths, 53 commands (the last `cd nucleus/v3 && bash scripts/gate.sh`), no container, and `validate_card` returns `None`. My own extraction of the Acceptance section gives the same 53 lines.
+
+## Scope 3: gate, Acceptance, checkers, omit-one
+
+- **Acceptance.** I ran the 52 commands before `gate.sh` with `/bin/sh -c` from the worktree root at ecdae5d9 (clean, `git status --short` empty). They pass **52 of 52 under `LANG=en_CA.UTF-8` and 52 of 52 under `LC_ALL=C`**. Line 53 is the fresh gate above.
+- **On the base.** In a `--shared` scratch clone (`~/.cache/nv3-review/gate4-R-1-SPEC/sc`, local `nucleus/v3-scaffold` = 1cd6d482), all 52 fail at 1cd6d482 in both locales.
+- **The checkers** print, in both locales:
+  - line 17: `7 invariants; 20 rows` and `OK`;
+  - line 37: `172 rows; 263 mutants; 24 judged only on Phase B cards; 48 invariants; 55 tests` and `OK`.
+- **Omit-one** (12 of the 36 edit blocks, all four files' kinds). I built each variant with my parser on 1cd6d482's files with one block left out, committed it on ecdae5d9 in the scratch clone, and ran the 52 lines in both locales. All 12 are caught, and the locales agree:
+
+  | Block left out | Failing lines |
+  |---|---|
+  | E3 | 26, 36, 39 |
+  | E5 | 27, 38, 39 |
+  | E8 | 30, 38, 39, 51 |
+  | E9 | 31, 36, 39 |
+  | E12a | 38, 39, 51, 52 |
+  | E14 | 37, 38, 39 |
+  | E18 | 37, 38, 39 |
+  | E21 | 34, 38, 39 |
+  | E24 | 35, 38, 39, 51 |
+  | E25 | 24, 38, 39, 52 |
+  | T5 | 42, 43, 48 |
+  | X1 | 44, 45, 49 |
+- **Tests and mutants.** The move changes no test, mutant, judging row or Needs cell of R-1-SPEC's: the blocks are gate 3's. S-THETA's, S-ETA's and S-ZETA's tests and rows are untouched (line 37's "moved" and "lost" checks pass against 7.18). So no test becomes unpassable and no mutant unkillable by the move. Gates 1–3's walks stand.
+
+## Scope 4: R-1's rules against S-THETA's, S-ETA's and S-ZETA's in 7.19
+
+I grepped 7.19, R-1-memory and R-1's S-STORE blocks for: I-PIN-CURRENT; "being loaded"/load; "for reuse"/"freed"; "page table"; tree latches and waits under latches; the flip wait; `wal_seg_size`; 58030; XX001; the fence; refusal; the walk; salvage; "well-formed"/"intact"; segments; and "writes nothing". I read each hit in context.
+- **S-THETA's pool rules.** Gate 1's analysis (History, "Merge order with S-ZETA, S-ETA and S-THETA") still holds on the merged text. I re-checked it against R-1-memory §4.4's five classes and E3's §5.3 sentence in 7.19:
+  - A frame being loaded is the loader's own pin, so it is (T) in the loader's path term. A pin that finds the page being loaded holds no frame for it and waits for no frame acquisition. Its unused `Q_t` is slack.
+  - A load ends, its frame out of the page table, before its thread restarts or waits for the flip. So no loading frame stays pinned across the flip wait.
+  - A freed page's frame is no longer dirty (7.16, §4.2). It is unpinned and clean, so it is (U), and its MapLeaf no longer holds a §4.1 pin for it, which only shrinks (Mu). A creation that makes its page in a freed frame obtains no frame.
+  - A creation that waits for a load under its tree latches (§5.4) waits for no frame and no page read. That is S-THETA's own wait, outside §5.3's frame-acquisition bound, which E3's sentence ("so the operation waits only for such a frame's brief latch holder") concerns. The 7.15 sentence already had that scope, and E3 changes only what it counts.
+  - I-PIN-CURRENT's "a pin looks in the page table first" and its "at most one frame per page" leave `|T|`, `|Mp|` and `|Mc|` as counted.
+  - §5.2's existing rule (a non-gated evictor under a pending flip takes a clean victim or restarts) predates S-THETA. R-1's fairness premise is for a gated operation past its first mutation, which holds the gate and can evict dirty pages.
+
+  No restatement, no contradiction.
+- **S-ETA's WAL-walk rules.**
+  - R-1-memory §5.3 charges "the walk's record buffer … at most the longest record that pass 1, step 3b or pass 2 holds whole, itself at most `wal_seg_size / 4`". S-ETA makes pass 1 decode every record it accepts, with no decode state beyond the record that S-STORE §12.5 names, so the bound stands.
+  - R-1-memory §6.1's lowering of `preapply_bytes` to `wal_seg_size / 4`, "2 MiB at C-T6-rehost's least segment, 8 MiB", agrees with S-ETA's 8 MiB creation floor, and its 212-byte floor binds only the store's tests.
+  - S-ETA's 58030 for a WAL read error, and its XX001 for malformed records and short segments, are outcomes R-1 does not restate. R-1-memory's error table lists 58030 only for its own temp-file case.
+  - R-1-memory §5.3's "nothing written beyond the fence (step 1) and step 4a's pass-2 evictions" for a 53200 before the retire write agrees with S-ETA's new §14.2 row. That row adds "the retire write" only once meta `k` is retired, which R-1's sizing precedes.
+- **S-ZETA's open refusal.**
+  - S-ZETA's refusals are at §14 step 1, before any charge or sizing of R-1's (steps 2–3b), and "an open that the open rule refuses writes nothing, the fence included". R-1-memory's open 53200s come at its charges and sizing in steps 2–3b, after step 1, and write nothing, so the two do not meet.
+  - R-1's texts name no XX001 (the owner's XX000 for engine bugs, S-IOTA, does not touch them).
+
+Nothing here meets the blocking bar. D11 is the only blocking defect, and it is found by the draft references, not by these rules.
+
+## D11 (REWORK): four cross-references name the wrong S-STORE draft
+
+R-1-memory and C-T0 8.8 were written when R-1-SPEC's S-STORE was draft 7.16. The move makes R-1-SPEC's S-STORE draft 7.19 and leaves draft 7.16 to S-THETA. The two other spec files still pair themselves with "S-STORE draft 7.16" (four places; `grep -c 'draft 7\.16'` gives 3 in R-1-memory and 1 in C-T0):
+- **R-1-memory §4.4** says "S-STORE §5.3's premise, as draft 7.16 words it, is `O ≥ Σ Q_t`". S-THETA's 7.16 words it as draft 7.15 did, `|U| ≥ Σ Q_t`, so the sentence is false of the draft it names.
+- **R-1-memory's status line and Changelog, and C-T0's 8.8 Changelog entry,** pair R-1-memory draft 1 and C-T0 8.8 with S-STORE 7.16. S-STORE 7.19's status clause and Changelog pair them with 7.19.
+
+Blocking because the move changed these sentences' meaning (their referent), because one of them is now false, and because the version pairings contradict S-STORE's own. P0 is to be judged on this merged spec.
+
+"Draft 7.15's wording" (R-1-memory §4.4), "the figure S-STORE §5.4 gave at draft 7.15" (§4.4) and S-STORE 7.19's E25 "draft 7.15's wording" stay true: drafts 7.15 to 7.18 all have that wording. They need no change.
+
+## Corrections (one complete list; each Old occurs exactly once in ecdae5d9's file named)
+
+In the card, K12a–K12c are Doc block text (K12a in the status line, K12b in §4.4, K12c in the Changelog), and K12d is T9's New. Each Old also occurs exactly once in the card. Applied in this order to ecdae5d9's files in scratch, they give `docs/R-1-memory.md` sha256 `c59273029ee150367a542aed711ca0b57cbd8eb3f604b13ee7e7b7d2978958bb` and `docs/C-T0-txn-protocol.md` sha256 `58924b86b56ef246146de83353d59a70ba429c63d7bad7426553e14f39d9efb7`, at the dates the files carry (2026-11-17). `docs/S-STORE.md` and `docs/README.md` do not change.
+
+**K12a.** `docs/R-1-memory.md` — the status line (Doc block 0).
+
+Old:
+```text
+derived against S-STORE draft 7.16;
+```
+New:
+```text
+derived against S-STORE draft 7.19;
+```
+
+**K12b.** `docs/R-1-memory.md` — §4.4, "The fairness bound holds with it."
+
+Old:
+```text
+S-STORE §5.3's premise, as draft 7.16 words it,
+```
+New:
+```text
+S-STORE §5.3's premise, as draft 7.19 words it,
+```
+
+**K12c.** `docs/R-1-memory.md` — the Changelog, draft 1.
+
+Old:
+```text
+With S-STORE draft 7.16 and C-T0 draft 8.8.
+```
+New:
+```text
+With S-STORE draft 7.19 and C-T0 draft 8.8.
+```
+
+**K12d.** `docs/C-T0-txn-protocol.md` — the Changelog, draft 8.8 (T9's New).
+
+Old:
+```text
+card R-1-SPEC, with S-STORE draft 7.16 and the new
+```
+New:
+```text
+card R-1-SPEC, with S-STORE draft 7.19 and the new
+```
+
+## Acceptance-line changes (card numbering; tried in scratch)
+
+- **Line 48** keeps its command and its numstat `'9 8'`, and its hash becomes `14e769ca75104f3af6b25fd92856ffd0ce5aac686bf3402a7d677f307190bb12`.
+- **Lines 38 and 39** do not change: K12 touches no S-STORE line.
+- **One new line**, inserted after line 52, so the gate line becomes line 54. It contains no backtick:
+```text
+cd nucleus/v3 && ! grep -n 'draft 7\.16' docs/R-1-memory.md docs/C-T0-txn-protocol.md && test "$(grep -c 'S-STORE draft 7\.19' docs/R-1-memory.md)" = 2 && grep -q 'premise, as draft 7\.19 words it, is .O ≥ Σ Q_t.\. Draft 7\.15.s wording' docs/R-1-memory.md && grep -q '^- \*\*Draft 8\.8\*\* (20[0-9][0-9]-[0-9][0-9]-[0-9][0-9], card R-1-SPEC, with S-STORE draft 7\.19 and the new ' docs/C-T0-txn-protocol.md
+```
+- **Tried.**
+  - I committed K12's files on ecdae5d9 in the scratch clone (a throwaway commit). The card with K12, line 48's new hash and the new line applied (`~/.cache/nv3-review/gate4-R-1-SPEC/card-k12.md`, sha256 `c0f2819b…d221`) parses to 54 commands, and `validate_card` returns `None`. All 53 non-gate lines pass there, under `en_CA.UTF-8` and under `LC_ALL=C`.
+  - That card's blocks, applied by my parser to 1cd6d482's files, reproduce all four K12 files byte for byte (dates 2026-11-20 for S-STORE, 2026-11-17 for the others).
+  - At ecdae5d9, lines 48 and 53 fail and the other 51 pass, in both locales.
+  - Omitting one K12 entry: K12a, K12b or K12c alone fails line 53, and K12d fails lines 48 and 53, in both locales.
+  - Line 37's checker is unchanged, because K12 adds no row, test or mutant.
+
+## Card text the rework must update (beyond the blocks and lines above)
+
+- **"Mutation evidence".**
+  - The sentence "every mutant that S-STORE 7.15 judges on a Phase A row is judged on the same rows at 7.16" becomes "… 7.18 … at 7.19".
+  - A record of the move (2026-11-20, ecdae5d9): the blocks on 7.18, the run (52 of 52 in both locales), and the checkers' lines as Scope 3 gives them.
+  - Rework 3's evidence: K12, the 53-line run, the new hash, and omit-one.
+- **"The runner"** gives 54 commands, rework 3 adding line 53, with the gate line 54. Rework 2's record keeps its own numbers.
+- **Notes.**
+  - "Dry-run results" take the move's and K12's sha256s: S-STORE `a9978ac5…24b8` (date 2026-11-20); R-1-memory `c5927302…58bb` and C-T0 `58924b86…efb7` after K12 (2026-11-17); README `191f528f…ab82`.
+  - "If S-ZETA, S-ETA or S-THETA merges first" records that all three did and that the move is ecdae5d9, and adds the four 7.16 references (K12) to its list.
+  - "Not carried here" says that F2-b's Old no longer occurs, since S-ETA's 7.17, and that the S-EPSILON-F2 card re-anchors it.
+- **"For the gate"** gains item 13: K12 (D11), with the check that no "draft 7.16" in R-1-memory or C-T0 is left meaning R-1-SPEC's S-STORE.
+
+## Rulings on the owner points (the gate's part)
+
+The owner answered most of them in their own words on 2026-11-20 (QUEUE head, `# OWNER DECISION 2026-11-20 17:00 MST`): "Accept the memory minimum (about 224 KiB per connection), the default connection caps (8 embedded, 2 browser) and the provisional per-mode budgets." and "Yes to: … the tree-height and file-growth stops." In the card's terms:
+- **P-R1 (four tree paths, ~224 KiB per connection):** accepted. Gate 3 noted that P-1 had no answer in the owner's own words; the 224 KiB figure now has one.
+- **P-R2 (the height bound and its stop):** accepted ("the tree-height … stops"). Gate 3's added consequence, a read-only open's lower bound, was stated in plain words before the answer and is part of what the stop means.
+- **P-R3 (the per-mode budgets):** accepted as provisional ("the provisional per-mode budgets"). R-1-memory §12's re-measurements stand.
+- **P-R5 (the growth residual):** accepted ("the … file-growth stops").
+- **P-R6 (the caps 8 and 2):** accepted.
+- **P-R4 (C-T0's thresholds per mode, and the earlier switch to range locks in embedded and browser mode):** **still open.** The reply does not name it. R-1-memory §7.1 and C-T0 8.8 carry the recommended values, and the no-decision default is the text as written.
+
+K12 changes no owner point.
+
+## Merge timing
+
+The owner's own words of 2026-11-20 (QUEUE head) say: "The spec cards S-ETA, S-THETA, S-ZETA and R-1-SPEC may merge before P0 passes, and P0 is then judged on the merged spec." So after rework 3 and a passing re-gate, R-1-SPEC may merge before P0 PASS. This replaces gate 3's merge-timing line. K12 is worth landing before P0 reads the merged spec: it is exactly the cross-reference P0's reader would follow.
+
+## Follow-ups (F1–F8 carried from gate 3, unchanged)
+
+Gate 3's eight follow-ups carry as gate 3 stated them (History). I re-checked each against ecdae5d9 and the merged 7.19:
+- **R-1-SPEC-F1** (S-STORE spec card, before A-7d is cut: the read-only budget's two test forms, RO-BUDGET-DIRTY-ONLY and RO-SIZED-FROM-F, on A-7d). This does not depend on the base: `t_ro_open`'s and `t_ro_open_disk_full`'s §15.1 rows are unchanged from 7.15 to 7.18.
+- **R-1-SPEC-F2** (R-1 spec, before R-1's Phase B card: an exact "third growth" allowance). Unchanged.
+- **R-1-SPEC-F3** (R-1 and A-7c, before A-7c is cut: step 2's copy of image `k`'s two bitmaps). Unchanged. S-THETA's freed-frame rule (no write of a freed frame by step 2) does not settle it.
+- **R-1-SPEC-F4** (R-1 spec, before R-1's Phase B card: the open refuses with 53200 a directory taller than the sized pool's `H`; and gate 3's read-only item). Unchanged. S-ZETA's step-1 refusals precede it, and they do not cover it.
+- **R-1-SPEC-F5** (the next S-STORE card; pointers only).
+  - S-STORE §14 step 3b and §6.8's CreateTree point to R-1-memory §5.2.
+  - **Now due:** S-THETA has merged, so R-1-memory's "step budget" (`t_mem_caps` (x)) should point to S-STORE §15's definition (its "the step budget is a count stated by each test, never a time").
+  - The optional "(a read-only open: from its evictable part, R-1-memory §5.3)" in §5.4 and §19 T8.
+- **R-1-SPEC-F6** (R-1 spec, with or before R-1's Phase B card: tests for K1, K7 and K10). Unchanged.
+- **R-1-SPEC-F7** (S-STORE question; depends on P-R2): skip a tree rather than poison on a GC or drop-walk descent past `H`. The owner's "yes to … the tree-height … stops" accepts P-R2 as recommended, stop included. F7 stays a question for the next S-STORE card: whether a sweep or a walk may skip with a report, which the stop rule does not forbid.
+- **R-1-SPEC-F8** (R-1 and S-STORE, with F1, before A-7d is cut: the read-only floor checked continuously, the reserve allowed to shrink mid-op, a fall-back re-sizing afresh, a third test form; RO-FLOOR-PER-OP and RO-H-SET-ONCE on A-7d). Unchanged.
+
+Full descriptions are gate 3's and gate 1's (History). No new follow-up id: D11 is fixed by this rework, and the card-text items are listed above. F2-b's re-anchor belongs to the S-EPSILON-F2 card (its QUEUE row), not to R-1-SPEC.
+
+## Not verified
+
+- **No code exists.** Every test and mutant was walked as text by gates 1–3. I re-walked none: the move changes none of them.
+- **Omit-one on the other 24 edit blocks and the 15 Doc blocks.** Gates 1–3 ran their own.
+- **The implementer's scratch** (`~/.cache/nv3-review/R-1-SPEC-718/`: `apply719.py`, `checker37.*`, `run_acc.py`, `final/`). I read `apply719.py`'s head only, to see its date handling, and used none of its outputs. The implementer ran no `gate.sh` and wrote no report. No worker log exists for the move in `cards/logs/`.
+- **Gate 1's 24-order composition** of the four cards' blocks on 7.15 was not repeated. The actual order (S-THETA, S-ETA, S-ZETA, R-1-SPEC) was checked directly on 7.18 (Scope 1).
+- **The provisional constants** (`o_frame`, 64 bytes per root-table entry, `e_lock`, the 1/32 slope) are unmeasured, as gate 3 recorded. Gate 3's other unverified items carry.
+- **S-ZETA's, S-ETA's and S-THETA's own checkers** were not run on 7.19. Line 37's moved and lost checks against 7.18 cover their mutants' placements.
+
+## History
+
+- **Gate 1: REWORK, verdict commit 7fb189020418b1700928486fd8d84d3aba4a5358, judging 32f68472b4155671f5418f0fb633b0859958c89a.** P gate, Claude Code session d36e5b00-a57c-4ef7-b43c-283e6f9e735c, GATE EXIT=0. It found defects D1–D9 and gave K1–K10 (25 entries), two new Acceptance lines and follow-ups F1–F7.
+- **Rework 1: commit 98c85acadefe95d62badb88856eaff989727099e,** by a GLM 5.3 implementer. It applied K1–K10.
+- **Gate 2: REWORK, verdict commit 22722c9dc481a41246bf5bad1bc7c6faad3b8943, judging 98c85aca.** P gate, Claude Code session c2c35c7c-b073-4464-9a1e-0c7e47f1942b, GATE EXIT=0. It found D10 and gave K11 (five entries), one new Acceptance line and line 39's new hash, and extended F1.
+- **Rework 2: commit a8486ede087555faa2c55f86c6417c28063419d0,** by a GLM 5.3 implementer. It applied K11.
+- **Gate 3: MERGE-WITH-FOLLOWUPS, verdict commit e7703ea255e9a7fbbddb3974296a8e37ba251eef, judging a8486ede.** P gate, Claude Code session df6338c5-4202-4216-a68d-447224f3dcc6, GATE EXIT=0, against S-STORE 7.15 at scaffold 71ecf3e6. Follow-up F8 new; F1–F7 carried.
+- **S-THETA, S-ETA and S-ZETA merged first** (merges 6e3423f6, adbe6a16 and 1cd6d482; passes 169, 170 and 172), taking S-STORE to 7.16, 7.17 and 7.18. A-2-0 (0755a61e) and A-6a (9bbc77ab, pass 171) merged in between, without touching S-STORE, C-T0 or README.
+- **The move: commit ecdae5d93c33dcde53d59ad98a282a1044b6a2fb,** by a GLM 5.3 implementer. It merges 1cd6d482 into the card branch, resolves `docs/S-STORE.md` as 7.18 with R-1-SPEC's blocks applied as draft 7.19, and updates the card in the main checkout; the card's pre-move copy is `~/.cache/nv3-review/R-1-SPEC.card-backup-pre-718.local.md`. It hit its usage limit before running `gate.sh` or reporting. The orchestrator then ran the 52 non-gate Acceptance lines at it (default locale): all pass.
+- **Gate 4 (this verdict): REWORK on ecdae5d9,** for D11, with K12.
+
+**Gate 3's verdict, as committed at e7703ea2, verbatim.** Its header lines are prefixed with "- ", so that no tool reads them as this verdict's fields. Everything after them is unchanged, headings included. That includes gate 2's verdict, which gate 3's History holds verbatim, and gate 1's verdict inside it. Where its sections differ from the ones above (merge timing, the owner points, F5's due pointer, Acceptance numbering), the sections above are current. The same text is at `git show e7703ea2:nucleus/v3/verdicts/R-1-SPEC.md`.
+
+<!-- gate 3's verdict (e7703ea2), verbatim but for its header lines, begins -->
+
+- Card: R-1-SPEC
+- Class: spec
+- Card-gate: P
+- Verdict: MERGE-WITH-FOLLOWUPS
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent for thread 45584af2-e651-490e-862c-3402320cffa3, Claude Code session df6338c5-4202-4216-a68d-447224f3dcc6 (an independent P gate 3, a narrow re-gate after rework 2 with a design re-read of K11: this agent wrote neither the card, its implementation 32f68472, rework 1 98c85aca, rework 2 a8486ede, nor gate 1's or gate 2's verdict, and is not the orchestrator)
+- Date: 2026-11-20
+- Gate-exit: GATE EXIT=0
+- Commit: a8486ede087555faa2c55f86c6417c28063419d0
+- Mutants: spec text, none in code; K11 adds no test or mutant, so gate 1's and gate 2's walks stand (History). G4 RO-SIZED-FROM-F (gate 2's) -> UNCAUGHT by t_ro_open and t_ro_open_disk_full as they stand, caught by F1's second form. Gate 3's own: G5 RO-FLOOR-PER-OP (a read-only open checks `F_e ≥ F_min` only before each replayed op, so a replayed insert whose overflow chain build takes `F_e` below `F_min` mid-op waits for an unpin) -> UNCAUGHT by t_ro_open, t_ro_open_disk_full and F1's two forms (F8); G6 RO-H-SET-ONCE (`R_EPOCH` re-set before each op but `H` kept at the open's value) -> UNCAUGHT by the same, since no form descends a tree taller than the current `H` and no taller than the open's (F8). Mechanical: K11 applied by this gate's own script to 98c85aca's files equals a8486ede's byte for byte; the card's blocks applied by this gate's own parser reproduce all four files at both dates; omitting any one K11 entry fails Acceptance in both locales (5/5 caught: K11a, K11b, K11c line 52; K11d, K11e lines 39 and 52)
+- Followups: R-1-SPEC-F1, R-1-SPEC-F2, R-1-SPEC-F3, R-1-SPEC-F4, R-1-SPEC-F5, R-1-SPEC-F6, R-1-SPEC-F7, R-1-SPEC-F8
 
 ## Verdict in brief
 
@@ -1016,3 +1316,5 @@ By P0 re-check 1 this card may be built and gated on a branch but may NOT merge 
 - C-T6-rehost and C-T0 v7.8 were read only where cited.
 
 <!-- gate 2's verdict (22722c9d) ends -->
+
+<!-- gate 3's verdict (e7703ea2) ends -->
