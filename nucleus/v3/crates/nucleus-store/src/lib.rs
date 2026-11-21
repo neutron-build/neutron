@@ -46,6 +46,7 @@ pub mod page;
 pub mod pool;
 pub mod store;
 pub mod tree;
+pub mod wal;
 
 pub use pool::BufferPool;
 pub use store::{MemStore, PageId, PageStore, StoreError};
