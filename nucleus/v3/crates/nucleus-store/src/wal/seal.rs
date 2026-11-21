@@ -150,7 +150,7 @@ impl Sealed {
         &self.bytes
     }
 
-    /// The record's bytes, owned.
+    /// The record's bytes, owned, ready to be written at its `lsn` (§12.2).
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
