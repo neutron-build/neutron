@@ -4,12 +4,203 @@ Card-gate: P
 Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session fe4ac879-18e5-48b7-ac50-9730f0dfc01c (independent P gate 2 of S-ZETA, a narrow re-gate after rework 1; it wrote neither the card, its implementation 5c62470b, the rework b84d5c03, nor gate 1's verdict 6d4465ca, and is not the orchestrator)
+Gate-session: T3 review sub-agent, Claude Code session e8fb90c5-c354-49fb-b11f-fe1e0ef95f4f (gate 3, a narrow re-gate after the card was moved onto S-ETA's draft 7.17: this agent wrote neither the card S-ZETA, its implementation 5c62470b, the rework b84d5c03, the move 278f7b64, nor gate 1's or gate 2's verdict, and is not the orchestrator)
 Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: b84d5c03ba3314c31626a93cb391f852390b7ef1
-Mutants: spec text, none in code; the A-2 ones run in this gate's own model of the table form, written from the reworked text and independent of gate 1's (16 symbols, 4 page-0 states, 262,144 cases; ~/.cache/nv3-review/gate2-S-ZETA/tools/model2.py), numbers = cases whose outcome changes with RW-3a's alphabet: G-REFUSE-NEWER-ONLY -> table form (13,952; 0 with 5c62470b's alphabet, gate 1's finding reproduced), MALFORMED-AS-TORN -> table form (61,098), IDENTITY-NO-FV-ALG -> table form (15,222), STATICS-AS-FOREIGN -> table form (4,394), IDENTITY-DOMAIN-SKIP -> table form (1,120), FOREIGN-MALFORMED-REFUSES -> table form (3,446), UNLOCATED-AS-CORRUPT -> table form (256), META-RANGE-SKIP -> table form (14,838), TIE-NO-BOOT-ID -> table form (3,109), TIE-EQUAL-OPENS -> table form (2,092), MISPLACED-SHADOWS -> table form (3,124), IDENTITY-SKIP -> table form (24,302), PAGE0-REQUIRED -> table form (9,664), META-WRONG-SLOT -> table form (19,388), MISPLACED-NEXT-REFUSES -> table form (2,712), MISPLACED-IGNORED -> table form (12,996), G-58030-FIRST -> table form (2), FENCE-BEFORE-REFUSAL -> fault form unlocated variant (byte identity; text unchanged by the rework), WRITE-MALFORMED -> write form (text unchanged by the rework). Text mutants: each RW block left out (RW-1, RW-2, RW-3a, RW-3b, RW-4) fails its own Acceptance line and line 30 in both locales; 5c62470b's file fails lines 8, 9, 12, 14 and 30. All in a scratch clone; the worktree was never written before this verdict
-Followups: S-ZETA-F1, S-ZETA-F2, S-ZETA-F3
+Commit: 278f7b6457af9ec88aac568fdf65d6b4389fa599
+Mutants: spec text, none in code. Omit-one on 7 of the 22 blocks, each built by my own parser on 7.17 (adbe6a16's file) with one block left out, committed in a scratch clone and judged by the card's 31 non-gate Acceptance lines in both locales: Z2 -> 8, 25, 27, 29, 30, caught; Z5 -> 11, 25, 29, 30, caught; Z9 -> 14, 26, 27, 30, caught; Z12 -> 17, 25, 29, 30, caught; Z14 -> 19, 25, 29, 30, caught; Z17 -> 21, 25, 27, 28, 29, 30, caught; E2 -> 3, 4, 5, 6, 29, 30, caught. One planted error: Z2's pre-move "`wal_seg_size` not 0;" put back -> 8, 30, caught. The named mutants' judgements are unchanged from gates 1 and 2 (History): Z1 and Z3 to Z20 are byte-identical to the blocks gate 2 judged, and Z2's floor touches no table-form symbol
+Followups: S-ZETA-F1, S-ZETA-F2, S-ZETA-F3, S-ZETA-F4
+
+## Verdict in brief
+
+**MERGE-WITH-FOLLOWUPS** on the merge commit `278f7b6457af9ec88aac568fdf65d6b4389fa599`, which moves S-ZETA onto S-ETA's draft 7.17 as draft 7.18.
+- **The move changes no meaning beyond Z2's floor.** All 22 Olds and 19 of the 22 News are byte-identical to the blocks gate 2 judged. E1 and E2 change only their draft number and counts. Z2 changes exactly as the card's Notes ("If S-ETA merges first") prescribe: `` `wal_seg_size` not 0; `` → `` `wal_seg_size` at least 212 (§12.1); ``.
+- **The resolved file is 7.17 with S-ZETA's blocks applied**, byte for byte by my own parser (sha256 `79cd8027…bcb9`), and the reverse gives 7.17 back. No S-THETA or S-ETA text is altered.
+- **Z2's change is right.** §2.2's well-formedness and S-ETA's §12.1 floor now agree, and every restatement of the domain in 7.18 says 212. The card's own "Terms." prose still says "not 0". That is card text, not spec, but it matters for card A-2-0-F1's code, so it is the new follow-up S-ZETA-F4.
+- **The checks pass.** The fresh gate gives `GATE EXIT=0` on the first run. The 31 non-gate Acceptance lines pass in both locales, and the checker prints `OK`. S-ZETA's rules neither restate nor contradict S-THETA's or S-ETA's in a way that matters: XX001's two kinds, §14.2's rows and step 1's precedence over S-ETA's later 58030 all agree.
+- **Carried and answered.** Gate 2's three follow-ups carry unchanged. OP-1 and OP-2 have been answered by the owner for newer-version files, and their rider goes to card S-IOTA.
+
+**Merge timing.** The owner's own words of 2026-11-20 (QUEUE head, `# OWNER DECISION 2026-11-20`) say: "The spec cards S-ETA, S-THETA, S-ZETA and R-1-SPEC may merge before P0 passes, and P0 is then judged on the merged spec." So this card may merge now.
+
+## Gate run
+
+- **Load check.** At 21:39 the load average was 33.55 / 36.72 / 38.58, on a 16-CPU host with other projects' builds running. I waited, polling every 30 s, until the 1-minute average fell below 16. It read 15.59 at 21:57, and 14.26 / 24.10 / 29.74 at 21:57:59.
+- **Scaffold extract** (GATE-PROMPT step 1): the shallow `--no-local` clone of `nucleus/v3-scaffold` printed **9bbc77abaf19b96925be6322226efde32eb3e042**. `fresh-gate.sh` and `git-env.sh` were extracted with no `EXTRACT FAILED`.
+- **The run:** `bash "$fg/fresh-gate.sh" 278f7b6457af9ec88aac568fdf65d6b4389fa599`, from `~/Workspace/neutron-v3`, with `PATH=$HOME/.cargo/bin:$PATH` and `CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate3-S-ZETA`. Stdout and stderr went to separate files under `~/.cache/nv3-review/gate3-S-ZETA/` (`gate1.out`, `gate1.err`). It ran 21:58 to about 22:21. The 1-minute load, sampled each minute (`load1.log`), was 13.60 at the start, rose to a peak of 62.94 at 22:07 when other projects' jobs started, and was 20.65 at 22:21. Its lines:
+  - `fresh-gate: commit 278f7b6457af9ec88aac568fdf65d6b4389fa599`
+  - `fresh-gate: base 9bbc77abaf19b96925be6322226efde32eb3e042`
+  - `fresh-gate: checks passed (4883 files hashed in 4.54 s)`
+  - `fresh-gate: 2 file(s) matched through their eol conversion`
+  - `STEP test EXIT=0`, `STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=0`, `STEP api-surface EXIT=0`
+  - The literal last line was **`GATE EXIT=0`**, the exit status 0, and stderr was empty (0 bytes). No test failed.
+- **Flakes.** None of the known flakes occurred:
+  - The test step exited 0, so neither `undo_order.rs` `readers_never_see_past_their_snapshot_during_apply` nor `sim_env.rs` `sim_halted_off_task` failed.
+  - ENF-TIMING-1's two self-tests printed `ok   premise: GUC: a -c core.untrackedCache=true beats the environment` and `ok   runner refs: RV cost ten honest moved refs verify in under 2 s`.
+
+  No re-run was needed. `$fg` was removed afterwards.
+- **The worktree** `~/.cache/nv3-cards/S-ZETA`, branch `card/v3-S-ZETA`, was clean at tip 278f7b64 before this commit (`git status --short` empty), and was never written except by this verdict. The omit-one variants used a `--shared`, sparse scratch clone, `~/.cache/nv3-review/gate3-S-ZETA/omit`, which was reset to 278f7b64 after each variant.
+- **The branch:** 71ecf3e6 → 5c62470b (the card, 7.16) → 6d4465ca (gate 1's REWORK) → b84d5c03 (rework 1) → 512ea1f8 (gate 2's MERGE-WITH-FOLLOWUPS) → 278f7b64 (the merge of adbe6a16, the move, by a GLM 5.3 implementer) → this verdict.
+
+## Scope 1: the merge commit
+
+- **Its parents and tree.** The parents of 278f7b64 are 512ea1f8 (gate 2's verdict) and adbe6a16 (the scaffold tip after S-ETA's merge). `git diff --stat adbe6a16 278f7b64` lists exactly two files: `nucleus/v3/docs/S-STORE.md` (+36/−19 against 7.17, as against 7.15 at gate 2) and `nucleus/v3/verdicts/S-ZETA.md`. The verdict file is gate 2's, unchanged: `git diff 512ea1f8 278f7b64 -- nucleus/v3/verdicts/S-ZETA.md` is empty. Touch only is `nucleus/v3/docs/S-STORE.md`, and no protected path is touched. The scaffold tip has since moved to 9bbc77ab (A-6a, pass 171). A-6a touched only `crates/nucleus-store/src/wal/`, `src/lib.rs`, `tests/wal_codec.rs` and `verdicts/A-6a.md`. Its `docs/S-STORE.md` is still 7.17 (`2777e5d7…91dd`), and adbe6a16 is an ancestor of it.
+- **The bytes, by my own parser.** I wrote a fence-aware parser for the card's `## Edits` section (`~/.cache/nv3-review/gate3-S-ZETA/bin/blocks.py`). It read 22 blocks: E1, Z1 to Z20, E2. I applied them in order to adbe6a16's `docs/S-STORE.md` (S-ETA's 7.17, sha256 `2777e5d739d4deacc0fb7f73e5abc3a9d927798baf236e51575e80cfb31391dd`), with `<date>` = 2026-11-20, the date the result carries in both its status clause and its Changelog head.
+  - Every Old occurs exactly once at its turn, in file order.
+  - The result is byte-identical to 278f7b64's file, sha256 `79cd8027141ef0bf3f4fb0640f5961afce38a4165bf76fdd96fbc725f28bbcb9`.
+  - The reverse (E2 down to E1, New to Old) gives adbe6a16's file byte for byte.
+  - The same parser on the pre-move card backup (`~/.cache/nv3-review/S-ZETA.card-backup-pre-717.local.md`, sha256 `cbf75339…2495`, the card gate 2 judged), applied to 7.15 (`a1376c94…700f`) with `<date>` = 2026-11-17, gives b84d5c03's file, sha256 `6c186f8975845278151c2f34465a38d5f13ec847f51609ed63a092b1d80025c4`, which is also 512ea1f8's. So the parser reads both cards the same way, and the blocks it compares are the ones gate 2 judged.
+- **S-ZETA's meaning is unchanged apart from Z2's floor.** I compared the blocks of the pre-move backup and the moved card one by one. All 22 Olds and 19 of the 22 News are byte-identical. Three News differ, word by word, only as follows:
+  - **E1:** `7.16` → `7.18` (the draft number in `Status: draft 7.18 (card S-ZETA,`).
+  - **E2:** `7.16**` → `7.18**` (the heading); the Counts bullet `47` → `48` rows, `234` → `256` mutants, `48` → `53` tests, `158` → `168` §15.1 rows; and "as at drafts `7.14` and `7.15.`" → "`7.16` and `7.17.`" (Phase B only, 24).
+  - **Z2:** `` `wal_seg_size` not 0; `` → `` `wal_seg_size` at least 212 (§12.1); ``. This is exactly the card's Notes' "If S-ETA merges first" text, which says "its New's "`.wal_seg_size.` not 0;" becomes "`.wal_seg_size.` at least 212 (§12.1);"". The dots in the Notes are regex wildcards for the backticks.
+- **No S-THETA or S-ETA text is altered.** I diffed 7.15 → 7.17, which is S-THETA's and S-ETA's changes (98 lines of 7.17 touched), and 7.17 → 7.18, which is S-ZETA's (21 lines of 7.17 touched). The two sets meet only at line 3 and line 1708:
+  - **Line 3** is the status line. E1 replaces only its prefix `Status: draft 7.1`, and Acceptance line 2 (passes) checks that the tail after `) on draft 7.17 (card S-ETA, ` equals the scaffold's.
+  - **Line 1708** is S-ETA's Changelog head `- **Draft 7.17**`. E2 inserts above it and keeps it, and Acceptance line 5 (passes) checks that the Changelog from that head down equals the scaffold's.
+  - No other changed line of S-ZETA's is on or next to a line S-THETA or S-ETA changed.
+
+## Scope 2: Z2's change is right, and every restatement of the domain agrees
+
+- **The floor agrees.** S-ETA's §12.1 ("Files") says that `wal_seg_size` is at least 212, four 53-byte record headers, and that "An open whose file's identity (§2.2) carries a smaller value fails with XX001 before it reads the WAL, and writes nothing". Under 7.18's §2.2, a page 0 or a set of shared identity fields with `wal_seg_size` below 212 is not well-formed, and the open fails with XX001 at §14 step 1, which is before the WAL, writing nothing. So the two rules give the same outcome on the same input, and S-ZETA's comes first. With "not 0" (the pre-move text), a page 0 carrying 1 to 211 would have been well-formed for §2.2 but refused by §12.1. That disagreement was harmless, since both refuse with XX001, but it would have made "well-formed" weaker than the spec's own domain. Z2 removes it.
+- **Every restatement in 7.18.** I grepped for `wal_seg_size` and `212` and read each hit:
+  - §2.1's record table: "at least 212 (§12.1)".
+  - The error table's 22023 row: creation below its floor.
+  - §2.3: creation's 8 MiB floor, or 212 in the store's tests.
+  - §12.1: the 212 floor and the open's XX001.
+  - §14.2: the row "The file's identity carries a `wal_seg_size` below 212 (§12.1) | XX001, nothing written | XX001".
+  - §15.1: `t_wal_seg_size` on A-7c (8 MiB and 212) and A-7d (211, both modes).
+  - S-ETA's Changelog entry.
+  - Z2's new sentence.
+
+  All agree with 212. No "not 0" remains anywhere in 7.18.
+- **The §14.2 overlap.** S-ETA's `wal_seg_size` row and S-ZETA's new refusal row ("An intact page 0 that is not well-formed, or … an intact copy with the file's `creation_uuid` that is not well-formed …") both cover a page 0 with `wal_seg_size` 211. Both give XX001 in both columns and write nothing. This is a restatement, not a contradiction.
+- **The card's "Terms." prose** still says "`wal_seg_size` not 0", and says "The first seven are card A-2-0's Work 3 list, exactly". G-2 says "It is A-2-0's list exactly", and "Card text for the orchestrator" says "(A-2-0 Work 3's list, with §14 step 1's …)". My ruling: **this is a card-text follow-up, and it does not matter to the spec.** The card's prose does not merge. The normative text is Z2's New, which the file carries and Acceptance line 8 pins: the moved Z2 passes line 8, and the pre-move "not 0" planted into the result fails lines 8 and 30. It matters for one later card, though. A-2-0's merged code checks `wal_seg_size == 0` (`crates/nucleus-store/src/meta.rs:344`), so card A-2-0-F1, which implements this rule, must use §2.2's 212, not A-2-0 Work 3's "not 0". The orchestrator's sentence for that card, taken verbatim from this card, would point it at the wrong list. This is S-ZETA-F4.
+- **Nothing becomes unpassable or unkillable.** A-2-0's fixtures use `wal_seg_size` 64 MiB (`tests/meta.rs:64`) and 32 MiB (line 1111), both well-formed under 212. Their out-of-domain cases use 0, which is still out of domain. The table form (Z6) names no `wal_seg_size` symbol. S-ETA's SEG-SIZE-UNCHECKED ("an open accepts one below 212") stays killable on A-7d through `t_wal_seg_size`'s forged 211, whichever card's code holds the check.
+
+## Scope 3: the card's other updates
+
+I diffed `cards/S-ZETA.local.md` (sha256 `b21535c0fd5f4cb5a2f2b284b98b389dd34987ab4c9bc4e40aab41affc9fd54e`) against its pre-move backup, word by word. Every change is one that the base change needs:
+- **Draft numbers and base.** The title, the Base line (adbe6a16; 7.17's sha256 `2777e5d7…91dd`), the Goal's "draft 7.18", the cases preamble, "The draft target", Edits' preamble, E1, E2, Limits 1 ("before S-ETA's", "7.17's line"), Read, Work 1 and 3, and the reverse (7.19; "draft 7.17 byte for byte"; 248 mutants).
+- **The counts.** §15 48 rows, 256 mutants (248 + 8), 53 tests; §15.1 168; Phase B only 24; 87 new since 7.10, with "14 at 7.16, 8 at 7.17". These are S-ETA's 7.17 counts (48/248/53/168, its Changelog) plus this card's 0, 8, 0, 0. The checker prints them.
+- **Acceptance.** Lines 1 to 6, 8, 28 and 30 changed, and no others:
+  - 1 to 6: the draft numbers, the chain `card S-ETA,` and the Counts numbers.
+  - 8: Z2's grep.
+  - 28: the checker gains NT and NE and the count tuple `(…,1,14,8,8,87)`.
+  - 30: the diff hash, `bce60c6c…5854`.
+
+  The checker's NT (14 names) and NE (8 names) and all their placements, ROOT-PIN-MAP-FIRST's A-3a included, equal those in S-ETA's merged card checker, compared by script.
+- **"Mutation evidence"** gained a "rebase dry run" record. It and "The mutant set" text name S-THETA's and S-ETA's placements. The 2026-11-16 dry-run record is kept as history.
+- **Not updated, non-blocking (card text only).**
+  - "§15 and §15.1: the rows" still ends "No row is added, removed or moved: 158 rows" (168 at 7.18).
+  - Notes still say "It may not merge before P0 PASS", which the owner's words of 2026-11-20 supersede (below).
+  - The Notes' merge-order paragraphs still give one-predecessor counts on 7.15. The rebase record says so.
+  - The `wal_seg_size` prose of Scope 2.
+
+  None of these is in a block. S-ZETA-F4 lists them.
+
+## Scope 4: gate, Acceptance, checker, omit-one
+
+- **Acceptance.** I parsed the card with the branch's `tools/run_card.py` `parse_card` and `validate_card`, extracted with `ast`. They read `S-ZETA`, Touch only `['nucleus/v3/docs/S-STORE.md']`, 32 commands, the last `cd nucleus/v3 && bash scripts/gate.sh`, no container, and `validate_card` returns `None`. I ran the 31 commands before `gate.sh` with `/bin/sh -c` from the worktree root at 278f7b64 (clean, `git status --short` empty). They pass **31 of 31 under `LANG=en_CA.UTF-8` and 31 of 31 under `LC_ALL=C`**. Line 32 is the fresh gate above.
+- **The checker** (line 28) prints, in both locales:
+  - `168 rows; 256 mutants; 24 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`
+  - `87 new since 7.10 (31 at 7.11, 11 at 7.12, 4 at 7.13, 10 at 7.14, 1 at 7.15, 14 at 7.16, 8 at 7.17, 8 here), 87 of them judged on a Phase A row; 48 invariants, 53 tests`
+  - `OK`
+- **Omit-one** (7 of 22 blocks). I built each variant with my parser on 7.17 with one block left out, committed it on 278f7b64 in a `--shared`, sparse scratch clone (`~/.cache/nv3-review/gate3-S-ZETA/omit`, local `nucleus/v3-scaffold` = 9bbc77ab), and ran the 31 non-gate lines in both locales. Every omission is caught, and the two locales agree:
+
+  | Block left out | Failing lines |
+  |---|---|
+  | Z2 | 8, 25, 27, 29, 30 |
+  | Z5 | 11, 25, 29, 30 |
+  | Z9 | 14, 26, 27, 30 |
+  | Z12 | 17, 25, 29, 30 |
+  | Z14 | 19, 25, 29, 30 |
+  | Z17 | 21, 25, 27, 28, 29, 30 |
+  | E2 | 3, 4, 5, 6, 29, 30 |
+
+  One planted error, run in the default locale only: Z2's pre-move "not 0" put back into the result fails lines 8 and 30.
+- **The named mutants.** Their judgements are unchanged from gates 1 and 2 (History). Z1 and Z3 to Z20 are byte-identical to the blocks gate 2 judged. Z2's change touches a field no table-form symbol uses, and the out-of-domain value its tests use (0) stays out of domain.
+
+## Scope 5: S-ZETA's rules against S-THETA's and S-ETA's in 7.18
+
+I grepped 7.18 for XX001, 58030, "well-formed", `creation_uuid`, "page 0", "§2.2", "engine invariant", "poison" and "writes nothing", and read each hit in the other cards' sections.
+- **XX001's definitions.** S-THETA's error-table row reads "an integrity check failed, or an engine invariant violation (§9.2)". Its §9.2 item limits engine invariant violations to the engine's own bookkeeping "and … bytes the engine made itself before it writes them", and says "A check of what the device returned … is not one".
+  - **S-ZETA's open refusal** (an intact record that is not well-formed) checks what the device returned. So it is an integrity check of the first kind, a refusal at open with no running store to poison.
+  - **S-ZETA's writers' check** (Z2, Z11; WRITE-MALFORMED) checks bytes the engine made before writing them. Under S-THETA's §9.2 that is an engine invariant violation. S-ZETA makes it fail creation, and fail-stop at step 4 (§9.2). S-THETA's text gives it XX001 and poisoning, which a failed checkpoint step does anyway. The two agree, and S-ZETA names no other code.
+  - **Note for S-IOTA:** when it moves engine invariant violations to XX000 (the owner's "yes" of 2026-11-20), that move covers step 4's well-formedness check, and must not cover the open's refusal.
+- **§14.2.** S-ZETA's three rows (two changed, one added) sit in the open rule's block. S-ETA's rows (`wal_seg_size` below 212, malformed record or short segment, WAL read error 58030) are later steps, or the overlap ruled on in Scope 2. They give the same code wherever they meet. S-THETA added no §14.2 row.
+- **58030 precedence.** S-ZETA's unlocated 58030 and its refusals are at §14 step 1. S-ETA's 58030 for a WAL read error is at step 3 and in pass 2, and its XX001s (start segment missing, malformed record, short segment) are at steps 3 and 3a. So step 1's outcome always comes first, and neither card's text says otherwise. S-THETA's §9.2 "client reads never poison … every read of a read-only open" concerns a running store, not an open's refusal.
+- **Gate 2's S-ZETA-F3** (the torn page 0 with every place unreadable: 58030 by §2.2's first sentence, XX001 by the identity bullet) is unchanged by the move. Both of its Olds still occur exactly once in 7.18. Neither S-THETA nor S-ETA touches those lines.
+
+Nothing here meets the blocking bar:
+- the resolution changes no meaning beyond Z2's floor, which the card's Notes prescribe;
+- it alters no other card's text;
+- it leaves every test passable and every named mutant killable as gates 1 and 2 judged them;
+- it introduces no contradiction.
+
+So no Old/New list is needed.
+
+## The P0 question
+
+Gate 1's P0 fact is carried unchanged (History). At 7.15, under the events 7.15 covers, the text is not defective: no covered fault or crash makes an intact record of the file with an out-of-range field. But 7.15 is under-specified, because §2.2 and §14 step 1 are two-minded, and it lacks future-proofing: a later format version gets a silent rollback with loss after a downgrade. That is a due point before A-7d and before 2.0 ships, not a failure of 7.15 under its own model. This gate does not rule on what P0 concludes. Under the owner's decision, P0 is judged on the merged spec.
+
+## Owner points OP-1 and OP-2: answered for newer-version files
+
+The owner answered in their own words on 2026-11-20 (QUEUE head, `# OWNER DECISION 2026-11-20 17:00 MST`): "Yes to: … 55000 and full refusal for newer-version files". That is the card's recommended "yes" to OP-1 (55000 rather than XX001) and to OP-2 (refuse, read-only included, with no override in 2.0), for a file that a newer format version wrote.
+- **Still open:** the faulty-build and deliberate-write cases of OP-2 (a record of this file that is not well-formed but carries `format_version` 1). The answer names only newer-version files. 7.18's text refuses those cases with XX001, the no-decision default.
+- **Where the rider text goes:** to card S-IOTA (QUEUE row S-IOTA), not to this card. This card merges with the no-decision default (XX001 for every refused record), as gated. OP-1's rider is in the card's Open points: §2.2's two refusal sentences, the 55000 row of the error table, §14.2's new row split in two, and the mutant LATER-FORMAT-AS-CORRUPT on A-2 and A-7d. S-IOTA writes and applies it after S-ZETA merges. I did not apply it in scratch, because it is a description, not an Old/New list.
+
+## Merge timing
+
+The owner's own words of 2026-11-20 (QUEUE head) say: "The spec cards S-ETA, S-THETA, S-ZETA and R-1-SPEC may merge before P0 passes, and P0 is then judged on the merged spec." So S-ZETA may merge now. That replaces gate 2's "may not merge before P0 PASS unless the owner says so in their own words", and the card's Notes' "It may not merge before P0 PASS".
+
+## Follow-ups
+
+S-ZETA-F1 to S-ZETA-F3 carry unchanged from gate 2. Each has its QUEUE row. I re-checked them against 278f7b64:
+- **S-ZETA-F1** (O-1's spec card, before A-7d): O-1's Old, §14 step 4a's "The newest image **fails at open** when …", occurs once in 7.18. Neither S-THETA nor S-ETA changed that sentence.
+- **S-ZETA-F2** (the later-version rule's limits, for D-8 and §17): this does not depend on the base.
+- **S-ZETA-F3** (§2.2's 58030 sentence and §14.2's 58030 row): both Olds occur exactly once in 7.18, so the two-line fix in History, gate 2, applies as written.
+
+One new follow-up, non-blocking:
+- **S-ZETA-F4. Card A-2-0-F1 uses §2.2's domain (`wal_seg_size` at least 212), not A-2-0 Work 3's list; S-ZETA's stale card text.**
+  - **Card A-2-0-F1.** Since S-ETA merged first, §2.2's well-formedness list is A-2-0 Work 3's list with `wal_seg_size` raised from "not 0" to "at least 212 (§12.1)", plus §14 step 1's two range relations. A-2-0's merged code checks `== 0` (`crates/nucleus-store/src/meta.rs:344`). When the orchestrator writes card A-2-0-F1, the sentence it takes from S-ZETA's "Card text for the orchestrator" should read "S-STORE §2.2's domain list" without "(A-2-0 Work 3's list, …)", or name the floor. A-2-0-F1's table form should also carry a page 0 and a copy of the file's `creation_uuid` with `wal_seg_size` 211, so that a build which checks only "not 0" fails on A-2 and not first on A-7d's `t_wal_seg_size`. Placing S-ETA's SEG-SIZE-UNCHECKED on A-2 as well, if A-2-0-F1's shared check holds the open's floor, is the next S-STORE card's choice.
+  - **Card text** (local, does not merge; for whoever next edits `cards/S-ZETA.local.md`, or for P0's reader):
+    - "The rule, re-derived", Terms ("`wal_seg_size` not 0"; "the first seven are card A-2-0's Work 3 list, exactly");
+    - G-2 ("A-2-0's list exactly");
+    - "§15 and §15.1: the rows" ("158 rows", now 168);
+    - Notes "It may not merge before P0 PASS" (superseded, above).
+
+## Not verified
+
+- **No code.** The 7.18 rule has no implementation yet; that is A-2-0-F1's work. I did not re-walk the named mutants or re-run gates 1 and 2's table-form models. The blocks they judged are byte-identical except Z2's floor, whose effect is argued in Scope 2, not modelled.
+- **The implementer's throwaway-clone route** (merge-card accepting the merge plus a stub verdict; `audit: ok (134 commits)`). I did not re-run it. merge-card judges the real route when it runs on this verdict.
+- **Omit-one on the other 15 blocks.** The planted error ran under the default locale only.
+- **The card's Notes' merge-order counts** for R-1-SPEC with S-ZETA on 7.17 or 7.18, and whether R-1-SPEC's blocks still apply after 7.18. R-1-SPEC is not this card's scope.
+- **The implementer's two red `gate.sh` runs** (ENF-TIMING-1). I did not reproduce them. Only this gate's fresh-gate runs are reported above.
+
+## History
+
+- **Gate 1: REWORK, verdict commit 6d4465ca4693451a1e496d6a5d5610ac0fe60b53, on 5c62470b7bf66431f2976b28836449cf60f7c32c.** Its findings, among them the test gap G-REFUSE-NEWER-ONLY (uncaught by every specified test), came with the fix RW-1 to RW-4. Follow-ups S-ZETA-F1 and F2, owner points OP-1 and OP-2, and the P0 fact.
+- **The rework: commit b84d5c03ba3314c31626a93cb391f852390b7ef1**, RW-1 to RW-4 on `docs/S-STORE.md` only.
+- **Gate 2: MERGE-WITH-FOLLOWUPS, verdict commit 512ea1f84e0c9be98810637d0cd4441cc31d631e, on b84d5c03.** Against S-STORE 7.15 at scaffold 71ecf3e6. New follow-up S-ZETA-F3.
+- **S-THETA and S-ETA merged first** (passes 169 and 170; merges 6e3423f6 and adbe6a16), taking S-STORE to 7.16 and then 7.17. A-6a then merged (pass 171, scaffold 9bbc77ab), with S-STORE unchanged.
+- **The move: commit 278f7b6457af9ec88aac568fdf65d6b4389fa599** (a GLM 5.3 implementer). It merges adbe6a16 into the card branch, with `docs/S-STORE.md` resolved to 7.17 plus S-ZETA's 22 blocks as draft 7.18 (sha256 `79cd8027…bcb9`) and Z2's floor as the card's Notes prescribe. The card was updated in the main checkout; its pre-move copy is `~/.cache/nv3-review/S-ZETA.card-backup-pre-717.local.md`. Its two `gate.sh` runs were red on ENF-TIMING-1's self-tests under load 33–46.
+- **Gate 3 (this verdict): MERGE-WITH-FOLLOWUPS on 278f7b64.**
+
+**Gate 2's verdict, as committed at 512ea1f8, verbatim.** Its header lines carry a "- " prefix, so that no tool reads them as this verdict's fields. Everything after them is unchanged, including gate 1's verbatim verdict in its own History. Where its sections ("Merge timing", "Follow-ups", the owner points) differ from the sections above, the sections above are current. The same text is at `git show 512ea1f8:nucleus/v3/verdicts/S-ZETA.md`.
+
+<!-- gate 2's verdict (512ea1f8), verbatim, begins -->
+
+- Card: S-ZETA
+- Class: spec
+- Card-gate: P
+- Verdict: MERGE-WITH-FOLLOWUPS
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent, Claude Code session fe4ac879-18e5-48b7-ac50-9730f0dfc01c (independent P gate 2 of S-ZETA, a narrow re-gate after rework 1; it wrote neither the card, its implementation 5c62470b, the rework b84d5c03, nor gate 1's verdict 6d4465ca, and is not the orchestrator)
+- Date: 2026-11-20
+- Gate-exit: GATE EXIT=0
+- Commit: b84d5c03ba3314c31626a93cb391f852390b7ef1
+- Mutants: spec text, none in code; the A-2 ones run in this gate's own model of the table form, written from the reworked text and independent of gate 1's (16 symbols, 4 page-0 states, 262,144 cases; ~/.cache/nv3-review/gate2-S-ZETA/tools/model2.py), numbers = cases whose outcome changes with RW-3a's alphabet: G-REFUSE-NEWER-ONLY -> table form (13,952; 0 with 5c62470b's alphabet, gate 1's finding reproduced), MALFORMED-AS-TORN -> table form (61,098), IDENTITY-NO-FV-ALG -> table form (15,222), STATICS-AS-FOREIGN -> table form (4,394), IDENTITY-DOMAIN-SKIP -> table form (1,120), FOREIGN-MALFORMED-REFUSES -> table form (3,446), UNLOCATED-AS-CORRUPT -> table form (256), META-RANGE-SKIP -> table form (14,838), TIE-NO-BOOT-ID -> table form (3,109), TIE-EQUAL-OPENS -> table form (2,092), MISPLACED-SHADOWS -> table form (3,124), IDENTITY-SKIP -> table form (24,302), PAGE0-REQUIRED -> table form (9,664), META-WRONG-SLOT -> table form (19,388), MISPLACED-NEXT-REFUSES -> table form (2,712), MISPLACED-IGNORED -> table form (12,996), G-58030-FIRST -> table form (2), FENCE-BEFORE-REFUSAL -> fault form unlocated variant (byte identity; text unchanged by the rework), WRITE-MALFORMED -> write form (text unchanged by the rework). Text mutants: each RW block left out (RW-1, RW-2, RW-3a, RW-3b, RW-4) fails its own Acceptance line and line 30 in both locales; 5c62470b's file fails lines 8, 9, 12, 14 and 30. All in a scratch clone; the worktree was never written before this verdict
+- Followups: S-ZETA-F1, S-ZETA-F2, S-ZETA-F3
 
 ## Verdict in brief
 
@@ -658,3 +849,5 @@ By P0 re-check 1, this card may be built and gated on a branch, but may NOT merg
     - treats the WAL framing (no version field, and not in the rule's list) the same way, or relies on page 0's mark.
 
     Otherwise a single covered fault after a partial upgrade still lets an old build roll back.
+
+<!-- gate 2's verdict (512ea1f8), verbatim, ends -->
