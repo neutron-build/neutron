@@ -318,6 +318,48 @@ fn row_i_integrity() {
                 &format!("{ctx}: (e)"),
             );
 
+            // (b2)-(e2) every bit of each compared field: a stored crc, a
+            // reference crc, an expected id or a reference epoch that
+            // differs in one bit fails that one check, so a check that
+            // compares part of its field (a truncating cast, a mask) is
+            // caught. In (b2) the reference names the altered stored crc,
+            // so only the self CRC fails.
+            for bit in 0..32 {
+                let flip = 1u32 << bit;
+                let mut b2 = pg.clone();
+                b2[..4].copy_from_slice(&(crc ^ flip).to_le_bytes());
+                let rb2 = Ref {
+                    crc: crc ^ flip,
+                    ..r
+                };
+                expect_corrupt(
+                    page::verify(&b2, &rb2, ID),
+                    "CRC32C of its bytes",
+                    &format!("{ctx}: (b2) bit {bit}"),
+                );
+                expect_corrupt(
+                    page::verify(&pg, &rb2, ID),
+                    "reference's crc",
+                    &format!("{ctx}: (c2) bit {bit}"),
+                );
+                let re2 = Ref {
+                    epoch: 11 ^ flip,
+                    ..r
+                };
+                expect_corrupt(
+                    page::verify(&pg, &re2, ID),
+                    "reference's epoch",
+                    &format!("{ctx}: (e2) bit {bit}"),
+                );
+            }
+            for bit in 0..64 {
+                expect_corrupt(
+                    page::verify(&pg, &r, ID ^ (1u64 << bit)),
+                    "expected id",
+                    &format!("{ctx}: (d2) bit {bit}"),
+                );
+            }
+
             // (f) a page of a length outside PAGE_SIZES: cut by one byte,
             // grown by one byte, and every length of BAD_LENS.
             let mut grown = pg.clone();
@@ -649,6 +691,14 @@ fn slotted_every_page_size() {
             let mut p = e.clone();
             p[24..26].copy_from_slice(&1u16.to_le_bytes());
             bad.push(("nslots 1 with free_start 44".into(), p));
+            // The high bytes of free_start and free_end: free_start at or
+            // above 2^16 (bytes 30, 31) and free_end past the page (bytes 34,
+            // 35), so each u32 is read whole.
+            for (at, v) in [(30, 1u8), (31, 1), (34, 2), (35, 1)] {
+                let mut p = e.clone();
+                p[at] = v;
+                bad.push((format!("byte {at} = {v}"), p));
+            }
             for k in [5u8, 6, 7, 8, 9] {
                 let mut p = e.clone();
                 p[4] = k;
@@ -769,21 +819,29 @@ fn slotted_every_page_size() {
             "{ctx}: raw inner header"
         );
         let sep_of = |i: u32| ckey(2 * i, mixed(i, 4, kmax));
+        // Child ids with every byte non-zero, so a cell's u64 child is read
+        // whole.
+        let child_of = |i: u32| PageId(0xA1B2_C3D4_E5F6_0000 + u64::from(i));
         let mut m = 0u32;
         let pending = loop {
             let s = sep_of(m);
             let pos = page::inner_cell_position(&ip, &s).unwrap().unwrap_err();
-            if !page::inner_insert(&mut ip, pos, PageId(1000 + u64::from(m)), &s).unwrap() {
-                break (PageId(1000 + u64::from(m)), s);
+            if !page::inner_insert(&mut ip, pos, child_of(m), &s).unwrap() {
+                break (child_of(m), s);
             }
             m += 1;
         };
-        page::set_right_child(&mut ip, PageId(999_999)).unwrap();
+        // A right-most child with every byte non-zero, so the u64 at 36
+        // is read whole.
+        let rc = PageId(0xF1E2_D3C4_B5A6_9788);
+        page::set_right_child(&mut ip, rc).unwrap();
+        assert_eq!(le_u64(&ip, 36), rc.0, "{ctx}: right child @36");
+        assert_eq!(page::right_child(&ip).unwrap(), rc, "{ctx}: right child");
         assert!(m >= 4, "{ctx}: an inner page took only {m} separators");
         for i in 0..m {
             assert_eq!(
                 page::inner_cell(&ip, i as usize).unwrap(),
-                (PageId(1000 + u64::from(i)), sep_of(i).as_slice()),
+                (child_of(i), sep_of(i).as_slice()),
                 "{ctx}: inner cell {i}"
             );
         }
@@ -812,7 +870,7 @@ fn slotted_every_page_size() {
         );
         assert_eq!(
             page::right_child(&right).unwrap(),
-            PageId(999_999),
+            rc,
             "{ctx}: right child moves right"
         );
         assert_eq!(
@@ -1103,6 +1161,13 @@ fn map_page_codec() {
                 let mut p = pg.clone();
                 p[8..16].copy_from_slice(&((1 << 63) | id).to_le_bytes());
                 bad.push(("the free set's id", p));
+                // Every bit of the header id, so that the whole id (radix,
+                // level and index) is compared.
+                for bit in 0..64 {
+                    let mut p = pg.clone();
+                    p[8..16].copy_from_slice(&(id ^ (1u64 << bit)).to_le_bytes());
+                    bad.push(("an id one bit off the position's", p));
+                }
                 let mut p = pg.clone();
                 p[24 + 16 + 12] = 1;
                 bad.push(("an unmapped entry with a non-zero crc", p));
