@@ -150,6 +150,17 @@ fn oracle_slotted(page: &[u8]) -> Option<(u8, usize, usize, usize)> {
 // Fixtures and assertions
 // ---------------------------------------------------------------------------
 
+/// The first 44 bytes `init` writes (card A-2's two tables): `crc` 0, the
+/// kind, `flags` and reserved 0, `id` 0, `epoch` 0, reserved 0; `nslots`
+/// 0, reserved 0, `free_start` 44, `free_end` the page size, right child 0.
+fn init_bytes(ps: usize, kind: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 44];
+    v[4] = kind;
+    v[28..32].copy_from_slice(&44u32.to_le_bytes());
+    v[32..36].copy_from_slice(&(ps as u32).to_le_bytes());
+    v
+}
+
 /// A `len`-byte buffer of non-zero pattern bytes.
 fn patterned(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 31 % 251 + 1) as u8).collect()
@@ -319,6 +330,40 @@ fn row_i_integrity() {
                     &format!("{ctx}: (f) {} bytes", bad.len()),
                 );
             }
+
+            // (g) the structure, checked after the four comparisons: a
+            // header byte made malformed and the page re-sealed, read
+            // through a reference to the new crc, passes all four and is
+            // refused by the structural checks.
+            // (h) the order: the same byte damaged without re-sealing
+            // fails the self CRC first, before the structure is looked at.
+            for (at, v) in [(4, 0u8), (4, 10), (5, 1), (7, 0x80), (22, 1)] {
+                let mut g = pg.clone();
+                g[at] = v;
+                let mut sealed = g.clone();
+                let g_crc = page::seal(&mut sealed).unwrap();
+                let rg = Ref { crc: g_crc, ..r };
+                assert_eq!(
+                    four_checks(&sealed, &rg, ID),
+                    [true; 4],
+                    "{ctx}: (g) fixture"
+                );
+                assert_eq!(oracle_header(&sealed), None, "{ctx}: (g) byte {at} = {v}");
+                expect_any_corrupt(
+                    page::verify(&sealed, &rg, ID),
+                    &format!("{ctx}: (g) byte {at}"),
+                );
+                assert_eq!(
+                    four_checks(&g, &r, ID),
+                    [false, true, true, true],
+                    "{ctx}: (h) fixture"
+                );
+                expect_corrupt(
+                    page::verify(&g, &r, ID),
+                    "CRC32C of its bytes",
+                    &format!("{ctx}: (h) byte {at}"),
+                );
+            }
         }
     }
     for len in BAD_LENS {
@@ -360,6 +405,8 @@ fn row_i_key_size() {
         page::init(&mut lf, PageKind::Leaf).unwrap();
         let val = vec![0x5Au8; v];
         for i in 0..4u32 {
+            // A leaf with room for exactly one more maximum cell is safe.
+            assert!(page::is_safe(&lf).unwrap(), "{ctx}: {i} cells, not safe");
             let key = ckey(i, k);
             let pos = page::leaf_find(&lf, &key).unwrap().unwrap_err();
             assert!(
@@ -585,6 +632,33 @@ fn slotted_every_page_size() {
     for ps in SIZES {
         let (kmax, vmax) = (page::k_max(ps), page::v_inline(ps));
         let ctx = format!("{ps} bytes");
+
+        // The empty pages `init` writes, byte for byte, over any old bytes;
+        // and what `header` refuses in the B+tree header.
+        for (kind, kb) in [(PageKind::Leaf, 3u8), (PageKind::Inner, 4)] {
+            let mut e = patterned(ps);
+            page::init(&mut e, kind).unwrap();
+            assert_eq!(e[..44], init_bytes(ps, kb), "{ctx}: init({kind:?})");
+            assert_eq!(e[44..], patterned(ps)[44..], "{ctx}: init({kind:?}) body");
+            let mut bad: Vec<(String, Vec<u8>)> = Vec::new();
+            for at in [26, 27] {
+                let mut p = e.clone();
+                p[at] = 1;
+                bad.push((format!("byte {at}"), p));
+            }
+            let mut p = e.clone();
+            p[24..26].copy_from_slice(&1u16.to_le_bytes());
+            bad.push(("nslots 1 with free_start 44".into(), p));
+            for k in [5u8, 6, 7, 8, 9] {
+                let mut p = e.clone();
+                p[4] = k;
+                bad.push((format!("kind {k}"), p));
+            }
+            for (what, p) in bad {
+                assert_eq!(oracle_slotted(&p), None, "{ctx}: {kind:?}, {what}: oracle");
+                expect_any_corrupt(page::header(&p), &format!("{ctx}: {kind:?}, {what}"));
+            }
+        }
 
         // --- Leaf ---
         let mut lf = vec![0u8; ps];
