@@ -414,6 +414,42 @@ fn round_trip(rec: &Record<'_>, chain: Chain) -> Result<Sealed, String> {
     Ok(sealed)
 }
 
+/// The `(index, value)` pairs that `pick` takes from the ops of `rec` after
+/// encode, seal, `read_frame` and `decode_body`, and no other check: the
+/// value round trip that §15.1's two forms for this card state. Their tests
+/// run it over every case before `round_trip`'s byte checks, so a codec that
+/// loses a value fails there first.
+fn decoded_picks(
+    rec: &Record<'_>,
+    chain: Chain,
+    pick: fn(&Op<'_>) -> Option<u64>,
+) -> Result<Vec<(usize, u64)>, String> {
+    let sealed = encode(rec).map_err(|e| format!("encode: {e}"))?.seal(chain);
+    let frame = read_frame(sealed.bytes()).map_err(|e| format!("read_frame: {e:?}"))?;
+    let back = decode_body(&frame).map_err(|e| format!("decode_body: {e}"))?;
+    Ok(ops_of(&back)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| pick(op).map(|v| (i, v)))
+        .collect())
+}
+
+/// A `DropTree{12, w}`'s `w`.
+fn drop_w(op: &Op<'_>) -> Option<u64> {
+    match op {
+        Op::DropTree { tree_id: 12, w } => Some(*w),
+        _ => None,
+    }
+}
+
+/// A `RequireCkpt`'s `ckpt_id`.
+fn require_id(op: &Op<'_>) -> Option<u64> {
+    match op {
+        Op::RequireCkpt { ckpt_id } => Some(*ckpt_id),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Owned records, for the generators
 // ---------------------------------------------------------------------
@@ -838,6 +874,7 @@ fn t_drop_restart_floor() {
         prev_lsn: (1 << 20) - 90,
         prev_crc: 0xFEED_F00D,
     };
+    let mut cases = Vec::new();
     for w in [1, 77, (1u64 << 40) + 3, u64::MAX] {
         let drop = Op::DropTree { tree_id: 12, w };
         let commit = |ops: Vec<Op<'static>>| Record {
@@ -893,20 +930,20 @@ fn t_drop_restart_floor() {
                 },
             ]),
         ];
-        for rec in &records {
-            let sealed = round_trip(rec, chain).unwrap();
-            let back = decode(sealed.bytes()).unwrap().unwrap();
-            let ws: Vec<u64> = ops_of(&back)
-                .iter()
-                .filter_map(|op| match op {
-                    Op::DropTree { tree_id: 12, w } => Some(*w),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(ws, [w], "w {w} in {rec:?}");
-            // (2) The fuzz target takes the record.
-            assert_eq!(fuzz_record(sealed.bytes()), Ok(()), "w {w} in {rec:?}");
-        }
+        cases.extend(records.into_iter().map(|rec| (w, rec)));
+    }
+    for (w, rec) in &cases {
+        let ws: Vec<u64> = decoded_picks(rec, chain, drop_w)
+            .unwrap()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(ws, [*w], "w {w} in {rec:?}");
+    }
+    // (1) Every byte against the model; (2) the fuzz target takes each.
+    for (w, rec) in &cases {
+        let sealed = round_trip(rec, chain).unwrap();
+        assert_eq!(fuzz_record(sealed.bytes()), Ok(()), "w {w} in {rec:?}");
     }
     // (1) The two golden records holding DropTree{12, 77}, byte for byte.
     for g in golden().into_iter().take(2) {
@@ -959,7 +996,8 @@ fn t_ckpt_dep() {
         revert: true,
         before: None,
     };
-    // (1) Round trips with `ckpt_id` exact; (4) the fuzz target takes each.
+    // (1) Round trips with `ckpt_id` exact, as op 0: first the values alone.
+    let mut cases = Vec::new();
     for ckpt_id in [1, (1u64 << 32) + 7, u64::MAX - 1] {
         let req = Op::RequireCkpt { ckpt_id };
         let bodies = [
@@ -980,21 +1018,24 @@ fn t_ckpt_dep() {
                 ops: vec![req, revert],
             },
         ];
-        for body in bodies {
-            let rec = Record { txn, body };
-            let sealed = round_trip(&rec, chain).unwrap();
-            let back = decode(sealed.bytes()).unwrap().unwrap();
-            let ids: Vec<u64> = ops_of(&back)
-                .iter()
-                .filter_map(|op| match op {
-                    Op::RequireCkpt { ckpt_id } => Some(*ckpt_id),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(ids, [ckpt_id], "{rec:?}");
-            assert_eq!(ops_of(&back).first(), Some(&req), "{rec:?}");
-            assert_eq!(fuzz_record(sealed.bytes()), Ok(()), "{rec:?}");
-        }
+        cases.extend(
+            bodies
+                .into_iter()
+                .map(|body| (ckpt_id, Record { txn, body })),
+        );
+    }
+    for (ckpt_id, rec) in &cases {
+        let ids = decoded_picks(rec, chain, require_id).unwrap();
+        assert_eq!(ids, [(0, *ckpt_id)], "ckpt_id {ckpt_id} in {rec:?}");
+    }
+    // (1) Every byte against the model; (4) the fuzz target takes each.
+    for (ckpt_id, rec) in &cases {
+        let sealed = round_trip(rec, chain).unwrap();
+        assert_eq!(
+            fuzz_record(sealed.bytes()),
+            Ok(()),
+            "ckpt_id {ckpt_id} in {rec:?}"
+        );
     }
     // (2) First in its record: refused by the encoder, Corrupt from the
     // decoder, in a Commit and in a Chunk.
@@ -1216,6 +1257,25 @@ proptest! {
 /// in the card's order.
 #[test]
 fn wal_frame_checks() {
+    // The chain fields are under the CRC that `seal` writes and `read_frame`
+    // checks: in each golden record as the crate seals it, one flipped bit
+    // of any byte from `crc` to `len`, `lsn`, `prev_lsn` and `prev_crc`
+    // included, is `Crc`.
+    for g in golden() {
+        let sealed = encode(&g.record).unwrap().seal(g.chain);
+        let rec = sealed.bytes();
+        assert!(read_frame(rec).is_ok(), "{}: the crate's seal", g.name);
+        for i in CRC_AT..rec.len() {
+            let mut m = rec.to_vec();
+            m[i] ^= 1 << (i % 8);
+            assert_eq!(
+                read_frame(&m),
+                Err(FrameError::Crc),
+                "{}: the crate's seal, byte {i} flipped",
+                g.name
+            );
+        }
+    }
     for g in golden() {
         let rec = &g.bytes;
         // Followed by 100 extra bytes, of two contents: the same frame.
