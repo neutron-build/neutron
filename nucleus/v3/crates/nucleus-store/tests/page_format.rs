@@ -1153,6 +1153,33 @@ fn map_page_codec() {
                     assert_eq!(map::map_ref(&pg, &geom, i).unwrap(), want, "{ctx}: ref {i}");
                 }
 
+                // Every bit of a mapped ref's slot: ref 0 with its slot
+                // bytes set to `1 << bit` (its epoch and crc kept) is still
+                // mapped, so the page stays well formed and `map_ref` reads
+                // the ref back whole; a check or read that narrows the slot
+                // is caught.
+                for bit in 0..64 {
+                    let mut p = pg.clone();
+                    p[24..32].copy_from_slice(&(1u64 << bit).to_le_bytes());
+                    page::seal(&mut p).unwrap();
+                    assert!(
+                        oracle_map_ok(&p, fu, level, index),
+                        "{ctx}: slot bit {bit}: oracle"
+                    );
+                    assert!(
+                        map::check_map_page(&p, &geom, level, index).is_ok(),
+                        "{ctx}: slot bit {bit}: check_map_page"
+                    );
+                    assert_eq!(
+                        map::map_ref(&p, &geom, 0).unwrap(),
+                        Ref {
+                            slot: 1u64 << bit,
+                            ..first
+                        },
+                        "{ctx}: slot bit {bit}: map_ref"
+                    );
+                }
+
                 // Refusals of a caller's bug: Invalid, the page unchanged.
                 let mut w = pg.clone();
                 expect_invalid(
@@ -1215,6 +1242,14 @@ fn map_page_codec() {
                 let mut p = pg.clone();
                 p[24 + 16 + 8] = 1;
                 bad.push(("an unmapped entry with a non-zero epoch", p));
+                // Every bit of an unmapped ref's epoch and crc (ref 1, slot
+                // 0), each set alone, so that all of their eight bytes are
+                // judged.
+                for bit in 0..64 {
+                    let mut p = pg.clone();
+                    p[24 + 16 + 8 + bit / 8] |= 1u8 << (bit % 8);
+                    bad.push(("an unmapped ref with one bit of its epoch or crc set", p));
+                }
                 let mut p = pg.clone();
                 p[ps - 1] = 1;
                 bad.push(("the last byte", p));
