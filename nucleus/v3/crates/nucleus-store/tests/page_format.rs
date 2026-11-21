@@ -640,6 +640,20 @@ fn page_header_codec() {
             p[at] = 0x10;
             bad_pages.push((format!("byte {at}"), p));
         }
+        // Every kind byte outside 3-9, and every bit of `flags` and of
+        // both reserved fields set alone, so that each is judged whole.
+        for k in (0..=255u8).filter(|k| !(3..=9).contains(k)) {
+            let mut p = good.clone();
+            p[4] = k;
+            bad_pages.push((format!("kind byte {k}"), p));
+        }
+        for at in (5..8).chain(20..24) {
+            for bit in 0..8 {
+                let mut p = good.clone();
+                p[at] |= 1 << bit;
+                bad_pages.push((format!("byte {at} bit {bit}"), p));
+            }
+        }
         for (what, mut p) in bad_pages {
             // Re-sealed, so only the structure can refuse it.
             page::seal(&mut p).unwrap();
@@ -735,9 +749,118 @@ fn slotted_every_page_size() {
                 p[4] = k;
                 bad.push((format!("kind {k}"), p));
             }
+            // Every bit of `nslots` and of bytes 26..28, and the high bits
+            // of `free_start` (16..32, past every page's end) and of
+            // `free_end` (17..32), each set alone, so that each field is
+            // read and compared whole.
+            for bit in 0..16 {
+                let mut p = e.clone();
+                p[24..26].copy_from_slice(&(1u16 << bit).to_le_bytes());
+                bad.push((format!("nslots bit {bit}"), p));
+                let mut p = e.clone();
+                p[26..28].copy_from_slice(&(1u16 << bit).to_le_bytes());
+                bad.push((format!("bytes 26..28 bit {bit}"), p));
+            }
+            for bit in 16..32 {
+                let mut p = e.clone();
+                p[28..32].copy_from_slice(&(44u32 | (1 << bit)).to_le_bytes());
+                bad.push((format!("free_start bit {bit}"), p));
+                if bit > 16 {
+                    let mut p = e.clone();
+                    p[32..36].copy_from_slice(&(ps as u32 | (1 << bit)).to_le_bytes());
+                    bad.push((format!("free_end bit {bit}"), p));
+                }
+            }
             for (what, p) in bad {
                 assert_eq!(oracle_slotted(&p), None, "{ctx}: {kind:?}, {what}: oracle");
                 expect_any_corrupt(page::header(&p), &format!("{ctx}: {kind:?}, {what}"));
+            }
+        }
+
+        // The cell readers on raw pages: a Leaf and an Inner page of one
+        // cell each, written byte by byte at the page's end, with a second
+        // well-formed copy of the cell just below the cell area. Each bound
+        // `slot` checks, a leaf's right-most child, and every bit of the
+        // slot's and the cell's length fields are judged, so a dropped
+        // bound or a narrowed read is caught.
+        let child = 0x0102_0304_0506_0708u64;
+        for (kb, cell, want) in [
+            (
+                3u8,
+                [&1u16.to_le_bytes()[..], &3u32.to_le_bytes(), b"k", b"vvv"].concat(),
+                (b"k".to_vec(), b"vvv".to_vec()),
+            ),
+            (
+                4u8,
+                [&1u16.to_le_bytes()[..], &child.to_le_bytes(), b"k"].concat(),
+                (child.to_le_bytes().to_vec(), b"k".to_vec()),
+            ),
+        ] {
+            let n = cell.len();
+            let at = ps - n;
+            let mut raw = vec![0u8; ps];
+            raw[..44].copy_from_slice(&init_bytes(ps, kb));
+            raw[24..26].copy_from_slice(&1u16.to_le_bytes());
+            raw[28..32].copy_from_slice(&48u32.to_le_bytes());
+            raw[32..36].copy_from_slice(&(at as u32).to_le_bytes());
+            raw[44..46].copy_from_slice(&(at as u16).to_le_bytes());
+            raw[46..48].copy_from_slice(&(n as u16).to_le_bytes());
+            raw[at..].copy_from_slice(&cell);
+            raw[at - n..at].copy_from_slice(&cell);
+            let read = |p: &[u8]| -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+                if kb == 3 {
+                    page::leaf_cell(p, 0).map(|(k, v)| (k.to_vec(), v.to_vec()))
+                } else {
+                    page::inner_cell(p, 0).map(|(c, k)| (c.0.to_le_bytes().to_vec(), k.to_vec()))
+                }
+            };
+            let ctx = format!("{ctx}: raw kind {kb}");
+            assert_eq!(oracle_slotted(&raw), Some((kb, 1, 48, at)), "{ctx}: oracle");
+            assert_eq!(page::slot(&raw, 0).unwrap(), (at, n), "{ctx}: slot 0");
+            assert_eq!(read(&raw).unwrap(), want, "{ctx}: cell 0");
+            if kb == 3 {
+                expect_any_corrupt(page::right_child(&raw), &format!("{ctx}: right child"));
+            }
+            // Slots `slot` refuses: an index past `nslots` (0, with
+            // `free_start` 44, the slot's bytes left), an offset below
+            // `free_end`, and a cell one byte past the page.
+            let mut slot_bad: Vec<(&str, Vec<u8>)> = Vec::new();
+            let mut p = raw.clone();
+            p[24..26].fill(0);
+            p[28..32].copy_from_slice(&44u32.to_le_bytes());
+            slot_bad.push(("slot 0 past nslots 0", p));
+            let mut p = raw.clone();
+            p[44..46].copy_from_slice(&((at - n) as u16).to_le_bytes());
+            slot_bad.push(("a slot below free_end", p));
+            let mut p = raw.clone();
+            p[46..48].copy_from_slice(&((n + 1) as u16).to_le_bytes());
+            slot_bad.push(("a cell one byte past the page", p));
+            for (what, p) in slot_bad {
+                page::header(&p).unwrap();
+                expect_any_corrupt(page::slot(&p, 0), &format!("{ctx}: {what}: slot"));
+                expect_any_corrupt(read(&p), &format!("{ctx}: {what}: cell"));
+            }
+            // Every bit of the slot's `len`, of the cell's `klen` and of a
+            // leaf cell's `vlen`, each flipped alone: the lengths no longer
+            // agree, so the cell is refused.
+            let mut cell_bad: Vec<(String, Vec<u8>)> = Vec::new();
+            for bit in 0..16 {
+                let mut p = raw.clone();
+                p[46..48].copy_from_slice(&((n as u16) ^ (1 << bit)).to_le_bytes());
+                cell_bad.push((format!("slot len bit {bit}"), p));
+                let mut p = raw.clone();
+                p[at..at + 2].copy_from_slice(&(1u16 ^ (1 << bit)).to_le_bytes());
+                cell_bad.push((format!("klen bit {bit}"), p));
+            }
+            if kb == 3 {
+                for bit in 0..32 {
+                    let mut p = raw.clone();
+                    p[at + 2..at + 6].copy_from_slice(&(3u32 ^ (1 << bit)).to_le_bytes());
+                    cell_bad.push((format!("vlen bit {bit}"), p));
+                }
+            }
+            for (what, p) in cell_bad {
+                expect_any_corrupt(read(&p), &format!("{ctx}: {what}"));
             }
         }
 
@@ -959,6 +1082,17 @@ fn position_ids() {
     expect_invalid(map::position_id(Radix::Map, 128, 0), "level 128");
     expect_invalid(map::position_id(Radix::FreeSet, 255, 0), "level 255");
     expect_invalid(map::position_id(Radix::Map, 0, 1 << 56), "index 2^56");
+    // Every index bit from 56 up, alone, is refused at both radixes, so
+    // the index check reads the whole u64 and no index reaches the level
+    // or the radix bits.
+    for bit in 56..64 {
+        for radix in [Radix::Map, Radix::FreeSet] {
+            expect_invalid(
+                map::position_id(radix, 0, 1 << bit),
+                &format!("{radix:?} index bit {bit}"),
+            );
+        }
+    }
     expect_invalid(
         map::position_id(Radix::FreeSet, 0, u64::MAX),
         "index u64::MAX",
@@ -1204,7 +1338,71 @@ fn map_page_codec() {
                     map::set_map_ref(&mut w, &geom, 1, slot0),
                     &format!("{ctx}: slot 0, crc 5"),
                 );
+                // Every power of two at or past the fanout, which a
+                // narrowed index check would take for an index below it, is
+                // a caller's bug for `map_ref` and for `set_map_ref`.
+                for bit in 0..64 {
+                    let i = 1u64 << bit;
+                    if i < f {
+                        continue;
+                    }
+                    expect_invalid(map::map_ref(&pg, &geom, i), &format!("{ctx}: map_ref {i}"));
+                    expect_invalid(
+                        map::set_map_ref(&mut w, &geom, i, first),
+                        &format!("{ctx}: set ref {i}"),
+                    );
+                }
+                // Every bit of a mapped ref's slot, alone, is accepted and
+                // written whole; every bit of an unmapped ref's epoch and
+                // crc, alone, is refused.
+                for bit in 0..64 {
+                    let mut s = pg.clone();
+                    let mapped = Ref {
+                        slot: 1u64 << bit,
+                        ..first
+                    };
+                    map::set_map_ref(&mut s, &geom, 1, mapped).unwrap();
+                    assert_eq!(s[40..56], ref_bytes(mapped), "{ctx}: set slot bit {bit}");
+                    let unmapped = Ref {
+                        slot: 0,
+                        epoch: if bit < 32 { 1 << bit } else { 0 },
+                        crc: if bit < 32 { 0 } else { 1 << (bit - 32) },
+                    };
+                    expect_invalid(
+                        map::set_map_ref(&mut w, &geom, 1, unmapped),
+                        &format!("{ctx}: set slot 0 with bit {bit} of its epoch or crc"),
+                    );
+                }
                 assert_eq!(w, pg, "{ctx}: a refused set changed the page");
+                // A page of the wrong length: one byte short, the map page
+                // in a page of another allowed size, and 2^16 bytes longer.
+                // Reads are Corrupt, the write Invalid, the page unchanged.
+                let other = if ps < 65536 { 2 * ps } else { 32768 };
+                let mut resized = vec![0u8; other];
+                let k = ps.min(other);
+                resized[..k].copy_from_slice(&pg[..k]);
+                let mut longer = pg.clone();
+                longer.resize(ps + 65536, 0);
+                for (what, p) in [
+                    ("one byte short", pg[..ps - 1].to_vec()),
+                    ("in a page of another allowed size", resized),
+                    ("2^16 bytes longer", longer),
+                ] {
+                    expect_any_corrupt(
+                        map::check_map_page(&p, &geom, level, index),
+                        &format!("{ctx}: {what}: check_map_page"),
+                    );
+                    expect_any_corrupt(
+                        map::map_ref(&p, &geom, 0),
+                        &format!("{ctx}: {what}: map_ref"),
+                    );
+                    let mut q = p.clone();
+                    expect_invalid(
+                        map::set_map_ref(&mut q, &geom, 0, first),
+                        &format!("{ctx}: {what}: set_map_ref"),
+                    );
+                    assert_eq!(q, p, "{ctx}: {what}: a refused set changed the page");
+                }
                 expect_invalid(map::map_ref(&pg, &geom, f), &format!("{ctx}: map_ref f"));
 
                 // Refusals of damaged bytes: Corrupt (each re-sealed, so
@@ -1256,6 +1454,16 @@ fn map_page_codec() {
                 let mut p = pg.clone();
                 p[24 + 16 * fu] = 1;
                 bad.push(("the first byte past the refs", p));
+                // Every bit of those two bytes, alone, so that the tail
+                // rule judges each byte whole.
+                for bit in 0..8 {
+                    let mut p = pg.clone();
+                    p[24 + 16 * fu] = 1 << bit;
+                    bad.push(("a bit of the first byte past the refs", p));
+                    let mut p = pg.clone();
+                    p[ps - 1] = 1 << bit;
+                    bad.push(("a bit of the last byte", p));
+                }
                 if f == 3 {
                     let mut p = pg.clone();
                     p[24 + 16 * 3..24 + 16 * 4].copy_from_slice(&ref_bytes(first));
