@@ -55,7 +55,7 @@
 //!   does not grow the store.
 //!
 //! Known spike limits, on purpose: no merge, no overflow pages (values are
-//! capped at `page::MAX_VALUE`), no prefix truncation, no WAL.
+//! capped at `page::v_inline`), no prefix truncation, no WAL.
 
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -257,10 +257,10 @@ impl<S: PageStore> BTree<S> {
         value: &[u8],
         early_release: bool,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        if key.len() > page::MAX_KEY {
+        if key.len() > page::k_max(self.pool.page_size()) {
             return Err(StoreError::KeyTooLarge(key.len()));
         }
-        if value.len() > page::MAX_VALUE {
+        if value.len() > page::v_inline(self.pool.page_size()) {
             return Err(StoreError::ValueTooLarge(value.len()));
         }
         let mut tries = 0u32;
@@ -319,7 +319,7 @@ impl<S: PageStore> BTree<S> {
     /// [`StoreError::KeyTooLarge`] for oversized keys; any pool/store
     /// error otherwise.
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        if key.len() > page::MAX_KEY {
+        if key.len() > page::k_max(self.pool.page_size()) {
             return Err(StoreError::KeyTooLarge(key.len()));
         }
         let mut tries = 0u32;

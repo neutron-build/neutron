@@ -14,7 +14,7 @@
 //! `find_parent` fallback deleted, this file also catches the
 //! G-SAFE-LAX-class mutants it used to mask.
 
-use nucleus_store::{BTree, MemStore, StoreError};
+use nucleus_store::{BTree, MemStore, StoreError, page};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -138,13 +138,24 @@ proptest! {
 fn split_without_retained_ancestor_is_corrupt() {
     let store = MemStore::new(8192).expect("fresh MemStore");
     let tree = BTree::new(store, 16).expect("fresh tree");
-    // 2,000-byte values make a leaf hold at most four cells (cost 2,012
-    // bytes each against 8,176 free), so twelve sequential inserts grow a
-    // two-level tree whose right-most leaf sits one cell over capacity:
-    // the next insert into it must split. The insert sequence itself uses
-    // the normal coupled descent, so the tree is consistent here.
+    // Maximum cells (card A-2): a `page::k_max(8192)`-byte key (675) and a
+    // `page::v_inline(8192)`-byte value (1,352) cost exactly Q = 2,037
+    // bytes with their slot, a quarter of U = 8,148, so a leaf holds
+    // exactly four. Sequential inserts split each full leaf 2|3, so twelve
+    // of them grow a two-level tree of leaves holding 2, 2, 2, 2 and 4
+    // cells: the right-most leaf is full, and the next insert into it must
+    // split. The insert sequence itself uses the normal coupled descent,
+    // so the tree is consistent here. Keys are the 2-byte big-endian
+    // counter padded with a constant byte, so ascending as before.
+    let k_max = page::k_max(8192);
+    let max_val = vec![0u8; page::v_inline(8192)];
+    let max_key = |prefix: [u8; 2]| {
+        let mut k = prefix.to_vec();
+        k.resize(k_max, 0xA5);
+        k
+    };
     for i in 0u16..12 {
-        tree.insert(&i.to_be_bytes(), &vec![0u8; 2000])
+        tree.insert(&max_key(i.to_be_bytes()), &max_val)
             .expect("normal coupled insert");
     }
     let stats = tree.check().expect("tree consistent before the pin");
@@ -153,11 +164,11 @@ fn split_without_retained_ancestor_is_corrupt() {
         "pin needs a non-root leaf, height was {}",
         stats.height
     );
-    // Key 0xff_f0 routes to the right-most leaf; the chaos descent
-    // releases the root, the full leaf splits, and `propagate_split`
-    // finds no retained parent.
+    // Key 0xff_f0 (padded like the others) routes to the right-most leaf;
+    // the chaos descent releases the root, the full leaf splits, and
+    // `propagate_split` finds no retained parent.
     let err = tree
-        .insert_early_release(&[0xff, 0xf0], &vec![0u8; 2000])
+        .insert_early_release(&max_key([0xff, 0xf0]), &max_val)
         .expect_err("a split with no retained ancestor must be Corrupt");
     match err {
         StoreError::Corrupt(msg) => assert!(

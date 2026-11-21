@@ -1,20 +1,37 @@
 // Provenance (card A-0): nucleus/v3/spikes/e0-btree/src/page.rs at 7ccd1cff8ef926f95a240b15d4b9c6a346251efe lines 1-849.
 // Seed copy; the spike file stays the E0 evidence record (PLAN-v3 §9 A-0).
+// Edits (card A-2): new §3.1 page header, seal/verify and §3.2 size limits; the slotted body moved under it (offsets, u32 free pointers), E0's constants replaced, A-0-F2's checked subtractions, a u16 fit check in compact; unit tests rebuilt.
 #![deny(clippy::indexing_slicing)]
-//! The E0 slotted page (card X-0 Work 4; PLAN-v3 §3.3 "leaves and inner
-//! nodes use a slotted layout").
+//! The page header (S-STORE §3.1), the check of a page read through a
+//! reference (§3.3, I-INTEGRITY), the size limits (§3.2, I-KEY-SIZE), and
+//! the E0 slotted page of Leaf and Inner pages under that header (card X-0
+//! Work 4; PLAN-v3 §3.3 "leaves and inner nodes use a slotted layout").
+//! Card A-2 pins every byte below.
 //!
-//! Layout, all little-endian:
+//! The page header, on every page in slots ≥ 3, all little-endian:
 //!
 //! ```text
 //! offset  size  field
-//!      0     1  kind (0 = leaf, 1 = inner)
-//!      1     1  reserved (0)
-//!      2     2  nslots
-//!      4     2  free_start   first byte after the slot array
-//!      6     2  free_end     first byte of the cell area
-//!      8     8  right-most child page id (inner pages only)
-//!     16   ...  slot array: (offset u16, len u16) per cell, growing up
+//!      0     4  crc     CRC32C of bytes 4..page_size
+//!      4     1  kind    3 Leaf | 4 Inner | 5 Overflow | 6 MapLeaf |
+//!                       7 MapInner | 8 FreeSetLeaf | 9 FreeSetInner
+//!      5     1  flags   0
+//!      6     2  reserved (0)
+//!      8     8  id      LPID (kinds 3-5); radix position (kinds 6-9, `map`)
+//!     16     4  epoch   content epoch, low 32 bits
+//!     20     4  reserved (0)
+//! ```
+//!
+//! The slotted body of a Leaf or Inner page (kinds 3 and 4), after it:
+//!
+//! ```text
+//! offset  size  field
+//!     24     2  nslots
+//!     26     2  reserved (0)
+//!     28     4  free_start   first byte after the slot array
+//!     32     4  free_end     first byte of the cell area; page_size if empty
+//!     36     8  right-most child page id (inner pages; 0 in a leaf)
+//!     44   ...  slot array: (offset u16, len u16) per cell, growing up
 //! free_end      cell area, cells growing DOWN from the page end
 //! ```
 //!
@@ -23,12 +40,33 @@
 //! `&[u8]`/`&mut [u8]`.
 //!
 //! Invariants owned here:
+//! - The header bytes (§3.1: "Card A-2 pins the bytes and fuzzes the
+//!   decoders. A decoder never panics: every malformed byte sequence is
+//!   XX001"): [`read_header`] accepts exactly a page whose length is one of
+//!   `meta::PAGE_SIZES`, whose kind is 3–9 and whose flags and reserved
+//!   bytes are 0, and returns [`StoreError::Corrupt`] for every other byte
+//!   sequence; a header it accepts writes back to the same bytes.
+//! - I-INTEGRITY (§3.3): [`verify`] makes the four checks of a page read
+//!   through a reference, each its own `Corrupt`, in a fixed order (the
+//!   length, the self CRC, the reference's crc, the expected id, the
+//!   reference's epoch, then the header's structure), and hands back
+//!   nothing of the page until all of them pass.
+//! - I-KEY-SIZE and the size limits (§3.2): [`k_max`] and [`v_inline`] are
+//!   derived so that four maximum cells, slots included, fill a page's
+//!   usable bytes `U` exactly at every allowed page size; [`check_key_size`]
+//!   is the store's size check, refusing an over-size key with
+//!   [`StoreError::KeyTooLarge`] (54000).
 //! - P-PARSE: every accessor validates the header and the slot/cell bounds
 //!   and returns [`StoreError::Corrupt`] on bad bytes — no indexing panic
 //!   is possible anywhere in this module (`clippy::indexing_slicing` is
 //!   denied at module level, PLAN-v3 §6.1).
 //! - P-LAYOUT: `HEADER + SLOT*nslots <= free_start <= free_end <= len`,
 //!   every cell lies inside `[free_end, len)` and cells never overlap.
+//!   Every in-page offset field addresses the whole page at every allowed
+//!   page size (§3.1): `free_start` and `free_end` are u32, since an empty
+//!   65536-byte page's `free_end` is 65536, while a slot's u16 `offset`
+//!   and `len` hold every cell, which starts below the page size and is at
+//!   most `⌊U / 4⌋` bytes.
 //! - P-ORDER: slots are stored in ascending key order (leaf) / separator
 //!   order (inner). Removing a cell clears its slot; the hole in the cell
 //!   area is reclaimed by [`compact`], which the insert path runs lazily
@@ -37,11 +75,23 @@
 //!   that both halves can always accept one more maximum-size cell; the
 //!   separator of a leaf split is the first key of the right page (card
 //!   X-0 Work 5), and an inner split moves its middle separator up.
+//!
+//! The seed writes its pages with `id` 0, `epoch` 0 and `crc` 0 and never
+//! seals or verifies them; A-3a and A-3c call [`seal`] and [`verify`]
+//! (lib.rs, "Seed status").
 
+use crate::codec::{get_u8, get_u16, get_u32, get_u64, put_u8, put_u16, put_u32, put_u64};
+use crate::crc::crc32c;
+use crate::meta::{self, Ref};
 use crate::store::{PageId, StoreError};
 
-/// Header size in bytes.
-pub const HEADER: usize = 16;
+/// The page header's size: every page in slots ≥ 3 starts with it, and its
+/// kind-specific body follows (S-STORE §3.1).
+pub const PAGE_HEADER: usize = 24;
+/// Where the slot array starts: the 24-byte page header (§3.1) plus the
+/// 20-byte B+tree header of a Leaf or Inner page (card A-2), so 44. `U`
+/// is the page size minus this (§1, [`usable`]).
+pub const HEADER: usize = 44;
 /// One slot: `(offset u16, len u16)`.
 pub const SLOT: usize = 4;
 /// Leaf cell header: `klen u16, vlen u32`.
@@ -49,25 +99,315 @@ const LEAF_HDR: usize = 6;
 /// Inner cell header: `klen u16, child u64`.
 const INNER_HDR: usize = 10;
 
-/// Largest key accepted by the tree (leaf and inner cells).
-///
-/// Chosen so that one worst-case leaf cell plus its slot
-/// (`MAX_KEY + MAX_VALUE + LEAF_HDR + SLOT` = 4058 bytes) fits **twice**
-/// into the smallest accepted page: that is what makes P-SPLIT always
-/// satisfiable without overflow pages.
-pub const MAX_KEY: usize = 2000;
-/// Largest value accepted by the tree (card X-0 Work 5; no overflow pages
-/// in the spike, so anything larger is `ValueTooLarge`).
-pub const MAX_VALUE: usize = 2048;
-/// Worst-case cost of a leaf cell including its slot.
-pub const MAX_LEAF_COST: usize = SLOT + LEAF_HDR + MAX_KEY + MAX_VALUE;
-/// Worst-case cost of an inner cell including its slot.
-pub const MAX_INNER_COST: usize = SLOT + INNER_HDR + MAX_KEY + 8;
-/// Smallest page the format can split safely: the header plus two
-/// worst-case leaf cells.
-pub const MIN_PAGE: usize = HEADER + 2 * MAX_LEAF_COST;
+/// Header `crc` (u32): CRC32C of bytes `CRC_COVERS..page_size` (§3.1).
+const CRC_AT: usize = 0;
+/// The first byte the header `crc` covers: every byte after the field.
+const CRC_COVERS: usize = 4;
+/// Header `kind` (u8).
+const KIND_AT: usize = 4;
+/// Header `flags` (u8), 0.
+const FLAGS_AT: usize = 5;
+/// The header's reserved u16, 0.
+const RESERVED_U16_AT: usize = 6;
+/// Header `id` (u64).
+const ID_AT: usize = 8;
+/// Header `epoch` (u32).
+const EPOCH_AT: usize = 16;
+/// The header's reserved u32, 0.
+const RESERVED_U32_AT: usize = 20;
+/// B+tree header `nslots` (u16).
+const NSLOTS_AT: usize = 24;
+/// The B+tree header's reserved u16, 0.
+const BODY_RESERVED_AT: usize = 26;
+/// B+tree header `free_start` (u32).
+const FREE_START_AT: usize = 28;
+/// B+tree header `free_end` (u32).
+const FREE_END_AT: usize = 32;
+/// B+tree header right-most child (u64).
+const RIGHT_CHILD_AT: usize = 36;
 
-/// Page kind.
+/// The bytes an entry key adds to its user key besides the escape's
+/// doubled zeros: the `0x00 0x00` terminator and the 8-byte ts suffix
+/// (S-STORE §7.2, `|entry_key| = |k| + zeros(k) + 10`).
+const ENTRY_KEY_EXTRA: usize = 10;
+
+/// The kind byte of the page header (S-STORE §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Kind {
+    /// A B+tree leaf, with the slotted body (§3.1, §6).
+    Leaf = 3,
+    /// A B+tree inner page, with the slotted body (§3.1, §6).
+    Inner = 4,
+    /// A page of an overflow chain (§6.7); its body is card A-5's.
+    Overflow = 5,
+    /// A page-map leaf (§4.1); its body is `map`'s.
+    MapLeaf = 6,
+    /// A page-map inner page (§4.1); its body is `map`'s.
+    MapInner = 7,
+    /// A free-set leaf (§4.3); its body is card A-7b's.
+    FreeSetLeaf = 8,
+    /// A free-set inner page (§4.3); its body is card A-7b's.
+    FreeSetInner = 9,
+}
+
+impl Kind {
+    /// The kind a header `kind` byte names; `None` outside 3–9 (§3.1).
+    pub fn from_byte(b: u8) -> Option<Kind> {
+        match b {
+            3 => Some(Kind::Leaf),
+            4 => Some(Kind::Inner),
+            5 => Some(Kind::Overflow),
+            6 => Some(Kind::MapLeaf),
+            7 => Some(Kind::MapInner),
+            8 => Some(Kind::FreeSetLeaf),
+            9 => Some(Kind::FreeSetInner),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded page header (S-STORE §3.1). `flags` and the reserved bytes
+/// are not kept: they are 0 in every header [`read_header`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageHeader {
+    /// The `crc` field: CRC32C of bytes `4..page_size` when sealed.
+    pub crc: u32,
+    /// The page kind.
+    pub kind: Kind,
+    /// The LPID (kinds 3–5) or the radix position (kinds 6–9,
+    /// `map::position_id`).
+    pub id: u64,
+    /// The content epoch, low 32 bits (§1).
+    pub epoch: u32,
+}
+
+/// Whether `len` is one of the allowed page sizes (S-STORE §2.1,
+/// `meta::PAGE_SIZES`).
+pub(crate) fn is_page_len(len: usize) -> bool {
+    u32::try_from(len).is_ok_and(meta::is_page_size)
+}
+
+/// Decode a page's header (S-STORE §3.1): `Corrupt` unless the page's
+/// length is an allowed page size, its kind is 3–9, and its `flags` and
+/// both reserved fields are 0. The `crc`, `id` and `epoch` are returned
+/// as stored; [`verify`] is what compares them.
+///
+/// # Errors
+/// [`StoreError::Corrupt`] (XX001) for every byte sequence that is not a
+/// header, never a panic.
+pub fn read_header(page: &[u8]) -> Result<PageHeader, StoreError> {
+    let len = page.len();
+    if !is_page_len(len) {
+        return Err(StoreError::Corrupt(format!(
+            "a page of {len} bytes is not an allowed page size"
+        )));
+    }
+    let crc = get_u32(page, CRC_AT)?;
+    let kind_byte = get_u8(page, KIND_AT)?;
+    let kind = Kind::from_byte(kind_byte)
+        .ok_or_else(|| StoreError::Corrupt(format!("page kind {kind_byte} is not 3-9")))?;
+    let flags = get_u8(page, FLAGS_AT)?;
+    if flags != 0 {
+        return Err(StoreError::Corrupt(format!(
+            "page flags {flags:#04x} are not 0"
+        )));
+    }
+    if get_u16(page, RESERVED_U16_AT)? != 0 {
+        return Err(corrupt("page header bytes 6..8 are not 0"));
+    }
+    let id = get_u64(page, ID_AT)?;
+    let epoch = get_u32(page, EPOCH_AT)?;
+    if get_u32(page, RESERVED_U32_AT)? != 0 {
+        return Err(corrupt("page header bytes 20..24 are not 0"));
+    }
+    Ok(PageHeader {
+        crc,
+        kind,
+        id,
+        epoch,
+    })
+}
+
+/// Write a page header's bytes 4..24 (S-STORE §3.1): `kind`, `flags` 0,
+/// the reserved u16 0, `id`, `epoch` and the reserved u32 0. The `crc`
+/// field is left as it is; [`seal`] writes it once the body is final.
+///
+/// # Errors
+/// [`StoreError::Invalid`] if the page's length is not an allowed page
+/// size (a caller's bug); the page is then unchanged.
+pub fn write_header(page: &mut [u8], kind: Kind, id: u64, epoch: u32) -> Result<(), StoreError> {
+    if !is_page_len(page.len()) {
+        return Err(StoreError::Invalid(format!(
+            "a page of {} bytes is not an allowed page size",
+            page.len()
+        )));
+    }
+    put_u8(page, KIND_AT, kind as u8)?;
+    put_u8(page, FLAGS_AT, 0)?;
+    put_u16(page, RESERVED_U16_AT, 0)?;
+    put_u64(page, ID_AT, id)?;
+    put_u32(page, EPOCH_AT, epoch)?;
+    put_u32(page, RESERVED_U32_AT, 0)?;
+    Ok(())
+}
+
+/// Seal a page (S-STORE §3.1): write the CRC32C of bytes `4..page_size`
+/// into the `crc` field and return it, for the reference that will name
+/// the page (§3.3).
+///
+/// # Errors
+/// [`StoreError::Invalid`] if the page's length is not an allowed page
+/// size (a caller's bug); the page is then unchanged.
+pub fn seal(page: &mut [u8]) -> Result<u32, StoreError> {
+    if !is_page_len(page.len()) {
+        return Err(StoreError::Invalid(format!(
+            "a page of {} bytes is not an allowed page size",
+            page.len()
+        )));
+    }
+    let covered = page
+        .get(CRC_COVERS..)
+        .ok_or_else(|| StoreError::Invalid("a page shorter than its crc field".into()))?;
+    let crc = crc32c(0, covered);
+    put_u32(page, CRC_AT, crc)?;
+    Ok(crc)
+}
+
+/// The check of a page read through a reference (S-STORE §3.3,
+/// I-INTEGRITY). `reference` is the page-map entry or parent ref the page
+/// was read through and `expected_id` the id the reader expects; the
+/// reference's `slot` is where the page was read from and is not compared.
+///
+/// In this order, each its own check: the length is an allowed page size;
+/// (1) the header `crc` equals the CRC32C of bytes `4..`; (2) it equals
+/// `reference.crc`; (3) the header `id` equals `expected_id`; (4) the
+/// header `epoch` equals `reference.epoch`; then [`read_header`]'s checks.
+/// A torn, lost (stale) or misdirected write fails one of them, and no byte
+/// of the body is decoded or handed back before all of them pass ("the
+/// bytes are never served").
+///
+/// # Errors
+/// [`StoreError::Corrupt`] (XX001) naming the first check that failed.
+pub fn verify(page: &[u8], reference: &Ref, expected_id: u64) -> Result<PageHeader, StoreError> {
+    let len = page.len();
+    if !is_page_len(len) {
+        return Err(StoreError::Corrupt(format!(
+            "a page of {len} bytes is not an allowed page size"
+        )));
+    }
+    let stored = get_u32(page, CRC_AT)?;
+    let covered = page
+        .get(CRC_COVERS..)
+        .ok_or_else(|| corrupt("a page shorter than its crc field"))?;
+    let computed = crc32c(0, covered);
+    if stored != computed {
+        return Err(StoreError::Corrupt(format!(
+            "page crc {stored:#010x} does not match the CRC32C of its bytes, {computed:#010x}"
+        )));
+    }
+    if stored != reference.crc {
+        return Err(StoreError::Corrupt(format!(
+            "page crc {stored:#010x} does not match the reference's crc {:#010x}",
+            reference.crc
+        )));
+    }
+    let id = get_u64(page, ID_AT)?;
+    if id != expected_id {
+        return Err(StoreError::Corrupt(format!(
+            "page id {id:#x} is not the expected id {expected_id:#x}"
+        )));
+    }
+    let epoch = get_u32(page, EPOCH_AT)?;
+    if epoch != reference.epoch {
+        return Err(StoreError::Corrupt(format!(
+            "page epoch {epoch} is not the reference's epoch {}",
+            reference.epoch
+        )));
+    }
+    read_header(page)
+}
+
+/// `U` (S-STORE §1): the usable bytes of a B+tree page, `page_size` minus
+/// the page header (§3.1) and the B+tree header, so `page_size − 44`.
+/// 4052, 8148, 16340, 32724 and 65492 at the allowed sizes; 0 below 44.
+pub fn usable(page_size: usize) -> usize {
+    page_size.saturating_sub(HEADER)
+}
+
+/// `Q = ⌊U / 4⌋`: the budget of one maximum cell, its slot included, so
+/// that four of them fit in `U` (§3.2: "at least **4** cells of maximum
+/// size").
+fn cell_budget(page_size: usize) -> usize {
+    usable(page_size) / 4
+}
+
+/// `K_MAX(page_size)` (S-STORE §3.2): the largest key field of a cell, so
+/// the bound on an encoded entry key (§7.2). `⌊(Q − 10) / 3⌋`, 10 being a
+/// leaf cell's slot and `klen`/`vlen` header: a third of a maximum leaf
+/// cell's key-and-value budget, card A-2's pin under §3.2's delegation.
+/// 334, 675, 1358, 2723 and 5454 at 4, 8, 16, 32 and 64 KiB.
+pub fn k_max(page_size: usize) -> usize {
+    cell_budget(page_size).saturating_sub(SLOT + LEAF_HDR) / 3
+}
+
+/// `V_INLINE(page_size)` (S-STORE §3.2): the largest value field of a
+/// cell, so the bound on an inline encoded entry value (§7.3: the tag
+/// byte and its body, a provisional value's header included). `Q − 10 −
+/// K_MAX`: 669, 1352, 2717, 5448 and 10909 at 4, 8, 16, 32 and 64 KiB.
+pub fn v_inline(page_size: usize) -> usize {
+    cell_budget(page_size)
+        .saturating_sub(SLOT + LEAF_HDR)
+        .saturating_sub(k_max(page_size))
+}
+
+/// The worst-case cost of a leaf cell, its slot included: a
+/// [`k_max`]-byte key and a [`v_inline`]-byte value, which is exactly `Q`
+/// (§3.2). [`is_safe`] tests a leaf against it.
+pub fn max_leaf_cost(page_size: usize) -> usize {
+    SLOT + LEAF_HDR + k_max(page_size) + v_inline(page_size)
+}
+
+/// The worst-case cost of an inner cell, its slot included: a
+/// [`k_max`]-byte separator, at most `Q` (§3.2); an inner page holds
+/// eleven at every allowed size. [`is_safe`] tests an inner page against
+/// it.
+pub fn max_inner_cost(page_size: usize) -> usize {
+    SLOT + INNER_HDR + k_max(page_size)
+}
+
+/// The size of `entry_key(k, ts)` for the user key `k` (S-STORE §7.2):
+/// `|k| + zeros(k) + 10`, each zero byte escaped to two.
+pub fn entry_key_len(user_key: &[u8]) -> usize {
+    let zeros = user_key.iter().filter(|&&b| b == 0).count();
+    user_key
+        .len()
+        .saturating_add(zeros)
+        .saturating_add(ENTRY_KEY_EXTRA)
+}
+
+/// The store's size check (S-STORE §3.2, I-KEY-SIZE), which the write path
+/// calls when a write enters the write set (card B-1a): `Ok` with the
+/// entry key's size when it is at most [`k_max`] of the page size.
+///
+/// # Errors
+/// [`StoreError::KeyTooLarge`] with the entry key's size when it exceeds
+/// `K_MAX` (54000, §3.2); [`StoreError::Invalid`] if `page_size` is not
+/// an allowed page size.
+pub fn check_key_size(page_size: usize, user_key: &[u8]) -> Result<usize, StoreError> {
+    if !is_page_len(page_size) {
+        return Err(StoreError::Invalid(format!(
+            "page size {page_size} is not an allowed page size"
+        )));
+    }
+    let len = entry_key_len(user_key);
+    if len > k_max(page_size) {
+        return Err(StoreError::KeyTooLarge(len));
+    }
+    Ok(len)
+}
+
+/// The kind of a slotted page: the header `kind`s 3 and 4 (§3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageKind {
     /// A leaf holds key/value cells.
@@ -146,21 +486,28 @@ pub struct Header {
     pub right_child: PageId,
 }
 
-/// Parse and validate the header (P-PARSE, P-LAYOUT).
+/// Parse and validate the header (P-PARSE, P-LAYOUT): the page header
+/// through [`read_header`], whose kind must be 3 (Leaf) or 4 (Inner), then
+/// the B+tree header after it.
 pub fn header(buf: &[u8]) -> Result<Header, StoreError> {
     let len = buf.len();
-    if len < HEADER {
-        return Err(corrupt("page shorter than the header"));
-    }
-    let kind = match buf.first().copied().unwrap_or(255) {
-        0 => PageKind::Leaf,
-        1 => PageKind::Inner,
-        other => return Err(corrupt(&format!("unknown page kind {other}"))),
+    let kind = match read_header(buf)?.kind {
+        Kind::Leaf => PageKind::Leaf,
+        Kind::Inner => PageKind::Inner,
+        other => {
+            return Err(corrupt(&format!(
+                "page kind {} has no slotted body",
+                other as u8
+            )));
+        }
     };
-    let nslots = u16_rd(buf, 2)? as usize;
-    let free_start = u16_rd(buf, 4)? as usize;
-    let free_end = u16_rd(buf, 6)? as usize;
-    let right_child = PageId(u64_rd(buf, 8)?);
+    let nslots = u16_rd(buf, NSLOTS_AT)? as usize;
+    if u16_rd(buf, BODY_RESERVED_AT)? != 0 {
+        return Err(corrupt("B+tree header bytes 26..28 are not 0"));
+    }
+    let free_start = u32_rd(buf, FREE_START_AT)? as usize;
+    let free_end = u32_rd(buf, FREE_END_AT)? as usize;
+    let right_child = PageId(u64_rd(buf, RIGHT_CHILD_AT)?);
     if HEADER + SLOT * nslots > free_start {
         return Err(corrupt("slot array overlaps the cell area"));
     }
@@ -176,25 +523,33 @@ pub fn header(buf: &[u8]) -> Result<Header, StoreError> {
     })
 }
 
-/// Initialize an empty page of the given kind.
+/// Initialize an empty page of the given kind: the page header with kind 3
+/// or 4, `id` 0, `epoch` 0 and `crc` 0 (the seed's pages are never sealed;
+/// lib.rs, "Seed status"), and an empty B+tree header (`free_start` 44,
+/// `free_end` the page size, right-most child 0).
+///
+/// # Errors
+/// [`StoreError::Invalid`] if the page's length is not one of
+/// `meta::PAGE_SIZES`.
 pub fn init(buf: &mut [u8], kind: PageKind) -> Result<(), StoreError> {
-    if buf.len() < MIN_PAGE || buf.len() > u16::MAX as usize {
-        return Err(corrupt("page size outside the accepted range"));
+    let len = buf.len();
+    if !is_page_len(len) {
+        return Err(StoreError::Invalid(format!(
+            "a page of {len} bytes is not an allowed page size"
+        )));
     }
     let k = match kind {
-        PageKind::Leaf => 0u8,
-        PageKind::Inner => 1u8,
+        PageKind::Leaf => Kind::Leaf,
+        PageKind::Inner => Kind::Inner,
     };
-    if let Some(b) = buf.get_mut(0) {
-        *b = k;
-    }
-    if let Some(b) = buf.get_mut(1) {
-        *b = 0;
-    }
-    u16_wr(buf, 2, 0)?;
-    u16_wr(buf, 4, HEADER as u16)?;
-    u16_wr(buf, 6, buf.len() as u16)?;
-    u64_wr(buf, 8, 0)?;
+    u32_wr(buf, CRC_AT, 0)?;
+    write_header(buf, k, 0, 0)?;
+    u16_wr(buf, NSLOTS_AT, 0)?;
+    u16_wr(buf, BODY_RESERVED_AT, 0)?;
+    u32_wr(buf, FREE_START_AT, HEADER as u32)?;
+    // An allowed page size is at most 65536, so it fits the u32 field.
+    u32_wr(buf, FREE_END_AT, len as u32)?;
+    u64_wr(buf, RIGHT_CHILD_AT, 0)?;
     Ok(())
 }
 
@@ -255,9 +610,15 @@ pub fn inner_cell(buf: &[u8], i: usize) -> Result<(PageId, &[u8]), StoreError> {
 }
 
 /// Bytes free between the slot array and the cell area (holes not included).
+///
+/// The subtraction is checked (card A-0-F2): [`header`] already refuses
+/// `free_start > free_end`, and this keeps P-PARSE from resting on that one
+/// comparison.
 pub fn free_bytes(buf: &[u8]) -> Result<usize, StoreError> {
     let h = header(buf)?;
-    Ok(h.free_end - h.free_start)
+    h.free_end
+        .checked_sub(h.free_start)
+        .ok_or_else(|| corrupt("free_start lies past free_end"))
 }
 
 /// Total hole bytes: cell-area bytes not covered by any live cell. Removed
@@ -292,14 +653,20 @@ pub fn right_child(buf: &[u8]) -> Result<PageId, StoreError> {
 /// Does this page have room for one more worst-case cell of its kind?
 ///
 /// This is the latch-coupling safety test of card X-0 Work 5: a writer may
-/// release an ancestor's latch only once the child passes this test.
+/// release an ancestor's latch only once the child passes this test. The
+/// worst-case cell is [`max_leaf_cost`] or [`max_inner_cost`] of the
+/// page's own size, and the subtraction is checked (card A-0-F2).
 pub fn is_safe(buf: &[u8]) -> Result<bool, StoreError> {
     let h = header(buf)?;
     let need = match h.kind {
-        PageKind::Leaf => MAX_LEAF_COST,
-        PageKind::Inner => MAX_INNER_COST,
+        PageKind::Leaf => max_leaf_cost(buf.len()),
+        PageKind::Inner => max_inner_cost(buf.len()),
     };
-    Ok(h.free_end - h.free_start >= need)
+    let free = h
+        .free_end
+        .checked_sub(h.free_start)
+        .ok_or_else(|| corrupt("free_start lies past free_end"))?;
+    Ok(free >= need)
 }
 
 /// Binary-search a leaf for `key`: `Ok(i)` if it equals slot `i`'s key,
@@ -460,9 +827,9 @@ pub fn leaf_insert(
     shift_slots(buf, pos, h.nslots, 1)?;
     u16_wr(buf, HEADER + SLOT * pos, cell_off as u16)?;
     u16_wr(buf, HEADER + SLOT * pos + 2, cell_len as u16)?;
-    u16_wr(buf, 2, (h.nslots + 1) as u16)?;
-    u16_wr(buf, 4, (h.free_start + SLOT) as u16)?;
-    u16_wr(buf, 6, cell_off as u16)?;
+    u16_wr(buf, NSLOTS_AT, (h.nslots + 1) as u16)?;
+    u32_wr(buf, FREE_START_AT, (h.free_start + SLOT) as u32)?;
+    u32_wr(buf, FREE_END_AT, cell_off as u32)?;
     Ok(true)
 }
 
@@ -498,9 +865,9 @@ pub fn inner_insert(
     shift_slots(buf, pos, h.nslots, 1)?;
     u16_wr(buf, HEADER + SLOT * pos, cell_off as u16)?;
     u16_wr(buf, HEADER + SLOT * pos + 2, cell_len as u16)?;
-    u16_wr(buf, 2, (h.nslots + 1) as u16)?;
-    u16_wr(buf, 4, (h.free_start + SLOT) as u16)?;
-    u16_wr(buf, 6, cell_off as u16)?;
+    u16_wr(buf, NSLOTS_AT, (h.nslots + 1) as u16)?;
+    u32_wr(buf, FREE_START_AT, (h.free_start + SLOT) as u32)?;
+    u32_wr(buf, FREE_END_AT, cell_off as u32)?;
     Ok(true)
 }
 
@@ -521,7 +888,7 @@ pub fn set_right_child(buf: &mut [u8], child: PageId) -> Result<(), StoreError> 
     if header(buf)?.kind != PageKind::Inner {
         return Err(corrupt("right-most child of a leaf"));
     }
-    u64_wr(buf, 8, child.0)
+    u64_wr(buf, RIGHT_CHILD_AT, child.0)
 }
 
 fn remove_slot(buf: &mut [u8], i: usize) -> Result<(), StoreError> {
@@ -530,8 +897,8 @@ fn remove_slot(buf: &mut [u8], i: usize) -> Result<(), StoreError> {
         return Err(corrupt("slot index out of range"));
     }
     shift_slots(buf, i + 1, h.nslots, -1)?;
-    u16_wr(buf, 2, (h.nslots - 1) as u16)?;
-    u16_wr(buf, 4, (h.free_start - SLOT) as u16)?;
+    u16_wr(buf, NSLOTS_AT, (h.nslots - 1) as u16)?;
+    u32_wr(buf, FREE_START_AT, (h.free_start - SLOT) as u32)?;
     Ok(())
 }
 
@@ -577,6 +944,14 @@ pub fn compact(buf: &mut [u8]) -> Result<(), StoreError> {
         cur = cur
             .checked_sub(len)
             .ok_or_else(|| corrupt("cells overflow the page during compaction"))?;
+        // `cur` becomes this cell's offset in its u16 slot field (card
+        // A-2). Only an empty cell at the end of a 65536-byte page reaches
+        // 65536, and no well-formed cell is empty, so this refuses corrupt
+        // bytes before any byte of the page is written; it is also why the
+        // offsets written below fit.
+        if cur > usize::from(u16::MAX) {
+            return Err(corrupt("a compacted cell's offset does not fit its slot"));
+        }
         let src = buf
             .get(off..off + len)
             .ok_or_else(|| corrupt("compaction source out of bounds"))?;
@@ -601,9 +976,9 @@ pub fn compact(buf: &mut [u8]) -> Result<(), StoreError> {
         u16_wr(buf, HEADER + SLOT * i + 2, len as u16)?;
     }
     debug_assert_eq!(top, cur);
-    u16_wr(buf, 2, h.nslots as u16)?;
-    u16_wr(buf, 4, (HEADER + SLOT * h.nslots) as u16)?;
-    u16_wr(buf, 6, cur as u16)?;
+    u16_wr(buf, NSLOTS_AT, h.nslots as u16)?;
+    u32_wr(buf, FREE_START_AT, (HEADER + SLOT * h.nslots) as u32)?;
+    u32_wr(buf, FREE_END_AT, cur as u32)?;
     Ok(())
 }
 
@@ -813,9 +1188,9 @@ mod tests {
     fn overlapping_slots_page() -> Vec<u8> {
         let mut buf = vec![0u8; 8192];
         init(&mut buf, PageKind::Leaf).unwrap();
-        u16_wr(&mut buf, 2, 3).unwrap();
-        u16_wr(&mut buf, 4, (HEADER + 3 * SLOT) as u16).unwrap();
-        u16_wr(&mut buf, 6, 4096).unwrap();
+        u16_wr(&mut buf, NSLOTS_AT, 3).unwrap();
+        u32_wr(&mut buf, FREE_START_AT, (HEADER + 3 * SLOT) as u32).unwrap();
+        u32_wr(&mut buf, FREE_END_AT, 4096).unwrap();
         for i in 0..3 {
             u16_wr(&mut buf, HEADER + SLOT * i, 4096).unwrap();
             u16_wr(&mut buf, HEADER + SLOT * i + 2, 3000).unwrap();

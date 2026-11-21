@@ -17,12 +17,12 @@
 //! same store, which is where a lost `mark_dirty` shows up.
 //!
 //! The pool is 16 frames over a tree of ~60 pages, so eviction (and
-//! with it the dirty write-back path) runs constantly. Keys are 1,200
-//! bytes and values 300–2,048 bytes: an inner page fills at ~6
-//! children, so leaf splits, inner splits and (at least two) root
-//! splits all happen inside the workload, and the tree settles at
-//! height 4 — within `2·h + 1 = 9 ≤ 16`, the minimum pool size card
-//! X-0-F2's reservation strategy imposes.
+//! with it the dirty write-back path) runs constantly. Keys are
+//! `page::k_max(8192)` = 675 bytes and values 300–1,352 bytes (card A-2):
+//! an inner page fills at eleven separators, so leaf splits, inner splits
+//! and (two) root splits all happen inside the workload, and the tree
+//! settles at height 3 — within `2·h + 1 = 7 ≤ 16`, the minimum pool size
+//! card X-0-F2's reservation strategy imposes.
 //!
 //! `faults_pool_starved_mid_split` covers the pool-size failure mode
 //! the fault store cannot produce on its own: `PoolStarved` striking
@@ -261,9 +261,10 @@ enum Op {
 }
 
 /// A `len`-byte key: a big-endian u16 prefix (ascending u16 order is
-/// ascending byte order) plus constant padding. 1,200 bytes of key make
-/// inner pages fill at ~6 children, so inner splits and root splits
-/// happen inside the workload.
+/// ascending byte order) plus constant padding. Keys of
+/// `page::k_max(8192)` = 675 bytes cost 689 bytes as separators with their
+/// slot, so an inner page (U = 8,148) fills at eleven separators, and
+/// inner splits and root splits happen inside the workload.
 fn key(n: u16, len: usize) -> Vec<u8> {
     let mut k = n.to_be_bytes().to_vec();
     k.extend(std::iter::repeat_n(0xA5, len - 2));
@@ -279,42 +280,43 @@ fn value(rng: &mut Sm, len: usize) -> Vec<u8> {
 /// and ranges (card X-0-F2 Work 5). Same op sequence in every run, so
 /// each armed N lands on the same call.
 fn workload() -> Vec<Op> {
+    let klen = page::k_max(8192);
     let mut rng = Sm::new(0xFA17_C0DE);
     let mut ops = Vec::new();
     let mut live: Vec<u16> = Vec::new();
     for i in 0u16..190 {
         let vlen = 300 + (rng.next_u64() % 600) as usize;
         ops.push(Op::Insert {
-            k: key(i, 1200),
+            k: key(i, klen),
             v: value(&mut rng, vlen),
         });
         live.push(i);
         if i >= 8 && i % 3 == 0 {
-            // growing upsert: 1,600–2,048 bytes against a 300–900-byte
-            // cell — the replacement often does not fit, which is the
-            // remove-before-split shape the UPSERT-REMOVE-FIRST mutation
-            // targets.
+            // growing upsert: 1,000–1,352 bytes (`page::v_inline(8192)`)
+            // against a 300–900-byte cell — the replacement often does not
+            // fit, which is the remove-before-split shape the
+            // UPSERT-REMOVE-FIRST mutation targets.
             let j = live[(rng.next_u64() as usize) % live.len()];
-            let vlen = 1600 + (rng.next_u64() % 449) as usize;
+            let vlen = 1000 + (rng.next_u64() % (page::v_inline(8192) as u64 - 999)) as usize;
             ops.push(Op::Upsert {
-                k: key(j, 1200),
+                k: key(j, klen),
                 v: value(&mut rng, vlen),
             });
         }
         if i >= 12 && i % 4 == 0 {
             let j = live[(rng.next_u64() as usize) % live.len()];
-            ops.push(Op::Delete { k: key(j, 1200) });
+            ops.push(Op::Delete { k: key(j, klen) });
         }
         if i % 5 == 0 {
             let j = live[(rng.next_u64() as usize) % live.len()];
-            ops.push(Op::Get { k: key(j, 1200) });
+            ops.push(Op::Get { k: key(j, klen) });
         }
         if i % 7 == 0 {
             let a = (rng.next_u64() % 190) as u16;
             let b = (rng.next_u64() % 190) as u16;
             ops.push(Op::Range {
-                lo: key(a, 1200),
-                hi: key(b, 1200),
+                lo: key(a, klen),
+                hi: key(b, klen),
             });
         }
     }
@@ -646,18 +648,20 @@ fn faults_no_page_leak_small_values() {
 /// live keys to their values.
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
-/// A `MAX_KEY`-byte key: with `MAX_VALUE`-byte values every leaf cell
-/// costs `page::MAX_LEAF_COST`, so a leaf holds at most two cells — and
-/// a two-cell leaf is both unsafe and genuinely full: no cell fits, the
-/// next insert must split. Inner cells cost `page::MAX_INNER_COST`, so
-/// an inner page fills at four children.
+/// A `page::k_max(8192)`-byte key: with `page::v_inline(8192)`-byte
+/// values every leaf cell costs `page::max_leaf_cost(8192)` = Q = 2,037
+/// bytes with its slot, a quarter of U = 8,148, so a leaf holds exactly
+/// four maximum cells — and a four-cell leaf is both unsafe and genuinely
+/// full: no cell fits, the next insert must split. Inner cells cost
+/// `page::max_inner_cost(8192)` = 689 bytes, so an inner page holds
+/// eleven maximum separators.
 fn max_key(n: u16) -> Vec<u8> {
-    key(n, page::MAX_KEY)
+    key(n, page::k_max(8192))
 }
 
-/// A `MAX_VALUE`-byte value.
+/// A `page::v_inline(8192)`-byte value.
 fn max_val() -> Vec<u8> {
-    vec![0xC3; page::MAX_VALUE]
+    vec![0xC3; page::v_inline(8192)]
 }
 
 /// Build a tree of `n` sequential max-size cells at a comfortable pool,
@@ -712,7 +716,7 @@ fn assert_starved_untouched(
         return Err(format!("{phase}: height changed to {}", stats.height));
     }
     let scan: Vec<(Vec<u8>, Vec<u8>)> = tree
-        .range(&[0x00], &[0xff; page::MAX_KEY + 1])
+        .range(&[0x00], &vec![0xff; page::k_max(8192) + 1])
         .map_err(|m| format!("range {phase}: {m}"))?
         .collect::<Result<_, _>>()
         .map_err(|m| format!("range item {phase}: {m}"))?;
@@ -772,13 +776,14 @@ fn assert_starved_untouched(
 #[test]
 fn faults_pool_starved_mid_split() {
     // --- Scenario 1: starve the leaf's own split page. ---------------
-    // Four max-size cells grow a height-2 tree whose right-most leaf is
-    // full (two cells). The fifth insert must split that leaf.
-    let (store, root, model) = build_max_tree(4).expect("build scenario 1");
+    // Six max-size cells grow a height-2 tree whose right-most leaf is
+    // full (four cells): the fifth insert splits the first leaf 2|3, the
+    // sixth fills the right one. The seventh insert must split that leaf.
+    let (store, root, model) = build_max_tree(6).expect("build scenario 1");
     let tree = BTree::open(store, 2, root).expect("reopen with 2 frames");
     let stats = tree.check().expect("check scenario 1");
     assert_eq!(stats.height, 2, "scenario 1 needs a height-2 tree");
-    let pending = max_key(4);
+    let pending = max_key(6);
     let err = tree
         .insert(&pending, &max_val())
         .expect_err("the leaf split must starve at 2 frames");
@@ -799,9 +804,13 @@ fn faults_pool_starved_mid_split() {
     // arithmetic, not something to hard-code: scan key counts on fresh
     // trees until the insert starves (deterministic — same build every
     // time — and bounded; every count whose insert succeeds is simply
-    // not the shape, its tree is discarded).
+    // not the shape, its tree is discarded). The scan starts at 27, the
+    // smallest count whose built tree has height 3 (card A-2): with four
+    // maximum cells per leaf, sequential inserts give the root its
+    // eleventh separator at 25 and split it at 27; it tries at most 64
+    // counts from there.
     let mut starved = None;
-    for n in 8u16..=40 {
+    for n in 27u16..27 + 64 {
         let (store, root, model) = build_max_tree(n).expect("build scenario 2");
         let tree = BTree::open(store, 4, root).expect("reopen with 4 frames");
         let stats = tree.check().expect("check the small-pool tree");
@@ -820,6 +829,6 @@ fn faults_pool_starved_mid_split() {
     }
     assert!(
         starved.is_some(),
-        "no key count in 8..=40 starved the cascade page"
+        "no key count in 27..=90 starved the cascade page"
     );
 }

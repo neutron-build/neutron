@@ -1,12 +1,12 @@
 // Provenance (card A-0): nucleus/v3/spikes/e0-btree/src/store.rs at 7ccd1cff8ef926f95a240b15d4b9c6a346251efe lines 1-166.
 // Edits: the module doc drops its FileStore sentence; the three imports only FileStore used are deleted; FileStore itself (source lines 167-251) is not copied, so I/O reaches disk only through nucleus-env (card A-1a).
-//! Page ids, the error type and the two page stores of the E0 spike
+//! Page ids, the error type, the page-store trait and its in-memory store, from the E0 spike
 //! (card X-0 Work 2; PLAN-v3 §3.3 pages and buffer manager).
 //!
 //! Invariants owned here:
-//! - [`PageStore`] is the binding I/O interface for X-5 (E4): everything
-//!   above it (pool, tree, tests, benchmarks) reaches storage only through
-//!   these five methods, so X-5 can swap in a page map underneath.
+//! - [`PageStore`] is the seed's only page I/O surface: the pool and the
+//!   tree reach storage only through its five methods. A-3a and A-3c
+//!   replace it with frames read through the page map (S-STORE §4.1, §5).
 //! - [`StoreError::Corrupt`] is the only answer bad on-disk bytes may
 //!   produce (PLAN-v3 §6.1: corruption never panics and never is UB).
 //! - [`MemStore`] mirrors exactly `Mutex<Vec<Box<[u8]>>>`.
@@ -22,8 +22,8 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub u64);
 
-/// Error type of the whole spike: one `thiserror` enum per crate
-/// (PLAN-v3 §6.1).
+/// The crate's error type: one `thiserror` enum per crate (PLAN-v3 §6.1).
+/// Its SQLSTATE mapping is A-3c's and A-4c's (lib.rs, Seed status).
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// An I/O error from the underlying store or file.
@@ -33,12 +33,11 @@ pub enum StoreError {
     /// (PLAN-v3 §6.1); `XX001` territory in the future engine.
     #[error("corrupt page: {0}")]
     Corrupt(String),
-    /// A value exceeded the spike limit (card X-0 Work 5: no overflow pages).
-    #[error("value of {0} bytes exceeds the spike limit of 2048")]
+    /// A value longer than `V_INLINE` (S-STORE §3.2); overflow chains are card A-5's.
+    #[error("value of {0} bytes exceeds V_INLINE (S-STORE §3.2)")]
     ValueTooLarge(usize),
-    /// A key exceeded the spike limit (kept small enough that any split can
-    /// always leave both halves room for one more cell; see `page::MAX_KEY`).
-    #[error("key of {0} bytes exceeds the spike limit of 2000")]
+    /// A key longer than `K_MAX` (S-STORE §3.2, I-KEY-SIZE): SQLSTATE 54000.
+    #[error("key of {0} bytes exceeds K_MAX (S-STORE §3.2)")]
     KeyTooLarge(usize),
     /// A page id was never allocated in this store.
     #[error("page {0:?} was never allocated")]
@@ -56,8 +55,9 @@ pub enum StoreError {
     Poisoned(String),
 }
 
-/// The storage surface of the spike; binding for X-5, which implements it
-/// over a logical-page-id page map (PLAN-v3 §3.3, N1).
+/// The seed's page storage surface (card A-0). E4 implemented it over a
+/// page map; the engine replaces it with the page map and frames (A-3a,
+/// A-3c).
 ///
 /// `read`/`write` move whole pages; `buf` is always exactly
 /// [`Self::page_size`] bytes.
@@ -70,8 +70,8 @@ pub trait PageStore: Send + Sync {
     fn write(&self, id: PageId, buf: &[u8]) -> Result<(), StoreError>;
     /// Allocate a fresh page id.
     fn allocate(&self) -> Result<PageId, StoreError>;
-    /// Free a page. The spike's tree never calls this (no merges); both
-    /// stores accept and ignore it, documented per implementation.
+    /// Free a page. The spike's tree never calls this (no merges);
+    /// `MemStore` accepts and ignores it, documented per implementation.
     fn free(&self, id: PageId) -> Result<(), StoreError>;
 }
 
