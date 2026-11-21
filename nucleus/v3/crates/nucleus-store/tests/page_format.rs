@@ -359,6 +359,37 @@ fn row_i_integrity() {
                     &format!("{ctx}: (d2) bit {bit}"),
                 );
             }
+            // (d3), (e3) every bit of the page's own id and epoch: the page
+            // with that field one bit off, re-sealed, and read through a
+            // reference naming its new crc, fails that one check, so a
+            // check that reads part of the page's field (a narrowed read, a
+            // mask) is caught. (d2) and (e2) alter only the other side.
+            for bit in 0..64 {
+                let mut d3 = pg.clone();
+                d3[8..16].copy_from_slice(&(ID ^ (1u64 << bit)).to_le_bytes());
+                let rd3 = Ref {
+                    crc: page::seal(&mut d3).unwrap(),
+                    ..r
+                };
+                expect_corrupt(
+                    page::verify(&d3, &rd3, ID),
+                    "expected id",
+                    &format!("{ctx}: (d3) bit {bit}"),
+                );
+            }
+            for bit in 0..32 {
+                let mut e3 = pg.clone();
+                e3[16..20].copy_from_slice(&(11u32 ^ (1u32 << bit)).to_le_bytes());
+                let re3 = Ref {
+                    crc: page::seal(&mut e3).unwrap(),
+                    ..r
+                };
+                expect_corrupt(
+                    page::verify(&e3, &re3, ID),
+                    "reference's epoch",
+                    &format!("{ctx}: (e3) bit {bit}"),
+                );
+            }
 
             // (f) a page of a length outside PAGE_SIZES: cut by one byte,
             // grown by one byte, and every length of BAD_LENS.
@@ -819,8 +850,8 @@ fn slotted_every_page_size() {
             "{ctx}: raw inner header"
         );
         let sep_of = |i: u32| ckey(2 * i, mixed(i, 4, kmax));
-        // Child ids with every byte non-zero, so a cell's u64 child is read
-        // whole.
+        // Child ids whose top six bytes are all non-zero (the low two count
+        // the cells), so a cell's u64 child is read whole.
         let child_of = |i: u32| PageId(0xA1B2_C3D4_E5F6_0000 + u64::from(i));
         let mut m = 0u32;
         let pending = loop {
@@ -1167,6 +1198,16 @@ fn map_page_codec() {
                     let mut p = pg.clone();
                     p[8..16].copy_from_slice(&(id ^ (1u64 << bit)).to_le_bytes());
                     bad.push(("an id one bit off the position's", p));
+                }
+                // The first and the last ref with slot 0 but their epoch
+                // and crc kept, so that every ref is checked.
+                for (i, what) in [
+                    (0, "ref 0 with slot 0 and a non-zero epoch and crc"),
+                    (fu - 1, "ref f-1 with slot 0 and a non-zero epoch and crc"),
+                ] {
+                    let mut p = pg.clone();
+                    p[24 + 16 * i..24 + 16 * i + 8].fill(0);
+                    bad.push((what, p));
                 }
                 let mut p = pg.clone();
                 p[24 + 16 + 12] = 1;
