@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::page;
+use crate::meta;
 use crate::store::{PageId, PageStore, StoreError};
 
 /// One frame of the pool: the page bytes, their identity, and the dirty
@@ -87,17 +87,18 @@ impl<S: PageStore> BufferPool<S> {
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if the capacity is zero or the store's page
-    /// size is outside what the slotted format can split safely
-    /// (`page::MIN_PAGE..=65535`).
+    /// size is not one of the allowed page sizes, [`meta::PAGE_SIZES`]
+    /// (S-STORE §2.1), the sizes the page format and its size limits are
+    /// pinned for (card A-2).
     pub fn new(store: S, capacity: usize) -> Result<Self, StoreError> {
         let page_size = store.page_size();
         if capacity == 0 {
             return Err(StoreError::Invalid("pool capacity must be nonzero".into()));
         }
-        if page_size < page::MIN_PAGE || page_size > u16::MAX as usize {
+        if !u32::try_from(page_size).is_ok_and(meta::is_page_size) {
             return Err(StoreError::Invalid(format!(
-                "page size {page_size} outside {}..=65535",
-                page::MIN_PAGE
+                "page size {page_size} is not one of {:?}",
+                meta::PAGE_SIZES
             )));
         }
         let slots = (0..capacity)

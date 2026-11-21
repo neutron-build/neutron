@@ -5,33 +5,72 @@
 //! redo-only WAL, copy-on-write checkpoints and recovery. Normative design:
 //! `docs/S-STORE.md` (card S-1). Implementation: Phase A cards.
 //!
-//! # Seed status (card A-0)
+//! Invariants owned by this crate as a whole (the E0 spike's crate doc,
+//! restated by card A-2):
+//! - no `unsafe` (`unsafe_code = "forbid"`), and no panic on a path data can
+//!   reach: every malformed byte sequence is `StoreError::Corrupt`, which is
+//!   XX001 (S-STORE §3.1, §3.3; PLAN-v3 §6.1);
+//! - no storage code calls `std::fs` or `std::time`: all I/O goes through
+//!   `nucleus-env` (S-STORE §2; PLAN-v3 §3.2);
+//! - B+tree keys are uninterpreted byte strings ordered by `memcmp`
+//!   (S-STORE §6.1).
 //!
-//! The modules below are the E0 spike's page, pool and tree, copied with
-//! provenance from `spikes/e0-btree` (PLAN-v3 §9 A-0). They meet E0's
-//! invariants (T-ORDER, T-COUPLING, T-ATOMIC, P-PARSE, P-LAYOUT, P-ORDER,
-//! P-SPLIT, each stated in its module), not yet S-STORE. The known
-//! departures, each with the card that removes it:
+//! # What is built
 //!
-//! - page format: a 16-byte header with kinds 0/1 and no CRC, id or epoch
-//!   (S-STORE §3.1, §3.3), and limits sized for two maximum cells, not four
-//!   (§3.2): A-2;
-//! - ids: [`store::PageStore`] hands out dense page ids that are never freed
-//!   and are addressed directly, with no page map, free set or slot reuse
-//!   (§4): A-2, A-3c;
-//! - pool: `std::sync::RwLock` frame latches, which are not task-fair
-//!   (§5.1, §5.3); victims picked by pin count, not `try_latch` (§5.2);
-//!   dirty victims written back in place under the same id, not to a fresh
-//!   slot (§5.2, I-NO-INPLACE); no epoch gate or `write_guard` (§5.6):
-//!   A-3a, A-3b, A-3c, A-7a;
+//! - `crc`, `meta` and `open` (card A-2-0): CRC32C; page 0, the two meta
+//!   copies, the replica region and the open rule (S-STORE §2), as codecs
+//!   with no I/O.
+//! - `page`'s header, `verify` and size limits, and `map` (card A-2): the
+//!   page header (§3.1), I-INTEGRITY (§3.3), `K_MAX` and `V_INLINE` (§3.2),
+//!   and the page-map pages and their positions (§4.1), as codecs with no
+//!   I/O.
+//! - `page`'s slotted body, `pool`, `store` and `tree` (card A-0, re-based
+//!   on §3.1 by card A-2): the E0 spike's B+tree, copied with provenance
+//!   from `spikes/e0-btree`. They meet E0's invariants (T-ORDER, T-COUPLING,
+//!   T-ATOMIC, P-PARSE, P-LAYOUT, P-ORDER, P-SPLIT, each stated in its
+//!   module), not yet S-STORE's.
+//!
+//! # Seed status (card A-0; completed by card A-2)
+//!
+//! The known departures from S-STORE, each with the card that removes it:
+//!
+//! - pages are neither sealed nor checked: the seed writes every page with
+//!   `id` 0, `epoch` 0 and `crc` 0 and never calls `page::seal` or
+//!   `page::verify` (§3.1, §3.3): A-3a (reads through a reference), A-3c
+//!   (dirty eviction), A-7b (the checkpoint's image writes);
+//! - ids: [`store::PageStore`] hands out dense page ids that are addressed
+//!   directly, with no LPID allocation (§4.2), page map (§4.1), free set
+//!   (§4.3) or slot reuse (§4.4, §4.5): A-3a, A-3c; LPID freeing: A-4b; the
+//!   pool's recycle list of unpublished reserved ids (card X-0-F2), which
+//!   S-STORE does not have: A-3c;
+//! - the file header is encoded and selected (`meta`, `open`) but never
+//!   written or read: A-7c (step 4's meta write), A-7d (the open); map and
+//!   free-set persistence: A-7b;
+//! - pool: frame latches are `std::sync::RwLock`, which is not task-fair
+//!   (§5.1, §5.3): A-3b; victims are picked by pin count, not by the clock
+//!   and `try_latch` (§5.2): A-3b; no minimum pool size (§5.4): A-3b; dirty
+//!   victims are written back in place under the same id, not to a fresh
+//!   slot (§5.2, I-NO-INPLACE): A-3c; no epoch gate (§5.6): A-3c; no
+//!   `write_guard` (§5.6): A-7a;
+//! - latch scope: `BufferPool`'s guards keep a latch past the call, and
+//!   `fetch_*` reads the store while ancestors are latched (§5.3 "No latch
+//!   escapes a call"; §5.6's restart rule): A-3b, A-4c;
+//! - fail-stop: no poison mark, and `StoreError` has no SQLSTATE mapping
+//!   (XX001, 58030, 53100, 53200; §9.2): A-3c, A-4c;
 //! - tree: the root id in a `RwLock<PageId>` with the T-ROOT restart, not a
-//!   stable root (§6.3, I-ROOT-STABLE); the split separator is the right
-//!   page's first key, not the shortest separator (§6.4); keys are plain
-//!   user keys, not versioned entries (§7): A-4a; no pack or page free,
-//!   T-NOMERGE (§6.5): A-4b; the range iterator latches its whole cursor
-//!   stack for its lifetime, not parked cursors (§6.6): A-4e; no prefix
-//!   truncation: A-4d; no overflow chains (§6.7): A-5;
-//! - no WAL, checkpoint or recovery (§12–§14): A-6a onward.
+//!   stable root (§6.3): A-4a; the split separator is the right page's first
+//!   key, not the shortest separator, and no prune-before-split decision
+//!   (§6.4): A-4a; keys are plain user keys, not versioned entries (§7):
+//!   A-4a; no pack or page free, T-NOMERGE (§6.5): A-4b; the range iterator
+//!   latches its whole cursor stack for its lifetime, not parked cursors
+//!   (§6.6): A-4e; no prefix truncation: A-4d; no overflow chains, so a
+//!   value longer than `V_INLINE` is refused (§6.7): A-5;
+//! - no tree directory or root table (§6.8): A-7b;
+//! - WAL: the record codec (§12.2, §12.3) is card A-6a's; segments, the
+//!   writer and the walk (§12.1, §12.4–§12.6): A-6b, A-6c, A-6d; the
+//!   checkpoint (§13): A-7a, A-7b, A-7c; recovery (§14): A-7d.
+//!
+//! Every later A-card that removes a departure deletes or narrows its line.
 #![deny(clippy::indexing_slicing)]
 
 // Provenance (card A-0): the module list and re-exports are
@@ -40,6 +79,7 @@
 
 mod codec;
 pub mod crc;
+pub mod map;
 pub mod meta;
 pub mod open;
 pub mod page;
