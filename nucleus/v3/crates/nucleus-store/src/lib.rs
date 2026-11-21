@@ -38,6 +38,10 @@
 // nucleus/v3/spikes/e0-btree/src/lib.rs at 7ccd1cff8ef926f95a240b15d4b9c6a346251efe
 // lines 27-34, without the spike's file-backed store, which is not copied.
 
+mod codec;
+pub mod crc;
+pub mod meta;
+pub mod open;
 pub mod page;
 pub mod pool;
 pub mod store;
