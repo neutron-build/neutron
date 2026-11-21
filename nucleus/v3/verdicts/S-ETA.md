@@ -4,12 +4,140 @@ Card-gate: P
 Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: T3 review sub-agent, Claude Code session ecdca529-1b7a-462a-800b-23873858d62d (gate 2, a narrow re-gate after rework 1: this agent wrote neither the card S-ETA, its implementation becd0afc, the rework 901e85dd nor gate 1's verdict, and is not the orchestrator)
+Gate-session: T3 review sub-agent, Claude Code session 8156817c-3119-4cb1-a371-06a8bdb0c9e2 (gate 3, a narrow re-gate after the card was moved onto S-THETA's draft 7.16: this agent wrote neither the card S-ETA, its implementation becd0afc, the rework 901e85dd, the move c9f231e8, nor gate 1's or gate 2's verdict, and is not the orchestrator)
 Date: 2026-11-20
 Gate-exit: GATE EXIT=0
-Commit: 901e85ddf94dd4d68dc8652795c880b5a8451582
-Mutants: spec text, none in code. Omit-one per rework block, each committed off 71ecf3e6 and judged by the card's 44 non-gate Acceptance lines in both locales: RW-1 -> lines 20, 22, 43, caught; RW-2 -> 32, 42, 43, caught; RW-3 -> 22, 32, 43, caught; RW-4 -> 22, 33, 43, caught; RW-5 -> 22, 34, 43, caught; RW-6 -> 6, 43, caught; RW-7 -> 6, 43, caught. Gate 2's own planted errors, same method: G2-1 W22's lost record back to c's Commit record (D1's unkillable fixture) -> 33, 43, caught; G2-2 the retire write dropped from §14.2's read-error row -> 32, 43, caught; G2-3 the retire write dropped from §12.5 "Read errors" -> 20, 43, caught; G2-4 SHORT-SEG-ERROR's gloss back to "short" -> 34, 43, caught; G2-5 I-WAL-STALE's read-error clause reworded -> 35, 43, caught; G2-6 the wal_seg_size row moved below its neighbour -> 32, caught. Named mutants re-walked as text on the reworked fixtures: COVER-AT-EOF -> t_wal_loss_below_ckpt_end short-segment variant (RW-4), caught; SHORT-SEG-ERROR -> t_ro_open_disk_full under the corrected gloss, caught; the rest unchanged from gate 1 (History). Gate 2's own design mutant: G2-7 a pass 2 that takes a WAL read error as the end of its walk and opens -> UNCAUGHT (no named test makes a read error that only pass 2 meets; S-ETA-F6 (c)). The worktree was never written before this commit
+Commit: c9f231e8a9e5aa6c0a45c5a94cddcebd2c2bc67e
+Mutants: spec text, none in code. Omit-one on 16 of the 37 blocks, each built by my own parser on 7.16 (0755a61e's file) with one block left out and judged by the card's non-gate Acceptance lines other than the whole-diff pins 42 and 43, which fail on any change: E1 -> 1, 2, caught; W1 -> 7, caught; W2 -> 8, caught; W4 -> 10, caught; W7 -> 13, 22, caught; W11 -> 17 to 22, 40, caught; W14 -> 25, caught; W16 -> 22, 27, caught; W20a -> 32, caught; W22 -> 22, 33, caught; W23a -> 22, 34, caught; W25 -> 22, 34, 40, 41, caught; W27 -> 22, 36, 40, 41, caught; W30 -> 37, 38, 40, 41, caught; W33 -> 22, 39, caught; E2 -> 3, 4, 5, 6, caught. Where gate 1 ran the same block, the lines match its table. The named mutants' judgements are unchanged from gates 1 and 2 (History), since W1 to W33 are byte-identical to the blocks gate 2 judged.
 Followups: S-ETA-F1, S-ETA-F2, S-ETA-F3, S-ETA-F4, S-ETA-F5, S-ETA-F6
+
+## Verdict in brief
+
+**MERGE-WITH-FOLLOWUPS** on the merge commit `c9f231e8a9e5aa6c0a45c5a94cddcebd2c2bc67e`, which moves S-ETA onto S-THETA's draft 7.16. The move changes no meaning. The 35 body blocks W1 to W33 (with W20a and W23a) are byte-identical to the ones gate 2 judged. Only E1 and E2 change, and only by what a new base needs: the draft number 7.16 → 7.17, the counts, and "as at draft 7.15" → "as at draft 7.16". No S-THETA text is altered. S-ETA's and S-THETA's rules neither restate nor contradict each other in §9.2, §14 or §15. Gate 2's six follow-ups carry unchanged. OP-1 has been answered by the owner, and its riders go to card S-IOTA, not to this card.
+
+**Merge timing.** The owner's own words of 2026-11-20 (QUEUE head, `# OWNER DECISION 2026-11-20`) say: "The spec cards S-ETA, S-THETA, S-ZETA and R-1-SPEC may merge before P0 passes, and P0 is then judged on the merged spec." So this card may merge now. That replaces gate 2's "may not merge before P0 PASS unless the owner says so in their own words".
+
+## Gate run
+- **Scaffold extract** (GATE-PROMPT step 1): a shallow `--no-local` clone of `nucleus/v3-scaffold` printed **0755a61e29858635c2f1fea1fa64214dfe4cce0f**. `fresh-gate.sh` and `git-env.sh` were extracted with no `EXTRACT FAILED`.
+- **The run:** `bash "$fg/fresh-gate.sh" c9f231e8a9e5aa6c0a45c5a94cddcebd2c2bc67e`, from `~/Workspace/neutron-v3`, with `PATH=$HOME/.cargo/bin:$PATH`, `CARGO_TARGET_DIR=$HOME/.cache/nv3-target/gate3-S-ETA`, and both streams captured to files under `~/.cache/nv3-review/gate3-S-ETA/`. Its lines:
+  - **Run 1** (`gate.out`, `gate.err`):
+    - `fresh-gate: commit c9f231e8a9e5aa6c0a45c5a94cddcebd2c2bc67e`
+    - `fresh-gate: base 0755a61e29858635c2f1fea1fa64214dfe4cce0f`
+    - `fresh-gate: checks passed (4882 files hashed in 6.53 s)`
+    - `fresh-gate: 2 file(s) matched through their eol conversion`
+    - `STEP test EXIT=101`, `STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=0`, `STEP api-surface EXIT=0`
+    - The literal last line was `GATE EXIT=1`, the exit status 1, and stderr was empty. The one failure, verbatim: `sim_halted_off_task --- FAILED`, then `thread 'sim_halted_off_task' (16330) panicked at crates/nucleus-env/tests/sim_env.rs:35:5:` / `the life halted: crashed=true deadlock=true`, then `test result: FAILED. 34 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s` and ``error: test failed, to rerun pass `-p nucleus-env --test sim_env` ``. This is **not** the known `spikes/e1-arm-c` `undo_order.rs` flake.
+  - **Why it is not this card's.** c9f231e8's tree differs from the scaffold tip 0755a61e only in two Markdown files (Scope 1), so `nucleus-env`'s code and tests are the scaffold's, byte for byte. Host load average was 30 to 53 on 16 CPUs during the run (other projects were running cargo). I re-ran the test alone 700 times on the scratch clone at c9f231e8 (`cargo test -p nucleus-env --test sim_env sim_halted_off_task`, its own `CARGO_TARGET_DIR`): **1 failure in the first 200 runs, then 0 in 500**. The whole `sim_env` binary passed 40 of 40. So it is an intermittent failure of a scaffold test, not caused by this card. A likely mechanism, read but **not verified**: `Sched::acquire` (`crates/nucleus-env/src/sim/sched.rs`) gives up after 1,000,000 failed `try_lock` spins and fails the world with `SimFail::Baton`, so a world-lock holder preempted long enough under load trips it. The sim has no wall-clock watchdog.
+  - **Run 2** (`gate2.out`, `gate2.err`), the one re-run, with the same extracted scripts and the same command:
+    - `fresh-gate: commit c9f231e8a9e5aa6c0a45c5a94cddcebd2c2bc67e`
+    - `fresh-gate: base 0755a61e29858635c2f1fea1fa64214dfe4cce0f`
+    - `fresh-gate: checks passed (4882 files hashed in 4.27 s)`
+    - `fresh-gate: 2 file(s) matched through their eol conversion`
+    - `STEP test EXIT=0`, `STEP clippy EXIT=0`, `STEP fmt EXIT=0`, `STEP deny EXIT=0`, `STEP wasm32 EXIT=0`, `STEP core-paths-selftest EXIT=0`, `STEP enforcement-tests EXIT=0`, `STEP api-surface EXIT=0`
+    - The literal last line was **`GATE EXIT=0`**, the exit status 0, and stderr was empty. No test failed. `$fg` was removed afterwards.
+  - `Gate-exit:` above records run 2. The `sim_halted_off_task` flake is reported to the orchestrator for a QUEUE row of its own. It is not an S-ETA follow-up.
+- **The worktree** `~/.cache/nv3-cards/S-ETA`, branch `card/v3-S-ETA`, was clean at tip c9f231e8 before this commit (`git status --short` empty). Every Acceptance run and omit-one variant used a `--no-local` scratch clone, `~/.cache/nv3-review/gate3-S-ETA/oclone`, whose local `nucleus/v3-scaffold` was 0755a61e. Its file was restored afterwards, and the clone was left clean.
+- **The branch:** 71ecf3e6 → becd0afc (the card) → 3e6e999c (gate 1's REWORK) → 901e85dd (rework 1) → 58a4fba0 (gate 2's MERGE-WITH-FOLLOWUPS) → c9f231e8 (the merge of 0755a61e, the move, by a GLM 5.3 implementer) → this verdict.
+
+## Scope 1: the merge commit
+- **Its parents and tree.** The parents of c9f231e8 are 58a4fba0 and 0755a61e, the scaffold tip. `git diff --stat 0755a61e c9f231e8` lists exactly two files: `nucleus/v3/docs/S-STORE.md` (numstat 63 added, 28 removed, as against 71ecf3e6 at gate 2) and `nucleus/v3/verdicts/S-ETA.md`. The verdict file is gate 2's, unchanged (`git diff 58a4fba0 c9f231e8 -- nucleus/v3/verdicts/S-ETA.md` is empty). Touch only is `nucleus/v3/docs/S-STORE.md`, and no protected path is touched.
+- **The bytes, by my own parser.** I wrote a fence-aware parser for the card's `## Edits` section (it stops at the next `## ` heading outside a fence, so O1 to O12 and the W34 sketch in Notes are excluded). It read 37 blocks: E1, W1 to W20, W20a, W21 to W23, W23a, W24 to W33, E2. I applied them in order to 0755a61e's `docs/S-STORE.md` (S-THETA's 7.16, sha256 `2c2351e5…3875`), with `<date>` = 2026-11-20, the commit date of c9f231e8.
+  - Every Old occurs exactly once, and every New occurs exactly once in the result.
+  - The result is byte-identical to c9f231e8's file, sha256 `2777e5d739d4deacc0fb7f73e5abc3a9d927798baf236e51575e80cfb31391dd`.
+  - The reverse (E2 down to E1, New to Old) gives 0755a61e's file byte for byte.
+  - The same parser on the pre-move card backup, applied to 7.15 (`a1376c94…700f`) with `<date>` = 2026-11-17, reproduces gate 2's file, sha256 `3a75fb62…9b79`. So the parser reads both cards the same way.
+- **S-ETA's semantics are unchanged.** I compared the blocks of the pre-move backup and the moved card one by one. The Old and New of W1 to W33, W20a and W23a are byte-identical. Only two Old/New pairs differ, and only in their New:
+  - E1's New: `Status: draft 7.16 (card S-ETA,` → `Status: draft 7.17 (card S-ETA,`.
+  - E2's New: `- **Draft 7.16**` → `- **Draft 7.17**`; the Counts bullet `§15: 47 rows, 234 mutants, 52 tests. §15.1: 166 rows` → `§15: 48 rows, 248 mutants, 53 tests. §15.1: 168 rows`; and "as at draft 7.15" → "as at draft 7.16" (Phase B only, 24).
+  - I then compared the two diffs line by line: gate 2's 7.15 → 7.16 (`diff 71ecf3e6:… 58a4fba0:…`) and this 7.16 → 7.17 (`diff 0755a61e:… c9f231e8:…`), with dates and the card's own draft number normalised. Apart from line 3, whose tail is the base's status chain, the only line that differs is that Counts bullet. Every removed line is the same in both. So no Old meets a line that S-THETA changed.
+  - No W block's New cites a draft number that is not also in its Old, so nothing in the body now points at 7.16 meaning S-ETA's draft.
+- **No S-THETA text is altered.** The reverse gives 7.16 back byte for byte, every changed line is inside a block, and Acceptance lines 2 and 5 (both pass) check that line 3's tail after `) on draft 7.16 (card S-THETA, ` and the Changelog from `- **Draft 7.16**` down equal the scaffold's.
+- **The other order.** I parsed S-THETA's 30 blocks from `cards/S-THETA.local.md` with the same parser. Applied to 7.15 with `<date>` = 2026-11-17, they give 0755a61e's file exactly. Applied instead to gate 2's file (S-ETA first), they give a file whose only differences from c9f231e8's are line 3 and S-ETA's Changelog entry: its draft number, date and Counts bullet. The body is identical in both orders. This agrees with S-THETA's gate 2, which composed the two cards (with S-ZETA and R-1-SPEC) in all 24 orders.
+
+## Scope 2: the card's changes
+I diffed `cards/S-ETA.local.md` against its pre-move backup `~/.cache/nv3-review/S-ETA.card-backup-pre-716.local.md`. Every change is one a base change needs:
+- **Draft numbers.** In the title, the Goal, the cases table's column head, "The draft target", E1 and E2, Limits 1, "For the gate" item 4, "For the plan card" items 1 and 7, the card-text note, O2's rider text ("as at draft 7.17", the S-ETA rule it names), and the reverse.
+- **The base.** The Base line, Work's tip and sha256, and Limits 1's anchors now name S-THETA's 7.16 (`2c2351e5…3875`).
+- **The counts.** "The draft target": §15 48 rows, 248 mutants, 53 tests; §15.1 168 rows; Phase B only 24; 79 new since 7.10 (… 14 at 7.16, 8 here). They are S-THETA's 7.16 counts (48, 240, 49, 160, from its Changelog) plus this card's 0 invariants, 8 mutants, 4 tests and 8 rows.
+- **The Acceptance lines that change**, 1 to 6 (status line, status chain, Changelog head, Changelog order, older entries, the entry's bullets), 41 (the checker) and 43 (the diff hash `658edb15…5ac0d`). Line 42's numstat (`63 28`) is unchanged.
+- **The checker** gains S-THETA's fourteen names as a set NT, the count tuple `(…,1,14,8,79)`, and its placements: LOAD-REF-BEFORE-PUBLISH on A-3a and A-3c; LOADING-SERVED, FAILED-LOAD-KEPT, MISS-TWO-FRAMES, CREATE-OVER-LOADING, CREATE-BESIDE-FREED and PAGE-KEY-MERGED on A-3a; EVICT-UNLINK-BEFORE-ENTRY, LOAD-KEPT-ACROSS-RESTART, INVARIANT-NOT-POISON and PANIC-UNPOISONED on A-3c; FREED-FRAME-WRITTEN on A-4b; MAPLEAF-EXISTS-BY-REF on A-4a and A-7f; MAPLEAF-WAIT-UNDER-INNER on A-4a; ROOT-PIN-MAP-FIRST on A-3a and A-7b. Nothing else in it changed: I diffed the old and new line 41 character by character, and the other edits are the `%d` format and the summary string "14 at 7.16".
+- **A new dry-run record**, "The rebase dry run" (2026-11-20), and the description of the checker and the mutant set.
+- **Not updated, non-blocking (card text only; cards are local and do not merge).** The Notes still describe the old base. "Overlaps with R-1-SPEC and S-ZETA" says both cards "take S-STORE 7.15 to 7.16", and the "If S-ZETA / R-1-SPEC / both merge first" counts are computed on 7.15 (242, 241, 249 mutants). "Who implements and gates" still says "It may not merge before P0 PASS". The pre-move dry-run paragraph speaks of "the 7.16 Changelog entry" as history. S-ZETA and R-1-SPEC, which have not merged, must now move onto 7.17 themselves, and their own Notes govern that. No block of this card changes in any of those orders. I did not recompute those counts, and the orchestrator should not cite this card's old ones.
+
+## Scope 3: gate, Acceptance, checker, omit-one
+- **Acceptance.** I parsed the card with `tools/run_card.py`'s own `parse_card` (unchanged on the branch). It reads `S-ETA`, Touch only `['nucleus/v3/docs/S-STORE.md']`, 45 commands, the last `cd nucleus/v3 && bash scripts/gate.sh`, no container, and `validate_card` returns `None`. I ran the 44 commands before `gate.sh` with `/bin/sh -c` from the root of the scratch clone at c9f231e8, with `PATH=/usr/bin:/bin` and the runner's `git_env`. They pass **44 of 44 under `LANG=en_CA.UTF-8` and 44 of 44 under `LC_ALL=C`**. Line 45 is the fresh gate above (run 2), under the default locale.
+- **The checker** (line 41) prints:
+  - `168 rows; 248 mutants; 24 judged only on Phase B cards; 144 judged on a Phase A card at 7.8`
+  - `79 new since 7.10 (31 at 7.11, 11 at 7.12, 4 at 7.13, 10 at 7.14, 1 at 7.15, 14 at 7.16, 8 here), 79 of them judged on a Phase A row; 48 invariants, 53 tests`
+  - `OK`
+- **Omit-one** (16 of 37 blocks; the table is in `Mutants:` above). Each variant was written into the scratch clone's working tree, and I ran every non-gate line except 42 and 43, which pin the committed diff and so fail on any committed change. Every omission was caught by at least one content line. For the eleven blocks that gate 1 also ran, the lines that failed are the same as in its table (minus 42 and 43). The variants ran under the default locale only.
+
+## Scope 4: S-ETA's and S-THETA's rules in 7.17
+S-THETA changed the error table's XX001 row, §4.1 "Shape", §4.2 "Freeing", §5.1 to §5.6, §9.2 (a new "Engine invariant violations" item, and "Client reads never poison" narrowed to device damage), the §15 preamble (the interleaving harness), the §15 rows I-LATCH, I-FAIL-STOP, I-LPID-EXACT, I-LINK-ATOMIC and the new I-PIN-CURRENT, four §15.1 rows changed and two added, R15, and its Changelog. It changed nothing in §12 or §14. S-ETA changed the error table (a new 22023 row), §2.1, §2.3, §12.1, §12.5, §13, §14 steps 3, 3a, 4a and 5 and "Post-sync damage", §14.1, §14.2, the §15 rows I-WAL-COVER, I-RO-OPEN, I-WAL-STALE and I-WAL-START, four §15.1 rows changed and eight added, R21, and its Changelog. No line and no §15 or §15.1 row is touched by both. I then checked where the rules meet:
+- **XX001's meaning.** S-THETA's row now reads "an integrity check failed, or an engine invariant violation (§9.2)". §9.2 defines the second kind as a check that a correct engine never fails "whatever the device has done", and says "A check of what the device returned … is not one". Each of S-ETA's new XX001s checks what the device returned: a record whose body does not decode (a faulty writer or a CRC collision on read-back bytes), a segment file shorter than a completed sync left it, and an identity whose `wal_seg_size` is below 212. All three are integrity checks of the first kind. None claims to be an engine invariant violation, and none poisons a running store, since all are refusals at open.
+- **Client reads and the read-only open.** S-THETA's §9.2 keeps "every read of a read-only open (§14.1)" among the paths on which device damage never poisons. S-ETA's read-only opens serve salvage for a malformed record or a short segment (§14 step 3a, §14.1) and fail with 58030 for a WAL read error. Neither contradicts the other: one is about poisoning a running store, the other about what an open serves or refuses.
+- **I-FAIL-STOP's WAL path** (S-THETA edited only its client-read clause) still lists "recovery's step-5 truncation", the same words as 7.15. S-ETA's W16 keeps step 5 a truncation, zeroing in place without shortening any file. No conflict.
+- **Restatements.** I grepped 7.17 for "client read", "poison", "writing nothing" / "writes nothing", "Read errors", "malformed", "short segment" and "truncat", and read each hit that lies in the other card's sections. S-THETA's hits (§9.2, I-FAIL-STOP, I-LINK-ATOMIC, `t_poison_before_unlatch`, R15, its Changelog) say nothing about the WAL walk. S-ETA's hits say nothing about the pool or poisoning. §14.1's 53100 paragraph ("poisoning lives only in memory (§9.2)") is 7.15 text that neither card changed. Each Changelog entry describes only its own card. Gate 2's F6 (two summaries saying "writing nothing" without the bound) is still the only internal looseness in S-ETA's text, and it is not an interaction with S-THETA.
+- **The owner's answers of 2026-11-20 that touch these sections** ("XX000 for engine bugs", "read-only salvage when part of the log is unreadable") are written in neither card's text. Both cards were written on the defaults that need no owner decision. QUEUE row S-IOTA carries them: S-THETA's OP-1 (XX000) and this card's O1 to O12 (salvage). Once S-IOTA moves engine invariant violations to XX000, the XX001 split above becomes a split between codes, and S-ETA's three XX001s stay where they are.
+
+Nothing here meets the blocking bar: the resolution changes no meaning, alters no S-THETA text, leaves every test passable and every named mutant killable as gates 1 and 2 judged them, and introduces no contradiction.
+
+## The P0 question
+Gate 1's P0 facts (i) to (iii) (History) are carried unchanged. The move changed no rule they rest on, and S-THETA touched neither §12 nor §14:
+- (i) F-3 is not a defect under the given definition, but an under-specification with an inconsistency.
+- (ii) The recycling target is a defect at the level of the spec's claims, reachable only under a reading no planned build takes. Its two-copy-fault path is reasoned, not modelled.
+- (iii) F-1 is an under-specification only.
+
+This gate does not rule on what P0 should conclude. Under the owner's decision, P0 is judged on the merged spec.
+
+## Owner point OP-1: answered
+The owner answered OP-1 in their own words on 2026-11-20 (QUEUE head, `# OWNER DECISION 2026-11-20 17:00 MST`): "Yes to: … read-only salvage when part of the log is unreadable". That is the card's recommended "yes".
+- **Where the rider text goes.** To card S-IOTA (QUEUE row S-IOTA), not to this card. This card merges with the no-decision default (58030 for every open), as gated. S-IOTA applies O1 to O12 after S-ETA, S-ZETA and R-1-SPEC merge.
+- **The riders still apply.** I parsed O1 to O12 from the moved card's `## Open points` and applied them in order to c9f231e8's file. Each Old occurs exactly once at its turn.
+- **F6 against O11.** As gate 2 said, S-ETA-F6 (a) and O11 rewrite the same I-WAL-STALE clause. S-IOTA, which lands O11, should carry F6 (a)'s write bound in it, and F6 (d)'s wording if it rewrites step 3's sentence through O4.
+
+## Follow-ups
+S-ETA-F1 to S-ETA-F6 carry unchanged from gate 2. F1 to F5 are gate 1's (History). Each has its QUEUE row (`- S-ETA-F1 | waiting` … `- S-ETA-F6 | waiting`). I re-checked them against c9f231e8:
+- **F1** (wording and test-precision riders): the texts it names (W13's step-3 sentence, W17's exception, W33's R21, `t_wal_read_error` (c), `t_wal_start` (f), "Malformed records", W16) are byte-identical to 901e85dd's.
+- **F2, F3 and F4** do not depend on S-STORE's base.
+- **F5** (COVER-END-AT-T, pre-existing): I-WAL-COVER's row is S-ETA's W22 text on 7.16 unchanged, and S-THETA did not touch it.
+- **F6**: riders (a), (b) and (c) each occur exactly once in c9f231e8's file. In (b), "if the next card keeps 7.16's entry" now reads "7.17's entry", since S-ETA's status clause is draft 7.17. The rider itself is unchanged.
+
+No new follow-up.
+
+## Not verified
+- No A-6b, A-7c, A-7d or A-7f code exists, and no code for S-THETA's rules either. Every "caught" for a named test was walked as text by gates 1 and 2, and I did not re-walk the named mutants. The blocks they judged are byte-identical.
+- **The implementer's claim of `GATE EXIT=0` under `LC_ALL=C`.** I ran `gate.sh` only through the fresh gate, twice (run 1 failed on the flake, run 2 passed), under the default locale. The 44 other lines ran in both locales.
+- **The implementer's throwaway-clone route** (merge-card accepting the merge plus a stub verdict; `audit: ok (133 commits)`). I did not re-run it. merge-card judges the real route when it runs on this verdict.
+- **Omit-one on the other 21 blocks**, and omit-one under `LC_ALL=C`.
+- **The card's Notes' merge-order counts** for S-ZETA or R-1-SPEC on 7.17 (Scope 2, "Not updated").
+- Gate 1's P0 point (ii) two-copy-fault path, OPFS length durability (F4), E4's `truncate_wal` and A-6b-0's `DirLoss` stay as gate 1 left them.
+
+## History
+
+- **Gate 1: REWORK, verdict commit 3e6e999cddef9d052f99d11b49f40f36815f8f38, on becd0afcd40d6d18252606a989c48f62c5eb0d67.** Findings D1 to D4. Fix RW-1 to RW-7 and eight replaced Acceptance lines. Follow-ups S-ETA-F1 to F5, owner point OP-1, and P0 facts (i) to (iii).
+- **The rework: commit 901e85ddf94dd4d68dc8652795c880b5a8451582** (a GLM 5.3 implementer), RW-1 to RW-7 on `docs/S-STORE.md` only.
+- **Gate 2: MERGE-WITH-FOLLOWUPS, verdict commit 58a4fba0d1b6ecea140bd466f03da100a2872070, on 901e85dd.** Against S-STORE 7.15 at scaffold 71ecf3e6. New follow-up S-ETA-F6.
+- **S-THETA merged first** (merge 6e3423f6; then A-2-0, scaffold tip 0755a61e), taking S-STORE to 7.16.
+- **The move: commit c9f231e8a9e5aa6c0a45c5a94cddcebd2c2bc67e** (a GLM 5.3 implementer). It merges 0755a61e into the card branch, with `docs/S-STORE.md` resolved to 7.16 plus S-ETA's 37 blocks as draft 7.17 (sha256 `2777e5d7…91dd`). The card was updated in the main checkout; its pre-move copy is `~/.cache/nv3-review/S-ETA.card-backup-pre-716.local.md`.
+- **Gate 3 (this verdict): MERGE-WITH-FOLLOWUPS on c9f231e8.**
+
+**Gate 2's verdict, as committed at 58a4fba0, verbatim.** Its header lines carry a "- " prefix, so that no tool reads them as this verdict's fields. Everything after them is unchanged, gate 1's verbatim verdict in its History included. Where its sections ("Merge timing", "Owner point OP-1", "Follow-ups", "The P0 question") differ from the sections above, the sections above are current. The same text is at `git show 58a4fba0:nucleus/v3/verdicts/S-ETA.md`.
+
+<!-- gate 2's verdict (58a4fba0), verbatim, begins -->
+
+- Card: S-ETA
+- Class: spec
+- Card-gate: P
+- Verdict: MERGE-WITH-FOLLOWUPS
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: T3 review sub-agent, Claude Code session ecdca529-1b7a-462a-800b-23873858d62d (gate 2, a narrow re-gate after rework 1: this agent wrote neither the card S-ETA, its implementation becd0afc, the rework 901e85dd nor gate 1's verdict, and is not the orchestrator)
+- Date: 2026-11-20
+- Gate-exit: GATE EXIT=0
+- Commit: 901e85ddf94dd4d68dc8652795c880b5a8451582
+- Mutants: spec text, none in code. Omit-one per rework block, each committed off 71ecf3e6 and judged by the card's 44 non-gate Acceptance lines in both locales: RW-1 -> lines 20, 22, 43, caught; RW-2 -> 32, 42, 43, caught; RW-3 -> 22, 32, 43, caught; RW-4 -> 22, 33, 43, caught; RW-5 -> 22, 34, 43, caught; RW-6 -> 6, 43, caught; RW-7 -> 6, 43, caught. Gate 2's own planted errors, same method: G2-1 W22's lost record back to c's Commit record (D1's unkillable fixture) -> 33, 43, caught; G2-2 the retire write dropped from §14.2's read-error row -> 32, 43, caught; G2-3 the retire write dropped from §12.5 "Read errors" -> 20, 43, caught; G2-4 SHORT-SEG-ERROR's gloss back to "short" -> 34, 43, caught; G2-5 I-WAL-STALE's read-error clause reworded -> 35, 43, caught; G2-6 the wal_seg_size row moved below its neighbour -> 32, caught. Named mutants re-walked as text on the reworked fixtures: COVER-AT-EOF -> t_wal_loss_below_ckpt_end short-segment variant (RW-4), caught; SHORT-SEG-ERROR -> t_ro_open_disk_full under the corrected gloss, caught; the rest unchanged from gate 1 (History). Gate 2's own design mutant: G2-7 a pass 2 that takes a WAL read error as the end of its walk and opens -> UNCAUGHT (no named test makes a read error that only pass 2 meets; S-ETA-F6 (c)). The worktree was never written before this commit
+- Followups: S-ETA-F1, S-ETA-F2, S-ETA-F3, S-ETA-F4, S-ETA-F5, S-ETA-F6
 
 ## Verdict in brief
 
@@ -654,3 +782,5 @@ The card is not this gate's to edit; these points are for the author or orchestr
 - **E4's `truncate_wal` zeroing** (the card's D-9 source) and **A-6b-0's `DirLoss`** were not read. The `DirLoss` code is not on the scaffold yet, and SimEnv's current directory loss is prefix-only.
 
 <!-- gate 1's verdict (3e6e999c), verbatim, ends -->
+
+<!-- gate 2's verdict (58a4fba0), verbatim, ends -->
