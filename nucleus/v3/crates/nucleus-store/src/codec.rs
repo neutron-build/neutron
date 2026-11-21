@@ -210,13 +210,11 @@ fn put<const N: usize>(buf: &mut [u8], off: usize, v: [u8; N]) -> Result<(), Sto
 }
 
 /// The byte at `off`; `Corrupt` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn get_u8(buf: &[u8], off: usize) -> Result<u8, StoreError> {
     get(buf, off).map(u8::from_le_bytes)
 }
 
 /// The little-endian `u16` at `off`; `Corrupt` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn get_u16(buf: &[u8], off: usize) -> Result<u16, StoreError> {
     get(buf, off).map(u16::from_le_bytes)
 }
@@ -227,31 +225,26 @@ pub(crate) fn get_u32(buf: &[u8], off: usize) -> Result<u32, StoreError> {
 }
 
 /// The little-endian `u64` at `off`; `Corrupt` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn get_u64(buf: &[u8], off: usize) -> Result<u64, StoreError> {
     get(buf, off).map(u64::from_le_bytes)
 }
 
 /// Writes the byte `v` at `off`; `Invalid` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn put_u8(buf: &mut [u8], off: usize, v: u8) -> Result<(), StoreError> {
     put(buf, off, v.to_le_bytes())
 }
 
 /// Writes `v` little-endian at `off`; `Invalid` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn put_u16(buf: &mut [u8], off: usize, v: u16) -> Result<(), StoreError> {
     put(buf, off, v.to_le_bytes())
 }
 
 /// Writes `v` little-endian at `off`; `Invalid` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn put_u32(buf: &mut [u8], off: usize, v: u32) -> Result<(), StoreError> {
     put(buf, off, v.to_le_bytes())
 }
 
 /// Writes `v` little-endian at `off`; `Invalid` out of bounds.
-#[allow(dead_code)] // first used by A-2 or A-6a (module doc)
 pub(crate) fn put_u64(buf: &mut [u8], off: usize, v: u64) -> Result<(), StoreError> {
     put(buf, off, v.to_le_bytes())
 }
