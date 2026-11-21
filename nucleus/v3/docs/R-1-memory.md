@@ -1,6 +1,6 @@
 # R-1: Memory governance (normative)
 
-Status: draft 1 (card R-1-SPEC, 2026-11-17: PLAN-v3 N16's one budget per store instance, every consumer's account and what it does at its limit; the numbers S-STORE §17 leaves to R-1 (`F`, `R_EPOCH`, `R_MAP`, the height bound `H` and its floor `H_min`) derived against S-STORE draft 7.16; C-T0 v8's thresholds per mode; per-mode budgets, proposed for the owner (§7.1); seven invariants with their tests and mutants, and the Phase A cards' share in S-STORE §15.1). This is a P-authored spec and needs a P gate before it is normative.
+Status: draft 1 (card R-1-SPEC, 2026-11-17: PLAN-v3 N16's one budget per store instance, every consumer's account and what it does at its limit; the numbers S-STORE §17 leaves to R-1 (`F`, `R_EPOCH`, `R_MAP`, the height bound `H` and its floor `H_min`) derived against S-STORE draft 7.19; C-T0 v8's thresholds per mode; per-mode budgets, proposed for the owner (§7.1); seven invariants with their tests and mutants, and the Phase A cards' share in S-STORE §15.1). This is a P-authored spec and needs a P gate before it is normative.
 
 **Scope.** PLAN-v3 N16: "one budget across the buffer pool, write sets, undo, lock table, query operators and connection buffers. Every consumer spills or refuses with SQLSTATE 53200, and never OOMs." This file says what the budget is, who draws on it, how much each consumer may hold and what each does at its limit. It owns:
 - the numbers S-STORE §17 gives R-1: the budgets per mode, `F`, `R_EPOCH`, `R_MAP`'s value, the height bound `H` and its floor `H_min`, and the per-consumer accounting of S-STORE §5.7;
@@ -187,7 +187,7 @@ gives `O ≥ Σ Q_t` at every instant, however the dirty pages' LPIDs lie: every
 
 **The epoch copies' term.** S-STORE does not say whether an epoch copy holds a §4.1 pin on its page's MapLeaf (§4.1 says "dirty in the pool"; a claim sets no map entry, §5.6, so the pin would serve nothing). `R_MAP` counts one per copy, so it holds under either reading; if S-STORE rules that a copy holds none, the term is slack (§14, Q-COPY-PIN).
 
-**The fairness bound holds with it.** S-STORE §5.3's premise, as draft 7.16 words it, is `O ≥ Σ Q_t`. Draft 7.15's wording, "a frame outside `R_EPOCH` that no pin holds" for every pin, is `|U| ≥ Σ Q_t`; a state whose (U) frames are all dirty pages, each alone under an (Mu) MapLeaf, has `|U| = |Mu| = (N − |T| − |Mp| − |Mc|) / 2`, so that wording would need `R_MAP ≥ Σ Q_t + |Mp| + |Mc|`, that is up to `3n(H + 2) + R_EPOCH`: two more tree paths per thread, for an unpinned frame the argument does not need before the thread arrives.
+**The fairness bound holds with it.** S-STORE §5.3's premise, as draft 7.19 words it, is `O ≥ Σ Q_t`. Draft 7.15's wording, "a frame outside `R_EPOCH` that no pin holds" for every pin, is `|U| ≥ Σ Q_t`; a state whose (U) frames are all dirty pages, each alone under an (Mu) MapLeaf, has `|U| = |Mu| = (N − |T| − |Mp| − |Mc|) / 2`, so that wording would need `R_MAP ≥ Σ Q_t + |Mp| + |Mc|`, that is up to `3n(H + 2) + R_EPOCH`: two more tree paths per thread, for an unpinned frame the argument does not need before the thread arrives.
 
 **A test may set `R_MAP` higher**, as S-STORE §5.4's pool-floor variant does: a larger value only adds frames.
 
@@ -463,4 +463,4 @@ R-1's own code (the ledger, the division of `B`, the accounts) is Phase B (PLAN-
 - **Q-MAPLEAF-DIRTY** (an S-STORE question): who makes a clean page's MapLeaf resident when the page is first dirtied, and when, given no I/O under an inner page's exclusive latch (S-STORE §5.3) and no restart after an operation's first mutation (S-STORE §5.6)? `R_MAP` counts the frame either way (§4.4: class (Mp), whichever pin holds it).
 
 ## Changelog
-- **Draft 1** (2026-11-17, card R-1-SPEC): the file. PLAN-v3 §9 row R-1; verdict S-1-F7's N6; verdict S-1-F7-F2-F2-F4b's follow-up F2 (a); card S-DELTA's owner point P-1; X-4 ruling R2. With S-STORE draft 7.16 and C-T0 draft 8.8.
+- **Draft 1** (2026-11-17, card R-1-SPEC): the file. PLAN-v3 §9 row R-1; verdict S-1-F7's N6; verdict S-1-F7-F2-F2-F4b's follow-up F2 (a); card S-DELTA's owner point P-1; X-4 ruling R2. With S-STORE draft 7.19 and C-T0 draft 8.8.
