@@ -59,7 +59,7 @@ mod env;
 mod sched;
 
 pub use disk::{
-    DWrite, DirOp, DiskEvent, FaultClass, FaultKnobs, MediaFault, MediaKind, PAGE_FILE,
+    DWrite, DirLoss, DirOp, DiskEvent, FaultClass, FaultKnobs, MediaFault, MediaKind, PAGE_FILE,
     PAGE_FILE as DISK_PAGE_FILE, ROOT_DIR, ROOT_DIR as DISK_ROOT_DIR, ReadRec, SECTOR, SimDisk,
     WAL_DIR, WAL_DIR as DISK_WAL_DIR,
 };
