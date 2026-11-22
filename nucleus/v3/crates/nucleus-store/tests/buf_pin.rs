@@ -1455,3 +1455,34 @@ fn create_resets_flags() {
         }
     );
 }
+
+/// `mark_written` takes the content epoch as the home's, not only the
+/// header's (§5.2: the entry is set to `(new slot, content epoch, crc)`): a
+/// page dirtied in epoch 2 whose header still says epoch 1 passes §3.3
+/// against a home of epoch 1, and is refused all the same.
+#[test]
+fn mark_written_epoch() {
+    let (_file, _map, pool) = fixture(2).unwrap();
+    let mut c = created!(pool.create(pool.reserve().unwrap(), L7, Kind::Leaf, 1));
+    c.mark_dirty(2).unwrap();
+    assert_eq!(c.content_epoch(), 2);
+    let crc = page::seal(&mut c).unwrap();
+    let home = Ref {
+        slot: 21,
+        epoch: 1,
+        crc,
+    };
+    assert!(page::verify(&c, &home, 7).is_ok(), "§3.3 alone would pass");
+    let e = error!(c.mark_written(home));
+    assert!(matches!(e, StoreError::Invalid(_)), "{e:?}");
+    assert!(c.is_dirty());
+    c[16..20].copy_from_slice(&2u32.to_le_bytes());
+    let crc = page::seal(&mut c).unwrap();
+    c.mark_written(Ref {
+        slot: 21,
+        epoch: 2,
+        crc,
+    })
+    .unwrap();
+    assert!(!c.is_dirty());
+}
