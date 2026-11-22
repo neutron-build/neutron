@@ -259,7 +259,9 @@ fn sim_namespace_is_root_plus_wal() {
 /// life and leaves nothing on disk, so the three lock probes assert
 /// only the `Crashed` return. The gate's G8 (a `rename` that steps
 /// before its yield) and mutant OP-BEFORE-YIELD (the same for
-/// `write_at`) fail it.
+/// `write_at`) fail it. The dry run also checks that the life's yields
+/// are exactly its Env calls, so the first-baton wait (S1) moved no
+/// yield number.
 #[test]
 fn env_calls_yield_and_crash() {
     // The probes' durable setup: `page` holds `abc`; with `wal`, the
@@ -288,56 +290,60 @@ fn env_calls_yield_and_crash() {
         sim
     };
     type Body = fn(&SimEnv) -> Result<(), EnvError>;
-    let probes: [(&str, bool, Body); 12] = [
-        ("open", true, |env| {
+    // (name, whether the setup makes `wal`, the body's Env calls, the body)
+    let probes: [(&str, bool, u64, Body); 12] = [
+        ("open", true, 1, |env| {
             env.open("wal/n", OpenMode::CreateNew).map(drop)
         }),
-        ("create_dir", false, |env| env.create_dir("wal")),
-        ("rename", true, |env| env.rename("wal/a", "wal/b")),
-        ("remove", true, |env| env.remove("wal/r")),
-        ("write_at", true, |env| {
+        ("create_dir", false, 1, |env| env.create_dir("wal")),
+        ("rename", true, 1, |env| env.rename("wal/a", "wal/b")),
+        ("remove", true, 1, |env| env.remove("wal/r")),
+        ("write_at", true, 2, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.write_at(0, &[7u8; 16])
         }),
-        ("set_len", true, |env| {
+        ("set_len", true, 2, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.set_len(100)
         }),
-        ("sync_data", true, |env| {
+        ("sync_data", true, 3, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.write_at(0, b"xyz")?;
             f.sync_data()
         }),
-        ("sync_all", true, |env| {
+        ("sync_all", true, 3, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.write_at(0, b"xyz")?;
             f.sync_all()
         }),
-        ("sync_dir", true, |env| {
+        ("sync_dir", true, 2, |env| {
             env.open("wal/c", OpenMode::CreateNew)?;
             env.sync_dir("wal")
         }),
-        ("lock_exclusive", true, |env| {
+        ("lock_exclusive", true, 2, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.lock_exclusive()
         }),
-        ("lock_shared", true, |env| {
+        ("lock_shared", true, 2, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.lock_shared()
         }),
-        ("unlock", true, |env| {
+        ("unlock", true, 3, |env| {
             let f = env.open("page", OpenMode::ReadWrite)?;
             f.lock_exclusive()?;
             f.unlock()
         }),
     ];
-    for (name, wal, body) in probes {
+    for (name, wal, calls, body) in probes {
         // The dry run: every call succeeds, and the probed call's
-        // leading yield is the life's last, the `Y`-th.
+        // leading yield is the life's last, the `Y`-th. Each Env call is
+        // exactly one yield and nothing else counts one: the first-baton
+        // wait is a park (S1), so it moves no yield number.
         let mut dry = setup(wal);
         let out = dry.run_life(1, None, |env, _t| body(env));
         assert_life_ok(&out);
         let y = out.yields;
+        assert_eq!(y, calls, "{name}: the life's yields are not its Env calls");
 
         let mut sim = setup(wal);
         let page = sim.file_id("page").unwrap().unwrap();
