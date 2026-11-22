@@ -20,6 +20,11 @@
 //!   explicitly; A-1a's trait has `&self` methods with no task
 //!   argument, and a store may share one handle across its threads,
 //!   so the id lives in the thread-local instead.
+//!   A task's body starts only once the baton first reaches it
+//!   (`Sched::await_first_baton`; A-1b-F1 (a)), so none of its calls,
+//!   `rand`, `now`, `wake` and `accepted` included, runs before its
+//!   task holds the baton. The wait is a park, not a yield: it draws
+//!   nothing and counts no yield.
 //! - **Yield then step** (E4 card 1.2, kept). Every `Env` and `File`
 //!   method except `now`, `rand`, [`SimFile::accepted`] and `Drop`
 //!   first calls `yield_baton_at(task, "env:<method>")`, where the
@@ -37,7 +42,12 @@
 //!   would return `Err(String)`. E4's `step` turned every disk error
 //!   into `Crashed`, and its own `exists` doc records the false
 //!   "start segment missing" that caused; A-1a's contract forbids it
-//!   (`sim_open_modes`).
+//!   (`sim_open_modes`). Every `Halted` the layer raises in a life (a
+//!   world failure other than a crash, a refused acquisition, a call
+//!   off a task thread, a panicked task) is also recorded, in order, in
+//!   [`LifeOutcome::halts`], and so is a refused `rand`, which still
+//!   answers 0: a body that swallows one still fails the life
+//!   (A-1b-F1 (f); `sim_halted_off_task`). A crash is not a halt.
 //! - **Namespace** (S-STORE §2's layout: root files, `wal`, files in
 //!   `wal/`). Env path `x` maps to disk `/x`, `wal/x` to `/wal/x`;
 //!   directories `""` → `/` and `wal` → `/wal/`. The E-KIND checks
@@ -82,6 +92,10 @@
 //!   survives lives and which only `sleep` moves; `sleep(d)` is a
 //!   yield point and then adds `d`. `rand` draws from a per-life
 //!   stream (`sim_clock_and_rand`, `sim_life_is_deterministic`).
+//!   A task observes a crash only through a fallible call. `now` and
+//!   `sleep` keep working in a failed world, and every `sleep`
+//!   advances the clock by its `d`, so a time-bounded loop ends after
+//!   a crash (A-1b-F1 (b); `sim_sleep_after_crash`).
 //! - **Streams.** Every stream is `rng::derive(seed, TAG)` with fixed
 //!   `TAG` constants, so adding or removing a stream never perturbs
 //!   the others (rng.rs's rule): the schedule per life
@@ -98,7 +112,12 @@
 //!   lose a suffix of each directory's unsynced ops, keep a length
 //!   only where surviving data needs it. That is S-2-F2-F1's loss of
 //!   unsynced creates, renames and `set_len`
-//!   (`power_cut_loses_unsynced_*`). Media faults
+//!   (`power_cut_loses_unsynced_*`).
+//!   `Sim::set_dir_loss(DirLoss::Independent)` makes a power cut keep
+//!   each unsynced directory op independently, applied in issue order
+//!   where it still applies; the default, `DirLoss::Prefix`, keeps a
+//!   prefix per directory, as E4 did (card A-6b-0, D4;
+//!   `sim_dir_loss_independent`). Media faults
 //!   (`media_page`, `media_wal`, `media_one`) are post-sync LOST,
 //!   MISDIRECTED or TORN on durable writes, as in E4; their caller
 //!   decides when they apply.
@@ -107,8 +126,8 @@ use crate::error::EnvError;
 use crate::path;
 use crate::rng::{self, Rng};
 use crate::sim::HasDisk;
-use crate::sim::disk::{FaultKnobs, MediaFault, SimDisk};
-use crate::sim::sched::{Sched, SchedCore, SchedHost, SimFail, TaskId, WaitKey};
+use crate::sim::disk::{DirLoss, FaultKnobs, MediaFault, SimDisk};
+use crate::sim::sched::{Sched, SchedCore, SchedHost, SimFail, TaskId, WaitKey, world_held_by_me};
 use crate::{Env, File, OpenMode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,30 +161,49 @@ thread_local! {
     static TASK: std::cell::Cell<Option<TaskId>> = const { std::cell::Cell::new(None) };
 }
 
-/// The calling task, or `Halted` off a task thread.
-fn current_task() -> Result<TaskId, EnvError> {
-    TASK.with(|t| t.get()).ok_or_else(|| EnvError::Halted {
-        what: "an Env call from a thread that is not a life task".to_string(),
-    })
+/// S-ENV "Errors" (A-1b-F1 (f)): every `Halted` this layer raises is
+/// built here, which also records `what` in the life's world, so
+/// [`LifeOutcome::halts`] lists it even when the body swallows the
+/// error. The record takes the world with `Sched::lock`, the
+/// scheduler's own blocking acquisition, which no caller holds here:
+/// a halt is raised after a refused or failed scheduler call, which
+/// released the world, or off a task thread, which never held it. The
+/// one exception is a thread that already holds the world through an
+/// `acquire` guard (a re-entrant acquisition, refused with `Baton`),
+/// which cannot take the lock again; no SimEnv method holds a guard
+/// across another call, so it never arises through the trait, and the
+/// record is then skipped rather than deadlocking. (A stale handle's
+/// "the life has ended", after `run_life` returned, has no life left to
+/// record it in.)
+fn halt(sched: &Sched<SimWorld>, what: String) -> EnvError {
+    if !world_held_by_me() {
+        sched.lock().halts.push(what.clone());
+    }
+    EnvError::Halted { what }
+}
+
+/// The calling task, or `Halted` off a task thread (recorded, A-1b-F1
+/// (f)).
+fn current_task(sched: &Sched<SimWorld>) -> Result<TaskId, EnvError> {
+    match TASK.with(|t| t.get()) {
+        Some(t) => Ok(t),
+        None => Err(halt(
+            sched,
+            "an Env call from a thread that is not a life task".to_string(),
+        )),
+    }
 }
 
 /// S-ENV "Errors": `SimFail` onto the A-1a surface. `Crashed` keeps
-/// its variant; every other world failure is `Halted`, naming itself.
-fn fail(f: SimFail) -> EnvError {
+/// its variant and is not a halt; every other world failure is
+/// `Halted`, naming itself, and recorded (A-1b-F1 (f)).
+fn fail(sched: &Sched<SimWorld>, f: SimFail) -> EnvError {
     match f {
         SimFail::Crashed => EnvError::Crashed,
-        SimFail::Deadlock => EnvError::Halted {
-            what: "deadlock".to_string(),
-        },
-        SimFail::Livelock(site) => EnvError::Halted {
-            what: format!("livelock at {site}"),
-        },
-        SimFail::Baton(site) => EnvError::Halted {
-            what: format!("baton violation at {site}"),
-        },
-        SimFail::Internal(what) => EnvError::Halted {
-            what: format!("internal: {what}"),
-        },
+        SimFail::Deadlock => halt(sched, "deadlock".to_string()),
+        SimFail::Livelock(site) => halt(sched, format!("livelock at {site}")),
+        SimFail::Baton(site) => halt(sched, format!("baton violation at {site}")),
+        SimFail::Internal(what) => halt(sched, format!("internal: {what}")),
     }
 }
 
@@ -177,9 +215,11 @@ fn yield_step<T>(
     site: &'static str,
     f: impl FnOnce(&mut SimWorld) -> Result<T, EnvError>,
 ) -> Result<T, EnvError> {
-    let task = current_task()?;
-    sched.yield_baton_at(task, site).map_err(fail)?;
-    let mut guard = sched.acquire(task, site).map_err(fail)?;
+    let task = current_task(sched)?;
+    sched
+        .yield_baton_at(task, site)
+        .map_err(|e| fail(sched, e))?;
+    let mut guard = sched.acquire(task, site).map_err(|e| fail(sched, e))?;
     f(&mut guard)
 }
 
@@ -313,8 +353,8 @@ impl LockTable {
 
 /// The scheduler host of one life (S-ENV): the scheduling core, the
 /// disk — moved in from [`Sim`] for the life and back out after — the
-/// virtual clock, the per-life `rand` stream, the wal-directory flag
-/// and the per-life lock table.
+/// virtual clock, the per-life `rand` stream, the wal-directory flag,
+/// the per-life lock table and the life's halt record.
 struct SimWorld {
     sched: SchedCore,
     disk: Option<SimDisk>,
@@ -326,6 +366,9 @@ struct SimWorld {
     rand: Rng,
     wal_dir: bool,
     locks: LockTable,
+    /// Every `Halted` the layer raised in this life, in order
+    /// (A-1b-F1 (f)); `run_life` moves it into [`LifeOutcome::halts`].
+    halts: Vec<String>,
 }
 
 impl SchedHost for SimWorld {
@@ -668,6 +711,10 @@ pub struct Sim {
     clock_ns: u64,
     wal_dir: bool,
     lives: u32,
+    /// How [`Sim::power_cut`] resolves each directory's unsynced ops
+    /// (D4, card A-6b-0): [`DirLoss::Prefix`], E4's rule, unless
+    /// [`Sim::set_dir_loss`] chose otherwise.
+    dir_loss: DirLoss,
 }
 
 impl Sim {
@@ -685,18 +732,24 @@ impl Sim {
             clock_ns: 0,
             wal_dir: false,
             lives: 0,
+            dir_loss: DirLoss::Prefix,
         }
     }
 
     /// Run one life: `tasks` workload tasks (ids `1..=tasks`) under
     /// the baton, each on its own OS thread with its own [`SimEnv`];
     /// the crash fires at `crash_at_yield` if armed (E4's `run_world`
-    /// shape). The disk, the clock and the wal flag move into the
-    /// life's world and back out when every task has ended; a fresh
-    /// lock table and a fresh `rand` stream come with each life, so
-    /// **a crash releases every lock** (S-ENV "Locks"). Each life
-    /// begins a new disk round (the per-round read, accept and event
-    /// logs clear; taint references and durable-write history survive).
+    /// shape). Each task's body starts only once the baton first
+    /// reaches it (`Sched::await_first_baton`, A-1b-F1 (a)); a task
+    /// whose world failed before that never runs its body, and its
+    /// result is the failure (`Crashed` for a crash). The disk, the
+    /// clock and the wal flag move into the life's world and back out
+    /// when every task has ended; a fresh lock table and a fresh `rand`
+    /// stream come with each life, so **a crash releases every lock**
+    /// (S-ENV "Locks"). Each life begins a new disk round (the
+    /// per-round read, accept and event logs clear; taint references
+    /// and durable-write history survive). The outcome carries every
+    /// `Halted` the layer raised in the life (A-1b-F1 (f)).
     pub fn run_life<F>(&mut self, tasks: usize, crash_at_yield: Option<u64>, body: F) -> LifeOutcome
     where
         F: Fn(&SimEnv, TaskId) -> Result<(), EnvError> + Send + Sync,
@@ -720,6 +773,7 @@ impl Sim {
             rand: Rng::new(rng::derive(self.seed, TAG_RAND.wrapping_add(life))),
             wal_dir: self.wal_dir,
             locks: LockTable::default(),
+            halts: Vec::new(),
         };
         let sched = Arc::new(Sched::new(world));
         let panicked = Arc::new(AtomicBool::new(false));
@@ -736,18 +790,28 @@ impl Sim {
                 };
                 handles.push(scope.spawn(move || {
                     TASK.with(|c| c.set(Some(t)));
-                    let caught =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&env, t)));
-                    sched.finish(t);
-                    let result = match caught {
-                        Ok(r) => r,
-                        Err(_) => {
-                            panicked.store(true, Ordering::SeqCst);
-                            Err(EnvError::Halted {
-                                what: format!("task {t} panicked"),
-                            })
+                    // A-1b-F1 (a): the body starts only once the baton
+                    // first reaches this task — a park, not a yield, so
+                    // it draws nothing and counts no yield. A world that
+                    // failed first ends the task without its body, with
+                    // the failure mapped as every `SimFail` is.
+                    let result = match sched.await_first_baton(t) {
+                        Err(f) => Err(fail(&sched, f)),
+                        Ok(()) => {
+                            let caught =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    body(&env, t)
+                                }));
+                            match caught {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    panicked.store(true, Ordering::SeqCst);
+                                    Err(halt(&sched, format!("task {t} panicked")))
+                                }
+                            }
                         }
                     };
+                    sched.finish(t);
                     if let Ok(mut rs) = results.lock() {
                         rs.push((t, result));
                     }
@@ -763,7 +827,7 @@ impl Sim {
         // Take the world back out of the scheduler (it may outlive the
         // life through a leaked SimEnv clone; the disk moves home
         // regardless, and a stale handle then answers `Halted`).
-        let (trace, yields, crashed, deadlock, livelock) = {
+        let (trace, yields, crashed, deadlock, livelock, halts) = {
             let mut guard = sched.lock();
             let w = &mut *guard;
             let core = &w.sched;
@@ -777,6 +841,7 @@ impl Sim {
                 } else {
                     None
                 },
+                std::mem::take(&mut w.halts),
             );
             self.disk = w.disk.take().unwrap_or_default();
             self.clock_ns = w.clock_ns;
@@ -795,25 +860,44 @@ impl Sim {
             yields,
             trace,
             results: results.into_iter().map(|(_, r)| r).collect(),
+            halts,
         }
     }
 
     /// F-CRASH, the **power cut**: resolve every volatile write, every
-    /// directory op and every length change (`SimDisk::apply_crash`)
+    /// directory op and every length change (`SimDisk::apply_crash_with`)
     /// with the seed's one crash stream. Sector images drop, tear or
-    /// reorder; each directory's unsynced ops persist as a prefix —
-    /// **S-2-F2-F1's loss of unsynced creates, renames and
-    /// `set_len`** — and a length survives only as far as the
-    /// surviving data needs it. Returns the dropped directory ops.
+    /// reorder; each directory's unsynced ops persist as a prefix
+    /// (`DirLoss::Prefix`, the default) or each independently, applied
+    /// in issue order where it still applies (`DirLoss::Independent`,
+    /// [`Sim::set_dir_loss`]; D4) — **S-2-F2-F1's loss of unsynced
+    /// creates, renames and `set_len`** — and a length survives only
+    /// as far as the surviving data needs it. Returns the dropped
+    /// directory ops.
     pub fn power_cut(&mut self) -> u64 {
-        self.disk.apply_crash(&mut self.crash_rng, &self.knobs)
+        self.disk
+            .apply_crash_with(&mut self.crash_rng, &self.knobs, self.dir_loss)
+    }
+
+    /// Choose how every later [`Sim::power_cut`] resolves each
+    /// directory's unsynced ops (D4, card A-6b-0; S-STORE §12.5's
+    /// `t_wal_start`). [`DirLoss::Independent`] keeps each op
+    /// independently, applied in issue order where it still applies,
+    /// so a later rename can survive an earlier one that is lost;
+    /// [`DirLoss::Prefix`], the default, keeps a prefix per directory,
+    /// as E4 did, with E4's draws. Only the directory step differs:
+    /// the file data is resolved the same way, draw for draw.
+    pub fn set_dir_loss(&mut self, mode: DirLoss) {
+        self.dir_loss = mode;
     }
 
     /// F-MEDIA-PAGE on the page file named `page_file` (an Env root
     /// path, mapped to the disk's `/<name>`) with `slot`-byte slots
     /// (D1: S-STORE §2.1's configurable page size; 4096 reproduces
     /// E4's draws exactly). Post-sync LOST/MISDIRECTED/TORN on 1–3
-    /// durable writes; the caller decides when they apply.
+    /// durable writes; the caller decides when they apply. A `slot`
+    /// of 0 is `Io { InvalidInput }` before any disk call: the copied
+    /// draw divides by it (A-1b-F1 (e)).
     pub fn media_page(
         &mut self,
         page_file: &str,
@@ -821,6 +905,14 @@ impl Sim {
         referenced: &BTreeSet<u64>,
     ) -> Result<Vec<MediaFault>, EnvError> {
         path::check(page_file)?;
+        if slot == 0 {
+            return Err(EnvError::Io {
+                op: "media_page",
+                path: page_file.to_string(),
+                kind: std::io::ErrorKind::InvalidInput,
+                detail: "the slot size must be positive (it divides every offset)".to_string(),
+            });
+        }
         let dpath = disk_file_path(page_file).ok_or_else(|| invalid_model(page_file))?;
         Ok(self
             .disk
@@ -868,7 +960,8 @@ impl Sim {
 }
 
 /// What one life did (S-ENV): whether it crashed or failed, its yield
-/// count, its handoff trace, and every task's result.
+/// count, its handoff trace, every task's result, and every `Halted`
+/// the layer raised.
 pub struct LifeOutcome {
     /// The crash point fired (or the world failed) — a process crash
     /// until [`Sim::power_cut`] resolves it.
@@ -885,6 +978,9 @@ pub struct LifeOutcome {
     pub trace: Vec<(u64, TaskId)>,
     /// Each task's result, in task order.
     pub results: Vec<Result<(), EnvError>>,
+    /// Every `Halted` the layer raised in this life, in order,
+    /// including those a body swallowed; A-1b-F1 (f).
+    pub halts: Vec<String>,
 }
 
 /// A task's view of the world: clone it freely inside the life's body
@@ -897,20 +993,24 @@ pub struct SimEnv {
 impl SimEnv {
     /// The calling task (S-ENV "Tasks"): `Halted` off a task thread.
     pub fn task(&self) -> Result<TaskId, EnvError> {
-        current_task()
+        current_task(&self.sched)
     }
 
     /// A plain yield point naming its site (E4's `EnvRef::yield_at`).
     pub fn yield_now(&self, site: &'static str) -> Result<(), EnvError> {
-        let task = current_task()?;
-        self.sched.yield_baton_at(task, site).map_err(fail)
+        let task = current_task(&self.sched)?;
+        self.sched
+            .yield_baton_at(task, site)
+            .map_err(|e| fail(&self.sched, e))
     }
 
     /// Park on a wait key (the scheduler-level condition variable;
     /// E4's `EnvRef::wait_for`).
     pub fn wait_for(&self, key: WaitKey) -> Result<(), EnvError> {
-        let task = current_task()?;
-        self.sched.wait_for(task, key).map_err(fail)
+        let task = current_task(&self.sched)?;
+        self.sched
+            .wait_for(task, key)
+            .map_err(|e| fail(&self.sched, e))
     }
 
     /// Wake every task parked on `key` (E4's scheduler `wake`).
@@ -981,14 +1081,25 @@ impl Env for SimEnv {
     }
 
     fn sleep(&self, d: Duration) {
-        // A yield point, then the clock advances by exactly `d`. A
-        // world that failed at the yield is left alone: the caller
-        // learns at its next Env call, and the clock does not move.
-        let Ok(task) = current_task() else {
+        // A yield point, then the clock advances by exactly `d` — also
+        // when the yield fails because the world failed (a crash, a
+        // deadlock or a livelock): a task observes a crash only through
+        // a fallible call, and a time-bounded loop must still end
+        // (A-1b-F1 (b)). The failure itself is mapped as at every other
+        // yield, so a livelock tripped here is recorded as a halt and a
+        // crash is not. Off a task thread nothing moves and the call is
+        // a recorded halt. An S-BATON refusal (this thread already holds
+        // the world) cannot take the lock for the clock, so it returns
+        // with the clock unmoved.
+        let Ok(task) = current_task(&self.sched) else {
             return;
         };
-        if self.sched.yield_baton_at(task, "env:sleep").is_err() {
-            return;
+        if let Err(f) = self.sched.yield_baton_at(task, "env:sleep") {
+            let holds_world = matches!(f, SimFail::Baton(_));
+            let _ = fail(&self.sched, f);
+            if holds_world {
+                return;
+            }
         }
         let add = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let mut guard = self.sched.lock();
@@ -1000,13 +1111,26 @@ impl Env for SimEnv {
         // acquisition (X5-R14) lets only the baton holder draw, so a
         // task that has not been handed the baton yet cannot perturb
         // the stream. `rand` is infallible on every backend; a world
-        // that refuses the step cannot advance it, and answers 0.
-        let Ok(task) = current_task() else {
+        // that refuses the step cannot advance it, and answers 0. A
+        // refusal while the world has not failed is a halt the caller
+        // cannot see, so it is recorded (A-1b-F1 (f)); since a body now
+        // starts only once it holds the baton (A-1b-F1 (a)), a task's
+        // own `rand` is never refused.
+        let Ok(task) = current_task(&self.sched) else {
             return 0;
         };
         match self.sched.acquire(task, "env:rand") {
             Ok(mut guard) => guard.rand.next_u64(),
-            Err(_) => 0,
+            Err(_) => {
+                if !world_held_by_me() {
+                    let mut guard = self.sched.lock();
+                    let failed = guard.sched.crashed || guard.sched.deadlock;
+                    if !failed {
+                        guard.halts.push("rand refused: env:rand".to_string());
+                    }
+                }
+                0
+            }
         }
     }
 }
@@ -1042,10 +1166,24 @@ impl SimFile {
     /// it just read at this range as valid. Not an Env call, not a
     /// yield point (like E4's `E4Env::accepted`): one gated step, no
     /// baton offer. `Err` is a world failure the caller propagates —
-    /// an accept that silently fails to record fails open.
+    /// an accept that silently fails to record fails open. A range
+    /// whose `off + len` overflows is `Io { InvalidInput }` before any
+    /// disk call: the copied hook computes the end unchecked, with the
+    /// world held (A-1b-F1 (e)).
     pub fn accepted(&self, off: u64, len: u64) -> Result<(), EnvError> {
-        let task = current_task()?;
-        let mut guard = self.sched.acquire(task, "env:accepted").map_err(fail)?;
+        if off.checked_add(len).is_none() {
+            return Err(EnvError::Io {
+                op: "accepted",
+                path: self.path.clone(),
+                kind: std::io::ErrorKind::InvalidInput,
+                detail: "offset plus length overflows u64".to_string(),
+            });
+        }
+        let task = current_task(&self.sched)?;
+        let mut guard = self
+            .sched
+            .acquire(task, "env:accepted")
+            .map_err(|e| fail(&self.sched, e))?;
         let w = &mut *guard;
         let disk = w.disk_mut()?;
         disk.accepted(self.id, off, len);
