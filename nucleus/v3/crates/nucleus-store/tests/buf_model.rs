@@ -721,6 +721,14 @@ const ROWS: &[(FrameState, Ev)] = &[
     (FrameState::Orphan, Ev::TryVictimAndPinFrame),
 ];
 
+/// The pool's frames by state: free, reserved, loading, resident, orphan.
+fn states(pool: &Pool<FaultFile>) -> (u32, u32, u32, u32, u32) {
+    match pool.stats() {
+        Ok(s) => (s.free, s.reserved, s.loading, s.resident, s.orphan),
+        Err(_) => (u32::MAX, 0, 0, 0, 0),
+    }
+}
+
 /// A frame's bookkeeping, for the table's expectations.
 fn info(state: FrameState, key: Option<PageKey>, pins: u64, freed: bool) -> FrameInfo {
     FrameInfo {
@@ -843,8 +851,11 @@ fn transition_table() {
                     let first = pz.next_event();
                     let (mut at_pause, mut probes) = (None, None);
                     if first == Event::Arrived(HookPoint::LoadPublished, key, f0) {
-                        at_pause =
-                            Some((pool.frame_info(f0).unwrap(), pool.frame_of(key).unwrap()));
+                        at_pause = Some((
+                            pool.frame_info(f0).unwrap(),
+                            pool.frame_of(key).unwrap(),
+                            states(&pool),
+                        ));
                         if ev == Ev::TryVictimAndPinFrame {
                             probes = Some((
                                 pool.try_victim(f0).unwrap().is_none(),
@@ -861,9 +872,14 @@ fn transition_table() {
                     Event::Arrived(HookPoint::LoadPublished, key, f0),
                     "{row}"
                 );
+                // Free, reserved, loading, resident, orphan.
                 assert_eq!(
                     at_pause,
-                    Some((info(Loading, Some(key), 1, false), Some(f0))),
+                    Some((
+                        info(Loading, Some(key), 1, false),
+                        Some(f0),
+                        (1, 0, 1, 0, 0)
+                    )),
                     "{row}"
                 );
                 match ev {
@@ -932,6 +948,7 @@ fn transition_table() {
                                 woken = Some((
                                     pool.frame_info(f0).unwrap(),
                                     pool.frame_of(L1).unwrap(),
+                                    states(&pool),
                                 ));
                                 if ev == Ev::TryVictimAndPinFrame {
                                     probes = Some((
@@ -960,7 +977,7 @@ fn transition_table() {
                 );
                 assert_eq!(
                     woken,
-                    Some((info(Orphan, Some(L1), 1, false), None)),
+                    Some((info(Orphan, Some(L1), 1, false), None, (1, 0, 0, 0, 1))),
                     "{row} {events:?}"
                 );
                 assert!(matches!(r1, Err(StoreError::Corrupt(_))), "{row}");
