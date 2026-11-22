@@ -36,16 +36,17 @@
 //!   a key is in the page table under at most one frame; a frame is in the
 //!   table if and only if its state is `Loading` or `Resident`; a frame's
 //!   state, key and pin count change only under the table mutex. Tests
-//!   `table_chains`, `key_namespaces`, `double_miss_one_frame`,
-//!   `t_pin_load_race_e`, `t_pin_load_race_i`, the model tests; mutants
-//!   NAMESPACE-MERGED, TABLE-UNLINK-HEAD-ONLY, TABLE-INSERT-OVERWRITES,
-//!   MISS-NO-RECHECK, CREATE-OVER-LOADING, CREATE-OVER-LIVE,
-//!   CREATE-FREED-NEW-FRAME.
+//!   `table_chains`, `table_chain_ends`, `hash_placement`, `key_namespaces`,
+//!   `double_miss_one_frame`, `t_pin_load_race_e`, `t_pin_load_race_i`, the
+//!   model tests; mutants NAMESPACE-MERGED, TABLE-UNLINK-HEAD-ONLY,
+//!   TABLE-INSERT-OVERWRITES, MISS-NO-RECHECK, CREATE-OVER-LOADING,
+//!   CREATE-OVER-LIVE, CREATE-FREED-NEW-FRAME.
 //! - **BUF-TABLE-LEAF** (§4.2, §6.8; C-T0 §2.6): the table mutex is a leaf
 //!   lock: while it is held no latch is taken (not even with `try_`), no
 //!   `CurrentRef` is called, no I/O is made, no hook fires and nothing is
-//!   waited on (the condition-variable wait releases it). Test
-//!   `independent_loads`; mutant TABLE-HELD-ACROSS-IO.
+//!   waited on (the condition-variable wait releases it). Tests
+//!   `independent_loads`, `hooks_fire_unlocked` (and the model's check that
+//!   no reference read finds the mutex held); mutant TABLE-HELD-ACROSS-IO.
 //! - **BUF-TABLE-FIRST** (§5.4 "What a pin finds"): a pin reads a key's
 //!   current reference only when the key is not in the table; it returns
 //!   `Unmapped` only when the key was not in the table and its reference has
@@ -64,10 +65,12 @@
 //!   never reads the slot itself, and `pin_resident` never returns a
 //!   `Loading` frame. Tests `load_integrity`, `load_waiter_shares_one_read`,
 //!   `stale_load_race`, `failed_load_wakes_waiters`,
-//!   `unmapped_load_wakes_waiters`, `t_pin_load_race_a` to `_d`; mutants
-//!   LOAD-RESOLVE-BEFORE-PUBLISH, LOADING-AS-RESIDENT, PIN-RESIDENT-LOADING,
-//!   WAITER-RETURNS-ORPHAN, ORPHAN-LEAK, FAILED-LOAD-KEEPS-KEY,
-//!   VERIFY-SKIPPED, KIND-UNCHECKED, HOME-SLOT-UNCHECKED, SHORT-READ-SERVED.
+//!   `unmapped_load_wakes_waiters`, `t_pin_load_race_a` to `_d`,
+//!   `current_ref_error_ends_load`, `reads_counted`, `load_resets_flags`,
+//!   `home_slot_bounds`, `key_rules`; mutants LOAD-RESOLVE-BEFORE-PUBLISH,
+//!   LOADING-AS-RESIDENT, PIN-RESIDENT-LOADING, WAITER-RETURNS-ORPHAN,
+//!   ORPHAN-LEAK, FAILED-LOAD-KEEPS-KEY, VERIFY-SKIPPED, KIND-UNCHECKED,
+//!   HOME-SLOT-UNCHECKED, SHORT-READ-SERVED.
 //! - **BUF-PINNED-STAYS** (§5.3 "Pins guarantee residency, not identity"): a
 //!   frame with a live `Pin` is `Resident` under that pin's key until the pin
 //!   drops. Tests `remove_rules`, `remove_vs_pin`, `evict_sets_entry_first`
@@ -80,16 +83,17 @@
 //!   §3.3's four checks) or by `mark_freed` (§4.2: a freed page's frame is
 //!   never written); a page never written since its creation never leaves
 //!   the table. Tests `remove_rules`, `mark_written_checks`, `freed_frame`,
-//!   `evict_sets_entry_first`; mutants REMOVE-DIRTY, WRITTEN-UNCHECKED,
-//!   FREED-STAYS-DIRTY.
+//!   `evict_sets_entry_first`, `mark_written_more`, `mark_written_epoch`;
+//!   mutants REMOVE-DIRTY, WRITTEN-UNCHECKED, FREED-STAYS-DIRTY.
 //! - **BUF-BORN-LATCHED** (§6.8 "Root names"; §15 `t_root_name_reuse` case
 //!   D): a created page enters the table under its creator's exclusive
 //!   latch, already zeroed and with its header (`kind`, `id`, `epoch`)
 //!   written, so no other thread reads it before the creator releases that
 //!   latch; a creation of a key a frame holds makes no second frame (§5.4).
 //!   Tests `born_latched`, `create_outcomes`, `create_vs_loading`,
-//!   `t_pin_load_race_f`, `t_pin_load_race_g`; mutants CREATE-PUBLISH-EARLY,
-//!   CREATE-OVER-LOADING, CREATE-FREED-NEW-FRAME.
+//!   `t_pin_load_race_f`, `t_pin_load_race_g`, `create_resets_flags`;
+//!   mutants CREATE-PUBLISH-EARLY, CREATE-OVER-LOADING,
+//!   CREATE-FREED-NEW-FRAME.
 //! - **BUF-NO-WRAP**: a pin count never wraps; a pin that would raise it past
 //!   `u64::MAX` is refused with `Invalid` and changes nothing. Test
 //!   `pin_count_overflow`; mutant PIN-WRAP.
