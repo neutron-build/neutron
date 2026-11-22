@@ -33,18 +33,20 @@ use super::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLoc
 use crate::meta::Ref;
 use crate::store::StoreError;
 
-/// A frame's index in its pool, `0 ≤ id < frames` (card A-3a).
+/// A frame's index in its pool, `0 ≤ id < frames` (S-STORE §5.1: "A fixed
+/// array of `F` frames"; card A-3a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameId(pub u32);
 
-/// A frame's state (card A-3a, Work 7). The five states partition the pool's
+/// A frame's state (S-STORE §5.1, §5.4; card A-3a, Work 7). The five states
+/// partition the pool's
 /// frames (BUF-FIXED), and a frame is in the page table exactly when it is
 /// `Loading` or `Resident` (BUF-ONE-FRAME). Deliberately not
 /// `#[non_exhaustive]`: the tests match it exhaustively, so a state added
 /// later fails to compile there until they name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameState {
-    /// On the free list.
+    /// On the free list (§5.1), in no reservation and not in the page table.
     Free,
     /// Owned by a [`FrameReservation`]: off the free list and not in the page
     /// table (a pin's miss path holds one between its steps P3 and P4; a
@@ -60,7 +62,8 @@ pub enum FrameState {
     Resident,
     /// Out of the page table: a load that failed, or found the key unmapped,
     /// removed it while waiters still held counts; it keeps the key it was
-    /// loading and becomes `Free` when the last waiter drops its count.
+    /// loading and becomes `Free` when the last waiter drops its count (§5.4:
+    /// a pin never takes a frame whose load failed).
     Orphan,
 }
 
@@ -204,12 +207,12 @@ impl<'p, H: File> Pin<'p, H> {
         Pin { pool, frame, key }
     }
 
-    /// The pinned page's key.
+    /// The pinned page's key (§5.1).
     pub fn key(&self) -> PageKey {
         self.key
     }
 
-    /// The pinned frame.
+    /// The pinned frame (§5.3: a pin guarantees residency, not identity).
     pub fn frame(&self) -> FrameId {
         self.frame
     }
@@ -241,7 +244,8 @@ impl<'p, H: File> Pin<'p, H> {
         })
     }
 
-    /// Latch the frame shared if that does not block; `Ok(None)` if it would.
+    /// Latch the frame shared if that does not block; `Ok(None)` if it would
+    /// (§5.3).
     ///
     /// # Errors
     /// [`StoreError::Poisoned`] if the latch was poisoned.
@@ -258,7 +262,7 @@ impl<'p, H: File> Pin<'p, H> {
     }
 
     /// Latch the frame exclusively if that does not block; `Ok(None)` if it
-    /// would.
+    /// would (§5.3).
     ///
     /// # Errors
     /// [`StoreError::Poisoned`] if the latch was poisoned.
@@ -308,12 +312,12 @@ pub struct SharedGuard<'a> {
 }
 
 impl SharedGuard<'_> {
-    /// The page's key.
+    /// The page's key (§5.1).
     pub fn key(&self) -> PageKey {
         self.key
     }
 
-    /// The latched frame.
+    /// The latched frame (§5.3).
     pub fn frame(&self) -> FrameId {
         self.frame
     }
@@ -377,12 +381,12 @@ impl<'a, H: File> ExclusiveGuard<'a, H> {
         }
     }
 
-    /// The page's key.
+    /// The page's key (§5.1).
     pub fn key(&self) -> PageKey {
         self.key
     }
 
-    /// The latched frame.
+    /// The latched frame (§5.3).
     pub fn frame(&self) -> FrameId {
         self.frame
     }
@@ -499,19 +503,20 @@ impl<'p, H: File> CreatedPage<'p, H> {
         CreatedPage { guard, pin }
     }
 
-    /// Release the latch and keep the pin.
+    /// Release the latch and keep the pin: from here other threads may read
+    /// the page (§6.8 "Root names").
     pub fn release(self) -> Pin<'p, H> {
         let CreatedPage { guard, pin } = self;
         drop(guard);
         pin
     }
 
-    /// The page's key.
+    /// The page's key (§5.1).
     pub fn key(&self) -> PageKey {
         self.pin.key()
     }
 
-    /// The page's frame.
+    /// The page's frame (§5.3).
     pub fn frame(&self) -> FrameId {
         self.pin.frame()
     }
@@ -531,7 +536,7 @@ impl<'p, H: File> CreatedPage<'p, H> {
         self.guard.is_freed()
     }
 
-    /// As [`ExclusiveGuard::mark_dirty`].
+    /// As [`ExclusiveGuard::mark_dirty`] (§5.6).
     ///
     /// # Errors
     /// [`StoreError::Invalid`] on a freed page.
@@ -539,7 +544,7 @@ impl<'p, H: File> CreatedPage<'p, H> {
         self.guard.mark_dirty(epoch)
     }
 
-    /// As [`ExclusiveGuard::mark_written`].
+    /// As [`ExclusiveGuard::mark_written`] (§5.2, §3.3).
     ///
     /// # Errors
     /// [`StoreError::Invalid`], the page still dirty, unless every check of
@@ -548,7 +553,7 @@ impl<'p, H: File> CreatedPage<'p, H> {
         self.guard.mark_written(home)
     }
 
-    /// As [`ExclusiveGuard::mark_freed`].
+    /// As [`ExclusiveGuard::mark_freed`] (§4.2).
     ///
     /// # Errors
     /// [`StoreError::Poisoned`] if the table mutex was poisoned.
@@ -579,8 +584,9 @@ impl<H: File> fmt::Debug for CreatedPage<'_, H> {
     }
 }
 
-/// A `Reserved` frame owned by the caller (card A-3a, `Pool::reserve`): off
-/// the free list and not in the page table. Dropped unconsumed, it returns
+/// A `Reserved` frame owned by the caller (card A-3a, `Pool::reserve`; S-STORE
+/// §5.4's "reservation's pages", §6.4): off the free list and not in the page
+/// table. Dropped unconsumed, it returns
 /// the frame to the free list (BUF-FIXED).
 pub struct FrameReservation<'p, H: File> {
     pool: &'p Pool<H>,
@@ -594,7 +600,7 @@ impl<'p, H: File> FrameReservation<'p, H> {
         FrameReservation { pool, frame }
     }
 
-    /// The reserved frame.
+    /// The reserved frame (§5.4).
     pub fn frame(&self) -> FrameId {
         self.frame
     }
@@ -659,12 +665,12 @@ impl<'p, H: File> VictimGuard<'p, H> {
         }
     }
 
-    /// The page's key.
+    /// The page's key (§5.1).
     pub fn key(&self) -> PageKey {
         self.key
     }
 
-    /// The latched frame.
+    /// The latched frame (§5.3).
     pub fn frame(&self) -> FrameId {
         self.frame
     }
@@ -754,9 +760,9 @@ impl<H: File> fmt::Debug for VictimGuard<'_, H> {
 pub enum Removal<'p, H: File> {
     /// The frame left the page table and is `Reserved` for the caller (A-3b's
     /// frame acquisition uses it at once; dropped, it returns to the free
-    /// list).
+    /// list; §5.2).
     Removed(FrameReservation<'p, H>),
-    /// The frame stays in the page table: it was pinned or dirty.
+    /// The frame stays in the page table: it was pinned or dirty (§5.2, §5.4).
     Kept,
 }
 

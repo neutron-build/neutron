@@ -42,7 +42,7 @@ const FIRST_PAGE_SLOT: u64 = 3;
 /// the minimum pool size of §5.4 is card A-3b's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolConfig {
-    /// `F`, the frame count: `1 ≤ frames ≤ 2^31`.
+    /// `F`, the frame count (§5.1): `1 ≤ frames ≤ 2^31`.
     pub frames: u32,
     /// The page size: one of `meta::PAGE_SIZES` (§2.1).
     pub page_size: u32,
@@ -71,7 +71,7 @@ pub trait CurrentRef<H: File> {
 /// What [`Pool::pin`] found (S-STORE §5.4 "What a pin finds").
 #[must_use]
 pub enum PinOutcome<'p, H: File> {
-    /// The page, pinned in its frame.
+    /// The page, pinned in its frame (§5.3).
     Pinned(Pin<'p, H>),
     /// No frame held the key and its reference has slot 0: an LPID that is
     /// not mapped, or a MapLeaf never made. The pin holds no frame, and
@@ -97,36 +97,37 @@ pub enum CreateOutcome<'p, H: File> {
     Loading(FrameReservation<'p, H>),
 }
 
-/// The pool's frames by state, and its counters (card A-3a; each answer may
-/// be stale once returned).
+/// The pool's frames by state, and its counters (S-STORE §5.1, §5.4; card
+/// A-3a; each answer may be stale once returned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolStats {
-    /// `F`.
+    /// `F` (§5.1).
     pub frames: u32,
-    /// Frames on the free list.
+    /// Frames on the free list (§5.1).
     pub free: u32,
-    /// Frames owned by a reservation.
+    /// Frames owned by a reservation (§5.4, §6.4).
     pub reserved: u32,
-    /// Frames being loaded.
+    /// Frames being loaded (§5.4 "The load").
     pub loading: u32,
-    /// Frames holding their page.
+    /// Frames holding their page (§5.4).
     pub resident: u32,
-    /// Frames of failed or unmapped loads that waiters still count.
+    /// Frames of failed or unmapped loads that waiters still count (§5.4).
     pub orphan: u32,
-    /// Slot reads issued by loads.
+    /// Slot reads issued by loads (§3.3).
     pub reads: u64,
-    /// The page table's bucket count, fixed at `F.next_power_of_two()`.
+    /// The page table's bucket count, fixed at `F.next_power_of_two()` (§5.7).
     pub buckets: u32,
 }
 
-/// One frame's bookkeeping (card A-3a; may be stale once returned).
+/// One frame's bookkeeping (S-STORE §5.1; card A-3a; may be stale once
+/// returned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameInfo {
-    /// The frame's state.
+    /// The frame's state (§5.1, §5.4).
     pub state: FrameState,
-    /// Its key while `Loading`, `Resident` or `Orphan`.
+    /// Its key while `Loading`, `Resident` or `Orphan` (§5.1).
     pub key: Option<PageKey>,
-    /// Its pin count.
+    /// Its pin count (§5.3).
     pub pins: u64,
     /// Whether its page was freed (§4.2).
     pub freed: bool,
@@ -137,14 +138,15 @@ pub struct FrameInfo {
 /// the image-record list's, A-3b reports `o_frame`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolFootprint {
-    /// The page buffers: `F × page_size`.
+    /// The page buffers: `F × page_size` (R-1-memory §5.1).
     pub page_bytes: u64,
     /// The frames' headers: `F × (size_of::<FrameLatch>() +
     /// size_of::<FrameMeta>())`, each latch holding its frame's content
-    /// cell (dirty flag, freed flag, content epoch and the buffer's handle).
+    /// cell (dirty flag, freed flag, content epoch and the buffer's handle;
+    /// R-1-memory §4.1).
     pub frame_bytes: u64,
     /// The page table: `F.next_power_of_two()` bucket heads and the free
-    /// stack's `F` frame ids.
+    /// stack's `F` frame ids (S-STORE §5.7).
     pub table_bytes: u64,
 }
 
@@ -158,36 +160,39 @@ pub struct PoolFootprint {
 /// *waiting* [`HookPoint::LoadWaiting`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookPoint {
-    /// P3: a miss holds its reservation (a frame not in the table), before
+    /// P3 (§5.4 "The load"): a miss holds its reservation (a frame not in the table), before
     /// it looks again and publishes it.
     MissReserved,
-    /// P4: the frame is in the table as `Loading`; the loader holds its count.
+    /// P4 (§5.4): the frame is in the table as `Loading`; the loader holds its
+    /// count.
     LoadPublished,
-    /// P7: the reference read has a non-zero slot; the loader holds its count.
+    /// P7 (§5.4): the reference read has a non-zero slot; the loader holds its
+    /// count.
     LoadResolved,
-    /// P8: a whole page was read, before `verify`; the loader holds its count
+    /// P8 (§3.3): a whole page was read, before `verify`; the loader holds its count
     /// and the frame's exclusive latch.
     LoadRead,
     /// Where a pin (P2 (b), holding its count on the `Loading` frame) or a
     /// creation ([`Pool::wait_settled`], holding its reservation) is about to
-    /// wait for a load. No latch.
+    /// wait for a load (§5.4). No latch.
     LoadWaiting,
-    /// P2 (b): a pin's wait for a load ended, before it decides; it holds its
+    /// P2 (b) (§5.4): a pin's wait for a load ended, before it decides; it holds its
     /// count. No latch.
     WaitWoken,
-    /// After any [`Pin`] is made; from `create` or `VictimGuard::pin_frame`,
+    /// After any [`Pin`] is made (§5.3); from `create` or `VictimGuard::pin_frame`,
     /// the frame's exclusive latch is held.
     Pinned,
-    /// After a [`Pin`]'s count is lowered.
+    /// After a [`Pin`]'s count is lowered (§5.3).
     Unpinned,
-    /// C3: the reservation's frame is latched exclusively and initialised,
+    /// C3 (§6.8): the reservation's frame is latched exclusively and initialised,
     /// not yet in the table; no pin.
     CreateReady,
-    /// R1: the victim's exclusive latch is held; no pin.
+    /// R1 (§5.2): the victim's exclusive latch is held; no pin.
     RemoveLatched,
 }
 
-/// A test hook (card A-3a): called with the point, the key and the frame.
+/// A test hook (card A-3a; S-STORE §15's hook-placed interleavings): called
+/// with the point, the key and the frame.
 pub type Hook = Arc<dyn Fn(HookPoint, PageKey, FrameId) + Send + Sync>;
 
 /// The buffer pool (S-STORE §5.1): `F` frames, the page table and the free
@@ -354,18 +359,18 @@ impl<H: File> Pool<H> {
         })
     }
 
-    /// `F`, the frame count.
+    /// `F`, the frame count (§5.1).
     pub fn frames(&self) -> u32 {
         // `new` built one latch per frame of a `u32` count.
         u32::try_from(self.latches.len()).unwrap_or(u32::MAX)
     }
 
-    /// The page size.
+    /// The page size (§2.1).
     pub fn page_size(&self) -> u32 {
         self.page_size
     }
 
-    /// The page file.
+    /// The page file, through which every page read goes (§2).
     pub fn file(&self) -> &Arc<H> {
         &self.file
     }
@@ -696,7 +701,8 @@ impl<H: File> Pool<H> {
     }
 
     /// Pin frame `f` if it is `Resident`, with its key; `None` otherwise. For
-    /// callers that scan frames (card A-3b's clock, A-7b's step 2).
+    /// callers that scan frames (card A-3b's clock, A-7b's step 2; S-STORE
+    /// §5.2, §13 step 2).
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range or its count is at
@@ -994,7 +1000,7 @@ impl<H: File> Pool<H> {
         Ok(())
     }
 
-    /// The frames by state and the counters (each diagnostic takes the
+    /// The frames by state and the counters (S-STORE §5.1; each diagnostic takes the
     /// table mutex briefly; the answer may be stale once returned).
     ///
     /// # Errors
@@ -1034,7 +1040,7 @@ impl<H: File> Pool<H> {
         Ok(s)
     }
 
-    /// Frame `f`'s bookkeeping.
+    /// Frame `f`'s bookkeeping (§5.1).
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range.
@@ -1049,7 +1055,8 @@ impl<H: File> Pool<H> {
         })
     }
 
-    /// The frame the page table holds for `key`, if any: a lookup, no pin.
+    /// The frame the page table holds for `key`, if any: a lookup, no pin
+    /// (§5.1).
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if the table's chain is broken.
@@ -1058,7 +1065,7 @@ impl<H: File> Pool<H> {
     }
 
     /// The page-table bucket `key` lands in: its hash masked by the bucket
-    /// count less one. No lock: the bucket count never changes.
+    /// count less one (§5.1, §5.7). No lock: the bucket count never changes.
     pub fn bucket_of(&self, key: PageKey) -> u32 {
         bucket_index(key, self.bucket_mask)
     }
@@ -1097,7 +1104,7 @@ impl<H: File> Pool<H> {
     /// the page buffers' lengths (read under each frame's latch shared, in
     /// turn, so call it holding no latch), the latches and metadata, the
     /// buckets and the free stack. Independent of [`Pool::bytes_for`]'s
-    /// arithmetic, which it must equal.
+    /// arithmetic, which it must equal (R-1-memory §4.1, §8).
     pub fn footprint(&self) -> PoolFootprint {
         let page_bytes = self
             .latches
@@ -1121,14 +1128,16 @@ impl<H: File> Pool<H> {
         }
     }
 
-    /// Install or remove the test hook (`test-hooks` only).
+    /// Install or remove the test hook (`test-hooks` only; S-STORE §15's
+    /// hook-placed interleavings).
     #[cfg(feature = "test-hooks")]
     pub fn set_hook(&self, hook: Option<Hook>) {
         *self.hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
     /// Set a `Resident` frame's pin count to `n`: fault injection for a count
-    /// no caller can reach (test `pin_count_overflow`; `test-hooks` only).
+    /// no caller can reach (§5.3's counts; test `pin_count_overflow`;
+    /// `test-hooks` only).
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range or not `Resident`.
@@ -1145,7 +1154,7 @@ impl<H: File> Pool<H> {
 
     /// Whether the table mutex is free (`try_lock` would not block): what a
     /// test checks while another thread is paused mid-load (test
-    /// `independent_loads`; `test-hooks` only).
+    /// `independent_loads`; `test-hooks` only; S-STORE §4.2's leaf-lock rank).
     #[cfg(feature = "test-hooks")]
     pub fn table_free(&self) -> bool {
         match self.table.try_lock() {
