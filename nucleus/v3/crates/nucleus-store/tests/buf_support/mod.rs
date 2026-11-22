@@ -138,10 +138,15 @@ impl File for FaultFile {
 }
 
 /// The test double of card A-3c's current page map (S3): a key's reference,
-/// `Ref::NULL` when it has none, and a count of lookups.
+/// `Ref::NULL` when it has none, and a count of lookups. It also counts the
+/// lookups made while the pool's table mutex was not free, which only a load
+/// that holds it across its reference read makes (BUF-TABLE-LEAF); only a
+/// single-threaded test can read that count as a verdict, since another
+/// thread may hold the mutex for a moment.
 pub struct TestMap {
     refs: Mutex<HashMap<PageKey, Ref>>,
     lookups: AtomicU64,
+    locked: AtomicU64,
 }
 
 impl TestMap {
@@ -150,6 +155,7 @@ impl TestMap {
         TestMap {
             refs: Mutex::new(HashMap::new()),
             lookups: AtomicU64::new(0),
+            locked: AtomicU64::new(0),
         }
     }
 
@@ -172,11 +178,19 @@ impl TestMap {
     pub fn lookups(&self) -> u64 {
         self.lookups.load(Ordering::SeqCst)
     }
+
+    /// How many lookups found the pool's table mutex held.
+    pub fn locked_lookups(&self) -> u64 {
+        self.locked.load(Ordering::SeqCst)
+    }
 }
 
 impl<H: File> CurrentRef<H> for TestMap {
-    fn current_ref(&self, _pool: &Pool<H>, key: PageKey) -> Result<Ref, StoreError> {
+    fn current_ref(&self, pool: &Pool<H>, key: PageKey) -> Result<Ref, StoreError> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
+        if !pool.table_free() {
+            self.locked.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(self.get(key))
     }
 }
@@ -427,6 +441,13 @@ impl Pauser {
     /// The next event, blocking until one comes.
     pub fn next_event(&self) -> Event {
         lock(&self.rx).recv().unwrap_or(Event::Disconnected)
+    }
+
+    /// Every event sent and not yet taken, without blocking: for a test that
+    /// has joined its threads.
+    pub fn drain(&self) -> Vec<Event> {
+        let rx = lock(&self.rx);
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
     /// The hook to install with `Pool::set_hook`.

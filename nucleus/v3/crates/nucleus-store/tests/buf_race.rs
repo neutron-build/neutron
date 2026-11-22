@@ -809,3 +809,50 @@ fn t_pin_load_race_j() {
     let found = pin_read(&pool, &map, k).unwrap();
     assert_eq!(found.map(|(g, _)| g), Some(f));
 }
+
+/// Beyond the card's list: the hooks of a pin that waits for a load (card
+/// A-3a's hook table): `LoadWaiting`, then once the load ends `WaitWoken`
+/// and `Pinned`, and `Unpinned` when each pin drops; counted after the join.
+#[test]
+fn hooks_on_wait() {
+    use HookPoint::{Pinned, Unpinned};
+    let (file, map, pool) = fixture(3).unwrap();
+    put_leaf(&file, &map, 1, 10, 0x11).unwrap();
+    let pz = Pauser::new();
+    pool.set_hook(Some(pz.hook()));
+    pz.pause_at(LoadPublished, L1);
+    for point in [LoadWaiting, WaitWoken, Pinned, Unpinned] {
+        pz.report(point, L1);
+    }
+    let (first, second, r1, r2) = thread::scope(|s| {
+        let t1 = spawn(s, &pz, "T1", || pin_read(&pool, &map, L1));
+        // T1 holds its count on the Loading frame; no latch, no mutex.
+        let first = pz.next_event();
+        let (mut second, mut t2) = (None, None);
+        if arrived(&first, LoadPublished, L1) {
+            t2 = Some(spawn(s, &pz, "T2", || pin_read(&pool, &map, L1)));
+            second = Some(pz.next_event());
+        }
+        pz.release_all();
+        (first, second, t1.join(), t2.map(|h| h.join()))
+    });
+    assert!(arrived(&first, LoadPublished, L1), "{first:?}");
+    assert!(
+        second.is_some_and(|e| seen(&e, LoadWaiting, L1)),
+        "{second:?}"
+    );
+    r1.unwrap().unwrap().unwrap();
+    r2.unwrap().unwrap().unwrap().unwrap();
+    let rest = pz.drain();
+    let count = |p: HookPoint| rest.iter().filter(|e| seen(e, p, L1)).count();
+    assert_eq!(
+        (
+            count(LoadWaiting),
+            count(WaitWoken),
+            count(Pinned),
+            count(Unpinned)
+        ),
+        (0, 1, 2, 2),
+        "{rest:?}"
+    );
+}

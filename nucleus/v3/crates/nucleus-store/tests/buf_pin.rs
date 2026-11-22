@@ -21,8 +21,8 @@ use buf_support::{
 use nucleus_env::{EnvError, File};
 use nucleus_store::StoreError;
 use nucleus_store::buf::{
-    CreateOutcome, FrameId, FrameInfo, FrameState, Hook, HookPoint, PageKey, Pin, PinOutcome, Pool,
-    PoolConfig, PoolStats, Removal,
+    CreateOutcome, CurrentRef, FrameId, FrameInfo, FrameState, Hook, HookPoint, PageKey, Pin,
+    PinOutcome, Pool, PoolConfig, PoolStats, Removal,
 };
 use nucleus_store::map::{self, Radix};
 use nucleus_store::meta::Ref;
@@ -852,7 +852,7 @@ fn evict_sets_entry_first() {
 /// and `set_hook(None)` removes the hook.
 #[test]
 fn hook_placement() {
-    let (file, map, pool) = fixture(2).unwrap();
+    let (file, map, pool) = fixture(3).unwrap();
     put_leaf(&file, &map, 1, 10, 0x11).unwrap();
     let seen: Arc<Mutex<Vec<(HookPoint, PageKey, FrameId)>>> = Arc::default();
     let sink = Arc::clone(&seen);
@@ -890,8 +890,33 @@ fn hook_placement() {
     assert_eq!(take(), vec![(CreateReady, L2, f1), (Pinned, L2, f1)]);
     let pf = pool.pin_frame(f1).unwrap().unwrap();
     drop(pf);
+    assert_eq!(take(), vec![(Pinned, L2, f1), (Unpinned, L2, f1)]);
+    // A live key: `Exists` pins the live frame; the reservation's frame
+    // (frame 2) fired `CreateReady` first.
+    let f2 = FrameId(2);
+    match pool.create(pool.reserve().unwrap(), L2, Kind::Leaf, 1) {
+        Ok(CreateOutcome::Exists(p, r)) => drop((p, r)),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+    assert_eq!(
+        take(),
+        vec![(CreateReady, L2, f2), (Pinned, L2, f1), (Unpinned, L2, f1)]
+    );
+    // A freed key: remade in its own frame.
+    p2.latch_exclusive().unwrap().mark_freed().unwrap();
+    let c = created!(pool.create(pool.reserve().unwrap(), L2, Kind::Leaf, 2));
+    assert_eq!(c.frame(), f1);
+    drop(c);
     drop(p2);
-    take();
+    assert_eq!(
+        take(),
+        vec![
+            (CreateReady, L2, f2),
+            (Pinned, L2, f1),
+            (Unpinned, L2, f1),
+            (Unpinned, L2, f1)
+        ]
+    );
     let v = pool.try_victim(f0).unwrap().unwrap();
     let vp = v.pin_frame().unwrap();
     assert!(matches!(v.remove_from_table().unwrap(), Removal::Kept));
@@ -1205,4 +1230,228 @@ fn range_checks() {
     let p = pinned!(pool.pin(L1, &map));
     assert!(pool.table_free());
     drop(p);
+}
+
+/// A chain as long as the pool: a walk reaches its tail, and the tail leaves
+/// the table (the card's `table_chains` removes a middle and a head).
+#[test]
+fn table_chain_ends() {
+    let (file, map, pool) = fixture(3).unwrap();
+    let bucket = pool.bucket_of(L1);
+    let mut keys = vec![L1];
+    keys.extend(
+        (2u64..)
+            .map(PageKey::Lpid)
+            .filter(|&k| pool.bucket_of(k) == bucket)
+            .take(2),
+    );
+    for (i, &k) in keys.iter().enumerate() {
+        let PageKey::Lpid(x) = k else { unreachable!() };
+        put_leaf(&file, &map, x, 10 + i as u64, 0x51 + i as u8).unwrap();
+    }
+    let frames: Vec<FrameId> = keys
+        .iter()
+        .map(|&k| pinned!(pool.pin(k, &map)).frame())
+        .collect();
+    // From its head the chain is keys[2], keys[1], keys[0]: three links.
+    for (&k, &f) in keys.iter().zip(&frames) {
+        assert_eq!(pool.frame_of(k).unwrap(), Some(f));
+    }
+    assert_eq!(drop_clean(&pool, frames[0]).unwrap(), Evicted::Removed);
+    assert_eq!(pool.frame_of(keys[0]).unwrap(), None);
+    assert_eq!(pool.frame_of(keys[1]).unwrap(), Some(frames[1]));
+    assert_eq!(pool.frame_of(keys[2]).unwrap(), Some(frames[2]));
+    // Reloaded, keys[0] heads the chain, and keys[1] is its tail.
+    let p = pinned!(pool.pin(keys[0], &map));
+    assert_eq!(marker(&p).unwrap(), 0x51);
+    drop(p);
+    assert_eq!(drop_clean(&pool, frames[1]).unwrap(), Evicted::Removed);
+    assert_eq!(pool.frame_of(keys[1]).unwrap(), None);
+    assert_eq!(pool.frame_of(keys[2]).unwrap(), Some(frames[2]));
+    assert!(pool.frame_of(keys[0]).unwrap().is_some());
+}
+
+/// An error from the `CurrentRef` ends the load before it is returned
+/// (S-STORE §5.4 "The load": a load ends, serving nothing, before its thread
+/// restarts): no frame is left in the table, none loading, none orphaned.
+#[test]
+fn current_ref_error_ends_load() {
+    struct Failing;
+    impl CurrentRef<FaultFile> for Failing {
+        fn current_ref(&self, _pool: &Pool<FaultFile>, _key: PageKey) -> Result<Ref, StoreError> {
+            Err(StoreError::Corrupt("the MapLeaf failed its check".into()))
+        }
+    }
+    let (file, map, pool) = fixture(2).unwrap();
+    put_leaf(&file, &map, 1, 10, 0x11).unwrap();
+    let e = error!(pool.pin(L1, &Failing));
+    assert!(
+        matches!(&e, StoreError::Corrupt(m) if m == "the MapLeaf failed its check"),
+        "{e:?}"
+    );
+    assert_eq!(pool.frame_of(L1).unwrap(), None);
+    let s = pool.stats().unwrap();
+    assert_eq!((s.free, s.loading, s.orphan, s.reads), (2, 0, 0, 0));
+    assert_eq!(file.reads(), 0);
+    assert_eq!(marker(&pinned!(pool.pin(L1, &map))).unwrap(), 0x11);
+}
+
+/// `stats().reads` counts every slot read a load issues, failed ones
+/// included, and nothing else: it stays equal to the page file's read log.
+#[test]
+fn reads_counted() {
+    let (file, map, pool) = fixture(2).unwrap();
+    put_leaf(&file, &map, 1, 10, 0x11).unwrap();
+    // L2: a page that fails §3.3. L3: past the end. L5: a failing read.
+    // L6: slot 1. L9: unmapped.
+    let (mut b, crc) = page(Kind::Leaf, 2, 1, 0x22).unwrap();
+    b[SPOIL] ^= 0xFF;
+    file.write_at(offset(11), &b).unwrap();
+    map.set(
+        L2,
+        Ref {
+            slot: 11,
+            epoch: 1,
+            crc,
+        },
+    );
+    put_leaf(&file, &map, 5, 12, 0x55).unwrap();
+    file.fail_read_at(Some(offset(12)));
+    map.set(
+        PageKey::Lpid(3),
+        Ref {
+            slot: 90,
+            epoch: 1,
+            crc: 0,
+        },
+    );
+    map.set(
+        PageKey::Lpid(6),
+        Ref {
+            slot: 1,
+            epoch: 1,
+            crc: 0,
+        },
+    );
+    let reads_are = |n: u64| {
+        assert_eq!(pool.stats().unwrap().reads, n);
+        assert_eq!(file.reads() as u64, n);
+    };
+    reads_are(0);
+    drop(pinned!(pool.pin(L1, &map)));
+    reads_are(1);
+    drop(pinned!(pool.pin(L1, &map)));
+    reads_are(1);
+    assert!(matches!(pool.pin(L2, &map), Err(StoreError::Corrupt(_))));
+    reads_are(2);
+    assert!(matches!(
+        pool.pin(PageKey::Lpid(3), &map),
+        Err(StoreError::Corrupt(_))
+    ));
+    reads_are(3);
+    assert!(matches!(
+        pool.pin(PageKey::Lpid(5), &map),
+        Err(StoreError::Env(_))
+    ));
+    reads_are(4);
+    assert!(matches!(
+        pool.pin(PageKey::Lpid(6), &map),
+        Err(StoreError::Corrupt(_))
+    ));
+    reads_are(4);
+    assert!(matches!(pool.pin(L9, &map), Ok(PinOutcome::Unmapped)));
+    reads_are(4);
+}
+
+/// Every hook a single thread fires finds the table mutex free, and so does
+/// every reference read (BUF-TABLE-LEAF: no hook fires and no `CurrentRef` is
+/// called under it). Single-threaded, so no other thread can hold it.
+#[test]
+fn hooks_fire_unlocked() {
+    let (file, map, pool) = fixture(3).unwrap();
+    let pool = Arc::new(pool);
+    put_leaf(&file, &map, 1, 10, 0x11).unwrap();
+    let weak = Arc::downgrade(&pool);
+    let fired = Arc::new(Mutex::new(Vec::<(HookPoint, Option<bool>)>::new()));
+    let sink = Arc::clone(&fired);
+    let hook: Hook = Arc::new(move |p, _k, _f| {
+        let free = weak.upgrade().map(|pool| pool.table_free());
+        sink.lock().unwrap().push((p, free));
+    });
+    pool.set_hook(Some(hook));
+    let p = pinned!(pool.pin(L1, &map));
+    drop(pool.pin_resident(L1).unwrap());
+    assert!(matches!(pool.pin(L9, &map), Ok(PinOutcome::Unmapped)));
+    let p2 = created!(pool.create(pool.reserve().unwrap(), L2, Kind::Leaf, 1)).release();
+    match pool.create(pool.reserve().unwrap(), L2, Kind::Leaf, 1) {
+        Ok(CreateOutcome::Exists(a, b)) => drop((a, b)),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+    p2.latch_exclusive().unwrap().mark_freed().unwrap();
+    drop(created!(pool.create(
+        pool.reserve().unwrap(),
+        L2,
+        Kind::Leaf,
+        2
+    )));
+    drop(pool.pin_frame(p2.frame()).unwrap());
+    drop(p2);
+    drop(p);
+    let v = pool.try_victim(FrameId(0)).unwrap().unwrap();
+    let vp = v.pin_frame().unwrap();
+    assert!(matches!(v.remove_from_table().unwrap(), Removal::Kept));
+    drop(vp);
+    let v = pool.try_victim(FrameId(0)).unwrap().unwrap();
+    assert!(matches!(
+        v.remove_from_table().unwrap(),
+        Removal::Removed(_)
+    ));
+    pool.set_hook(None);
+    let fired = fired.lock().unwrap().clone();
+    use HookPoint::*;
+    for point in [
+        MissReserved,
+        LoadPublished,
+        LoadResolved,
+        LoadRead,
+        Pinned,
+        Unpinned,
+        CreateReady,
+        RemoveLatched,
+    ] {
+        assert!(
+            fired.iter().any(|&(p, _)| p == point),
+            "{point:?} never fired"
+        );
+    }
+    assert!(
+        fired.iter().all(|&(_, free)| free == Some(true)),
+        "{fired:?}"
+    );
+    assert_eq!(map.locked_lookups(), 0);
+}
+
+/// `create` resets the flags a frame's last page left: a freed page's frame,
+/// dropped from the table, is made a live page that is not freed.
+#[test]
+fn create_resets_flags() {
+    let (_file, _map, pool) = fixture(2).unwrap();
+    let mut c = created!(pool.create(pool.reserve().unwrap(), L2, Kind::Leaf, 1));
+    c.mark_freed().unwrap();
+    let f = c.release().frame();
+    assert_eq!(drop_clean(&pool, f).unwrap(), Evicted::Removed);
+    // f tops the free list, its content still marked freed.
+    let c = created!(pool.create(pool.reserve().unwrap(), L4, Kind::Leaf, 3));
+    assert_eq!(c.frame(), f);
+    assert!(!c.is_freed() && c.is_dirty());
+    assert_eq!(c.content_epoch(), 3);
+    assert_eq!(
+        pool.frame_info(f).unwrap(),
+        FrameInfo {
+            state: FrameState::Resident,
+            key: Some(L4),
+            pins: 1,
+            freed: false
+        }
+    );
 }

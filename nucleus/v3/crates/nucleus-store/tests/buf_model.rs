@@ -450,6 +450,12 @@ fn compare(model: &Model, d: &Driver<'_>, keys: &[PageKey], buckets0: u32) -> Re
     if got != want {
         return Err(format!("stats {got:?}, model {want:?}"));
     }
+    if d.map.locked_lookups() != 0 {
+        return Err(format!(
+            "{} reference reads under the table mutex",
+            d.map.locked_lookups()
+        ));
+    }
     if reads != d.file.reads() as u64 {
         return Err(format!("stats.reads {reads}, file log {}", d.file.reads()));
     }
