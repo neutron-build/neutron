@@ -58,12 +58,20 @@ pub struct FaultFile {
 impl FaultFile {
     /// A new, empty page file `data` in a fresh `MemEnv`.
     pub fn new() -> Result<FaultFile, EnvError> {
-        Ok(FaultFile {
-            inner: MemEnv::new(1).open("data", OpenMode::CreateNew)?,
+        Ok(FaultFile::over(
+            MemEnv::new(1).open("data", OpenMode::CreateNew)?,
+        ))
+    }
+
+    /// A page file over an open handle, with an empty log: for a test that
+    /// resets one file's bytes between runs instead of growing a new one.
+    pub fn over(inner: MemFile) -> FaultFile {
+        FaultFile {
+            inner,
             log: Mutex::new(Vec::new()),
             fail_at: Mutex::new(None),
             writes: AtomicUsize::new(0),
-        })
+        }
     }
 
     /// Make every later `read_at` at `off` fail with an injected `Io`

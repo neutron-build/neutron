@@ -9,16 +9,18 @@
 mod buf_support;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::thread;
 
 use buf_support::{
-    Event, FaultFile, MARK, Pauser, SPOIL, TestMap, fixture, marker, offset, page, put_leaf, spawn,
+    Event, FaultFile, MARK, PS, Pauser, SPOIL, TestMap, fixture, marker, offset, page, put_leaf,
+    spawn,
 };
-use nucleus_env::File;
+use nucleus_env::{Env, EnvError, File, MemEnv, MemFile, OpenMode};
 use nucleus_store::StoreError;
 use nucleus_store::buf::{
     CreateOutcome, FrameId, FrameInfo, FrameState, HookPoint, PageKey, Pin, PinOutcome, Pool,
-    PoolStats, Removal,
+    PoolConfig, PoolStats, Removal,
 };
 use nucleus_store::meta::Ref;
 use nucleus_store::page::{self, Kind};
@@ -536,10 +538,70 @@ fn fixed(pages: &[(PageKey, u64, u8)]) -> Result<Vec<Fixed>, StoreError> {
         .collect()
 }
 
-/// Run `ops` on a fresh fixture of `frames` frames holding `pages`, comparing
-/// the pool with the model after every op; `keys` are every key of the run.
-fn run(frames: u32, pages: &[Fixed], keys: &[PageKey], ops: &[Op]) -> Result<(), String> {
-    let (file, map, pool) = fixture(frames).map_err(text)?;
+/// The runs' page file. A fresh `MemFile` zero-fills every byte below slot
+/// 10 one at a time in a debug build, which dominated 22,620 runs; so the
+/// file is made once and, before every run, reset to the fixture's image
+/// (the pages at their slots, zeros elsewhere) and checked against it byte
+/// for byte through a handle of its own. Each run then starts from exactly
+/// the bytes a fresh file would hold, through a fresh `FaultFile` handle with
+/// an empty log, a fresh pool and a fresh test map.
+struct Disk {
+    env: MemEnv,
+    raw: MemFile,
+    image: Vec<u8>,
+}
+
+impl Disk {
+    fn new(pages: &[Fixed]) -> Result<Disk, String> {
+        let env = MemEnv::new(1);
+        let raw = env
+            .open("data", OpenMode::CreateNew)
+            .map_err(|e| e.to_string())?;
+        let len = pages.iter().map(|p| offset(p.slot + 1)).max().unwrap_or(0);
+        let mut image = vec![0u8; len as usize];
+        for p in pages {
+            let at = offset(p.slot) as usize;
+            image[at..at + p.bytes.len()].copy_from_slice(&p.bytes);
+        }
+        Ok(Disk { env, raw, image })
+    }
+
+    /// A `FaultFile` with an empty log over the file, reset to the image.
+    fn fresh(&self) -> Result<Arc<FaultFile>, String> {
+        let text = |e: EnvError| e.to_string();
+        let len = self.image.len() as u64;
+        self.raw.set_len(len).map_err(text)?;
+        self.raw.write_at(0, &self.image).map_err(text)?;
+        let mut back = vec![0u8; self.image.len()];
+        let n = self.raw.read_at(0, &mut back).map_err(text)?;
+        if n != self.image.len() || back != self.image || self.raw.len().map_err(text)? != len {
+            return Err("the reset page file differs from the fixture's image".into());
+        }
+        let handle = self.env.open("data", OpenMode::ReadWrite).map_err(text)?;
+        Ok(Arc::new(FaultFile::over(handle)))
+    }
+}
+
+/// Run `ops` on a fresh fixture of `frames` frames holding `pages` (on
+/// `disk`, reset), comparing the pool with the model after every op; `keys`
+/// are every key of the run.
+fn run(
+    disk: &Disk,
+    frames: u32,
+    pages: &[Fixed],
+    keys: &[PageKey],
+    ops: &[Op],
+) -> Result<(), String> {
+    let file = disk.fresh()?;
+    let pool = Pool::new(
+        Arc::clone(&file),
+        PoolConfig {
+            frames,
+            page_size: PS,
+        },
+    )
+    .map_err(text)?;
+    let map = TestMap::new();
     let mut model = Model {
         frames,
         disk: HashMap::new(),
@@ -550,8 +612,6 @@ fn run(frames: u32, pages: &[Fixed], keys: &[PageKey], ops: &[Op]) -> Result<(),
         next_slot: 40,
     };
     for p in pages {
-        file.write_at(offset(p.slot), &p.bytes)
-            .map_err(|e| e.to_string())?;
         map.set(p.key, p.r);
         model.disk.insert(p.slot, (p.marker, false));
         model.entry.insert(p.key, Some(p.slot));
@@ -579,6 +639,7 @@ fn run(frames: u32, pages: &[Fixed], keys: &[PageKey], ops: &[Op]) -> Result<(),
 fn buf_model_exhaustive() {
     // F 2; L1 at slot 10 (marker 1), L2 at slot 11 (marker 2), L4 unmapped.
     let pages = fixed(&[(L1, 10, 1), (L2, 11, 2)]).unwrap();
+    let disk = Disk::new(&pages).unwrap();
     let keys = [L1, L2, L4];
     // The alphabet; `Write`'s marker is set per sequence, 0x40 up.
     let alphabet = [
@@ -614,7 +675,7 @@ fn buf_model_exhaustive() {
                     }
                 })
                 .collect();
-            if let Err(e) = run(2, &pages, &keys, &ops) {
+            if let Err(e) = run(&disk, 2, &pages, &keys, &ops) {
                 panic!("{ops:?}: {e}");
             }
             runs += 1;
@@ -654,7 +715,8 @@ proptest! {
     fn buf_model_random(frames in 1u32..=3, ops in prop::collection::vec(op(), 1..=48)) {
         // L1, L2, L3 at slots 10–12, M0 at slot 13, L4 unmapped.
         let pages = fixed(&[(L1, 10, 1), (L2, 11, 2), (L3, 12, 3), (M0, 13, 0x30)]).unwrap();
-        run(frames, &pages, &[L1, L2, L3, L4, M0], &ops).map_err(TestCaseError::fail)?;
+        let disk = Disk::new(&pages).unwrap();
+        run(&disk, frames, &pages, &[L1, L2, L3, L4, M0], &ops).map_err(TestCaseError::fail)?;
     }
 }
 
