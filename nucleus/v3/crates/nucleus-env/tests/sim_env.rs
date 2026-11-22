@@ -14,10 +14,12 @@
 mod common;
 
 use nucleus_env::sim::{
-    DiskEvent, FaultKnobs, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sim, SimEnv,
+    DiskEvent, FaultKnobs, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sched, SchedCore,
+    SchedHost, Sim, SimEnv, WaitKey,
 };
 use nucleus_env::{Env, EnvError, File, OpenMode};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Verbatim from E4's `tests/sim.rs` (card A-1b Work 6): the knobs
@@ -1101,4 +1103,104 @@ fn sim_halted_off_task() {
         Ok(())
     });
     assert_life_ok(&out);
+}
+
+// ---- FLAKE-FIX-1 (card FLAKE-FIX-1 Work 4): the start/finish race pins ----
+
+/// **SIMENV-FLAKE-1, forced deterministically (FLAKE-FIX-1 Work 4):**
+/// the racy interleaving itself — a workload task's wrapper runs the
+/// body and `Sched::finish` before the harness thread (descheduled
+/// between `scope.spawn` and `sched.start()` in `run_life`) has parked.
+/// Pre-fix, `handoff_locked` found zero runnable candidates with
+/// `any_alive` true and failed the healthy world as `DEADLOCK`;
+/// FLAKE-FIX-1's guard recognises the baton-home-all-finished world as
+/// a completed life. Joining the finisher first makes `finish` strictly
+/// precede the harness's park — the exact race window, without the
+/// race. Direct-`Sched` shape of `r14_pre_baton_host_step_is_refused`.
+#[test]
+fn sim_start_after_finish_is_not_deadlock() {
+    /// The minimal host: just the scheduler core.
+    struct Host {
+        sched: SchedCore,
+    }
+    impl SchedHost for Host {
+        fn sched_mut(&mut self) -> &mut SchedCore {
+            &mut self.sched
+        }
+    }
+    let sched = Arc::new(Sched::new(Host {
+        sched: SchedCore::new(2, 991),
+    }));
+    let finisher = Arc::clone(&sched);
+    let t = std::thread::spawn(move || {
+        finisher.finish(1);
+    });
+    t.join().unwrap();
+    assert!(
+        sched.start().is_ok(),
+        "a start() that parks after every task already finished is a completed life, not a deadlock (SIMENV-FLAKE-1)"
+    );
+}
+
+/// **FLAKE-FIX-1 pin 2: a wait/wake pair completes a life.** Task 1
+/// parks on `Tree(1)`; task 2 wakes it a thousand times, each wake
+/// after its own yield — the yield hands the baton around, so a wake
+/// that lands before the waiter parks is always followed by another
+/// after it: the lost-wakeup window is un-hittable for any fixed seed.
+/// The life must complete cleanly: no false deadlock, no livelock, no
+/// hang.
+#[test]
+fn sim_wait_wake_completes() {
+    let mut sim = Sim::new(2, drop_all());
+    let out = sim.run_life(2, None, |env, t| {
+        if t == 1 {
+            env.wait_for(WaitKey::Tree(1))?;
+            Ok(())
+        } else {
+            for _ in 0..1000 {
+                env.yield_now("wake:step")?;
+                env.wake(WaitKey::Tree(1));
+            }
+            Ok(())
+        }
+    });
+    assert_life_ok(&out);
+}
+
+/// **FLAKE-FIX-1 pin 3: a genuinely all-parked world is still
+/// reported.** The only task parks on a key nobody ever wakes — a real
+/// deadlock. `run_life` must return (not hang), the world flags must
+/// name the deadlock, and the task's own result must show it unwound
+/// through the failure — never a panic, never a quiet `Ok`. (Card
+/// Work 4 named only `Err(EnvError::Crashed)`; the task that trips
+/// the detector unwinds through its own `park_locked`, which returns
+/// `SimFail::Deadlock` → `Halted { "deadlock" }` — `Crashed` is what
+/// every *other* task sees at its next scheduler call — so both arms
+/// are caught here. Verbatim-body evidence in the card's RESULT.)
+#[test]
+fn sim_real_deadlock_reported() {
+    let mut sim = Sim::new(1, drop_all());
+    let out = sim.run_life(1, None, |env, _t| match env.wait_for(WaitKey::Tree(7)) {
+        Ok(()) => panic!("woke with no waker"),
+        Err(EnvError::Crashed) | Err(EnvError::Halted { .. }) => Ok(()),
+        Err(e) => Err(e),
+    });
+    assert!(
+        out.deadlock,
+        "a genuinely all-parked world is reported as deadlock"
+    );
+    assert!(out.crashed, "the deadlock fails the world as a crash does");
+    assert!(
+        !out.panicked,
+        "the deadlock unwinds the task, it does not panic it"
+    );
+    assert!(
+        out.livelock.is_none(),
+        "a parked world is a deadlock, not a livelock"
+    );
+    assert_eq!(
+        out.results,
+        vec![Ok(())],
+        "the task observes the world failure and unwinds"
+    );
 }
