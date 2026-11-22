@@ -299,6 +299,11 @@ fn read_back(sim: &mut Sim, name: &'static str) -> Option<(u64, Vec<u8>)> {
 /// written and still unsynced (iv-b) before it: `[100, 1000)` reads
 /// zeros, as in (i) — `sync_all` makes the current bytes durable,
 /// exactly (D3 (a), this card's judgment call over truncation alone).
+/// (v) a new empty file and three unsynced writes of nonzero bytes over
+/// four sectors, cut at `keep_latest_pm` 500 and `tear_pm` 500 over seeds
+/// 0..32: the length is 0 or its last byte is one a surviving write put
+/// there, never a zero past the written data — whatever prefix each
+/// sector keeps (D3 (b)'s prefix and its clip at the sector's end).
 #[test]
 fn sim_disk_lengths() {
     let aa = [0xAAu8; 1024];
@@ -403,6 +408,38 @@ fn sim_disk_lengths() {
             bytes[100..].iter().filter(|&&b| b != 0).count()
         );
     }
+
+    // (v) any prefix per sector: the length ends at written data.
+    let mixed = FaultKnobs {
+        keep_latest_pm: 500,
+        tear_pm: 500,
+    };
+    let mut unaligned = 0u32;
+    for seed in 0..32u64 {
+        let mut sim = Sim::new(seed, mixed);
+        durable_empty_file(&mut sim, "h");
+        let out = sim.run_life(1, None, |env, _t| {
+            let f = env.open("h", OpenMode::ReadWrite)?;
+            f.write_at(0, &[0x11u8; 700])?;
+            f.write_at(600, &[0x22u8; 500])?;
+            f.write_at(1500, &[0x33u8; 100])?;
+            Ok(())
+        });
+        assert_life_ok(&out);
+        sim.power_cut();
+        let (len, bytes) = read_back(&mut sim, "h").unwrap();
+        if len > 0 {
+            assert_ne!(
+                bytes.last(),
+                Some(&0),
+                "(v) seed {seed}: the length {len} ends past the written data"
+            );
+        }
+        if len % 512 != 0 {
+            unaligned += 1;
+        }
+    }
+    assert!(unaligned > 0, "(v): no seed kept a length off a sector end");
 }
 
 /// The names bound after a power cut, from a fixed list (`wal/<name>`).
@@ -454,7 +491,12 @@ fn durable_wal(seed: u64, knobs: FaultKnobs, mode: DirLoss, names: &'static [&'s
 /// one beside the writes. (v) the Base's golden: three unsynced creates
 /// `wal/p0`–`p2`, seeds 0..32 at `keep_latest_pm` 500, give exactly the
 /// survivors E4's rule gave on the Base, under the default and under an
-/// explicit `Prefix` (PREFIX-DRAWS-MOVED fails it).
+/// explicit `Prefix` (PREFIX-DRAWS-MOVED fails it). (vi) the
+/// applicability of `Create` and `Unlink` too: durable `wal/a`, then an
+/// unsynced rename `a → b`, a create of a new `a` and its removal, under
+/// `Independent` at `keep_latest_pm` 500: the first file keeps exactly
+/// one name, `a` or `b`, whichever its own rename left it, so neither the
+/// new file's create nor its unlink ever takes `a` from it.
 #[test]
 fn sim_dir_loss_independent() {
     const ABCD: &[&str] = &["a", "b", "c", "d"];
@@ -559,6 +601,40 @@ fn sim_dir_loss_independent() {
     assert!(
         neither > 0,
         "(iii): no seed lost the create (and with it the rename)"
+    );
+
+    // (vi) a kept op that no longer applies is dropped: Create and
+    // Unlink as well as Rename.
+    let mut renamed = 0u32;
+    let mut stayed = 0u32;
+    for seed in 0..64u64 {
+        let mut sim = durable_wal(seed, half, DirLoss::Independent, &["a"]);
+        let first = sim.file_id("wal/a").unwrap().unwrap();
+        let out = sim.run_life(1, None, |env, _t| {
+            env.rename("wal/a", "wal/b")?;
+            env.open("wal/a", OpenMode::CreateNew)?;
+            env.remove("wal/a")?;
+            Ok(())
+        });
+        assert_life_ok(&out);
+        sim.power_cut();
+        let a = sim.file_id("wal/a").unwrap();
+        let b = sim.file_id("wal/b").unwrap();
+        match (a == Some(first), b == Some(first)) {
+            (true, false) => stayed += 1,
+            (false, true) => renamed += 1,
+            _ => panic!("(vi) seed {seed}: the first file is under a={a:?} b={b:?}"),
+        }
+        if let Some(id) = a {
+            assert!(
+                id == first || b == Some(first),
+                "(vi) seed {seed}: the new file took a while the first file kept no name"
+            );
+        }
+    }
+    assert!(
+        renamed > 0 && stayed > 0,
+        "(vi): renamed {renamed}, stayed {stayed}: both outcomes must occur"
     );
 
     // (iv) the file data is resolved the same way in both modes.
