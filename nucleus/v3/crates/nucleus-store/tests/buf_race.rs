@@ -858,8 +858,10 @@ fn hooks_on_wait() {
     );
 }
 
-// ---- Card A-3a-F2 (verdict A-3a, finding 2): the claim a creation makes on
-// a freed key's frame, pinned, on threads under a `Pauser`.
+// ---- Card A-3a-F2 (verdict A-3a, findings 2 and 4): the claim a creation
+// makes on a freed key's frame, pinned, and what follows the claim on error.
+// `create_vs_freed` runs on threads under a `Pauser`; `create_freed_poison`
+// is one thread and no hook.
 
 /// What creator A saw of the page `create` gave it, read before A wrote to
 /// it (`create_vs_freed`).
@@ -879,7 +881,7 @@ struct NewPage {
     epoch: u32,
 }
 
-/// The freed frame of `create_vs_freed`, as
+/// The freed frame of `create_vs_freed` and `create_freed_poison`, as
 /// `t_pin_load_race_g` makes it: `k` created in epoch 1 at the first
 /// attempt, marked 0x81, unmapped, then freed under a pin that is kept on
 /// its frame as a stale name's would be. No hook is set. Returns the pin and
@@ -1163,4 +1165,52 @@ fn create_vs_freed() {
         (2, 0, 0, 1, 0)
     );
     assert_eq!(file.reads(), 0);
+}
+
+/// The freed branch's error path gives the claim back (verdict A-3a, finding
+/// 2; card A-3a-F2): with `g`'s latch poisoned, a creation of `K` returns
+/// `Poisoned` and the table's mirror says the frame is freed again, as its
+/// content still is (the failing path writes nothing; the content cannot be
+/// read through the poisoned latch, so the test judges the mirror). The
+/// frame keeps its key and its one pin, and the creation's reservation is
+/// back on the free list. FREED-STAYS-CLAIMED fails it.
+#[test]
+fn create_freed_poison() {
+    const K: PageKey = PageKey::Lpid(8);
+    let (_file, map, pool) = fixture(3).unwrap();
+    let (stale, g) = freed_frame(&pool, &map, K).unwrap();
+    // Poison g's latch with a panic under it, inside `catch_unwind`. The
+    // panic hook is not replaced (it is process-wide), and the table mutex
+    // is not held here: only the latch is poisoned.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = stale.latch_exclusive().unwrap();
+        panic!("poison the freed frame's latch for create_freed_poison");
+    }));
+    assert!(
+        poisoned.is_err(),
+        "the panic under the latch was not caught"
+    );
+    let before = pool.stats().unwrap();
+    let made = pool.create(pool.reserve().unwrap(), K, Kind::Leaf, 2);
+    assert!(matches!(made, Err(StoreError::Poisoned(_))), "{made:?}");
+    assert_eq!(
+        pool.frame_info(g).unwrap(),
+        FrameInfo {
+            state: FrameState::Resident,
+            key: Some(K),
+            pins: 1,
+            freed: true
+        },
+        "the claim is given back; only stale counts"
+    );
+    assert_eq!(pool.frame_of(K).unwrap(), Some(g));
+    let st = pool.stats().unwrap();
+    assert_eq!(
+        (st.free, st.reserved, st.loading, st.resident, st.orphan),
+        (2, 0, 0, 1, 0)
+    );
+    assert_eq!(
+        st.free, before.free,
+        "the reservation's frame is back on the free list"
+    );
 }

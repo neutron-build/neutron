@@ -836,9 +836,24 @@ impl<H: File> Pool<H> {
                 self.fire(HookPoint::FreedClaimed, key, g);
                 // A freed frame's latch holders hold nothing else: stale-name
                 // threads (§6.8) and `try_victim`.
-                let mut gc = self.latch(g)?.exclusive()?;
-                init_page(&mut gc, kind, id, epoch)?;
-                let guard = ExclusiveGuard::held(gc, self, key, g);
+                let made = self
+                    .latch(g)
+                    .and_then(FrameLatch::exclusive)
+                    .and_then(|mut gc| {
+                        init_page(&mut gc, kind, id, epoch)
+                            .map(|()| ExclusiveGuard::held(gc, self, key, g))
+                    });
+                let guard = match made {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        // The claim is given back before the error is
+                        // returned, so before `pin` drops: the frame is
+                        // freed again by the table's mirror, as it still is
+                        // by its content (card A-3a-F2).
+                        self.lock_table()?.meta_mut(g)?.freed = true;
+                        return Err(e);
+                    }
+                };
                 self.fire(HookPoint::Pinned, key, g);
                 Ok(CreateOutcome::Created(CreatedPage::new(guard, pin)))
             }
