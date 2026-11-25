@@ -25,6 +25,10 @@
 //!   `rand`, `now`, `wake` and `accepted` included, runs before its
 //!   task holds the baton. The wait is a park, not a yield: it draws
 //!   nothing and counts no yield.
+//!   A handle used after its life ended answers at once —
+//!   `Halted { "the life has ended" }` from a fallible call, 0 from `rand`,
+//!   the final clock from `now`, nothing from `sleep` and `wake` — and
+//!   never parks (S-LIVE; Work 10).
 //! - **Yield then step** (E4 card 1.2, kept). Every `Env` and `File`
 //!   method except `now`, `rand`, [`SimFile::accepted`] and `Drop`
 //!   first calls `yield_baton_at(task, "env:<method>")`, where the
@@ -93,9 +97,11 @@
 //!   yield point and then adds `d`. `rand` draws from a per-life
 //!   stream (`sim_clock_and_rand`, `sim_life_is_deterministic`).
 //!   A task observes a crash only through a fallible call. `now` and
-//!   `sleep` keep working in a failed world, and every `sleep`
-//!   advances the clock by its `d`, so a time-bounded loop ends after
-//!   a crash (A-1b-F1 (b); `sim_sleep_after_crash`).
+//!   `sleep` keep working in a failed world: each `sleep` there advances
+//!   the calling task's own clock by its `d`, so a time-bounded loop ends
+//!   after a crash, while the world's clock stays where the failure left
+//!   it, so one task's unwinding never moves another task's time or the
+//!   next life's (A-1b-F1 (b); S-DET).
 //! - **Streams.** Every stream is `rng::derive(seed, TAG)` with fixed
 //!   `TAG` constants, so adding or removing a stream never perturbs
 //!   the others (rng.rs's rule): the schedule per life
@@ -159,6 +165,33 @@ const TAG_MEDIA: u64 = 0x00A1_7B04;
 // from it is `Halted`.
 thread_local! {
     static TASK: std::cell::Cell<Option<TaskId>> = const { std::cell::Cell::new(None) };
+    /// The calling task's own post-failure clock offset in nanoseconds
+    /// (card A-6b-0 Work 2; the A-6b-0 ruling R1). It is 0 until this
+    /// task's `sleep` fails in a failed world, and only this task's
+    /// thread ever reads or writes it: after a failure every task
+    /// unwinds on its own OS thread, so one clock shared by all of them
+    /// would follow thread order (S-DET). `run_life` sets it to 0 beside
+    /// `TASK`, so the next life, on fresh threads, starts without it.
+    static FAILED_SLEEP_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The life-ended check every `SimEnv` and `SimFile` entry point makes
+/// before any yield, acquisition or other access to the world (card
+/// A-6b-0 Work 10; the A-6b-0 ruling R2). `run_life` sets the flag once
+/// every task thread has joined, so it is never set in a live life. A
+/// handle kept past its life answers this instead of parking on a world
+/// that will never hand out its baton again (S-LIVE: never a hang). The
+/// answer is built here, not through [`halt`]: an ended life has no world
+/// left to record in, so none of these is a halt. One atomic read: no
+/// scheduler and no lock.
+fn life_ended(ended: &AtomicBool) -> Result<(), EnvError> {
+    if ended.load(Ordering::SeqCst) {
+        Err(EnvError::Halted {
+            what: "the life has ended".to_string(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// S-ENV "Errors" (A-1b-F1 (f)): every `Halted` this layer raises is
@@ -207,14 +240,17 @@ fn fail(sched: &Sched<SimWorld>, f: SimFail) -> EnvError {
     }
 }
 
-/// S-ENV yield then step: the leading yield — where an armed crash
-/// fires, so a crashed operation never executes — then one atomic
-/// step under the world lock (E4's card 1.2 shape, kept).
+/// S-ENV yield then step: the life-ended check (Work 10), then the
+/// leading yield — where an armed crash fires, so a crashed operation
+/// never executes — then one atomic step under the world lock (E4's card
+/// 1.2 shape, kept).
 fn yield_step<T>(
+    ended: &AtomicBool,
     sched: &Sched<SimWorld>,
     site: &'static str,
     f: impl FnOnce(&mut SimWorld) -> Result<T, EnvError>,
 ) -> Result<T, EnvError> {
+    life_ended(ended)?;
     let task = current_task(sched)?;
     sched
         .yield_baton_at(task, site)
@@ -749,7 +785,10 @@ impl Sim {
     /// (S-ENV "Locks"). Each life begins a new disk round (the
     /// per-round read, accept and event logs clear; taint references
     /// and durable-write history survive). The outcome carries every
-    /// `Halted` the layer raised in the life (A-1b-F1 (f)).
+    /// `Halted` the layer raised in the life (A-1b-F1 (f)). Once every
+    /// task thread has joined, the life is marked ended, and a handle of
+    /// this life that outlives it answers at once and never parks
+    /// (Work 10; the A-6b-0 ruling R2).
     pub fn run_life<F>(&mut self, tasks: usize, crash_at_yield: Option<u64>, body: F) -> LifeOutcome
     where
         F: Fn(&SimEnv, TaskId) -> Result<(), EnvError> + Send + Sync,
@@ -776,6 +815,11 @@ impl Sim {
             halts: Vec::new(),
         };
         let sched = Arc::new(Sched::new(world));
+        // The life-ended flag (Work 10): every `SimEnv` of this life, and
+        // every `SimFile` opened through one, holds a clone. It is set
+        // below, after the joins, and at no other time, so in a live life
+        // it is never set and no live call changes.
+        let ended = Arc::new(AtomicBool::new(false));
         let panicked = Arc::new(AtomicBool::new(false));
         let results_lock = Mutex::new(Vec::<(TaskId, Result<(), EnvError>)>::new());
         std::thread::scope(|scope| {
@@ -787,9 +831,16 @@ impl Sim {
                 let results = &results_lock;
                 let env = SimEnv {
                     sched: Arc::clone(&sched),
+                    ended: Arc::clone(&ended),
                 };
                 handles.push(scope.spawn(move || {
                     TASK.with(|c| c.set(Some(t)));
+                    // This task's own post-failure clock offset starts at 0
+                    // (the A-6b-0 ruling R1): the offset belongs to one task
+                    // in one life. A thread spawned for the life starts at 0
+                    // anyway; setting it here makes that hold by
+                    // construction, wherever the thread came from.
+                    FAILED_SLEEP_NS.with(|off| off.set(0));
                     // A-1b-F1 (a): the body starts only once the baton
                     // first reaches this task — a park, not a yield, so
                     // it draws nothing and counts no yield. A world that
@@ -824,6 +875,12 @@ impl Sim {
                 let _ = h.join();
             }
         });
+        // Work 10: the scope has returned, so every task thread has joined,
+        // and the world has not been taken back yet. From here on no call of
+        // this life is live: every handle of it that survives is stale, and
+        // each of its entry points answers at once instead of parking on a
+        // world whose baton will never move again.
+        ended.store(true, Ordering::SeqCst);
         // Take the world back out of the scheduler (it may outlive the
         // life through a leaked SimEnv clone; the disk moves home
         // regardless, and a stale handle then answers `Halted`).
@@ -984,20 +1041,27 @@ pub struct LifeOutcome {
 }
 
 /// A task's view of the world: clone it freely inside the life's body
-/// (S-ENV). Implements [`Env`].
+/// (S-ENV). Implements [`Env`]. A clone kept past the end of its life
+/// answers at once and never parks (Work 10).
 #[derive(Clone)]
 pub struct SimEnv {
     sched: Arc<Sched<SimWorld>>,
+    /// Set by [`Sim::run_life`] once the life has ended (Work 10); read
+    /// by every entry point before it touches the world.
+    ended: Arc<AtomicBool>,
 }
 
 impl SimEnv {
-    /// The calling task (S-ENV "Tasks"): `Halted` off a task thread.
+    /// The calling task (S-ENV "Tasks"): `Halted` off a task thread, and
+    /// `Halted` on a handle whose life has ended (Work 10).
     pub fn task(&self) -> Result<TaskId, EnvError> {
+        life_ended(&self.ended)?;
         current_task(&self.sched)
     }
 
     /// A plain yield point naming its site (E4's `EnvRef::yield_at`).
     pub fn yield_now(&self, site: &'static str) -> Result<(), EnvError> {
+        life_ended(&self.ended)?;
         let task = current_task(&self.sched)?;
         self.sched
             .yield_baton_at(task, site)
@@ -1007,14 +1071,19 @@ impl SimEnv {
     /// Park on a wait key (the scheduler-level condition variable;
     /// E4's `EnvRef::wait_for`).
     pub fn wait_for(&self, key: WaitKey) -> Result<(), EnvError> {
+        life_ended(&self.ended)?;
         let task = current_task(&self.sched)?;
         self.sched
             .wait_for(task, key)
             .map_err(|e| fail(&self.sched, e))
     }
 
-    /// Wake every task parked on `key` (E4's scheduler `wake`).
+    /// Wake every task parked on `key` (E4's scheduler `wake`). Nothing
+    /// happens on a handle whose life has ended (Work 10).
     pub fn wake(&self, key: WaitKey) {
+        if life_ended(&self.ended).is_err() {
+            return;
+        }
         self.sched.wake(key)
     }
 }
@@ -1024,9 +1093,10 @@ impl Env for SimEnv {
 
     fn open(&self, p: &str, mode: OpenMode) -> Result<SimFile, EnvError> {
         path::check(p)?;
-        let (id, handle) = yield_step(&self.sched, "env:open", |w| w.open(p, mode))?;
+        let (id, handle) = yield_step(&self.ended, &self.sched, "env:open", |w| w.open(p, mode))?;
         Ok(SimFile {
             sched: Arc::clone(&self.sched),
+            ended: Arc::clone(&self.ended),
             path: p.to_string(),
             id,
             handle,
@@ -1036,12 +1106,14 @@ impl Env for SimEnv {
 
     fn create_dir(&self, p: &str) -> Result<(), EnvError> {
         path::check(p)?;
-        yield_step(&self.sched, "env:create_dir", |w| w.create_dir(p))
+        yield_step(&self.ended, &self.sched, "env:create_dir", |w| {
+            w.create_dir(p)
+        })
     }
 
     fn sync_dir(&self, p: &str) -> Result<(), EnvError> {
         path::check_dir(p)?;
-        yield_step(&self.sched, "env:sync_dir", |w| w.sync_dir(p))
+        yield_step(&self.ended, &self.sched, "env:sync_dir", |w| w.sync_dir(p))
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), EnvError> {
@@ -1056,57 +1128,91 @@ impl Env for SimEnv {
                 why: "cross-directory rename",
             });
         }
-        yield_step(&self.sched, "env:rename", |w| w.rename(from, to))
+        yield_step(&self.ended, &self.sched, "env:rename", |w| {
+            w.rename(from, to)
+        })
     }
 
     fn remove(&self, p: &str) -> Result<(), EnvError> {
         path::check(p)?;
-        yield_step(&self.sched, "env:remove", |w| w.remove(p))
+        yield_step(&self.ended, &self.sched, "env:remove", |w| w.remove(p))
     }
 
     fn exists(&self, p: &str) -> Result<bool, EnvError> {
         path::check(p)?;
-        yield_step(&self.sched, "env:exists", |w| Ok(w.exists(p)))
+        yield_step(&self.ended, &self.sched, "env:exists", |w| Ok(w.exists(p)))
     }
 
     fn list_dir(&self, p: &str) -> Result<Vec<String>, EnvError> {
         path::check_dir(p)?;
-        yield_step(&self.sched, "env:list_dir", |w| w.list_dir(p))
+        yield_step(&self.ended, &self.sched, "env:list_dir", |w| w.list_dir(p))
     }
 
     fn now(&self) -> Duration {
         // Not a yield point (S-ENV): the virtual clock, read without
-        // offering the baton. `Sched::lock` is poison-tolerant.
-        Duration::from_nanos(self.sched.lock().clock_ns)
+        // offering the baton. `Sched::lock` is poison-tolerant and is
+        // never held across a park, so this cannot wait on the scheduler.
+        // On a task thread of a live life the answer is the world's clock
+        // plus that task's own post-failure offset (A-1b-F1 (b); the
+        // A-6b-0 ruling R1), which is 0 until the task's first `sleep` in a
+        // failed world and which no other task can move. Off a task thread
+        // it is the world's clock alone. So it is on a handle whose life
+        // has ended: that life's final clock, whatever the calling thread's
+        // own offset (Work 10).
+        let clock_ns = self.sched.lock().clock_ns;
+        let offset = if life_ended(&self.ended).is_ok() && TASK.with(|t| t.get()).is_some() {
+            FAILED_SLEEP_NS.with(|off| off.get())
+        } else {
+            0
+        };
+        Duration::from_nanos(clock_ns.saturating_add(offset))
     }
 
     fn sleep(&self, d: Duration) {
-        // A yield point, then the clock advances by exactly `d` — also
-        // when the yield fails because the world failed (a crash, a
-        // deadlock or a livelock): a task observes a crash only through
-        // a fallible call, and a time-bounded loop must still end
-        // (A-1b-F1 (b)). The failure itself is mapped as at every other
-        // yield, so a livelock tripped here is recorded as a halt and a
-        // crash is not. Off a task thread nothing moves and the call is
-        // a recorded halt. An S-BATON refusal (this thread already holds
-        // the world) cannot take the lock for the clock, so it returns
-        // with the clock unmoved.
+        // A handle whose life has ended does nothing (Work 10).
+        if life_ended(&self.ended).is_err() {
+            return;
+        }
+        // A yield point, then the clock advances by exactly `d`. When the
+        // yield fails because the world failed (a crash, a deadlock or a
+        // livelock), only the calling task's own clock advances by `d`,
+        // and the world's clock stays where the failure left it: a task
+        // observes a crash only through a fallible call and a time-bounded
+        // loop must still end (A-1b-F1 (b)), but after the failure every
+        // task unwinds on its own OS thread, so a clock shared by all of
+        // them would follow thread order, and the next life would inherit
+        // the result (S-DET; the A-6b-0 ruling R1). The failure itself is
+        // mapped as at every other yield, so a livelock tripped here is
+        // recorded as a halt and a crash is not. Off a task thread nothing
+        // moves and the call is a recorded halt. An S-BATON refusal (this
+        // thread already holds the world) cannot take the lock for the
+        // clock, so it returns with nothing advanced.
         let Ok(task) = current_task(&self.sched) else {
             return;
         };
+        let add = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         if let Err(f) = self.sched.yield_baton_at(task, "env:sleep") {
             let holds_world = matches!(f, SimFail::Baton(_));
             let _ = fail(&self.sched, f);
             if holds_world {
                 return;
             }
+            // This task's offset alone: no lock and no world access, so
+            // two tasks unwinding at once cannot interleave here.
+            FAILED_SLEEP_NS.with(|off| off.set(off.get().saturating_add(add)));
+            return;
         }
-        let add = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let mut guard = self.sched.lock();
         guard.clock_ns = guard.clock_ns.saturating_add(add);
     }
 
     fn rand(&self) -> u64 {
+        // A handle whose life has ended answers 0 without touching the
+        // scheduler (Work 10): on a crashed life's world the acquisition
+        // below would wait for an unwind turn that never comes.
+        if life_ended(&self.ended).is_err() {
+            return 0;
+        }
         // Not a yield point (S-ENV), but still a gated host step: the
         // acquisition (X5-R14) lets only the baton holder draw, so a
         // task that has not been handed the baton yet cannot perturb
@@ -1150,6 +1256,10 @@ fn parent_of(path: &str) -> &str {
 /// messages only.
 pub struct SimFile {
     sched: Arc<Sched<SimWorld>>,
+    /// The life-ended flag of the `SimEnv` that opened it (Work 10): set
+    /// by [`Sim::run_life`] once the life has ended, and read by every
+    /// entry point before it touches the world.
+    ended: Arc<AtomicBool>,
     path: String,
     id: FileId,
     handle: u64,
@@ -1179,6 +1289,10 @@ impl SimFile {
                 detail: "offset plus length overflows u64".to_string(),
             });
         }
+        // The life-ended check (Work 10) comes before the task and the
+        // acquisition; the overflow refusal above is an argument check
+        // that touches nothing.
+        life_ended(&self.ended)?;
         let task = current_task(&self.sched)?;
         let mut guard = self
             .sched
@@ -1206,7 +1320,7 @@ impl SimFile {
 impl File for SimFile {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, EnvError> {
         let p = self.path.clone();
-        yield_step(&self.sched, "env:read_at", move |w| {
+        yield_step(&self.ended, &self.sched, "env:read_at", move |w| {
             w.read_at(self.id, off, buf, &p)
         })
     }
@@ -1214,7 +1328,7 @@ impl File for SimFile {
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), EnvError> {
         self.refuse_read_only()?;
         let p = self.path.clone();
-        yield_step(&self.sched, "env:write_at", move |w| {
+        yield_step(&self.ended, &self.sched, "env:write_at", move |w| {
             // E-IO's zero-length write (A-1a-F3): after the `Read`
             // refusal and the leading yield, `Ok` without a disk
             // call — E4's `SimDisk::write_at` would extend the file
@@ -1236,7 +1350,7 @@ impl File for SimFile {
     fn sync_data(&self) -> Result<(), EnvError> {
         self.refuse_read_only()?;
         let p = self.path.clone();
-        yield_step(&self.sched, "env:sync_data", move |w| {
+        yield_step(&self.ended, &self.sched, "env:sync_data", move |w| {
             w.sync(self.id, false, &p)
         })
     }
@@ -1244,19 +1358,19 @@ impl File for SimFile {
     fn sync_all(&self) -> Result<(), EnvError> {
         self.refuse_read_only()?;
         let p = self.path.clone();
-        yield_step(&self.sched, "env:sync_all", move |w| {
+        yield_step(&self.ended, &self.sched, "env:sync_all", move |w| {
             w.sync(self.id, true, &p)
         })
     }
 
     fn len(&self) -> Result<u64, EnvError> {
-        yield_step(&self.sched, "env:len", |w| w.cur_len(self.id))
+        yield_step(&self.ended, &self.sched, "env:len", |w| w.cur_len(self.id))
     }
 
     fn set_len(&self, len: u64) -> Result<(), EnvError> {
         self.refuse_read_only()?;
         let p = self.path.clone();
-        yield_step(&self.sched, "env:set_len", move |w| {
+        yield_step(&self.ended, &self.sched, "env:set_len", move |w| {
             // The same bound and cap as `write_at` (A-1b-0-F2).
             check_lengths("set_len", &p, len)?;
             w.set_len(self.id, len, &p)
@@ -1264,7 +1378,7 @@ impl File for SimFile {
     }
 
     fn lock_exclusive(&self) -> Result<(), EnvError> {
-        yield_step(&self.sched, "env:lock_exclusive", |w| {
+        yield_step(&self.ended, &self.sched, "env:lock_exclusive", |w| {
             // E-LOCK's same-handle rule (A-1b-0-F3): the held mode
             // again is Ok; the other mode is Locked and the handle
             // keeps its lock.
@@ -1290,7 +1404,7 @@ impl File for SimFile {
     }
 
     fn lock_shared(&self) -> Result<(), EnvError> {
-        yield_step(&self.sched, "env:lock_shared", |w| {
+        yield_step(&self.ended, &self.sched, "env:lock_shared", |w| {
             match w.locks.by_handle.get(&self.handle) {
                 Some(LockMode::Shared) => return Ok(()),
                 Some(LockMode::Exclusive) => {
@@ -1313,7 +1427,7 @@ impl File for SimFile {
     }
 
     fn unlock(&self) -> Result<(), EnvError> {
-        yield_step(&self.sched, "env:unlock", |w| {
+        yield_step(&self.ended, &self.sched, "env:unlock", |w| {
             w.locks.release(self.handle);
             Ok(())
         })

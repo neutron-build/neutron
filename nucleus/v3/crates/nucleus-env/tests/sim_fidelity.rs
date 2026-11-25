@@ -5,19 +5,25 @@
 //! synced shrink and of a power cut's survivors (A-1b-F2, `disk.rs`
 //! departure D3); and the power cut that loses unsynced directory ops
 //! independently (departure D4, S-STORE §12.5's `t_wal_start`). The
-//! S-ENV invariants these pin are stated in `src/sim/env.rs`; PLAN-v3
-//! §3.2 and S-STORE §12.5, §13 step 6 and §15 are the normative sources.
-//! Every life here runs one task, except `sim_first_baton`'s three; no
-//! test holds a test-side lock across an Env call, and none waits on
-//! real time.
+//! A-6b-0 ruling of 2026-11-24 added three pins: a task whose world
+//! failed before its first baton runs no body (Work 1); after a failure
+//! each task keeps its own clock (Work 2); and a handle used after its
+//! life ended answers at once and never parks (Work 10). The S-ENV
+//! invariants these pin are stated in `src/sim/env.rs`; PLAN-v3 §3.2 and
+//! S-STORE §12.5, §13 step 6 and §15 are the normative sources. Every
+//! life here runs one task, except `sim_first_baton`'s and
+//! `sim_no_body_before_first_baton`'s three and
+//! `sim_sleep_after_crash_tasks`'s two and three; no test holds a
+//! test-side lock across an Env call, and none waits on real time.
 
 #![allow(missing_docs)]
 
-use nucleus_env::sim::{DirLoss, FaultKnobs, LifeOutcome, Sim, SimEnv, TaskId};
+use nucleus_env::sim::{DirLoss, FaultKnobs, LifeOutcome, Sim, SimEnv, SimFile, TaskId};
 use nucleus_env::{Env, EnvError, File, OpenMode};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// The knobs that drop every unsynced byte and directory op (E4's
@@ -121,6 +127,49 @@ fn sim_first_baton() {
     }
 }
 
+/// Work 1, "On `Err`, `body` is not called" (the A-6b-0 ruling R3): a
+/// task whose world failed before its first baton runs no body. Three
+/// tasks, the crash armed at the first yield: before the crash only the
+/// baton holder runs, so exactly one body enters, the holder's, and its
+/// first call's yield trips the crash; the other two tasks end with
+/// `Crashed` from `await_first_baton`, their bodies never called. Seeds
+/// 1, 7 and 42. Under BODY-AFTER-FAILED-FIRST-BATON every body runs.
+#[test]
+fn sim_no_body_before_first_baton() {
+    for seed in [1, 7, 42] {
+        let entered = AtomicUsize::new(0);
+        let holder = AtomicUsize::new(0);
+        let mut sim = Sim::new(seed, drop_all());
+        let out = sim.run_life(3, Some(1), |env, t| {
+            if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                holder.store(t, Ordering::SeqCst);
+            }
+            env.exists("x").map(drop)
+        });
+        assert!(
+            out.crashed,
+            "seed {seed}: the life must crash at the armed yield"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "seed {seed}: bodies that entered; only the baton holder's may"
+        );
+        let holder = holder.load(Ordering::SeqCst);
+        assert_eq!(out.results.len(), 3, "seed {seed}: every task has a result");
+        for (t, r) in out.results.iter().enumerate() {
+            if t + 1 != holder {
+                assert_eq!(
+                    r,
+                    &Err(EnvError::Crashed),
+                    "seed {seed}: task {} never held the baton, so its result is",
+                    t + 1
+                );
+            }
+        }
+    }
+}
+
 /// A-1b-F1 (b): in a failed world `sleep` still advances the clock by
 /// its `d`, so a time-bounded loop ends after a crash; a task observes
 /// the crash only through a fallible call. A dry run of a body that only
@@ -169,6 +218,86 @@ fn sim_sleep_after_crash() {
         "the deadline loop must end after 10 sleeps of 1 ms"
     );
     assert!(out.halts.is_empty(), "halts: {:?}", out.halts);
+}
+
+/// Work 2 after the A-6b-0 ruling (R1): after a failure each task keeps
+/// its own clock, so no value depends on the order the OS runs the
+/// threads in (S-DET). Two shapes, each 50 times in a fresh `Sim`:
+/// (seed 7, 2 tasks, two warm yields each, the crash armed at yield 3)
+/// and (seed 7, 3 tasks, three warm yields each, the crash armed at
+/// yield 7). After its warm yields (results ignored) each body runs the
+/// 10 ms deadline loop of 1 ms sleeps that `sim_sleep_after_crash` runs,
+/// and stores `(task, n)` in a test-side map, the lock taken once, after
+/// the loop. A second one-task life in the same `Sim` stores `env.now()`:
+/// the clock the next life inherits, which is the world's clock, stopped
+/// at the failure. Every run crashes with no halt, ends its loops under
+/// the cap, and gives the same map and the same inherited clock as the
+/// first run. Under FAILED-SLEEP-SHARED-CLOCK (a failed `sleep` moves the
+/// one world clock) both follow thread order.
+#[test]
+fn sim_sleep_after_crash_tasks() {
+    // (tasks, warm yields per body, the yield the crash is armed at)
+    for (tasks, warm, crash_at) in [(2usize, 2u32, 3u64), (3, 3, 7)] {
+        let mut first: Option<(BTreeMap<TaskId, u32>, Duration)> = None;
+        for run in 0..50 {
+            let slept: Mutex<Option<BTreeMap<TaskId, u32>>> = Mutex::new(None);
+            let mut sim = Sim::new(7, drop_all());
+            let out = sim.run_life(tasks, Some(crash_at), |env, t| {
+                for _ in 0..warm {
+                    let _ = env.yield_now("warm");
+                }
+                let deadline = env.now() + Duration::from_millis(10);
+                let mut n = 0u32;
+                while env.now() < deadline {
+                    env.sleep(Duration::from_millis(1));
+                    n += 1;
+                    if n == 1_000 {
+                        break;
+                    }
+                }
+                if let Ok(mut g) = slept.lock() {
+                    g.get_or_insert_with(BTreeMap::new).insert(t, n);
+                }
+                Ok(())
+            });
+            assert!(
+                out.crashed,
+                "{tasks} tasks, run {run}: the life must crash at the armed yield"
+            );
+            assert!(
+                out.halts.is_empty(),
+                "{tasks} tasks, run {run}: halts: {:?}",
+                out.halts
+            );
+            let map = slept.into_inner().unwrap_or_default().unwrap_or_default();
+            for (t, n) in &map {
+                assert!(
+                    *n < 1_000,
+                    "{tasks} tasks, run {run}: task {t}'s loop ran to the cap"
+                );
+            }
+            let inherited: Mutex<Option<Duration>> = Mutex::new(None);
+            let second = sim.run_life(1, None, |env, _t| {
+                if let Ok(mut g) = inherited.lock() {
+                    *g = Some(env.now());
+                }
+                Ok(())
+            });
+            assert_life_ok(&second);
+            let clock = inherited
+                .into_inner()
+                .unwrap_or_default()
+                .unwrap_or_default();
+            match &first {
+                None => first = Some((map, clock)),
+                Some(f) => assert_eq!(
+                    &(map, clock),
+                    f,
+                    "{tasks} tasks, run {run}: the map and the inherited clock differ from run 0's"
+                ),
+            }
+        }
+    }
 }
 
 /// A-1b-F1 (e): `Sim::media_page` with a zero slot, and
@@ -283,6 +412,163 @@ fn read_back(sim: &mut Sim, name: &'static str) -> Option<(u64, Vec<u8>)> {
     });
     assert_life_ok(&out);
     got.into_inner().ok().flatten()
+}
+
+/// What life 2's task saw on the stale handles (`sim_stale_handle_answers`).
+#[derive(Debug, PartialEq, Eq)]
+struct StaleAnswers {
+    exists: Result<bool, EnvError>,
+    open: Result<(), EnvError>,
+    yield_now: Result<(), EnvError>,
+    /// The stale clock just before and just after the stale `sleep`,
+    /// which must do nothing.
+    around_sleep: [Duration; 2],
+    rand: u64,
+    now: Duration,
+    read: Result<usize, EnvError>,
+    write: Result<(), EnvError>,
+    sync_data: Result<(), EnvError>,
+    accepted: Result<(), EnvError>,
+}
+
+/// Life 1's body in `sim_stale_handle_answers`: create `x`, write it,
+/// keep a clone of the `SimEnv` and the open `SimFile`, then one 7 ms
+/// sleep — the body's last yield, and the only call that moves the clock.
+fn keep_handles(env: &SimEnv, kept: &Mutex<Option<(SimEnv, SimFile)>>) -> Result<(), EnvError> {
+    let f = env.open("x", OpenMode::CreateNew)?;
+    f.write_at(0, &[0xABu8; 8])?;
+    if let Ok(mut g) = kept.lock() {
+        *g = Some((env.clone(), f));
+    }
+    env.sleep(Duration::from_millis(7));
+    Ok(())
+}
+
+/// Life 2's body in `sim_stale_handle_answers`: every call the pin names,
+/// in its order, on the stale handles.
+fn stale_calls(stale: &SimEnv, file: &SimFile) -> StaleAnswers {
+    let exists = stale.exists("x");
+    let open = stale.open("y", OpenMode::CreateNew).map(drop);
+    let yield_now = stale.yield_now("stale");
+    let before = stale.now();
+    stale.sleep(Duration::from_millis(1));
+    let after = stale.now();
+    let rand = stale.rand();
+    let now = stale.now();
+    let mut buf = [0u8; 8];
+    let read = file.read_at(0, &mut buf);
+    let write = file.write_at(0, &[0xCDu8; 8]);
+    let sync_data = file.sync_data();
+    let accepted = file.accepted(0, 1);
+    StaleAnswers {
+        exists,
+        open,
+        yield_now,
+        around_sleep: [before, after],
+        rand,
+        now,
+        read,
+        write,
+        sync_data,
+        accepted,
+    }
+}
+
+/// Work 10 (the A-6b-0 ruling R2; S-LIVE): a handle used after its life
+/// ended answers at once and never parks. Life 1, one task, creates `x`
+/// and writes it, keeps a clone of its `SimEnv` and the open `SimFile`,
+/// and ends with one sleep, its last yield. Life 2, one task, takes the
+/// handles out — the test-side lock is released before any call — and
+/// calls each of them: every fallible call is
+/// `Halted { "the life has ended" }`, `rand` answers 0, `now` answers
+/// life 1's final clock, the stale `sleep` moves nothing, life 2 raises
+/// no halt, and `x` is as life 1 left it (`y` is never created; nothing
+/// was synced or accepted on the stale file). Twice: with life 1 ended
+/// cleanly (its clock is 7 ms) and ended by the crash armed at that last
+/// yield (the sleep failed, so by Work 2 the world's clock stopped at
+/// 0). No real-time watchdog: a regression parks, the test hangs, and
+/// the gate kills it and records the mutant caught by hang
+/// (STALE-HANDLE-PARKS, STALE-RAND-PARKS).
+#[test]
+fn sim_stale_handle_answers() {
+    // (whether life 1 crashes at its last yield, the clock it leaves)
+    for (crash, final_clock) in [(false, Duration::from_millis(7)), (true, Duration::ZERO)] {
+        // A dry run of life 1's body gives its yield count, which is its
+        // last yield: the sleep's.
+        let dry: Mutex<Option<(SimEnv, SimFile)>> = Mutex::new(None);
+        let mut dry_sim = Sim::new(3, drop_all());
+        let out = dry_sim.run_life(1, None, |env, _t| keep_handles(env, &dry));
+        assert_life_ok(&out);
+        let armed = out.yields;
+
+        let kept: Mutex<Option<(SimEnv, SimFile)>> = Mutex::new(None);
+        let mut sim = Sim::new(3, drop_all());
+        let first = sim.run_life(1, if crash { Some(armed) } else { None }, |env, _t| {
+            keep_handles(env, &kept)
+        });
+        if crash {
+            assert!(
+                first.crashed,
+                "life 1 crashed={crash}: it must crash at its last yield"
+            );
+        } else {
+            assert_life_ok(&first);
+        }
+
+        let seen: Mutex<Option<StaleAnswers>> = Mutex::new(None);
+        let second = sim.run_life(1, None, |_env, _t| {
+            // The lock is taken and released by this statement, before any
+            // call on the stale handles.
+            let taken = kept.lock().unwrap().take();
+            let (stale, file) = taken.expect("life 1 stored its handles");
+            let answers = stale_calls(&stale, &file);
+            if let Ok(mut g) = seen.lock() {
+                *g = Some(answers);
+            }
+            Ok(())
+        });
+        assert_life_ok(&second);
+        let halted = || EnvError::Halted {
+            what: "the life has ended".to_string(),
+        };
+        assert_eq!(
+            seen.into_inner().unwrap_or_default(),
+            Some(StaleAnswers {
+                exists: Err(halted()),
+                open: Err(halted()),
+                yield_now: Err(halted()),
+                around_sleep: [final_clock; 2],
+                rand: 0,
+                now: final_clock,
+                read: Err(halted()),
+                write: Err(halted()),
+                sync_data: Err(halted()),
+                accepted: Err(halted()),
+            }),
+            "life 1 crashed={crash}: what the stale handles answered"
+        );
+        // `x` is as life 1 left it, and `y` was never created.
+        let id = sim.file_id("x").unwrap().unwrap();
+        assert!(
+            sim.disk().dwrites_of(id).is_empty(),
+            "life 1 crashed={crash}: the stale sync_data made a write durable"
+        );
+        assert!(
+            sim.disk().accepts.is_empty(),
+            "life 1 crashed={crash}: the stale accepted recorded an accept"
+        );
+        let (len, bytes) = read_back(&mut sim, "x").unwrap();
+        assert_eq!(
+            (len, bytes.as_slice()),
+            (8, &[0xABu8; 8][..]),
+            "life 1 crashed={crash}: x is not as life 1 left it"
+        );
+        assert_eq!(
+            sim.file_id("y").unwrap(),
+            None,
+            "life 1 crashed={crash}: the stale open created y"
+        );
+    }
 }
 
 /// A-1b-F2 (D3), the A-1b verdict's Findings 3–4, through SimEnv on
@@ -496,7 +782,15 @@ fn durable_wal(seed: u64, knobs: FaultKnobs, mode: DirLoss, names: &'static [&'s
 /// unsynced rename `a → b`, a create of a new `a` and its removal, under
 /// `Independent` at `keep_latest_pm` 500: the first file keeps exactly
 /// one name, `a` or `b`, whichever its own rename left it, so neither the
-/// new file's create nor its unlink ever takes `a` from it.
+/// new file's create nor its unlink ever takes `a` from it. (vii, the
+/// A-6b-0 ruling R3) issue order: an unsynced create of `wal/x` and an
+/// unsynced rename `x → y`, a cut that keeps every op, seeds 0..8: `y`
+/// is bound and `x` is not (INDEPENDENT-REVERSED fails it). (viii) a
+/// kept rename onto a bound name is dropped: durable `wal/a` and
+/// `wal/t`, an unsynced remove of `t` and rename `a → t`, a cut at
+/// `keep_latest_pm` 500, seeds 0..64: whenever `t` names `a`'s file,
+/// both ops were kept and `a` is unbound, and some seed ends so
+/// (RENAME-TARGET-UNCHECKED fails it).
 #[test]
 fn sim_dir_loss_independent() {
     const ABCD: &[&str] = &["a", "b", "c", "d"];
@@ -734,4 +1028,56 @@ fn sim_dir_loss_independent() {
             );
         }
     }
+
+    // (vii) the ops are judged in issue order: with every op kept, the
+    // create binds x and the rename then moves it to y. Newest first, the
+    // rename would be judged on an unbound x and dropped.
+    let every = FaultKnobs {
+        keep_latest_pm: 1000,
+        tear_pm: 0,
+    };
+    for seed in 0..9u64 {
+        let mut sim = durable_wal(seed, every, DirLoss::Independent, &[]);
+        let out = sim.run_life(1, None, |env, _t| {
+            env.open("wal/x", OpenMode::CreateNew)?.sync_all()?;
+            env.rename("wal/x", "wal/y")?;
+            Ok(())
+        });
+        assert_life_ok(&out);
+        sim.power_cut();
+        assert_eq!(
+            bound(&sim, &["x", "y"]),
+            BTreeSet::from(["y"]),
+            "(vii) seed {seed}: the create and the rename, in issue order, leave y alone"
+        );
+    }
+
+    // (viii) a kept rename does not apply onto a bound name. Of the four
+    // outcomes per seed, only "both kept" ends with t naming a's file: a
+    // lost unlink leaves the old t bound, so the rename is dropped too.
+    let mut onto_a = 0u32;
+    for seed in 0..65u64 {
+        let mut sim = durable_wal(seed, half, DirLoss::Independent, &["a", "t"]);
+        let a = sim.file_id("wal/a").unwrap().unwrap();
+        let out = sim.run_life(1, None, |env, _t| {
+            env.remove("wal/t")?;
+            env.rename("wal/a", "wal/t")?;
+            Ok(())
+        });
+        assert_life_ok(&out);
+        let dropped = sim.power_cut();
+        if sim.file_id("wal/t").unwrap() == Some(a) {
+            onto_a += 1;
+            assert_eq!(
+                dropped, 0,
+                "(viii) seed {seed}: t names a's file, so both ops were kept"
+            );
+            assert_eq!(
+                sim.file_id("wal/a").unwrap(),
+                None,
+                "(viii) seed {seed}: a is unbound once its rename applied"
+            );
+        }
+    }
+    assert!(onto_a > 0, "(viii): no seed ended with t naming a's file");
 }
