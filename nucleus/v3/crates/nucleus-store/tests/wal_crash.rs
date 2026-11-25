@@ -1188,7 +1188,7 @@ fn wal_model() {
     for mode in FOUR {
         y1 = dry_yields(10_000 * mode.index, &mode, &mut setup, &life1);
         yields.push((mode.name, y1));
-        rounds += sweep_rounds(&mode, &mut setup, &life1, &start0(), |k, round| {
+        let ran = sweep_rounds(&mode, &mut setup, &life1, &start0(), |k, round| {
             let what = format!("boot 1, {} at crash point {k}", mode.name);
             let m = check_prefix(&round.walk, &round.seen, &oracle1, 0, &what);
             check_covered(m, &oracle1, &round.progress.reports, &what);
@@ -1203,6 +1203,8 @@ fn wal_model() {
                 lost_unreported += 1;
             }
         });
+        rounds += ran;
+        eprintln!("wal_model: boot 1, {}: Y = {y1}, {ran} rounds", mode.name);
     }
     // The card's two derived crash points: "⌊Y1 / 2⌋" and "Y1 − 1, the
     // first `sync_data` of its final sync, which leaves the `SegmentEnd` at
@@ -1211,6 +1213,7 @@ fn wal_model() {
     let last1 = y1 - 1;
 
     // ---- MW: boot 1's every fourth crash point, P0 then media_wal ----
+    let mut mw_rounds = 0usize;
     for k in (4..=y1).step_by(4) {
         let seed = 10_000 * MW_INDEX + k;
         let base = run_round(seed, &P0, Some(k), false, &mut setup, &life1, &start0());
@@ -1236,6 +1239,7 @@ fn wal_model() {
             mw_differs += 1;
         }
         rounds += 1;
+        mw_rounds += 1;
     }
 
     // ---- Boot 2: after six boot-1 histories ----
@@ -1309,7 +1313,7 @@ fn wal_model() {
                 y2_of[h] = mode_yields.max(y2_of[h]);
             }
             eprintln!(
-                "wal_model: boot 2 after boot 1 at {crash1:?} then {}, {} reaches crash point {mode_yields}",
+                "wal_model: boot 2 after boot 1 at {crash1:?} then {}, {}: {ran} rounds, to crash point {mode_yields}",
                 mode1.name, mode.name
             );
         }
@@ -1363,7 +1367,7 @@ fn wal_model() {
                 });
                 rounds += ran;
                 eprintln!(
-                    "wal_model: boot 3 after boot 1 at {crash1:?}, boot 2 at {crash2:?} then {:?}, {} reaches crash point {mode_yields}",
+                    "wal_model: boot 3 after boot 1 at {crash1:?}, boot 2 at {crash2:?} then {:?}, {}: {ran} rounds, to crash point {mode_yields}",
                     cut2.map(|m| m.name),
                     mode.name
                 );
@@ -1386,5 +1390,5 @@ fn wal_model() {
         mw_differs > 0,
         "no MW round's walk differs from the same round without the media fault"
     );
-    eprintln!("wal_model: Y1 = {y1}; {rounds} rounds");
+    eprintln!("wal_model: Y1 = {y1}; {rounds} rounds, {mw_rounds} of them MW");
 }
