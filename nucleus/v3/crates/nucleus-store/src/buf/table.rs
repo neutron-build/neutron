@@ -19,6 +19,16 @@
 //!   pushed last is popped next (LIFO, which tests `load_integrity` (j) and
 //!   `born_latched` rely on). A frame is on it exactly when its state is
 //!   `Free` ([`Table::release`] refuses a frame that is already `Free`).
+//! - **The reference bit** (S-STORE §5.2 "Clock"; card A-3b-0, Work 3):
+//!   [`FrameMeta::referenced`] is set only where a user pin raises a frame's
+//!   count, cleared when the frame becomes `Free` or `Reserved`, and by the
+//!   clock's sweep. Test `clock_bit_sites`; mutants of the sweep's table,
+//!   "the bit".
+//! - **The clock's counter and the generation** (card A-3b-0, Work 4): `hand`
+//!   advances once per sweep step, whoever takes it, so its position is
+//!   `hand mod F`; `unheld_events` changes only at U1–U4, each under this
+//!   mutex. Tests `clock_order`, `sweep_end_rechecks_generation`; mutants
+//!   HAND-STAYS, UNHELD-NO-BUMP-UNPIN.
 
 use super::frame::{FrameId, FrameState};
 use super::key::PageKey;
@@ -41,17 +51,24 @@ pub(crate) struct FrameMeta {
     /// The frame's freed flag, mirrored here (from the frame's content,
     /// under its latch) so that `create` can read it under the mutex.
     pub(crate) freed: bool,
+    /// The clock's reference bit (S-STORE §5.2: a frame used since the hand
+    /// last passed it gets a second chance; card A-3b-0, Work 3): set only
+    /// where a user pin raises the count, never by `pin_frame`, and cleared
+    /// when the frame becomes `Free` or `Reserved` and by the sweep.
+    pub(crate) referenced: bool,
     /// The next frame on this frame's bucket chain.
     pub(crate) next: Option<FrameId>,
 }
 
 impl FrameMeta {
-    /// A frame on the free list: no key, no pins, not freed, on no chain.
+    /// A frame on the free list: no key, no pins, not freed, not referenced,
+    /// on no chain.
     pub(crate) const FREE: FrameMeta = FrameMeta {
         state: FrameState::Free,
         key: None,
         pins: 0,
         freed: false,
+        referenced: false,
         next: None,
     };
 }
@@ -72,6 +89,19 @@ pub(crate) struct Table {
     free_len: u32,
     /// Slot reads issued by loads (card A-3a, `PoolStats::reads`).
     pub(crate) reads: u64,
+    /// The clock's counter (card A-3b-0, Work 4): its position is
+    /// `hand mod F`, and it advances by one per sweep step, whoever takes it.
+    pub(crate) hand: u64,
+    /// Clean victims the frame acquisition has taken (card A-3b-0, Work 5,
+    /// A2; `PoolStats::evictions`).
+    pub(crate) evictions: u64,
+    /// Frame acquisitions registered as waiting for an unpin (card A-3b-0,
+    /// Work 5, A7; `PoolStats::unpin_waiters`).
+    pub(crate) unpin_waiters: u32,
+    /// The generation a waiting acquisition re-tests (card A-3b-0, Work 4):
+    /// it changes only when a held frame becomes unheld, at U1–U4, each under
+    /// this mutex, and wraps.
+    pub(crate) unheld_events: u64,
 }
 
 /// The bucket `key` lands in, for a table whose bucket count is
@@ -113,6 +143,10 @@ impl Table {
             free,
             free_len,
             reads: 0,
+            hand: 0,
+            evictions: 0,
+            unpin_waiters: 0,
+            unheld_events: 0,
         })
     }
 
@@ -267,6 +301,73 @@ impl Table {
         Some(f)
     }
 
+    /// Take a frame off the free list for the caller (card A-3a's `reserve`;
+    /// card A-3b-0's step A1): pop the free stack and make the frame
+    /// `Reserved`, its reference bit cleared (card A-3b-0, Work 3). `None`
+    /// when no frame is free.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] if a frame on the free list is not `Free` (an
+    /// engine invariant violation); that frame is pushed back and the table
+    /// is otherwise unchanged.
+    pub(crate) fn reserve_free(&mut self) -> Result<Option<FrameId>, StoreError> {
+        let Some(f) = self.pop_free() else {
+            return Ok(None);
+        };
+        let m = self.meta_mut(f)?;
+        if m.state != FrameState::Free {
+            let state = m.state;
+            self.push_free(f)?;
+            return Err(StoreError::Invalid(format!(
+                "frame {} is {state:?} on the free list",
+                f.0
+            )));
+        }
+        m.state = FrameState::Reserved;
+        m.referenced = false;
+        Ok(Some(f))
+    }
+
+    /// The clock's next frame, `hand mod F`, advancing the counter by one
+    /// (card A-3b-0, Work 5, A2).
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] if the table has no frame, or its frame count
+    /// or the position does not fit a `u32` (neither can a pool reach).
+    pub(crate) fn clock_frame(&mut self) -> Result<FrameId, StoreError> {
+        let f = self.clock_at(self.hand)?;
+        self.hand = self.hand.wrapping_add(1);
+        Ok(f)
+    }
+
+    /// The frame the clock's counter `hand` names.
+    fn clock_at(&self, hand: u64) -> Result<FrameId, StoreError> {
+        // `new` sized the metadata from a `u32` frame count of at least 1.
+        self.meta
+            .first()
+            .and_then(|_| u64::try_from(self.meta.len()).ok())
+            .and_then(|n| u32::try_from(hand % n).ok())
+            .map(FrameId)
+            .ok_or_else(|| StoreError::Invalid("the page table has no frame to sweep".into()))
+    }
+
+    /// The clock's position, `hand mod F` (card A-3b-0, Work 7).
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] as [`Table::clock_frame`]'s.
+    pub(crate) fn clock_hand(&self) -> Result<u32, StoreError> {
+        self.clock_at(self.hand).map(|f| f.0)
+    }
+
+    /// Whether some frame is `Resident` with no count: the scan that decides
+    /// between a retry, `PoolStarved` and a wait for an unpin (card A-3b-0,
+    /// Work 5, A6).
+    pub(crate) fn has_unpinned_resident(&self) -> bool {
+        self.meta
+            .iter()
+            .any(|m| m.state == FrameState::Resident && m.pins == 0)
+    }
+
     /// Push frame `f` on the free stack.
     ///
     /// # Errors
@@ -311,8 +412,9 @@ impl Table {
         Ok(m.pins)
     }
 
-    /// Return frame `f` to the free list: `Free`, no key, not freed, on no
-    /// chain, pushed on the free stack (BUF-FIXED's "returns to it").
+    /// Return frame `f` to the free list: `Free`, no key, not freed, not
+    /// referenced, on no chain, pushed on the free stack (BUF-FIXED's "returns
+    /// to it").
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is already `Free`, still counted, or

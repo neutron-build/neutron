@@ -24,10 +24,11 @@ publish.workspace = true
 # hook. No workspace crate other than nucleus-store may reference
 # `insert_early_release`.
 # Card A-3a: the same feature exposes `buf`'s test seams (`Pool::set_hook`,
-# `Pool::force_pins`, `Pool::table_free`), which exist solely so this crate's
-# own tests can pause a thread at a named point, reach a pin count no caller
-# can, and see whether the page table's mutex is held. The same reach rule
-# applies: no workspace crate other than nucleus-store may reference them.
+# `Pool::force_pins`, `Pool::table_free`, `Pool::new_below_minimum_for_tests`),
+# which exist solely so this crate's own tests can pause a thread at a named
+# point, reach a pin count no caller can, and see whether the page table's
+# mutex is held. The same reach rule applies: no workspace crate other than
+# nucleus-store may reference them.
 test-hooks = []
 
 [dependencies]

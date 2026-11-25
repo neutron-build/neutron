@@ -9,6 +9,12 @@
 //! - **A pin is counted** (BUF-PINNED-STAYS): a [`Pin`] exists only for a
 //!   count raised under the table mutex, and its `Drop` lowers that count
 //!   under the mutex, even a poisoned one, and never panics.
+//! - **A frame is held while a pin counts on it** (card A-3b-0, Work 4): a
+//!   [`Pin`]'s last count (U1) and a dropped [`FrameReservation`] (U2) are two
+//!   of the four transitions that make a held frame unheld; each counts the
+//!   event and wakes the acquisitions waiting for an unpin, still under the
+//!   table mutex. Tests `sweep_end_rechecks_generation`, `unpin_wait_then_served`;
+//!   mutant UNHELD-NO-BUMP-UNPIN.
 //! - **Clean only by a write or a free** (BUF-LEAVE-CLEAN): the dirty flag is
 //!   cleared only by `mark_written`, whose four checks are §3.3's against
 //!   the home its caller wrote, or by `mark_freed`; a freed page is never
@@ -282,12 +288,24 @@ impl<'p, H: File> Pin<'p, H> {
 
 impl<H: File> Drop for Pin<'_, H> {
     /// Lower the count under the table mutex, taken even if poisoned; a count
-    /// already 0, impossible by construction, stays 0. Then fire `Unpinned`.
+    /// already 0, impossible by construction, stays 0. A `Resident` frame
+    /// whose last count leaves becomes unheld here (U1, card A-3b-0, Work 4),
+    /// still under that mutex, so an acquisition waiting for an unpin wakes.
+    /// Then fire `Unpinned`. Never panics.
     fn drop(&mut self) {
         {
             let mut t = self.pool.lock_table_anyway();
+            let mut last = false;
             if let Ok(m) = t.meta_mut(self.frame) {
-                m.pins = m.pins.saturating_sub(1);
+                if m.state == FrameState::Resident && m.pins == 1 {
+                    m.pins = 0;
+                    last = true;
+                } else {
+                    m.pins = m.pins.saturating_sub(1);
+                }
+            }
+            if last {
+                self.pool.became_unheld(&mut t);
             }
         }
         self.pool.fire(HookPoint::Unpinned, self.key, self.frame);
@@ -619,12 +637,16 @@ impl<'p, H: File> FrameReservation<'p, H> {
 
 impl<H: File> Drop for FrameReservation<'_, H> {
     /// Return the frame to the free list (`Free`, key and freed flag
-    /// cleared), under the table mutex, taken even if poisoned. Never panics.
+    /// cleared), under the table mutex, taken even if poisoned. A frame that
+    /// returns becomes unheld here (U2, card A-3b-0, Work 4), still under
+    /// that mutex. Never panics.
     fn drop(&mut self) {
         let mut t = self.pool.lock_table_anyway();
         // Only an engine bug fails this, and `drop` cannot report it: the
         // frame then stays `Reserved`, which `Pool::stats` shows.
-        let _ = t.release(self.frame);
+        if t.release(self.frame).is_ok() {
+            self.pool.became_unheld(&mut t);
+        }
     }
 }
 
