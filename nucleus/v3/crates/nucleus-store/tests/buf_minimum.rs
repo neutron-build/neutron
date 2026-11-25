@@ -233,24 +233,26 @@ fn pool_sizing_table() {
 }
 
 /// The refusals (Work 1's S1 and S2): no callers, no reserve frame for step
-/// 2 and no height floor are each `Invalid`, and so is a sum that passes
-/// `u64`; none panics. Mutant CALLERS-ZERO accepts no callers.
+/// 2 and no height floor are each refused by S1, a sum that passes `u64` is
+/// `Invalid` too, and none panics. Mutant CALLERS-ZERO accepts no callers
+/// (its pool then fails later, with another message).
 #[test]
 fn pool_sizing_refusals() {
-    let invalid = |r: Result<PoolSizing, StoreError>| match r {
-        Err(e @ StoreError::Invalid(_)) => e.to_string(),
-        other => panic!("expected Invalid, got {other:?}"),
+    // S1's own refusal, told from a later `Invalid` by its words.
+    let s1 = |r: Result<PoolSizing, StoreError>| match r {
+        Err(StoreError::Invalid(m)) => {
+            assert!(m.contains("must each be at least 1"), "{m}");
+            m
+        }
+        other => panic!("expected S1's Invalid, got {other:?}"),
     };
-    invalid(PoolSizing::compute(34, 0, 0, 1, 5));
-    invalid(PoolSizing::compute(34, 1, 0, 0, 5));
-    invalid(PoolSizing::compute(34, 1, 0, 1, 0));
-    invalid(PoolSizing::compute(
-        u32::MAX,
-        u32::MAX,
-        u32::MAX,
-        u32::MAX,
-        u32::MAX,
-    ));
+    s1(PoolSizing::compute(34, 0, 0, 1, 5));
+    s1(PoolSizing::compute(34, 1, 0, 0, 5));
+    s1(PoolSizing::compute(34, 1, 0, 1, 0));
+    match PoolSizing::compute(u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX) {
+        Err(StoreError::Invalid(m)) => assert!(m.contains("passed u64"), "{m}"),
+        other => panic!("expected an overflow's Invalid, got {other:?}"),
+    }
 }
 
 /// `o_frame` bounds what a frame costs besides its page (R-1-memory §4.1,

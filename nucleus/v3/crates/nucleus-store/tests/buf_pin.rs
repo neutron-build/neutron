@@ -736,7 +736,10 @@ fn pool_config() {
             callers: 0,
         }
     ));
-    assert!(matches!(e, StoreError::Invalid(_)), "{e:?}");
+    assert!(
+        matches!(&e, StoreError::Invalid(m) if m.contains("must each be at least 1")),
+        "{e:?}"
+    );
     // Beyond the card: the bounds are inclusive, and the accessors say what
     // was asked for. Card A-3b-0 (Work 11): one frame is below §5.4's
     // minimum, so it opens through the test-only constructor.
