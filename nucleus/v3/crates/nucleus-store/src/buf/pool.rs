@@ -154,7 +154,8 @@ pub struct PoolFootprint {
 /// A-3a, Work 8). Always defined; the hook storage and [`Pool::set_hook`]
 /// exist only under the crate's `test-hooks` feature, and without it firing
 /// compiles to nothing. A hook fires holding no pool mutex; the latches each
-/// point holds are in card A-3a's hook table. S-STORE §15's `t_pin_load_race`
+/// point holds are in card A-3a's hook table and, for `FreedClaimed`, in card
+/// A-3a-F2's. S-STORE §15's `t_pin_load_race`
 /// names four of them: *missed* is [`HookPoint::MissReserved`], *published*
 /// [`HookPoint::LoadPublished`], *resolved* [`HookPoint::LoadResolved`] and
 /// *waiting* [`HookPoint::LoadWaiting`].
@@ -187,6 +188,9 @@ pub enum HookPoint {
     /// C3 (§6.8): the reservation's frame is latched exclusively and initialised,
     /// not yet in the table; no pin.
     CreateReady,
+    /// C4, the freed branch (§4.2): the key's freed frame is claimed and not
+    /// yet latched; the creator holds its pin on it. No mutex.
+    FreedClaimed,
     /// R1 (§5.2): the victim's exclusive latch is held; no pin.
     RemoveLatched,
 }
@@ -829,6 +833,7 @@ impl<H: File> Pool<H> {
                 let pin = Pin::counted(self, g, key);
                 drop(c);
                 drop(res);
+                self.fire(HookPoint::FreedClaimed, key, g);
                 // A freed frame's latch holders hold nothing else: stale-name
                 // threads (§6.8) and `try_victim`.
                 let mut gc = self.latch(g)?.exclusive()?;

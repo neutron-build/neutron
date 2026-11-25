@@ -849,7 +849,10 @@ fn evict_sets_entry_first() {
 // ---- Beyond the card's list (each pins what a systematic sweep would hit).
 
 /// The hook points fire where card A-3a's hook table places them, in order,
-/// and `set_hook(None)` removes the hook.
+/// and `set_hook(None)` removes the hook. `FreedClaimed` fires where card
+/// A-3a-F2's row places it: once the hold that found the freed frame is
+/// released and its reservation is back on the free list, before the creator
+/// latches that frame.
 #[test]
 fn hook_placement() {
     let (file, map, pool) = fixture(3).unwrap();
@@ -912,6 +915,7 @@ fn hook_placement() {
         take(),
         vec![
             (CreateReady, L2, f2),
+            (FreedClaimed, L2, f1),
             (Pinned, L2, f1),
             (Unpinned, L2, f1),
             (Unpinned, L2, f1)
@@ -1417,6 +1421,7 @@ fn hooks_fire_unlocked() {
         Pinned,
         Unpinned,
         CreateReady,
+        FreedClaimed,
         RemoveLatched,
     ] {
         assert!(
