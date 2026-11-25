@@ -1612,8 +1612,9 @@ fn walk_valid_end(end: &WalkEnd) -> Option<u64> {
     .valid_end()
 }
 
-/// The three read-error cases (card Work 11's (g) and (h); the body of
-/// `t_wal_read_error`).
+/// The read-error cases (card Work 11's (g) and (h); the body of
+/// `t_wal_read_error`): a record's header, its body, the `open` of the
+/// segment a hop enters, and the `open` of the start segment.
 fn read_error_cases() {
     let path = seg_name(1024);
     for case in 0..3u8 {
@@ -1668,6 +1669,24 @@ fn read_error_cases() {
             stop(1124, 1024, StopReason::Magic),
             "{case}"
         );
+    }
+    // The start segment's `open` failing (S-STORE §12.5 "Read errors": "an
+    // open of one that fails other than by the file's absence"): the walk
+    // ends with that error before its first read, and writes nothing.
+    {
+        let env = HookEnv::new(MemEnv::new(11));
+        hop_store(&env);
+        let before = snapshot(&env);
+        let p0 = seg_name(0);
+        env.forget();
+        env.arm(Arm::always("open", &p0, READ, io_error("open", &p0)));
+        let mut seen = Vec::new();
+        let err = walk_into(&env, &start0(), &mut seen).expect_err("a read error");
+        assert!(is_io(&err, "open", &p0), "{err}");
+        assert!(seen.is_empty(), "nothing was accepted");
+        assert_eq!(env.log(), vec![call_a("open", &p0, READ)]);
+        env.disarm();
+        assert_eq!(snapshot(&env), before, "the walk wrote something");
     }
 }
 
