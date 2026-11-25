@@ -25,6 +25,7 @@
 
 mod buf_support;
 
+use std::any::Any;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -40,8 +41,8 @@ use buf_support::{
 };
 use nucleus_store::StoreError;
 use nucleus_store::buf::{
-    CreateOutcome, FrameId, FrameInfo, FrameState, Hook, HookPoint, PageKey, Pin, PinOutcome, Pool,
-    PoolConfig, PoolStats,
+    CreateOutcome, FrameId, FrameInfo, FrameReservation, FrameState, Hook, HookPoint, PageKey, Pin,
+    PinOutcome, Pool, PoolConfig, PoolStats,
 };
 use nucleus_store::page::Kind;
 
@@ -1174,6 +1175,53 @@ fn fired_point(got: Got) -> Option<HookPoint> {
     }
 }
 
+/// Whether `who`'s last recorded thing is an `UnpinWait`: it is held at that
+/// firing or just past it, and has produced nothing since.
+fn at_wait(record: &[Got], who: Who) -> bool {
+    matches!(
+        record.iter().rev().find(|got| {
+            matches!(got, Got::At(f) if f.who == who) || **got == Got::Done(who)
+        }),
+        Some(Got::At(f)) if f.point == UnpinWait
+    )
+}
+
+/// Take `who`'s events until it waits for an unpin or its closure ends; `true`
+/// if it waits.
+fn settle(permits: &Permits, record: &mut Vec<Got>, who: Who) -> bool {
+    let mut waits = false;
+    while !waits && !ended(record, who) {
+        let got = next_from(permits, record, who);
+        waits = matches!(got, Got::At(f) if f.point == UnpinWait);
+    }
+    waits
+}
+
+/// Let `who` pass every firing from here on, and [`settle`] it. A thread held
+/// at an `UnpinWait` firing sends nothing once it passes it: it is held in
+/// the pool's wait until a frame is released, so it is taken to wait at once.
+fn run_free(permits: &Permits, record: &mut Vec<Got>, who: Who) -> bool {
+    permits.free(who);
+    at_wait(record, who) || settle(permits, record, who)
+}
+
+/// What a thread's join gave, as the controller records it: its answer, and
+/// the reservation it returned, if any.
+fn outcome(
+    joined: Result<Result<FrameReservation<'_, FaultFile>, String>, Box<dyn Any + Send>>,
+    who: Who,
+) -> (
+    Result<FrameId, String>,
+    Option<FrameReservation<'_, FaultFile>>,
+) {
+    let answer = match &joined {
+        Ok(Ok(res)) => Ok(res.frame()),
+        Ok(Err(e)) => Err(e.clone()),
+        Err(_) => Err(format!("{who:?} panicked")),
+    };
+    (answer, joined.ok().and_then(|r| r.ok()))
+}
+
 /// Records `Done(who)` when dropped: at the end of a thread's closure, and
 /// on its way out of a panic, so the controller never waits for a thread that
 /// has finished.
@@ -1219,7 +1267,12 @@ fn spawn_held<'s, 'env, T: Send + 's>(
 /// `PoolStarved` right after its first sweep.
 ///
 /// While a thread is held the controller makes no pool call at all. It
-/// records, releases, joins, and only then asserts.
+/// records, releases, joins, and only then asserts. The release is in this
+/// order: T_A's reservation, which is what ends T_B's wait on a correct build,
+/// and the controller's own pin `p` only if a waiter is still waiting then,
+/// which no correct build needs. So under a mutant that makes a thread wait
+/// or end where the script does not, the test still fails by an assertion; it
+/// hangs only where a waiter is really waiting and never woken.
 #[test]
 fn acquire_shared_hand() {
     let (file, map, pool) = fixture(2).unwrap();
@@ -1237,6 +1290,8 @@ fn acquire_shared_hand() {
         pool.frame_info(fx).unwrap().referenced,
         "X's bit is set by its load"
     );
+    // The controller's pin on Y, which it drops last.
+    let mut p = Some(p);
 
     let permits = Permits::new();
     pool.set_hook(Some(permits.hook()));
@@ -1270,38 +1325,60 @@ fn acquire_shared_hand() {
                 after_first_sweep = Some(next_from(&permits, &mut record, Who::B));
             }
         }
-        // T_A runs to its end.
-        permits.free(Who::A);
-        while !ended(&record, Who::A) {
-            next_from(&permits, &mut record, Who::A);
+        // T_A runs freely: to its end or, under a mutant, to a wait.
+        let mut a_waits = run_free(&permits, &mut record, Who::A);
+        let mut t_a = Some(t_a);
+        let mut a_answer = Err("T_A waits for an unpin".to_string());
+        // T_A's reservation `r_A`, which the controller holds once T_A ended.
+        let mut r_a = None;
+        if !a_waits {
+            let (answer, res) = outcome(t_a.take().unwrap().join(), Who::A);
+            a_answer = answer;
+            r_a = res;
         }
-        let a = t_a.join();
-        let a_answer = match &a {
-            Ok(Ok(res)) => Ok(res.frame()),
-            Ok(Err(e)) => Err(e.clone()),
-            Err(_) => Err("T_A panicked".to_string()),
-        };
-        // T_A's reservation `r_A`, which the controller holds from here.
-        let r_a = a.ok().and_then(|r| r.ok());
+        let mut t_b = t_b;
         let mut b_answer = Err("T_B was not started".to_string());
-        if let Some(t_b) = t_b {
+        let mut b_waits = false;
+        let mut r_b = None;
+        if t_b.is_some() {
+            b_answer = Err("T_B waits for an unpin".to_string());
             // T_B runs freely: to its wait for an unpin, or to its end.
-            permits.free(Who::B);
-            let mut waits = false;
-            while !waits && !ended(&record, Who::B) {
-                let got = next_from(&permits, &mut record, Who::B);
-                waits = matches!(got, Got::At(f) if f.point == UnpinWait);
+            b_waits = run_free(&permits, &mut record, Who::B);
+        }
+        if !b_waits && t_b.is_some() {
+            let (answer, res) = outcome(t_b.take().unwrap().join(), Who::B);
+            b_answer = answer;
+            r_b = res;
+        }
+        // Release: the reservations the controller holds. Dropping `r_A` frees
+        // frame 0, which is what ends T_B's wait on a correct build.
+        drop(r_a);
+        drop(r_b);
+        if a_waits {
+            a_waits = settle(&permits, &mut record, Who::A);
+        }
+        if b_waits {
+            b_waits = settle(&permits, &mut record, Who::B);
+        }
+        if a_waits || b_waits {
+            // A waiter still waiting has only the controller's pin `p` left to
+            // end its wait. A correct build never comes here.
+            drop(p.take());
+            if a_waits {
+                settle(&permits, &mut record, Who::A);
             }
-            // The controller drops `r_A` and joins T_B.
-            drop(r_a);
-            let b = t_b.join();
-            b_answer = match &b {
-                Ok(Ok(res)) => Ok(res.frame()),
-                Ok(Err(e)) => Err(e.clone()),
-                Err(_) => Err("T_B panicked".to_string()),
-            };
-        } else {
-            drop(r_a);
+            if b_waits {
+                settle(&permits, &mut record, Who::B);
+            }
+        }
+        // Join what is not joined yet. A thread still waiting here is a waiter
+        // that is really waiting and never woken: a lost wake-up, which on OS
+        // threads only a hang can show (card A-3b-0, "For the gate").
+        if let Some(t) = t_a.take() {
+            a_answer = outcome(t.join(), Who::A).0;
+        }
+        if let Some(t) = t_b.take() {
+            b_answer = outcome(t.join(), Who::B).0;
         }
         (record, after_first_sweep, a_answer, b_answer)
     });
