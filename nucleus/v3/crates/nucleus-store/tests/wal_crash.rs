@@ -698,8 +698,7 @@ fn t_wal_exact_segment_end() {
             let last = oracle
                 .iter()
                 .take(m)
-                .filter(|r| r.lsn < seg + S)
-                .last()
+                .rfind(|r| r.lsn < seg + S)
                 .unwrap_or_else(|| panic!("no record in segment {seg}"));
             let room = seg + S - end_of(last);
             if seg < 4096 {
@@ -751,7 +750,7 @@ fn past_own_hop(seen: &[Seen], boot: u32) -> bool {
     seen.windows(2).any(|w| {
         let (a, b) = (&w[0], &w[1]);
         a.boot == boot
-            && (a.kind == RecordKind::SegmentEnd || end_of(a) % S == 0)
+            && (a.kind == RecordKind::SegmentEnd || end_of(a).is_multiple_of(S))
             && b.lsn > a.lsn
             && seg_of(b.lsn) > seg_of(a.lsn)
     })
@@ -884,17 +883,17 @@ fn t_wal_start() {
                 );
                 // Each old segment is under exactly one of its two names,
                 // with its bytes and its length unchanged.
-                for i in 0..old.len() {
-                    let at_old = names.contains(&seg_name(old[i]).replace("wal/", ""));
-                    let at_new = names.contains(&seg_name(target[i]).replace("wal/", ""));
+                for ((o, t), was) in old.iter().zip(target.iter()).zip(bytes.iter()) {
+                    let at_old = names.contains(&seg_name(*o).replace("wal/", ""));
+                    let at_new = names.contains(&seg_name(*t).replace("wal/", ""));
                     assert_ne!(
                         at_old,
                         at_new,
                         "{what}: segment {} is under {} of its two names",
-                        old[i],
+                        o,
                         usize::from(at_old) + usize::from(at_new)
                     );
-                    let held = if at_new { target[i] } else { old[i] };
+                    let held = if at_new { *t } else { *o };
                     let id = round
                         .sim
                         .file_id(&seg_name(held))
@@ -904,7 +903,7 @@ fn t_wal_start() {
                     assert_eq!(round.sim.disk().durable_len(id), S, "{what}");
                     assert_eq!(
                         round.sim.disk().durable_read(id, 0, S),
-                        bytes[i].1,
+                        was.1,
                         "{what}: its bytes changed"
                     );
                 }
@@ -917,9 +916,9 @@ fn t_wal_start() {
                 );
                 // Non-vacuity: a rename that ran and was lost. The life
                 // issued segment `i`'s rename at yield `2 + 2i`.
-                for i in 0..old.len() {
+                for (i, o) in old.iter().enumerate() {
                     let issued = k == 0 || k > 2 + 2 * i as u64;
-                    if issued && names.contains(&seg_name(old[i]).replace("wal/", "")) {
+                    if issued && names.contains(&seg_name(*o).replace("wal/", "")) {
                         lost_rename += 1;
                     }
                 }
@@ -1229,7 +1228,7 @@ fn wal_model() {
                 // from where it resumed.
                 let stream2 = seen_stream(&oracle_stream(h.valid_end, &plan2));
                 check_boot_round(
-                    &round,
+                    round,
                     &h,
                     &stream2,
                     &h.reports,
@@ -1293,7 +1292,7 @@ fn wal_model() {
                     let mut reports = h1.reports.clone();
                     reports.extend_from_slice(&h2.reports);
                     check_boot_round(
-                        &round,
+                        round,
                         &h2,
                         &stream3,
                         &reports,
