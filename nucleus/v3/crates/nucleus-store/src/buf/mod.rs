@@ -92,14 +92,19 @@
 //!   mutants REMOVE-DIRTY, WRITTEN-UNCHECKED, FREED-STAYS-DIRTY,
 //!   EVICT-FREED-WRITES, DIRTY-NOT-SKIPPED.
 //! - **BUF-BORN-LATCHED** (§6.8 "Root names"; §15 `t_root_name_reuse` case
-//!   D): a created page enters the table under its creator's exclusive
-//!   latch, already zeroed and with its header (`kind`, `id`, `epoch`)
-//!   written, so no other thread reads it before the creator releases that
-//!   latch; a creation of a key a frame holds makes no second frame (§5.4).
-//!   Tests `born_latched`, `create_outcomes`, `create_vs_loading`,
-//!   `t_pin_load_race_f`, `t_pin_load_race_g`, `create_resets_flags`;
-//!   mutants CREATE-PUBLISH-EARLY, CREATE-OVER-LOADING,
-//!   CREATE-FREED-NEW-FRAME.
+//!   D): a created page that enters the table does so under its creator's
+//!   exclusive latch, already zeroed and with its header (`kind`, `id`,
+//!   `epoch`) written. A freed page's frame is already in the table and is
+//!   reused in place (§4.2): its creator claims it in the hold that finds it
+//!   freed and latches it only afterwards, and until then the frame stays
+//!   open to §6.8's stale-name window, in which a stale name can latch it
+//!   and read the old, freed bytes (`is_freed()` is true). No other thread
+//!   reads the new page before the creator releases that latch. Either way a
+//!   creation of a key a frame holds makes no second frame (§5.4). Tests
+//!   `born_latched`, `create_outcomes`, `create_vs_loading`,
+//!   `create_vs_freed`, `t_pin_load_race_f`, `t_pin_load_race_g`,
+//!   `create_resets_flags`; mutants CREATE-PUBLISH-EARLY,
+//!   CREATE-OVER-LOADING, CREATE-FREED-NEW-FRAME, CREATE-FREED-CLAIM-LATE.
 //! - **BUF-NO-WRAP**: a pin count never wraps; a pin that would raise it past
 //!   `u64::MAX` is refused with `Invalid` and changes nothing. Test
 //!   `pin_count_overflow`; mutant PIN-WRAP.

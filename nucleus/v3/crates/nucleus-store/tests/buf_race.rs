@@ -23,14 +23,15 @@ use buf_support::{
 use nucleus_env::File;
 use nucleus_store::StoreError;
 use nucleus_store::buf::{
-    CreateOutcome, FrameId, FrameInfo, FrameState, HookPoint, PageKey, PinOutcome, Pool, Removal,
+    CreateOutcome, FrameId, FrameInfo, FrameState, HookPoint, PageKey, Pin, PinOutcome, Pool,
+    Removal,
 };
 use nucleus_store::meta::Ref;
 use nucleus_store::page::Kind;
 
 use HookPoint::{
-    CreateReady, LoadPublished, LoadRead, LoadResolved, LoadWaiting, MissReserved, RemoveLatched,
-    WaitWoken,
+    CreateReady, FreedClaimed, LoadPublished, LoadRead, LoadResolved, LoadWaiting, MissReserved,
+    Pinned, RemoveLatched, WaitWoken,
 };
 
 const L1: PageKey = PageKey::Lpid(1);
@@ -857,5 +858,362 @@ fn hooks_on_wait() {
         ),
         (0, 1, 2, 2),
         "{rest:?}"
+    );
+}
+
+// ---- Card A-3a-F2 (verdict A-3a, findings 2 and 4): the claim a creation
+// makes on a freed key's frame, pinned, and what follows the claim on error.
+// `create_vs_freed` runs on threads under a `Pauser`; `create_freed_poison`
+// is one thread and no hook.
+
+/// What creator A saw of the page `create` gave it, read before A wrote to
+/// it (`create_vs_freed`).
+#[derive(Debug)]
+struct NewPage {
+    /// The page's frame.
+    frame: FrameId,
+    /// Bytes 4..24 of the page: the kind, the id and the epoch.
+    header: Vec<u8>,
+    /// Whether the body (bytes 24..) is all zero.
+    body_zero: bool,
+    /// `is_freed()`.
+    freed: bool,
+    /// `is_dirty()`.
+    dirty: bool,
+    /// `content_epoch()`.
+    epoch: u32,
+}
+
+/// The freed frame of `create_vs_freed` and `create_freed_poison`, as
+/// `t_pin_load_race_g` makes it: `k` created in epoch 1 at the first
+/// attempt, marked 0x81, unmapped, then freed under a pin that is kept on
+/// its frame as a stale name's would be. No hook is set. Returns the pin and
+/// the frame.
+///
+/// # Errors
+/// Whatever the pool returns, or [`StoreError::Invalid`] if `k` was not
+/// created by the first `create`.
+fn freed_frame<'p>(
+    pool: &'p Pool<FaultFile>,
+    map: &TestMap,
+    k: PageKey,
+) -> Result<(Pin<'p, FaultFile>, FrameId), StoreError> {
+    let Made::Created(mut c, attempts) = create_as_allocation(pool, k, Kind::Leaf, 1)? else {
+        return Err(StoreError::Invalid(format!("{k:?} is not new")));
+    };
+    if attempts != 1 {
+        return Err(StoreError::Invalid(format!(
+            "{k:?} took {attempts} create calls"
+        )));
+    }
+    c.mark_dirty(1)?;
+    c[MARK] = 0x81;
+    let stale = c.release();
+    map.clear(k);
+    stale.latch_exclusive()?.mark_freed()?;
+    let g = stale.frame();
+    Ok((stale, g))
+}
+
+/// A stale name's read of a pinned page through a shared latch that cannot
+/// wait (`create_vs_freed`'s first pause): `None` if the latch is held,
+/// else `(is_freed(), the byte at MARK, content_epoch())`.
+///
+/// # Errors
+/// [`StoreError::Poisoned`] if the latch was poisoned.
+fn stale_marker(p: &Pin<'_, FaultFile>) -> Result<Option<(bool, u8, u32)>, StoreError> {
+    match p.try_latch_shared()? {
+        Some(gr) => Ok(Some((gr.is_freed(), gr[MARK], gr.content_epoch()))),
+        None => Ok(None),
+    }
+}
+
+/// Whether `p`'s frame refuses its shared latch (`Ok(None)` from
+/// `try_latch_shared`: an exclusive latch is held on the frame).
+///
+/// # Errors
+/// [`StoreError::Poisoned`] if the latch was poisoned.
+fn latch_refused(p: &Pin<'_, FaultFile>) -> Result<bool, StoreError> {
+    p.try_latch_shared().map(|held| held.is_none())
+}
+
+/// Whether a pin of `k`'s resident frame refuses its shared latch.
+///
+/// # Errors
+/// Whatever `pin_resident` and the latch return, or a message if `k` is not
+/// resident.
+fn resident_latch_refused(pool: &Pool<FaultFile>, k: PageKey) -> Result<bool, String> {
+    match pool.pin_resident(k).map_err(|e| e.to_string())? {
+        Some(p) => latch_refused(&p).map_err(|e| e.to_string()),
+        None => Err(format!("{k:?} is not resident")),
+    }
+}
+
+/// `create_vs_freed`'s record of a creation of `k`: the outcome's name, the
+/// frame it names (`Exists`: its pin's frame; `Created` and `Loading`: the
+/// outcome's own) and whether the outcome's pin is refused the frame's
+/// shared latch. Everything the outcome gave is dropped before this
+/// returns.
+fn create_named(
+    pool: &Pool<FaultFile>,
+    k: PageKey,
+    epoch: u32,
+) -> Result<(&'static str, FrameId, bool), String> {
+    let out = pool
+        .reserve()
+        .and_then(|res| pool.create(res, k, Kind::Leaf, epoch))
+        .map_err(|e| e.to_string())?;
+    Ok(match out {
+        CreateOutcome::Exists(p, _res) => (
+            "Exists",
+            p.frame(),
+            latch_refused(&p).map_err(|e| e.to_string())?,
+        ),
+        // A created page's pin sits under the outcome's own exclusive latch.
+        CreateOutcome::Created(c) => ("Created", c.frame(), true),
+        // A creation told `Loading` holds no pin.
+        CreateOutcome::Loading(res) => ("Loading", res.frame(), false),
+    })
+}
+
+/// C4's claim is made in the hold that decides (verdict A-3a, finding 2;
+/// §4.2, §5.4, §6.8), so a second creation of the freed key's frame gets
+/// `Exists` and never remakes the page over its first creator's. Creator A
+/// pauses twice: at `FreedClaimed`, where it holds only its pin on the
+/// claimed frame, and at `Pinned`, where it holds `Created`. At the first
+/// pause the table's mirror already says live while a stale name still reads
+/// the old, freed page (§6.8's window); at both, the controller's creation
+/// returns `Exists` while A is paused, so without waiting for anything A
+/// holds. While A is paused, the controller calls the pool only in ways that
+/// cannot wait on what A holds. CREATE-FREED-CLAIM-LATE fails at the first
+/// pause.
+#[test]
+fn create_vs_freed() {
+    const K: PageKey = PageKey::Lpid(8);
+    let (file, map, pool) = fixture(3).unwrap();
+    // `stale` is kept to the end of the test: the stale name's pin on `g`.
+    let (stale, g) = freed_frame(&pool, &map, K).unwrap();
+    let pz = Pauser::new();
+    pool.set_hook(Some(pz.hook()));
+    pz.pause_at(FreedClaimed, K);
+    let (
+        first,
+        table_free,
+        info1,
+        stale_read,
+        first_create,
+        second,
+        info2,
+        latch_held,
+        second_create,
+        a,
+    ) = thread::scope(|s| {
+        let a = spawn(s, &pz, "A", || {
+            let res = pool.reserve()?;
+            match pool.create(res, K, Kind::Leaf, 2)? {
+                CreateOutcome::Created(mut c) => {
+                    let seen = NewPage {
+                        frame: c.frame(),
+                        header: c[4..24].to_vec(),
+                        body_zero: c[24..].iter().all(|&b| b == 0),
+                        freed: c.is_freed(),
+                        dirty: c.is_dirty(),
+                        epoch: c.content_epoch(),
+                    };
+                    c[MARK] = 0x82;
+                    Ok((seen, c.release()))
+                }
+                CreateOutcome::Exists(..) | CreateOutcome::Loading(..) => {
+                    Err(StoreError::Invalid("A must remake the freed page".into()))
+                }
+            }
+        });
+        // A holds its pin on g, beside the stale name's; no latch, no mutex.
+        let first = pz.next_event();
+        let (mut table_free, mut info1, mut stale_read, mut first_create) =
+            (None, None, None, None);
+        let (mut second, mut info2, mut latch_held, mut second_create) = (None, None, None, None);
+        if arrived(&first, FreedClaimed, K) && frame_of_event(&first) == Some(g) {
+            // The controller goes on only if the table mutex is free: a
+            // firing under it must fail the test, not hang it.
+            let free = pool.table_free();
+            table_free = Some(free);
+            if free {
+                info1 = Some(pool.frame_info(g).map_err(|e| e.to_string()));
+                // A stale name's read of the claimed frame, through a pin
+                // that cannot wait; the guard and the pin are dropped here.
+                stale_read = Some(
+                    pool.pin_resident(K)
+                        .and_then(|p| p.as_ref().map(stale_marker).unwrap_or(Ok(None)))
+                        .map_err(|e| e.to_string()),
+                );
+                // The controller is creator B.
+                first_create =
+                    Some(create_named(&pool, K, 2).map(|(name, frame, _)| (name, frame)));
+                // Armed after the controller's own creation, whose `Pinned`
+                // firing must not take the pause.
+                pz.pause_at(Pinned, K);
+                pz.release(FreedClaimed, K);
+                let e = pz.next_event();
+                second = Some(e);
+                if arrived(&e, Pinned, K) && frame_of_event(&e) == Some(g) {
+                    // A holds Created: g's exclusive latch and its pin.
+                    info2 = Some(pool.frame_info(g).map_err(|e| e.to_string()));
+                    latch_held = Some(resident_latch_refused(&pool, K));
+                    // Only on a frame the mirror calls live: on a freed one a
+                    // creation latches that frame, which A holds here.
+                    if info2
+                        .as_ref()
+                        .is_some_and(|i| matches!(i, Ok(info) if !info.freed))
+                    {
+                        second_create = Some(create_named(&pool, K, 3));
+                    }
+                }
+            }
+        }
+        pz.release_all();
+        (
+            first,
+            table_free,
+            info1,
+            stale_read,
+            first_create,
+            second,
+            info2,
+            latch_held,
+            second_create,
+            a.join(),
+        )
+    });
+    assert!(arrived(&first, FreedClaimed, K), "{first:?}");
+    assert_eq!(frame_of_event(&first), Some(g));
+    assert_eq!(
+        table_free,
+        Some(true),
+        "the hook fires holding no table mutex"
+    );
+    assert_eq!(
+        info1,
+        Some(Ok(FrameInfo {
+            state: FrameState::Resident,
+            key: Some(K),
+            pins: 2,
+            freed: false
+        })),
+        "the claim is made in the hold that decided"
+    );
+    assert_eq!(
+        stale_read,
+        Some(Ok(Some((true, 0x81, 1)))),
+        "until its creator latches it, the claimed frame is open to a stale name and still \
+         holds the old, freed page"
+    );
+    assert_eq!(
+        first_create,
+        Some(Ok(("Exists", g))),
+        "a second creation of a claimed frame gets Exists, without waiting"
+    );
+    assert!(
+        second.as_ref().is_some_and(|e| arrived(e, Pinned, K)),
+        "{second:?}"
+    );
+    assert_eq!(second.as_ref().and_then(frame_of_event), Some(g));
+    assert_eq!(
+        info2,
+        Some(Ok(FrameInfo {
+            state: FrameState::Resident,
+            key: Some(K),
+            pins: 2,
+            freed: false
+        })),
+        "the frame a creator holds Created on is live by the table's mirror"
+    );
+    assert_eq!(
+        latch_held,
+        Some(Ok(true)),
+        "A holds the frame's exclusive latch"
+    );
+    assert_eq!(
+        second_create,
+        Some(Ok(("Exists", g, true))),
+        "Exists while the creator holds the latch"
+    );
+    let (seen, a_pin) = a.unwrap().unwrap();
+    assert_eq!(seen.frame, g);
+    assert_eq!(
+        seen.header,
+        [3, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+        "kind 3, id 8, epoch 2"
+    );
+    assert!(seen.body_zero, "{seen:?}");
+    assert_eq!((seen.freed, seen.dirty, seen.epoch), (false, true, 2));
+    assert_eq!(a_pin.frame(), g);
+    assert_eq!(marker(&a_pin).unwrap(), 0x82);
+    assert_eq!(pz.drain(), vec![Event::Done("A")]);
+    assert_eq!(pool.frame_of(K).unwrap(), Some(g));
+    assert_eq!(stale.frame(), g, "the stale name's pin, kept to the end");
+    assert_eq!(
+        pool.frame_info(g).unwrap(),
+        FrameInfo {
+            state: FrameState::Resident,
+            key: Some(K),
+            pins: 2,
+            freed: false
+        },
+        "stale's pin and A's"
+    );
+    let st = pool.stats().unwrap();
+    assert_eq!(
+        (st.free, st.reserved, st.loading, st.resident, st.orphan),
+        (2, 0, 0, 1, 0)
+    );
+    assert_eq!(file.reads(), 0);
+}
+
+/// The freed branch's error path gives the claim back (verdict A-3a, finding
+/// 2; card A-3a-F2): with `g`'s latch poisoned, a creation of `K` returns
+/// `Poisoned` and the table's mirror says the frame is freed again, as its
+/// content still is (the failing path writes nothing; the content cannot be
+/// read through the poisoned latch, so the test judges the mirror). The
+/// frame keeps its key and its one pin, and the creation's reservation is
+/// back on the free list. FREED-STAYS-CLAIMED fails it.
+#[test]
+fn create_freed_poison() {
+    const K: PageKey = PageKey::Lpid(8);
+    let (_file, map, pool) = fixture(3).unwrap();
+    let (stale, g) = freed_frame(&pool, &map, K).unwrap();
+    // Poison g's latch with a panic under it, inside `catch_unwind`. The
+    // panic hook is not replaced (it is process-wide), and the table mutex
+    // is not held here: only the latch is poisoned.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = stale.latch_exclusive().unwrap();
+        panic!("poison the freed frame's latch for create_freed_poison");
+    }));
+    assert!(
+        poisoned.is_err(),
+        "the panic under the latch was not caught"
+    );
+    let before = pool.stats().unwrap();
+    let made = pool.create(pool.reserve().unwrap(), K, Kind::Leaf, 2);
+    assert!(matches!(made, Err(StoreError::Poisoned(_))), "{made:?}");
+    assert_eq!(
+        pool.frame_info(g).unwrap(),
+        FrameInfo {
+            state: FrameState::Resident,
+            key: Some(K),
+            pins: 1,
+            freed: true
+        },
+        "the claim is given back; only stale counts"
+    );
+    assert_eq!(pool.frame_of(K).unwrap(), Some(g));
+    let st = pool.stats().unwrap();
+    assert_eq!(
+        (st.free, st.reserved, st.loading, st.resident, st.orphan),
+        (2, 0, 0, 1, 0)
+    );
+    assert_eq!(
+        st.free, before.free,
+        "the reservation's frame is back on the free list"
     );
 }
