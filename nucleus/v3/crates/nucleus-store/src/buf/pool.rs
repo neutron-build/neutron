@@ -175,7 +175,8 @@ pub enum HookPoint {
     LoadRead,
     /// Where a pin (P2 (b), holding its count on the `Loading` frame) or a
     /// creation ([`Pool::wait_settled`], holding its reservation) is about to
-    /// wait for a load (§5.4). No latch.
+    /// wait for a load (§5.4). No latch the pool holds; a creation may hold
+    /// its tree's latches (§5.4).
     LoadWaiting,
     /// P2 (b) (§5.4): a pin's wait for a load ended, before it decides; it holds its
     /// count. No latch.
@@ -752,10 +753,14 @@ impl<H: File> Pool<H> {
     /// last paragraph; §6.4, §6.8; card A-3a, steps C1–C4), born latched: the
     /// frame is zeroed, given its header (`kind`, the key's id, `epoch`) and
     /// published `Resident` while its creator holds its exclusive latch, so
-    /// no other thread reads it before [`CreatedPage::release`]
+    /// no other thread reads the new page before [`CreatedPage::release`]
     /// (BUF-BORN-LATCHED). A key that a frame already holds gets no second
     /// frame: `Loading` while it is being loaded, the freed page remade in
-    /// its own frame (§4.2), or `Exists` for a live one.
+    /// its own frame (§4.2), or `Exists` for a live one. A remade page's
+    /// frame is already in the table: its creator claims it in the hold that
+    /// finds it freed and latches it only afterwards, and until then the
+    /// frame stays open to §6.8's stale-name window, in which a stale name
+    /// can latch it and read the old, freed bytes.
     ///
     /// Precondition: the caller allocated `key` (an LPID it took under the
     /// free-set lock, §4.2, §5.6; or a MapLeaf whose parent reference it found
@@ -769,7 +774,9 @@ impl<H: File> Pool<H> {
     /// [`StoreError::Invalid`] if `res` belongs to another pool, the key has
     /// no header id, the key does not admit `kind`, or a count is at
     /// `u64::MAX` (the reservation then returns to the free list by its
-    /// drop); [`StoreError::Poisoned`] if a latch or the mutex was poisoned.
+    /// drop); [`StoreError::Poisoned`] if a latch or the mutex was poisoned
+    /// (if it is the latch of a freed frame this call had claimed, the claim
+    /// is first given back and the frame is freed again, card A-3a-F2).
     pub fn create<'p>(
         &'p self,
         res: FrameReservation<'p, H>,
