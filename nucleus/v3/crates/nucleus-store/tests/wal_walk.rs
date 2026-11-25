@@ -1784,7 +1784,11 @@ fn wal_walk_writes_nothing() {
 /// Segment names and the size floor (card A-6b, Work 11; §12.1): the
 /// path's 16 lowercase hex digits, `parse_segment_name`'s round trip and
 /// refusals, `list_segments` skipping what is not a segment, and
-/// `check_seg_size`'s floor and ceiling.
+/// `check_seg_size`'s floor and ceiling. Every public function that takes a
+/// `seg_size` refuses one out of range before any Env call (card Work 3),
+/// and a segment, a walk's start segment or a recycling target that would
+/// end past `u64::MAX` is `Invalid` too (every sum on a position is
+/// checked), the last before any rename.
 #[test]
 fn wal_segment_names() {
     const BAD_NAMES: [&str; 8] = [
@@ -1857,6 +1861,71 @@ fn wal_segment_names() {
         &list_segments(&hooked, 211).expect_err("refused")
     ));
     assert!(hooked.log().is_empty());
+    // The same of `create_wal`, `ensure_segment` and `recycle_below`: an
+    // out-of-range size is `Invalid` and nothing reaches the `Env`.
+    {
+        let env = HookEnv::new(MemEnv::new(1));
+        for bad in [0u64, 211, u64::from(u32::MAX) + 1, u64::MAX] {
+            let what = format!("wal_seg_size {bad}");
+            assert!(
+                is_invalid(&create_wal(&env, bad).expect_err(&what)),
+                "{what}"
+            );
+            // A file handle is not `Debug`: the refusal is matched, not
+            // `expect_err`'d.
+            match ensure_segment(&env, bad, 0) {
+                Err(e) => assert!(is_invalid(&e), "{what}"),
+                Ok(_) => panic!("{what}: ensure_segment accepted the size"),
+            }
+            assert!(
+                is_invalid(&recycle_below(&env, bad, 0, 0).expect_err(&what)),
+                "{what}"
+            );
+            assert!(
+                env.log().is_empty(),
+                "{what}: a refused size made an Env call: {:?}",
+                env.log()
+            );
+        }
+        // The highest multiple of S: a segment there would end at 2^64. It is
+        // refused before any I/O by `ensure_segment`, and a walk starting in
+        // it before its first `open`.
+        let top = u64::MAX - 1023;
+        assert_eq!(segment_first(u64::MAX, S), top);
+        match ensure_segment(&env, S, top) {
+            Err(e) => assert!(is_invalid(&e), "a segment that ends past u64::MAX: {e}"),
+            Ok(_) => panic!("ensure_segment made usable a segment that ends past u64::MAX"),
+        }
+        assert!(
+            env.log().is_empty(),
+            "ensure_segment made an Env call: {:?}",
+            env.log()
+        );
+        assert!(is_invalid(
+            &walk(&env, S, &start(u64::MAX - 5, PREV_NONE, 0), &mut |_| Ok(()))
+                .expect_err("a start segment that ends past u64::MAX")
+        ));
+        assert!(
+            env.log().is_empty(),
+            "the walk made an Env call: {:?}",
+            env.log()
+        );
+        // Recycling with segment 0 and that highest segment present: the
+        // only name above every present segment would end past `u64::MAX`,
+        // so the whole run is refused before its first rename (the listing
+        // alone reaches the `Env`), and nothing moved.
+        wal_dir(&env);
+        env.open(&seg_name(0), OpenMode::CreateNew)
+            .expect("segment 0");
+        env.open(&seg_name(top), OpenMode::CreateNew)
+            .expect("the highest segment");
+        env.forget();
+        assert!(is_invalid(
+            &recycle_below(&env, S, u64::MAX, u64::MAX).expect_err("no name above the top")
+        ));
+        assert_eq!(env.ops(), vec![("list_dir", "wal".to_string())]);
+        assert_eq!(list_segments(&env, S).expect("list"), vec![0, top]);
+    }
 }
 
 /// Reads `len` bytes at `off` of the file of segment `seg`, through `env`.
@@ -2266,6 +2335,40 @@ fn wal_append_errors() {
             .expect_err("a size below the floor")
         ));
         assert!(env.log().is_empty(), "new does no I/O");
+    }
+    // (d) again: an append position whose segment ends past `u64::MAX`. `new`
+    // takes the room (61 bytes, a `SegmentEnd`'s or more); the append is
+    // `Invalid` (A-6a's `place` refuses the segment) before any I/O, and the
+    // appender is where it was.
+    {
+        let env = HookEnv::new(MemEnv::new(43));
+        let pos = u64::MAX - 60;
+        let mut app = Appender::new(
+            &env,
+            S,
+            1,
+            Resume {
+                append_pos: pos,
+                prev_lsn: 7,
+                prev_crc: 7,
+                durable_end: pos,
+            },
+        )
+        .expect("new");
+        assert!(is_invalid(
+            &app.append(&rec)
+                .expect_err("a segment that ends past u64::MAX")
+        ));
+        assert!(env.log().is_empty(), "steps 1-4 do no I/O");
+        assert_eq!(
+            (
+                app.position(),
+                app.written_end(),
+                app.durable_end(),
+                app.chain_head()
+            ),
+            (pos, pos, pos, (7, 7))
+        );
     }
 }
 
