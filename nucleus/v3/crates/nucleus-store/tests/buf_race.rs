@@ -1098,7 +1098,9 @@ fn create_vs_freed() {
             state: FrameState::Resident,
             key: Some(K),
             pins: 2,
-            freed: false
+            freed: false,
+            // Card A-3b-0: the remade page's pin sets the clock's bit.
+            referenced: true
         })),
         "the claim is made in the hold that decided"
     );
@@ -1124,7 +1126,9 @@ fn create_vs_freed() {
             state: FrameState::Resident,
             key: Some(K),
             pins: 2,
-            freed: false
+            freed: false,
+            // Card A-3b-0: the remade page's pin sets the clock's bit.
+            referenced: true
         })),
         "the frame a creator holds Created on is live by the table's mirror"
     );
@@ -1158,7 +1162,9 @@ fn create_vs_freed() {
             state: FrameState::Resident,
             key: Some(K),
             pins: 2,
-            freed: false
+            freed: false,
+            // Card A-3b-0: the remade page's pin sets the clock's bit.
+            referenced: true
         },
         "stale's pin and A's"
     );
@@ -1202,7 +1208,10 @@ fn create_freed_poison() {
             state: FrameState::Resident,
             key: Some(K),
             pins: 1,
-            freed: true
+            freed: true,
+            // Card A-3b-0: the claim's pin set the clock's bit, and the
+            // give-back leaves it set.
+            referenced: true
         },
         "the claim is given back; only stale counts"
     );
