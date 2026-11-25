@@ -20,13 +20,19 @@
 //! controller records what it sees, releases every paused thread, joins every
 //! thread, and only then asserts; while a thread is paused it calls the pool
 //! only in ways that cannot wait on what that thread holds.
+//! `acquire_shared_hand` places its interleaving with its own permit hook
+//! instead, on the same rule.
 
 mod buf_support;
 
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::thread::{Scope, ScopedJoinHandle, ThreadId};
 
 use buf_support::{
     Event, EventLog, FaultFile, MARK, NO_FRAME, NO_KEY, PS, Pauser, fixture, fixture_at_minimum,
@@ -39,7 +45,7 @@ use nucleus_store::buf::{
 };
 use nucleus_store::page::Kind;
 
-use HookPoint::{Evicted, RemoveLatched, SweepEnded, UnpinWait};
+use HookPoint::{Evicted, RemoveLatched, SweepEnded, SweepStep, UnpinWait};
 
 /// `Lpid(n)`.
 const fn lpid(n: u64) -> PageKey {
@@ -185,9 +191,26 @@ fn skip(events: &[Event], point: HookPoint, key: PageKey) -> (&[Event], usize) {
 /// mutant that retries without bound fails the test instead of hanging it.
 /// With `after`, only firings once that flag is set are counted.
 fn budgeted(pz: &Pauser, budget: usize, after: Option<Arc<AtomicBool>>) -> Hook {
+    budgeted_wait(pz, budget, after, false)
+}
+
+/// [`budgeted`], and with `no_wait` set a hook that also fails the test at
+/// an `UnpinWait`, which no thread of that test may reach: where one did, the
+/// thread would hold a real waiter whose wake-up no other thread of the test
+/// sends (card A-3b-0, Work 12, "Step budgets"; gate ruling A-3b-0 R2).
+fn budgeted_wait(
+    pz: &Pauser,
+    budget: usize,
+    after: Option<Arc<AtomicBool>>,
+    no_wait: bool,
+) -> Hook {
     let count = Arc::new(AtomicUsize::new(0));
     let pauser = pz.hook();
     Arc::new(move |point, key, frame| {
+        assert!(
+            !no_wait || point != HookPoint::UnpinWait,
+            "this test's acquisition waited for an unpin"
+        );
         if point == SweepEnded && after.as_ref().is_none_or(|f| f.load(Ordering::SeqCst)) {
             let n = count.fetch_add(1, Ordering::SeqCst) + 1;
             assert!(
@@ -952,6 +975,359 @@ fn unpin_wait_then_served() {
     assert_eq!((s.unpin_waiters, s.evictions), (0, 1));
 }
 
+/// `acquire_shared_hand`'s step budget (card A-3b-0, Work 12; gate ruling
+/// A-3b-0 R1): B's `SweepEnded` ≤ 4. A correct build ends two for T_B (the
+/// scripted sweep and one more before its wait) and none for T_A; the hook
+/// holds T_A to the same bound, so that a thread whose acquisition retries
+/// without end fails inside it instead of hanging the test.
+const SWEEP_BUDGET: usize = 4;
+
+/// A thread of `acquire_shared_hand`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Who {
+    /// T_A: the acquirer that takes the victim.
+    A,
+    /// T_B: the acquirer that shares T_A's clock hand.
+    B,
+}
+
+impl Who {
+    /// Its place among the two threads.
+    fn at(self) -> usize {
+        match self {
+            Who::A => 0,
+            Who::B => 1,
+        }
+    }
+}
+
+/// One firing of the pool's hook, as the controller of `acquire_shared_hand`
+/// records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fired {
+    /// The thread that fired.
+    who: Who,
+    /// The point that fired.
+    point: HookPoint,
+    /// The key it fired with.
+    key: PageKey,
+    /// The frame it fired with.
+    frame: FrameId,
+}
+
+/// What the controller of `acquire_shared_hand` saw come next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Got {
+    /// A thread fired the hook, and is held at that firing until permitted.
+    At(Fired),
+    /// A thread's closure ended, by its return or by a panic.
+    Done(Who),
+}
+
+/// What `acquire_shared_hand`'s permit hook and its controller share.
+struct Held {
+    /// Each thread's id once it has entered, so the hook knows who fires.
+    ids: [Option<ThreadId>; 2],
+    /// Each thread's permits not yet taken; `None` lets it pass every firing.
+    permits: [Option<usize>; 2],
+    /// What came, in order: every firing and every end.
+    log: Vec<Got>,
+}
+
+/// `acquire_shared_hand`'s own controller (card A-3b-0, Work 12; gate ruling
+/// A-3b-0 R1), not the `Pauser`: each thread passes one firing of any point
+/// per permit, and a firing from any other thread passes at once. Every wait
+/// is on one condition variable: a thread's for a permit, and the
+/// controller's for the next thing to come. The hook also keeps the step
+/// budget, so that a thread whose acquisition retries without end fails
+/// inside the hook, which holds no lock, instead of hanging the test.
+#[derive(Clone)]
+struct Permits(Arc<Gate>);
+
+/// The state behind [`Permits`].
+struct Gate {
+    held: Mutex<Held>,
+    wake: Condvar,
+    /// Each thread's `SweepEnded` firings.
+    sweeps: [AtomicUsize; 2],
+}
+
+/// Lock a test mutex, recovering from poison: a panicking test thread must
+/// not turn a second lock into a second panic.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Permits {
+    /// A controller with nothing permitted.
+    fn new() -> Permits {
+        Permits(Arc::new(Gate {
+            held: Mutex::new(Held {
+                ids: [None, None],
+                permits: [Some(0), Some(0)],
+                log: Vec::new(),
+            }),
+            wake: Condvar::new(),
+            sweeps: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        }))
+    }
+
+    /// The hook to install: a thread's firing is recorded, and that thread is
+    /// held at the firing until permitted. The step budget is asserted
+    /// before any lock is taken.
+    fn hook(&self) -> Hook {
+        let gate = Arc::clone(&self.0);
+        Arc::new(move |point, key, frame| {
+            let me = thread::current().id();
+            let at = lock(&gate.held).ids.iter().position(|id| *id == Some(me));
+            let Some(at) = at else {
+                return;
+            };
+            let who = [Who::A, Who::B][at];
+            if point == SweepEnded {
+                let n = gate.sweeps[at].fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(
+                    n <= SWEEP_BUDGET,
+                    "{who:?} ended {n} sweeps, past the step budget of {SWEEP_BUDGET}"
+                );
+            }
+            let mut held = lock(&gate.held);
+            held.log.push(Got::At(Fired {
+                who,
+                point,
+                key,
+                frame,
+            }));
+            gate.wake.notify_all();
+            while held.permits[at] == Some(0) {
+                held = gate.wake.wait(held).unwrap_or_else(PoisonError::into_inner);
+            }
+            if let Some(left) = held.permits[at].as_mut() {
+                *left -= 1;
+            }
+        })
+    }
+
+    /// A thread's first call, which makes its firings `who`'s.
+    fn enter(&self, who: Who) {
+        lock(&self.0.held).ids[who.at()] = Some(thread::current().id());
+    }
+
+    /// Let `who` pass one firing.
+    fn permit(&self, who: Who) {
+        let mut held = lock(&self.0.held);
+        if let Some(left) = held.permits[who.at()].as_mut() {
+            *left += 1;
+        }
+        self.0.wake.notify_all();
+    }
+
+    /// Let `who` pass every firing from here on.
+    fn free(&self, who: Who) {
+        lock(&self.0.held).permits[who.at()] = None;
+        self.0.wake.notify_all();
+    }
+
+    /// Record that `who`'s closure ended.
+    fn done(&self, who: Who) {
+        lock(&self.0.held).log.push(Got::Done(who));
+        self.0.wake.notify_all();
+    }
+
+    /// The `n`th thing that came, waiting until it has.
+    fn came(&self, n: usize) -> Got {
+        let mut held = lock(&self.0.held);
+        while held.log.len() <= n {
+            held = self
+                .0
+                .wake
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        held.log[n]
+    }
+}
+
+/// The controller's next thing from `who`; what came from the other thread
+/// before it is kept in `record` too.
+fn next_from(permits: &Permits, record: &mut Vec<Got>, who: Who) -> Got {
+    loop {
+        let got = permits.came(record.len());
+        record.push(got);
+        let mine = matches!(got, Got::At(f) if f.who == who) || got == Got::Done(who);
+        if mine {
+            return got;
+        }
+    }
+}
+
+/// Whether `who`'s closure ended, as `record` shows.
+fn ended(record: &[Got], who: Who) -> bool {
+    record.contains(&Got::Done(who))
+}
+
+/// The point a recorded thing fired, if it was a firing.
+fn fired_point(got: Got) -> Option<HookPoint> {
+    match got {
+        Got::At(f) => Some(f.point),
+        Got::Done(_) => None,
+    }
+}
+
+/// Records `Done(who)` when dropped: at the end of a thread's closure, and
+/// on its way out of a panic, so the controller never waits for a thread that
+/// has finished.
+struct DoneOnDrop {
+    permits: Permits,
+    who: Who,
+}
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.permits.done(self.who);
+    }
+}
+
+/// Spawn `f` on scope `s` as thread `who` of `acquire_shared_hand`.
+fn spawn_held<'s, 'env, T: Send + 's>(
+    s: &'s Scope<'s, 'env>,
+    permits: &Permits,
+    who: Who,
+    f: impl FnOnce() -> T + Send + 's,
+) -> ScopedJoinHandle<'s, T> {
+    let permits = Permits(Arc::clone(&permits.0));
+    s.spawn(move || {
+        permits.enter(who);
+        let _done = DoneOnDrop { permits, who };
+        f()
+    })
+}
+
+/// Two acquirers share the clock hand (card A-3b-0, Work 5, A6′ and Work 12;
+/// gate ruling A-3b-0 R1): the hand alone does not decide. F = 2: X = L1 in
+/// frame 0, loaded, clean, unpinned, its bit set; Y = L2 in frame 1, pinned
+/// by the controller throughout. No frame is dirty. T_A and T_B each call
+/// `reserve()`, both from `h0 = 0`. Permitted one firing at a time, T_A
+/// clears X's bit at hand 0 and takes X as a candidate at hand 2, where it is
+/// held at `RemoveLatched` with X's exclusive latch (no pin, no mutex), while
+/// T_B passes Y at hands 1 and 3 and ends its sweep having met no busy frame.
+/// So the shared hand tells T_B that every unpinned frame is dirty, which is
+/// false: X is clean and T_A is about to take it. T_B's own pass (A6′) meets
+/// X's latch, so T_B retries; then, T_A holding frame 0 and Y pinned, it
+/// waits for an unpin, and the release of T_A's reservation serves it frame
+/// 0. Mutants OWN-PASS-SKIPPED and PASS-NONE-NOT-BUSY end T_B with
+/// `PoolStarved` right after its first sweep.
+///
+/// While a thread is held the controller makes no pool call at all. It
+/// records, releases, joins, and only then asserts.
+#[test]
+fn acquire_shared_hand() {
+    let (file, map, pool) = fixture(2).unwrap();
+    for n in [1u64, 2] {
+        put_l!(&file, &map, n);
+    }
+    // X = L1 in frame 0, its pin dropped, its bit set; Y = L2 in frame 1,
+    // pinned by the controller throughout. No frame is dirty.
+    let (x, y) = (L1, L2);
+    let fx = load!(&pool, &map, x);
+    let p = pinned!(pool.pin(y, &map));
+    let fy = p.frame();
+    assert_eq!((fx, fy), (FrameId(0), FrameId(1)));
+    assert!(
+        pool.frame_info(fx).unwrap().referenced,
+        "X's bit is set by its load"
+    );
+
+    let permits = Permits::new();
+    pool.set_hook(Some(permits.hook()));
+    let (record, after_first_sweep, a_answer, b_answer) = thread::scope(|s| {
+        // The controller's record, in order.
+        let mut record = Vec::new();
+        let t_a = spawn_held(s, &permits, Who::A, || pool.reserve().map_err(text));
+        // T_A's first `SweepStep`: it has passed A1 with `h0 = 0` and holds
+        // nothing.
+        next_from(&permits, &mut record, Who::A);
+        let mut t_b = None;
+        let mut after_first_sweep = None;
+        if !ended(&record, Who::A) {
+            t_b = Some(spawn_held(s, &permits, Who::B, || {
+                pool.reserve().map_err(text)
+            }));
+            // T_B's first `SweepStep`: it too has passed A1 with `h0 = 0`.
+            next_from(&permits, &mut record, Who::B);
+            // Permits in the order A, B, A, B, B, each awaited.
+            for who in [Who::A, Who::B, Who::A, Who::B, Who::B] {
+                if ended(&record, Who::A) || ended(&record, Who::B) {
+                    break;
+                }
+                permits.permit(who);
+                next_from(&permits, &mut record, who);
+            }
+            if !ended(&record, Who::B) {
+                // One more for T_B: its next event is a `SweepStep` (it
+                // retried) or its end.
+                permits.permit(Who::B);
+                after_first_sweep = Some(next_from(&permits, &mut record, Who::B));
+            }
+        }
+        // T_A runs to its end.
+        permits.free(Who::A);
+        while !ended(&record, Who::A) {
+            next_from(&permits, &mut record, Who::A);
+        }
+        let a = t_a.join();
+        let a_answer = match &a {
+            Ok(Ok(res)) => Ok(res.frame()),
+            Ok(Err(e)) => Err(e.clone()),
+            Err(_) => Err("T_A panicked".to_string()),
+        };
+        // T_A's reservation `r_A`, which the controller holds from here.
+        let r_a = a.ok().and_then(|r| r.ok());
+        let mut b_answer = Err("T_B was not started".to_string());
+        if let Some(t_b) = t_b {
+            // T_B runs freely: to its wait for an unpin, or to its end.
+            permits.free(Who::B);
+            let mut waits = false;
+            while !waits && !ended(&record, Who::B) {
+                let got = next_from(&permits, &mut record, Who::B);
+                waits = matches!(got, Got::At(f) if f.point == UnpinWait);
+            }
+            // The controller drops `r_A` and joins T_B.
+            drop(r_a);
+            let b = t_b.join();
+            b_answer = match &b {
+                Ok(Ok(res)) => Ok(res.frame()),
+                Ok(Err(e)) => Err(e.clone()),
+                Err(_) => Err("T_B panicked".to_string()),
+            };
+        } else {
+            drop(r_a);
+        }
+        (record, after_first_sweep, a_answer, b_answer)
+    });
+
+    // The assertions, after the joins.
+    let unpin_waits = record
+        .iter()
+        .filter(|got| matches!(got, Got::At(f) if f.who == Who::B && f.point == UnpinWait))
+        .count();
+    assert_eq!(
+        after_first_sweep.map(fired_point),
+        Some(Some(SweepStep)),
+        "T_B's event after its first SweepEnded was not a SweepStep: {record:?}"
+    );
+    assert_eq!(unpin_waits, 1, "T_B's UnpinWait firings: {record:?}");
+    for (who, answer) in [(Who::A, &a_answer), (Who::B, &b_answer)] {
+        assert!(
+            !matches!(answer, Err(e) if e.contains("starved")),
+            "{who:?} answered PoolStarved: {answer:?}"
+        );
+    }
+    assert_eq!(a_answer, Ok(fx), "T_A's reservation, frame 0");
+    assert_eq!(b_answer, Ok(fx), "T_B's answer");
+    drop(p);
+}
+
 // ---- Beyond the card's list: each pins a site of the acquisition or of
 // ---- the reference bit that the card's own tests leave unjudged.
 
@@ -1092,11 +1468,13 @@ fn clear_and_hold<'p>(
 /// Where the clock's reference bit is set, and where it is not (card
 /// A-3b-0, Work 3; S-STORE §5.2 "Clock"): a load (P10), a hit (P2 (a)),
 /// `pin_resident`'s hit and `create`'s three pins each set it as they raise
-/// a count; `pin_frame` sets it never; the hand clears it, and so does a
-/// frame's becoming `Free` or `Reserved`. (A served waiter's set is not told
-/// apart here: its frame has kept the loader's bit since P10, the hand
-/// clearing no pinned frame.) Beyond the card's list: each site is seen
-/// alone, on a frame whose bit is clear.
+/// a count; neither `Pool::pin_frame` nor `VictimGuard::pin_frame` sets it
+/// (each is seen alone below; the latter by gate ruling A-3b-0 R3, mutant
+/// VICTIM-PIN-SETS-BIT); the hand clears it, and so does a frame's becoming
+/// `Free` or `Reserved`. (A served waiter's set is not told apart here: its
+/// frame has kept the loader's bit since P10, the hand clearing no pinned
+/// frame.) Beyond the card's list: each site is seen alone, on a frame whose
+/// bit is clear.
 #[test]
 fn clock_bit_sites() {
     let bit = |pool: &Pool<FaultFile>, f: FrameId| pool.frame_info(f).unwrap().referenced;
@@ -1130,6 +1508,15 @@ fn clock_bit_sites() {
         assert_eq!(q.key(), lpid(2));
         assert!(!bit(&pool, fb), "pin_frame");
         drop(q);
+
+        // `VictimGuard::pin_frame` is not a use either (gate ruling A-3b-0
+        // R3): frame 1 taken as a victim and pinned under that latch keeps
+        // its clear bit.
+        let v = pool.try_victim(fb).unwrap().expect("L2 is unpinned");
+        let q2 = v.pin_frame().unwrap();
+        assert!(!bit(&pool, fb), "VictimGuard::pin_frame");
+        drop(q2);
+        drop(v);
 
         // A hit (P2 (a)) and `pin_resident`'s hit set it.
         let p = pinned!(pool.pin(lpid(2), &map));
@@ -1183,8 +1570,10 @@ fn clock_bit_sites() {
             put_l!(&file, &map, n);
         }
         let pz = Pauser::new();
-        // The step budget: one sweep per `clear_and_hold`.
-        pool.set_hook(Some(budgeted(&pz, 4, None)));
+        // The step budget: one sweep per `clear_and_hold`; and no wait for an
+        // unpin, which no thread of this test may reach (gate ruling A-3b-0
+        // R2: mutant TRY-WAITS ends a thread as a real waiter there).
+        pool.set_hook(Some(budgeted_wait(&pz, 4, None, true)));
         let (fa, fb, fc) = (
             load!(&pool, &map, lpid(1)),
             load!(&pool, &map, lpid(2)),

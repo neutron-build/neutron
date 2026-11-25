@@ -232,6 +232,12 @@ pub enum HookPoint {
     /// before its first wait: with the key it is for or none. The firing
     /// thread holds nothing, and is counted in [`PoolStats::unpin_waiters`].
     UnpinWait,
+    /// Step A2, at the start of each sweep step, before the table mutex is
+    /// taken (so before the test that ends the sweep): with the key the
+    /// acquisition is for (`pin`'s miss) or none, and no frame (card A-3b-0,
+    /// Work 6; gate ruling A-3b-0 R1). The firing thread holds nothing: no
+    /// reservation, no pin, no latch, no mutex.
+    SweepStep,
 }
 
 /// A test hook (card A-3a; S-STORE §15's hook-placed interleavings): called

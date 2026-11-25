@@ -14,12 +14,14 @@
 //! `try_reserve` rows.
 //!
 //! No thread, and no hook outside `transition_table` and the guard `run`
-//! installs, which only fails a run that reaches the wait for an unpin.
+//! installs, which fails a run that reaches the wait for an unpin, or that
+//! ends more sweeps than the ops it drove (its step budget).
 
 mod buf_support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use buf_support::{
@@ -744,9 +746,31 @@ fn run(
     .map_err(text)?;
     // Card A-3b-0: no op the model drives may reach the wait for an unpin
     // (it leaves those undriven). One that does fails here, in the hook,
-    // instead of holding the only thread.
+    // instead of holding the only thread. The hook also keeps the step
+    // budget (card A-3b-0, Work 12, "Step budgets"; gate ruling A-3b-0 R2):
+    // one `SweepEnded` per driven op, the driver raising the op count before
+    // each op it drives. No other thread runs, so an acquisition that ends a
+    // second sweep in one op retries without end (mutant DIRTY-NOT-SKIPPED);
+    // it fails here, by assertion, instead of hanging.
+    let driven = Arc::new(AtomicUsize::new(0));
+    let ended = Arc::new(AtomicUsize::new(0));
+    let (driven_in_hook, ended_in_hook) = (Arc::clone(&driven), Arc::clone(&ended));
     let log = EventLog::new();
-    pool.set_hook(Some(log.hook_no_wait()));
+    pool.set_hook(Some(log.hook_with(move |point| {
+        assert_ne!(
+            point,
+            HookPoint::UnpinWait,
+            "a single thread waited for an unpin"
+        );
+        if point == HookPoint::SweepEnded {
+            let ended = ended_in_hook.fetch_add(1, Ordering::SeqCst) + 1;
+            let driven = driven_in_hook.load(Ordering::SeqCst);
+            assert!(
+                ended <= driven,
+                "{ended} sweeps ended in {driven} driven ops, past the step budget of one per driven op"
+            );
+        }
+    })));
     let map = TestMap::new();
     let mut model = Model {
         frames,
@@ -784,6 +808,8 @@ fn run(
             // Every frame is held: not driven.
             None
         } else {
+            // Driven: the step budget allows one `SweepEnded` for it.
+            driven.fetch_add(1, Ordering::SeqCst);
             Some(d.drive(op).map_err(at)?)
         };
         let evicted = match before {
