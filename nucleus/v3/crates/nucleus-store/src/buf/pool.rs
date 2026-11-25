@@ -154,7 +154,8 @@ pub struct PoolFootprint {
 /// A-3a, Work 8). Always defined; the hook storage and [`Pool::set_hook`]
 /// exist only under the crate's `test-hooks` feature, and without it firing
 /// compiles to nothing. A hook fires holding no pool mutex; the latches each
-/// point holds are in card A-3a's hook table. S-STORE §15's `t_pin_load_race`
+/// point holds are in card A-3a's hook table and, for `FreedClaimed`, in card
+/// A-3a-F2's. S-STORE §15's `t_pin_load_race`
 /// names four of them: *missed* is [`HookPoint::MissReserved`], *published*
 /// [`HookPoint::LoadPublished`], *resolved* [`HookPoint::LoadResolved`] and
 /// *waiting* [`HookPoint::LoadWaiting`].
@@ -174,7 +175,8 @@ pub enum HookPoint {
     LoadRead,
     /// Where a pin (P2 (b), holding its count on the `Loading` frame) or a
     /// creation ([`Pool::wait_settled`], holding its reservation) is about to
-    /// wait for a load (§5.4). No latch.
+    /// wait for a load (§5.4). No latch the pool holds; a creation may hold
+    /// its tree's latches (§5.4).
     LoadWaiting,
     /// P2 (b) (§5.4): a pin's wait for a load ended, before it decides; it holds its
     /// count. No latch.
@@ -187,6 +189,9 @@ pub enum HookPoint {
     /// C3 (§6.8): the reservation's frame is latched exclusively and initialised,
     /// not yet in the table; no pin.
     CreateReady,
+    /// C4, the freed branch (§4.2): the key's freed frame is claimed and not
+    /// yet latched; the creator holds its pin on it. No mutex.
+    FreedClaimed,
     /// R1 (§5.2): the victim's exclusive latch is held; no pin.
     RemoveLatched,
 }
@@ -748,10 +753,14 @@ impl<H: File> Pool<H> {
     /// last paragraph; §6.4, §6.8; card A-3a, steps C1–C4), born latched: the
     /// frame is zeroed, given its header (`kind`, the key's id, `epoch`) and
     /// published `Resident` while its creator holds its exclusive latch, so
-    /// no other thread reads it before [`CreatedPage::release`]
+    /// no other thread reads the new page before [`CreatedPage::release`]
     /// (BUF-BORN-LATCHED). A key that a frame already holds gets no second
     /// frame: `Loading` while it is being loaded, the freed page remade in
-    /// its own frame (§4.2), or `Exists` for a live one.
+    /// its own frame (§4.2), or `Exists` for a live one. A remade page's
+    /// frame is already in the table: its creator claims it in the hold that
+    /// finds it freed and latches it only afterwards, and until then the
+    /// frame stays open to §6.8's stale-name window, in which a stale name
+    /// can latch it and read the old, freed bytes.
     ///
     /// Precondition: the caller allocated `key` (an LPID it took under the
     /// free-set lock, §4.2, §5.6; or a MapLeaf whose parent reference it found
@@ -765,7 +774,9 @@ impl<H: File> Pool<H> {
     /// [`StoreError::Invalid`] if `res` belongs to another pool, the key has
     /// no header id, the key does not admit `kind`, or a count is at
     /// `u64::MAX` (the reservation then returns to the free list by its
-    /// drop); [`StoreError::Poisoned`] if a latch or the mutex was poisoned.
+    /// drop); [`StoreError::Poisoned`] if a latch or the mutex was poisoned
+    /// (if it is the latch of a freed frame this call had claimed, the claim
+    /// is first given back and the frame is freed again, card A-3a-F2).
     pub fn create<'p>(
         &'p self,
         res: FrameReservation<'p, H>,
@@ -829,11 +840,27 @@ impl<H: File> Pool<H> {
                 let pin = Pin::counted(self, g, key);
                 drop(c);
                 drop(res);
+                self.fire(HookPoint::FreedClaimed, key, g);
                 // A freed frame's latch holders hold nothing else: stale-name
                 // threads (§6.8) and `try_victim`.
-                let mut gc = self.latch(g)?.exclusive()?;
-                init_page(&mut gc, kind, id, epoch)?;
-                let guard = ExclusiveGuard::held(gc, self, key, g);
+                let made = self
+                    .latch(g)
+                    .and_then(FrameLatch::exclusive)
+                    .and_then(|mut gc| {
+                        init_page(&mut gc, kind, id, epoch)
+                            .map(|()| ExclusiveGuard::held(gc, self, key, g))
+                    });
+                let guard = match made {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        // The claim is given back before the error is
+                        // returned, so before `pin` drops: the frame is
+                        // freed again by the table's mirror, as it still is
+                        // by its content (card A-3a-F2).
+                        self.lock_table()?.meta_mut(g)?.freed = true;
+                        return Err(e);
+                    }
+                };
                 self.fire(HookPoint::Pinned, key, g);
                 Ok(CreateOutcome::Created(CreatedPage::new(guard, pin)))
             }
