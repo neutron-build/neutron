@@ -772,9 +772,11 @@ fn fixture_appended() -> Vec<Appended> {
 }
 
 /// Whether, among the old names, the present ones form an upper set: never
-/// a segment renamed while a lower one is present (I-WAL-START).
+/// a segment renamed while a lower one is present (I-WAL-START). `names`
+/// is a listing of `wal/`, which holds bare names ([`seg_file`]); a path
+/// never matches one, so a check written with [`seg_name`] holds vacuously.
 fn present_is_upper_set(old: &[u64], names: &[String]) -> bool {
-    let present: Vec<bool> = old.iter().map(|f| names.contains(&seg_name(*f))).collect();
+    let present: Vec<bool> = old.iter().map(|f| names.contains(&seg_file(*f))).collect();
     // From the highest name down: present names, then renamed (absent)
     // ones, and never an absent one above a present one. Consecutive
     // present names alone are not enough: a highest-first recycling, the
@@ -852,10 +854,11 @@ fn t_wal_start() {
     let oracle = seen_stream(&oracle_stream(0, &plan));
     let old = [0u64, 1024, 2048, 3072];
     let target = [5120u64, 6144, 7168, 8192];
-    // The oracle itself (I-WAL-START): the lower ones renamed is an upper
-    // set; a highest-first recycling's leftovers are not, whether or not
-    // the names left are consecutive.
-    let names_of = |fs: &[u64]| fs.iter().map(|f| seg_name(*f)).collect::<Vec<_>>();
+    // The oracle itself (I-WAL-START), on bare names as a listing gives
+    // them: the lower ones renamed is an upper set; a highest-first
+    // recycling's leftovers are not, whether or not the names left are
+    // consecutive.
+    let names_of = |fs: &[u64]| fs.iter().map(|f| seg_file(*f)).collect::<Vec<_>>();
     assert!(present_is_upper_set(&old, &names_of(&[1024, 2048, 3072])));
     assert!(present_is_upper_set(&old, &names_of(&[])));
     assert!(!present_is_upper_set(&old, &names_of(&[0, 1024])));
