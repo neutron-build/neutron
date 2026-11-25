@@ -348,13 +348,19 @@ impl EventLog {
         })
     }
 
-    /// A hook that also fails once `SweepEnded` has fired more than `budget`
-    /// times: the step budget of a test whose mutants could make an
-    /// acquisition retry without bound (S-STORE §15 "The step budget"; card
-    /// A-3b-0, Work 12).
+    /// A hook that also fails at an `UnpinWait` and once `SweepEnded` has fired
+    /// more than `budget` times: the step budget of a single-threaded test
+    /// whose mutants could make an acquisition retry or wait without end
+    /// (S-STORE §15 "The step budget"; card A-3b-0, Work 12).
     pub fn hook_sweep_budget(&self, budget: usize) -> Hook {
         let sweeps = Arc::new(AtomicUsize::new(0));
         self.hook_with(move |point| {
+            // A single thread's wait for an unpin could never end.
+            assert_ne!(
+                point,
+                HookPoint::UnpinWait,
+                "a single thread waited for an unpin"
+            );
             if point == HookPoint::SweepEnded {
                 let n = sweeps.fetch_add(1, Ordering::SeqCst) + 1;
                 assert!(
