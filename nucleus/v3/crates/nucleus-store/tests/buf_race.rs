@@ -577,7 +577,10 @@ fn t_pin_load_race_b() {
             state: FrameState::Loading,
             key: Some(L1),
             pins: 1,
-            freed: false
+            freed: false,
+            // Card A-3b-0: the clock's bit is set only when the page is
+            // served, so a frame being loaded is not referenced.
+            referenced: false
         }
     );
     assert_eq!(probe_none, Ok(true), "a page being loaded is not resident");

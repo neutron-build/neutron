@@ -1,12 +1,14 @@
 #![allow(dead_code)]
-// The three test binaries (buf_pin, buf_race, buf_model) each include this
-// module and use a subset of it, so the rest would warn as dead code in each.
+// The five test binaries (buf_pin, buf_race, buf_model, buf_minimum and
+// buf_evict) each include this module and use a subset of it, so the rest
+// would warn as dead code in each.
 
-//! Shared fixtures for card A-3a's tests of `buf` (Work 10): a page file
-//! that logs its reads and can fail one, a test map standing in for card
-//! A-3c's current page map (S-STORE §15's stand-in S3), page builders, the
-//! race tests' controller, and the test-only evictor and creator that later
-//! cards' real callers will replace.
+//! Shared fixtures for card A-3a's tests of `buf` (Work 10) and card
+//! A-3b-0's (Work 11 and 12): a page file that logs its reads and can fail
+//! one, a test map standing in for card A-3c's current page map (S-STORE
+//! §15's stand-in S3), page builders, the race tests' controller, an event
+//! log for the single-threaded tests, and the test-only evictor and creator
+//! that later cards' real callers will replace.
 //!
 //! Every wait here is on an event a hook or a thread sends: the controller
 //! blocks on a channel, and a paused thread on a condition variable that only
@@ -22,11 +24,19 @@ use std::thread::{Scope, ScopedJoinHandle};
 use nucleus_env::{Env, EnvError, File, MemEnv, MemFile, OpenMode};
 use nucleus_store::StoreError;
 use nucleus_store::buf::{
-    CreateOutcome, CreatedPage, CurrentRef, FrameId, Hook, HookPoint, PageKey, Pin, Pool,
-    PoolConfig, Removal,
+    CreateOutcome, CreatedPage, CurrentRef, FrameId, H_MIN, Hook, HookPoint, OWN_PINNING_THREADS,
+    PageKey, Pin, Pool, PoolConfig, Removal, STEP2_RESERVE_FRAMES,
 };
 use nucleus_store::meta::Ref;
 use nucleus_store::page::{self, Kind};
+
+/// The frame a hook of the frame acquisition fires with when it has none
+/// (card A-3b-0, Work 6): no frame has it, since `frames ≤ 2^31`.
+pub const NO_FRAME: FrameId = FrameId(u32::MAX);
+
+/// The key a hook of the frame acquisition fires with when it is for no page
+/// (card A-3b-0, Work 6): LPID 0 is null (S-STORE §1), so no page has it.
+pub const NO_KEY: PageKey = PageKey::Lpid(0);
 
 /// The page size of every fixture but `pool_fixed`'s second half.
 pub const PS: u32 = 4096;
@@ -241,17 +251,144 @@ pub fn put_leaf(
 }
 
 /// A pool of `frames` frames at `PS` over a fresh `FaultFile`, with an empty
-/// test map.
+/// test map. Its `frames` are below S-STORE §5.4's minimum, so it opens
+/// through the test-only constructor (card A-3b-0, Work 11; OP-3): these
+/// tests exercise the pin protocol and the clock, not the minimum.
 pub fn fixture(frames: u32) -> Result<(Arc<FaultFile>, TestMap, Pool<FaultFile>), StoreError> {
     let file = Arc::new(FaultFile::new()?);
-    let pool = Pool::new(
+    let pool = Pool::new_below_minimum_for_tests(
         Arc::clone(&file),
         PoolConfig {
             frames,
             page_size: PS,
+            callers: 4,
         },
     )?;
     Ok((file, TestMap::new(), pool))
+}
+
+/// The least frame count a pool for `callers` calling threads may have
+/// (card A-3b-0, Work 12, `t_pool_minimum`): S-STORE §5.4's formula with
+/// R-1-memory §4.2's values, written here from the spec and not asked of the
+/// build's sizing. `n = n_c + n_s` (the build's own pinning threads are
+/// `OWN_PINNING_THREADS`), `R_EPOCH_min = n + s + 1` (R-1-memory §4.3, `s`
+/// being `STEP2_RESERVE_FRAMES`), `R_MAP = n × (H_min + 2) + R_EPOCH_min`
+/// (§4.4), and `F_min = threads × 3 × (H_min + 2) + R_EPOCH + R_MAP`.
+pub fn minimum_frames(callers: u32) -> u32 {
+    let n = u64::from(callers) + u64::from(OWN_PINNING_THREADS);
+    let per_thread = u64::from(H_MIN) + 2;
+    let r_epoch = n + u64::from(STEP2_RESERVE_FRAMES) + 1;
+    let r_map = n * per_thread + r_epoch;
+    let f_min = n * 3 * per_thread + r_epoch + r_map;
+    // No caller count a test uses comes near `u32::MAX` frames.
+    u32::try_from(f_min).unwrap_or(u32::MAX)
+}
+
+/// A pool at S-STORE §5.4's minimum for `callers` calling threads, `page_size`
+/// bytes a page, over a fresh `FaultFile`, with an empty test map (card
+/// A-3b-0, Work 11): through `Pool::new`, so it is refused unless its frame
+/// count is the test's own [`minimum_frames`].
+pub fn fixture_at_minimum(
+    callers: u32,
+    page_size: u32,
+) -> Result<(Arc<FaultFile>, TestMap, Pool<FaultFile>), StoreError> {
+    let file = Arc::new(FaultFile::new()?);
+    let pool = Pool::new(
+        Arc::clone(&file),
+        PoolConfig {
+            frames: minimum_frames(callers),
+            page_size,
+            callers,
+        },
+    )?;
+    Ok((file, TestMap::new(), pool))
+}
+
+/// Every firing of the pool's hook, in order, for the single-threaded tests
+/// (card A-3b-0, Work 11): a `Hook` that appends every
+/// `(HookPoint, PageKey, FrameId)` to a shared log.
+#[derive(Clone, Default)]
+pub struct EventLog {
+    events: Arc<Mutex<Vec<(HookPoint, PageKey, FrameId)>>>,
+}
+
+impl EventLog {
+    /// An empty log.
+    pub fn new() -> EventLog {
+        EventLog::default()
+    }
+
+    /// A hook that appends every firing to the log.
+    pub fn hook(&self) -> Hook {
+        self.hook_with(|_| {})
+    }
+
+    /// A hook that appends every firing to the log and then calls `guard`
+    /// with the point, outside every lock: a guard's failed assertion is a
+    /// panic inside the hook, which runs holding no pool mutex, so a run that
+    /// should never reach the point fails there instead of going on (card
+    /// A-3b-0, Work 12, "Step budgets").
+    pub fn hook_with(&self, guard: impl Fn(HookPoint) + Send + Sync + 'static) -> Hook {
+        let events = Arc::clone(&self.events);
+        Arc::new(move |point, key, frame| {
+            lock(&events).push((point, key, frame));
+            guard(point);
+        })
+    }
+
+    /// A hook that also fails on `UnpinWait`: for a single-threaded test, where
+    /// no other thread can end that wait.
+    pub fn hook_no_wait(&self) -> Hook {
+        self.hook_with(|point| {
+            assert_ne!(
+                point,
+                HookPoint::UnpinWait,
+                "a single thread waited for an unpin"
+            );
+        })
+    }
+
+    /// A hook that also fails once `SweepEnded` has fired more than `budget`
+    /// times: the step budget of a test whose mutants could make an
+    /// acquisition retry without bound (S-STORE §15 "The step budget"; card
+    /// A-3b-0, Work 12).
+    pub fn hook_sweep_budget(&self, budget: usize) -> Hook {
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        self.hook_with(move |point| {
+            if point == HookPoint::SweepEnded {
+                let n = sweeps.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(
+                    n <= budget,
+                    "{n} sweeps ended, past the step budget of {budget}"
+                );
+            }
+        })
+    }
+
+    /// The log so far.
+    pub fn all(&self) -> Vec<(HookPoint, PageKey, FrameId)> {
+        lock(&self.events).clone()
+    }
+
+    /// The log so far, emptied.
+    pub fn take(&self) -> Vec<(HookPoint, PageKey, FrameId)> {
+        std::mem::take(&mut *lock(&self.events))
+    }
+
+    /// The firings of `point` since the log held `from` entries.
+    pub fn since(&self, from: usize, point: HookPoint) -> Vec<(PageKey, FrameId)> {
+        lock(&self.events)
+            .iter()
+            .skip(from)
+            .filter(|e| e.0 == point)
+            .map(|e| (e.1, e.2))
+            .collect()
+    }
+
+    /// How many firings the log holds.
+    pub fn len(&self) -> usize {
+        lock(&self.events).len()
+    }
 }
 
 /// The marker byte of a pinned page, read under its shared latch.
@@ -391,11 +528,12 @@ impl Shared {
         let _ = lock(&self.tx).send(e);
     }
 
-    /// The hook: report, then pause if armed, until released.
+    /// The hook: a firing that an armed pause holds sends `Arrived` only, and
+    /// blocks until released; every other firing of a reported point sends
+    /// `Seen` (card A-3b-0, Work 11 pins this where card A-3a's left it
+    /// open). So an event says which happened: a thread held at a pause, or a
+    /// point passed.
     fn fire(&self, point: HookPoint, key: PageKey, frame: FrameId) {
-        if lock(&self.reports).contains(&(point, key)) {
-            self.send(Event::Seen(point, key, frame));
-        }
         let mut p = lock(&self.pauses);
         if p.get(&(point, key)) == Some(&Pause::Armed) {
             p.insert((point, key), Pause::Paused);
@@ -403,6 +541,11 @@ impl Shared {
             while p.get(&(point, key)) == Some(&Pause::Paused) {
                 p = self.wake.wait(p).unwrap_or_else(PoisonError::into_inner);
             }
+            return;
+        }
+        drop(p);
+        if lock(&self.reports).contains(&(point, key)) {
+            self.send(Event::Seen(point, key, frame));
         }
     }
 }

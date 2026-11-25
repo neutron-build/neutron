@@ -9,14 +9,21 @@
 //! reserved slots 256 and 257. The tests after `evict_sets_entry_first` go
 //! beyond the card's list: each pins a rule a systematic mutant sweep of
 //! `buf` (every field and comparison) would otherwise leave unjudged.
+//!
+//! Card A-3b-0 (Work 11) changed only what its frame acquisition and pool
+//! sizing answer: `create_outcomes` (e), which asked for a frame with every
+//! frame pinned; the `PoolConfig` literals, which name `callers`; the
+//! `FrameInfo` and `PoolStats` literals, which name the reference bit and the
+//! acquisition's counters; and the pools of fewer frames than §5.4's minimum,
+//! which open through the test-only constructor with every assertion kept.
 
 mod buf_support;
 
 use std::sync::{Arc, Mutex};
 
 use buf_support::{
-    Evicted, FaultFile, MARK, PS, SPOIL, TestMap, drop_clean, evict_to, fixture, marker, offset,
-    page, put, put_leaf,
+    EventLog, Evicted, FaultFile, MARK, PS, SPOIL, TestMap, drop_clean, evict_to, fixture, marker,
+    offset, page, put, put_leaf,
 };
 use nucleus_env::{EnvError, File};
 use nucleus_store::StoreError;
@@ -350,7 +357,9 @@ fn create_outcomes() {
                 state: FrameState::Resident,
                 key: Some(L2),
                 pins: 1,
-                freed: false
+                freed: false,
+                // Card A-3b-0: a created page's pin sets the clock's bit.
+                referenced: true
             }
         );
         assert_eq!(c[4], 3);
@@ -405,7 +414,10 @@ fn create_outcomes() {
         assert!(matches!(e, StoreError::Invalid(_)), "{e:?}");
         assert_eq!(pool.stats().unwrap().free, free);
     }
-    // (e) every frame pinned: no frame to reserve.
+    // (e) every frame pinned: no frame to take without a wait. Card A-3b-0
+    // (Work 11): a pin that misses may evict or wait for an unpin, so the
+    // form that never waits answers `None`; `reserve` there is
+    // `unpin_wait_then_served`'s (buf_evict).
     {
         let (_file, _map, pool) = fixture(3).unwrap();
         let pins: Vec<_> = (2..5)
@@ -414,7 +426,24 @@ fn create_outcomes() {
                     .release()
             })
             .collect();
-        assert!(matches!(pool.reserve(), Err(StoreError::PoolStarved)));
+        let log = EventLog::new();
+        // The hook fails the test at an `UnpinWait`: no other thread could
+        // end that wait.
+        pool.set_hook(Some(log.hook_no_wait()));
+        let free = pool.stats().unwrap().free;
+        let got = pool.try_reserve();
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        assert!(
+            !log.all().iter().any(|&(p, _, _)| p == HookPoint::UnpinWait),
+            "{:?}",
+            log.all()
+        );
+        let s = pool.stats().unwrap();
+        assert_eq!(
+            (s.free, s.reserved, s.unpin_waiters, s.evictions),
+            (free, 0, 0, 0)
+        );
+        pool.set_hook(None);
         drop(pins);
     }
 }
@@ -545,7 +574,10 @@ fn freed_frame() {
             state: FrameState::Reserved,
             key: None,
             pins: 0,
-            freed: false
+            freed: false,
+            // Card A-3b-0: a frame that becomes `Reserved` loses the clock's
+            // bit its creation set.
+            referenced: false
         }
     );
     drop(res);
@@ -623,6 +655,11 @@ fn pool_fixed() {
             orphan,
             reads: _,
             buckets: b2,
+            // Card A-3b-0's fields: this loop's reserves come off the free
+            // list, so it asserts nothing of them.
+            evictions: _,
+            clock_hand: _,
+            unpin_waiters: _,
         } = s;
         assert_eq!((b2, frames), (buckets, 5), "round {round}");
         assert_eq!(
@@ -634,8 +671,16 @@ fn pool_fixed() {
     }
     for frames in [1u32, 5, 64] {
         for page_size in [4096u32, 65536] {
-            let cfg = PoolConfig { frames, page_size };
-            let pool = Pool::new(Arc::new(FaultFile::new().unwrap()), cfg).unwrap();
+            // Card A-3b-0 (Work 11): 1 and 5 frames are below §5.4's minimum
+            // (34 for one caller), so these pools open through the test-only
+            // constructor; the assertions are card A-3a's.
+            let cfg = PoolConfig {
+                frames,
+                page_size,
+                callers: 1,
+            };
+            let pool = Pool::new_below_minimum_for_tests(Arc::new(FaultFile::new().unwrap()), cfg)
+                .unwrap();
             let fp = pool.footprint();
             assert_eq!(Pool::<FaultFile>::bytes_for(cfg).unwrap(), fp, "{cfg:?}");
             assert_eq!(fp.page_bytes, u64::from(frames) * u64::from(page_size));
@@ -657,7 +702,11 @@ fn pool_config() {
     let new = |frames, page_size| {
         Pool::new(
             Arc::new(FaultFile::new().unwrap()),
-            PoolConfig { frames, page_size },
+            PoolConfig {
+                frames,
+                page_size,
+                callers: 1,
+            },
         )
     };
     for (frames, page_size) in [(0, 4096), ((1 << 31) + 1, 4096), (4, 12288)] {
@@ -666,23 +715,45 @@ fn pool_config() {
             matches!(e, StoreError::Invalid(_)),
             "{frames} {page_size}: {e:?}"
         );
-        // Beyond the card: bytes_for refuses what new refuses.
+        // Beyond the card: bytes_for refuses what new refuses. It reads
+        // neither `callers` (card A-3b-0) nor the minimum.
         let e = error!(Pool::<FaultFile>::bytes_for(PoolConfig {
             frames,
-            page_size
+            page_size,
+            callers: 1,
         }));
         assert!(
             matches!(e, StoreError::Invalid(_)),
             "{frames} {page_size}: {e:?}"
         );
     }
+    // Card A-3b-0 (Work 11): no callers is refused, before any allocation.
+    let e = error!(Pool::new(
+        Arc::new(FaultFile::new().unwrap()),
+        PoolConfig {
+            frames: 64,
+            page_size: 4096,
+            callers: 0,
+        }
+    ));
+    assert!(matches!(e, StoreError::Invalid(_)), "{e:?}");
     // Beyond the card: the bounds are inclusive, and the accessors say what
-    // was asked for.
-    let pool = new(1, 65536).unwrap();
+    // was asked for. Card A-3b-0 (Work 11): one frame is below §5.4's
+    // minimum, so it opens through the test-only constructor.
+    let pool = Pool::new_below_minimum_for_tests(
+        Arc::new(FaultFile::new().unwrap()),
+        PoolConfig {
+            frames: 1,
+            page_size: 65536,
+            callers: 1,
+        },
+    )
+    .unwrap();
     assert_eq!((pool.frames(), pool.page_size()), (1, 65536));
     let top = Pool::<FaultFile>::bytes_for(PoolConfig {
         frames: 1 << 31,
         page_size: 4096,
+        callers: 1,
     })
     .unwrap();
     assert_eq!(top.page_bytes, 1 << 43);
@@ -1020,11 +1091,14 @@ fn hash_placement() {
         k
     }
     for frames in [1u32, 2, 3, 5, 64, 1000] {
-        let pool = Pool::new(
+        // Card A-3b-0 (Work 11): the pools below §5.4's minimum open through
+        // the test-only constructor, which builds the same table.
+        let pool = Pool::new_below_minimum_for_tests(
             Arc::new(FaultFile::new().unwrap()),
             PoolConfig {
                 frames,
                 page_size: PS,
+                callers: 1,
             },
         )
         .unwrap();
@@ -1451,7 +1525,9 @@ fn create_resets_flags() {
             state: FrameState::Resident,
             key: Some(L4),
             pins: 1,
-            freed: false
+            freed: false,
+            // Card A-3b-0: the remade page's pin sets the clock's bit.
+            referenced: true
         }
     );
 }
