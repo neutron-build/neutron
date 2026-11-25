@@ -37,11 +37,14 @@
 //!
 //! # What it does not own
 //!
-//! Segment files, segment 0 and recycling, and the walk with its `lsn`,
-//! boot-id and chain checks on a [`Frame`]'s fields (card A-6b); the
-//! writer, the append critical section, the chain head, sealing in LSN
-//! order and group commit (card A-6c); the open-chunk set and chunking
-//! (card A-6d); recovery (card A-7d).
+//! Segment names, segment 0, preallocation, the writer rule, recycling
+//! (`segment`), the walk with its `lsn`, boot-id and chain checks on a
+//! [`Frame`]'s fields, its stops, its hops and its damage outcomes
+//! (`walk`), and a serial appender (`append`) are card A-6b's; the
+//! concurrent writer, the append critical section, batches, the chain
+//! head's moves under them, sealing in LSN order and group commit are card
+//! A-6c's; the open-chunk set and chunking, card A-6d's; recovery, card
+//! A-7d's.
 //!
 //! # The record (§12.2)
 //!
@@ -88,6 +91,10 @@ mod op;
 mod place;
 mod record;
 mod seal;
+
+pub mod append;
+pub mod segment;
+pub mod walk;
 
 pub use op::Op;
 pub use place::{Placement, max_record_len, place};
