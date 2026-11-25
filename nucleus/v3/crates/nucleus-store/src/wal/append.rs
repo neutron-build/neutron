@@ -353,6 +353,12 @@ impl<'e, E: Env> Appender<'e, E> {
                     .sync_handle(s)
                     .and_then(|f| f.sync_data().map_err(StoreError::Env));
                 self.latch(r)?;
+                // The next segment. The sum saturates rather than wrap:
+                // `last` is the first LSN of the segment that holds the
+                // last written byte, `written_end − 1`, which ends inside a
+                // `u64` (A-6a's `place` puts no record in one that does
+                // not), so a saturated value lies past `last` and ends the
+                // loop instead of wrapping under it.
                 s = s.saturating_add(self.seg_size);
             }
             self.durable = self.written;

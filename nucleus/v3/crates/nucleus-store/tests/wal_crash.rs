@@ -51,10 +51,12 @@ type Life<'a> = &'a (
             + Sync
     );
 
-/// What a round leaves: the round's progress, its check walk (or the text
-/// of the error the walk returned), what the walk saw, and the machine.
+/// What a round leaves: the round's progress, the names its life left in
+/// `wal/` before any cut, its check walk (or the text of the error the walk
+/// returned), what the walk saw, and the machine.
 struct Round {
     progress: Progress,
+    before_cut: Vec<String>,
     walk: Result<Walk, String>,
     seen: Vec<Seen>,
     sim: Sim,
@@ -130,6 +132,9 @@ fn run_round(
     let shared = Arc::clone(&progress);
     let out = sim.run_life(1, crash, move |env, _t| life(env, &shared));
     assert_life(out, crash);
+    // What the life left in `wal/`, page cache included, before any cut:
+    // which creates and renames ran.
+    let before_cut = wal_names(&sim);
     if mode.power_cut.is_some() {
         sim.power_cut();
     }
@@ -142,6 +147,7 @@ fn run_round(
     let (walk, seen) = walk_life(&mut sim, start);
     Round {
         progress: progress_lock(&progress).clone(),
+        before_cut,
         walk,
         seen,
         sim,
@@ -526,10 +532,6 @@ fn t_seg_ack_durable() {
     let head: Vec<Plan> = plan[..10].to_vec();
     let tail: Vec<Plan> = plan[10..15].to_vec();
     for case in ["create", "rename"] {
-        // The yield of the new segment's `sync_dir` in the round's life
-        // (card Work 5): the sixth Env call of a segment the appender
-        // creates, the fourth of one that exists.
-        let sync_dir_yield: u64 = if case == "create" { 6 } else { 4 };
         // What the setup's appender returned.
         let recorded = Mutex::new(Vec::<Appended>::new());
         let mut setup = |sim: &mut Sim| {
@@ -565,7 +567,26 @@ fn t_seg_ack_durable() {
         };
         let start = start(1024, (appended[4].lsn, appended[4].crc), 1);
         let life = append_life(resume, 1, &tail, &[3, 5]);
+        // The round life's Env calls are its yields (S-ENV: every call is
+        // one), and each crash point takes its meaning from them. A crash
+        // at a yield is before that call. Before the new segment, the
+        // appender makes segment 1024 usable, where record 11's `SegmentEnd`
+        // goes (`open`, `len`, `sync_all`, `sync_dir`: yields 1 to 4; the
+        // writer rule of S-STORE §12.5, "even one that existed at open"),
+        // and writes that `SegmentEnd` (yield 5). The new segment, 2048,
+        // is then made usable (card Work 5): created, by `open` `ReadWrite`
+        // (`NotFound`), `open` `CreateNew`, `len`, `set_len`, `sync_all` and
+        // `sync_dir`, yields 6 to 11; or found under the name the setup's
+        // rename gave it, by `open`, `len`, `sync_all` and `sync_dir`,
+        // yields 6 to 9. So the create has run from crash point 8, and is
+        // durable from 12, after its own `sync_dir` (yield 11). The rename
+        // ran in the setup's life and is durable from 5: segment 1024's
+        // `sync_dir` at yield 4 makes every pending entry of `wal/` durable,
+        // the rename included, and before it the cut undoes the rename.
+        let (ran_from, durable_from): (u64, u64) = if case == "create" { (8, 12) } else { (0, 5) };
+        let (n0, n2048) = (seg_file(0), seg_file(2048));
         let mut lost = 0usize;
+        let mut kept = 0usize;
         let mut after_report = 0usize;
         let mut yields = Vec::new();
         for mode in [P0, P1, P3] {
@@ -597,32 +618,51 @@ fn t_seg_ack_durable() {
                         after_report += 1;
                     }
                 }
-                // Non-vacuity in P3: the cut loses a create, or a rename,
-                // that no `sync_dir` made durable.
-                if mode.name == "P3" && k <= sync_dir_yield {
-                    let at_2048 = file_exists(&round.sim, 2048);
-                    let at_0 = file_exists(&round.sim, 0);
-                    match case {
-                        "create" => {
-                            if !at_2048 {
-                                lost += 1;
-                            }
-                        }
-                        _ => {
-                            if at_0 && !at_2048 {
-                                lost += 1;
-                            }
-                        }
+                // Non-vacuity in P3, where nothing unsynced survives
+                // (S-STORE §12.5 "Short segments": a segment present at
+                // open can be a crashed process's create or rename, "kept in
+                // the page cache with no directory sync behind it"). What
+                // the life left in `wal/` before the cut says whether the
+                // create, or the rename, ran; what the cut left says
+                // whether it was durable: it is lost by a crash that
+                // precedes its `sync_dir`, and kept by one that follows it.
+                if mode.name == "P3" {
+                    let ran = round.before_cut.contains(&n2048)
+                        && (case == "create" || !round.before_cut.contains(&n0));
+                    let held = file_exists(&round.sim, 2048)
+                        && (case == "create" || !file_exists(&round.sim, 0));
+                    assert_eq!(
+                        ran,
+                        k == 0 || k >= ran_from,
+                        "{what}: the segment's create or rename has run"
+                    );
+                    assert_eq!(
+                        held,
+                        k == 0 || k >= durable_from,
+                        "{what}: the segment is under the new name after the cut"
+                    );
+                    if !ran {
+                        assert!(!held, "{what}: a segment that never ran is present");
+                    } else if held {
+                        kept += 1;
+                    } else {
+                        lost += 1;
                     }
                 }
             });
         }
         assert!(
             lost > 0,
-            "{case} case: no P3 round cut before the new segment's sync_dir lost it"
+            "{case} case: no P3 round cut between the new segment's create or rename and its sync_dir lost it"
+        );
+        assert!(
+            kept > 0,
+            "{case} case: no P3 round kept the new segment after its sync_dir"
         );
         assert!(after_report > 0);
-        eprintln!("t_seg_ack_durable {case}: Y per mode {yields:?}");
+        eprintln!(
+            "t_seg_ack_durable {case}: Y per mode {yields:?}; in P3, {lost} rounds lost the segment and {kept} kept it"
+        );
     }
 }
 
@@ -843,11 +883,14 @@ fn t_wal_start() {
     let y = dry_yields(0, &P1, &mut setup, &life);
     assert_eq!(y, 9);
     let bytes = recorded.lock().unwrap().clone();
-    let mut lost_rename = 0usize;
+    // Per mode, how many renames ran (the life had moved the old name
+    // before the cut) and the cut undid.
+    let mut lost_renames: Vec<(&'static str, usize)> = Vec::new();
     let mut rounds = 0usize;
     let mut kept: Option<Round> = None;
     for mode in [P0, P1, P3] {
         let seeds: u64 = if mode.name == "P0" { 1 } else { 8 };
+        let mut lost_here = 0usize;
         for k in 0..=y {
             for j in 0..seeds {
                 let seed = 10_000 * mode.index + 16 * k + j;
@@ -866,13 +909,10 @@ fn t_wal_start() {
                 // No name but the old ones, their targets and 4096's.
                 for name in &names {
                     assert!(
-                        old.contains(
-                            &u64::from_str_radix(name.strip_suffix(".log").unwrap_or(""), 16)
-                                .unwrap_or(u64::MAX)
-                        ) || target.contains(
-                            &u64::from_str_radix(name.strip_suffix(".log").unwrap_or(""), 16)
-                                .unwrap_or(u64::MAX)
-                        ) || *name == "0000000000001000.log",
+                        old.iter()
+                            .chain(target.iter())
+                            .any(|f| seg_file(*f) == *name)
+                            || *name == seg_file(4096),
                         "{what}: {name} is not a segment the round could have made"
                     );
                 }
@@ -884,8 +924,8 @@ fn t_wal_start() {
                 // Each old segment is under exactly one of its two names,
                 // with its bytes and its length unchanged.
                 for ((o, t), was) in old.iter().zip(target.iter()).zip(bytes.iter()) {
-                    let at_old = names.contains(&seg_name(*o).replace("wal/", ""));
-                    let at_new = names.contains(&seg_name(*t).replace("wal/", ""));
+                    let at_old = names.contains(&seg_file(*o));
+                    let at_new = names.contains(&seg_file(*t));
                     assert_ne!(
                         at_old,
                         at_new,
@@ -910,16 +950,15 @@ fn t_wal_start() {
                 // 4096 is untouched.
                 let untouched = round.sim.file_id(&seg_name(4096)).ok().flatten().unwrap();
                 assert_eq!(round.sim.disk().durable_len(untouched), S);
-                assert!(
-                    names.contains(&"0000000000001000.log".to_string()),
-                    "{what}"
-                );
-                // Non-vacuity: a rename that ran and was lost. The life
-                // issued segment `i`'s rename at yield `2 + 2i`.
-                for (i, o) in old.iter().enumerate() {
-                    let issued = k == 0 || k > 2 + 2 * i as u64;
-                    if issued && names.contains(&seg_name(*o).replace("wal/", "")) {
-                        lost_rename += 1;
+                assert!(names.contains(&seg_file(4096)), "{what}");
+                // Non-vacuity: a rename that ran and was lost. It ran when
+                // the life had moved the old name before the cut (what the
+                // life left in `wal/`, page cache included), and the cut
+                // lost it when it put the old name back.
+                for o in &old {
+                    let name = seg_file(*o);
+                    if !round.before_cut.contains(&name) && names.contains(&name) {
+                        lost_here += 1;
                     }
                 }
                 // The round's walk, from 4096, when nothing was lost.
@@ -933,10 +972,17 @@ fn t_wal_start() {
                 }
             }
         }
+        lost_renames.push((mode.name, lost_here));
     }
-    assert!(lost_rename > 0, "no round lost a rename that ran");
+    // The drawn mode bites (P1: each unsynced rename kept or lost by a
+    // coin), and the deterministic one loses every unsynced rename (P3).
+    for (name, lost) in &lost_renames {
+        if *name != "P0" {
+            assert!(*lost > 0, "{name}: no round lost a rename that ran");
+        }
+    }
     eprintln!(
-        "t_wal_start (b): {} rounds; {lost_rename} lost renames",
+        "t_wal_start (b): {} rounds; renames a cut undid, by mode: {lost_renames:?}",
         rounds + 1
     );
     // (c) The walk's start, after (b)'s no-crash round and its P0 cut.

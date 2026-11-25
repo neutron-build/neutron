@@ -56,6 +56,11 @@ pub fn seg_name(first: u64) -> String {
     format!("wal/{first:016x}.log")
 }
 
+/// The same name without `wal/`: what a listing of `wal/` holds.
+pub fn seg_file(first: u64) -> String {
+    format!("{first:016x}.log")
+}
+
 /// The payload that makes a `Commit` exactly `len` bytes long (Work 10):
 /// one `Ddl` op of `len − 58` bytes (tag 3, a `u32` length, the bytes; A-6a's
 /// op encoding), for record `i`, whose bytes are `(31 × i + j) mod 251` at

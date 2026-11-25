@@ -96,7 +96,7 @@ impl WalkStart {
 /// One record the walk accepted, as it lies in the walk's buffer: the frame
 /// with every header field, and the decoded body. The borrow ends when the
 /// visitor returns; a caller that keeps something copies it there.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted<'a> {
     /// The record's frame (§12.2), every check passed.
     pub frame: Frame<'a>,
@@ -274,6 +274,14 @@ fn header_len(buf: &[u8]) -> Result<u32, StoreError> {
         .map_err(|e| StoreError::Invalid(format!("WAL walk: {e}")))
 }
 
+/// The length a short read shows a segment file to have: where the read
+/// started, plus the bytes it returned (S-STORE §12.5 "Short segments": the
+/// damage detail names "its file's length"). The sum saturates, since no
+/// file is longer than `u64::MAX`; the value is reported, never read through.
+fn file_len(at: u64, got: usize) -> u64 {
+    at.saturating_add(u64::try_from(got).unwrap_or(u64::MAX))
+}
+
 /// Walks the WAL from `start` (§12.5; §14 step 3's pass 1), calling `visit`
 /// once for each record it accepts, in LSN order, and stopping at the first
 /// record it does not accept.
@@ -398,7 +406,7 @@ pub fn walk<E: Env>(
                 WalkEnd::ShortRead {
                     lsn: p,
                     segment: s,
-                    file_len: off + u64::try_from(got).unwrap_or(u64::MAX),
+                    file_len: file_len(off, got),
                 }
             };
             return Ok(finished(end, accepted, last, newest));
@@ -422,7 +430,12 @@ pub fn walk<E: Env>(
             StoreError::Invalid("WAL walk: a record shorter than its header".into())
         })?;
         let want_body = body.len();
-        let got = file.read_at(off + header_len_bytes, body)?;
+        // `off + 53` lies inside the segment, since `room ≥ 53` (step 2);
+        // the sum stays checked like every one on a position.
+        let body_at = off
+            .checked_add(header_len_bytes)
+            .ok_or_else(|| past_u64("the body of the record", p))?;
+        let got = file.read_at(body_at, body)?;
         if got < want_body {
             // Damage wherever it lies: a segment whose preallocation was
             // cut short holds zeros, never a header with a valid magic.
@@ -430,7 +443,7 @@ pub fn walk<E: Env>(
                 WalkEnd::ShortRead {
                     lsn: p,
                     segment: s,
-                    file_len: off + header_len_bytes + u64::try_from(got).unwrap_or(u64::MAX),
+                    file_len: file_len(body_at, got),
                 },
                 accepted,
                 last,

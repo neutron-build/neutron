@@ -24,10 +24,11 @@ mod wal_common;
 
 use nucleus_env::{Env, EnvError, File, MemEnv, OpenMode};
 use nucleus_store::StoreError;
+use nucleus_store::meta::{Identity, Meta, Ref};
 use nucleus_store::wal::append::{Appender, Resume};
 use nucleus_store::wal::segment::{
-    MIN_WAL_SEG_SIZE, check_seg_size, create_wal, list_segments, parse_segment_name, recycle_below,
-    segment_first, segment_path,
+    MIN_WAL_SEG_SIZE, check_seg_size, create_wal, ensure_segment, list_segments,
+    parse_segment_name, recycle_below, segment_first, segment_path,
 };
 use nucleus_store::wal::walk::{Last, StopReason, Walk, WalkEnd, WalkStart, walk};
 use nucleus_store::wal::{Body, PREV_NONE, Record, RecordKind, SEGMENT_END_LEN, TxnId};
@@ -276,7 +277,7 @@ fn t_stale_boot_record() {
     // (iv) The walk's first record: start `boot_id` 6, A1 of boot 5.
     {
         let env = MemEnv::new(1);
-        let a = put_plan(&env, 0, PREV_NONE, &commits(5, 0, &[100, 100]));
+        put_plan(&env, 0, PREV_NONE, &commits(5, 0, &[100, 100]));
         check(
             &env,
             &start(0, PREV_NONE, 6),
@@ -288,7 +289,6 @@ fn t_stale_boot_record() {
             &[],
             None,
         );
-        let _ = a;
     }
     // (v) Serial order: boot 0xFFFF_FFFE, then a newer boot 3, then
     // 0xFFFF_FFFF, which is older than 3 in serial order.
@@ -481,7 +481,6 @@ fn splice_a(env: &impl Env) -> (WalkStart, WalkEnd, Vec<Crafted>, Option<u32>) {
 /// PREV-MISMATCH-AS-END fails (a)–(e).
 #[test]
 fn t_wal_splice() {
-    const COMMIT: RecordKind = RecordKind::Commit;
     // (a) Early placement.
     {
         let env = MemEnv::new(1);
@@ -573,7 +572,6 @@ fn t_wal_splice() {
             Some(7),
         );
     }
-    let _ = COMMIT;
 }
 
 /// Assembles one record at `lsn`, chained to `prev`: its bytes, and what
@@ -866,10 +864,18 @@ fn wal_walk_table() {
                                         if bad_magic {
                                             bytes[0] ^= 1;
                                         }
+                                        // `len`: right; 52, below a header; `room + 1`, one
+                                        // byte past what the target's position leaves in its
+                                        // segment (949 after a 100-byte record; 1025 at a
+                                        // segment's first LSN).
+                                        let room = S + SEG - p;
                                         match len_dim {
                                             1 => bytes[4..8].copy_from_slice(&52u32.to_le_bytes()),
-                                            2 => bytes[4..8]
-                                                .copy_from_slice(&((S + 1) as u32).to_le_bytes()),
+                                            2 => bytes[4..8].copy_from_slice(
+                                                &u32::try_from(room + 1)
+                                                    .expect("a room in a segment")
+                                                    .to_le_bytes(),
+                                            ),
                                             _ => {}
                                         }
                                         if bad_crc {
@@ -1553,6 +1559,46 @@ fn wal_walk_ends() {
         assert_eq!(seen, seen_of(&records));
         assert_eq!(outcome(&walk.end), stop(1400, 1024, StopReason::Magic));
     }
+    // (m) `WalkStart::from_meta`: a walk from meta `m` starts at its
+    // `wal_start_lsn`, names the pair `wal_start_prev` and
+    // `wal_start_prev_crc`, and takes `boot_id` as its floor (§2.2, §14
+    // step 3). Every other field is a bystander's.
+    {
+        let m = Meta {
+            identity: Identity {
+                format_version: 1,
+                page_size: 4096,
+                checksum_alg: 1,
+                wal_seg_size: 1024,
+                creation_uuid: [7; 16],
+            },
+            ckpt_id: 3,
+            t: 900,
+            gc_w: 800,
+            epoch: 3,
+            map_root: Ref::NULL,
+            map_level: 1,
+            free_root: Ref::NULL,
+            dir_root: 7,
+            next_lpid: 64,
+            slot_count: 4096,
+            wal_start_lsn: 4212,
+            wal_start_prev: 4043,
+            wal_start_prev_crc: 0x5EED_1234,
+            wal_ckpt_end: 5000,
+            ts_ckpt_hi: 950,
+            boot_id: 7,
+        };
+        assert_eq!(
+            WalkStart::from_meta(&m),
+            WalkStart {
+                lsn: 4212,
+                prev_lsn: 4043,
+                prev_crc: 0x5EED_1234,
+                boot_id: 7,
+            }
+        );
+    }
 }
 
 /// `Walk::valid_end` of an end: `Some` for a stop only.
@@ -2167,6 +2213,41 @@ fn wal_append_errors() {
         );
         assert_eq!(app.durable_end(), 0);
     }
+    // (d) again, at `new`: a `durable_end` above the append position, or a
+    // `seg_size` below the floor, is `Invalid` before any I/O (§12.4:
+    // `durable_end` is never above `written_end`).
+    {
+        let env = HookEnv::new(MemEnv::new(43));
+        assert!(is_invalid(
+            &Appender::new(
+                &env,
+                S,
+                1,
+                Resume {
+                    append_pos: 100,
+                    prev_lsn: 7,
+                    prev_crc: 7,
+                    durable_end: 101,
+                },
+            )
+            .expect_err("durable_end above the append position")
+        ));
+        assert!(is_invalid(
+            &Appender::new(
+                &env,
+                211,
+                1,
+                Resume {
+                    append_pos: 100,
+                    prev_lsn: 7,
+                    prev_crc: 7,
+                    durable_end: 100,
+                },
+            )
+            .expect_err("a size below the floor")
+        ));
+        assert!(env.log().is_empty(), "new does no I/O");
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2224,6 +2305,47 @@ fn wal_op_order() {
             ]
         );
         assert_eq!(env.opens(), vec![(p0.clone(), RW), (p0.clone(), CREATE)]);
+        // An existing `wal/` is refused as `AlreadyExists`, and nothing
+        // else is called: creation is for a new file.
+        env.forget();
+        let err = create_wal(&env, S).expect_err("the WAL exists");
+        assert!(
+            matches!(&err, StoreError::Env(EnvError::AlreadyExists { path }) if path == "wal"),
+            "{err}"
+        );
+        assert_eq!(env.ops(), vec![("create_dir", "wal".to_string())]);
+    }
+    // `ensure_segment` on its own (card Work 5): a first LSN that is not a
+    // multiple of the size is `Invalid` before any I/O; a file longer than
+    // the size is left as long as it is (bytes past the size are never read
+    // or written) and still made durable before a writer's first write.
+    {
+        let env = HookEnv::new(MemEnv::new(47));
+        let refused = match ensure_segment(&env, S, 5) {
+            Err(e) => e,
+            Ok(_) => panic!("a first LSN that is not a multiple of the size was accepted"),
+        };
+        assert!(is_invalid(&refused));
+        assert!(env.log().is_empty(), "an Invalid first LSN does no I/O");
+        wal_dir(&env);
+        let p1 = seg_name(1024);
+        env.open(&p1, OpenMode::CreateNew)
+            .expect("create")
+            .set_len(2 * S)
+            .expect("lengthen past the size");
+        env.forget();
+        let _ = ensure_segment(&env, S, 1024).expect("make usable");
+        assert_eq!(
+            env.log(),
+            vec![
+                call_a("open", &p1, RW),
+                call("len", &p1),
+                call("sync_all", &p1),
+                call("sync_dir", "wal"),
+            ],
+            "no set_len for a file that is long enough"
+        );
+        assert_eq!(len_of(&env, &p1).expect("the length"), 2 * S);
     }
     // (b) Crossing into a new segment.
     {
@@ -2276,7 +2398,6 @@ fn wal_op_order() {
         let p4 = seg_name(4096);
         let p5 = seg_name(5120);
         let p6 = seg_name(6144);
-        let p7 = seg_name(7168);
         // Into the full one.
         let mut app = Appender::new(
             &env,
@@ -2344,7 +2465,6 @@ fn wal_op_order() {
             ],
             "set_len first when the file was shorter than S"
         );
-        let _ = p7;
     }
     // (c) A resumed appender's first sync.
     {
@@ -2454,5 +2574,18 @@ fn wal_op_order() {
             &recycle_below(&env, S, 4600, 4500).expect_err("a bound above the append position")
         ));
         assert!(env.log().is_empty());
+        // Nothing wholly below the bound: the listing alone, no rename, no
+        // directory sync, and no pair.
+        let env = HookEnv::new(MemEnv::new(47));
+        for seg in [3072u64, 4096] {
+            zeros(&env, seg);
+        }
+        env.forget();
+        assert_eq!(
+            recycle_below(&env, S, 2048, 4500).expect("nothing to recycle"),
+            Vec::<(u64, u64)>::new()
+        );
+        assert_eq!(env.ops(), vec![("list_dir", "wal".to_string())]);
+        assert_eq!(list_segments(&env, S).expect("list"), vec![3072, 4096]);
     }
 }
