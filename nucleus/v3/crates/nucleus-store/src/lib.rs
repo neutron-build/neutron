@@ -24,6 +24,10 @@
 //!   page header (§3.1), I-INTEGRITY (§3.3), `K_MAX` and `V_INLINE` (§3.2),
 //!   and the page-map pages and their positions (§4.1), as codecs with no
 //!   I/O.
+//! - `buf` (card A-3a): the buffer manager's frames, page table and pins
+//!   (S-STORE §5.1, §5.4): a fixed pool, a page table that never grows,
+//!   and loads through a page's current reference, checked by
+//!   `page::verify` (§3.3). No tree uses it yet.
 //! - `page`'s slotted body, `pool`, `store` and `tree` (card A-0, re-based
 //!   on §3.1 by card A-2): the E0 spike's B+tree, copied with provenance
 //!   from `spikes/e0-btree`. They meet E0's invariants (T-ORDER, T-COUPLING,
@@ -34,27 +38,38 @@
 //!
 //! The known departures from S-STORE, each with the card that removes it:
 //!
-//! - pages are neither sealed nor checked: the seed writes every page with
-//!   `id` 0, `epoch` 0 and `crc` 0 and never calls `page::seal` or
-//!   `page::verify` (§3.1, §3.3): A-3a (reads through a reference), A-3c
-//!   (dirty eviction), A-7b (the checkpoint's image writes);
-//! - ids: [`store::PageStore`] hands out dense page ids that are addressed
-//!   directly, with no LPID allocation (§4.2), page map (§4.1), free set
-//!   (§4.3) or slot reuse (§4.4, §4.5): A-3a, A-3c; LPID freeing: A-4b; the
-//!   pool's recycle list of unpublished reserved ids (card X-0-F2), which
-//!   S-STORE does not have: A-3c;
+//! - the seed tree's pages are neither sealed nor checked: it writes every
+//!   page with `id` 0, `epoch` 0 and `crc` 0 through `pool`, which never
+//!   calls `page::seal` or `page::verify` (§3.1, §3.3): A-4a moves the tree
+//!   onto `buf`, whose every load is checked (card A-3a); A-3c (dirty
+//!   eviction) and A-7b (the checkpoint's image writes) seal;
+//! - ids: the seed tree's [`store::PageStore`] hands out dense page ids
+//!   that are addressed directly (§4.1–§4.5): A-4a moves the tree onto
+//!   `buf`, which names a page by LPID or map position and loads it through
+//!   its current reference (card A-3a); the current page map (§4.1), LPID
+//!   allocation (§4.2), the free set (§4.3) and slot reuse (§4.4, §4.5):
+//!   A-3c; LPID freeing: A-4b; `pool`'s recycle list of unpublished
+//!   reserved ids (card X-0-F2), which S-STORE does not have, goes with
+//!   `pool`: A-4a;
 //! - the file header is encoded and selected (`meta`, `open`) but never
 //!   written or read: A-7c (step 4's meta write), A-7d (the open); map and
 //!   free-set persistence: A-7b;
-//! - pool: frame latches are `std::sync::RwLock`, which is not task-fair
-//!   (§5.1, §5.3): A-3b; victims are picked by pin count, not by the clock
-//!   and `try_latch` (§5.2): A-3b; no minimum pool size (§5.4): A-3b; dirty
-//!   victims are written back in place under the same id, not to a fresh
-//!   slot (§5.2, I-NO-INPLACE): A-3c; no epoch gate (§5.6): A-3c; no
-//!   `write_guard` (§5.6): A-7a;
+//! - pool: the seed tree runs on `pool`, whose victims are picked by pin
+//!   count and whose dirty victims are written back in place under the same
+//!   id (§5.2, I-NO-INPLACE): A-4a moves the tree onto `buf` and retires
+//!   `pool`. `buf` (card A-3a): its frame latches are `std::sync::RwLock`,
+//!   which is not task-fair (§5.1, §5.3): A-3b; a frame comes only from its
+//!   free list, with no clock, `try_latch` victim choice or wait for an
+//!   unpin (§5.2, §5.4): A-3b; no minimum pool size (§5.4): A-3b; no current
+//!   page map behind its `CurrentRef`, no dirty eviction to a fresh slot and
+//!   no poison check at a pin or in its load wait (§4.1, §5.2, §9.2): A-3c;
+//!   no epoch gate (§5.6): A-3c; no `write_guard` (§5.6): A-7a;
 //! - latch scope: `BufferPool`'s guards keep a latch past the call, and
 //!   `fetch_*` reads the store while ancestors are latched (§5.3 "No latch
-//!   escapes a call"; §5.6's restart rule): A-3b, A-4c;
+//!   escapes a call"; §5.6's restart rule): A-4a retires `pool`; `buf`
+//!   leaves both to its callers (its blocking `pin` may read a page, so a
+//!   caller under latches uses it only where §5.3 allows a read), which
+//!   A-4c's tracker checks;
 //! - fail-stop: no poison mark, and `StoreError` has no SQLSTATE mapping
 //!   (XX001, 58030, 53100, 53200; §9.2): A-3c, A-4c;
 //! - tree: the root id in a `RwLock<PageId>` with the T-ROOT restart, not a
@@ -77,6 +92,7 @@
 // nucleus/v3/spikes/e0-btree/src/lib.rs at 7ccd1cff8ef926f95a240b15d4b9c6a346251efe
 // lines 27-34, without the spike's file-backed store, which is not copied.
 
+pub mod buf;
 mod codec;
 pub mod crc;
 pub mod map;
