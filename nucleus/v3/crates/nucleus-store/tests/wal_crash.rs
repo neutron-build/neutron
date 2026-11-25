@@ -774,13 +774,13 @@ fn fixture_appended() -> Vec<Appended> {
 /// Whether, among the old names, the present ones form an upper set: never
 /// a segment renamed while a lower one is present (I-WAL-START).
 fn present_is_upper_set(old: &[u64], names: &[String]) -> bool {
-    let present: Vec<usize> = old
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| names.contains(&seg_name(**f)))
-        .map(|(i, _)| i)
-        .collect();
-    present.windows(2).all(|w| w[1] == w[0] + 1)
+    let present: Vec<bool> = old.iter().map(|f| names.contains(&seg_name(*f))).collect();
+    // From the highest name down: present names, then renamed (absent)
+    // ones, and never an absent one above a present one. Consecutive
+    // present names alone are not enough: a highest-first recycling, the
+    // descending form of RECYCLE-UNORDERED, leaves 0 and 1024 present with
+    // 2048 and 3072 renamed.
+    present.iter().rev().skip_while(|p| **p).all(|p| !*p)
 }
 
 /// Whether the walk accepted a record past a hop that boot `boot` wrote: a
@@ -852,6 +852,14 @@ fn t_wal_start() {
     let oracle = seen_stream(&oracle_stream(0, &plan));
     let old = [0u64, 1024, 2048, 3072];
     let target = [5120u64, 6144, 7168, 8192];
+    // The oracle itself (I-WAL-START): the lower ones renamed is an upper
+    // set; a highest-first recycling's leftovers are not, whether or not
+    // the names left are consecutive.
+    let names_of = |fs: &[u64]| fs.iter().map(|f| seg_name(*f)).collect::<Vec<_>>();
+    assert!(present_is_upper_set(&old, &names_of(&[1024, 2048, 3072])));
+    assert!(present_is_upper_set(&old, &names_of(&[])));
+    assert!(!present_is_upper_set(&old, &names_of(&[0, 1024])));
+    assert!(!present_is_upper_set(&old, &names_of(&[0, 1024, 2048])));
     let recorded = Mutex::new(Vec::<(u64, Vec<u8>)>::new());
     let mut setup = |sim: &mut Sim| {
         create_life(sim);
