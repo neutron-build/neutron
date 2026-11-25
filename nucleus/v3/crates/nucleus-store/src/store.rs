@@ -45,6 +45,8 @@ pub enum StoreError {
     /// Every frame stayed pinned across two full clock sweeps: the pool is
     /// smaller than threads × (tree height + 2), below the minimum of
     /// PLAN-v3 §3.3.
+    /// Card A-3a: `buf::Pool` also returns it when its free list is empty, since
+    /// that card has no eviction (A-3b replaces that answer).
     #[error("buffer pool starved: no unpinned frame after two clock sweeps")]
     PoolStarved,
     /// A pool or store was constructed with unusable parameters.
@@ -53,6 +55,15 @@ pub enum StoreError {
     /// A mutex needed for correctness was poisoned by a panic elsewhere.
     #[error("poisoned lock: {0}")]
     Poisoned(String),
+    /// A `nucleus-env` call failed (card A-3a: a page read through
+    /// `buf::Pool`). Its SQLSTATE is the `EnvError`'s (S-STORE's error
+    /// table): 58030, or 53100 for `NoSpace`.
+    #[error("env: {0}")]
+    Env(#[from] nucleus_env::EnvError),
+    /// An allocation the store makes once, at construction, failed (card
+    /// A-3a: `buf::Pool`'s frames and page table): SQLSTATE 53200 (N16).
+    #[error("out of memory: {0}")]
+    OutOfMemory(String),
 }
 
 /// The seed's page storage surface (card A-0). E4 implemented it over a
