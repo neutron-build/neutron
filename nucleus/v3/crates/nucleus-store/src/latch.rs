@@ -257,7 +257,9 @@ impl LatchCore {
         let mut len = 0u32;
         for e in self.live() {
             if e & EXCLUSIVE_BIT != 0 {
-                return len + 1;
+                // An exclusive head is a batch of one; behind shared entries
+                // it ends the run.
+                return if len == 0 { 1 } else { len };
             }
             len += 1;
         }
@@ -435,9 +437,13 @@ impl LatchCore {
         match self.head_mode() {
             Some(Mode::Exclusive) => self.holders = Holders::Exclusive,
             Some(Mode::Shared) => {
+                // R0: a shared batch is granted over a free latch or beside
+                // the shared holders still there (a batch's uncollected
+                // members included).
                 self.holders = match self.holders {
                     Holders::Free => Holders::Shared(batch),
-                    other => other,
+                    Holders::Shared(n) => Holders::Shared(n.saturating_add(batch)),
+                    exclusive @ Holders::Exclusive => exclusive,
                 };
             }
             None => {

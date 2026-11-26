@@ -369,6 +369,24 @@ impl<P: Primitives, T: Send + Sync> DerefMut for RwCellWriteGuard<'_, P, T> {
     }
 }
 
+impl<P: Primitives, T: Send + fmt::Debug> fmt::Debug for MutexGuard<'_, P, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<P: Primitives, T: Send + Sync + fmt::Debug> fmt::Debug for RwCellReadGuard<'_, P, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<P: Primitives, T: Send + Sync + fmt::Debug> fmt::Debug for RwCellWriteGuard<'_, P, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
 /// Yields the thread or task to the scheduler (F2): the only spin of
 /// model-tested store code.
 pub fn yield_now<P: Primitives>() {
