@@ -28,6 +28,10 @@
 //!   (S-STORE §5.1, §5.4): a fixed pool, a page table that never grows,
 //!   and loads through a page's current reference, checked by
 //!   `page::verify` (§3.3). No tree uses it yet.
+//! - `buf`'s frame acquisition and pool sizing (card A-3b-0): clock
+//!   eviction of clean victims with `try_latch`, the wait for an unpin,
+//!   and the minimum pool size at open with R-1-memory's values
+//!   (S-STORE §5.2, §5.4).
 //! - `page`'s slotted body, `pool`, `store` and `tree` (card A-0, re-based
 //!   on §3.1 by card A-2): the E0 spike's B+tree, copied with provenance
 //!   from `spikes/e0-btree`. They meet E0's invariants (T-ORDER, T-COUPLING,
@@ -58,12 +62,12 @@
 //!   count and whose dirty victims are written back in place under the same
 //!   id (§5.2, I-NO-INPLACE): A-4a moves the tree onto `buf` and retires
 //!   `pool`. `buf` (card A-3a): its frame latches are `std::sync::RwLock`,
-//!   which is not task-fair (§5.1, §5.3): A-3b; a frame comes only from its
-//!   free list, with no clock, `try_latch` victim choice or wait for an
-//!   unpin (§5.2, §5.4): A-3b; no minimum pool size (§5.4): A-3b; no current
-//!   page map behind its `CurrentRef`, no dirty eviction to a fresh slot and
-//!   no poison check at a pin or in its load wait (§4.1, §5.2, §9.2): A-3c;
-//!   no epoch gate (§5.6): A-3c; no `write_guard` (§5.6): A-7a;
+//!   which is not task-fair (§5.1, §5.3): A-3b; dirty victims are not
+//!   evicted, so a pool whose unpinned frames are all dirty answers
+//!   `PoolStarved` (§5.2): A-3c; no current page map behind its `CurrentRef`,
+//!   no dirty eviction to a fresh slot and no poison check at a pin or in its
+//!   load wait (§4.1, §5.2, §9.2): A-3c; no epoch gate (§5.6): A-3c; no
+//!   `write_guard` (§5.6): A-7a;
 //! - latch scope: `BufferPool`'s guards keep a latch past the call, and
 //!   `fetch_*` reads the store while ancestors are latched (§5.3 "No latch
 //!   escapes a call"; §5.6's restart rule): A-4a retires `pool`; `buf`

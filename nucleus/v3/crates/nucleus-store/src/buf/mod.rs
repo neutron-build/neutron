@@ -3,8 +3,11 @@
 //! the page table first (§5.4 "What a pin finds"), loads through a page's
 //! current reference checked by I-INTEGRITY (§3.3, §4.1, §4.4), the frame
 //! state machine, creation under the creator's latch (§6.8 "Root names"), and
-//! the step by which a frame leaves the page table, which eviction (card
-//! A-3b), dirty eviction (A-3c) and freeing (A-4b) build on.
+//! the step by which a frame leaves the page table, which dirty eviction
+//! (A-3c) and freeing (A-4b) build on. Its frame acquisition and pool sizing
+//! are card A-3b-0's (`acquire`, `sizing`), whose own module docs state the
+//! invariants they own: the clock's second chance, the wait for an unpin and
+//! the minimum pool size.
 //!
 //! No tree uses this module yet: card A-4a moves the tree onto it and
 //! retires the seed's `pool` (lib.rs, "Seed status").
@@ -30,8 +33,8 @@
 //!   only through `reserve`, and returns to it when its reservation is
 //!   dropped, when a load ends with no count left on it, or when the last
 //!   waiter drops its count on an Orphan. Tests `pool_fixed`, `pool_config`,
-//!   the model tests; mutants RESERVATION-LEAK, ORPHAN-LEAK,
-//!   UNMAPPED-LEAVES-FRAME.
+//!   the model tests, `pool_never_grows` (card A-3b-0); mutants
+//!   RESERVATION-LEAK, ORPHAN-LEAK, UNMAPPED-LEAVES-FRAME, POOL-GROW.
 //! - **BUF-ONE-FRAME** (§5.1: "The table holds at most one frame for a page"):
 //!   a key is in the page table under at most one frame; a frame is in the
 //!   table if and only if its state is `Loading` or `Resident`; a frame's
@@ -43,10 +46,11 @@
 //!   CREATE-OVER-LIVE, CREATE-FREED-NEW-FRAME.
 //! - **BUF-TABLE-LEAF** (§4.2, §6.8; C-T0 §2.6): the table mutex is a leaf
 //!   lock: while it is held no latch is taken (not even with `try_`), no
-//!   `CurrentRef` is called, no I/O is made, no hook fires and nothing is
-//!   waited on (the condition-variable wait releases it). Tests
-//!   `independent_loads`, `hooks_fire_unlocked` (and the model's check that
-//!   no reference read finds the mutex held); mutant TABLE-HELD-ACROSS-IO.
+//!   `CurrentRef` is called, no I/O is made, no hook fires, no yield is made
+//!   and nothing is waited on (the condition-variable wait releases it). Tests
+//!   `independent_loads`, `hooks_fire_unlocked`, `acquire_hooks_unlocked`
+//!   (and the model's check that no reference read finds the mutex held);
+//!   mutant TABLE-HELD-ACROSS-IO.
 //! - **BUF-TABLE-FIRST** (§5.4 "What a pin finds"): a pin reads a key's
 //!   current reference only when the key is not in the table; it returns
 //!   `Unmapped` only when the key was not in the table and its reference has
@@ -83,8 +87,10 @@
 //!   §3.3's four checks) or by `mark_freed` (§4.2: a freed page's frame is
 //!   never written); a page never written since its creation never leaves
 //!   the table. Tests `remove_rules`, `mark_written_checks`, `freed_frame`,
-//!   `evict_sets_entry_first`, `mark_written_more`, `mark_written_epoch`;
-//!   mutants REMOVE-DIRTY, WRITTEN-UNCHECKED, FREED-STAYS-DIRTY.
+//!   `evict_sets_entry_first`, `mark_written_more`, `mark_written_epoch`,
+//!   `clock_evicts_freed_unwritten`, `pool_starved_all_dirty` (card A-3b-0);
+//!   mutants REMOVE-DIRTY, WRITTEN-UNCHECKED, FREED-STAYS-DIRTY,
+//!   EVICT-FREED-WRITES, DIRTY-NOT-SKIPPED.
 //! - **BUF-BORN-LATCHED** (§6.8 "Root names"; §15 `t_root_name_reuse` case
 //!   D): a created page that enters the table does so under its creator's
 //!   exclusive latch, already zeroed and with its header (`kind`, `id`,
@@ -105,18 +111,21 @@
 //!
 //! # What later cards add (not here)
 //!
-//! Card A-3b: the clock over `pin_frame`, `try_victim` and
-//! `remove_from_table`, the wait for an unpin, the minimum pool size, the
-//! task-fair latch inside `FrameLatch` on the store's sync layer, and
-//! `o_frame`. Card A-3c: the current page map behind `CurrentRef`, dirty
-//! eviction, the poison mark in every acquisition and wait predicate here
-//! (§9.2), and the mapping of this module's `Invalid` (every one an engine
-//! invariant violation when an engine caller meets it) to XX000 (§9.2 at
-//! draft 7.20).
+//! Card A-3b: the task-fair latch inside `FrameLatch` on the store's sync
+//! layer, which `buf` then moves onto in one step, and the wait of `acquire`
+//! judged under the interleaving harness. Card A-3c: the current page map
+//! behind `CurrentRef`, dirty eviction (which replaces `acquire`'s
+//! `PoolStarved` branch and the epoch-copy reserve sized from
+//! `PoolSizing::r_epoch`), the poison mark in every acquisition and wait
+//! predicate here (§9.2), and the mapping of this module's `Invalid` (every
+//! one an engine invariant violation when an engine caller meets it) to XX000
+//! (§9.2 at draft 7.20).
 
+mod acquire;
 mod frame;
 mod key;
 mod pool;
+mod sizing;
 mod sync;
 mod table;
 
@@ -128,4 +137,7 @@ pub use key::PageKey;
 pub use pool::{
     CreateOutcome, CurrentRef, FrameInfo, Hook, HookPoint, PinOutcome, Pool, PoolConfig,
     PoolFootprint, PoolStats,
+};
+pub use sizing::{
+    H_MIN, IMAGE_RECORD_BYTES, OWN_PINNING_THREADS, PoolSizing, STEP2_RESERVE_FRAMES,
 };

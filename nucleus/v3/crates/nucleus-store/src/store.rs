@@ -45,8 +45,8 @@ pub enum StoreError {
     /// Every frame stayed pinned across two full clock sweeps: the pool is
     /// smaller than threads × (tree height + 2), below the minimum of
     /// PLAN-v3 §3.3.
-    /// Card A-3a: `buf::Pool` also returns it when its free list is empty, since
-    /// that card has no eviction (A-3b replaces that answer).
+    /// Card A-3b-0: `buf::Pool`'s frame acquisition returns it when no frame is
+    /// free and every unpinned frame is dirty (A-3c writes dirty victims).
     #[error("buffer pool starved: no unpinned frame after two clock sweeps")]
     PoolStarved,
     /// A pool or store was constructed with unusable parameters.
@@ -64,6 +64,17 @@ pub enum StoreError {
     /// A-3a: `buf::Pool`'s frames and page table): SQLSTATE 53200 (N16).
     #[error("out of memory: {0}")]
     OutOfMemory(String),
+    /// The pool is below S-STORE §5.4's minimum with R-1-memory's values
+    /// (card A-3b-0): SQLSTATE 53200. The open is refused and writes nothing.
+    #[error(
+        "buffer pool of {frames} frames is below its minimum of {minimum} frames (S-STORE §5.4)"
+    )]
+    BelowMinimum {
+        /// The frame count asked for.
+        frames: u32,
+        /// `threads × 3 × (H_min + 2) + R_EPOCH + R_MAP` (R-1-memory §4.2).
+        minimum: u64,
+    },
 }
 
 /// The seed's page storage surface (card A-0). E4 implemented it over a

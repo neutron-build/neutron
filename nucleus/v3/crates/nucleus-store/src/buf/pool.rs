@@ -9,6 +9,13 @@
 //! rest on. The table mutex is a leaf lock (BUF-TABLE-LEAF): no step takes a
 //! latch, calls a [`CurrentRef`], makes I/O, fires a hook or waits while it
 //! holds it, except the condition-variable wait, which releases it.
+//!
+//! Card A-3b-0 adds, without moving a step: the reference bit (Work 3), set
+//! where a user pin raises a count and cleared where a frame becomes `Free`
+//! or `Reserved`; the four transitions U1–U4 that make a held frame unheld
+//! (Work 4), two of them in `frame.rs` and two here, each counted by
+//! [`Pool::became_unheld`]; and P3's call of the frame acquisition (Work 5),
+//! whose own steps A1–A7 are in `acquire.rs`.
 
 use core::fmt;
 use core::ops::Range;
@@ -29,6 +36,8 @@ use crate::meta::{self, Ref};
 use crate::page::{self, Kind};
 use crate::store::StoreError;
 
+use super::sizing::{H_MIN, OWN_PINNING_THREADS, PoolSizing, STEP2_RESERVE_FRAMES};
+
 /// The largest frame count a pool takes: `2^31`, so that every frame id and
 /// the bucket count (the next power of two) fit a `u32`.
 const MAX_FRAMES: u32 = 1 << 31;
@@ -37,15 +46,23 @@ const MAX_FRAMES: u32 = 1 << 31;
 /// two meta slots (S-STORE §1, §2, §4.4).
 const FIRST_PAGE_SLOT: u64 = 3;
 
-/// A pool's size (card A-3a): `frames` frames (S-STORE §5.1's `F`) of
-/// `page_size` bytes. Phase A opens take `F` directly (R-1-memory §4.1);
-/// the minimum pool size of §5.4 is card A-3b's.
+/// A pool's size (card A-3a; card A-3b-0, Work 2): `frames` frames
+/// (S-STORE §5.1's `F`) of `page_size` bytes for `callers` calling threads.
+/// Phase A opens take `F` and `n_c` directly (R-1-memory §4.1, §11); R-1
+/// derives them from a budget in Phase B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolConfig {
-    /// `F`, the frame count (§5.1): `1 ≤ frames ≤ 2^31`.
+    /// `F`, the frame count (§5.1): `1 ≤ frames ≤ 2^31`, and at least the
+    /// minimum of §5.4 for `callers` ([`PoolSizing::compute`]).
     pub frames: u32,
     /// The page size: one of `meta::PAGE_SIZES` (§2.1).
     pub page_size: u32,
+    /// `n_c`: the threads (or under N10 the tasks that can hold a pin while
+    /// they wait) that call into the pool at once (R-1-memory §1, §11). The
+    /// minimum counts every pin each can hold (S-STORE §5.4), so a pool that
+    /// would be below it is refused; 0 is refused. `Pool::bytes_for` and
+    /// `Pool::footprint` do not read it.
+    pub callers: u32,
 }
 
 /// The source of a page's current reference (S-STORE §4.1, §5.4): the
@@ -117,10 +134,16 @@ pub struct PoolStats {
     pub reads: u64,
     /// The page table's bucket count, fixed at `F.next_power_of_two()` (§5.7).
     pub buckets: u32,
+    /// Clean victims the frame acquisition has taken (§5.2; card A-3b-0).
+    pub evictions: u64,
+    /// The clock's position, `hand mod F` (§5.2; card A-3b-0).
+    pub clock_hand: u32,
+    /// Frame acquisitions waiting for an unpin right now (§5.4; card A-3b-0).
+    pub unpin_waiters: u32,
 }
 
-/// One frame's bookkeeping (S-STORE §5.1; card A-3a; may be stale once
-/// returned).
+/// One frame's bookkeeping (S-STORE §5.1; card A-3a and A-3b-0; may be stale
+/// once returned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameInfo {
     /// The frame's state (§5.1, §5.4).
@@ -131,11 +154,14 @@ pub struct FrameInfo {
     pub pins: u64,
     /// Whether its page was freed (§4.2).
     pub freed: bool,
+    /// The clock's reference bit (§5.2; card A-3b-0, Work 3).
+    pub referenced: bool,
 }
 
 /// The pool's memory as R-1 accounts it (R-1-memory §4.1 `o_frame`, §5.1,
-/// §8; card A-3a reports the frame-header and page-table terms, A-3c adds
-/// the image-record list's, A-3b reports `o_frame`).
+/// §8; card A-3a reports the frame-header and page-table terms, and card
+/// A-3b-0's [`PoolSizing::o_frame`] bounds both per frame, with the
+/// image-record list's record that A-3c adds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolFootprint {
     /// The page buffers: `F × page_size` (R-1-memory §5.1).
@@ -151,14 +177,18 @@ pub struct PoolFootprint {
 }
 
 /// A named point in the pool's protocols where a test hook fires (card
-/// A-3a, Work 8). Always defined; the hook storage and [`Pool::set_hook`]
-/// exist only under the crate's `test-hooks` feature, and without it firing
-/// compiles to nothing. A hook fires holding no pool mutex; the latches each
-/// point holds are in card A-3a's hook table and, for `FreedClaimed`, in card
-/// A-3a-F2's. S-STORE §15's `t_pin_load_race`
+/// A-3a, Work 8; card A-3b-0, Work 6). Always defined; the hook storage and
+/// [`Pool::set_hook`] exist only under the crate's `test-hooks` feature, and
+/// without it firing compiles to nothing. A hook fires holding no pool mutex;
+/// the latches each point holds are in card A-3a's hook table and, for
+/// `FreedClaimed`, in card A-3a-F2's. S-STORE §15's `t_pin_load_race`
 /// names four of them: *missed* is [`HookPoint::MissReserved`], *published*
 /// [`HookPoint::LoadPublished`], *resolved* [`HookPoint::LoadResolved`] and
 /// *waiting* [`HookPoint::LoadWaiting`].
+///
+/// A hook with no page fires with key `PageKey::Lpid(0)` (LPID 0 is null,
+/// S-STORE §1, so no page has it) and frame `FrameId(u32::MAX)` (no frame has
+/// it: `frames ≤ 2^31`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookPoint {
     /// P3 (§5.4 "The load"): a miss holds its reservation (a frame not in the table), before
@@ -194,6 +224,25 @@ pub enum HookPoint {
     FreedClaimed,
     /// R1 (§5.2): the victim's exclusive latch is held; no pin.
     RemoveLatched,
+    /// The frame acquisition's step A2 (§5.2; card A-3b-0, Work 5), after a
+    /// clean victim left the page table: with the victim's old key and its
+    /// frame. The firing thread holds that frame's reservation; no latch, no
+    /// mutex.
+    Evicted,
+    /// Step A3, once per sweep that took no victim: with the key the
+    /// acquisition is for (`pin`'s miss) or none. The firing thread holds
+    /// nothing: no reservation, no pin, no latch, no mutex.
+    SweepEnded,
+    /// Step A7, after the acquisition registered as a waiter for an unpin and
+    /// before its first wait: with the key it is for or none. The firing
+    /// thread holds nothing, and is counted in [`PoolStats::unpin_waiters`].
+    UnpinWait,
+    /// Step A2, at the start of each sweep step, before the table mutex is
+    /// taken (so before the test that ends the sweep): with the key the
+    /// acquisition is for (`pin`'s miss) or none, and no frame (card A-3b-0,
+    /// Work 6; gate ruling A-3b-0 R1). The firing thread holds nothing: no
+    /// reservation, no pin, no latch, no mutex.
+    SweepStep,
 }
 
 /// A test hook (card A-3a; S-STORE §15's hook-placed interleavings): called
@@ -220,6 +269,11 @@ pub struct Pool<H: File> {
     table: Mutex<Table>,
     /// Signalled whenever a load ends (P10, cleanup).
     settled: Condvar,
+    /// Signalled whenever a held frame becomes unheld (U1–U4, card A-3b-0,
+    /// Work 4) while an acquisition waits for it.
+    unheld: Condvar,
+    /// The numbers the pool was opened with (R-1-memory §8 "The report").
+    sizing: PoolSizing,
     /// The test hook (card A-3a, `test-hooks`).
     #[cfg(feature = "test-hooks")]
     hook: Mutex<Option<Hook>>,
@@ -234,7 +288,10 @@ struct Sizes {
 }
 
 /// Validate `cfg` (card A-3a, `Pool::new`): the page size is allowed and
-/// `1 ≤ frames ≤ 2^31`. No minimum: §5.4's is card A-3b's.
+/// `1 ≤ frames ≤ 2^31`. The minimum of §5.4 is checked after this, by
+/// [`PoolSizing::compute`] (card A-3b-0, Work 2), and not here: R-1 charges
+/// [`Pool::bytes_for`], which reads only `frames` and `page_size`, before it
+/// calls [`Pool::new`].
 fn sizes(cfg: PoolConfig) -> Result<Sizes, StoreError> {
     if !meta::is_page_size(cfg.page_size) {
         return Err(StoreError::Invalid(format!(
@@ -271,7 +328,7 @@ fn wide(n: usize) -> u64 {
 }
 
 /// The error a poisoned table mutex gives.
-fn poisoned_table() -> StoreError {
+pub(crate) fn poisoned_table() -> StoreError {
     StoreError::Poisoned("the buffer pool's page table mutex was poisoned by a panic".into())
 }
 
@@ -296,19 +353,82 @@ fn init_page(c: &mut FrameContent, kind: Kind, id: u64, epoch: u32) -> Result<()
 impl<H: File> Pool<H> {
     /// A pool of `cfg.frames` frames over `file` (S-STORE §5.1).
     ///
+    /// A-3a's checks first (the page size, `1 ≤ frames ≤ 2^31`), then the
+    /// minimum of §5.4 with R-1-memory's values (card A-3b-0, Work 2), then
+    /// the allocations. So a pool below its minimum allocates nothing and
+    /// does no I/O (§5.4: "refused with 53200 and writes nothing").
+    ///
     /// Allocates, each with `try_reserve_exact` and in this order, the frame
     /// metadata, the latches, the buckets, the free stack and the `frames`
     /// zeroed page buffers; nothing in `buf` allocates after this
-    /// (BUF-FIXED), but for an error's message. Checks no minimum (§5.4's
-    /// minimum and its 53200 are card A-3b's).
+    /// (BUF-FIXED), but for an error's message.
     ///
     /// # Errors
     /// [`StoreError::Invalid`] unless the page size is allowed and
-    /// `1 ≤ frames ≤ 2^31`; [`StoreError::OutOfMemory`] (53200) if an
-    /// allocation fails.
+    /// `1 ≤ frames ≤ 2^31`; [`StoreError::BelowMinimum`] (53200) if `frames`
+    /// is below the minimum for `cfg.callers`;
+    /// [`StoreError::OutOfMemory`] (53200) if an allocation fails.
     pub fn new(file: Arc<H>, cfg: PoolConfig) -> Result<Pool<H>, StoreError> {
         let s = sizes(cfg)?;
         let reserved = meta::reserved_slots(s.page_size)?;
+        let sizing = PoolSizing::compute(
+            cfg.frames,
+            cfg.callers,
+            OWN_PINNING_THREADS,
+            STEP2_RESERVE_FRAMES,
+            H_MIN,
+        )?;
+        Self::build(file, s, reserved, sizing)
+    }
+
+    /// [`Pool::new`] for a pool below its minimum (card A-3b-0, Work 2;
+    /// `test-hooks` only): the same checks but §5.4's, so a pool of a few
+    /// frames opens, and [`Pool::sizing`] reports the numbers
+    /// [`PoolSizing::below_minimum`] gives.
+    ///
+    /// It exists so this crate's own tests can exercise the pin protocol and
+    /// the clock on pools of a few frames, which the minimum (34 for one
+    /// caller) would refuse. No store path calls it, and no workspace crate
+    /// other than nucleus-store may reference it (card A-0's reach rule for
+    /// `test-hooks`).
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] unless the page size is allowed,
+    /// `1 ≤ frames ≤ 2^31` and `callers ≥ 1`; [`StoreError::OutOfMemory`]
+    /// (53200) if an allocation fails.
+    #[cfg(feature = "test-hooks")]
+    pub fn new_below_minimum_for_tests(
+        file: Arc<H>,
+        cfg: PoolConfig,
+    ) -> Result<Pool<H>, StoreError> {
+        let s = sizes(cfg)?;
+        let reserved = meta::reserved_slots(s.page_size)?;
+        let sizing = PoolSizing::below_minimum(
+            cfg.frames,
+            cfg.callers,
+            OWN_PINNING_THREADS,
+            STEP2_RESERVE_FRAMES,
+            H_MIN,
+        )?;
+        Self::build(file, s, reserved, sizing)
+    }
+
+    /// The pool's numbers (R-1-memory §8 "The report": `F`, `R_EPOCH`,
+    /// `R_MAP`, `H`, `n_s`, `s` and `o_frame`; card A-3b-0, Work 2). Fixed at
+    /// open.
+    pub fn sizing(&self) -> PoolSizing {
+        self.sizing
+    }
+
+    /// Card A-3a's allocations (BUF-FIXED), for a validated configuration
+    /// and its sizing. Neither `Pool::new` nor
+    /// [`Pool::new_below_minimum_for_tests`] allocates before it is called.
+    fn build(
+        file: Arc<H>,
+        s: Sizes,
+        reserved: Range<u64>,
+        sizing: PoolSizing,
+    ) -> Result<Pool<H>, StoreError> {
         let too_wide = || StoreError::Invalid("pool size past usize".into());
         let frames = usize::try_from(s.frames).map_err(|_| too_wide())?;
         let buckets_len = usize::try_from(s.buckets).map_err(|_| too_wide())?;
@@ -359,6 +479,8 @@ impl<H: File> Pool<H> {
             latches: latches.into_boxed_slice(),
             table: Mutex::new(table),
             settled: Condvar::new(),
+            unheld: Condvar::new(),
+            sizing,
             #[cfg(feature = "test-hooks")]
             hook: Mutex::new(None),
         })
@@ -397,6 +519,32 @@ impl<H: File> Pool<H> {
     /// condition variable, and lock it again.
     fn wait<'t>(&self, t: MutexGuard<'t, Table>) -> Result<MutexGuard<'t, Table>, StoreError> {
         self.settled.wait(t).map_err(|_| poisoned_table())
+    }
+
+    /// Wait for a held frame to become unheld (card A-3b-0, Work 5, A7):
+    /// release the table mutex, wait on `unheld`, and lock it again. A
+    /// poisoned mutex gives the guard back in `Err`, so the caller, a
+    /// registered waiter, can take itself off the count before it returns
+    /// the error.
+    pub(crate) fn wait_for_unheld<'t>(
+        &self,
+        t: MutexGuard<'t, Table>,
+    ) -> Result<MutexGuard<'t, Table>, MutexGuard<'t, Table>> {
+        self.unheld.wait(t).map_err(PoisonError::into_inner)
+    }
+
+    /// U1–U4's second half (card A-3b-0, Work 4): a held frame has just
+    /// become unheld, under the table mutex, which the caller still holds as
+    /// `t`. Counts the event and, while an acquisition waits for an unpin,
+    /// wakes every waiter. The four callers are [`Pin::drop`] (U1),
+    /// [`FrameReservation::drop`] (U2), the cleanup of a load (U3) and a
+    /// pin's Orphan path (U4); no other site changes `unheld_events`, and a
+    /// frame that `remove_from_table` makes `Reserved` stays held.
+    pub(crate) fn became_unheld(&self, t: &mut Table) {
+        t.unheld_events = t.unheld_events.wrapping_add(1);
+        if t.unpin_waiters > 0 {
+            self.unheld.notify_all();
+        }
     }
 
     /// Frame `f`'s latch.
@@ -465,16 +613,19 @@ impl<H: File> Pool<H> {
     /// failure takes the frame out of the table and serves nothing.
     ///
     /// Precondition (§5.3, §5.4): `pin` may wait for another thread's load of
-    /// `key`, which reads a page and takes the key's map latches shared. A
-    /// caller holding latches calls it only where §5.3 allows its holds a
-    /// page read, and never while it holds a map latch; elsewhere it uses
-    /// [`Pool::pin_resident`], and on `None` releases its latches and
-    /// restarts.
+    /// `key`, which reads a page and takes the key's map latches shared, and
+    /// a pin that misses may wait for an unpin, since its frame is the frame
+    /// acquisition's waiting form (§5.4: "every frame is pinned"; card
+    /// A-3b-0, Work 5). A caller holding latches calls it only where §5.3
+    /// allows a page read and a wait for an unpin, and never while it holds a
+    /// map latch; elsewhere it uses [`Pool::pin_resident`], and on `None`
+    /// releases its latches and restarts.
     ///
     /// # Errors
     /// [`StoreError::Invalid`] for `Lpid(0)` (before anything is touched) or a
     /// count at `u64::MAX`; [`StoreError::PoolStarved`] when no frame is free
-    /// (card A-3b replaces this answer); [`StoreError::Corrupt`] (XX001) for
+    /// and every unpinned frame is dirty, which only A-3c's dirty eviction
+    /// resolves (§5.2); [`StoreError::Corrupt`] (XX001) for
     /// a reference naming slot 1, 2, a reserved slot or a slot past `u64`, a
     /// short read, a §3.3 mismatch or a kind the key does not admit;
     /// [`StoreError::Env`] (58030) if the read fails; whatever `map` returns.
@@ -493,6 +644,8 @@ impl<H: File> Pool<H> {
                     // (a) Resident: no reference is read.
                     FrameState::Resident => {
                         t.raise(f)?;
+                        // A user pin sets the clock's bit (card A-3b-0, Work 3).
+                        t.meta_mut(f)?.referenced = true;
                         drop(t);
                         let pin = Pin::counted(self, f, key);
                         self.fire(HookPoint::Pinned, key, f);
@@ -513,6 +666,9 @@ impl<H: File> Pool<H> {
                         match t.meta(f)?.state {
                             // A counted frame cannot change key.
                             FrameState::Resident => {
+                                // The waiter is served: a user pin sets the
+                                // clock's bit (card A-3b-0, Work 3).
+                                t.meta_mut(f)?.referenced = true;
                                 drop(t);
                                 let pin = Pin::counted(self, f, key);
                                 self.fire(HookPoint::Pinned, key, f);
@@ -522,6 +678,9 @@ impl<H: File> Pool<H> {
                             FrameState::Orphan => {
                                 if t.lower(f)? == 0 {
                                     t.release(f)?;
+                                    // U4 (card A-3b-0, Work 4): the last count
+                                    // left an Orphan frame.
+                                    self.became_unheld(&mut t);
                                 }
                                 drop(t);
                                 continue;
@@ -535,8 +694,12 @@ impl<H: File> Pool<H> {
             // (c) Absent.
             drop(t);
 
-            // P3.
-            let res = self.reserve()?;
+            // P3: the frame acquisition in its waiting form, for this key, so
+            // that `pin` may wait for an unpin (card A-3b-0, Work 5). Its
+            // `None` cannot occur there.
+            let res = self.acquire(true, Some(key))?.ok_or_else(|| {
+                StoreError::Invalid("a waiting frame acquisition returned no frame".into())
+            })?;
             let f = res.frame();
             self.fire(HookPoint::MissReserved, key, f);
 
@@ -642,7 +805,11 @@ impl<H: File> Pool<H> {
 
         // P10.
         let mut t = self.lock_table()?;
-        t.meta_mut(f)?.state = FrameState::Resident;
+        let m = t.meta_mut(f)?;
+        m.state = FrameState::Resident;
+        // The loader is served a page: a user pin sets the clock's bit
+        // (card A-3b-0, Work 3).
+        m.referenced = true;
         t.reads = t.reads.saturating_add(1);
         self.settled.notify_all();
         drop(t);
@@ -675,6 +842,8 @@ impl<H: File> Pool<H> {
         t.remove(key, f)?;
         if t.lower(f)? == 0 {
             t.release(f)?;
+            // U3 (card A-3b-0, Work 4): the loader's was the last count.
+            self.became_unheld(&mut t);
         } else {
             t.meta_mut(f)?.state = FrameState::Orphan;
         }
@@ -699,6 +868,8 @@ impl<H: File> Pool<H> {
             return Ok(None);
         }
         t.raise(f)?;
+        // A user pin sets the clock's bit (card A-3b-0, Work 3).
+        t.meta_mut(f)?.referenced = true;
         drop(t);
         let pin = Pin::counted(self, f, key);
         self.fire(HookPoint::Pinned, key, f);
@@ -706,8 +877,9 @@ impl<H: File> Pool<H> {
     }
 
     /// Pin frame `f` if it is `Resident`, with its key; `None` otherwise. For
-    /// callers that scan frames (card A-3b's clock, A-7b's step 2; S-STORE
-    /// §5.2, §13 step 2).
+    /// callers that scan frames (A-7b's step 2, §13 step 2; §4.1's two-step
+    /// map write). Not a use of the page: it sets no reference bit, so the
+    /// clock gives the frame no second chance for it (card A-3b-0, Work 3).
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range or its count is at
@@ -728,25 +900,43 @@ impl<H: File> Pool<H> {
         Ok(Some(pin))
     }
 
-    /// Take a frame off the free list for the caller (card A-3a): the frame a
-    /// split reserves before its first mutation (§5.4's "reservation's
-    /// pages", §6.4), or a pin's miss (P3).
+    /// Take a frame for the caller (card A-3a; card A-3b-0, Work 5): the
+    /// frame a split reserves before its first mutation (§5.4's
+    /// "reservation's pages", §6.4), or a pin's miss (P3). The free list
+    /// first; then the clock over the clean, unpinned frames, taken with
+    /// `try_latch` and never blocked on (§5.2); then, if no frame was found,
+    /// it waits for an unpin (§5.4: "A thread that cannot pin a frame because
+    /// every frame is pinned waits for an unpin").
+    ///
+    /// §5.3's rule: call it holding no latch, or from a gated operation past
+    /// its first mutation, which cannot restart (§5.6 "Restart"); which a
+    /// caller is, A-4a decides. A caller that holds a latch and may still
+    /// restart calls [`Pool::try_reserve`] instead.
     ///
     /// # Errors
-    /// [`StoreError::PoolStarved`] when the free list is empty (card A-3b
-    /// adds eviction and the wait for an unpin).
+    /// [`StoreError::PoolStarved`] when no frame is free and every unpinned
+    /// frame is dirty: at this card no dirty victim is written (A-3c writes
+    /// them, §5.2); [`StoreError::Poisoned`] if the table mutex was poisoned.
     pub fn reserve(&self) -> Result<FrameReservation<'_, H>, StoreError> {
-        let mut t = self.lock_table()?;
-        let f = t.pop_free().ok_or(StoreError::PoolStarved)?;
-        let m = t.meta_mut(f)?;
-        if m.state != FrameState::Free {
-            let state = m.state;
-            t.push_free(f)?;
-            return Err(bad_state(f, state, "on the free list"));
+        match self.acquire(true, None)? {
+            Some(res) => Ok(res),
+            None => Err(StoreError::Invalid(
+                "a waiting frame acquisition returned no frame".into(),
+            )),
         }
-        m.state = FrameState::Reserved;
-        drop(t);
-        Ok(FrameReservation::reserved(self, f))
+    }
+
+    /// [`Pool::reserve`] in the form that never waits (card A-3b-0, Work 5;
+    /// S-STORE §5.3, §5.4): it looks at the free list and runs the clock once,
+    /// and neither retries nor waits for an unpin. `Ok(None)` means the caller
+    /// releases its latches and restarts (§5.3: "with no evictable frame it
+    /// releases its latches and restarts"): at the pool floor a thread that
+    /// holds a latch and may still restart never waits for an unpin.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`] if the table mutex or a latch was poisoned.
+    pub fn try_reserve(&self) -> Result<Option<FrameReservation<'_, H>>, StoreError> {
+        self.acquire(false, None)
     }
 
     /// Make `key`'s page in the reservation's frame (S-STORE §5.4 "The load",
@@ -816,6 +1006,8 @@ impl<H: File> Pool<H> {
             m.key = Some(key);
             m.pins = 1;
             m.freed = false;
+            // A user pin sets the clock's bit (card A-3b-0, Work 3).
+            m.referenced = true;
             drop(t);
             let r = res.consume();
             let pin = Pin::counted(self, r, key);
@@ -835,7 +1027,10 @@ impl<H: File> Pool<H> {
                 // Claimed in the hold that decided: a second creation of the
                 // key now finds the frame live (`Exists`) and never remakes
                 // the page over this one's.
-                t.meta_mut(g)?.freed = false;
+                let m = t.meta_mut(g)?;
+                m.freed = false;
+                // A user pin sets the clock's bit (card A-3b-0, Work 3).
+                m.referenced = true;
                 drop(t);
                 let pin = Pin::counted(self, g, key);
                 drop(c);
@@ -866,6 +1061,8 @@ impl<H: File> Pool<H> {
             }
             FrameState::Resident => {
                 t.raise(g)?;
+                // A user pin sets the clock's bit (card A-3b-0, Work 3).
+                t.meta_mut(g)?.referenced = true;
                 drop(t);
                 drop(c);
                 let pin = Pin::counted(self, g, key);
@@ -965,6 +1162,9 @@ impl<H: File> Pool<H> {
             m.state = FrameState::Reserved;
             m.key = None;
             m.freed = false;
+            // A `Reserved` frame's reference bit is clear (card A-3b-0,
+            // Work 3): a load or a creation into it sets the bit afresh.
+            m.referenced = false;
             drop(t);
             drop(content);
             return Ok(Removal::Removed(FrameReservation::reserved(self, f)));
@@ -1027,13 +1227,15 @@ impl<H: File> Pool<H> {
         Ok(())
     }
 
-    /// The frames by state and the counters (S-STORE §5.1; each diagnostic takes the
-    /// table mutex briefly; the answer may be stale once returned).
+    /// The frames by state and the counters (S-STORE §5.1, §5.2, §5.4; each
+    /// diagnostic takes the table mutex briefly; the answer may be stale once
+    /// returned). Card A-3b-0, Work 7 adds the eviction count, the clock's
+    /// position and the acquisitions waiting for an unpin: table-only reads.
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if the free list's length is not the number of
-    /// `Free` frames (an engine invariant violation);
-    /// [`StoreError::Poisoned`] if the mutex was poisoned.
+    /// `Free` frames (an engine invariant violation), or the pool has no
+    /// frame; [`StoreError::Poisoned`] if the mutex was poisoned.
     pub fn stats(&self) -> Result<PoolStats, StoreError> {
         let t = self.lock_table()?;
         let mut s = PoolStats {
@@ -1045,6 +1247,9 @@ impl<H: File> Pool<H> {
             orphan: 0,
             reads: t.reads,
             buckets: u32::try_from(t.bucket_count()).unwrap_or(u32::MAX),
+            evictions: t.evictions,
+            clock_hand: t.clock_hand()?,
+            unpin_waiters: t.unpin_waiters,
         };
         for m in t.metas() {
             s.frames = s.frames.saturating_add(1);
@@ -1067,7 +1272,7 @@ impl<H: File> Pool<H> {
         Ok(s)
     }
 
-    /// Frame `f`'s bookkeeping (§5.1).
+    /// Frame `f`'s bookkeeping (§5.1, §5.2), a table-only read.
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range.
@@ -1079,6 +1284,7 @@ impl<H: File> Pool<H> {
             key: m.key,
             pins: m.pins,
             freed: m.freed,
+            referenced: m.referenced,
         })
     }
 

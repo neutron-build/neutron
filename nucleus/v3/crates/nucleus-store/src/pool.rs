@@ -165,7 +165,7 @@ impl<S: PageStore> BufferPool<S> {
     /// installed dirty and zeroed: the caller writes the page header.
     ///
     /// A **recycled** id — one a split reservation took but never
-    /// published, handed back by [`Self::release_new`] — is preferred
+    /// published, handed back by `release_new` — is preferred
     /// over a fresh `store.allocate` (X-0-F2 gate rework: pre-allocating
     /// split cascades must not grow the store when the cascade comes to
     /// nothing). The store itself still never reuses an id
