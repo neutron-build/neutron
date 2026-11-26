@@ -797,7 +797,7 @@ fn config(max_steps: usize) -> Config {
     let mut config = Config::new();
     config.max_steps = MaxSteps::FailAfter(max_steps);
     config.stack_size = 1 << 20;
-    config.failure_persistence = FailurePersistence::None;
+    config.failure_persistence = FailurePersistence::Print;
     config
 }
 

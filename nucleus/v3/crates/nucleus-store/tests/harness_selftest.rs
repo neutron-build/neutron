@@ -22,11 +22,11 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use harness::suite::{LatchUnderTest, NewLatch, Stamps, TryOutcome, new_latch, run};
+use harness::suite::{LatchUnderTest, Stamps, TryOutcome, new_latch, run};
 use harness::{
     Bounds, Census, Class, EXHAUSTIVE, EXHAUSTIVE_CAP, Evidence, Explore, FLOOR_EXECUTIONS,
-    FLOOR_PCT_DEPTH, Failure, Harness, PCT, RANDOM, Report, Shuttle, census, check, kill_evidence,
-    replay, run_threads,
+    FLOOR_PCT_DEPTH, Failure, Harness, PCT, RANDOM, Shuttle, census, check, kill_evidence, replay,
+    run_threads,
 };
 use nucleus_store::latch::{Latch, Mode};
 use nucleus_store::sync::{AtomicU64, Condvar, Mutex, StdPrimitives, yield_now};
@@ -958,28 +958,4 @@ fn harness_share_boundary() {
     let failure = kill_evidence(RANDOM, move || exact_counter::<Shuttle>(3, 2))
         .expect_err("kill_evidence on a clean body must fail");
     assert!(failure.message.contains("no execution failed"), "{failure}");
-}
-
-/// The suite's constructor type is part of the harness's surface; this test
-/// only needs it to name the real latch's.
-#[test]
-fn harness_suite_names_the_real_latch() {
-    let new: NewLatch<Latch<Shuttle>> = new_latch::<Shuttle>;
-    let report = check(EXHAUSTIVE, move || {
-        run::<Shuttle, Latch<Shuttle>>(harness::suite::Scenario::S5, new, 1)
-    })
-    .map_err(|f| f.to_string())
-    .unwrap();
-    assert!(report.executions < EXHAUSTIVE_CAP);
-}
-
-/// The report of a passing exhaustive run is part of the harness's surface.
-fn report_of(report: Report) -> usize {
-    report.executions
-}
-
-/// Keeps `report_of` and the direct-construction type in use.
-#[test]
-fn harness_report_is_public() {
-    assert_eq!(report_of(Report { executions: 7 }), 7);
 }

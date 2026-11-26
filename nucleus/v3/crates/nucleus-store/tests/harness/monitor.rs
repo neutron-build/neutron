@@ -233,13 +233,8 @@ impl LatchMonitor {
             return Err(Violation {
                 rule: "M1",
                 text: format!(
-                    "{mode:?} grant to request {id} while {} hold{} the latch",
-                    self.describe_holders(),
-                    if self.shared == 1 && self.exclusive.is_none() {
-                        ""
-                    } else {
-                        "s"
-                    }
+                    "{mode:?} grant to request {id} while the latch is held: {}",
+                    self.describe_holders()
                 ),
             });
         }
@@ -372,16 +367,9 @@ impl LatchMonitor {
             return Err(Violation {
                 rule: "M5",
                 text: format!(
-                    "at the end {} request{} still wait{}, {} hold{} and {} arrived without an answer",
+                    "at the end {} request(s) still wait, the holders are ({}), and {} arrived without an answer",
                     self.waiting.len(),
-                    if self.waiting.len() == 1 { "" } else { "s" },
-                    if self.waiting.len() == 1 { "s" } else { "" },
                     self.describe_holders(),
-                    if self.shared == 1 && self.exclusive.is_none() {
-                        "s"
-                    } else {
-                        ""
-                    },
                     unanswered
                 ),
             });
