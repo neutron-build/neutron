@@ -27,8 +27,10 @@
 //! - **The clock's counter and the generation** (card A-3b-0, Work 4): `hand`
 //!   advances once per sweep step, whoever takes it, so its position is
 //!   `hand mod F`; `unheld_events` changes only at U1–U4, each under this
-//!   mutex. Tests `clock_order`, `sweep_end_rechecks_generation`; mutants
-//!   HAND-STAYS, UNHELD-NO-BUMP-UNPIN.
+//!   mutex. Test `clock_order`; mutant HAND-STAYS. Mutant
+//!   UNHELD-NO-BUMP-UNPIN is caught by hang since A6′
+//!   (`acquire_vs_acquire`, `unpin_wait_then_served`; re-gate ruling A-3b-0
+//!   (a)) and by assertion (`own_pass_rechecks`).
 
 use super::frame::{FrameId, FrameState};
 use super::key::PageKey;

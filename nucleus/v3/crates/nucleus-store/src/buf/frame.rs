@@ -13,8 +13,10 @@
 //!   [`Pin`]'s last count (U1) and a dropped [`FrameReservation`] (U2) are two
 //!   of the four transitions that make a held frame unheld; each counts the
 //!   event and wakes the acquisitions waiting for an unpin, still under the
-//!   table mutex. Tests `sweep_end_rechecks_generation`, `unpin_wait_then_served`;
-//!   mutant UNHELD-NO-BUMP-UNPIN.
+//!   table mutex. Test `unpin_wait_then_served`. Mutant
+//!   UNHELD-NO-BUMP-UNPIN is caught by hang since A6′
+//!   (`acquire_vs_acquire`, `unpin_wait_then_served`; re-gate ruling A-3b-0
+//!   (a)) and by assertion (`own_pass_rechecks`).
 //! - **Clean only by a write or a free** (BUF-LEAVE-CLEAN): the dirty flag is
 //!   cleared only by `mark_written`, whose four checks are §3.3's against
 //!   the home its caller wrote, or by `mark_freed`; a freed page is never

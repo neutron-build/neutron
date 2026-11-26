@@ -880,7 +880,7 @@ fn acquire_vs_acquire() {
 
 /// The end of a sweep rechecks the generation (card A-3b-0, Work 5, A5): a
 /// frame unpinned while a sweep ran is taken by the next one without waiting
-/// or answering starved. Step budget: 2 sweeps.
+/// or answering starved. Step budget: 4 `SweepEnded`.
 #[test]
 fn sweep_end_rechecks_generation() {
     let (file, map, pool) = fixture(2).unwrap();
@@ -1415,8 +1415,9 @@ fn acquire_shared_hand() {
 /// frame 0: T_B's own pass (A6′) must go on to frame 1, where it meets X's
 /// latch, so T_B retries; then, T_A holding frame 1 and Y pinned, it waits
 /// for an unpin, and the release of T_A's reservation serves it frame 1.
-/// Under PASS-FRAME0-ONLY the pass visits frame 0 only, meets nothing busy
-/// and answers `PoolStarved`, so T_B ends right after its first sweep.
+/// Under PASS-FRAME0-ONLY the pass visits frame 0 only and meets nothing
+/// busy, so it fires `PassEnded` there, where the permit hook holds T_B: its
+/// next event is that firing, not the retry's `SweepStep`.
 ///
 /// While a thread is held the controller makes no pool call at all, as in
 /// `acquire_shared_hand`: it records, releases, joins, and only then
@@ -1675,8 +1676,9 @@ fn hit_record(
 /// own pass (A6′) finds frame 0 dirty and frame 1 pinned, so it fires
 /// `PassEnded` holding nothing, just before the hold that decides.
 /// (a) The controller drops `p` there: the final hold sees that a frame
-/// became unheld since A1, T looks again and takes Y. No `PoolStarved`, no
-/// `UnpinWait`. Mutant PASS-NO-GEN ends T with `PoolStarved` there.
+/// became unheld since A1, T looks again from A1, and its sweep (four
+/// `SweepStep`) takes Y. No `PoolStarved`, no `UnpinWait`. Mutant PASS-NO-GEN
+/// ends T with `PoolStarved` there.
 /// (b) The controller pins `lpid(1)` there instead, a hit that moves no
 /// generation: every frame is then held, and T goes on to wait for an unpin;
 /// the controller's drop of `p` serves T frame 1. Mutant PASS-NO-SCAN ends T
@@ -1702,6 +1704,8 @@ fn own_pass_rechecks() {
             let first = pz.next_event();
             let mut seen = None;
             if first == Event::Arrived(PassEnded, NO_KEY, NO_FRAME) {
+                // T is paused here, so no step is missed or added.
+                pz.report(SweepStep, NO_KEY);
                 let at = at_pass_end(&pool, &p, fy);
                 let free = at.table_free == Ok(true);
                 seen = Some(at);
@@ -1748,8 +1752,14 @@ fn own_pass_rechecks() {
         assert_eq!(got.frame(), fy, "T got frame 1");
         assert_eq!(
             without_done(reported(&pz)),
-            vec![Event::Seen(Evicted, y, fy)],
-            "the one Evicted is Y, and no UnpinWait was seen"
+            vec![
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(Evicted, y, fy),
+            ],
+            "after its release T looks again from A1 and sweeps (four SweepStep) before it takes Y; the one Evicted is Y, and no UnpinWait was seen"
         );
         drop(got);
         assert_eq!(pool.frame_of(y).unwrap(), None);
