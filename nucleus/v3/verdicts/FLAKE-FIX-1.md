@@ -1,21 +1,83 @@
 Card: FLAKE-FIX-1
 Class: test
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: claude-code session 5a4aa093-7903-4f90-a596-041e804ade1c (T3 Code review sub-agent of T3 thread 45584af2-e651-490e-862c-3402320cffa3; P re-gate of record after rework 1; it wrote neither the card, its amendments, the build, the move, the rework nor either GLM report; the first gate, session 843ab9f0, wrote R1 to R7, and this gate rules on R1's text below)
+Gate-session: claude-code session 0e72e014-3ddd-40c9-b39a-e0fa9490f687 (T3 Code review sub-agent of T3 thread 45584af2-e651-490e-862c-3402320cffa3; P gate of record, third gate, after rework 2; it wrote neither the card, its amendments, the build, the move, either rework nor any GLM report; gates 1 and 2 are kept under History)
 Date: 2026-11-26
 Gate-exit: GATE EXIT=0
-Commit: b12de1ea8bc584de96fe3f0ef368871f67436be0
-Mutants: written and run by this gate in the card worktree (python exact-string plants, each anchor asserted unique; build untimed, tests under `timeout -k 5 120`; `git checkout --` and an empty `git status --porcelain --untracked-files=all` after each). SE-1 FALSE-DEADLOCK-BACK (R1's clause deleted) -> sim_start_after_finish_is_not_deadlock (sim_env.rs:1318); SE-3 DEADLOCK-MUTE -> sim_harness_wait_before_start_is_deadlock (sim_env.rs:1415, "the deadlock fails the world") and sim_real_deadlock_reported (sim_env.rs:1367), and deadlock_detection (sim.rs:333); SE-4 GUARD-WIDE -> sim_harness_wait_before_start_is_deadlock (sim_env.rs:1407, left Ok(()) right Err(Deadlock)); E1C-4 WINDOW-ONLY -> readers_never_see_past_their_snapshot_during_apply (undo_order.rs:186, `scan failed: engine: undo record 1 is missing from the log (AC-UNDO-FIRST broken)`). Own: OWN-1 SKIP2 (`skip(1)` -> `skip(2)` in R1's clause) -> sim_harness_wait_before_start_is_deadlock (assertion), then the binary hung and was killed at 120 s; OWN-2 HARNESS-OFF-JOIN-AFTER-LIFE (not a plant: the tip itself, probed; F6) -> UNCAUGHT by every test (sim_env 39, sim 26 pass); a harness `wait_for(HARNESS, Tree(7))` after a completed life returns Ok 100000 times in a row, deadlock=false. The rework's own logs, opened by this gate: E1C-1 -> undo_order.rs:186 `point read saw None`; E1C-2 -> undo_order.rs:195 windows; E1C-3 -> undo_order.rs:187 `point read saw Some(..)`; SE-2 -> sim_env.rs:37 deadlock=true.
+Commit: 81048c4564c074b185d1f8478b688bf2e1c52681
+Mutants: written and run by this gate in the card worktree (python exact-string plants on whole lines, each anchor asserted unique; build untimed; `cargo test -q -p nucleus-env --test sim_env` and `--test sim` each under `timeout -k 5 120`; `git checkout --` and an empty `git status --porcelain --untracked-files=all` after each). Card: SE-5 JOIN-DROPPED -> sim_harness_wait_after_life_is_deadlock (sim_env.rs:1455, left Ok(()) right Err(Deadlock)); SE-4 GUARD-WIDE -> sim_harness_wait_before_start_is_deadlock (sim_env.rs:1407, left Ok(()) right Err(Deadlock)) and sim_harness_wait_after_life_is_deadlock (sim_env.rs:1455); SE-1 FALSE-DEADLOCK-BACK -> sim_start_after_finish_is_not_deadlock (sim_env.rs:1318); SE-3 DEADLOCK-MUTE -> sim_real_deadlock_reported (sim_env.rs:1367), sim_harness_wait_before_start_is_deadlock (sim_env.rs:1415), sim_harness_wait_after_life_is_deadlock (sim_env.rs:1462) and deadlock_detection (sim.rs:333). Own, aimed at the Join conjunct: OWN-ANYKEY (`== Some(&Some(WaitKey::Join))` -> `!= Some(&None)`, the harness parked on any key) -> sim_harness_wait_after_life_is_deadlock (sim_env.rs:1455, left Ok(()) right Err(Deadlock)); OWN-OR (the two conjuncts joined by `||`) -> sim_harness_wait_after_life_is_deadlock (FAILED), then caught by hang: sim_real_deadlock_reported, deadlock_detection and scheduler_determinism, both binaries killed at 120 s; OWN-WRONGKEY (`WaitKey::Join` -> `WaitKey::GateShared`) -> sim_start_after_finish_is_not_deadlock (sim_env.rs:1318). The rework's own logs, opened by this gate (`~/.cache/nv3-review/rework2-FLAKE-FIX-1/logs2/mutant-*.log`, plant diff, exit 101 and the failing row each): E1C-1 -> undo_order.rs:186 `scan saw [], want [(k, v0)]`; E1C-2 -> undo_order.rs:195 windows; E1C-3 -> undo_order.rs:187 `point read saw Some(..)`; E1C-4 -> undo_order.rs:186 `undo record 1 is missing from the log (AC-UNDO-FIRST broken)`; SE-2 -> sim_env.rs:37 deadlock=true. None UNCAUGHT.
 Followups: none
 
 ## Summary
 
-The rework applies R1 to R6 exactly, and every hunk of `git diff 94af6219..HEAD` is an R item's (R6's `cargo fmt` only reflows R4's two asserts, R4's import and R5's call). The fresh gate is green, Acceptance 1 to 6 as amended pass, and every mutant is caught. **F1 is not completely closed, and the fault is in this gate's own R1 text, not in the rework.** R1's clause is "every workload task has finished". The state it excuses is "every workload task has finished **and the harness is parked on `Join`**". When the life has completed and the harness then parks on any other key, the scheduler now returns `Ok` where the code before this card returned `Err(Deadlock)`. Only the harness is alive, it is blocked, and nothing can wake it: a real deadlock (S-CRASH, `sim/mod.rs:28-31`). Because `wait_for` counts no yield, a Mesa-style re-check loop then spins forever (S-LIVE: "A hang is never a pass, and never a hang"). This is the same API domain and the same shape of defect that F1 ruled blocking, and R2 (c) and (d)'s comments, now in the file, state the wide form as true. For consistency with the first verdict it is REWORK. The fix is one more conjunct and one pin, trial-applied green by this gate (below), so the rework stays mechanical: no spec or test changes, and nothing for ESCALATE.
+The second rework is R1′ to R4′ and nothing else, R5′ holds, the fresh gate is green on its first run, Acceptance 1 to 6 pass, and every mutant is caught, the card's nine and three of this gate's own aimed at the new `Join` conjunct. **The central question is closed.** This gate walked every state in which the guard now answers "completed" where the code before this card said DEADLOCK, by reading `handoff_locked`'s callers and by 14 probes run at the tip and under the pre-card condition. That set is exactly `cands = ∅ ∧ ¬crashed ∧ every workload task finished ∧ waiting[HARNESS] = Some(Join)`. In it, the only live thread is the harness, the fall-through sets `running = Some(HARNESS)` and signals it, and `WaitKey::Join`'s own condition ("The harness waiting for all workload tasks to end", `sched.rs:101`) holds. Nobody can wait for ever, so no real deadlock is masked on any path, direct `Sched` or `run_life`. The card's own prose is stale in five places. That is the orchestrator's text, not the work, so this gate writes it below (Amendment 5) for the orchestrator to apply before the merge, as R7′ was. No follow-up remains.
 
 ## Evidence (all run by this gate)
+
+- **Fresh gate** (GATE-PROMPT step 1, extracted through the `--no-local` clone): scaffold `65573171e408f720a7cd2e7f4e52d50f8a3b4145`; `fresh-gate: commit 81048c4564c074b185d1f8478b688bf2e1c52681`, `fresh-gate: base 65573171…`, `fresh-gate: checks passed (4914 files hashed in 1.47 s)`, `fresh-gate: 2 file(s) matched through their eol conversion`; STEP test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests and api-surface all EXIT=0; last line `GATE EXIT=0`, first run, launched at load 0.8.
+- **Scope:** `git diff nucleus/v3-scaffold...HEAD --stat` gives the four Touch-only files (sched.rs +29, sim_env.rs +185, lib.rs +27, undo_order.rs +103) plus this verdict file (the gates' commits, which Limit 7 and Acceptance line 6 except). Merge-base `f24803a0`. `git merge-tree --write-tree` onto `65573171` is clean. `spikes/e4-recovery` is identical to `48ac9920`; `spikes/e1-arm-c` is unchanged since `b12de1ea`.
+- **Acceptance as amended, all six run by this gate** (`CARGO_TARGET_DIR` = the gate's): 1: exit 0, 200/200, 19 s, load 0.7; 2: exit 0, 200/200, 12 s; 3: exit 0, 200/200, 28 s, load rising to 4.1; 4: exit 0, 200/200 with 6 tests each, 21 s, load 5.6; 5: exit 0, 138 passed; 6: exit 0.
+- **The rework against R1′ to R5′ (my own read of `git diff 92b97a62..HEAD`):** R1′'s three lines; R2′ (a) line 1's tail; R2′ (b) the departure block; R2′ (c) the doc; R2′ (d) the comment; R3′'s two doc lines; R4′'s test, in the form given. Two files, nothing else. Every hunk is an R′ item's.
+- **Probes** (a scratch test file in `tests/`, removed afterwards, tree clean). At the tip: (i) a normal-order life, then `wait_for(HARNESS, Tree(7))`: `Err(Deadlock)`, world failed. (i-r) the same after a race-order life (`finish(1)` then `start()`, which leaves a stale `waiting[HARNESS] = Some(Join)`): `Err(Deadlock)`. (w) the same after `wake(Join)`: `Err(Deadlock)`. (ii) before `start()`, task 1 alive on `Join`, harness on `Tree(1)`: `Err(Deadlock)`, task 1 `Err(Crashed)`. (ii-J) the same with the harness on `Join` itself: `Err(Deadlock)`, since a workload task is unfinished. (iii) `finish(1)` then `start()`: `Ok`. (iv) a zero-task `start()`: `Ok`; (iv-b) a zero-task `wait_for(HARNESS, Tree(7))`: `Err(Deadlock)`. (v) `start()`, then task 1 blocks on `Tree(7)` while the harness is parked on `Join`: task 1 `Err(Deadlock)`, `start` `Err(Crashed)`, world failed. (v-3) three tasks, task 1 finishes, task 2 blocks: reported the same way. (d) a normal life, then 10,000 calls of `wait_for(HARNESS, Join)`: 10,000 `Ok`, no deadlock; (d-r) the same after a race-order life: `Ok`. (y-r) a race-order life, then `yield_baton(HARNESS)`: `Ok`; (y-n) the same after a normal life: `Ok`. Under the pre-card condition (SE-1 planted), the race-order life fails at `start()` with the false DEADLOCK, as SIMENV-FLAKE-1 describes. (vi) `run_life`: `sim_halted_off_task` 200/200 alone and every `run_life` row green (Acceptance 2 and 5).
+
+## Findings
+
+**The masked set, by reading.** `handoff_locked`'s callers are `yield_baton_budget`, `park_locked` (from `start` and `wait_for`) and `finish`'s non-all-done branch. `finish` there has an unfinished workload task, so `life_complete` is false and nothing changes. A finished workload task never holds the baton, since a handoff never picks it and `finish` moves `running` off it, so it cannot reach `yield_baton_budget` or `wait_for`'s `park`. So every caller of the masked set is the harness, either parking on `Join` or yielding while a stale `Join` mark from a race-order `start()` is still set. In each case it holds the baton again at once, and Join's condition is true. The two pins and the three own mutants cover both directions of the conjunct: dropped (SE-5, OWN-ANYKEY), the wrong key (OWN-WRONGKEY) and `||` (OWN-OR).
+
+**G3-1 (record; no action): the comment names one way into the state, and there are three.** The comment says it is "Reached by a `start` that parks after the last `finish`". A direct `wait_for(HARNESS, Join)` after the life also reaches it (probe d), and so does a `yield_baton(HARNESS)` after a race-order life, whose stale `Join` mark the fall-through does not clear (probe y-r). Before this card both answered DEADLOCK. Neither is a deadlock: the harness is runnable, and a Mesa-style re-check of Join's condition exits. The doc (R2′ (c)) states the rule by state ("then that `Join` is answered"), which covers all three, and the comment does not claim to list every way in. This differs from F1 and F6, whose comments asserted something false. Request (d)'s observation is right.
+
+## Card text: ORCHESTRATOR AMENDMENT 5 (apply before the merge; no code)
+
+This gate's rulings on the refresh's PA-1 to PA-6. Each adopted text is the refresh report's (`~/.cache/nv3-review/pregate-FLAKE-FIX-1-refresh2/report.md`, section (f)), byte for byte, unless a change is given.
+
+- **PA-1 adopted as written.** In Work 3, replace `` "all tasks blocked" cannot be a deadlock when ~~the baton is already home with the harness and~~ every workload task has finished *(the struck words went with the first build's clause, per R1 and R2 (b) and (d))* `` with `` "all tasks blocked" cannot be a deadlock when ~~the baton is already home with the harness and~~ every workload task has finished and the harness is parked on `Join` *(Amendment 5: the second half is R1′'s conjunct, per the re-gate's F6; the struck words went with the first build's clause, per R1 and R2 (b) and (d))* ``.
+- **PA-2 adopted as written.** In Work 3, the struck sentence's marker gains, before its closing `)*`: `` So is one that parks there after every workload task has finished, which the first rework's clause returned as `Ok` (the re-gate's F6); Work 4's fifth row pins that it is reported. ``. After that marker, add `` *(Amendment 5, per verdict `92b97a62`, F6)* ``.
+- **PA-3 adopted as written** (this gate checked the numbers at `81048c45`: 677–678, 679, 680, 745–753 and 749–751). Append to the move note's (b): `` *(Amendment 5: those are the numbers at `cd6b45f3`; at `81048c45`, after the two reworks, the deadlock condition is line 679 (SE-1's and SE-4's site; SE-5's is lines 677–678), `core.deadlock = true;` is line 680 (SE-3), and `Sched::wake` is lines 745–753 with its loop body at 749–751 (SE-2).)* ``
+- **PA-4 adopted as written.** In Read, replace `the new pin follows` with `that Work 4's fourth and fifth rows follow`.
+- **PA-5 adopted as written.** In Goal (2), after `both interleavings now pass`, insert `` ; Work 4's fourth and fifth rows pin the other side on `Sched` directly: a harness parked on a key nobody can wake is reported, whether a workload task is still alive and blocked or every one has finished ``.
+- **PA-6 rejected.** The QUEUE is local and its lines move, so new numbers would go stale too. The rows are named next to the numbers, and the merge closes them (the first refresh's H7).
+- Add one dated note: `Amended 2026-11-26: ORCHESTRATOR AMENDMENT 5, per verdict FLAKE-FIX-1 (MERGE, third gate): PA-1 to PA-5 of the second pre-gate refresh, as that verdict rules; PA-6 rejected. Card text only; nothing built changes.`
+
+Form: MERGE, with the text above applied by the orchestrator before the merge, as R7′ was. It changes no line of the work, so it is not a gap in what was built, and a follow-up card for prose would only queue a row.
+
+## Rulings on the request's (a)–(f)
+
+- (a) Yes. F1 (a live, blocked task, probe ii) and F6 (a non-`Join` park after the life, probes i, i-r and w) are both closed and pinned. The masked set is exactly "every workload task finished and the harness parked on `Join`", where nobody can wait for ever. No real deadlock is masked on any path, direct `Sched` or `run_life` (probes v and v-3, `sim_real_deadlock_reported`, `deadlock_detection`).
+- (b) Amendment 4 is what R7′ and ruling (c) ordered. This gate checked Limit 3, Work 3, Goal (2), Work 4 rows 4 and 5, Limit 4, Acceptance line 4, SE-1, SE-4, SE-5, RESULT +5, and P2, P4 and P6 to P10 against the verdict. A GLM job typed it on the orchestrator's direction. The content is the ruling's, and who typed it does not change that.
+- (c) PA-1 to PA-5 adopted as written; PA-6 rejected. Form: MERGE, with the text in this verdict.
+- (d) Right, and benign: Join's condition holds, so the wait is satisfied, not masked (G3-1; probes d and d-r). A `yield_baton(HARNESS)` after a race-order life takes the same path (probe y-r).
+- (e) True and complete. Comments stripped, the tip's code differs from E4's `sched.rs` at `48ac9920` in exactly two places: `await_first_baton` (S1) and the `life_complete` conjunct. Line 1 and the departure block name both, and they state the guard as R1′ is. E4's own files are untouched.
+- (f) Nothing remains open from gates 1 and 2. F1, F6, R1 to R7 and R1′ to R7′ are closed. F2 to F5 and F7 were records needing no card. The Amendment 2 Note's "Not changed" sentence is superseded, as Amendment 4 says.
+
+## History
+
+The verdicts of record before this one, newest first. Each keeps its header with every line prefixed by "- ", so `vfield` reads only the header at the top of this file.
+
+### Gate 2 (verdict commit 92b97a623204033622eda8a249d5f0a07dc96c99, on b12de1ea8bc584de96fe3f0ef368871f67436be0)
+
+Gate 2's header, verbatim except that each line is prefixed with "- " (so `vfield` reads this verdict's header, not gate 2's):
+
+- Card: FLAKE-FIX-1
+- Class: test
+- Card-gate: P
+- Verdict: REWORK
+- Gate-tier: P
+- Gate-model: claude-opus-5-5
+- Gate-session: claude-code session 5a4aa093-7903-4f90-a596-041e804ade1c (T3 Code review sub-agent of T3 thread 45584af2-e651-490e-862c-3402320cffa3; P re-gate of record after rework 1; it wrote neither the card, its amendments, the build, the move, the rework nor either GLM report; the first gate, session 843ab9f0, wrote R1 to R7, and this gate rules on R1's text below)
+- Date: 2026-11-26
+- Gate-exit: GATE EXIT=0
+- Commit: b12de1ea8bc584de96fe3f0ef368871f67436be0
+- Mutants: written and run by this gate in the card worktree (python exact-string plants, each anchor asserted unique; build untimed, tests under `timeout -k 5 120`; `git checkout --` and an empty `git status --porcelain --untracked-files=all` after each). SE-1 FALSE-DEADLOCK-BACK (R1's clause deleted) -> sim_start_after_finish_is_not_deadlock (sim_env.rs:1318); SE-3 DEADLOCK-MUTE -> sim_harness_wait_before_start_is_deadlock (sim_env.rs:1415, "the deadlock fails the world") and sim_real_deadlock_reported (sim_env.rs:1367), and deadlock_detection (sim.rs:333); SE-4 GUARD-WIDE -> sim_harness_wait_before_start_is_deadlock (sim_env.rs:1407, left Ok(()) right Err(Deadlock)); E1C-4 WINDOW-ONLY -> readers_never_see_past_their_snapshot_during_apply (undo_order.rs:186, `scan failed: engine: undo record 1 is missing from the log (AC-UNDO-FIRST broken)`). Own: OWN-1 SKIP2 (`skip(1)` -> `skip(2)` in R1's clause) -> sim_harness_wait_before_start_is_deadlock (assertion), then the binary hung and was killed at 120 s; OWN-2 HARNESS-OFF-JOIN-AFTER-LIFE (not a plant: the tip itself, probed; F6) -> UNCAUGHT by every test (sim_env 39, sim 26 pass); a harness `wait_for(HARNESS, Tree(7))` after a completed life returns Ok 100000 times in a row, deadlock=false. The rework's own logs, opened by this gate: E1C-1 -> undo_order.rs:186 `point read saw None`; E1C-2 -> undo_order.rs:195 windows; E1C-3 -> undo_order.rs:187 `point read saw Some(..)`; SE-2 -> sim_env.rs:37 deadlock=true.
+- Followups: none
+
+#### Summary
+
+The rework applies R1 to R6 exactly, and every hunk of `git diff 94af6219..HEAD` is an R item's (R6's `cargo fmt` only reflows R4's two asserts, R4's import and R5's call). The fresh gate is green, Acceptance 1 to 6 as amended pass, and every mutant is caught. **F1 is not completely closed, and the fault is in this gate's own R1 text, not in the rework.** R1's clause is "every workload task has finished". The state it excuses is "every workload task has finished **and the harness is parked on `Join`**". When the life has completed and the harness then parks on any other key, the scheduler now returns `Ok` where the code before this card returned `Err(Deadlock)`. Only the harness is alive, it is blocked, and nothing can wake it: a real deadlock (S-CRASH, `sim/mod.rs:28-31`). Because `wait_for` counts no yield, a Mesa-style re-check loop then spins forever (S-LIVE: "A hang is never a pass, and never a hang"). This is the same API domain and the same shape of defect that F1 ruled blocking, and R2 (c) and (d)'s comments, now in the file, state the wide form as true. For consistency with the first verdict it is REWORK. The fix is one more conjunct and one pin, trial-applied green by this gate (below), so the rework stays mechanical: no spec or test changes, and nothing for ESCALATE.
+
+#### Evidence (all run by this gate)
 
 - **Fresh gate** (GATE-PROMPT step 1, extracted through the `--no-local` clone): scaffold `573e0f291eb277e1c16fc01248ef2eea9923cd81`; `fresh-gate: commit b12de1ea8bc584de96fe3f0ef368871f67436be0`, `fresh-gate: base 573e0f29…`, `fresh-gate: checks passed (4914 files hashed in 1.46 s)`, `fresh-gate: 2 file(s) matched through their eol conversion`; STEP test, clippy, fmt, deny, wasm32, core-paths-selftest, enforcement-tests and api-surface all EXIT=0; last line `GATE EXIT=0`, first run.
 - **Scope:** `git diff nucleus/v3-scaffold...HEAD --stat` gives the four Touch-only files (sched.rs +24, sim_env.rs +144, lib.rs +27, undo_order.rs +103) plus `nucleus/v3/verdicts/FLAKE-FIX-1.md` (+162, the first gate's own commit). Merge-base `f24803a0`. `git merge-tree` onto `573e0f29` is clean. Nothing under `spikes/e4-recovery` differs from `48ac9920`.
@@ -25,7 +87,7 @@ The rework applies R1 to R6 exactly, and every hunk of `git diff 94af6219..HEAD`
 - **R1′ trial-applied by this gate and reverted:** with R1′ plus R4′'s pin, sim_env 40 passed, sim 26 passed, the whole `-p nucleus-env` passed, `cargo clippy -p nucleus-env --all-targets -- -D warnings` exit 0, and `cargo fmt --check` was clean for sched.rs (for R4′ it is clean in the form given below). R4′'s pin at the tip FAILS (sim_env.rs:1455, left `Ok(())` right `Err(Deadlock)`).
 - **The rework against R1 to R6 (my own read of `git diff 94af6219..HEAD`):** R1's line; R2 (a) line 1; R2 (b) the departure block; R2 (c) the doc; R2 (d) the comment; R3's two doc replacements; R4's import and test (fmt-reflowed); R5's import, field, init, arm body with the doc sentence appended to the doc's last line, and call site with its comment. Nothing else. The refresh's report on this matches.
 
-## Findings
+#### Findings
 
 **F6 (blocking; caused by this gate's own R1): the guard still masks a real deadlock on the direct `Sched` API.** Since S1, every `handoff_locked` call with `cands = ∅` and all workload tasks finished comes from `park_locked` with `me = HARNESS`. Through `start()`, the key is `Join`, and the world really is a completed life (the race, H1, and a zero-task life). Through `wait_for(HARNESS, k ≠ Join)` it is a harness blocked on a key nobody alive can wake, which the pre-card code reported. Probe Q1 shows the tip answers it with `Ok` forever. The comment at `sched.rs:668` ("every workload task finished is a completed life, not a deadlock") and the doc at `sched.rs:648-651` state the wide form as true, the same shape as F1's "unreachable by construction". No in-tree caller reaches it (no `wait_for(HARNESS, …)` outside R4's pin; `SimEnv::wait_for` refuses off-task threads, `env.rs:220-228`). But F1 was ruled blocking on exactly that domain. Fixed by R1′ to R4′.
 
@@ -33,7 +95,7 @@ The rework applies R1 to R6 exactly, and every hunk of `git diff 94af6219..HEAD`
 
 **Other rulings:** H3 (the redundant `any_alive`): leave it. It is E4's own text, and R1′ keeps the departure to one added conjunct. H4 (the 136-column comment): fmt accepts it; no action. H8 (two wording nits): nothing. `sched.rs:17` is the scheduler's own term, and `undo_order.rs:216`'s range is the card's Work 2 text verbatim; neither weakens a check.
 
-## REWORK: exact text (mechanical; the orchestrator amends the card first, R7′)
+#### REWORK: exact text (mechanical; the orchestrator amends the card first, R7′)
 
 All paths are under `nucleus/v3/`. Every R item applies to the tip `b12de1ea`.
 
@@ -145,7 +207,7 @@ fn sim_harness_wait_after_life_is_deadlock() {
 - RESULT: nucleus-env +5.
 - Amendment 4, as ruled below (P2–P10).
 
-## Rulings on the request's (a)–(h)
+#### Rulings on the request's (a)–(h)
 
 - (a) No. R1 closes P1 (a live, blocked workload task), but a harness parked on a non-`Join` key after a completed life is still masked (F6, probe Q1). R1′ closes it.
 - (b) Amendments 2 and 3 are sound. Amendment 3 is the house form (A-1a, A-2-0) and the smallest change. Amendment 2's texts are the verdict's.
@@ -155,10 +217,6 @@ fn sim_harness_wait_after_life_is_deadlock() {
 - (f) H3: leave `any_alive`, E4's own text. R1′ adds one conjunct and changes nothing else.
 - (g) H8: nothing.
 - (h) Line 1 names both departures (S1 and the guard) and, after R2′ (a), names the guard truly. Against E4's copy at `48ac9920`, the tip's only code departures are `await_first_baton` and the condition; every other difference is a comment. E4's own files are untouched.
-
-## History
-
-The verdicts of record before this one, newest first. Each keeps its header with every line prefixed by "- ", so `vfield` reads only the header at the top of this file.
 
 ### Gate 1 (verdict commit 94af62195a01a62395c057c07da4e8d1c2a2eddd, on cd6b45f3372ade228f1944a5d4ef4148b25b4307)
 
