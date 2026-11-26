@@ -1196,11 +1196,17 @@ fn create_vs_freed() {
 /// `Poisoned` and the table's mirror says the frame is freed again, as its
 /// content still is (the latch's failing path writes nothing; the content
 /// cannot be read through the poisoned latch, so the test judges the mirror).
-/// The give-back comes before the claim's pin is dropped: a hook installed
-/// for the call records the mirror at `Unpinned`, which fires holding no
-/// mutex (card A-3a-F2-F1). The frame keeps its key and its one pin, and the
-/// creation's reservation is back on the free list. FREED-STAYS-CLAIMED and
-/// GIVEBACK-AFTER-PIN-DROP fail it.
+/// The give-back comes before the claim's pin is dropped, and `Unpinned`
+/// fires after that pin's count is lowered: a hook installed for the call
+/// records the mirror at `Unpinned`, and its one record must be the whole
+/// `FrameInfo`: `Resident` under `K`, freed, with the stale name's one pin
+/// and the clock's bit set (card A-3a-F2-F1-F1). A hook fires holding no
+/// mutex; a firing under the table mutex would hang the test on `frame_info`,
+/// so the hook asks `table_free()` first and records an error instead of
+/// calling it. The frame keeps its key and its one pin, and the creation's
+/// reservation is back on the free list. FREED-STAYS-CLAIMED,
+/// GIVEBACK-AFTER-PIN-DROP, UNPINNED-BEFORE-LOWER and UNPINNED-UNDER-MUTEX
+/// fail it.
 #[test]
 fn create_freed_poison() {
     use std::sync::{Arc, Mutex};
@@ -1235,6 +1241,13 @@ fn create_freed_poison() {
     let in_hook = Arc::clone(&pool);
     let hook: Hook = Arc::new(move |point, key, frame| {
         if point == Unpinned && key == K && frame == g {
+            // The table mutex first: a firing that holds it must fail the
+            // test, not hang it on `frame_info`.
+            if !in_hook.table_free() {
+                let err = Err("Unpinned fired holding the table mutex".to_string());
+                sink.lock().unwrap().push(err);
+                return;
+            }
             let info = in_hook.frame_info(g).map_err(|e| e.to_string());
             sink.lock().unwrap().push(info);
         }
@@ -1249,9 +1262,16 @@ fn create_freed_poison() {
         1,
         "one Unpinned for (K, g) in the call: {seen:?}"
     );
-    assert!(
-        matches!(seen.as_slice(), [Ok(info)] if info.freed),
-        "the claim is given back before its pin drops: {seen:?}"
+    assert_eq!(
+        seen,
+        vec![Ok(FrameInfo {
+            state: FrameState::Resident,
+            key: Some(K),
+            pins: 1,
+            freed: true,
+            referenced: true,
+        })],
+        "at Unpinned the claim is given back and its pin's count is lowered: {seen:?}"
     );
     assert_eq!(
         pool.frame_info(g).unwrap(),
