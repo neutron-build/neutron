@@ -1,4 +1,4 @@
-// Provenance (card A-1b): nucleus/v3/spikes/e4-recovery/src/sim/sched.rs at 48ac99203f97d9dd5a53b1370ed141a294c4df0c, verbatim except departure S1 (card A-6b-0, A-1b-F1 (a)): await_first_baton, the existing park made a public entry.
+// Provenance (card A-1b): nucleus/v3/spikes/e4-recovery/src/sim/sched.rs at 48ac99203f97d9dd5a53b1370ed141a294c4df0c, verbatim except departure S1 (card A-6b-0, A-1b-F1 (a)): await_first_baton, the existing park made a public entry; and the departure below (card FLAKE-FIX-1, 2026-11-21): `handoff_locked`'s deadlock condition gains `&& core.running != Some(HARNESS)`.
 // The spike stays E4's evidence record; nothing under spikes/ changes (card A-1b).
 // WaitKey's variants still name E4's waits (kept as copied; whether to generalise them is A-8a's question, named in this card's Notes).
 // E4_SCHED_LOG is E4's X5-R14 diagnostic, off by default and never a digest input.
