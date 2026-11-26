@@ -1384,8 +1384,8 @@ fn sim_real_deadlock_reported() {
     );
 }
 
-/// **FLAKE-FIX-1 pin 4 (gate R4): the guard is exactly "every workload
-/// task finished".** The harness holds the baton before `start()` and
+/// **FLAKE-FIX-1 pin 4 (gate R4): a live, blocked workload task is
+/// never a completed life.** The harness holds the baton before `start()` and
 /// parks on a key nobody can wake while task 1 is alive and parked on
 /// `Join`: nothing can ever run again, a real deadlock. It must be
 /// reported and task 1 must unwind, never a quiet `Ok`.
@@ -1421,5 +1421,46 @@ fn sim_harness_wait_before_start_is_deadlock() {
         t.join().unwrap(),
         Err(SimFail::Crashed),
         "the blocked task unwinds"
+    );
+}
+
+/// **FLAKE-FIX-1 pin 5 (re-gate R4′): the guard needs the harness on
+/// `Join`.** The life completes (task 1 runs and finishes, `start()`
+/// returns), then the harness parks on a key nobody can wake. Only the
+/// harness is alive and it is blocked: a real deadlock. It must be
+/// reported on the first call, never answered with a quiet `Ok` that a
+/// Mesa-style re-check loop would spin on forever (`wait_for` counts no
+/// yields, so S-LIVE's budget never trips).
+#[test]
+fn sim_harness_wait_after_life_is_deadlock() {
+    struct Host {
+        sched: SchedCore,
+    }
+    impl SchedHost for Host {
+        fn sched_mut(&mut self) -> &mut SchedCore {
+            &mut self.sched
+        }
+    }
+    let sched = Arc::new(Sched::new(Host {
+        sched: SchedCore::new(2, 991),
+    }));
+    let task = Arc::clone(&sched);
+    let t = std::thread::spawn(move || {
+        task.await_first_baton(1)?;
+        task.finish(1);
+        Ok::<(), SimFail>(())
+    });
+    assert_eq!(sched.start(), Ok(()), "the life completes");
+    assert_eq!(t.join().unwrap(), Ok(()), "task 1 ran and finished");
+    assert_eq!(
+        sched.wait_for(HARNESS, WaitKey::Tree(7)),
+        Err(SimFail::Deadlock),
+        "a harness parked on a key nobody can wake after the life is a deadlock"
+    );
+    let mut h = sched.lock();
+    let core = h.sched_mut();
+    assert!(
+        core.deadlock && core.crashed,
+        "the deadlock fails the world"
     );
 }

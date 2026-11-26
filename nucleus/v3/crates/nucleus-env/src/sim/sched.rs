@@ -1,12 +1,12 @@
-// Provenance (card A-1b): nucleus/v3/spikes/e4-recovery/src/sim/sched.rs at 48ac99203f97d9dd5a53b1370ed141a294c4df0c, verbatim except departure S1 (card A-6b-0, A-1b-F1 (a)): await_first_baton, the existing park made a public entry; and the departure below (card FLAKE-FIX-1, 2026-11-21): `handoff_locked` reports no deadlock once every workload task has finished.
+// Provenance (card A-1b): nucleus/v3/spikes/e4-recovery/src/sim/sched.rs at 48ac99203f97d9dd5a53b1370ed141a294c4df0c, verbatim except departure S1 (card A-6b-0, A-1b-F1 (a)): await_first_baton, the existing park made a public entry; and the departure below (card FLAKE-FIX-1, 2026-11-21): `handoff_locked` reports no deadlock once every workload task has finished and the harness is parked on `Join`.
 // The spike stays E4's evidence record; nothing under spikes/ changes (card A-1b).
 // WaitKey's variants still name E4's waits (kept as copied; whether to generalise them is A-8a's question, named in this card's Notes).
 // E4_SCHED_LOG is E4's X5-R14 diagnostic, off by default and never a digest input.
 // Departure from that copy (card FLAKE-FIX-1, 2026-11-21): `handoff_locked`'s deadlock condition
-// gains `&& !core.finished.iter().skip(1).all(|f| *f)`: a world whose workload tasks have all
-// finished is a completed life, not a deadlock (SIMENV-FLAKE-1: the start/finish race of the
-// pre-A-6b-0 `run_life`, which A-6b-0's `await_first_baton` has since closed from the life side).
-// E4's own sched.rs copy keeps the latent race unchanged (frozen evidence record).
+// gains `&& !life_complete`, "every workload task has finished and the harness is parked on
+// `Join`": that world is a completed life, not a deadlock (SIMENV-FLAKE-1: the start/finish race
+// of the pre-A-6b-0 `run_life`, which A-6b-0's `await_first_baton` has since closed from the life
+// side). E4's own sched.rs copy keeps the latent race unchanged (frozen evidence record).
 #![deny(clippy::indexing_slicing)]
 //! The baton scheduler (card X-5 Work 1.2).
 //!
@@ -646,13 +646,14 @@ impl<H: SchedHost> Sched<H> {
     /// Pick the next runnable task and signal it. The caller must already
     /// be parked or leaving. Deadlock: no runnable task while some task is
     /// still alive — a per-seed failure — **unless every workload task
-    /// has finished** (FLAKE-FIX-1): then nothing is left to run and the
-    /// harness's `Join` is answered (`finish`'s all-done branch handed it
-    /// the baton), so a `start` that parks after the last `finish` falls
-    /// through to the everyone-finished handoff below, a no-op. A harness
-    /// that parks on any other key while a workload task is alive and
-    /// blocked is a deadlock and is reported (pin
-    /// `sim_harness_wait_before_start_is_deadlock`).
+    /// has finished and the harness is parked on `Join`** (FLAKE-FIX-1):
+    /// then that `Join` is answered (`finish`'s all-done branch handed the
+    /// harness the baton), so a `start` that parks after the last `finish`
+    /// falls through to the everyone-finished handoff below, a no-op. A
+    /// harness that parks on any other key is a deadlock and is reported,
+    /// whether a workload task is still alive and blocked (pin
+    /// `sim_harness_wait_before_start_is_deadlock`) or every one has
+    /// finished (pin `sim_harness_wait_after_life_is_deadlock`).
     fn handoff_locked(&self, host: &mut MutexGuard<'_, H>) -> Result<(), SimFail> {
         let (yields, pick) = {
             let core = host.sched_mut();
@@ -665,13 +666,17 @@ impl<H: SchedHost> Sched<H> {
             }
             if cands.is_empty() {
                 let any_alive = core.finished.iter().any(|f| !*f);
-                // FLAKE-FIX-1: every workload task finished is a completed
-                // life, not a deadlock (`finished[HARNESS]` is never set, so
+                // FLAKE-FIX-1: every workload task finished, with the
+                // harness parked on `Join`, is a completed life, not a
+                // deadlock (`finished[HARNESS]` is never set, so
                 // `any_alive` alone cannot tell). Reached by a `start` that
                 // parks after the last `finish`: direct `Sched` use and a
                 // zero-task life. Since A-6b-0's `await_first_baton`,
-                // `run_life` cannot produce that order.
-                if any_alive && !core.crashed && !core.finished.iter().skip(1).all(|f| *f) {
+                // `run_life` cannot produce that order. A harness parked on
+                // any other key has nobody left to wake it: a deadlock.
+                let life_complete = core.finished.iter().skip(1).all(|f| *f)
+                    && core.waiting.get(HARNESS) == Some(&Some(WaitKey::Join));
+                if any_alive && !core.crashed && !life_complete {
                     core.deadlock = true;
                     core.crashed = true;
                     // X5-R14: the deterministic unwind (as at the crash
