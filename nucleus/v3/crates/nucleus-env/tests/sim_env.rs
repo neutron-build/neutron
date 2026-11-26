@@ -14,10 +14,12 @@
 mod common;
 
 use nucleus_env::sim::{
-    DiskEvent, FaultKnobs, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sim, SimEnv,
+    DiskEvent, FaultKnobs, HARNESS, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sched,
+    SchedCore, SchedHost, Sim, SimEnv, SimFail, WaitKey,
 };
 use nucleus_env::{Env, EnvError, File, OpenMode};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Verbatim from E4's `tests/sim.rs` (card A-1b Work 6): the knobs
@@ -1279,5 +1281,186 @@ fn sim_halted_off_task() {
         1,
         "the swallowed off-task halt must be recorded: {:?}",
         out.halts
+    );
+}
+
+// ---- FLAKE-FIX-1 (card FLAKE-FIX-1 Work 4): the start/finish race pins ----
+
+/// **SIMENV-FLAKE-1, forced deterministically (FLAKE-FIX-1 Work 4):**
+/// the interleaving of the pre-A-6b-0 `run_life` race, driven on
+/// `Sched` directly: a workload task's `finish` runs before the harness
+/// parks in `start()`.
+/// Pre-fix, `handoff_locked` found zero runnable candidates with
+/// `any_alive` true and failed the healthy world as `DEADLOCK`;
+/// FLAKE-FIX-1's guard recognises the all-finished world as
+/// a completed life. Joining the finisher first makes `finish` strictly
+/// precede the harness's park — the exact race window, without the
+/// race. Direct-`Sched` shape of `r14_pre_baton_host_step_is_refused`.
+#[test]
+fn sim_start_after_finish_is_not_deadlock() {
+    /// The minimal host: just the scheduler core.
+    struct Host {
+        sched: SchedCore,
+    }
+    impl SchedHost for Host {
+        fn sched_mut(&mut self) -> &mut SchedCore {
+            &mut self.sched
+        }
+    }
+    let sched = Arc::new(Sched::new(Host {
+        sched: SchedCore::new(2, 991),
+    }));
+    let finisher = Arc::clone(&sched);
+    let t = std::thread::spawn(move || {
+        finisher.finish(1);
+    });
+    t.join().unwrap();
+    assert!(
+        sched.start().is_ok(),
+        "a start() that parks after every task already finished is a completed life, not a deadlock (SIMENV-FLAKE-1)"
+    );
+}
+
+/// **FLAKE-FIX-1 pin 2: a wait/wake pair completes a life.** Task 1
+/// parks on `Tree(1)`; task 2 wakes it a thousand times, each wake
+/// after its own yield — the yield hands the baton around, so a wake
+/// that lands before the waiter parks is always followed by another
+/// after it: the lost-wakeup window is un-hittable for any fixed seed.
+/// The life must complete cleanly: no false deadlock, no livelock, no
+/// hang.
+#[test]
+fn sim_wait_wake_completes() {
+    let mut sim = Sim::new(2, drop_all());
+    let out = sim.run_life(2, None, |env, t| {
+        if t == 1 {
+            env.wait_for(WaitKey::Tree(1))?;
+            Ok(())
+        } else {
+            for _ in 0..1000 {
+                env.yield_now("wake:step")?;
+                env.wake(WaitKey::Tree(1));
+            }
+            Ok(())
+        }
+    });
+    assert_life_ok(&out);
+}
+
+/// **FLAKE-FIX-1 pin 3: a genuinely all-parked world is still
+/// reported.** The only task parks on a key nobody ever wakes — a real
+/// deadlock. `run_life` must return (not hang), the world flags must
+/// name the deadlock, and the task's own result must show it unwound
+/// through the failure — never a panic, never a quiet `Ok`. (Card
+/// Work 4 named only `Err(EnvError::Crashed)`; the task that trips
+/// the detector unwinds through its own `park_locked`, which returns
+/// `SimFail::Deadlock` → `Halted { "deadlock" }` — `Crashed` is what
+/// every *other* task sees at its next scheduler call — so both arms
+/// are caught here. Verbatim-body evidence in the card's RESULT.)
+#[test]
+fn sim_real_deadlock_reported() {
+    let mut sim = Sim::new(1, drop_all());
+    let out = sim.run_life(1, None, |env, _t| match env.wait_for(WaitKey::Tree(7)) {
+        Ok(()) => panic!("woke with no waker"),
+        Err(EnvError::Crashed) | Err(EnvError::Halted { .. }) => Ok(()),
+        Err(e) => Err(e),
+    });
+    assert!(
+        out.deadlock,
+        "a genuinely all-parked world is reported as deadlock"
+    );
+    assert!(out.crashed, "the deadlock fails the world as a crash does");
+    assert!(
+        !out.panicked,
+        "the deadlock unwinds the task, it does not panic it"
+    );
+    assert!(
+        out.livelock.is_none(),
+        "a parked world is a deadlock, not a livelock"
+    );
+    assert_eq!(
+        out.results,
+        vec![Ok(())],
+        "the task observes the world failure and unwinds"
+    );
+}
+
+/// **FLAKE-FIX-1 pin 4 (gate R4): a live, blocked workload task is
+/// never a completed life.** The harness holds the baton before `start()` and
+/// parks on a key nobody can wake while task 1 is alive and parked on
+/// `Join`: nothing can ever run again, a real deadlock. It must be
+/// reported and task 1 must unwind, never a quiet `Ok`.
+#[test]
+fn sim_harness_wait_before_start_is_deadlock() {
+    struct Host {
+        sched: SchedCore,
+    }
+    impl SchedHost for Host {
+        fn sched_mut(&mut self) -> &mut SchedCore {
+            &mut self.sched
+        }
+    }
+    let sched = Arc::new(Sched::new(Host {
+        sched: SchedCore::new(2, 991),
+    }));
+    let task = Arc::clone(&sched);
+    let t = std::thread::spawn(move || task.await_first_baton(1));
+    assert_eq!(
+        sched.wait_for(HARNESS, WaitKey::Tree(1)),
+        Err(SimFail::Deadlock),
+        "a harness parked before start() while a live task is blocked is a deadlock"
+    );
+    {
+        let mut h = sched.lock();
+        let core = h.sched_mut();
+        assert!(
+            core.deadlock && core.crashed,
+            "the deadlock fails the world"
+        );
+    }
+    assert_eq!(
+        t.join().unwrap(),
+        Err(SimFail::Crashed),
+        "the blocked task unwinds"
+    );
+}
+
+/// **FLAKE-FIX-1 pin 5 (re-gate R4′): the guard needs the harness on
+/// `Join`.** The life completes (task 1 runs and finishes, `start()`
+/// returns), then the harness parks on a key nobody can wake. Only the
+/// harness is alive and it is blocked: a real deadlock. It must be
+/// reported on the first call, never answered with a quiet `Ok` that a
+/// Mesa-style re-check loop would spin on forever (`wait_for` counts no
+/// yields, so S-LIVE's budget never trips).
+#[test]
+fn sim_harness_wait_after_life_is_deadlock() {
+    struct Host {
+        sched: SchedCore,
+    }
+    impl SchedHost for Host {
+        fn sched_mut(&mut self) -> &mut SchedCore {
+            &mut self.sched
+        }
+    }
+    let sched = Arc::new(Sched::new(Host {
+        sched: SchedCore::new(2, 991),
+    }));
+    let task = Arc::clone(&sched);
+    let t = std::thread::spawn(move || {
+        task.await_first_baton(1)?;
+        task.finish(1);
+        Ok::<(), SimFail>(())
+    });
+    assert_eq!(sched.start(), Ok(()), "the life completes");
+    assert_eq!(t.join().unwrap(), Ok(()), "task 1 ran and finished");
+    assert_eq!(
+        sched.wait_for(HARNESS, WaitKey::Tree(7)),
+        Err(SimFail::Deadlock),
+        "a harness parked on a key nobody can wake after the life is a deadlock"
+    );
+    let mut h = sched.lock();
+    let core = h.sched_mut();
+    assert!(
+        core.deadlock && core.crashed,
+        "the deadlock fails the world"
     );
 }
