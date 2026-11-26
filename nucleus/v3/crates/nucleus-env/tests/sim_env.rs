@@ -14,8 +14,8 @@
 mod common;
 
 use nucleus_env::sim::{
-    DiskEvent, FaultKnobs, HARNESS, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sched, SchedCore,
-    SchedHost, Sim, SimEnv, SimFail, WaitKey,
+    DiskEvent, FaultKnobs, HARNESS, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sched,
+    SchedCore, SchedHost, Sim, SimEnv, SimFail, WaitKey,
 };
 use nucleus_env::{Env, EnvError, File, OpenMode};
 use std::collections::BTreeSet;
@@ -1412,7 +1412,14 @@ fn sim_harness_wait_before_start_is_deadlock() {
     {
         let mut h = sched.lock();
         let core = h.sched_mut();
-        assert!(core.deadlock && core.crashed, "the deadlock fails the world");
+        assert!(
+            core.deadlock && core.crashed,
+            "the deadlock fails the world"
+        );
     }
-    assert_eq!(t.join().unwrap(), Err(SimFail::Crashed), "the blocked task unwinds");
+    assert_eq!(
+        t.join().unwrap(),
+        Err(SimFail::Crashed),
+        "the blocked task unwinds"
+    );
 }

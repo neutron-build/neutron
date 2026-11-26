@@ -603,7 +603,9 @@ impl TxnEngine for ArmC {
                     thread::sleep(APPLY_YIELD);
                 }
                 // FLAKE-FIX-1 test hook: the apply-window gate (unarmed: one atomic load). It may block for the whole window by design.
-                if let Some(gate) = self.apply_window_gate.get() { gate(); }
+                if let Some(gate) = self.apply_window_gate.get() {
+                    gate();
+                }
                 let tag = if value.is_none() {
                     TAG_TOMBSTONE
                 } else {
