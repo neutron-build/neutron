@@ -864,7 +864,7 @@ fn hooks_on_wait() {
 // ---- Card A-3a-F2 (verdict A-3a, findings 2 and 4): the claim a creation
 // makes on a freed key's frame, pinned, and what follows the claim on error.
 // `create_vs_freed` runs on threads under a `Pauser`; `create_freed_poison`
-// is one thread and no hook.
+// is one thread, with a hook that records and never pauses (card A-3a-F2-F1).
 
 /// What creator A saw of the page `create` gave it, read before A wrote to
 /// it (`create_vs_freed`).
@@ -1194,10 +1194,13 @@ fn create_vs_freed() {
 /// The freed branch's error path gives the claim back (verdict A-3a, finding
 /// 2; card A-3a-F2): with `g`'s latch poisoned, a creation of `K` returns
 /// `Poisoned` and the table's mirror says the frame is freed again, as its
-/// content still is (the failing path writes nothing; the content cannot be
-/// read through the poisoned latch, so the test judges the mirror). The
-/// frame keeps its key and its one pin, and the creation's reservation is
-/// back on the free list. FREED-STAYS-CLAIMED fails it.
+/// content still is (the latch's failing path writes nothing; the content
+/// cannot be read through the poisoned latch, so the test judges the mirror).
+/// The give-back comes before the claim's pin is dropped: a hook installed
+/// for the call records the mirror at `Unpinned`, which fires holding no
+/// mutex (card A-3a-F2-F1). The frame keeps its key and its one pin, and the
+/// creation's reservation is back on the free list. FREED-STAYS-CLAIMED and
+/// GIVEBACK-AFTER-PIN-DROP fail it.
 #[test]
 fn create_freed_poison() {
     use std::sync::{Arc, Mutex};
