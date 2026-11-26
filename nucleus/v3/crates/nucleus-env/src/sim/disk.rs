@@ -2,6 +2,8 @@
 // The spike stays E4's evidence record; nothing under spikes/ changes (card A-1b).
 // D1: the page-media slot size and page-file name are parameters (S-STORE §2.1 configures the page size; with slot = 4096 and page_file = "/pages" every draw is identical to E4's).
 // D2: the cur_len accessor, which the SimEnv layer needs for File::len and short reads.
+// D3 (card A-6b-0, A-1b-F2): a synced shrink drops the durable bytes past the new length, and a power cut keeps a length only to the end of the surviving written data, not to the end of its sector.
+// D4 (card A-6b-0): DirLoss::Independent, a power cut that keeps each unsynced directory op independently (S-STORE §12.5, t_wal_start); DirLoss::Prefix, the default, keeps the E4 rule and the E4 draws.
 #![deny(clippy::indexing_slicing)]
 //! The simulated disk (card X-5 Work 1.1) and the pre-registered fault
 //! model (1.3) with taint tracking and the accept hook (1.4).
@@ -186,6 +188,34 @@ pub struct FaultKnobs {
     /// Probability, given not-latest, of a torn choice (some earlier
     /// prefix) rather than the durable value.
     pub tear_pm: u32,
+}
+
+/// How a power cut resolves each directory's unsynced operations
+/// (D4, card A-6b-0). The file-data resolution is the same in both
+/// modes, draw for draw; only the directory step differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirLoss {
+    /// E4's rule, the default: each directory keeps a **prefix** of its
+    /// unsynced ops in issue order (ext4's ordered metadata journal; one
+    /// `keep` draw per directory, then an `nkeep` draw when not kept),
+    /// with E4's draws. Under it a lower rename issued first is never
+    /// lost while a later, higher one survives.
+    #[default]
+    Prefix,
+    /// Each unsynced op is kept **independently**, with one draw per
+    /// op in issue order (`keep_latest_pm`), and a kept op is applied
+    /// to the durable bindings as they stand at that point only if it
+    /// still applies: a `Create` when its name is unbound, a `Rename`
+    /// when its source is bound to its file and its target is unbound,
+    /// an `Unlink` when its name is bound to its file. An op not kept,
+    /// or kept but no longer applicable, is dropped. So with
+    /// `keep_latest_pm` 0 every unsynced op is lost, with 1000 every
+    /// applicable op is kept, and a rename whose source's create was
+    /// lost is lost too, keeping the namespace a function of issue
+    /// order. This is the loss S-STORE §12.5's `t_wal_start` asks of
+    /// SimEnv: a later recycling rename kept while an earlier, lower
+    /// one is lost (RECYCLE-UNORDERED's in-order form).
+    Independent,
 }
 
 /// The fault class of a seed (card 5.4).
@@ -658,6 +688,17 @@ impl SimDisk {
         if cur_len > inode.durable.len() as u64 {
             inode.durable.resize(cur_len as usize, 0);
         }
+        // D3 (a) (card A-6b-0, A-1b-F2): `sync_all` makes the current
+        // bytes the durable bytes, exactly. The writes graduated above
+        // compose to them except where a shrink cut them: durable bytes,
+        // or a graduated write's bytes, past a `set_len` that shrank the
+        // file before this sync, whether or not a later grow re-extended
+        // it with zeros. So after a synced shrink no byte from behind it
+        // stays durable: a later grow reads zeros, and `apply_crash`'s
+        // sector images, which compose from `durable`, carry none of it.
+        // Without a shrink this changes nothing: the composition already
+        // equals the current bytes.
+        inode.durable.clone_from(&inode.cur);
         inode.durable_len = cur_len;
         self.events.push(DiskEvent::SyncReturned {
             inode: id,
@@ -748,6 +789,21 @@ impl SimDisk {
     /// and accept logs (1.4: "in any life of this seed"). Returns the
     /// number of dropped directory ops.
     pub fn apply_crash(&mut self, rng: &mut Rng, knobs: &FaultKnobs) -> u64 {
+        self.apply_crash_with(rng, knobs, DirLoss::Prefix)
+    }
+
+    /// F-CRASH with the directory step chosen by `dir_loss` (D4, card
+    /// A-6b-0): [`DirLoss::Prefix`] is [`SimDisk::apply_crash`]'s E4 rule
+    /// with E4's draws; [`DirLoss::Independent`] keeps each unsynced
+    /// directory op independently, applied in issue order where it still
+    /// applies. The file-data loop runs first and is the same in both
+    /// modes, draw for draw. Returns the number of dropped directory ops.
+    pub fn apply_crash_with(
+        &mut self,
+        rng: &mut Rng,
+        knobs: &FaultKnobs,
+        dir_loss: DirLoss,
+    ) -> u64 {
         self.events.push(DiskEvent::Crash);
         let mut dropped_ops = 0u64;
         for inode in self.inodes.iter_mut() {
@@ -784,7 +840,21 @@ impl SimDisk {
                     let chosen = images.get(idx).cloned().unwrap_or_default();
                     write_durable(inode, sec, &chosen);
                     if idx > 0 {
-                        surviving_end = surviving_end.max(sec + SECTOR);
+                        // D3 (b) (card A-6b-0, A-1b-F2): the length a kept
+                        // prefix needs ends where the data it wrote in this
+                        // sector ends, not at the sector's end — no real
+                        // filesystem shows a length nothing wrote.
+                        let sec_end = sec + SECTOR;
+                        let written_end = inode
+                            .volatile
+                            .iter()
+                            .take(idx)
+                            .filter(|w| w.off < sec_end && w.off + w.bytes.len() as u64 > sec)
+                            .map(|w| (w.off + w.bytes.len() as u64).min(sec_end))
+                            .max();
+                        if let Some(end) = written_end {
+                            surviving_end = surviving_end.max(end);
+                        }
                     }
                 }
                 if surviving_end > inode.durable_len {
@@ -810,6 +880,15 @@ impl SimDisk {
         for dir in dirs {
             let ops = self.volatile_ops.get(&dir).cloned().unwrap_or_default();
             if ops.is_empty() {
+                continue;
+            }
+            if dir_loss == DirLoss::Independent {
+                // D4 (card A-6b-0): each op kept independently, in issue
+                // order, where it still applies; the Prefix path below is
+                // E4's, untouched, with its draws.
+                let durable = self.durable_bindings.entry(dir.clone()).or_default();
+                dropped_ops += keep_independently(durable, ops, rng, knobs);
+                self.volatile_ops.insert(dir, Vec::new());
                 continue;
             }
             let keep = rng.below(1000) < knobs.keep_latest_pm as u64;
@@ -1308,6 +1387,50 @@ impl SimDisk {
             .filter(|&(id, off, len)| self.range_tainted(id, off, len))
             .collect()
     }
+}
+
+/// D4 (card A-6b-0): [`DirLoss::Independent`]'s directory step for one
+/// directory. Each unsynced op, in issue order, is kept with one draw
+/// (`keep_latest_pm`), and a kept op is applied to `durable` as it
+/// stands at that point only if it still applies: a `Create` when its
+/// name is unbound, a `Rename` when its source is bound to its file and
+/// its target is unbound, an `Unlink` when its name is bound to its
+/// file. Returns the ops dropped: not kept, or kept but no longer
+/// applicable.
+fn keep_independently(
+    durable: &mut BTreeMap<String, FileId>,
+    ops: Vec<DirOp>,
+    rng: &mut Rng,
+    knobs: &FaultKnobs,
+) -> u64 {
+    let mut dropped = 0u64;
+    for op in ops {
+        let kept = rng.below(1000) < knobs.keep_latest_pm as u64;
+        let applies = match &op {
+            DirOp::Create(name, _) => !durable.contains_key(name),
+            DirOp::Rename(from, to, id) => {
+                durable.get(from) == Some(id) && !durable.contains_key(to)
+            }
+            DirOp::Unlink(name, id) => durable.get(name) == Some(id),
+        };
+        if !(kept && applies) {
+            dropped += 1;
+            continue;
+        }
+        match op {
+            DirOp::Create(name, id) => {
+                durable.insert(name, id);
+            }
+            DirOp::Rename(from, to, id) => {
+                durable.remove(&from);
+                durable.insert(to, id);
+            }
+            DirOp::Unlink(name, _) => {
+                durable.remove(&name);
+            }
+        }
+    }
+    dropped
 }
 
 /// Move a volatile write into the durable bytes and the durable-write log.

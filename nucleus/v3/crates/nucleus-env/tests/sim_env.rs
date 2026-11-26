@@ -48,6 +48,11 @@ fn assert_life_ok(out: &LifeOutcome) {
     for (i, r) in out.results.iter().enumerate() {
         assert_eq!(r, &Ok(()), "task {}'s result", i + 1);
     }
+    assert!(
+        out.halts.is_empty(),
+        "the life raised halts: {:?}",
+        out.halts
+    );
 }
 
 /// Runs one shared conformance check inside a one-task life: a failed
@@ -237,42 +242,188 @@ fn sim_namespace_is_root_plus_wal() {
     assert_life_ok(&out);
 }
 
-/// E4's `env_calls_yield_and_crash`, rewritten for this layer (S-ENV
-/// yield then step): with the crash armed at the `write_at`'s yield,
-/// the write returns `EnvError::Crashed` and never executes — the
-/// life's `DiskEvent`s contain no `WriteIssued`. (The card names
-/// `Some(1)`; with `open` a yield point too, the write_at is the
-/// life's second yield, so the arm is `Some(2)` — the assertion, and
-/// mutant OP-BEFORE-YIELD's catch, are the card's.)
+/// E4's `env_calls_yield_and_crash`, rewritten for this layer and
+/// extended to every mutating method (S-ENV yield then step; A-1b-F1
+/// (c)): twelve probes, one per method — `open` with `CreateNew`,
+/// `create_dir`, `rename`, `remove`, `write_at`, `set_len`,
+/// `sync_data`, `sync_all`, `sync_dir`, `lock_exclusive`,
+/// `lock_shared` and `unlock`. Each probe's body makes its preparatory
+/// calls and then the probed call, last; a dry run gives the life's
+/// yield count `Y`, so the probed call's leading yield is the `Y`-th.
+/// With the crash armed there, in a fresh `Sim` with the same durable
+/// setup, the probed call returns `EnvError::Crashed` and its effect is
+/// absent: no file for `open`, no `wal` in a later life for
+/// `create_dir`, the old name still bound and the new one not for
+/// `rename`, the name still bound for `remove`, no `WriteIssued` for
+/// `write_at`, the length unchanged for `set_len`, no new durable write
+/// for the two file syncs (each preceded by an unsynced write), and
+/// the created name not durably bound for `sync_dir`. A lock is per
+/// life and leaves nothing on disk, so the three lock probes assert
+/// only the `Crashed` return. The gate's G8 (a `rename` that steps
+/// before its yield) and mutant OP-BEFORE-YIELD (the same for
+/// `write_at`) fail it. The dry run also checks that the life's yields
+/// are exactly its Env calls, so the first-baton wait (S1) moved no
+/// yield number.
 #[test]
 fn env_calls_yield_and_crash() {
-    let mut sim = Sim::new(1, drop_all());
-    // The file, created and synced before the life under test.
-    let setup = sim.run_life(1, None, |env, _t| {
-        let f = env.open("page", OpenMode::CreateNew)?;
-        f.write_at(0, b"abc")?;
-        f.sync_all()?;
-        env.sync_dir("")?;
-        Ok(())
-    });
-    assert_life_ok(&setup);
+    // The probes' durable setup: `page` holds `abc`; with `wal`, the
+    // wal directory and `wal/a` and `wal/r`, each written and synced,
+    // all dir-synced. The `create_dir` probe's setup leaves `wal` out,
+    // so that its absence can be checked.
+    let setup = |wal: bool| -> Sim {
+        let mut sim = Sim::new(1, drop_all());
+        let out = sim.run_life(1, None, |env, _t| {
+            let f = env.open("page", OpenMode::CreateNew)?;
+            f.write_at(0, b"abc")?;
+            f.sync_all()?;
+            if wal {
+                env.create_dir("wal")?;
+                for p in ["wal/a", "wal/r"] {
+                    let g = env.open(p, OpenMode::CreateNew)?;
+                    g.write_at(0, b"seg")?;
+                    g.sync_all()?;
+                }
+                env.sync_dir("wal")?;
+            }
+            env.sync_dir("")?;
+            Ok(())
+        });
+        assert_life_ok(&out);
+        sim
+    };
+    type Body = fn(&SimEnv) -> Result<(), EnvError>;
+    // (name, whether the setup makes `wal`, the body's Env calls, the body)
+    let probes: [(&str, bool, u64, Body); 12] = [
+        ("open", true, 1, |env| {
+            env.open("wal/n", OpenMode::CreateNew).map(drop)
+        }),
+        ("create_dir", false, 1, |env| env.create_dir("wal")),
+        ("rename", true, 1, |env| env.rename("wal/a", "wal/b")),
+        ("remove", true, 1, |env| env.remove("wal/r")),
+        ("write_at", true, 2, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.write_at(0, &[7u8; 16])
+        }),
+        ("set_len", true, 2, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.set_len(100)
+        }),
+        ("sync_data", true, 3, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.write_at(0, b"xyz")?;
+            f.sync_data()
+        }),
+        ("sync_all", true, 3, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.write_at(0, b"xyz")?;
+            f.sync_all()
+        }),
+        ("sync_dir", true, 2, |env| {
+            env.open("wal/c", OpenMode::CreateNew)?;
+            env.sync_dir("wal")
+        }),
+        ("lock_exclusive", true, 2, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.lock_exclusive()
+        }),
+        ("lock_shared", true, 2, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.lock_shared()
+        }),
+        ("unlock", true, 3, |env| {
+            let f = env.open("page", OpenMode::ReadWrite)?;
+            f.lock_exclusive()?;
+            f.unlock()
+        }),
+    ];
+    for (name, wal, calls, body) in probes {
+        // The dry run: every call succeeds, and the probed call's
+        // leading yield is the life's last, the `Y`-th. Each Env call is
+        // exactly one yield and nothing else counts one: the first-baton
+        // wait is a park (S1), so it moves no yield number.
+        let mut dry = setup(wal);
+        let out = dry.run_life(1, None, |env, _t| body(env));
+        assert_life_ok(&out);
+        let y = out.yields;
+        assert_eq!(y, calls, "{name}: the life's yields are not its Env calls");
 
-    let out = sim.run_life(1, Some(2), |env, _t| {
-        let f = env.open("page", OpenMode::ReadWrite)?;
-        // The write crashes at its leading yield: it never executes.
-        let r = f.write_at(0, &[7u8; 16]);
-        assert_eq!(r, Err(EnvError::Crashed));
-        Ok(())
-    });
-    assert!(out.crashed, "the life must have crashed at the armed yield");
-    assert!(!out.panicked);
-    let writes = sim
-        .disk()
-        .events
-        .iter()
-        .filter(|e| matches!(e, DiskEvent::WriteIssued { .. }))
-        .count();
-    assert_eq!(writes, 0, "no write ran after the crash");
+        let mut sim = setup(wal);
+        let page = sim.file_id("page").unwrap().unwrap();
+        let durable_before = sim.disk().dwrites_of(page).len();
+        let out = sim.run_life(1, Some(y), |env, _t| body(env));
+        assert!(out.crashed, "{name}: the life must crash at yield {y}");
+        assert_eq!(out.yields, y, "{name}: the crash fired at another yield");
+        assert!(!out.panicked, "{name}: the life panicked");
+        assert_eq!(
+            out.results,
+            vec![Err(EnvError::Crashed)],
+            "{name}: the probed call must return Crashed"
+        );
+        assert!(out.halts.is_empty(), "{name}: halts {:?}", out.halts);
+        // The crashed call never executed: its effect is absent from
+        // the page cache (a process crash keeps it, so a step taken
+        // before the yield would show).
+        let disk = sim.disk();
+        match name {
+            "open" => assert_eq!(
+                sim.file_id("wal/n").unwrap(),
+                None,
+                "open: the crashed CreateNew made the file"
+            ),
+            "create_dir" => {
+                let seen = std::sync::Mutex::new(None);
+                let next = sim.run_life(1, None, |env, _t| {
+                    let wal = env.exists("wal")?;
+                    *seen.lock().unwrap() = Some(wal);
+                    Ok(())
+                });
+                assert_life_ok(&next);
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    Some(false),
+                    "create_dir: the crashed create_dir made wal"
+                );
+            }
+            "rename" => {
+                assert!(
+                    sim.file_id("wal/a").unwrap().is_some(),
+                    "rename: the old name is gone"
+                );
+                assert_eq!(
+                    sim.file_id("wal/b").unwrap(),
+                    None,
+                    "rename: the new name is bound"
+                );
+            }
+            "remove" => assert!(
+                sim.file_id("wal/r").unwrap().is_some(),
+                "remove: the name is gone"
+            ),
+            "write_at" => {
+                let writes = disk
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, DiskEvent::WriteIssued { .. }))
+                    .count();
+                assert_eq!(writes, 0, "write_at: a write ran after the crash");
+            }
+            "set_len" => assert_eq!(disk.cur_len(page), 3, "set_len: the length changed"),
+            "sync_data" | "sync_all" => assert_eq!(
+                disk.dwrites_of(page).len(),
+                durable_before,
+                "{name}: the unsynced write became durable"
+            ),
+            "sync_dir" => assert!(
+                !disk
+                    .durable_dir_bindings(nucleus_env::sim::WAL_DIR)
+                    .contains_key("c"),
+                "sync_dir: the unsynced create became durable"
+            ),
+            // `lock_exclusive`, `lock_shared`, `unlock`: per life, nothing
+            // on disk; the `Crashed` return above is the whole check.
+            _ => {}
+        }
+    }
 }
 
 /// S-DET through the new layer: three tasks run a fixed mix of
@@ -341,8 +492,13 @@ fn sim_life_is_deterministic() {
     );
 }
 
-/// The schedule is seeded (S-ENV "Streams"): over seeds 1–8 of the
-/// determinism body, at least two traces differ.
+/// The schedule is seeded at every pick, not only the first (S-ENV
+/// "Streams"; A-1b-F1 (d)): each of the three tasks runs the
+/// determinism body with 32 `mix:step` handoffs, and over seeds 1–8
+/// the eight traces are pairwise distinct after their first handoff
+/// (`trace[1..]`). A schedule that took only its first pick from the
+/// seed (the A-1b gate's G5) gives three first picks for eight seeds,
+/// so two seeds would agree from then on.
 #[test]
 fn sim_seeds_differ() {
     let body = |env: &SimEnv, t: nucleus_env::sim::TaskId| -> Result<(), EnvError> {
@@ -350,7 +506,7 @@ fn sim_seeds_differ() {
         let name = format!("r{t}");
         let f = env.open(&name, OpenMode::CreateNew)?;
         let mut step = 0u64;
-        while step < 4 {
+        while step < 32 {
             let v = env.rand();
             f.write_at(step * 8, &v.to_be_bytes())?;
             env.yield_now("mix:step")?;
@@ -373,17 +529,24 @@ fn sim_seeds_differ() {
         let mut sim = Sim::new(seed, drop_all());
         let out = sim.run_life(3, None, body);
         assert_life_ok(&out);
+        assert!(
+            out.trace.len() >= 3 * 32,
+            "seed {seed}: only {} handoffs",
+            out.trace.len()
+        );
         traces.push(out.trace);
     }
-    let mut differ = false;
     for (i, t) in traces.iter().enumerate() {
-        for u in traces.iter().skip(i + 1) {
-            if t != u {
-                differ = true;
-            }
+        for (j, u) in traces.iter().enumerate().skip(i + 1) {
+            assert_ne!(
+                t.get(1..),
+                u.get(1..),
+                "seeds {} and {} drew the same schedule after their first handoff",
+                i + 1,
+                j + 1
+            );
         }
     }
-    assert!(differ, "every seed 1..=8 drew the same schedule");
 }
 
 /// S-ENV "Crash kinds", the process crash: a life writes and renames
@@ -1102,7 +1265,23 @@ fn sim_halted_off_task() {
         assert!(halted, "the off-task call must be Halted");
         Ok(())
     });
-    assert_life_ok(&out);
+    // A-1b-F1 (f): the body swallowed the off-task `Halted` and returned
+    // `Ok`, but the life records it.
+    assert_eq!(out.results, vec![Ok(())], "the task's result");
+    assert!(!out.crashed, "the life crashed");
+    assert!(!out.deadlock, "the life deadlocked");
+    assert!(
+        out.livelock.is_none(),
+        "the life livelocked at {:?}",
+        out.livelock
+    );
+    assert!(!out.panicked, "the life panicked");
+    assert_eq!(
+        out.halts.len(),
+        1,
+        "the swallowed off-task halt must be recorded: {:?}",
+        out.halts
+    );
 }
 
 // ---- FLAKE-FIX-1 (card FLAKE-FIX-1 Work 4): the start/finish race pins ----
