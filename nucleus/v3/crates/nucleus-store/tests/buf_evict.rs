@@ -880,7 +880,7 @@ fn acquire_vs_acquire() {
 
 /// The end of a sweep rechecks the generation (card A-3b-0, Work 5, A5): a
 /// frame unpinned while a sweep ran is taken by the next one without waiting
-/// or answering starved. Step budget: 2 sweeps.
+/// or answering starved. Step budget: 4 `SweepEnded`.
 #[test]
 fn sweep_end_rechecks_generation() {
     let (file, map, pool) = fixture(2).unwrap();
@@ -1415,8 +1415,9 @@ fn acquire_shared_hand() {
 /// frame 0: T_B's own pass (A6′) must go on to frame 1, where it meets X's
 /// latch, so T_B retries; then, T_A holding frame 1 and Y pinned, it waits
 /// for an unpin, and the release of T_A's reservation serves it frame 1.
-/// Under PASS-FRAME0-ONLY the pass visits frame 0 only, meets nothing busy
-/// and answers `PoolStarved`, so T_B ends right after its first sweep.
+/// Under PASS-FRAME0-ONLY the pass visits frame 0 only and meets nothing
+/// busy, so it fires `PassEnded` there, where the permit hook holds T_B: its
+/// next event is that firing, not the retry's `SweepStep`.
 ///
 /// While a thread is held the controller makes no pool call at all, as in
 /// `acquire_shared_hand`: it records, releases, joins, and only then

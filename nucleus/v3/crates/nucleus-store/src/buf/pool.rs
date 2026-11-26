@@ -180,9 +180,11 @@ pub struct PoolFootprint {
 /// A-3a, Work 8; card A-3b-0, Work 6). Always defined; the hook storage and
 /// [`Pool::set_hook`] exist only under the crate's `test-hooks` feature, and
 /// without it firing compiles to nothing. A hook fires holding no pool mutex;
-/// the latches each point holds are in card A-3a's hook table and, for
-/// `FreedClaimed`, in card A-3a-F2's. S-STORE §15's `t_pin_load_race`
-/// names four of them: *missed* is [`HookPoint::MissReserved`], *published*
+/// the latches each point holds are in card A-3a's hook table, in card
+/// A-3b-0's (Work 6) for `Evicted`, `SweepEnded`, `UnpinWait`, `SweepStep`
+/// and `PassEnded`, and in card A-3a-F2's for `FreedClaimed`. S-STORE §15's
+/// `t_pin_load_race` names four of them: *missed* is
+/// [`HookPoint::MissReserved`], *published*
 /// [`HookPoint::LoadPublished`], *resolved* [`HookPoint::LoadResolved`] and
 /// *waiting* [`HookPoint::LoadWaiting`].
 ///

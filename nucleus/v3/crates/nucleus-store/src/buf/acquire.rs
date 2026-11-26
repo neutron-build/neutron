@@ -27,9 +27,11 @@
 //!   (A6′; gate ruling A-3b-0 R1), never on the shared hand alone. The
 //!   argument is [`Pool::acquire`]'s. Tests `pool_starved_all_dirty`,
 //!   `acquire_vs_acquire`, `acquire_shared_hand`,
-//!   `sweep_end_rechecks_generation`, `unpin_wait_then_served`; mutants
-//!   BUSY-AS-HELD, OWN-PASS-SKIPPED, PASS-NONE-NOT-BUSY (BUSY-AS-STARVED and
-//!   DECISION-NO-GEN are equivalent since A6′).
+//!   `acquire_shared_hand_mirrored`, `sweep_end_rechecks_generation`,
+//!   `unpin_wait_then_served`, `own_pass_rechecks`; mutants BUSY-AS-HELD,
+//!   OWN-PASS-SKIPPED, PASS-NONE-NOT-BUSY, PASS-FRAME0-ONLY, PASS-NO-GEN,
+//!   PASS-NO-SCAN (BUSY-AS-STARVED and DECISION-NO-GEN are equivalent since
+//!   A6′).
 //! - **`try_reserve` never waits nor retries** (§5.3: "with no evictable frame
 //!   it releases its latches and restarts"). Test `try_reserve_never_waits`;
 //!   mutant TRY-WAITS.
