@@ -37,6 +37,8 @@ nucleus-env = { path = "../nucleus-env" }
 
 [dev-dependencies]
 proptest = "1.12"
+# Card A-4c0: the model checker of the interleaving harness; dev-only, exact version.
+shuttle = "=0.9.10"
 nucleus-env = { path = "../nucleus-env", features = ["sim"] }
 # Self dev-dependency (card X-0-F1-F1): cargo unifies its features into the
 # lib copy the integration tests link, so `tests/model.rs` sees
