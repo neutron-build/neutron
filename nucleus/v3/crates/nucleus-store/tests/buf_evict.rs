@@ -36,8 +36,8 @@ use std::thread;
 use std::thread::{Scope, ScopedJoinHandle, ThreadId};
 
 use buf_support::{
-    Event, EventLog, FaultFile, MARK, NO_FRAME, NO_KEY, PS, Pauser, fixture, fixture_at_minimum,
-    marker, minimum_frames, put_leaf, spawn,
+    Event, EventLog, FaultFile, MARK, NO_FRAME, NO_KEY, PS, Pauser, TestMap, fixture,
+    fixture_at_minimum, marker, minimum_frames, put_leaf, spawn,
 };
 use nucleus_store::StoreError;
 use nucleus_store::buf::{
@@ -46,7 +46,7 @@ use nucleus_store::buf::{
 };
 use nucleus_store::page::Kind;
 
-use HookPoint::{Evicted, RemoveLatched, SweepEnded, SweepStep, UnpinWait};
+use HookPoint::{Evicted, PassEnded, RemoveLatched, SweepEnded, SweepStep, UnpinWait};
 
 /// `Lpid(n)`.
 const fn lpid(n: u64) -> PageKey {
@@ -752,9 +752,8 @@ const LATE_SWEEPS: usize = 8;
 /// Two acquisitions at once (card A-3b-0, Work 5, A2 and A5–A7; §5.3 "The
 /// fairness bound"): the one that finds a latched frame is busy and retries
 /// without blocking on the latch; once that frame is taken and the other is
-/// pinned, it waits for an unpin, and the unpin serves it. Mutants
-/// BUSY-AS-STARVED and BUSY-AS-HELD fail the order of events: the first
-/// ends T2 at its first decision, the second makes `UnpinWait` come before
+/// pinned, it waits for an unpin, and the unpin serves it. Mutant
+/// BUSY-AS-HELD fails the order of events: it makes `UnpinWait` come before
 /// T1's release.
 #[test]
 fn acquire_vs_acquire() {
@@ -881,8 +880,7 @@ fn acquire_vs_acquire() {
 
 /// The end of a sweep rechecks the generation (card A-3b-0, Work 5, A5): a
 /// frame unpinned while a sweep ran is taken by the next one without waiting
-/// or answering starved. Mutants UNHELD-NO-BUMP-UNPIN and DECISION-NO-GEN
-/// make T answer `PoolStarved`. Step budget: 2 sweeps.
+/// or answering starved. Step budget: 2 sweeps.
 #[test]
 fn sweep_end_rechecks_generation() {
     let (file, map, pool) = fixture(2).unwrap();
@@ -1403,6 +1401,478 @@ fn acquire_shared_hand() {
     assert_eq!(a_answer, Ok(fx), "T_A's reservation, frame 0");
     assert_eq!(b_answer, Ok(fx), "T_B's answer");
     drop(p);
+}
+
+/// `acquire_shared_hand` with its layout mirrored (card A-3b-0-F4; verdict
+/// A-3b-0's follow-up F4 (i), mutant PASS-FRAME0-ONLY): the own pass must
+/// visit every frame. F = 2: Y = L2 in frame 0, pinned by the controller
+/// throughout; X = L1 in frame 1, loaded, clean, unpinned, its bit set. No
+/// frame is dirty. T_A and T_B each call `reserve()`, both from `h0 = 0`.
+/// Permitted one firing at a time, T_B passes Y at hands 0 and 2, T_A clears
+/// X's bit at hand 1 and takes X as a candidate at hand 3, where it is held
+/// at `RemoveLatched` with X's exclusive latch (no pin, no mutex), and T_B
+/// ends its sweep having met no busy frame. The clean frame T_A holds is not
+/// frame 0: T_B's own pass (A6′) must go on to frame 1, where it meets X's
+/// latch, so T_B retries; then, T_A holding frame 1 and Y pinned, it waits
+/// for an unpin, and the release of T_A's reservation serves it frame 1.
+/// Under PASS-FRAME0-ONLY the pass visits frame 0 only, meets nothing busy
+/// and answers `PoolStarved`, so T_B ends right after its first sweep.
+///
+/// While a thread is held the controller makes no pool call at all, as in
+/// `acquire_shared_hand`: it records, releases, joins, and only then
+/// asserts, on the same release rule.
+#[test]
+fn acquire_shared_hand_mirrored() {
+    let (file, map, pool) = fixture(2).unwrap();
+    for n in [1u64, 2] {
+        put_l!(&file, &map, n);
+    }
+    // Y = L2 in frame 0, pinned by the controller throughout; X = L1 in
+    // frame 1, its pin dropped, its bit set. No frame is dirty.
+    let (x, y) = (L1, L2);
+    let p = pinned!(pool.pin(y, &map));
+    let fy = p.frame();
+    let fx = load!(&pool, &map, x);
+    assert_eq!((fx, fy), (FrameId(1), FrameId(0)));
+    assert!(
+        pool.frame_info(fx).unwrap().referenced,
+        "X's bit is set by its load"
+    );
+    // The controller's pin on Y, which it drops last.
+    let mut p = Some(p);
+
+    let permits = Permits::new();
+    pool.set_hook(Some(permits.hook()));
+    let (record, after_first_sweep, a_answer, b_answer) = thread::scope(|s| {
+        // The controller's record, in order.
+        let mut record = Vec::new();
+        let t_a = spawn_held(s, &permits, Who::A, || pool.reserve().map_err(text));
+        // T_A's first `SweepStep`: it has passed A1 with `h0 = 0` and holds
+        // nothing.
+        next_from(&permits, &mut record, Who::A);
+        let mut t_b = None;
+        let mut after_first_sweep = None;
+        if !ended(&record, Who::A) {
+            t_b = Some(spawn_held(s, &permits, Who::B, || {
+                pool.reserve().map_err(text)
+            }));
+            // T_B's first `SweepStep`: it too has passed A1 with `h0 = 0`.
+            next_from(&permits, &mut record, Who::B);
+            // Permits in the order B, A, B, A, B, each awaited.
+            for who in [Who::B, Who::A, Who::B, Who::A, Who::B] {
+                if ended(&record, Who::A) || ended(&record, Who::B) {
+                    break;
+                }
+                permits.permit(who);
+                next_from(&permits, &mut record, who);
+            }
+            if !ended(&record, Who::B) {
+                // One more for T_B: its next event is a `SweepStep` (it
+                // retried) or its end.
+                permits.permit(Who::B);
+                after_first_sweep = Some(next_from(&permits, &mut record, Who::B));
+            }
+        }
+        // T_A runs freely: to its end or, under a mutant, to a wait.
+        let mut a_waits = run_free(&permits, &mut record, Who::A);
+        let mut t_a = Some(t_a);
+        let mut a_answer = Err("T_A waits for an unpin".to_string());
+        // T_A's reservation `r_A`, which the controller holds once T_A ended.
+        let mut r_a = None;
+        if !a_waits {
+            let (answer, res) = outcome(t_a.take().unwrap().join(), Who::A);
+            a_answer = answer;
+            r_a = res;
+        }
+        let mut t_b = t_b;
+        let mut b_answer = Err("T_B was not started".to_string());
+        let mut b_waits = false;
+        let mut r_b = None;
+        if t_b.is_some() {
+            b_answer = Err("T_B waits for an unpin".to_string());
+            // T_B runs freely: to its wait for an unpin, or to its end.
+            b_waits = run_free(&permits, &mut record, Who::B);
+        }
+        if !b_waits && t_b.is_some() {
+            let (answer, res) = outcome(t_b.take().unwrap().join(), Who::B);
+            b_answer = answer;
+            r_b = res;
+        }
+        // Release: the reservations the controller holds. Dropping `r_A` frees
+        // frame 1, which is what ends T_B's wait on a correct build.
+        drop(r_a);
+        drop(r_b);
+        if a_waits {
+            a_waits = settle(&permits, &mut record, Who::A);
+        }
+        if b_waits {
+            b_waits = settle(&permits, &mut record, Who::B);
+        }
+        if a_waits || b_waits {
+            // A waiter still waiting has only the controller's pin `p` left to
+            // end its wait. A correct build never comes here.
+            drop(p.take());
+            if a_waits {
+                settle(&permits, &mut record, Who::A);
+            }
+            if b_waits {
+                settle(&permits, &mut record, Who::B);
+            }
+        }
+        // Join what is not joined yet. A thread still waiting here is a waiter
+        // that is really waiting and never woken: a lost wake-up, which on OS
+        // threads only a hang can show (card A-3b-0, "For the gate").
+        if let Some(t) = t_a.take() {
+            a_answer = outcome(t.join(), Who::A).0;
+        }
+        if let Some(t) = t_b.take() {
+            b_answer = outcome(t.join(), Who::B).0;
+        }
+        (record, after_first_sweep, a_answer, b_answer)
+    });
+
+    // The assertions, after the joins.
+    let unpin_waits = record
+        .iter()
+        .filter(|got| matches!(got, Got::At(f) if f.who == Who::B && f.point == UnpinWait))
+        .count();
+    assert_eq!(
+        after_first_sweep.map(fired_point),
+        Some(Some(SweepStep)),
+        "T_B's event after its first SweepEnded was not a SweepStep: {record:?}"
+    );
+    assert_eq!(unpin_waits, 1, "T_B's UnpinWait firings: {record:?}");
+    for (who, answer) in [(Who::A, &a_answer), (Who::B, &b_answer)] {
+        assert!(
+            !matches!(answer, Err(e) if e.contains("starved")),
+            "{who:?} answered PoolStarved: {answer:?}"
+        );
+    }
+    assert_eq!(a_answer, Ok(fx), "T_A's reservation, frame 1");
+    assert_eq!(b_answer, Ok(fx), "T_B's answer");
+    drop(p);
+}
+
+/// The layout of `own_pass_rechecks` (card A-3b-0-F4, Work 3), that of
+/// `sweep_end_rechecks_generation`: frame 0 holds `lpid(1)`, created and
+/// released, so dirty and unpinned; frame 1 holds Y = L2, loaded and left
+/// pinned to the controller. Returns Y, Y's frame and the controller's pin.
+///
+/// # Errors
+/// Whatever `put_leaf`, [`Pool::reserve`], [`Pool::create`] and [`Pool::pin`]
+/// return, and [`StoreError::Invalid`] when the creation or the load answers
+/// another outcome.
+fn own_pass_layout<'p>(
+    file: &FaultFile,
+    map: &TestMap,
+    pool: &'p Pool<FaultFile>,
+) -> Result<(PageKey, FrameId, Pin<'p, FaultFile>), StoreError> {
+    put_leaf(file, map, 2, 11, 0x22)?;
+    // Frame 0: dirty, unpinned. Frame 1: Y, pinned by the controller.
+    let c = match pool.create(pool.reserve()?, lpid(1), Kind::Leaf, 1)? {
+        CreateOutcome::Created(c) => c,
+        other => {
+            return Err(StoreError::Invalid(format!(
+                "own_pass_layout: expected Created, got {other:?}"
+            )));
+        }
+    };
+    assert_eq!(c.frame(), FrameId(0));
+    drop(c.release());
+    let y = L2;
+    let p = match pool.pin(y, map)? {
+        PinOutcome::Pinned(p) => p,
+        other => {
+            return Err(StoreError::Invalid(format!(
+                "own_pass_layout: expected Pinned, got {other:?}"
+            )));
+        }
+    };
+    assert_eq!(p.frame(), FrameId(1));
+    Ok((y, FrameId(1), p))
+}
+
+/// What T of `own_pass_rechecks` holds at its `PassEnded`, as its controller
+/// reads it while T is paused there (card A-3b-0-F4, Work 3): table-only
+/// reads, and Y's latch tried through the controller's own pin, each as text
+/// on error.
+#[derive(Debug, PartialEq, Eq)]
+struct Holds {
+    /// `(free, reserved, loading, resident, orphan, unpin_waiters)`: no frame
+    /// is `Reserved`, so T holds no reservation, and T is no waiter.
+    stats: Result<(u32, u32, u32, u32, u32, u32), String>,
+    /// The pin counts of frame 0 and of Y's frame: none, and the
+    /// controller's own.
+    pins: [Result<u64, String>; 2],
+    /// Whether Y's latch could be taken shared: T holds no latch on Y's
+    /// frame.
+    y_shared: Result<bool, String>,
+}
+
+/// What the controller of `own_pass_rechecks` recorded at T's `PassEnded`:
+/// whether the table mutex was free, read first, and what T holds there,
+/// read only when it was.
+#[derive(Debug, PartialEq, Eq)]
+struct AtPassEnd {
+    /// Whether the table mutex is free: the hook fired holding no mutex.
+    table_free: Result<bool, String>,
+    /// What T holds there; `None` if the table mutex was not free.
+    holds: Option<Holds>,
+}
+
+/// Read, changing nothing, what T holds at its `PassEnded`, through `p`, the
+/// controller's own pin on Y's frame `fy`. `table_free()` is read first, and
+/// the rest only if the table mutex is free: a firing under it must fail the
+/// test, not hang it, and `stats()` and `frame_info()` take that mutex.
+/// `table_free()` answers a plain `bool`; it is kept in a `Result` beside the
+/// other records.
+fn at_pass_end(pool: &Pool<FaultFile>, p: &Pin<'_, FaultFile>, fy: FrameId) -> AtPassEnd {
+    let table_free = Ok(pool.table_free());
+    let holds = (table_free == Ok(true)).then(|| Holds {
+        stats: pool
+            .stats()
+            .map(|s| {
+                (
+                    s.free,
+                    s.reserved,
+                    s.loading,
+                    s.resident,
+                    s.orphan,
+                    s.unpin_waiters,
+                )
+            })
+            .map_err(text),
+        pins: [
+            pool.frame_info(FrameId(0)).map(|i| i.pins).map_err(text),
+            pool.frame_info(fy).map(|i| i.pins).map_err(text),
+        ],
+        // A `try_` form, which never blocks; its guard is dropped at once.
+        y_shared: p.try_latch_shared().map(|g| g.is_some()).map_err(text),
+    });
+    AtPassEnd { table_free, holds }
+}
+
+/// The controller's hit in `own_pass_rechecks` (b), as it is recorded: the
+/// frame it pinned, and whether that frame's latch could then be taken
+/// shared through the pin (a `try_` form; its guard is dropped at once).
+fn hit_record(
+    hit: &Result<Option<Pin<'_, FaultFile>>, String>,
+) -> Result<(FrameId, Result<bool, String>), String> {
+    match hit {
+        Ok(Some(pin)) => Ok((
+            pin.frame(),
+            pin.try_latch_shared().map(|g| g.is_some()).map_err(text),
+        )),
+        Ok(None) => Err("no frame holds lpid(1) Resident".to_string()),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// The own pass's end and its final hold (card A-3b-0-F4; verdict A-3b-0's
+/// follow-up F4 (iii), mutants PASS-NO-GEN and PASS-NO-SCAN). F = 2: frame 0
+/// holds `lpid(1)`, created and released, so dirty and unpinned; frame 1
+/// holds Y = L2, pinned by the controller. T's sweep takes nothing, and its
+/// own pass (A6′) finds frame 0 dirty and frame 1 pinned, so it fires
+/// `PassEnded` holding nothing, just before the hold that decides.
+/// (a) The controller drops `p` there: the final hold sees that a frame
+/// became unheld since A1, T looks again and takes Y. No `PoolStarved`, no
+/// `UnpinWait`. Mutant PASS-NO-GEN ends T with `PoolStarved` there.
+/// (b) The controller pins `lpid(1)` there instead, a hit that moves no
+/// generation: every frame is then held, and T goes on to wait for an unpin;
+/// the controller's drop of `p` serves T frame 1. Mutant PASS-NO-SCAN ends T
+/// with `PoolStarved` before any `UnpinWait`.
+/// (c) The hook carries the key the acquisition is for: a pin's miss.
+/// Step budget: 4 `SweepEnded` in (a) and in (b); a correct build ends one
+/// in (a) and two in (b), the second before its wait.
+#[test]
+fn own_pass_rechecks() {
+    // (a) The generation is re-checked: the controller drops `p` at T's
+    //     `PassEnded`.
+    {
+        let (file, map, pool) = fixture(2).unwrap();
+        let (y, fy, p) = own_pass_layout(&file, &map, &pool).unwrap();
+        let pz = Pauser::new();
+        pool.set_hook(Some(budgeted_wait(&pz, 4, None, true)));
+        pz.pause_at(PassEnded, NO_KEY);
+        pz.report(Evicted, y);
+        let (first, seen, got) = thread::scope(|s| {
+            let t = spawn(s, &pz, "T", || pool.reserve().map_err(text));
+            // T holds nothing at its PassEnded: no reservation, no pin, no
+            // latch, no mutex.
+            let first = pz.next_event();
+            let mut seen = None;
+            if first == Event::Arrived(PassEnded, NO_KEY, NO_FRAME) {
+                let at = at_pass_end(&pool, &p, fy);
+                let free = at.table_free == Ok(true);
+                seen = Some(at);
+                if free {
+                    drop(p); // U1: the pin's own drop, no pool call.
+                    pz.release(PassEnded, NO_KEY);
+                } else {
+                    // The table mutex is held there: nothing may wait on it.
+                    pz.release_all();
+                }
+            } else {
+                pz.release_all();
+            }
+            (first, seen, t.join())
+        });
+        assert_eq!(first, Event::Arrived(PassEnded, NO_KEY, NO_FRAME));
+        let seen = seen.expect("T was held at its PassEnded");
+        assert_eq!(
+            seen.table_free,
+            Ok(true),
+            "at the pause: the hook fired holding no mutex"
+        );
+        let holds = seen
+            .holds
+            .expect("the pause's records, read only while the table mutex was free");
+        assert_eq!(
+            holds.stats,
+            Ok((0, 0, 0, 2, 0, 0)),
+            "at the pause: no frame is Reserved, so T holds no reservation, and T is no waiter"
+        );
+        assert_eq!(
+            holds.pins,
+            [Ok(0), Ok(1)],
+            "at the pause: frame 0's count is none, and frame 1's is the controller's own"
+        );
+        assert_eq!(
+            holds.y_shared,
+            Ok(true),
+            "at the pause: T holds no latch on Y's frame"
+        );
+        let got = got
+            .unwrap_or_else(|e| panic!("T: {e:?}"))
+            .unwrap_or_else(|e| panic!("T: {e}"));
+        assert_eq!(got.frame(), fy, "T got frame 1");
+        assert_eq!(
+            without_done(reported(&pz)),
+            vec![Event::Seen(Evicted, y, fy)],
+            "the one Evicted is Y, and no UnpinWait was seen"
+        );
+        drop(got);
+        assert_eq!(pool.frame_of(y).unwrap(), None);
+        let s = pool.stats().unwrap();
+        assert_eq!((s.evictions, s.unpin_waiters), (1, 0));
+    }
+
+    // (b) The scan is re-checked: the controller pins `lpid(1)` at T's
+    //     `PassEnded`, T waits for an unpin, and the drop of `p` serves it.
+    {
+        let (file, map, pool) = fixture(2).unwrap();
+        let (y, fy, p) = own_pass_layout(&file, &map, &pool).unwrap();
+        let pz = Pauser::new();
+        pool.set_hook(Some(budgeted(&pz, 4, None)));
+        pz.pause_at(PassEnded, NO_KEY);
+        pz.report(UnpinWait, NO_KEY);
+        pz.report(Evicted, y);
+        let (first, seen, hit, next, waiters, got) = thread::scope(|s| {
+            let t = spawn(s, &pz, "T", || pool.reserve().map_err(text));
+            // T holds nothing at its PassEnded: no reservation, no pin, no
+            // latch, no mutex.
+            let first = pz.next_event();
+            let (mut seen, mut hit, mut next, mut waiters) = (None, None, None, None);
+            // The controller's pin on `lpid(1)`, kept until after the join.
+            let mut q = None;
+            if first == Event::Arrived(PassEnded, NO_KEY, NO_FRAME) {
+                let at = at_pass_end(&pool, &p, fy);
+                let free = at.table_free == Ok(true);
+                seen = Some(at);
+                if free {
+                    // From here on `p` is kept as an `Option`: it is dropped
+                    // at T's wait.
+                    let mut p = Some(p);
+                    // A table-only call: a hit on frame 0, which raises its
+                    // count and moves no generation.
+                    let made = pool.pin_resident(lpid(1)).map_err(text);
+                    hit = Some(hit_record(&made));
+                    q = made.ok().flatten();
+                    pz.release(PassEnded, NO_KEY);
+                    let e = pz.next_event();
+                    next = Some(e);
+                    if e == Event::Seen(UnpinWait, NO_KEY, NO_FRAME) {
+                        // A table-only read.
+                        waiters = Some(pool.stats().map(|s| s.unpin_waiters).map_err(text));
+                        drop(p.take());
+                    } else {
+                        pz.release_all();
+                    }
+                } else {
+                    // The table mutex is held there: nothing may wait on it.
+                    pz.release_all();
+                }
+            } else {
+                pz.release_all();
+            }
+            let got = t.join();
+            drop(q);
+            (first, seen, hit, next, waiters, got)
+        });
+        assert_eq!(first, Event::Arrived(PassEnded, NO_KEY, NO_FRAME));
+        let seen = seen.expect("T was held at its PassEnded");
+        assert_eq!(
+            seen.table_free,
+            Ok(true),
+            "at the pause: the hook fired holding no mutex"
+        );
+        let holds = seen
+            .holds
+            .expect("the pause's records, read only while the table mutex was free");
+        assert_eq!(
+            holds.stats,
+            Ok((0, 0, 0, 2, 0, 0)),
+            "at the pause: no frame is Reserved, so T holds no reservation, and T is no waiter"
+        );
+        assert_eq!(
+            holds.pins,
+            [Ok(0), Ok(1)],
+            "at the pause: frame 0's count is none, and frame 1's is the controller's own"
+        );
+        assert_eq!(
+            holds.y_shared,
+            Ok(true),
+            "at the pause: T holds no latch on Y's frame"
+        );
+        assert_eq!(
+            hit,
+            Some(Ok((FrameId(0), Ok(true)))),
+            "the controller's hit: a pin on frame 0, whose latch T no longer holds"
+        );
+        assert_eq!(
+            next,
+            Some(Event::Seen(UnpinWait, NO_KEY, NO_FRAME)),
+            "T fired UnpinWait, holding nothing"
+        );
+        assert_eq!(waiters, Some(Ok(1)), "the count recorded at the wait");
+        let got = got
+            .unwrap_or_else(|e| panic!("T: {e:?}"))
+            .unwrap_or_else(|e| panic!("T: {e}"));
+        assert_eq!(got.frame(), fy, "T got frame 1");
+        assert_eq!(
+            without_done(reported(&pz)),
+            vec![Event::Seen(Evicted, y, fy)]
+        );
+        drop(got);
+        assert_eq!(pool.frame_of(y).unwrap(), None);
+        let s = pool.stats().unwrap();
+        assert_eq!((s.evictions, s.unpin_waiters), (1, 0));
+    }
+
+    // (c) The key: a pin's miss ends at the same hold, for its own key.
+    {
+        let (file, map, pool) = fixture(2).unwrap();
+        let (_y, _fy, _p) = own_pass_layout(&file, &map, &pool).unwrap();
+        let log = EventLog::new();
+        pool.set_hook(Some(log.hook_sweep_budget(4)));
+        let from = log.len();
+        assert!(matches!(
+            pool.pin(lpid(9), &map),
+            Err(StoreError::PoolStarved)
+        ));
+        assert_eq!(log.since(from, PassEnded), vec![(lpid(9), NO_FRAME)]);
+        assert_eq!(log.since(from, SweepEnded).len(), 1);
+    }
 }
 
 // ---- Beyond the card's list: each pins a site of the acquisition or of

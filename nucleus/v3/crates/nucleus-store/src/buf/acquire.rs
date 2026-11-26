@@ -28,8 +28,8 @@
 //!   argument is [`Pool::acquire`]'s. Tests `pool_starved_all_dirty`,
 //!   `acquire_vs_acquire`, `acquire_shared_hand`,
 //!   `sweep_end_rechecks_generation`, `unpin_wait_then_served`; mutants
-//!   BUSY-AS-STARVED, BUSY-AS-HELD, OWN-PASS-SKIPPED, PASS-NONE-NOT-BUSY,
-//!   DECISION-NO-GEN.
+//!   BUSY-AS-HELD, OWN-PASS-SKIPPED, PASS-NONE-NOT-BUSY (BUSY-AS-STARVED and
+//!   DECISION-NO-GEN are equivalent since A6′).
 //! - **`try_reserve` never waits nor retries** (§5.3: "with no evictable frame
 //!   it releases its latches and restarts"). Test `try_reserve_never_waits`;
 //!   mutant TRY-WAITS.
@@ -148,7 +148,7 @@ impl<H: File> Pool<H> {
                     yield_now();
                     continue;
                 }
-                match self.own_pass(g0)? {
+                match self.own_pass(g0, key)? {
                     Pass::Found(res) => return Ok(Some(res)),
                     Pass::Retry => continue,
                     Pass::Starved => return Err(StoreError::PoolStarved),
@@ -270,13 +270,14 @@ impl<H: File> Pool<H> {
     ///
     /// After the last frame, `busy` means another thread held a latch or a pin
     /// on a frame this acquisition looked at (§5.3 "The fairness bound"), so
-    /// it yields and looks again from A1. Otherwise, under one hold of the
-    /// table mutex, a free frame, a moved generation (`g0`) or no unpinned
-    /// frame left each makes it look again. Only when none does is every
-    /// unpinned frame dirty by this acquisition's own observation, and
+    /// it yields and looks again from A1. Otherwise it fires `PassEnded` with
+    /// `key` (card A-3b-0-F4, Work 1), holding nothing. Then, under one hold
+    /// of the table mutex, a free frame, a moved generation (`g0`) or no
+    /// unpinned frame left each makes it look again. Only when none does is
+    /// every unpinned frame dirty by this acquisition's own observation, and
     /// `PoolStarved` is the answer (the argument is in [`Pool::sweep`]'s doc,
     /// "Why the decision is exact at this card").
-    fn own_pass(&self, g0: u64) -> Result<Pass<'_, H>, StoreError> {
+    fn own_pass(&self, g0: u64, key: PageKey) -> Result<Pass<'_, H>, StoreError> {
         let mut busy = false;
         for i in 0..self.frames() {
             let f = FrameId(i);
@@ -307,6 +308,7 @@ impl<H: File> Pool<H> {
             yield_now();
             return Ok(Pass::Retry);
         }
+        self.fire(HookPoint::PassEnded, key, NO_FRAME);
         let look_again = {
             let t = self.lock_table()?;
             t.free_len() != 0 || t.unheld_events != g0 || !t.has_unpinned_resident()

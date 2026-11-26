@@ -244,6 +244,12 @@ pub enum HookPoint {
     /// Work 6; gate ruling A-3b-0 R1). The firing thread holds nothing: no
     /// reservation, no pin, no latch, no mutex.
     SweepStep,
+    /// Step A6′, the own pass: after its last frame, when the pass took no
+    /// victim and found nothing busy, and before the final hold of the table
+    /// mutex that decides: with the key the acquisition is for (`pin`'s miss)
+    /// or none, and no frame (card A-3b-0-F4, Work 1). The firing thread
+    /// holds nothing: no reservation, no pin, no latch, no mutex.
+    PassEnded,
 }
 
 /// A test hook (card A-3a; S-STORE §15's hook-placed interleavings): called
