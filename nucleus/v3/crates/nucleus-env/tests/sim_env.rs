@@ -14,8 +14,8 @@
 mod common;
 
 use nucleus_env::sim::{
-    DiskEvent, FaultKnobs, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sched, SchedCore,
-    SchedHost, Sim, SimEnv, WaitKey,
+    DiskEvent, FaultKnobs, HARNESS, LifeOutcome, MediaFault, MediaKind, SIM_MAX_LEN, Sched, SchedCore,
+    SchedHost, Sim, SimEnv, SimFail, WaitKey,
 };
 use nucleus_env::{Env, EnvError, File, OpenMode};
 use std::collections::BTreeSet;
@@ -1287,12 +1287,12 @@ fn sim_halted_off_task() {
 // ---- FLAKE-FIX-1 (card FLAKE-FIX-1 Work 4): the start/finish race pins ----
 
 /// **SIMENV-FLAKE-1, forced deterministically (FLAKE-FIX-1 Work 4):**
-/// the racy interleaving itself — a workload task's wrapper runs the
-/// body and `Sched::finish` before the harness thread (descheduled
-/// between `scope.spawn` and `sched.start()` in `run_life`) has parked.
+/// the interleaving of the pre-A-6b-0 `run_life` race, driven on
+/// `Sched` directly: a workload task's `finish` runs before the harness
+/// parks in `start()`.
 /// Pre-fix, `handoff_locked` found zero runnable candidates with
 /// `any_alive` true and failed the healthy world as `DEADLOCK`;
-/// FLAKE-FIX-1's guard recognises the baton-home-all-finished world as
+/// FLAKE-FIX-1's guard recognises the all-finished world as
 /// a completed life. Joining the finisher first makes `finish` strictly
 /// precede the harness's park — the exact race window, without the
 /// race. Direct-`Sched` shape of `r14_pre_baton_host_step_is_refused`.
@@ -1382,4 +1382,37 @@ fn sim_real_deadlock_reported() {
         vec![Ok(())],
         "the task observes the world failure and unwinds"
     );
+}
+
+/// **FLAKE-FIX-1 pin 4 (gate R4): the guard is exactly "every workload
+/// task finished".** The harness holds the baton before `start()` and
+/// parks on a key nobody can wake while task 1 is alive and parked on
+/// `Join`: nothing can ever run again, a real deadlock. It must be
+/// reported and task 1 must unwind, never a quiet `Ok`.
+#[test]
+fn sim_harness_wait_before_start_is_deadlock() {
+    struct Host {
+        sched: SchedCore,
+    }
+    impl SchedHost for Host {
+        fn sched_mut(&mut self) -> &mut SchedCore {
+            &mut self.sched
+        }
+    }
+    let sched = Arc::new(Sched::new(Host {
+        sched: SchedCore::new(2, 991),
+    }));
+    let task = Arc::clone(&sched);
+    let t = std::thread::spawn(move || task.await_first_baton(1));
+    assert_eq!(
+        sched.wait_for(HARNESS, WaitKey::Tree(1)),
+        Err(SimFail::Deadlock),
+        "a harness parked before start() while a live task is blocked is a deadlock"
+    );
+    {
+        let mut h = sched.lock();
+        let core = h.sched_mut();
+        assert!(core.deadlock && core.crashed, "the deadlock fails the world");
+    }
+    assert_eq!(t.join().unwrap(), Err(SimFail::Crashed), "the blocked task unwinds");
 }

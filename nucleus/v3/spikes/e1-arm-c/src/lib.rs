@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -143,7 +143,7 @@ pub struct ArmC {
     /// called by `commit`'s apply closure inside each apply window —
     /// after the apply-yield sleep, before the tree write. Inert unless
     /// armed; the engine's semantics never depend on it.
-    apply_window_gate: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    apply_window_gate: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The open-txn handle of [`ArmC`].
@@ -247,7 +247,7 @@ impl ArmC {
             ws_bytes: Mutex::new(HashMap::new()),
             bytes_applied: AtomicU64::new(0),
             apply_yield: AtomicBool::new(false),
-            apply_window_gate: Mutex::new(None),
+            apply_window_gate: OnceLock::new(),
         }
     }
 
@@ -303,14 +303,10 @@ impl ArmC {
     /// armed; the engine's semantics never depend on it. The gate runs
     /// while the committing txn already holds the key's row lock, so a
     /// blocking gate only widens the window the undo-order property is
-    /// probed in.
+    /// probed in. Arming is once per engine; a second call is ignored.
     #[doc(hidden)]
     pub fn arm_apply_window_gate(&self, gate: Arc<dyn Fn() + Send + Sync>) {
-        let mut g = match self.apply_window_gate.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        *g = Some(gate);
+        let _ = self.apply_window_gate.set(gate);
     }
 
     /// Walk one version chain to snapshot `snap` (card Work 4): the
@@ -606,17 +602,8 @@ impl TxnEngine for ArmC {
                 if self.apply_yield.load(Ordering::Acquire) {
                     thread::sleep(APPLY_YIELD);
                 }
-                // FLAKE-FIX-1 test hook: the apply-window gate. The Arc
-                // is cloned out and the guard dropped before the call,
-                // so the gate runs without the mutex held (it may block
-                // for the whole window by design). Inert unless armed.
-                let window_gate = match self.apply_window_gate.lock() {
-                    Ok(g) => g.clone(),
-                    Err(p) => p.into_inner().clone(),
-                };
-                if let Some(gate) = window_gate {
-                    gate();
-                }
+                // FLAKE-FIX-1 test hook: the apply-window gate (unarmed: one atomic load). It may block for the whole window by design.
+                if let Some(gate) = self.apply_window_gate.get() { gate(); }
                 let tag = if value.is_none() {
                     TAG_TOMBSTONE
                 } else {
