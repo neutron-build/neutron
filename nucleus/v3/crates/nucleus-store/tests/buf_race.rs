@@ -1200,8 +1200,15 @@ fn create_vs_freed() {
 /// back on the free list. FREED-STAYS-CLAIMED fails it.
 #[test]
 fn create_freed_poison() {
+    use std::sync::{Arc, Mutex};
+
+    use nucleus_store::buf::Hook;
+
+    use HookPoint::Unpinned;
+
     const K: PageKey = PageKey::Lpid(8);
     let (_file, map, pool) = fixture(3).unwrap();
+    let pool = Arc::new(pool);
     let (stale, g) = freed_frame(&pool, &map, K).unwrap();
     // Poison g's latch with a panic under it, inside `catch_unwind`. The
     // panic hook is not replaced (it is process-wide), and the table mutex
@@ -1215,8 +1222,34 @@ fn create_freed_poison() {
         "the panic under the latch was not caught"
     );
     let before = pool.stats().unwrap();
+    // A hook for the one call (card A-3a-F2-F1): at `Unpinned` for `(K, g)`,
+    // the creator's pin dropping, it records the table's mirror. `Unpinned`
+    // fires holding no mutex, so `frame_info` can take the table mutex there.
+    // The pool is a strong clone inside the hook: the cycle it makes with
+    // the pool's hook slot ends at the `set_hook(None)` after the call.
+    let seen: Arc<Mutex<Vec<Result<FrameInfo, String>>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let in_hook = Arc::clone(&pool);
+    let hook: Hook = Arc::new(move |point, key, frame| {
+        if point == Unpinned && key == K && frame == g {
+            let info = in_hook.frame_info(g).map_err(|e| e.to_string());
+            sink.lock().unwrap().push(info);
+        }
+    });
+    pool.set_hook(Some(hook));
     let made = pool.create(pool.reserve().unwrap(), K, Kind::Leaf, 2);
+    pool.set_hook(None);
     assert!(matches!(made, Err(StoreError::Poisoned(_))), "{made:?}");
+    let seen: Vec<Result<FrameInfo, String>> = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "one Unpinned for (K, g) in the call: {seen:?}"
+    );
+    assert!(
+        matches!(seen.as_slice(), [Ok(info)] if info.freed),
+        "the claim is given back before its pin drops: {seen:?}"
+    );
     assert_eq!(
         pool.frame_info(g).unwrap(),
         FrameInfo {
