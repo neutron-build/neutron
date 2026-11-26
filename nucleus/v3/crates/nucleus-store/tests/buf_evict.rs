@@ -1675,8 +1675,9 @@ fn hit_record(
 /// own pass (A6′) finds frame 0 dirty and frame 1 pinned, so it fires
 /// `PassEnded` holding nothing, just before the hold that decides.
 /// (a) The controller drops `p` there: the final hold sees that a frame
-/// became unheld since A1, T looks again and takes Y. No `PoolStarved`, no
-/// `UnpinWait`. Mutant PASS-NO-GEN ends T with `PoolStarved` there.
+/// became unheld since A1, T looks again from A1, and its sweep (four
+/// `SweepStep`) takes Y. No `PoolStarved`, no `UnpinWait`. Mutant PASS-NO-GEN
+/// ends T with `PoolStarved` there.
 /// (b) The controller pins `lpid(1)` there instead, a hit that moves no
 /// generation: every frame is then held, and T goes on to wait for an unpin;
 /// the controller's drop of `p` serves T frame 1. Mutant PASS-NO-SCAN ends T
@@ -1702,6 +1703,8 @@ fn own_pass_rechecks() {
             let first = pz.next_event();
             let mut seen = None;
             if first == Event::Arrived(PassEnded, NO_KEY, NO_FRAME) {
+                // T is paused here, so no step is missed or added.
+                pz.report(SweepStep, NO_KEY);
                 let at = at_pass_end(&pool, &p, fy);
                 let free = at.table_free == Ok(true);
                 seen = Some(at);
@@ -1748,8 +1751,14 @@ fn own_pass_rechecks() {
         assert_eq!(got.frame(), fy, "T got frame 1");
         assert_eq!(
             without_done(reported(&pz)),
-            vec![Event::Seen(Evicted, y, fy)],
-            "the one Evicted is Y, and no UnpinWait was seen"
+            vec![
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(SweepStep, NO_KEY, NO_FRAME),
+                Event::Seen(Evicted, y, fy),
+            ],
+            "after its release T looks again from A1 and sweeps (four SweepStep) before it takes Y; the one Evicted is Y, and no UnpinWait was seen"
         );
         drop(got);
         assert_eq!(pool.frame_of(y).unwrap(), None);
