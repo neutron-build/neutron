@@ -999,6 +999,7 @@ fn create_vs_freed() {
     let (
         first,
         table_free,
+        stats1,
         info1,
         stale_read,
         first_create,
@@ -1033,12 +1034,20 @@ fn create_vs_freed() {
         let (mut table_free, mut info1, mut stale_read, mut first_create) =
             (None, None, None, None);
         let (mut second, mut info2, mut latch_held, mut second_create) = (None, None, None, None);
+        let mut stats1 = None;
         if arrived(&first, FreedClaimed, K) && frame_of_event(&first) == Some(g) {
             // The controller goes on only if the table mutex is free: a
             // firing under it must fail the test, not hang it.
             let free = pool.table_free();
             table_free = Some(free);
             if free {
+                // Inside the guard: `stats()` takes the table mutex, which
+                // `table_free()` has just found free.
+                stats1 = Some(
+                    pool.stats()
+                        .map(|s| (s.free, s.reserved))
+                        .map_err(|e| e.to_string()),
+                );
                 info1 = Some(pool.frame_info(g).map_err(|e| e.to_string()));
                 // A stale name's read of the claimed frame, through a pin
                 // that cannot wait; the guard and the pin are dropped here.
@@ -1075,6 +1084,7 @@ fn create_vs_freed() {
         (
             first,
             table_free,
+            stats1,
             info1,
             stale_read,
             first_create,
@@ -1091,6 +1101,11 @@ fn create_vs_freed() {
         table_free,
         Some(true),
         "the hook fires holding no table mutex"
+    );
+    assert_eq!(
+        stats1,
+        Some(Ok((2, 0))),
+        "the creator's reservation is back on the free list when FreedClaimed fires"
     );
     assert_eq!(
         info1,

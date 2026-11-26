@@ -220,7 +220,8 @@ pub enum HookPoint {
     /// not yet in the table; no pin.
     CreateReady,
     /// C4, the freed branch (§4.2): the key's freed frame is claimed and not
-    /// yet latched; the creator holds its pin on it. No mutex.
+    /// yet latched; the creator holds its pin on it, and its reservation's
+    /// frame is back on the free list. No mutex.
     FreedClaimed,
     /// R1 (§5.2): the victim's exclusive latch is held; no pin.
     RemoveLatched,
