@@ -10,6 +10,8 @@
 //! - `latch_model_exhaustive`, `latch_model_overflow`, `latch_model_pct` and
 //!   `latch_model_random`: the blocking latch on the model checker's backend.
 //! - `latch_threads` and `latch_api`: the production backend.
+//! - `latch_forced_batch`: the blocking latch's batch path (R3's collection,
+//!   W2's handed stamps) on the production backend, in a forced order.
 //! - `sync_rwcell_std`, `sync_rwcell_model`, `sync_mutex_poison_std` and
 //!   `sync_mutex_poison_model`: the sync layer's cell and both backends'
 //!   poisoning.
@@ -30,7 +32,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use harness::monitor::{LatchMonitor, Violation};
+use harness::monitor::{LatchMonitor, Outcome, Request, Violation, check_trace};
 use harness::suite::{Op, Scenario, new_latch, overflow, run};
 use harness::{
     Bounds, EXHAUSTIVE, EXHAUSTIVE_CAP, Harness, PCT, RANDOM, Report, Shuttle, check, run_threads,
@@ -1433,4 +1435,113 @@ fn core_equality() -> Result<(), String> {
 #[test]
 fn latch_core_equality() {
     core_equality().unwrap();
+}
+
+/// How many rounds `latch_forced_batch`'s main thread yields, at most, for
+/// its two readers to queue. A count, not a time (Limit 6): in a correct
+/// build each reader queues within its first few instructions, so the bound
+/// only turns a reader that never queues into a failure instead of a hang.
+const QUEUE_ROUNDS: usize = 10_000_000;
+
+/// One reader's stamps in `latch_forced_batch`: arrived, granted, released.
+type ReaderStamps = (u64, u64, u64);
+
+/// `latch_forced_batch`: the batch path of the blocking latch, which no
+/// scenario of `latch_model_exhaustive` reaches (none queues two readers
+/// together; a three-thread batch scenario does not end within the cap).
+/// It forces the order the model tests can only sample, with no timing:
+/// on `Latch<StdPrimitives>` with K = 0, main holds Exclusive while two
+/// readers queue (it reads `info().waiting`, as A-3b's forced-order tests
+/// do), then releases. Whichever reader re-checks first grants the batch of
+/// both (R3), the other collects its handed grant, and W2 gives the two
+/// grants consecutive stamps in queue order after main's release. The
+/// monitor then checks the whole trace.
+fn forced_batch() -> Result<(), String> {
+    let latch: Arc<Latch<StdPrimitives>> = Arc::new(said(Latch::new(0, 3))?);
+    let main = said(latch.latch(Mode::Exclusive))?;
+    let (main_arrived, main_granted) = main.stamps();
+    let mut readers = Vec::new();
+    for id in [8, 16] {
+        let latch = Arc::clone(&latch);
+        let handle = std::thread::spawn(move || -> Result<ReaderStamps, String> {
+            let guard = latch.latch(Mode::Shared).map_err(|e| e.to_string())?;
+            let (arrived, granted) = guard.stamps();
+            let released = guard.release().map_err(|e| e.to_string())?;
+            Ok((arrived, granted, released))
+        });
+        readers.push((id, handle));
+    }
+    let mut rounds = 0;
+    while said(latch.info())?.waiting < 2 {
+        if readers.iter().any(|(_, handle)| handle.is_finished()) {
+            return Err("a reader returned while main held the latch exclusive".to_string());
+        }
+        rounds += 1;
+        require(
+            rounds < QUEUE_ROUNDS,
+            "the two readers did not queue behind the exclusive holder",
+        )?;
+        yield_now::<StdPrimitives>();
+    }
+    let main_released = said(main.release())?;
+    let mut requests = vec![Request {
+        id: 0,
+        mode: Mode::Exclusive,
+        kind: Kind::Blocking,
+        arrived: main_arrived,
+        outcome: Outcome::Granted {
+            grant: main_granted,
+            release: Some(main_released),
+        },
+    }];
+    let mut grants = Vec::new();
+    for (id, handle) in readers {
+        let (arrived, granted, released) = handle
+            .join()
+            .map_err(|_| "a reader panicked".to_string())??;
+        grants.push((arrived, granted));
+        requests.push(Request {
+            id,
+            mode: Mode::Shared,
+            kind: Kind::Blocking,
+            arrived,
+            outcome: Outcome::Granted {
+                grant: granted,
+                release: Some(released),
+            },
+        });
+    }
+    // Queue order is arrival order.
+    grants.sort_unstable();
+    let [(_, first), (_, second)] = grants[..] else {
+        return Err(format!("two readers' grants, where {grants:?}"));
+    };
+    require(
+        first > main_released,
+        format!("the batch's first grant {first} follows main's release {main_released}"),
+    )?;
+    require(
+        second == first.wrapping_add(1),
+        format!(
+            "the batch's grants are {first} and {second}: one tick per member in queue order (W2)"
+        ),
+    )?;
+    check_trace(&requests, 0).map_err(|v| v.to_string())?;
+    let info = said(latch.info())?;
+    require(
+        info == LatchInfo {
+            holders: Holders::Free,
+            waiting: 0,
+            arrivals: 3,
+            bound: 0,
+            capacity: 3,
+        },
+        format!("after the batch, info() is {info:?}"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn latch_forced_batch() {
+    forced_batch().unwrap();
 }
