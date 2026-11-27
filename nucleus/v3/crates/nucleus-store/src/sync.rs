@@ -56,8 +56,8 @@
 //!   and neither `unsafe` (N9) nor a primitive outside this layer (F2) may
 //!   provide them. Its first user is A-3b's frame latch.
 //!
-//! **What A-3b adds to the facade (card A-3b, Work 5; ESCALATE in its
-//! RESULT).** [`Primitives::mutex_try_lock`] and [`Mutex::try_lock`]. No
+//! **The table seam (card A-3b, Work 5's table seam).**
+//! [`Primitives::mutex_try_lock`] and [`Mutex::try_lock`]. No
 //! store path takes a mutex without waiting: a blocking acquire that may
 //! wait, and a `try` that never does, are the latch's ([`crate::latch`]),
 //! and a victim's latch is a latch, not a mutex. The one caller is a test
@@ -67,7 +67,8 @@
 //! this layer it had no equivalent here, and without it the tests of that
 //! invariant lose their oracle. So the layer grows the primitive the seam
 //! needs and nothing more: a try is a scheduling point like a lock, it
-//! never waits, and it answers a poisoned mutex with [`Poisoned`] (F5).
+//! never waits, and it answers a poisoned mutex with [`Poisoned`] (F5;
+//! S-STORE §9.2: the panic that poisoned it poisoned the store).
 
 use core::fmt;
 use core::ops::{Deref, DerefMut};
@@ -106,10 +107,10 @@ pub trait Primitives: Sized + Send + Sync + 'static {
     /// Locks the mutex, waiting for its holder, and reports a poisoned mutex
     /// as [`Poisoned`] without handing out its guard (F5).
     fn mutex_lock<T: Send>(m: &Self::RawMutex<T>) -> Result<Self::RawGuard<'_, T>, Poisoned>;
-    /// Tries the mutex without waiting (card A-3b, Work 5): `Ok(Some(guard))`
-    /// when it was free, `Ok(None)` while another thread holds it, and
-    /// `Err(Poisoned)` for a poisoned mutex, whose guard is never handed out
-    /// (F5).
+    /// Tries the mutex without waiting (card A-3b, Work 5's table seam):
+    /// `Ok(Some(guard))` when it was free, `Ok(None)` while another thread
+    /// holds it, and `Err(Poisoned)` for a poisoned mutex, whose guard is
+    /// never handed out (F5; S-STORE §9.2).
     fn mutex_try_lock<T: Send>(
         m: &Self::RawMutex<T>,
     ) -> Result<Option<Self::RawGuard<'_, T>>, Poisoned>;
@@ -186,15 +187,15 @@ impl<P: Primitives, T: Send> Mutex<P, T> {
             .map_err(|_| StoreError::Poisoned("sync layer mutex".into()))
     }
 
-    /// Tries the mutex without waiting (card A-3b, Work 5): the test seam
-    /// `buf::Pool::table_free`'s one primitive. No store path takes a mutex
-    /// this way.
+    /// Tries the mutex without waiting (card A-3b, Work 5's table seam): the
+    /// test seam `buf::Pool::table_free`'s one primitive. No store path takes
+    /// a mutex this way. `Ok(Some(guard))` when the mutex was free,
+    /// `Ok(None)` while another thread holds it.
     ///
     /// # Errors
     ///
-    /// `Ok(None)` while another thread holds the mutex.
     /// [`StoreError::Poisoned`] if a holder's panic poisoned it (S-STORE
-    /// §9.2). The poison's guard is not handed out.
+    /// §9.2; F5). The poison's guard is not handed out.
     pub fn try_lock(&self) -> Result<Option<MutexGuard<'_, P, T>>, StoreError> {
         P::mutex_try_lock(&self.raw)
             .map(|raw| raw.map(|raw| MutexGuard { raw }))
