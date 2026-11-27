@@ -3020,14 +3020,39 @@ res() { PYTHONDONTWRITEBYTECODE=1 python3 - "$e/$1" "$r" "$2" <<'P'
 import glob, json, os, pathlib, signal, subprocess, sys
 b, repo, expr = sys.argv[1:4]
 cid, e = pathlib.Path(b).name.split("-")[0], pathlib.Path(b).parent
+# ENF-ZOMBIE-1: a zombie answers kill(2) silently, so a successful kill is
+# not liveness. Under a PID 1 that reaps no orphans (a worker attempt: PID 1
+# there is `opencode run --standalone`, which reaps no orphans) a killed
+# same-group child stays a zombie and holds the pid's group, and the old
+# probe read that as alive. The state is read first, from /proc: a pid
+# counts as dead when it no longer exists or its state is Z. Read before
+# the kills, so a pid they end still reads alive; a live one is still
+# killed first, whatever EXPR says. Where /proc cannot be read, the
+# kill-based answer stands.
 pidf, gone = pathlib.Path(b + ".n.pid"), True
-for kill in (os.killpg, os.kill) if pidf.exists() else ():  # os.kill: a child left in the runner's own group
+pid = int(pidf.read_text()) if pidf.exists() else None
+def _state():
+    if pid is None:
+        return None  # no pid recorded: dead by default, as before
+    if not os.path.isdir("/proc"):
+        return "?"  # nothing to read: the kill-based answer
     try:
-        kill(int(pidf.read_text()), signal.SIGKILL)
+        with open(f"/proc/{pid}/stat") as f:
+            # state is field 3, after the parenthesised comm; comm can hold
+            # spaces and parentheses, so: the first field after the last ')'
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except FileNotFoundError:
+        return None  # no such pid: fully gone, reaped
+    except OSError:
+        return "?"  # present but unreadable: the kill-based answer
+state = _state()
+for kill in (os.killpg, os.kill) if pid is not None else ():  # os.kill: a child left in the runner's own group
+    try:
+        kill(pid, signal.SIGKILL)
         gone = False
     except ProcessLookupError:
         pass
-dead = lambda: gone
+dead = lambda: gone if state == "?" else state in (None, "Z")
 read = lambda suffix: pathlib.Path(b + suffix).read_text() if pathlib.Path(b + suffix).exists() else None
 r = json.loads(read(".json") or "{}")
 rc = int(read(".rc")) if read(".rc") else None
@@ -3179,6 +3204,101 @@ sys.exit(0 if c.returncode == -signal.SIGKILL else f"returncode {c.returncode}")
 P
 }
 expect_ok "runner e2e: BG: a second kill_child still kills a leader that is alive" bg_live_leader
+# --- ENF-ZOMBIE-1: res()'s dead() must be zombie-aware (rows K and BG under a
+# PID 1 that reaps no orphans — the worker's condition, QUEUE row
+# ENF-TIMING-1, 11-25 17:2x) ---
+# zkeeper: a non-reaping parent and adopter (a subreaper, as the worker's
+# opencode PID 1 is an adopter that reaps nothing). It builds and keeps, for
+# the rows below:
+#   XZ-a: a killed child of its own, never reaped — a zombie whose comm
+#         holds a space, '(' and ')' so a naive /proc stat parse misreads
+#         its state;
+#   XZ-b: rows K and BG's exact worker input: a group leader the runner's
+#         kill_child shape killed AND reaped, whose killed same-group
+#         member stays a zombie holding the group;
+#   XZ-c: a waited child — fully gone;
+#   XZ-d: a live child.
+# It writes each pid to $e/XZ-<x>.n.pid, touches $e/XZ.ready, then sleeps:
+# the corpses exist only while their non-reaping parent lives. exec: the
+# `kill "$zk"` below must reach the keeper itself; without it only the
+# background subshell dies, and the keeper outlives the suite for its 300 s,
+# holding the suite's stdout open.
+zkeeper() { PYTHONDONTWRITEBYTECODE=1 exec python3 - "$e" <<'P'
+import ctypes, os, pathlib, signal, subprocess, sys, time
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER: adopt orphans, reap none
+e = pathlib.Path(sys.argv[1])
+a = subprocess.Popen([sys.executable, "-c",
+    "import ctypes, time; ctypes.CDLL(None).prctl(15, b'zomb (ie)'); time.sleep(300)"])
+for _ in range(500):  # bounded: the child sets its comm before sleeping
+    try:
+        if open(f"/proc/{a.pid}/comm").read().strip() == "zomb (ie)":
+            break
+    except OSError:
+        pass
+    time.sleep(0.02)
+else:
+    sys.exit("the zombie child never set its comm")
+a.kill()  # a child of a non-reaping parent, killed: the corpse stays
+lead = subprocess.Popen(["bash", "-c", "sleep 300 & echo $!; wait"],
+                        stdout=subprocess.PIPE, process_group=0)
+member = int(lead.stdout.readline())
+lead.kill(); lead.wait()  # kill_child's shape: the leader killed AND reaped
+os.kill(member, signal.SIGKILL)  # the member: adopted by this subreaper when the
+                                 # leader died, killed, never reaped
+g = subprocess.Popen(["true"]); g.wait()  # fully gone
+d = subprocess.Popen(["sleep", "300"])  # live
+for name, pid in (("a", a.pid), ("b", lead.pid), ("c", g.pid), ("d", d.pid)):
+    (e / f"XZ-{name}.n.pid").write_text(f"{pid}\n")
+(e / "XZ.ready").touch()
+time.sleep(300)
+P
+}
+zkeeper & zk=$!
+i=0; while [ ! -e "$e/XZ.ready" ] && [ "$i" -lt 500 ]; do sleep 0.02; i=$((i + 1)); done
+expect_ok "runner e2e: Z: premise: the keeper recorded its four pids" bash -c 'for x in a b c d; do [ -s "$1/XZ-$x.n.pid" ] || exit 1; done' _ "$e"
+expect_ok "runner e2e: Z: a zombie counts as dead" res XZ-a "dead()"
+expect_ok "runner e2e: Z: a reaped leader whose zombie member holds the group counts as dead (rows K and BG's worker input)" res XZ-b "dead()"
+expect_ok "runner e2e: Z: a gone pid counts as dead" res XZ-c "dead()"
+expect_no "runner e2e: Z: a live process is not dead" res XZ-d "dead()"
+expect_ok "runner e2e: Z: a live one is killed first, whatever EXPR says" bash -c 'p=$(cat "$1/XZ-d.n.pid") || exit 1; s=$(ps -o stat= -p "$p" 2>/dev/null) || true; [ -z "$s" ] || [ "${s#Z}" != "$s" ]' _ "$e"
+kill "$zk" 2>/dev/null || true; wait "$zk" 2>/dev/null || true
+# --- ENF-ZOMBIE-1, rows K and BG themselves under a PID 1 that reaps no
+# orphans: the driver copy below is that PID 1 in miniature. It adopts the
+# run's orphans (PR_SET_CHILD_SUBREAPER) and reaps none, and it runs the
+# probe before it exits, while its zombies still hold their groups. Two
+# traps this shape avoids: a bash init reaps adopted children itself (its
+# job control reaps via waitpid(-1)), and an adopter that exits before the
+# probe lets the host's init reap the zombies, which would make the row
+# pass with and without the fix. The CT rows cannot be reused here: in
+# their real-unshare runs the pid file holds a namespace pid, so they
+# remove it before res (lines 3184-3187) — dead() reads the pid file, so
+# the probe must run in the same pid world as the fake. ---
+declare -f res >"$t/res.def"
+sed -e '/^import contextlib/a import ctypes; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # ENF-ZOMBIE-1: adopt the run orphans, reap none' -e "\$a import subprocess; sys.exit(subprocess.run(['bash', os.environ['Z_PROBE'], out.name, os.environ['E2E'], os.getcwd()]).returncode)  # ENF-ZOMBIE-1: probe before exit, while the zombies are unreaped" "$t/e2e.py" >"$t/e2e-zns.py"
+cat >"$t/zns-probe.sh" <<'Z'
+#!/usr/bin/env bash
+# ENF-ZOMBIE-1: the suite's live res() (res.def, written by declare -f
+# above), run by the driver copy before it exits. The premise is the
+# worker's condition itself: the pid file's pid is gone and an unreaped
+# zombie still holds its group.
+n=$1 e=$2 r=$3
+source "$(dirname "$0")/res.def"
+p=$(cat "$e/$n.n.pid") || exit 1
+kill -0 -- "-$p" 2>/dev/null || { echo "premise failed: nothing holds the group of $p (no zombie: the adopter did not work)"; exit 1; }
+res "$n" "$Z_EXPR"
+Z
+expect_ok "runner e2e: Z: premise: the driver copy adopts orphans and probes before exit" bash -c 'grep -q "prctl(36, 1" "$1" && grep -q Z_PROBE "$1"' _ "$t/e2e-zns.py"
+expect_ok "runner e2e: Z: premise: the probe runs the suite's live res" diff "$t/res.def" <(declare -f res)
+xkz_card=$(ec XKZ)
+expect_ok "runner e2e: Z: K's SIGTERM shape passes under a PID 1 that reaps no orphans" \
+  bash -c 'cd "$1" && FAKE_OC="forge silent" FAKE_OC_N="$2/XKZ.n" E2E="$2" PYTHONDONTWRITEBYTECODE=1 E2E_SIGTERM_AFTER=1 E2E_STALL_S=30 Z_PROBE="$3/zns-probe.sh" Z_EXPR="$4" python3 "$3/e2e-zns.py" "$5" "$2/XKZ" "$6" --base e2e/base --attempts 1' \
+  _ "$r" "$e" "$t" "rc == 143 and dead() and $closed" "$v3/tools/run_card.py" "$xkz_card"
+bg_alive_check_z="bash -c 'p=\$(cat $e/XBGZ.n.bg) || exit 1; s=\$(ps -o stat= -p \"\$p\" 2>/dev/null) || true; [ -z \"\$s\" ] || [ \"\${s#Z}\" != \"\$s\" ]'"
+printf '# CARD %s: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/base        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `%s`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' XBGZ "$bg_alive_check_z" >"$e/cards/XBGZ.local.md"
+expect_ok "runner e2e: Z: BG's same-group background child shape passes under a PID 1 that reaps no orphans" \
+  bash -c 'cd "$1" && FAKE_OC="work bgforge" FAKE_OC_N="$2/XBGZ.n" E2E="$2" PYTHONDONTWRITEBYTECODE=1 Z_PROBE="$3/zns-probe.sh" Z_EXPR="$4" python3 "$3/e2e-zns.py" "$5" "$2/XBGZ" "$6" --base e2e/base --attempts 1' \
+  _ "$r" "$e" "$t" "rc == 0 and r['pass'] and dead() and $closed" "$v3/tools/run_card.py" "$e/cards/XBGZ.local.md"
+expect_ok "runner e2e: Z: premise: bgforge recorded its background pid (Z row)" grep -qxE '[0-9]+' "$e/XBGZ.n.bg"
 # --- containment: real unshare around a fake that leaves the session (X-6-F1-F1-F2-F1) ---
 # Real opencode starts tool shells with setsid, so the group kill misses them
 # (verdict X-6-F1-F1-F2 R1). setsidforge does the same. The fake's pid file holds a
