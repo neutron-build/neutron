@@ -347,6 +347,12 @@ pub enum HookPoint {
     /// Card A-3c, Work 3.7: before each MapInner's mutex is taken by the
     /// map's growth; the key is the MapLeaf grown to, no frame, no map latch.
     GrowLocking,
+    /// Card A-3c (implementer's review, beside Work 3.8): `latch_leaf_parent`
+    /// found the MapInner's latch held by another thread and is about to
+    /// wait for it, its request counted; the key is the MapLeaf, no frame,
+    /// and the firing thread holds no map latch and no mutex. The seam that
+    /// places a race on the map latch's wait (test `map_latch_wait`).
+    MapLatchWaiting,
 }
 
 /// A test hook (card A-3a; S-STORE §15's hook-placed interleavings): called
@@ -859,8 +865,12 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// `t`. Counts the event and, while an acquisition waits for an unpin,
     /// wakes every waiter. The four callers are [`Pin::drop`] (U1),
     /// [`FrameReservation::drop`] (U2), the cleanup of a load (U3) and a
-    /// pin's Orphan path (U4); no other site changes `unheld_events`, and a
-    /// frame that `remove_from_table` makes `Reserved` stays held.
+    /// pin's Orphan path (U4). Card A-3c adds two kinds of site: the end of a
+    /// §4.1 pin that was its MapLeaf's last count (`mark_written`,
+    /// `mark_freed`, `create`'s failed revival; Work 6.3), and a write that
+    /// cleans a victim and leaves it in the table (E5's and E6's `Kept`;
+    /// Work 8.3). No other site changes `unheld_events`, and a frame that
+    /// `remove_from_table` makes `Reserved` stays held.
     pub(crate) fn became_unheld(&self, t: &mut Table) {
         t.unheld_events = t.unheld_events.wrapping_add(1);
         if t.unpin_waiters > 0 {
@@ -1506,9 +1516,6 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 drop(c);
                 drop(res);
                 self.fire(HookPoint::FreedClaimed, key, g);
-                if let (Some(lf), PageKey::Lpid(x)) = (leaf, key) {
-                    self.fire(HookPoint::DirtyPinned, PageKey::MapLeaf(x / fanout), lf);
-                }
                 // A freed frame's latch holders hold nothing else: stale-name
                 // threads (§6.8) and `try_victim`.
                 let made = self
@@ -1528,7 +1535,14 @@ impl<H: File, P: Primitives> Pool<H, P> {
                         // taken with the claim ends (card A-3c, Work 6.3).
                         let mut t = self.lock_table()?;
                         if let (Some(lf), PageKey::Lpid(x)) = (leaf, key) {
-                            end_dirty_pin(&mut t, PageKey::MapLeaf(x / fanout), g, lf)?;
+                            // `DirtyPinned` fires only once the page is
+                            // made, so none fired for this pin and none
+                            // `DirtyUnpinned` fires for its end. Its end may
+                            // be the MapLeaf's last count: an unheld event.
+                            let last = end_dirty_pin(&mut t, PageKey::MapLeaf(x / fanout), g, lf)?;
+                            if last {
+                                self.became_unheld(&mut t);
+                            }
                         }
                         t.meta_mut(g)?.freed = true;
                         return Err(e);
@@ -1724,7 +1738,9 @@ impl<H: File, P: Primitives> Pool<H, P> {
                     "LPID {x}'s MapLeaf frame is missing where its §4.1 pin ends (S-STORE §4.1)"
                 ))
             })?;
-            end_dirty_pin(&mut t, leaf, f, lf)?;
+            if end_dirty_pin(&mut t, leaf, f, lf)? {
+                self.became_unheld(&mut t);
+            }
             ended = Some((leaf, lf));
         }
         let m = t.meta_mut(f)?;
@@ -1810,7 +1826,9 @@ impl<H: File, P: Primitives> Pool<H, P> {
                         "{key:?}'s MapLeaf frame is missing where its §4.1 pin ends (S-STORE §4.1)"
                     ))
                 })?;
-                end_dirty_pin(&mut t, leaf, f, lf)?;
+                if end_dirty_pin(&mut t, leaf, f, lf)? {
+                    self.became_unheld(&mut t);
+                }
                 lf
             };
             self.fire(HookPoint::DirtyUnpinned, leaf, lf);
@@ -2048,7 +2066,20 @@ fn take_dirty_pin(t: &mut Table, lf: FrameId, f: FrameId) -> Result<(), StoreErr
 /// Work 6.3's effect, under the table mutex: the LPID page's frame `f` ends
 /// its §4.1 pin on the MapLeaf frame `lf`. A frame that holds no such pin,
 /// or a MapLeaf with none left, is an engine bookkeeping error (§9.2).
-fn end_dirty_pin(t: &mut Table, leaf: PageKey, f: FrameId, lf: FrameId) -> Result<(), StoreError> {
+///
+/// Answers whether that was the MapLeaf's last count, so that the caller,
+/// still under the table mutex, counts the unheld event (U1–U4's second
+/// half, [`Pool::became_unheld`]): an acquisition waiting at A7 for an unpin
+/// must be woken when a MapLeaf whose last dirty page left the pool becomes
+/// a victim, or it sleeps beside a clean unpinned frame (card A-3c, Work
+/// 6.3; A-3b-0's A7).
+#[must_use = "a last count is an unheld event the caller must count"]
+fn end_dirty_pin(
+    t: &mut Table,
+    leaf: PageKey,
+    f: FrameId,
+    lf: FrameId,
+) -> Result<bool, StoreError> {
     if !t.meta(f)?.holds_dirty_pin {
         return Err(StoreError::Invalid(format!(
             "frame {} is dirty under {leaf:?} but holds no §4.1 pin (S-STORE §4.1)",
@@ -2061,11 +2092,11 @@ fn end_dirty_pin(t: &mut Table, leaf: PageKey, f: FrameId, lf: FrameId) -> Resul
             lf.0, f.0
         )));
     }
-    t.lower(lf)?;
+    let left = t.lower(lf)?;
     let lm = t.meta_mut(lf)?;
     lm.dirty_pins -= 1;
     t.meta_mut(f)?.holds_dirty_pin = false;
-    Ok(())
+    Ok(left == 0)
 }
 
 /// The frame loading `key`, if the table holds it `Loading`.

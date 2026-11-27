@@ -344,8 +344,12 @@ impl<P: Primitives> SlotAlloc<P> {
     ///
     /// # Errors
     /// [`StoreError::Invalid`], changing nothing, if a slot of
-    /// `newly_pending` is fixed, reserved, past `slot_count`, free or listed
-    /// twice. The call allocates nothing.
+    /// `newly_pending` is fixed, reserved, past `slot_count`, free, already
+    /// pending or listed twice. The call allocates nothing. A pending slot
+    /// is one image `k−2` referenced and image `k−1` does not, so it is
+    /// never among those image `k−1` references; taking it would leave it
+    /// both free (the old generation's move) and pending, and `alloc` could
+    /// hand it out while an image may still read it.
     pub fn release_step6(&self, newly_pending: &[u64]) -> Result<(), StoreError> {
         let bad = |what: String| StoreError::Invalid(format!("step 6's release: {what}"));
         let mut s = self.lock()?;
@@ -360,6 +364,11 @@ impl<P: Primitives> SlotAlloc<P> {
             }
             if s.free.get(slot) {
                 return Err(bad(format!("slot {slot} is free")));
+            }
+            if s.pending.get(slot) {
+                return Err(bad(format!(
+                    "slot {slot} is already pending, and this release frees it"
+                )));
             }
         }
         // A duplicate is told with the free bitmap as a scratch set, which

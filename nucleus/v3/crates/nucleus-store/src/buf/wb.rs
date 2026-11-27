@@ -34,7 +34,7 @@ use super::gate::GateHold;
 use super::key::PageKey;
 use super::lpids::LpidState;
 use super::pool::{PinOutcome, Pool, PoolConfig};
-use super::slots::{SlotAlloc, SlotHook, SlotInit, SlotStats, SlotUse};
+use super::slots::{SlotAlloc, SlotInit, SlotStats, SlotUse};
 use super::sync::{Arc, Mutex, Primitives, StdPrimitives};
 use super::table::FrameMeta;
 use crate::map::MapGeometry;
@@ -397,7 +397,7 @@ impl<H: File, P: Primitives> Pool<H, P> {
 
     /// Install or remove the slot hook (Work 10; `test-hooks` only).
     #[cfg(feature = "test-hooks")]
-    pub fn set_slot_hook(&self, hook: Option<SlotHook>) {
+    pub fn set_slot_hook(&self, hook: Option<super::slots::SlotHook>) {
         if let Ok(slots) = self.slots() {
             slots.set_hook(hook);
         }

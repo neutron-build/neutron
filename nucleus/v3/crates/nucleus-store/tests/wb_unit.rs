@@ -653,6 +653,15 @@ impl LpModel {
             }
         }
         cands.sort_unstable();
+        // §5.6: under a pinned new MapLeaf the LPIDs from `next_lpid` on
+        // count as free, so they are candidates above; what `next_lpid++`
+        // hands out next starts past them, since no LPID is taken twice.
+        let fresh = cands
+            .iter()
+            .copied()
+            .filter(|&x| x >= self.next)
+            .max()
+            .map_or(self.next, |m| m + 1);
         if cands.len() >= n {
             let lpids: Vec<u64> = cands.into_iter().take(n).collect();
             self.commit(&lpids);
@@ -662,7 +671,7 @@ impl LpModel {
             };
         }
         if !emptied.is_empty() {
-            let leaf = self.first_outside_held(&held, 1).unwrap_or(self.next) / LF;
+            let leaf = self.first_outside_held(&held, 1).unwrap_or(fresh) / LF;
             return LpAnswer::Restart { leaf, emptied };
         }
         let mut lpids = cands;
@@ -680,7 +689,7 @@ impl LpModel {
                 None => break,
             }
         }
-        let mut x = self.next;
+        let mut x = fresh;
         while lpids.len() < n {
             lpids.push(x);
             if !pinned.contains(&(x / LF)) {
@@ -707,8 +716,10 @@ impl LpModel {
                 self.free.remove(&x);
             }
         }
-        if let Some(&last) = lpids.last() {
-            self.next = self.next.max(last + 1);
+        // `next_lpid` passes every LPID taken at or past it, wherever it
+        // stands in the list.
+        for &x in lpids {
+            self.next = self.next.max(x + 1);
         }
     }
 
@@ -905,6 +916,220 @@ fn lpid_table() {
         }
     });
     assert_eq!(sequences, 19 + 19 * 19 + 19 * 19 * 19);
+}
+
+/// `lpid_table`'s fixture, for the scripted cases of `lpid_held_scripts`:
+/// `n` 1, `F` 18, fanout 2, `slot_count` 600, epoch 1; MapLeafs 0, 1 and 2
+/// made and resident, LPIDs 1..=5 allocated with no page, `next_lpid` 6.
+fn lp_fixture() -> Result<(Arc<WbFile>, Pool<WbFile, StdPrimitives>), StoreError> {
+    let (file, pool) =
+        wb_pool::<StdPrimitives>(18, LF, 600, 1, H_MIN_TEST).map_err(StoreError::Invalid)?;
+    for i in 0..=2 {
+        s3_make_mapleaf(&pool, i)?;
+    }
+    {
+        let g = pool.gate_shared()?;
+        for _ in 0..5 {
+            match pool.alloc_lpids(1, &[], &g)? {
+                LpidAlloc::Taken { .. } => {}
+                LpidAlloc::Restart(r) => {
+                    return Err(StoreError::Invalid(format!(
+                        "the fixture's allocation restarted at {}",
+                        r.leaf
+                    )));
+                }
+            }
+        }
+    }
+    Ok((file, pool))
+}
+
+/// One allocation of `n` LPIDs under `held` in a gated operation of its own,
+/// as an `LpAnswer`: the LPIDs and the MapLeafs newly pinned (whose pins are
+/// then dropped), or the restart.
+fn lp_alloc(
+    pool: &Pool<WbFile, StdPrimitives>,
+    n: usize,
+    held: &[u64],
+) -> Result<LpAnswer, StoreError> {
+    let g = pool.gate_shared()?;
+    let answer = match pool.alloc_lpids(n, held, &g)? {
+        LpidAlloc::Taken { lpids, pins } => {
+            let mut pinned = Vec::new();
+            for p in &pins {
+                match p.key() {
+                    PageKey::MapLeaf(i) => pinned.push(i),
+                    other => return Err(StoreError::Invalid(format!("a pin on {other:?}"))),
+                }
+            }
+            LpAnswer::Taken { lpids, pinned }
+        }
+        LpidAlloc::Restart(AllocRestart { leaf, emptied }) => LpAnswer::Restart { leaf, emptied },
+    };
+    drop(g);
+    Ok(answer)
+}
+
+/// `lpid_held_scripts` (card A-3c, Work 14.1, beside `lpid_table`, whose
+/// sequences of length 1 to 3 never allocate with a held MapLeaf, since a
+/// held MapLeaf needs a restart at a made one first). L1, L2 and L3 with
+/// held MapLeafs, scripted on `lpid_table`'s fixture (fanout 2: MapLeaf `i`
+/// maps LPIDs `2i` and `2i + 1`), each answer worked out in the test from
+/// S-STORE §4.2 and §5.6 "Restart" as Work 5 restates them. Mutants
+/// ALLOC-RETRY-LOWEST (a), WB-LPID-EMPTIED-TAKES (b), (c), (d); the two
+/// defects the implementer's review found, an LPID handed out twice in one
+/// call (e) and `next_lpid` left below an LPID taken from it (f); and the
+/// bound `1 ≤ n ≤ 64` (g).
+#[test]
+fn lpid_held_scripts() {
+    let taken = |lpids: &[u64], pinned: &[u64]| LpAnswer::Taken {
+        lpids: lpids.to_vec(),
+        pinned: pinned.to_vec(),
+    };
+    let restart = |leaf: u64, emptied: &[u64]| LpAnswer::Restart {
+        leaf,
+        emptied: emptied.to_vec(),
+    };
+    let stats = |next_lpid: u64, free: u64| LpidStats { next_lpid, free };
+
+    // (a) L1: LPIDs 1 (MapLeaf 0) and 5 (MapLeaf 2) free, MapLeaf 2 held.
+    // The retry takes 5, the lowest free LPID under a MapLeaf it holds, not
+    // 1, the lowest overall, and pins nothing new.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        pool.release_lpid(1).unwrap();
+        pool.release_lpid(5).unwrap();
+        let _held = pin(&pool, mapleaf(2), &Hold::nothing()).unwrap();
+        assert_eq!(lp_alloc(&pool, 1, &[2]).unwrap(), taken(&[5], &[]), "(a)");
+        assert_eq!(pool.lpid_stats().unwrap(), stats(6, 1), "(a)");
+        assert!(pool.lpid_is_free(1).unwrap(), "(a)");
+    }
+    // (b) L2: LPID 1 free, MapLeaf 2 held and left with no free LPID.
+    // Nothing is taken; the restart names MapLeaf 0, LPID 1's, and drops 2.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        pool.release_lpid(1).unwrap();
+        let _held = pin(&pool, mapleaf(2), &Hold::nothing()).unwrap();
+        assert_eq!(lp_alloc(&pool, 1, &[2]).unwrap(), restart(0, &[2]), "(b)");
+        assert_eq!(pool.lpid_stats().unwrap(), stats(6, 1), "(b)");
+        assert!(pool.lpid_is_free(1).unwrap(), "(b)");
+    }
+    // (c) L2 beside L1: MapLeafs 0 (LPID 1 free) and 2 (none free) held, two
+    // LPIDs asked. One candidate is too few and 2 is emptied, so nothing is
+    // taken; past the held MapLeafs, L3 would take `next_lpid` 6, under
+    // MapLeaf 3.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        pool.release_lpid(1).unwrap();
+        let _h0 = pin(&pool, mapleaf(0), &Hold::nothing()).unwrap();
+        let _h2 = pin(&pool, mapleaf(2), &Hold::nothing()).unwrap();
+        assert_eq!(
+            lp_alloc(&pool, 2, &[0, 2]).unwrap(),
+            restart(3, &[2]),
+            "(c)"
+        );
+        assert_eq!(pool.lpid_stats().unwrap(), stats(6, 1), "(c)");
+    }
+    // (d) L2 with `next_lpid` under a held MapLeaf: MapLeaf 3 made and held
+    // (it covers `next_lpid` 6, so LPIDs 6 and 7 count as free), MapLeaf 2
+    // held and emptied, three asked. The restart names the MapLeaf of the
+    // first LPID past 7, MapLeaf 4, never 3, which the caller holds.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        s3_make_mapleaf(&pool, 3).unwrap();
+        let _h2 = pin(&pool, mapleaf(2), &Hold::nothing()).unwrap();
+        let _h3 = pin(&pool, mapleaf(3), &Hold::nothing()).unwrap();
+        assert_eq!(
+            lp_alloc(&pool, 3, &[2, 3]).unwrap(),
+            restart(4, &[2]),
+            "(d)"
+        );
+        assert_eq!(pool.lpid_stats().unwrap(), stats(6, 0), "(d)");
+    }
+    // (e) L3 past L1's candidates from `next_lpid`: MapLeafs 3 and 4 made, 3
+    // held, four asked. L1 counts 6 and 7; L3 adds 8 and 9, under MapLeaf 4,
+    // which it pins. Each LPID once, and `next_lpid` becomes 10.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        s3_make_mapleaf(&pool, 3).unwrap();
+        s3_make_mapleaf(&pool, 4).unwrap();
+        let _h3 = pin(&pool, mapleaf(3), &Hold::nothing()).unwrap();
+        assert_eq!(
+            lp_alloc(&pool, 4, &[3]).unwrap(),
+            taken(&[6, 7, 8, 9], &[4]),
+            "(e)"
+        );
+        assert_eq!(pool.lpid_stats().unwrap(), stats(10, 0), "(e)");
+    }
+    // (f) `next_lpid` passes every LPID taken from it: MapLeaf 3 made and
+    // held, LPID 1 free, three asked. L1's 6 and 7, then LPID 1 under MapLeaf
+    // 0, which L3 pins; `next_lpid` becomes 8 although 1 comes last. The
+    // next allocation then needs LPID 8, under MapLeaf 4, never made.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        s3_make_mapleaf(&pool, 3).unwrap();
+        pool.release_lpid(1).unwrap();
+        let _h3 = pin(&pool, mapleaf(3), &Hold::nothing()).unwrap();
+        assert_eq!(
+            lp_alloc(&pool, 3, &[3]).unwrap(),
+            taken(&[6, 7, 1], &[0]),
+            "(f)"
+        );
+        assert_eq!(pool.lpid_stats().unwrap(), stats(8, 0), "(f)");
+        assert!(!pool.lpid_is_free(1).unwrap(), "(f)");
+        assert_eq!(lp_alloc(&pool, 1, &[]).unwrap(), restart(4, &[]), "(f)");
+    }
+    // (g) One call takes 1 to 64 LPIDs (Work 5): 0 and 65 are `Invalid`; 64
+    // is answered (here a restart at MapLeaf 3, which is not made), and
+    // nothing is taken.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        let g = pool.gate_shared().unwrap();
+        assert!(is_invalid(&pool.alloc_lpids(0, &[], &g)), "(g) 0");
+        assert!(is_invalid(&pool.alloc_lpids(65, &[], &g)), "(g) 65");
+        drop(g);
+        assert_eq!(lp_alloc(&pool, 64, &[]).unwrap(), restart(3, &[]), "(g) 64");
+        assert_eq!(pool.lpid_stats().unwrap(), stats(6, 0), "(g)");
+    }
+}
+
+/// `release_step6_pending_refused` (card A-3c, Work 4, S5; the implementer's
+/// review): a slot that is already pending is not made pending again. Image
+/// `k−1` never references a slot pending since the previous step 6 (one
+/// image `k−2` referenced and `k−1` does not), and taking it would leave it
+/// both free, by the old generation's move, and pending, so that `alloc`
+/// could hand out a slot an image may still read. `Invalid`, changing
+/// nothing.
+#[test]
+fn release_step6_pending_refused() {
+    let alloc = SlotAlloc::<StdPrimitives>::new(
+        PS,
+        600,
+        256..258,
+        SlotInit::Given {
+            free: vec![3],
+            pending: vec![4],
+        },
+    )
+    .unwrap();
+    let before = alloc.stats().unwrap();
+    assert!(is_invalid(&alloc.release_step6(&[5, 4])));
+    assert_eq!(alloc.stats().unwrap(), before);
+    assert_eq!(alloc.state(4).unwrap(), SlotUse::Pending);
+    assert_eq!(alloc.state(5).unwrap(), SlotUse::Used);
+    // The next release frees slot 4 once: free, and no longer pending.
+    alloc.release_step6(&[5]).unwrap();
+    assert_eq!(alloc.state(4).unwrap(), SlotUse::Free);
+    assert_eq!(alloc.state(5).unwrap(), SlotUse::Pending);
+    assert_eq!(
+        alloc.stats().unwrap(),
+        SlotStats {
+            slot_count: 600,
+            free: 2,
+            pending: 1,
+            growths: 0,
+        }
+    );
 }
 
 // ------------------------------------------------------------------ the map
@@ -1511,7 +1736,10 @@ fn evict_prev_epoch() {
 
 /// `pin_hook_kinds` (card A-3c, Work 6.5): §4.1's pins fire `DirtyPinned` and
 /// `DirtyUnpinned`, never `Pinned` or `Unpinned`, and an eviction fires no
-/// `Pinned`. Mutants WB-DIRTYPIN-HOOKED, WB-EVICT-PIN-HOOKED.
+/// `Pinned`; L3's residency pins, an operation's own, fire `Pinned` and
+/// `Unpinned`; a revived freed page's §4.1 pin fires `DirtyPinned` once.
+/// Mutants WB-DIRTYPIN-HOOKED, WB-EVICT-PIN-HOOKED; L3's pins taken quiet,
+/// and `DirtyPinned` fired twice at a revival (both found in review).
 #[test]
 fn pin_hook_kinds() {
     assert_eq!(min_f(1), 18);
@@ -1573,6 +1801,43 @@ fn pin_hook_kinds() {
     check("while pin_page(x)'s pin is held", false, Some(lpid(x)));
     drop(p);
     check("after the pin is dropped", false, None);
+
+    // L3's residency pins are an operation's own (Work 6.5): an allocation
+    // L3 serves under MapLeaf 0, which it pins, fires `Pinned` for it once,
+    // and the pin's drop `Unpinned`.
+    {
+        let before = lock(&counts).get(&mapleaf(0)).copied().unwrap_or([0; 4]);
+        let g = pool.gate_shared().unwrap();
+        let (lpids, pins) = match pool.alloc_lpids(1, &[], &g).unwrap() {
+            LpidAlloc::Taken { lpids, pins } => (lpids, pins),
+            LpidAlloc::Restart(r) => panic!("the allocation restarted at {}", r.leaf),
+        };
+        assert_eq!(lpids, vec![2]);
+        assert_eq!(
+            pins.iter().map(|p| p.key()).collect::<Vec<_>>(),
+            vec![mapleaf(0)]
+        );
+        let during = lock(&counts).get(&mapleaf(0)).copied().unwrap_or([0; 4]);
+        assert_eq!(during[0] - before[0], 1, "L3's pin fired Pinned once");
+        check(
+            "while L3's pin on MapLeaf 0 is held",
+            false,
+            Some(mapleaf(0)),
+        );
+        drop(pins);
+        drop(g);
+        check("after L3's pin is dropped", false, None);
+    }
+
+    // A creation that revives a freed page's frame (`create`'s freed
+    // branch) takes §4.1's pin once and fires `DirtyPinned` once.
+    s3_free(pool, x, 4).unwrap();
+    check("after s3_free(x)", false, None);
+    let (y, p) = s3_new_page(pool, 0x42).unwrap();
+    assert_eq!(y, x, "the lowest free LPID is x again");
+    check("while the revived page's pin is held", true, Some(lpid(x)));
+    drop(p);
+    check("after the revived page's pin is dropped", true, None);
 }
 
 /// `s1_records_root` (card A-3c, Work 14.1): S1 records the root and its

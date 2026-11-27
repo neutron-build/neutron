@@ -12,9 +12,10 @@
 //!   table." Every acquisition goes through [`Pool::lock_freeset`], which
 //!   fires `FreesetLocking` before it locks, and whose guard fires
 //!   `FreesetUnlocked` after it unlocks (Work 10): the seam of
-//!   `t_freeset_lock_order`. The one allocation it can make is the bitmap's
-//!   growth for a released LPID past its length (a `try_reserve`), which is
-//!   still only "setting an LPID bit".
+//!   `t_freeset_lock_order`. Nothing allocates under it: `alloc_lpids`
+//!   reserves its buffers before it locks, and `release_lpid`, which may
+//!   need a longer bitmap, reserves one with the lock released and adopts
+//!   it under the lock by copying words.
 //! - **L1, held MapLeafs first** (§5.6 "Restart"): "A restarted allocation
 //!   keeps the MapLeaf pins its restart took and, on its retry, takes the
 //!   lowest free LPIDs that lie under MapLeafs it holds pinned, before any
@@ -45,23 +46,18 @@ use core::ops::{Deref, DerefMut};
 use nucleus_env::File;
 
 use super::bitmap::Bitmap;
-use super::frame::{FrameId, Pin};
+use super::frame::Pin;
 use super::gate::GateHold;
 use super::key::PageKey;
 use super::pool::{FireOnDrop, HookPoint, Pool};
 use super::sync::{MutexGuard, Primitives, StdPrimitives};
+use super::wb::{NO_FRAME, NO_KEY};
 use crate::store::StoreError;
 
 /// The most LPIDs one call takes (card A-3c, Work 5): a split cascading
 /// through a tree of `H` levels allocates at most `H + 1`, and 64 bounds the
 /// buffers a call reserves before the lock.
 pub(crate) const MAX_LPIDS_AT_ONCE: usize = 64;
-
-/// The key a hook of the allocator fires with: no page (LPID 0 is null).
-const NO_KEY: PageKey = PageKey::Lpid(0);
-
-/// The frame a hook of the allocator fires with when it has none.
-const NO_FRAME: FrameId = FrameId(u32::MAX);
 
 /// The LPID bitmap and `next_lpid`, under the free-set lock.
 #[derive(Debug)]
@@ -218,6 +214,20 @@ fn first_outside_held(st: &LpidState, held_sorted: &[u64], f: u64, from: u64) ->
     None
 }
 
+/// The first LPID that L3 may take from `next_lpid` on: `next_lpid` itself,
+/// or, when L1 already counted the LPIDs from `next_lpid` to the end of a
+/// held MapLeaf as free (S-STORE §5.6: "under a pinned new MapLeaf, the
+/// LPIDs from `next_lpid` on count as free"), the first LPID past them, so
+/// that no LPID is chosen twice in one call. `cands` are L1's candidates.
+fn fresh_start(next: u64, cands: &[u64]) -> Result<u64, StoreError> {
+    match cands.iter().copied().filter(|&x| x >= next).max() {
+        Some(last) => last
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Invalid("LPID allocation: an LPID passed u64".into())),
+        None => Ok(next),
+    }
+}
+
 /// Note that MapLeaf `leaf` must be pinned, once, keeping the order first
 /// needed.
 fn need_leaf(need: &mut Vec<u64>, leaf: u64) {
@@ -302,7 +312,10 @@ fn plan(
         need_leaf(&mut scr.need, x / f);
         at = first_outside_held(st, &scr.held_sorted, f, x.saturating_add(1));
     }
-    let mut x = next;
+    // From `next_lpid` on, past any LPID L1 already counted there. None of
+    // these lies under a held MapLeaf: a held MapLeaf that starts past
+    // `next_lpid` has no candidate, so L2 has already answered.
+    let mut x = fresh_start(next, &scr.cands)?;
     while lpids.len() < n {
         lpids.push(x);
         need_leaf(&mut scr.need, x / f);
@@ -311,8 +324,10 @@ fn plan(
     Ok(Verdict::Taken)
 }
 
-/// Take the chosen LPIDs: clear their bits and advance `next_lpid` past any
-/// taken from it. Called with the free-set lock held.
+/// Take the chosen LPIDs: clear their bits and advance `next_lpid` past
+/// every one taken from it. The highest of those need not come last: L3
+/// takes L1's candidates from `next_lpid` on before the free LPIDs below it.
+/// Called with the free-set lock held.
 fn commit(st: &mut LpidState, lpids: &[u64]) -> Result<(), StoreError> {
     let old_next = st.next_lpid;
     for &x in lpids {
@@ -322,10 +337,8 @@ fn commit(st: &mut LpidState, lpids: &[u64]) -> Result<(), StoreError> {
             })?;
         }
     }
-    if let Some(&last) = lpids.last()
-        && last >= old_next
-    {
-        st.next_lpid = last
+    if let Some(highest) = lpids.iter().copied().filter(|&x| x >= old_next).max() {
+        st.next_lpid = highest
             .checked_add(1)
             .ok_or_else(|| StoreError::Invalid("next_lpid passed u64".into()))?;
     }
@@ -394,9 +407,11 @@ impl<H: File, P: Primitives> Pool<H, P> {
         let mut st = self.lock_freeset()?;
         match plan(&st, f, n, held, &mut scr, &mut lpids)? {
             Verdict::Restart => {
-                // `leaf` is the MapLeaf of the lowest LPID L3 would choose.
-                let leaf =
-                    first_outside_held(&st, &scr.held_sorted, f, 1).unwrap_or(st.next_lpid) / f;
+                // `leaf` is the MapLeaf of the lowest LPID L3 would choose
+                // under a MapLeaf the caller does not hold: the lowest free
+                // one, else the first from `next_lpid` on past L1's.
+                let fresh = fresh_start(st.next_lpid, &scr.cands)?;
+                let leaf = first_outside_held(&st, &scr.held_sorted, f, 1).unwrap_or(fresh) / f;
                 Ok(LpidAlloc::Restart(AllocRestart {
                     leaf,
                     emptied: core::mem::take(&mut scr.emptied),
@@ -404,8 +419,12 @@ impl<H: File, P: Primitives> Pool<H, P> {
             }
             Verdict::Taken => {
                 let mut failed = None;
+                // The reservation's MapLeafs are the operation's own pins
+                // (Work 6.5): `pin_resident`, which fires `Pinned` (and their
+                // drop `Unpinned`), hooks Work 10 lets fire under the
+                // free-set lock.
                 for &leaf in &scr.need {
-                    match self.pin_resident_internal(PageKey::MapLeaf(leaf))? {
+                    match self.pin_resident(PageKey::MapLeaf(leaf))? {
                         Some(p) => pins.push(p),
                         None => {
                             failed = Some(leaf);
@@ -437,6 +456,14 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// for an LPID at or past `next_lpid` or for one already free;
     /// [`StoreError::OutOfMemory`] if the bitmap must grow for it and cannot
     /// (nothing changes).
+    ///
+    /// The bitmap covers the LPIDs below `next_lpid` at construction, and
+    /// `alloc_lpids` advances `next_lpid` without growing it, so a released
+    /// LPID may lie past its length. Nothing allocates under the free-set
+    /// lock (§4.2: under it "a thread only tests and sets LPID bits"): the
+    /// longer bitmap is reserved with the lock released, then adopted under
+    /// it by copying words, and the old one is dropped after the unlock.
+    /// `next_lpid` only grows, so the second hold always adopts.
     pub fn release_lpid(&self, lpid: u64) -> Result<(), StoreError> {
         let invalid = |what: String| StoreError::Invalid(format!("LPID free: {what}"));
         if self.wb().is_none() {
@@ -444,28 +471,45 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 "the pool was not built with write-back (card A-3c)".to_string(),
             ));
         }
-        let mut st = self.lock_freeset()?;
-        if lpid == 0 {
-            return Err(invalid("LPID 0 is null (S-STORE §1)".to_string()));
+        let mut spare: Option<Bitmap> = None;
+        loop {
+            let mut st = self.lock_freeset()?;
+            if lpid == 0 {
+                return Err(invalid("LPID 0 is null (S-STORE §1)".to_string()));
+            }
+            if lpid >= st.next_lpid {
+                return Err(invalid(format!(
+                    "LPID {lpid} is at or past next_lpid {}",
+                    st.next_lpid
+                )));
+            }
+            if st.free.get(lpid) {
+                return Err(invalid(format!("LPID {lpid} is already free")));
+            }
+            let mut old = None;
+            if lpid >= st.free.len() {
+                match spare.take() {
+                    Some(longer) if lpid < longer.len() => {
+                        old = Some(st.free.adopt(longer)?);
+                    }
+                    _ => {
+                        // Reserve a bitmap for every LPID below `next_lpid`
+                        // with the lock released, and look again.
+                        let want = st.next_lpid;
+                        drop(st);
+                        spare = Some(Bitmap::with_len(want)?);
+                        continue;
+                    }
+                }
+            }
+            let set = st
+                .free
+                .set(lpid, true)
+                .map_err(|_| invalid("a bit past the bitmap".to_string()));
+            drop(st);
+            drop(old);
+            return set;
         }
-        if lpid >= st.next_lpid {
-            return Err(invalid(format!(
-                "LPID {lpid} is at or past next_lpid {}",
-                st.next_lpid
-            )));
-        }
-        if st.free.get(lpid) {
-            return Err(invalid(format!("LPID {lpid} is already free")));
-        }
-        if lpid >= st.free.len() {
-            st.free.grow_to(
-                lpid.checked_add(1)
-                    .ok_or_else(|| invalid("an LPID past u64".to_string()))?,
-            )?;
-        }
-        st.free
-            .set(lpid, true)
-            .map_err(|_| invalid("a bit past the bitmap".to_string()))
     }
 
     /// The allocator's counters (the diagnostics of Work 5).

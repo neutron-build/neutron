@@ -81,6 +81,27 @@ impl Bitmap {
         Ok(())
     }
 
+    /// Take `longer`'s place, keeping every bit: `longer` covers at least as
+    /// many bits as `self`, all clear, and its words were reserved by the
+    /// caller, so this copies words and allocates nothing (the free-set
+    /// lock's rule, card A-3c, Work 5). Returns the old bitmap, for the
+    /// caller to drop after it releases its lock.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] if `longer` covers fewer bits than `self`.
+    pub(crate) fn adopt(&mut self, mut longer: Bitmap) -> Result<Bitmap, StoreError> {
+        if longer.len < self.len {
+            return Err(StoreError::Invalid(format!(
+                "a bitmap of {} bits cannot take the place of one of {}",
+                longer.len, self.len
+            )));
+        }
+        for (to, from) in longer.words.iter_mut().zip(self.words.iter()) {
+            *to = *from;
+        }
+        Ok(core::mem::replace(self, longer))
+    }
+
     /// How many bits the bitmap covers.
     pub(crate) fn len(&self) -> u64 {
         self.len
