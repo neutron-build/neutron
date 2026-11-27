@@ -108,6 +108,13 @@ impl WbOracle {
         }
     }
 
+    /// How many slots the model holds free.
+    pub fn predict_free(&self) -> u64 {
+        (3..self.slot_count)
+            .filter(|s| self.use_of(*s) == Use::Free)
+            .count() as u64
+    }
+
     /// The file's length in slots the model holds.
     pub fn slot_count(&self) -> u64 {
         self.slot_count
