@@ -84,6 +84,22 @@ use crate::store::StoreError;
 /// A-3b-0, Work 6): no frame has it, since `frames ≤ 2^31`.
 const NO_FRAME: FrameId = FrameId(u32::MAX);
 
+/// A6's and A6′'s yield before the acquisition looks again (card A-3b-0,
+/// Work 5), except for an acquisition made while its thread holds a page
+/// being loaded, which looks again at once (card A-3c, Work 8; S-STORE §5.3
+/// "No latch escapes a call": "a storage call never yields (an `await`, or
+/// an N10 cooperative step boundary) while it holds a latch, nor while it
+/// holds a page being loaded"). Card A-3c's nested MapLeaf pin (P5's
+/// `current_ref`, Work 3.3) is the first acquisition that runs inside a
+/// load. It still waits for no other thread's call to end: the latch it
+/// found busy is another thread's momentary `try_victim` or pin. Mutant
+/// LOAD-ACROSS-YIELD is judged by `t_latch_scope` (A-4c).
+fn yield_unless_in_load<H: File, P: Primitives>(hold: &Hold<'_, '_, H, P>) {
+    if !hold.in_load {
+        yield_now::<P>();
+    }
+}
+
 /// What the acquisition answered (card A-3c, Work 8.3).
 pub(crate) enum Acquired<'p, H: File, P: Primitives> {
     /// A frame, reserved for the caller.
@@ -229,8 +245,12 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 if busy {
                     // Another thread's brief latch on a victim, or a pin whose
                     // drop moved the generation (§5.3's fairness bound): never
-                    // block on it, and look again.
-                    yield_now::<P>();
+                    // block on it, and look again. Without yielding when the
+                    // thread holds a page being loaded (the nested MapLeaf
+                    // pin of a load; card A-3c, Work 8): S-STORE §5.3, "a
+                    // storage call never yields ... while it holds a page
+                    // being loaded".
+                    yield_unless_in_load(hold);
                     continue;
                 }
                 match self.own_pass(g0, key, hold)? {
@@ -393,7 +413,8 @@ impl<H: File, P: Primitives> Pool<H, P> {
             }
         }
         if busy {
-            yield_now::<P>();
+            // As at A6: no yield while the thread holds a page being loaded.
+            yield_unless_in_load(hold);
             return Ok(Pass::Retry);
         }
         self.fire(HookPoint::PassEnded, key, NO_FRAME);
