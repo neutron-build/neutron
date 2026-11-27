@@ -111,3 +111,7 @@ pub mod wal;
 pub use pool::BufferPool;
 pub use store::{MemStore, PageId, PageStore, StoreError};
 pub use tree::{BTree, TreeStats};
+
+// Card A-4c0: the sync facade and the task-fair latch of S-STORE 5.3.
+pub mod latch;
+pub mod sync;
