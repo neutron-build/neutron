@@ -1437,8 +1437,13 @@ fn latch_core_equality() {
     core_equality().unwrap();
 }
 
+/// How many readers `latch_forced_batch` queues together. Three, so that a
+/// handed member's stamp is checked whichever reader grants the batch: with
+/// two, the member the batch hands to may be the oldest, whose offset is 0.
+const READERS: u32 = 3;
+
 /// How many rounds `latch_forced_batch`'s main thread yields, at most, for
-/// its two readers to queue. A count, not a time (Limit 6): in a correct
+/// its readers to queue. A count, not a time (Limit 6): in a correct
 /// build each reader queues within its first few instructions, so the bound
 /// only turns a reader that never queues into a failure instead of a hang.
 const QUEUE_ROUNDS: usize = 10_000_000;
@@ -1450,18 +1455,18 @@ type ReaderStamps = (u64, u64, u64);
 /// scenario of `latch_model_exhaustive` reaches (none queues two readers
 /// together; a three-thread batch scenario does not end within the cap).
 /// It forces the order the model tests can only sample, with no timing:
-/// on `Latch<StdPrimitives>` with K = 0, main holds Exclusive while two
-/// readers queue (it reads `info().waiting`, as A-3b's forced-order tests
-/// do), then releases. Whichever reader re-checks first grants the batch of
-/// both (R3), the other collects its handed grant, and W2 gives the two
-/// grants consecutive stamps in queue order after main's release. The
-/// monitor then checks the whole trace.
+/// on `Latch<StdPrimitives>` with K = 0, main holds Exclusive while
+/// [`READERS`] readers queue (it reads `info().waiting`, as A-3b's
+/// forced-order tests do), then releases. Whichever reader re-checks first
+/// grants the batch of all of them (R3), the others collect their handed
+/// grants, and W2 gives the grants consecutive stamps in queue order after
+/// main's release. The monitor then checks the whole trace.
 fn forced_batch() -> Result<(), String> {
-    let latch: Arc<Latch<StdPrimitives>> = Arc::new(said(Latch::new(0, 3))?);
+    let latch: Arc<Latch<StdPrimitives>> = Arc::new(said(Latch::new(0, READERS + 1))?);
     let main = said(latch.latch(Mode::Exclusive))?;
     let (main_arrived, main_granted) = main.stamps();
     let mut readers = Vec::new();
-    for id in [8, 16] {
+    for id in (1..=READERS as usize).map(|n| n * 8) {
         let latch = Arc::clone(&latch);
         let handle = std::thread::spawn(move || -> Result<ReaderStamps, String> {
             let guard = latch.latch(Mode::Shared).map_err(|e| e.to_string())?;
@@ -1472,14 +1477,14 @@ fn forced_batch() -> Result<(), String> {
         readers.push((id, handle));
     }
     let mut rounds = 0;
-    while said(latch.info())?.waiting < 2 {
+    while said(latch.info())?.waiting < READERS {
         if readers.iter().any(|(_, handle)| handle.is_finished()) {
             return Err("a reader returned while main held the latch exclusive".to_string());
         }
         rounds += 1;
         require(
             rounds < QUEUE_ROUNDS,
-            "the two readers did not queue behind the exclusive holder",
+            "the readers did not queue behind the exclusive holder",
         )?;
         yield_now::<StdPrimitives>();
     }
@@ -1513,17 +1518,17 @@ fn forced_batch() -> Result<(), String> {
     }
     // Queue order is arrival order.
     grants.sort_unstable();
-    let [(_, first), (_, second)] = grants[..] else {
-        return Err(format!("two readers' grants, where {grants:?}"));
-    };
+    let first = grants.first().map_or(0, |&(_, granted)| granted);
     require(
         first > main_released,
         format!("the batch's first grant {first} follows main's release {main_released}"),
     )?;
+    let expected: Vec<u64> = (0..u64::from(READERS)).map(|n| first + n).collect();
+    let granted: Vec<u64> = grants.iter().map(|&(_, granted)| granted).collect();
     require(
-        second == first.wrapping_add(1),
+        granted == expected,
         format!(
-            "the batch's grants are {first} and {second}: one tick per member in queue order (W2)"
+            "the batch's grants, in arrival order, are {granted:?}, where one tick per member in queue order (W2) gives {expected:?}"
         ),
     )?;
     check_trace(&requests, 0).map_err(|v| v.to_string())?;
@@ -1532,9 +1537,9 @@ fn forced_batch() -> Result<(), String> {
         info == LatchInfo {
             holders: Holders::Free,
             waiting: 0,
-            arrivals: 3,
+            arrivals: u64::from(READERS) + 1,
             bound: 0,
-            capacity: 3,
+            capacity: READERS + 1,
         },
         format!("after the batch, info() is {info:?}"),
     )?;
