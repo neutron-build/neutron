@@ -19,6 +19,13 @@
 //!   pushed last is popped next (LIFO, which tests `load_integrity` (j) and
 //!   `born_latched` rely on). A frame is on it exactly when its state is
 //!   `Free` ([`Table::release`] refuses a frame that is already `Free`).
+//! - **§4.1's pins** (card A-3c, Work 6.1; S-STORE §4.1 "Residency": "a
+//!   MapLeaf stays resident while any page it maps is dirty in the pool (it
+//!   holds one pin per such page; §5.4)"): a MapLeaf frame's `dirty_pins`
+//!   counts the dirty LPID pages that hold it and is part of its `pins`, so
+//!   `try_victim` refuses it; an LPID page's `holds_dirty_pin` is true exactly
+//!   while it is dirty in a write-back pool. Both change under this mutex,
+//!   latched by the page whose transition they belong to.
 //! - **The reference bit** (S-STORE §5.2 "Clock"; card A-3b-0, Work 3):
 //!   [`FrameMeta::referenced`] is set only where a user pin raises a frame's
 //!   count, cleared when the frame becomes `Free` or `Reserved`, and by the
@@ -58,6 +65,16 @@ pub(crate) struct FrameMeta {
     /// where a user pin raises the count, never by `pin_frame`, and cleared
     /// when the frame becomes `Free` or `Reserved` and by the sweep.
     pub(crate) referenced: bool,
+    /// On a MapLeaf's frame (card A-3c, Work 6.1): how many LPID pages it
+    /// maps hold §4.1's pin on it while they are dirty in the pool (S-STORE
+    /// §4.1 "Residency"). A part of `pins`, kept apart so that
+    /// `try_victim` refuses the frame and the hooks can tell it from an
+    /// operation's pin; 0 on every other frame.
+    pub(crate) dirty_pins: u64,
+    /// On an LPID page's frame (card A-3c, Work 6.1): whether the page is
+    /// dirty and so holds §4.1's pin on its MapLeaf's frame; false on every
+    /// other frame and on a clean page.
+    pub(crate) holds_dirty_pin: bool,
     /// The next frame on this frame's bucket chain.
     pub(crate) next: Option<FrameId>,
 }
@@ -71,6 +88,8 @@ impl FrameMeta {
         pins: 0,
         freed: false,
         referenced: false,
+        dirty_pins: 0,
+        holds_dirty_pin: false,
         next: None,
     };
 }

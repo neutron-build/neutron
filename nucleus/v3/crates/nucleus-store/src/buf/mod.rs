@@ -12,6 +12,17 @@
 //! No tree uses this module yet: card A-4a moves the tree onto it and
 //! retires the seed's `pool` (lib.rs, "Seed status").
 //!
+//! Card A-3c: the write-back, in pools built with `Pool::with_writeback`, each
+//! part in its own module with the invariants it owns: the epoch gate
+//! (`gate`, S-STORE §5.6), the current page map and its growth (`cmap`,
+//! §4.1), slot allocation with the two-generation pending frees (`slots`,
+//! §4.3–§4.5, §13 step 6), LPID allocation under the free-set lock (`lpids`,
+//! §4.2, §5.6), dirty eviction to fresh slots (`evict`, §5.2), the caller's
+//! `Hold` and the pool's write-back state (`wb`), and the bitmap both free
+//! sets use (`bitmap`). A pool built with `Pool::new` keeps A-3a's and A-3b's
+//! behaviour exactly: it never writes, takes no §4.1 pin, and answers
+//! `Invalid` to every write-back call.
+//!
 //! Card A-3b: every frame's latch is card A-4c0's task-fair `latch::Latch`
 //! (S-STORE §5.3 "Fair latches"), with bypass bound [`FRAME_LATCH_BOUND`] and
 //! a fixed waiter queue, beside the frame's content in a cell of the store's
@@ -143,27 +154,40 @@
 //!
 //! # What later cards add (not here)
 //!
-//! Card A-3c: the current page map
-//! behind `CurrentRef`, dirty eviction (which replaces `acquire`'s
-//! `PoolStarved` branch and the epoch-copy reserve sized from
-//! `PoolSizing::r_epoch`), the poison mark in every acquisition and wait
-//! predicate here (§9.2), and the mapping of this module's `Invalid` (every
+//! Card A-3c-B: the poison mark in every acquisition and wait predicate here
+//! (§9.2), the broadcast, and the mapping of this module's `Invalid` (every
 //! one an engine invariant violation when an engine caller meets it) to XX000
-//! (§9.2 at draft 7.20).
+//! (§9.2 at draft 7.20). Card A-3c-C: the epoch-copy reserve sized from
+//! `PoolSizing::r_epoch`, the image-record list and step 2, and the write of
+//! a dirty victim from before the last flip (§5.2), which `evict` now passes
+//! over (`PrevEpoch`); until it lands `acquire`'s `PoolStarved` remains the
+//! answer when every unpinned frame is dirty and unwritable. Card A-7a:
+//! `write_guard`, whose copy decision `cmap`'s touch check stands in for.
 
 mod acquire;
+mod bitmap;
+mod cmap;
+mod evict;
 mod frame;
+mod gate;
 mod key;
+mod lpids;
 mod pool;
 mod sizing;
+mod slots;
 mod sync;
 mod table;
+mod wb;
 
+pub use cmap::{LeafParent, MapShape};
+pub use evict::EvictOutcome;
 pub use frame::{
     CreatedPage, ExclusiveGuard, FRAME_LATCH_BOUND, FrameId, FrameReservation, FrameState, Pin,
     Removal, SharedGuard, VictimGuard,
 };
+pub use gate::{FlipGuard, GateHold, ImageRoot};
 pub use key::PageKey;
+pub use lpids::{AllocRestart, LpidAlloc, LpidStats};
 pub use pool::{
     CreateOutcome, CurrentRef, FrameInfo, Hook, HookPoint, PinOutcome, Pool, PoolConfig,
     PoolFootprint, PoolStats,
@@ -171,3 +195,5 @@ pub use pool::{
 pub use sizing::{
     H_MIN, IMAGE_RECORD_BYTES, OWN_PINNING_THREADS, PoolSizing, STEP2_RESERVE_FRAMES,
 };
+pub use slots::{SlotAlloc, SlotHook, SlotInit, SlotStats, SlotUse};
+pub use wb::{Hold, MapPinInfo, Restart, WriteBackConfig};
