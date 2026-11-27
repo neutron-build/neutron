@@ -239,7 +239,6 @@ fn t_pool_floor_scattered() {
     };
     let (fired, events, r_a, r_b, r_g) = thread::scope(|s| {
         let mut events = Vec::new();
-        let fired: bool;
         let a = spawn(s, &pz, "A", a_work);
         // "A ready", or a wait for an unpin.
         events.push(pz.next_event());
@@ -264,7 +263,7 @@ fn t_pool_floor_scattered() {
                 }
             }
         }
-        fired = events
+        let fired = events
             .iter()
             .any(|e| matches!(e, Event::Seen(UnpinWait, _, _)));
         // On `Seen`, record it and release A and B (their drops let G's wait
