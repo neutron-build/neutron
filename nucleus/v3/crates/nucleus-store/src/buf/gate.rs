@@ -40,16 +40,10 @@
 use nucleus_env::File;
 
 use super::frame::FrameId;
-use super::key::PageKey;
 use super::pool::{HookPoint, Pool};
 use super::sync::{Condvar, Mutex, MutexGuard, Primitives, StdPrimitives};
+use super::wb::{NO_FRAME, NO_KEY};
 use crate::store::StoreError;
-
-/// The key a hook of the gate fires with: no page (LPID 0 is null, §1).
-const NO_KEY: PageKey = PageKey::Lpid(0);
-
-/// The frame a hook of the gate fires with when it has none.
-const NO_FRAME: FrameId = FrameId(u32::MAX);
 
 /// The map's root as a flip records it for an image (S-STORE §13 step 0
 /// item 2; §4.1: "The root is always a MapInner, at level 1 or above").

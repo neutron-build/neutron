@@ -38,9 +38,12 @@
 //!   page". Positions count from the leaf level, so a new level changes no
 //!   page's id (card A-2's `position_id`).
 //! - **The touch check** (Work 6.4) stands in for `write_guard`'s copy
-//!   decision until A-7a: a mutation of a map page whose content epoch is
-//!   below `e` while it is dirty needs the epoch copy A-7a builds, and is
-//!   `Invalid` here.
+//!   decision until A-7a, on a MapLeaf's entries only: "It never copies a
+//!   MapInner" (§5.6 "When it copies", card S-MU), so a MapInner's ref or
+//!   child is set with no check. A MapLeaf mutation in epoch `e` of content
+//!   from an earlier epoch needs the epoch copy A-7a builds and is `Invalid`
+//!   here, except for a clean MapLeaf after S1's stand-in flip, which S1
+//!   counts as the map phase having taken its content (see `touch_check`).
 //! - **A load reads the map holding no map latch while it pins or waits**
 //!   (§5.4: "No thread waits for a load while it holds a map latch"; §4.2).
 //!
@@ -51,18 +54,14 @@
 
 use nucleus_env::File;
 
-use super::frame::FrameId;
 use super::gate::GateHold;
 use super::key::PageKey;
 use super::pool::{CurrentRef, HookPoint, PinOutcome, Pool};
 use super::sync::{Arc, Condvar, Mutex, Primitives, StdPrimitives};
-use super::wb::Hold;
+use super::wb::{Hold, NO_FRAME};
 use crate::map::{self, MapGeometry};
 use crate::meta::Ref;
 use crate::store::StoreError;
-
-/// The frame a hook of the map fires with when it has none.
-const NO_FRAME: FrameId = FrameId(u32::MAX);
 
 /// An index into the map's node list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,12 +129,24 @@ impl<P: Primitives> BodyCell<P> {
     /// Take the latch (blocking): the holder owns the body until it gives it
     /// back with [`BodyCell::give_back`].
     fn take(&self) -> Result<InnerBody, StoreError> {
+        self.take_then(|| {})
+    }
+
+    /// [`BodyCell::take`], calling `before_wait` once if the body is taken:
+    /// after the request is counted, with the cell's mutex released, so a
+    /// hook it fires holds no mutex (card A-3c, Work 10). The wait then
+    /// re-tests under the mutex, so a give-back in between is not lost: it
+    /// finds the count raised and notifies, or the waiter finds the body.
+    fn take_then(&self, before_wait: impl FnOnce()) -> Result<InnerBody, StoreError> {
         let mut s = self.slot.lock().map_err(|_| poisoned("map latch"))?;
         if s.body.is_none() {
             s.waiters = s
                 .waiters
                 .checked_add(1)
                 .ok_or_else(|| StoreError::Invalid("a map latch's waiters passed u32".into()))?;
+            drop(s);
+            before_wait();
+            s = self.slot.lock().map_err(|_| poisoned("map latch"))?;
             while s.body.is_none() {
                 s = self.wake.wait(s).map_err(|_| poisoned("map latch"))?;
             }
@@ -262,9 +273,23 @@ impl<P: Primitives> core::fmt::Debug for LeafParent<P> {
     }
 }
 
-/// Work 6.4's touch check: whether a mutation of a map page may go on in
-/// epoch `e` without `write_guard`'s epoch copy (§5.6 "When it copies",
-/// A-7a's).
+/// Work 6.4's touch check, on a MapLeaf's frame: whether a mutation of its
+/// entries may go on in epoch `e` without `write_guard`'s epoch copy (§5.6
+/// "When it copies", A-7a's). A MapInner is never copied (§5.6: "It never
+/// copies a MapInner"), so no MapInner mutation calls it.
+///
+/// - Content epoch `e`: no copy is needed.
+/// - Above `e`: engine damage.
+/// - Below `e` and dirty: the content of image `e − 1` is only in this
+///   frame, so the mutation needs the copy, which A-7a builds: `Invalid`.
+/// - Below `e` and clean: S-STORE 7.23 copies "whether or not its frame is
+///   dirty ... unless the map phase has taken that content for image
+///   `e − 1`". Before A-7c only S1 flips, and S1 runs no step 2. This card
+///   reads S1 as counting its flip as the map phase having taken every clean
+///   MapLeaf's content, the sentence its implementer's report proposes for
+///   S-STORE §15 S1 (card A-3c, ESCALATE 3): so the mutation goes on. It
+///   loses nothing at this card: no image is read before A-3c-C, and §4.4's
+///   rule here frees no home whose epoch is below `e` before step 6.
 pub(crate) fn touch_check(content_epoch: u32, dirty: bool, e: u32) -> Result<(), StoreError> {
     if content_epoch == e {
         return Ok(());
@@ -275,7 +300,7 @@ pub(crate) fn touch_check(content_epoch: u32, dirty: bool, e: u32) -> Result<(),
         )));
     }
     if !dirty {
-        // Its content is at its home, which the image map references.
+        // S1's flip counts as the map phase having taken this content.
         return Ok(());
     }
     Err(StoreError::Invalid(format!(
@@ -442,8 +467,10 @@ impl<P: Primitives> CurrentMap<P> {
         })?;
         let j = usize::try_from(i % self.fanout())
             .map_err(|_| StoreError::Invalid("a map slot past usize".into()))?;
+        // No touch check: a MapInner is never copied (§5.6 "When it
+        // copies"). So nothing here can refuse once E6 has marked the
+        // MapLeaf written, except engine damage (a missing path or ref).
         parent.cell.with(|body| {
-            touch_check(body.content_epoch, body.dirty, e)?;
             let old = body
                 .refs
                 .get(j)
@@ -547,6 +574,10 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// or the path to it lacks a MapInner. Hold no other map latch, and
     /// release this one before any load or wait (§5.3, §5.4).
     ///
+    /// If another thread holds that MapInner's latch,
+    /// [`HookPoint::MapLatchWaiting`] fires before this one waits, with the
+    /// MapLeaf's key and no frame, holding nothing.
+    ///
     /// # Errors
     /// [`StoreError::Invalid`] on a pool without write-back or for a missing
     /// path; [`StoreError::Poisoned`] if a mutex was poisoned.
@@ -557,7 +588,9 @@ impl<H: File, P: Primitives> Pool<H, P> {
         })?;
         let j = usize::try_from(leaf % cmap.fanout())
             .map_err(|_| StoreError::Invalid("a map slot past usize".into()))?;
-        let body = node.cell.take()?;
+        let body = node.cell.take_then(|| {
+            self.fire(HookPoint::MapLatchWaiting, PageKey::MapLeaf(leaf), NO_FRAME);
+        })?;
         Ok(LeafParent {
             cell: Arc::clone(&node.cell),
             body,
@@ -579,8 +612,8 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// taken, with the MapLeaf's key and no frame.
     ///
     /// # Errors
-    /// [`StoreError::Invalid`] on a pool without write-back, or from the
-    /// touch check (Work 6.4); [`StoreError::OutOfMemory`] if a node cannot
+    /// [`StoreError::Invalid`] on a pool without write-back;
+    /// [`StoreError::OutOfMemory`] if a node cannot
     /// be allocated, nothing changed; [`StoreError::Poisoned`] if a mutex
     /// was poisoned.
     pub fn grow_map(&self, leaf: u64, g: &GateHold<'_, H, P>) -> Result<(), StoreError> {
@@ -640,7 +673,10 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 if let Some(child) = body.children.get(slot).copied().flatten() {
                     return Ok(child);
                 }
-                touch_check(body.content_epoch, body.dirty, e)?;
+                // No touch check: a MapInner is never copied (§5.6 "When
+                // it copies"; §4.1 "Growth": "The parent a new MapInner
+                // changes is changed through `write_guard`, which copies no
+                // MapInner").
                 let span = cmap.span(level)?;
                 let made = CurrentMap::make_inner(&cmap.geom, level - 1, leaf / span, e, |_| {})?;
                 let new = cmap.push(made)?;

@@ -33,7 +33,13 @@
 //!   the writer writes the bytes, keeping the frame pinned and in the page
 //!   table; it then releases the page's latch, latches the parent
 //!   exclusively and sets the ref. An eviction drops the frame only after
-//!   that, and only if no one has dirtied or pinned it meanwhile."
+//!   that, and only if no one has dirtied or pinned it meanwhile." Nothing
+//!   between `mark_written` and the ref's update can refuse on a correct
+//!   build: E2 lets only a MapLeaf of content epoch `e` reach E6, and the
+//!   parent's update runs no touch check (a MapInner is never copied, §5.6
+//!   "When it copies"). What can still fail there is engine damage (a
+//!   missing MapInner path, a poisoned mutex), which A-3c-B makes
+//!   fail-stop, so the half-written state is never used.
 //! - **E8, holds.** "Under a victim's latch takes only map latches" (§5.3):
 //!   the victim's MapLeaf's latch or, the victim's released, its MapInner's
 //!   mutex; the slot mutex; the page table. No tree latch, no free-set lock,
@@ -106,7 +112,8 @@ impl<H: File, P: Primitives> Pool<H, P> {
     ///
     /// # Errors
     /// [`StoreError::Invalid`] for a dirty frame of a pool built with
-    /// [`Pool::new`], or where E3's checks or the touch check fail;
+    /// [`Pool::new`], or where E3's checks or the touch check of an LPID
+    /// victim's MapLeaf fail (before anything is changed but the slot);
     /// [`StoreError::Env`] if the write fails (the victim then stays dirty
     /// and in the table); [`StoreError::OutOfMemory`] if the slot allocator
     /// cannot grow; [`StoreError::Poisoned`] if a mutex was poisoned.
