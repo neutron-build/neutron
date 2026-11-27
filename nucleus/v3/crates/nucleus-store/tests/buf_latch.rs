@@ -908,34 +908,28 @@ fn random_executions() -> usize {
 // ---------------------------------------------- t_root_latch_fair, latch-level variant
 
 /// `t_root_latch_fair`'s latch-level variant (S-STORE §15 I-LATCH; the latch
-/// type directly; exploration `EXHAUSTIVE`): with a writer queued on a latch
-/// that a reader holds, or is releasing, `try_latch` in either mode fails,
-/// including at the instant the reader releases. Main takes `Latch<H>`
-/// shared and makes `try_latch(Shared)` and `try_latch(Exclusive)`,
-/// releasing what it is granted; then W takes the latch exclusive and
-/// releases it, while main releases and makes the same two tries again, over
-/// the writer that waits or is being granted; main joins W.
+/// type directly; exploration `EXHAUSTIVE`): "with a writer queued on a frame
+/// that a reader holds shared, `try_latch` in either mode fails, including at
+/// the instant the reader releases". The card's script (Work 9): main takes
+/// `Latch<H>` shared; W takes it exclusive and releases it; main makes
+/// `try_latch(Shared)` and `try_latch(Exclusive)`, releasing what it is
+/// granted, releases its hold, makes the same two tries again, and joins W.
 ///
-/// So the second round of tries, and the release before it, are W's whole
-/// life: the search holds every interleaving of W's arrival, its wake and
-/// its release with them, among those the ones in which W is queued and not
-/// yet granted at each of main's second-round tries, where a try that
-/// succeeds over a queued writer (TRYLATCH-BYPASS) is M3 and fails the
-/// direct assertion. W is spawned after the first round on purpose: with W
-/// runnable during both rounds, the search holds the interleavings of its
-/// arrival with the first round's and of its wake with the second's, and
-/// these multiply past the cap (measured: past 100,000 executions). The
-/// first round is then the same two tries on a latch main holds shared with
-/// no writer waiting, where the shared one is granted and the exclusive one
-/// refused, and stamps are taken for the trace.
+/// W is spawned right after main takes the latch, so the search holds every
+/// interleaving of W's arrival with both rounds of tries and with main's
+/// release: among them the schedules in which W is queued while main still
+/// holds the latch shared (the first round, where a shared try that a held
+/// latch lets over the queued writer fails: mutant TRYLATCH-BYPASS-HELD) and
+/// those in which W is queued at or after main's release and not yet granted
+/// (the second round: mutant TRYLATCH-BYPASS). Either success over a queued
+/// writer is M3 or M2 and fails the direct assertion. The search ends under
+/// the cap (RESULT gives its count).
 fn latch_level<H: Harness>() -> Result<(), String> {
     let latch = Arc::new(Latch::<H>::new(K, 2).map_err(said)?);
 
     // Main takes it shared.
     let held_guard = latch.latch(Mode::Shared).map_err(said)?;
     let (arrived, granted) = held_guard.stamps();
-    let mut mine = Vec::new();
-    two_tries(&latch, TRIES[0], &mut mine)?;
 
     // W takes it exclusive and releases it.
     let theirs = Arc::clone(&latch);
@@ -952,6 +946,10 @@ fn latch_level<H: Harness>() -> Result<(), String> {
             release,
         ))
     });
+
+    // Main's two tries, over W once it has queued.
+    let mut mine = Vec::new();
+    two_tries(&latch, TRIES[0], &mut mine)?;
 
     // Main releases, then the same two tries again.
     let release = held_guard.release().map_err(said)?;
