@@ -568,13 +568,12 @@ fn freeset_order<H: Harness>(boundary: bool) -> Result<(), String> {
             // one dirty eviction is made.
             let mut made = 0;
             for x in [1u64, 2, 3] {
-                if let Some(f) = pool.frame_of(lpid(x)).map_err(said)? {
-                    if let nucleus_store::buf::EvictOutcome::Obtained(res) =
+                if let Some(f) = pool.frame_of(lpid(x)).map_err(said)?
+                    && let nucleus_store::buf::EvictOutcome::Obtained(res) =
                         pool.evict_frame(f, &Hold::nothing()).map_err(said)?
-                    {
-                        drop(res);
-                        made += 1;
-                    }
+                {
+                    drop(res);
+                    made += 1;
                 }
             }
             if made == 0 {
