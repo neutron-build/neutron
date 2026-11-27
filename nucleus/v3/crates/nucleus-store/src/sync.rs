@@ -458,15 +458,16 @@ impl Primitives for StdPrimitives {
         current: u64,
         new: u64,
     ) -> Result<u64, u64> {
-        // A failed exchange answers with the value read right after it: the
-        // standard library's error keeps the value it saw to itself.
+        // A failed exchange answers with the value it compared against, which
+        // the standard library returns in `Err`. A second load would answer
+        // with a later value, and would differ from the model checker's
+        // backend, which also returns the value compared (F1).
         a.compare_exchange(
             current,
             new,
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
         )
-        .map_err(|_| a.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn rwcell_new<T: Send + Sync>(value: T) -> Self::RawRwCell<T> {

@@ -11,6 +11,9 @@
 //! - `sync_rwcell_std`, `sync_rwcell_model`, `sync_mutex_poison_std` and
 //!   `sync_mutex_poison_model`: the sync layer's cell and both backends'
 //!   poisoning.
+//! - `sync_atomic_std` and `sync_atomic_model`: the sync layer's atomic,
+//!   including the value a failed `compare_exchange` answers, on both
+//!   backends.
 //!
 //! Every helper returns `Result`: the workspace lints deny `unwrap`, `expect`
 //! and `panic!` outside `#[test]` functions.
@@ -28,7 +31,7 @@ use harness::{
 };
 use nucleus_store::StoreError;
 use nucleus_store::latch::{Batch, Holders, Kind, Latch, LatchCore, LatchInfo, Mode, TryLatch};
-use nucleus_store::sync::{Mutex, RwCell, StdPrimitives, yield_now};
+use nucleus_store::sync::{AtomicU64, Mutex, Primitives, RwCell, StdPrimitives, yield_now};
 
 /// A check that answers with its text instead of panicking.
 fn require(condition: bool, what: impl Into<String>) -> Result<(), String> {
@@ -1095,6 +1098,52 @@ fn sync_mutex_poison_model() {
         "sync_mutex_poison_model executions: {} (cap {EXHAUSTIVE_CAP})",
         report.executions
     );
+    assert!(
+        report.executions < EXHAUSTIVE_CAP,
+        "the search reached the cap"
+    );
+}
+
+/// `sync_atomic_std` and `sync_atomic_model` (F1, F3): every operation of the
+/// sync layer's atomic answers the same on both backends. A failed
+/// `compare_exchange` answers `Err` with the value it compared against and
+/// stores nothing; a successful one answers `Ok` with the old value.
+fn atomic_ops<P: Primitives>() -> Result<(), String> {
+    let a: AtomicU64<P> = AtomicU64::new(5);
+    require(a.load() == 5, "load after new(5)")?;
+    a.store(7);
+    require(a.load() == 7, "load after store(7)")?;
+    require(a.fetch_add(3) == 7, "fetch_add answers the old value")?;
+    require(a.load() == 10, "fetch_add(3) adds 3")?;
+    require(a.fetch_sub(4) == 10, "fetch_sub answers the old value")?;
+    require(a.load() == 6, "fetch_sub(4) subtracts 4")?;
+    require(
+        a.compare_exchange(6, 9) == Ok(6),
+        "a compare_exchange that matches answers Ok with the old value",
+    )?;
+    require(a.load() == 9, "a compare_exchange that matches stores")?;
+    let failed = a.compare_exchange(6, 1);
+    require(
+        failed == Err(9),
+        format!(
+            "a compare_exchange that does not match answers {failed:?}, where Err(9) is expected"
+        ),
+    )?;
+    require(
+        a.load() == 9,
+        "a compare_exchange that does not match stores nothing",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn sync_atomic_std() {
+    atomic_ops::<StdPrimitives>().unwrap();
+}
+
+#[test]
+fn sync_atomic_model() {
+    let report = check(EXHAUSTIVE, atomic_ops::<Shuttle>).unwrap();
     assert!(
         report.executions < EXHAUSTIVE_CAP,
         "the search reached the cap"
