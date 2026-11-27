@@ -125,7 +125,13 @@ pub struct Batch {
 /// later requests granted before it, saturating at 127. A request is named by
 /// the **seq** that [`LatchCore::enqueue`] returns; seqs are consecutive in
 /// arrival order, wrap at `u32::MAX`, and every difference of two seqs wraps.
-#[derive(Debug, Clone)]
+///
+/// Its `Debug` shows the queue's live part, `queue[0..len]`, each entry as
+/// `S:n` (shared, overtaken `n` times) or `X:n` (exclusive): the bytes past
+/// `len` are stale entries of grants already made, which no reader of a
+/// failure message should take for waiters (verdict A-4c0 5ef87b98,
+/// follow-up A-4c0-F4 (c)).
+#[derive(Clone)]
 pub struct LatchCore {
     /// The bypass bound `K`.
     bound: u32,
@@ -475,6 +481,49 @@ impl LatchCore {
     }
 }
 
+/// One queue entry as [`LatchCore`]'s `Debug` prints it.
+struct Entry(u8);
+
+/// The live part of the queue as [`LatchCore`]'s `Debug` prints it: a list
+/// written entry by entry, so formatting allocates nothing (W7).
+struct Live<'a>(&'a [u8]);
+
+impl fmt::Debug for Live<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|e| Entry(*e)))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 & EXCLUSIVE_BIT != 0 {
+            write!(f, "X:{}", self.0 & COUNT_MASK)
+        } else {
+            write!(f, "S:{}", self.0 & COUNT_MASK)
+        }
+    }
+}
+
+impl fmt::Debug for LatchCore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Only `queue[0..len]`: the bytes past `len` are entries of grants
+        // already made, and showing them would name waiters that are gone.
+        f.debug_struct("LatchCore")
+            .field("bound", &self.bound)
+            .field("capacity", &self.capacity())
+            .field("holders", &self.holders)
+            .field("queue", &Live(self.live()))
+            .field("len", &self.len)
+            .field("head_seq", &self.head_seq)
+            .field("handed_first", &self.handed_first)
+            .field("handed_len", &self.handed_len)
+            .field("handed_left", &self.handed_left)
+            .finish()
+    }
+}
+
 /// Equality compares the logical state, so an enumerator can memoise on it:
 /// the bound, the capacity, the holders, the queued entries, the last batch's
 /// length and its uncollected members, and where the last batch started
@@ -575,6 +624,12 @@ impl LatchState {
 /// checker's backend, so the same code runs in both. The only allocation is
 /// the core's queue, in [`Latch::new`] (W7).
 pub struct Latch<P: Primitives = StdPrimitives> {
+    /// The bypass bound `K`, as `new` was given it: fixed at construction,
+    /// so [`Latch::bound`] reads no lock.
+    bound: u32,
+    /// The waiter capacity, as `new` was given it: fixed at construction,
+    /// so [`Latch::capacity`] reads no lock.
+    capacity: u32,
     state: crate::sync::Mutex<P, LatchState>,
     wake: Condvar<P>,
 }
@@ -588,9 +643,12 @@ impl<P: Primitives> Latch<P> {
     /// bound's and the capacity's domain, [`StoreError::OutOfMemory`] if the
     /// queue's allocation fails.
     pub fn new(bound: u32, capacity: u32) -> Result<Self, StoreError> {
+        let core = LatchCore::new(bound, capacity)?;
         Ok(Self {
+            bound: core.bound(),
+            capacity: core.capacity(),
             state: crate::sync::Mutex::new(LatchState {
-                core: LatchCore::new(bound, capacity)?,
+                core,
                 clock: 0,
                 handed_stamp: 0,
                 handed_seq: 0,
@@ -602,20 +660,20 @@ impl<P: Primitives> Latch<P> {
 
     /// The bypass bound `K`.
     ///
-    /// # Errors
-    ///
-    /// [`StoreError::Poisoned`] if the internal mutex is poisoned.
-    pub fn bound(&self) -> Result<u32, StoreError> {
-        self.info().map(|i| i.bound)
+    /// A field fixed by [`Latch::new`]: this takes no lock, so a thread may
+    /// ask while it holds the latch, and a poisoned internal mutex cannot
+    /// hide it (verdict A-4c0 5ef87b98, follow-up A-4c0-F4 (d)).
+    pub fn bound(&self) -> u32 {
+        self.bound
     }
 
     /// The waiter capacity.
     ///
-    /// # Errors
-    ///
-    /// [`StoreError::Poisoned`] if the internal mutex is poisoned.
-    pub fn capacity(&self) -> Result<u32, StoreError> {
-        self.info().map(|i| i.capacity)
+    /// A field fixed by [`Latch::new`]: this takes no lock, so a thread may
+    /// ask while it holds the latch, and a poisoned internal mutex cannot
+    /// hide it (verdict A-4c0 5ef87b98, follow-up A-4c0-F4 (d)).
+    pub fn capacity(&self) -> u32 {
+        self.capacity
     }
 
     /// A snapshot under one hold of the internal mutex.

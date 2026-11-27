@@ -928,7 +928,7 @@ fn api() -> Result<(), String> {
         "a dropped guard leaves Free",
     )?;
     require(
-        said(latch.bound())? == 1 && said(latch.capacity())? == 4,
+        latch.bound() == 1 && latch.capacity() == 4,
         "bound() and capacity()",
     )?;
     for (bound, capacity) in [(128u32, 1u32), (0, 0)] {
@@ -1310,16 +1310,26 @@ fn hash_of(core: &LatchCore) -> u64 {
 
 /// Two cores are equal and hash alike.
 fn same(a: &LatchCore, b: &LatchCore, what: &str) -> Result<(), String> {
-    require(a == b, format!("{what}: equal, where {a:?} and {b:?}"))?;
+    require(
+        a == b,
+        format!("{what}: expected equal, but {a:?} and {b:?} differ"),
+    )?;
     require(
         hash_of(a) == hash_of(b),
-        format!("{what}: equal cores hash alike"),
+        format!(
+            "{what}: expected equal cores to hash alike, but they hash to {} and {}",
+            hash_of(a),
+            hash_of(b)
+        ),
     )
 }
 
 /// Two cores differ.
 fn differ(a: &LatchCore, b: &LatchCore, what: &str) -> Result<(), String> {
-    require(a != b, format!("{what}: not equal, where {a:?} and {b:?}"))
+    require(
+        a != b,
+        format!("{what}: expected different, but {a:?} and {b:?} are equal"),
+    )
 }
 
 /// `latch_core_equality` (card A-4c0 Work 3, "Equality and hashing"): `Eq`
@@ -1328,6 +1338,11 @@ fn differ(a: &LatchCore, b: &LatchCore, what: &str) -> Result<(), String> {
 /// `head_seq` itself nor the bytes past `len` enter. `latch_core_exhaustive`
 /// memoises on them, so an equality that ignored a live field would shrink
 /// its search silently, and one that kept `head_seq` would grow it.
+///
+/// `handed_len` and `handed_first − head_seq` move together (the offset is
+/// always `−handed_len`, wrapping), so no case here tells either from the
+/// other; the test pins neither alone (verdict A-4c0 5ef87b98, follow-up
+/// A-4c0-F4 (b)).
 fn core_equality() -> Result<(), String> {
     use Mode::{Exclusive as X, Shared as S};
 
@@ -1529,6 +1544,28 @@ fn forced_batch() -> Result<(), String> {
         granted == expected,
         format!(
             "the batch's grants, in arrival order, are {granted:?}, where one tick per member in queue order (W2) gives {expected:?}"
+        ),
+    )?;
+    // The batch took exactly one tick per member and no more: a collection
+    // does not tick (W2), so the first release after the batch is the next
+    // tick. An extra tick in the batch leaves a gap the grants alone do not
+    // show (LATCH-BATCH-EXTRA-TICK; verdict A-4c0 5ef87b98, follow-up
+    // A-4c0-F4 (a)).
+    let first_release = requests
+        .iter()
+        .filter_map(|r| match r.outcome {
+            Outcome::Granted { release, .. } => release,
+            Outcome::Refused => None,
+        })
+        .filter(|&release| release > main_released)
+        .min()
+        .unwrap_or(0);
+    require(
+        first_release == first + u64::from(READERS),
+        format!(
+            "the first release after the batch is stamped {first_release}, where {first} + {READERS} readers = \
+             {} is expected: the batch ticks once per member and a collection not at all (W2)",
+            first + u64::from(READERS)
         ),
     )?;
     check_trace(&requests, 0).map_err(|v| v.to_string())?;

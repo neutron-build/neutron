@@ -39,14 +39,23 @@
 //!   generation under the same hold of the mutex in which it registers, and
 //!   re-tests it after every wake. Tests `unpin_wait_then_served`,
 //!   `acquire_vs_acquire`; the notify and count mutants are liveness ones,
-//!   which card A-3b judges under the interleaving harness.
+//!   which card A-3b judges under the interleaving harness (its
+//!   `harness_unheld_pin_drop`, `harness_unheld_reservation_drop` and
+//!   `harness_unheld_failed_load`, where a lost wake-up is a `Deadlock`).
+//!
+//! Card A-3b (Work 5): every lock, wait and yield here is the sync layer's,
+//! over the pool's backend `P`, so the interleaving harness runs this code
+//! (S-STORE §15). No step moved. The table mutex can no longer be taken
+//! "anyway": on a table mutex a panic poisoned, a waiter returns the error
+//! with its count still raised, since the sync layer gives no way into a
+//! poisoned mutex and the store is poisoned (§9.2).
 
 use nucleus_env::File;
 
 use super::frame::{FrameId, FrameReservation, FrameState, Removal};
 use super::key::PageKey;
-use super::pool::{HookPoint, Pool, poisoned_table};
-use super::sync::yield_now;
+use super::pool::{HookPoint, Pool};
+use super::sync::{Primitives, yield_now};
 use crate::store::StoreError;
 
 /// The frame a hook of the acquisition fires with when it has none (card
@@ -63,17 +72,17 @@ enum Step {
 }
 
 /// How a sweep (A2) ended.
-enum Sweep<'p, H: File> {
+enum Sweep<'p, H: File, P: Primitives> {
     /// It took no victim; `true` if a frame was momentarily latched or pinned.
     Over(bool),
     /// A clean victim left the page table and is the caller's reservation.
-    Found(FrameReservation<'p, H>),
+    Found(FrameReservation<'p, H, P>),
 }
 
 /// How the own pass (A6′) ended.
-enum Pass<'p, H: File> {
+enum Pass<'p, H: File, P: Primitives> {
     /// A clean victim left the page table and is the caller's reservation.
-    Found(FrameReservation<'p, H>),
+    Found(FrameReservation<'p, H, P>),
     /// Look again from A1: a frame was momentarily latched or pinned, or one
     /// may now be had.
     Retry,
@@ -82,7 +91,7 @@ enum Pass<'p, H: File> {
     Starved,
 }
 
-impl<H: File> Pool<H> {
+impl<H: File, P: Primitives> Pool<H, P> {
     /// Obtain a frame (card A-3b-0, Work 5; S-STORE §5.2, §5.4): the free list
     /// first (A1), then the clock over the clean, unpinned frames (A2), then
     /// the decision (A4–A7). `for_key` is the key a pin's miss (P3) loads, and
@@ -100,7 +109,7 @@ impl<H: File> Pool<H> {
         &self,
         wait: bool,
         for_key: Option<PageKey>,
-    ) -> Result<Option<FrameReservation<'_, H>>, StoreError> {
+    ) -> Result<Option<FrameReservation<'_, H, P>>, StoreError> {
         let key = for_key.unwrap_or(PageKey::Lpid(0));
         loop {
             // A1: the free list.
@@ -147,7 +156,7 @@ impl<H: File> Pool<H> {
                     // Another thread's brief latch on a victim, or a pin whose
                     // drop moved the generation (§5.3's fairness bound): never
                     // block on it, and look again.
-                    yield_now();
+                    yield_now::<P>();
                     continue;
                 }
                 match self.own_pass(g0, key)? {
@@ -216,7 +225,7 @@ impl<H: File> Pool<H> {
     /// another thread: an evictor's brief victim latch, or a pin whose drop
     /// moves the generation. A7 waits exactly when every frame is held (§5.4:
     /// "every frame is pinned").
-    fn sweep(&self, h0: u64, key: PageKey) -> Result<Sweep<'_, H>, StoreError> {
+    fn sweep(&self, h0: u64, key: PageKey) -> Result<Sweep<'_, H, P>, StoreError> {
         let mut busy = false;
         loop {
             self.fire(HookPoint::SweepStep, key, NO_FRAME);
@@ -279,7 +288,7 @@ impl<H: File> Pool<H> {
     /// every unpinned frame dirty by this acquisition's own observation, and
     /// `PoolStarved` is the answer (the argument is in [`Pool::sweep`]'s doc,
     /// "Why the decision is exact at this card").
-    fn own_pass(&self, g0: u64, key: PageKey) -> Result<Pass<'_, H>, StoreError> {
+    fn own_pass(&self, g0: u64, key: PageKey) -> Result<Pass<'_, H, P>, StoreError> {
         let mut busy = false;
         for i in 0..self.frames() {
             let f = FrameId(i);
@@ -307,7 +316,7 @@ impl<H: File> Pool<H> {
             }
         }
         if busy {
-            yield_now();
+            yield_now::<P>();
             return Ok(Pass::Retry);
         }
         self.fire(HookPoint::PassEnded, key, NO_FRAME);
@@ -336,36 +345,21 @@ impl<H: File> Pool<H> {
     /// A7's wait (card A-3b-0, Work 5): the caller is registered as a waiter
     /// and has read the generation `g1`. Sleep on `unheld` until a held frame
     /// becomes unheld (the generation moves), re-testing after every wake;
-    /// then the caller is no longer a waiter. A poisoned mutex ends the wait
-    /// with its error and still takes the caller off the count.
+    /// then the caller is no longer a waiter.
+    ///
+    /// Card A-3b, Work 5: a poisoned table mutex ends the wait with its
+    /// error, and the caller's count stays raised, since the sync layer
+    /// gives no way into a poisoned mutex (its F5). The pool is then
+    /// unusable, rightly: the panic poisoned the store (S-STORE §9.2).
     fn wait_unheld(&self, g1: u64) -> Result<(), StoreError> {
-        let mut t = match self.lock_table() {
-            Ok(t) => t,
-            Err(e) => {
-                self.unregister_waiter();
-                return Err(e);
-            }
-        };
+        let mut t = self.lock_table()?;
         loop {
             if t.unheld_events != g1 {
                 break;
             }
-            match self.wait_for_unheld(t) {
-                Ok(g) => t = g,
-                Err(poisoned) => {
-                    let mut t = poisoned;
-                    t.unpin_waiters = t.unpin_waiters.saturating_sub(1);
-                    return Err(poisoned_table());
-                }
-            }
+            t = self.wait_for_unheld(t)?;
         }
         t.unpin_waiters = t.unpin_waiters.saturating_sub(1);
         Ok(())
-    }
-
-    /// Take the caller off the waiter count when it cannot lock the table.
-    fn unregister_waiter(&self) {
-        let mut t = self.lock_table_anyway();
-        t.unpin_waiters = t.unpin_waiters.saturating_sub(1);
     }
 }

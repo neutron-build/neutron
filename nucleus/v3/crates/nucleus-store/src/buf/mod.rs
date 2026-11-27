@@ -12,6 +12,16 @@
 //! No tree uses this module yet: card A-4a moves the tree onto it and
 //! retires the seed's `pool` (lib.rs, "Seed status").
 //!
+//! Card A-3b: every frame's latch is card A-4c0's task-fair `latch::Latch`
+//! (S-STORE §5.3 "Fair latches"), with bypass bound [`FRAME_LATCH_BOUND`] and
+//! a fixed waiter queue, beside the frame's content in a cell of the store's
+//! sync layer; and the pool itself runs on that layer, `Pool<H, P>` over the
+//! backend `P`, the platform's in production and a model checker's in a
+//! harness test (S-STORE §15 "The interleaving harness"). So a harness test
+//! runs the pool's own waits: `tests/buf_latch.rs` holds `t_root_latch_fair`'s
+//! three variants, judged by the harness's monitor, and the pool's waits,
+//! where a lost wake-up is a `Deadlock` and not a hang.
+//!
 //! # Invariants owned here
 //!
 //! Each names the tests that pin it and the mutants they kill. Test names in
@@ -108,12 +118,32 @@
 //! - **BUF-NO-WRAP**: a pin count never wraps; a pin that would raise it past
 //!   `u64::MAX` is refused with `Invalid` and changes nothing. Test
 //!   `pin_count_overflow`; mutant PIN-WRAP.
+//! - **BUF-TASK-FAIR** (§5.3 "Fair latches"; card A-3b): a frame latch is
+//!   task-fair with bypass bound [`FRAME_LATCH_BOUND`]: a waiting exclusive
+//!   request blocks new shared grants, a waiter is overtaken by at most `K`
+//!   later requests, and `try_latch` never succeeds over a queued exclusive
+//!   waiter; the latch makes every lock, wait and wake through the store's
+//!   sync layer; no latch allocates after the pool is built (each frame's
+//!   queue is allocated with it, `threads` entries, one byte each). Tests
+//!   `t_root_latch_fair_reader_stream`, `t_root_latch_fair_writer`,
+//!   `t_root_latch_fair_latch_level`, `frame_latch_pinned`,
+//!   `pool_fixed`; mutants LATCH-READER-PREF, LATCH-WRITER-PREF,
+//!   TRYLATCH-BYPASS, FRAME-BOUND-ZERO, FRAME-CAPACITY-ONE.
+//! - **A cell is never waited on** (card A-3b; the sync layer's F7): the
+//!   frame's content is taken only under its latch's grant, and each guard
+//!   releases the cell before the latch. Test `harness_cell_handoff`; mutant
+//!   CELL-RELEASE-ORDER.
+//! - **No lost wake-up in the pool's own waits** (cards A-3a and A-3b-0;
+//!   judged here since card A-3b): a pin's wait for a load and the frame
+//!   acquisition's wait for an unpin end. Tests `harness_load_waiter_woken`,
+//!   `harness_unheld_pin_drop`, `harness_unheld_reservation_drop`,
+//!   `harness_unheld_failed_load`; mutants LOAD-NO-NOTIFY,
+//!   WAIT-NO-RECHECK, UNPIN-NO-NOTIFY, WAIT-NO-REGISTER,
+//!   RESERVATION-DROP-NO-NOTIFY, CLEANUP-NO-NOTIFY, each a `Deadlock`.
 //!
 //! # What later cards add (not here)
 //!
-//! Card A-3b: the task-fair latch inside `FrameLatch` on the store's sync
-//! layer, which `buf` then moves onto in one step, and the wait of `acquire`
-//! judged under the interleaving harness. Card A-3c: the current page map
+//! Card A-3c: the current page map
 //! behind `CurrentRef`, dirty eviction (which replaces `acquire`'s
 //! `PoolStarved` branch and the epoch-copy reserve sized from
 //! `PoolSizing::r_epoch`), the poison mark in every acquisition and wait
@@ -130,8 +160,8 @@ mod sync;
 mod table;
 
 pub use frame::{
-    CreatedPage, ExclusiveGuard, FrameId, FrameReservation, FrameState, Pin, Removal, SharedGuard,
-    VictimGuard,
+    CreatedPage, ExclusiveGuard, FRAME_LATCH_BOUND, FrameId, FrameReservation, FrameState, Pin,
+    Removal, SharedGuard, VictimGuard,
 };
 pub use key::PageKey;
 pub use pool::{
