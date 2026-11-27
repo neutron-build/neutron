@@ -1512,14 +1512,16 @@ fn harness_unheld_failed_load() {
 ///   at `WaitWoken` until main's call is over. T is asleep at P10 in every
 ///   schedule but those in which main got the mutex first and ended the load
 ///   before T's wait. A load that does not notify leaves T blocked: a
-///   `Deadlock`. This order is sampled, not exhaustive: its search does not
-///   end within the cap (past 100,000 executions under each of four forced
-///   orders, the probe's included), because the waiter's last steps before
-///   it sleeps interleave with the loader's end of the load, and its long
-///   wake with the loader's last steps, and the two multiply. Its kill does
-///   not rest on the sampling: the order places it, so the mutant fails in
-///   every execution in which T sleeps before P10, nearly all of them
-///   (ESCALATE in the card's RESULT; the exhaustive form is the look order's).
+///   `Deadlock`. This order is sampled, not exhaustive (card A-3b, Work 9,
+///   as amended: the look order exhaustive, the parked order sampled under
+///   `PCT` and `RANDOM`): its exhaustive search reaches the cap without
+///   ending (measured in this order: `NotExhausted` at the cap), because the
+///   waiter's last steps before it sleeps interleave with the loader's end
+///   of the load, and its long wake with the loader's last steps, and the
+///   two multiply. The order places the kill, so the mutant fails in every
+///   execution in which T sleeps before P10, most of them; the card's
+///   RESULT carries the kill's `kill_evidence` lines at both presets and at
+///   a second seed, each at or above the share (S-STORE §15, card S-KAPPA).
 fn load_waiter<H: Harness>(parked: bool) -> Result<(), String> {
     let (page, crc) = sealed_page(PageKind::Leaf, 1, 1, 0x11)?;
     let file = Arc::new(ModelFile::<H>::with(file_with(10, &page)));
