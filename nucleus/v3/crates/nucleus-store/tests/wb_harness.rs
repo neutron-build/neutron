@@ -754,7 +754,7 @@ fn row_i_pool_bound_e4() {
 /// `by_write`, by `mark_written` after sealing the page for a home, keeping
 /// its pin on `x`, and releases W. `M` has become an unpinned victim, so W
 /// must wake and take `M`'s frame: `Done("W")` is the next event. Without
-/// the unheld event at the pin's end, W sleeps with every other thread
+/// the unheld event at the pin's end, W stays blocked with every other thread
 /// waiting for it, and the model checker reports a `Deadlock`.
 fn dirty_pin_end<H: Harness>(by_write: bool) -> Result<(), String> {
     assert_eq!(min_f(1), 18);
@@ -874,7 +874,7 @@ fn dirty_pin_end_wakes_waiter() {
 /// `MapLatchWaiting`, its request counted, holding nothing; the controller
 /// releases W and gives the latch back; W is then granted it and reads the
 /// MapLeaf's ref, null (never written). A give-back that wakes no waiter
-/// leaves W asleep wherever it reached its wait before the give-back: a
+/// leaves W blocked wherever it reached its wait before the give-back: a
 /// `Deadlock`.
 fn map_latch_scenario<H: Harness>() -> Result<(), String> {
     let (_file, pool) = wb_pool::<H>(18, 4, 600, 1, H_MIN_TEST)?;
@@ -937,7 +937,7 @@ const MAP_LATCH_BOUNDS: Bounds = Bounds {
 /// `map_latch_wait` (card A-3c, Work 3.1; the implementer's review): the
 /// wait path of a MapInner's map latch (`BodyCell`), which no other test
 /// reaches. The hook places W's counted request before the give-back; whether
-/// W is already asleep when the latch is given back is the schedule's, so a
+/// W is already blocked when the latch is given back is the schedule's, so a
 /// lost wake-up fails the executions where it is (the RESULT reports how
 /// many of the 1000).
 #[test]
