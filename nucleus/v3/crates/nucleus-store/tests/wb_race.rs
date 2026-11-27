@@ -42,7 +42,7 @@ use wb_support::{H_MIN_TEST, MARK, PS, min_f, pin, wb_pool};
 
 use HookPoint::{
     EvictEntrySet, EvictWrite, GateExclusiveWaiting, GateSharedBlocking, GrowLocking,
-    LoadPublished, LoadResolved, LoadWaiting, MissReserved, Pinned,
+    LoadPublished, LoadResolved, LoadWaiting, MissReserved, Pinned, Restarting, SweepEnded,
 };
 
 /// The key with no page: what the gate's hooks fire with.
@@ -707,6 +707,96 @@ fn evict_holds_gate() {
     assert_eq!(pool.epoch().unwrap(), 2);
     // L's home from the fixture, and this eviction's write: no other.
     assert_eq!(file.writes().len(), 2);
+}
+
+/// `flip_pending_rechecks_free` (card A-3c, Work 8.3, with A5's re-check;
+/// S-STORE §5.2: "If the try fails because a flip is pending, the evictor
+/// takes a clean victim. If no victim is clean, the thread ... restarts").
+/// `n` 1, `F` 18, fanout 4, `slot_count` 600, epoch 1. Page `V` (LPID 1)
+/// dirty and unpinned, its MapLeaf held by `V`'s §4.1 pin, every other frame
+/// reserved by the controller, which also holds the gate shared; X's flip
+/// waits behind it. T (holding nothing) reserves a frame: its sweep passes
+/// `V` over as `FlipPending` (its gate try fails) and finds nothing else;
+/// paused at `SweepEnded`, T holds nothing. The controller then frees one
+/// reservation and releases T. A frame came free since T's A1, so T looks
+/// again and takes it, never restarting: `Done("T")` comes before any
+/// `Restarting`. The card's letter without the re-check (`FlipPending` at
+/// once) fails it: T fires `Restarting` and waits for the flip.
+#[test]
+fn flip_pending_rechecks_free() {
+    assert_eq!(min_f(1), 18);
+    let (_file, pool) = wb_pool::<StdPrimitives>(18, 4, 600, 1, H_MIN_TEST).unwrap();
+    let (v, p) = s3_new_page(&pool, 0x61).unwrap();
+    drop(p);
+    let mut reserved: Vec<_> = (0..16).map(|_| pool.reserve().unwrap()).collect();
+    assert_eq!(pool.stats().unwrap().free, 0);
+    let m0 = pool.frame_of(mapleaf(0)).unwrap().unwrap();
+    assert_eq!(pool.map_pin_info(m0).unwrap().dirty_pins, 1);
+    assert_eq!(
+        pool.frame_info(m0).unwrap().pins,
+        1,
+        "only V's §4.1 pin holds M"
+    );
+    let hold = pool.gate_shared().unwrap();
+    let pz = Pauser::new();
+    pool.set_hook(Some(pz.hook()));
+    pz.report(GateExclusiveWaiting, NO_KEY);
+    pz.pause_at(SweepEnded, NO_KEY);
+    pz.report(Restarting, NO_KEY);
+    let mut freed = None;
+    let (first_x, first_t, decided, r_x, r_t) = thread::scope(|s| {
+        let x = spawn(s, &pz, "X", || s1_flip(&pool));
+        // X holds its registration: every gate try now fails.
+        let first_x = pz.next_event();
+        let mut first_t = Event::Disconnected;
+        let mut decided = None;
+        let mut t = None;
+        if seen(&first_x, GateExclusiveWaiting, NO_KEY) {
+            t = Some(spawn(s, &pz, "T", || {
+                pool.reserve_with(&Hold::nothing()).map(|r| r.frame())
+            }));
+            // T has passed V over for the pending flip; it holds nothing.
+            first_t = pz.next_event();
+            if arrived(&first_t, SweepEnded, NO_KEY) {
+                let r = reserved.pop().unwrap();
+                freed = Some(r.frame());
+                drop(r);
+                pz.release(SweepEnded, NO_KEY);
+                let mut others = 0;
+                loop {
+                    let ev = pz.next_event();
+                    if seen(&ev, Restarting, NO_KEY) {
+                        decided = Some("restarting");
+                        break;
+                    }
+                    if done(&ev, "T") {
+                        decided = Some("done");
+                        break;
+                    }
+                    others += 1;
+                    if others > 16 {
+                        break;
+                    }
+                }
+            }
+        }
+        pz.release_all();
+        drop(hold);
+        let r_t = t.map(|t| t.join());
+        (first_x, first_t, decided, x.join(), r_t)
+    });
+    assert!(seen(&first_x, GateExclusiveWaiting, NO_KEY), "{first_x:?}");
+    assert!(arrived(&first_t, SweepEnded, NO_KEY), "{first_t:?}");
+    assert_eq!(
+        decided,
+        Some("done"),
+        "T looked again at the frame that came free instead of restarting"
+    );
+    assert_eq!(r_x.unwrap().unwrap(), 2);
+    let got = r_t.expect("T ran").unwrap().unwrap();
+    assert_eq!(Some(got), freed, "T took the frame that came free");
+    assert_eq!(v, 1);
+    drop(reserved);
 }
 
 /// `growth_race_level` (card evidence for LEVEL-GROW-UNCONDITIONAL, A-4a's

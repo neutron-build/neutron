@@ -34,6 +34,10 @@ pub struct Tracker<T: Eq + Hash + Copy + Send + 'static> {
     tag: fn() -> T,
     state: Arc<Mutex<HashMap<T, Flags>>>,
     violations: Arc<Mutex<Vec<String>>>,
+    /// How many free-set sections and page-table sections began (the
+    /// `FreesetLocking` and `TableLocking` firings), so that a test can
+    /// require the seams it judges by to have fired at all.
+    sections: Arc<Mutex<(u64, u64)>>,
 }
 
 /// Lock a test mutex, recovering from poison.
@@ -48,6 +52,7 @@ impl<T: Eq + Hash + Copy + Send + 'static> Tracker<T> {
             tag,
             state: Arc::new(Mutex::new(HashMap::new())),
             violations: Arc::new(Mutex::new(Vec::new())),
+            sections: Arc::new(Mutex::new((0, 0))),
         }
     }
 
@@ -56,7 +61,13 @@ impl<T: Eq + Hash + Copy + Send + 'static> Tracker<T> {
         let state = Arc::clone(&self.state);
         let tag = self.tag;
         let violations = Arc::clone(&self.violations);
+        let sections = Arc::clone(&self.sections);
         Arc::new(move |point, _key, _frame| {
+            match point {
+                HookPoint::FreesetLocking => lock(&sections).0 += 1,
+                HookPoint::TableLocking => lock(&sections).1 += 1,
+                _ => {}
+            }
             let me = tag();
             let mut held = lock(&state);
             let flags = held.entry(me).or_default();
@@ -87,6 +98,11 @@ impl<T: Eq + Hash + Copy + Send + 'static> Tracker<T> {
                 _ => {}
             }
         })
+    }
+
+    /// How many free-set sections and page-table sections began.
+    pub fn sections(&self) -> (u64, u64) {
+        *lock(&self.sections)
     }
 
     /// The violations recorded, in order.

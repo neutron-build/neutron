@@ -31,6 +31,8 @@ use nucleus_store::buf::{
     FrameId, FrameInfo, FrameState, Hold, HookPoint, LpidAlloc, PageKey, PinOutcome, Pool,
     PoolConfig,
 };
+use nucleus_store::meta::Ref;
+use nucleus_store::page;
 use nucleus_store::sync::Primitives;
 use wb_support::drive::{
     evict_out, s1_flip, s3_free, s3_make_mapleaf, s3_mapleaf_pin, s3_new_page,
@@ -41,7 +43,8 @@ use wb_support::track::Tracker;
 use wb_support::{H_MIN_TEST, MARK, PS, min_f, pin, pin_read, wb_pool};
 
 use HookPoint::{
-    GateExclusiveWaiting, GateSharedBlocking, LoadPublished, LoadWaiting, Restarting, WaitWoken,
+    GateExclusiveWaiting, GateSharedBlocking, LoadPublished, LoadWaiting, MapLatchWaiting,
+    Restarting, UnpinWait, WaitWoken,
 };
 
 /// The key with no page: what the gate's hooks fire with.
@@ -188,9 +191,9 @@ fn spawn_s1<H: Harness>(
 
 /// What the controller of `t_pin_load_race_k` recorded.
 struct Seen {
-    /// While T1 was at its `Restarting`: the frame holding `L`, if any, and
-    /// T1's own frame's state and count (the non-reload form).
-    at_restart: Option<(Option<FrameId>, FrameInfo)>,
+    /// While T1 was at its `Restarting`: the frame holding `L`, if any, T1's
+    /// own frame, and that frame's state and count (the non-reload form).
+    at_restart: Option<(Option<FrameId>, FrameId, FrameInfo)>,
     /// T1's first event after its first `Restarting` (the reload variant).
     first_after: Option<Event>,
 }
@@ -277,6 +280,7 @@ fn race_k<H: Harness>(reload: bool) -> Result<Seen, String> {
                         let f_t1 = t1_frame.ok_or("T1's frame was not recorded")?;
                         out.at_restart = Some((
                             pool.frame_of(l).map_err(said)?,
+                            f_t1,
                             pool.frame_info(f_t1).map_err(said)?,
                         ));
                         break;
@@ -385,18 +389,25 @@ fn t_pin_load_race_k() {
     let report = check(K_BOUNDS, move || {
         let seen = race_k::<Shuttle>(false)?;
         match seen.at_restart {
-            Some((None, _)) => Ok(()),
-            Some((Some(f), info)) => {
-                // T2 may already have published its own load of L, in the
-                // frame T1's load left: then T1's loader's count is gone
-                // from it and at most T2's one count remains.
+            Some((at, f_t1, info)) => {
+                // T1's loader's count has left its frame at Restarting. T2
+                // may already have taken that frame, the only one free once
+                // T1's load ended, for its own load of L under its gate
+                // hold: then L is in T1's old frame with T2's one count, and
+                // in no other frame.
                 if info.pins > 1 || (info.state == FrameState::Loading && info.key != Some(lpid(1)))
                 {
                     return Err(format!(
-                        "T1's load was still kept at Restarting: L in {f:?}, T1's frame {info:?}"
+                        "T1's load was still kept at Restarting: L in {at:?}, T1's frame \
+                         {f_t1:?} is {info:?}"
                     ));
                 }
-                Ok(())
+                match at {
+                    Some(f) if f != f_t1 => Err(format!(
+                        "L is in {f:?} at Restarting, not in T1's old frame {f_t1:?}"
+                    )),
+                    _ => Ok(()),
+                }
             }
             None => Err("the controller did not reach Restarting".to_string()),
         }
@@ -584,8 +595,17 @@ fn freeset_order<H: Harness>(boundary: bool) -> Result<(), String> {
     };
     let (r_a, r_b) = (H::join(a), H::join(b));
     let violations = tracker.violations();
+    let (freeset_sections, table_sections) = tracker.sections();
     r_a??;
     r_b??;
+    // The tracker judges by the seams, so they must have fired: A's two
+    // allocations are two free-set sections, and every table access a
+    // table section (Work 10).
+    if freeset_sections < 2 || table_sections == 0 {
+        return Err(format!(
+            "the seams fired {freeset_sections} free-set and {table_sections} table sections"
+        ));
+    }
     if violations.is_empty() {
         Ok(())
     } else {
@@ -719,4 +739,211 @@ fn row_i_pool_bound_e4() {
         report.executions, E4_BOUNDS.max_steps
     );
     assert_eq!(report.executions, 1, "one thread: one execution");
+}
+
+// ------------------------------------------------- the waits this card adds
+
+/// The scenario of `dirty_pin_end_wakes_waiter` (card A-3c, Work 6.3, with
+/// A-3b-0's A7; the implementer's review). `n` 1, `F` 18, fanout 4,
+/// `slot_count` 600, epoch 1. Page `x` (LPID 1) dirty and pinned by the
+/// controller; its MapLeaf `M` held only by `x`'s §4.1 pin; the other 16
+/// frames reserved by the controller: every frame is held. W, holding
+/// nothing, reserves a frame and waits at A7 for an unpin (paused at
+/// `UnpinWait`, registered, the generation read). The controller then ends
+/// `x`'s §4.1 pin through `x`'s exclusive latch, by `mark_freed` or, with
+/// `by_write`, by `mark_written` after sealing the page for a home, keeping
+/// its pin on `x`, and releases W. `M` has become an unpinned victim, so W
+/// must wake and take `M`'s frame: `Done("W")` is the next event. Without
+/// the unheld event at the pin's end, W sleeps with every other thread
+/// waiting for it, and the model checker reports a `Deadlock`.
+fn dirty_pin_end<H: Harness>(by_write: bool) -> Result<(), String> {
+    assert_eq!(min_f(1), 18);
+    let (_file, pool) = wb_pool::<H>(18, 4, 600, 1, H_MIN_TEST)?;
+    let pool: Shared<H> = Arc::new(pool);
+    let (x, p) = s3_new_page(&*pool, 0x51).map_err(said)?;
+    if x != 1 {
+        return Err(format!("x is LPID {x}, not 1"));
+    }
+    let m = pool
+        .frame_of(mapleaf(0))
+        .map_err(said)?
+        .ok_or("MapLeaf 0 is not resident")?;
+    let mut reserved = Vec::new();
+    for _ in 0..16 {
+        reserved.push(pool.reserve().map_err(said)?);
+    }
+    let held = (
+        pool.stats().map_err(said)?.free,
+        pool.frame_info(m).map_err(said)?.pins,
+        pool.map_pin_info(m).map_err(said)?.dirty_pins,
+    );
+    if held != (0, 1, 1) {
+        return Err(format!(
+            "the fixture's (free frames, M's count, M's §4.1 pins) are {held:?}"
+        ));
+    }
+    let pz = Arc::new(ModelPauser::<H>::new());
+    pool.set_hook(Some(pz.hook()));
+    pz.pause_at(UnpinWait, NO_KEY)?;
+    let w = {
+        let pz = Arc::clone(&pz);
+        let pool = Arc::clone(&pool);
+        H::spawn(move || {
+            let _done = DoneOnDrop { pz, name: "W" };
+            pool.reserve_with(&Hold::nothing())
+                .map(|r| r.frame())
+                .map_err(said)
+        })
+    };
+    let mut problem = None;
+    let mut after = None;
+    match pz.next_event()? {
+        ev if arrived(&ev, UnpinWait, NO_KEY) => {
+            // W is registered at A7 and has read the generation. End x's
+            // §4.1 pin, M's only count, keeping the pin on x.
+            let mut g = p.latch_exclusive().map_err(said)?;
+            if by_write {
+                let crc = page::seal(&mut g).map_err(said)?;
+                g.mark_written(Ref {
+                    slot: 3,
+                    epoch: 1,
+                    crc,
+                })
+                .map_err(said)?;
+            } else {
+                g.mark_freed().map_err(said)?;
+            }
+            drop(g);
+            pz.release(UnpinWait, NO_KEY)?;
+            after = Some(pz.next_event()?);
+        }
+        ev => {
+            problem = Some(format!(
+                "W's first event was {ev:?}, not Arrived(UnpinWait)"
+            ))
+        }
+    }
+    pz.release_all()?;
+    drop(p);
+    let r = H::join(w);
+    drop(reserved);
+    if let Some(problem) = problem {
+        return Err(problem);
+    }
+    if after != Some(Event::Done("W")) {
+        return Err(format!("after the pin's end the next event was {after:?}"));
+    }
+    let got = r??;
+    if got != m {
+        return Err(format!("W took {got:?}, not M's frame {m:?}"));
+    }
+    Ok(())
+}
+
+/// The exploration of `dirty_pin_end_wakes_waiter`, for each of its forms.
+const DIRTY_PIN_END_BOUNDS: Bounds = Bounds {
+    explore: Explore::Pct {
+        seed: 0xA3C0_0D01,
+        depth: 3,
+        executions: 300,
+    },
+    max_steps: 200_000,
+};
+
+/// `dirty_pin_end_wakes_waiter` (card A-3c, Work 6.3; the implementer's
+/// review): a §4.1 pin that was its MapLeaf's last count is an unheld event
+/// (U1–U4's second half), so an acquisition waiting at A7 for an unpin wakes
+/// when that MapLeaf becomes a victim. Both ends of the pin: `mark_freed`
+/// and `mark_written`. Without the event each fails in every execution with
+/// a `Deadlock`: the hooks place W's registration before the pin's end.
+#[test]
+fn dirty_pin_end_wakes_waiter() {
+    for by_write in [false, true] {
+        let report = check(DIRTY_PIN_END_BOUNDS, move || {
+            dirty_pin_end::<Shuttle>(by_write)
+        })
+        .map_err(|f| format!("dirty_pin_end_wakes_waiter (by_write {by_write}): {f}"))
+        .unwrap();
+        assert_eq!(report.executions, 300, "PCT's executions");
+    }
+}
+
+/// The scenario of `map_latch_wait` (card A-3c, Work 3.1's map latch; the
+/// implementer's review): the controller holds MapLeaf 0's parent latched
+/// (`latch_leaf_parent`); W asks for the same latch and fires
+/// `MapLatchWaiting`, its request counted, holding nothing; the controller
+/// releases W and gives the latch back; W is then granted it and reads the
+/// MapLeaf's ref, null (never written). A give-back that wakes no waiter
+/// leaves W asleep wherever it reached its wait before the give-back: a
+/// `Deadlock`.
+fn map_latch_scenario<H: Harness>() -> Result<(), String> {
+    let (_file, pool) = wb_pool::<H>(18, 4, 600, 1, H_MIN_TEST)?;
+    let pool: Shared<H> = Arc::new(pool);
+    let mut lp = Some(pool.latch_leaf_parent(0).map_err(said)?);
+    let pz = Arc::new(ModelPauser::<H>::new());
+    pool.set_hook(Some(pz.hook()));
+    pz.pause_at(MapLatchWaiting, mapleaf(0))?;
+    let w = {
+        let pz = Arc::clone(&pz);
+        let pool = Arc::clone(&pool);
+        H::spawn(move || {
+            let _done = DoneOnDrop { pz, name: "W" };
+            let lp = pool.latch_leaf_parent(0).map_err(said)?;
+            let r = lp.leaf_ref();
+            drop(lp);
+            Ok::<Ref, String>(r)
+        })
+    };
+    let mut problem = None;
+    let mut after = None;
+    match pz.next_event()? {
+        ev if arrived(&ev, MapLatchWaiting, mapleaf(0)) => {
+            pz.release(MapLatchWaiting, mapleaf(0))?;
+            drop(lp.take());
+            after = Some(pz.next_event()?);
+        }
+        ev => {
+            problem = Some(format!(
+                "W's first event was {ev:?}, not Arrived(MapLatchWaiting)"
+            ));
+        }
+    }
+    pz.release_all()?;
+    drop(lp);
+    let r = H::join(w);
+    if let Some(problem) = problem {
+        return Err(problem);
+    }
+    if after != Some(Event::Done("W")) {
+        return Err(format!("after the give-back the next event was {after:?}"));
+    }
+    let leaf_ref = r??;
+    if !leaf_ref.is_null() {
+        return Err(format!("MapLeaf 0's ref is {leaf_ref:?}, not null"));
+    }
+    Ok(())
+}
+
+/// The exploration of `map_latch_wait`.
+const MAP_LATCH_BOUNDS: Bounds = Bounds {
+    explore: Explore::Pct {
+        seed: 0xA3C0_0B0C,
+        depth: 3,
+        executions: 1000,
+    },
+    max_steps: 100_000,
+};
+
+/// `map_latch_wait` (card A-3c, Work 3.1; the implementer's review): the
+/// wait path of a MapInner's map latch (`BodyCell`), which no other test
+/// reaches. The hook places W's counted request before the give-back; whether
+/// W is already asleep when the latch is given back is the schedule's, so a
+/// lost wake-up fails the executions where it is (the RESULT reports how
+/// many of the 1000).
+#[test]
+fn map_latch_wait() {
+    let report = check(MAP_LATCH_BOUNDS, map_latch_scenario::<Shuttle>)
+        .map_err(|f| format!("map_latch_wait: {f}"))
+        .unwrap();
+    assert_eq!(report.executions, 1000, "PCT's executions");
 }
