@@ -56,7 +56,12 @@ if [ ${#ignored[@]} -gt 0 ]; then
 fi
 [ ${#dirty[@]} -eq 0 ] || die "worktree is not clean:$(printf '\n  %s' "${dirty[@]}")"
 log=$(mktemp)
-bash scripts/gate.sh >"$log" 2>&1 || true
+# NV3_GATE_FULL=1: the promote always runs every step, the enforcement
+# self-tests included, whatever the pass touches (ENF-FASTGATE-1). A card gate
+# may skip them for a card that leaves the tooling alone; this run is what
+# still catches a tooling regression before the scaffold moves. Set here, on
+# this one command, so no caller's environment decides it.
+NV3_GATE_FULL=1 bash scripts/gate.sh >"$log" 2>&1 || true
 cat "$log"
 [ "$(tail -n 1 "$log")" = "GATE EXIT=0" ] || die "gate is red (last line: $(tail -n 1 "$log")); not promoting"
 bash scripts/queue-check.sh || die "queue-check failed"

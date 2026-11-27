@@ -75,6 +75,9 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 # switch off replace refs, grafts and fsmonitor themselves, so none of that may
 # come from the caller (the runner and git-env.sh export it to their children).
 unset GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_CONFIG_COUNT
+# NV3_GATE_FULL (ENF-FASTGATE-1) forces every gate step. The promote exports it
+# to the gate that runs this suite; the rows here set it themselves.
+unset NV3_GATE_FULL
 git init -q --bare "$t/origin.git"
 r=$t/repo
 git init -q -b nucleus/v3-scaffold "$r"
@@ -544,6 +547,145 @@ else fail "gate: failing step not reported"; sed 's/^/     /' "$t/gate"; fi
 gate_out none
 if [ "$(cat "$t/gate.rc")" = 0 ] && [ "$(tail -n 1 "$t/gate")" = "GATE EXIT=0" ]; then pass "gate: all green gives GATE EXIT=0"; else fail "gate: green run"; sed 's/^/     /' "$t/gate"; fi
 
+# --- gate.sh: enforcement-tests only for a tooling change (ENF-FASTGATE-1) ----
+# A repository of its own: the real gate.sh and git-env.sh, stub steps, and a
+# stub suite that prints ENF-RAN and exits GS_ENF_RC (default 0), so a row can
+# tell a run from a skip, and see that a skipped failing suite cannot fail the
+# gate. The fake cargo above answers every cargo step. A row's branch is fresh
+# off the scaffold and clean; ref and exclude changes are undone after the row.
+gs=$t/gs
+git init -q -b nucleus/v3-scaffold "$gs"
+mkdir -p "$gs/nucleus/v3/scripts" "$gs/nucleus/v3/tools" "$gs/nucleus/v3/docs" "$gs/nucleus/v3/verdicts" "$gs/nucleus/v3/spikes"
+cp "$src/scripts/gate.sh" "$src/scripts/git-env.sh" "$gs/nucleus/v3/scripts/"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$gs/nucleus/v3/scripts/check-core-paths.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$gs/nucleus/v3/scripts/check-api-surface.sh"
+printf '#!/usr/bin/env bash\necho ENF-RAN\nexit "${GS_ENF_RC:-0}"\n' >"$gs/nucleus/v3/scripts/test-enforcement.sh"
+for f in tools/run_card.py CORE_PATHS docs/README.md verdicts/README.md spikes/base.txt; do echo base >"$gs/nucleus/v3/$f"; done
+git -C "$gs" add -A && git -C "$gs" commit -qm "gs base"
+gs_base=$(git -C "$gs" rev-parse HEAD)
+# gsb NAME [FILE...]: check out gs/NAME fresh off the scaffold, clean, with one
+# commit appending NAME to each FILE (nucleus/v3-relative; none: an empty commit).
+gsb() {
+  local n=$1 f; shift
+  git -C "$gs" checkout -q -f -B "gs/$n" "$gs_base" && git -C "$gs" clean -qfdx
+  for f in "$@"; do mkdir -p "$(dirname "$gs/nucleus/v3/$f")"; echo "$n" >>"$gs/nucleus/v3/$f"; done
+  git -C "$gs" add -A && git -C "$gs" commit -q --allow-empty -m "gs $n"
+}
+# gsrun [VAR=VALUE...]: the gate in DIR ($gs unless GSDIR), stdout and stderr to
+# $t/gs.out, the exit status to $t/gs.rc.
+gsrun() { local rc=0; (cd "${GSDIR:-$gs}/nucleus/v3" && env "$@" bash scripts/gate.sh) >"$t/gs.out" 2>&1 || rc=$?; echo "$rc" >"$t/gs.rc"; }
+GS_SKIP="STEP enforcement-tests SKIPPED (no scripts/ or tools/ change)"
+# gs_skipped [N]: exit N (default 0) and last line GATE EXIT=N; the SKIPPED line,
+# no ENF-RAN, no enforcement-tests EXIT= line; every other step's STEP line.
+gs_skipped() {
+  local n=${1:-0} s; cat "$t/gs.out"
+  [ "$(cat "$t/gs.rc")" = "$n" ] && [ "$(tail -n 1 "$t/gs.out")" = "GATE EXIT=$n" ] && grep -qxF "$GS_SKIP" "$t/gs.out" &&
+    ! grep -qx 'ENF-RAN' "$t/gs.out" && ! grep -q '^STEP enforcement-tests EXIT=' "$t/gs.out" || return 1
+  for s in test clippy fmt deny wasm32 core-paths-selftest api-surface; do grep -q "^STEP $s EXIT=[0-9]*$" "$t/gs.out" || { echo "no STEP $s line"; return 1; }; done
+}
+# gs_ran WHY [ENF_RC [N]]: the suite ran (ENF-RAN, `STEP enforcement-tests
+# EXIT=ENF_RC`, default 0), no SKIPPED line, the reason line names WHY, exit N
+# (default 0) and last line GATE EXIT=N.
+gs_ran() {
+  local why=$1 er=${2:-0} n=${3:-0}; cat "$t/gs.out"
+  [ "$(cat "$t/gs.rc")" = "$n" ] && [ "$(tail -n 1 "$t/gs.out")" = "GATE EXIT=$n" ] && grep -qx 'ENF-RAN' "$t/gs.out" &&
+    grep -qx "STEP enforcement-tests EXIT=$er" "$t/gs.out" && ! grep -qF 'enforcement-tests SKIPPED' "$t/gs.out" &&
+    grep '^gate: enforcement-tests runs: ' "$t/gs.out" | grep -qF -- "$why"
+}
+gsb spikes spikes/x.txt
+gsrun
+expect_ok "gate: GS1: a spikes/-only change skips enforcement-tests; every other step runs; GATE EXIT=0" gs_skipped
+gsrun GS_ENF_RC=1
+expect_ok "gate: GS2: the skipped suite never runs, so a failing one cannot fail the gate" gs_skipped
+gsrun FAKE_FAIL=clippy
+expect_ok "gate: GS3: with the skip, a failing engine step still gives GATE EXIT=1, exit 1" gs_skipped 1
+gsrun NV3_GATE_FULL=1
+expect_ok "gate: GS4: NV3_GATE_FULL=1 runs the suite on a spikes/-only change" gs_ran "NV3_GATE_FULL is set"
+gsb scr scripts/new.sh
+gsrun
+expect_ok "gate: GS5: a scripts/ change runs the suite" gs_ran "the change touches the tooling: nucleus/v3/scripts/new.sh"
+gsrun GS_ENF_RC=1
+expect_ok "gate: GS6: a failing suite on a scripts/ change gives STEP EXIT=1, GATE EXIT=1, exit 1" gs_ran "nucleus/v3/scripts/new.sh" 1 1
+gsb tools tools/run_card.py
+gsrun
+expect_ok "gate: GS7: a tools/ change runs the suite" gs_ran "the change touches the tooling: nucleus/v3/tools/run_card.py"
+for f in CORE_PATHS docs/README.md verdicts/README.md; do
+  gsb in "$f"; gsrun
+  expect_ok "gate: GS8: a change to $f (a file the suite copies) runs the suite" gs_ran "nucleus/v3/$f"
+done
+gsb del; git -C "$gs" rm -q nucleus/v3/tools/run_card.py && git -C "$gs" commit -qm "gs del: tools/run_card.py removed"
+gsrun
+expect_ok "gate: GS9: deleting a tools/ file runs the suite" gs_ran "nucleus/v3/tools/run_card.py"
+gsb unc spikes/x.txt; echo '# edit' >>"$gs/nucleus/v3/scripts/check-core-paths.sh"
+gsrun
+expect_ok "gate: GS10: an uncommitted scripts/ edit runs the suite" gs_ran "uncommitted tooling changes: nucleus/v3/scripts/check-core-paths.sh"
+gsb stg spikes/x.txt; echo '# staged' >>"$gs/nucleus/v3/tools/run_card.py"; git -C "$gs" add nucleus/v3/tools/run_card.py
+gsrun
+expect_ok "gate: GS11: a staged tools/ edit runs the suite" gs_ran "uncommitted tooling changes: nucleus/v3/tools/run_card.py"
+gsb unt spikes/x.txt; echo new >"$gs/nucleus/v3/tools/new.py"
+gsrun
+expect_ok "gate: GS12: an untracked tools/ file runs the suite" gs_ran "untracked tooling files: nucleus/v3/tools/new.py"
+gsb ign spikes/x.txt; printf '*.pyc\n' >"$gs/.git/info/exclude"; echo x >"$gs/nucleus/v3/tools/x.pyc"
+gsrun
+expect_ok "gate: GS13: an ignored untracked tools/ file runs the suite too" gs_ran "untracked tooling files: nucleus/v3/tools/x.pyc"
+rm -f "$gs/.git/info/exclude"
+# GS14-GS17: the base. No scaffold ref, a ref with no merge-base, the origin
+# ref alone, and two refs that disagree (the union is diffed).
+gsb nob spikes/x.txt; git -C "$gs" branch -q -m nucleus/v3-scaffold gs-moved
+gsrun
+expect_ok "gate: GS14: no nucleus/v3-scaffold ref (local or origin) runs the suite" gs_ran "no nucleus/v3-scaffold ref to diff against"
+git -C "$gs" branch -q -m gs-moved nucleus/v3-scaffold
+gs_orphan=$(git -C "$gs" commit-tree "$(git -C "$gs" hash-object -t tree /dev/null)" -m "gs unrelated")
+gsb unr spikes/x.txt; git -C "$gs" update-ref refs/remotes/origin/nucleus/v3-scaffold "$gs_orphan"
+gsrun
+expect_ok "gate: GS15: a scaffold ref with no merge-base with HEAD runs the suite" gs_ran "no merge-base of refs/remotes/origin/nucleus/v3-scaffold and HEAD"
+gsb ori spikes/x.txt; git -C "$gs" update-ref refs/remotes/origin/nucleus/v3-scaffold "$gs_base"; git -C "$gs" branch -q -m nucleus/v3-scaffold gs-moved
+gsrun
+expect_ok "gate: GS16: premise: the origin ref alone is a base (a spikes/-only change skips)" gs_skipped
+git -C "$gs" branch -q -m gs-moved nucleus/v3-scaffold
+gsb uni scripts/new.sh; git -C "$gs" update-ref refs/heads/nucleus/v3-scaffold "$(git -C "$gs" rev-parse HEAD)"
+gsrun
+expect_ok "gate: GS17: local scaffold at HEAD, origin behind a scripts/ change: the origin diff runs the suite" gs_ran "nucleus/v3/scripts/new.sh"
+git -C "$gs" update-ref refs/heads/nucleus/v3-scaffold "$gs_base"; git -C "$gs" update-ref -d refs/remotes/origin/nucleus/v3-scaffold
+# GS18: git state that hides changes (a replace ref) runs the suite.
+gsb rep spikes/x.txt; git -C "$gs" replace "$gs_orphan" "$gs_base"
+gsrun
+expect_ok "gate: GS18: a replace ref (git state that hides changes) runs the suite" gs_ran "git state hides changes: replace ref refs/replace/$gs_orphan"
+git -C "$gs" replace -d "$gs_orphan" >/dev/null
+# GS19-GS21: a failing git, and one that only warns, run the suite. The shim
+# fails (GS_GIT_FAIL) or warns on stderr (GS_GIT_WARN) for one subcommand, by
+# its first argument, and is the real git otherwise.
+mkdir -p "$t/gsgit"
+printf '#!/usr/bin/env bash\n[ "$1" != "${GS_GIT_FAIL:-}" ] || { echo "gsgit: $1 refused" >&2; exit 128; }\n[ "$1" != "${GS_GIT_WARN:-}" ] || echo "warning: gsgit: $1" >&2\nexec %q "$@"\n' "$(command -v git)" >"$t/gsgit/git"
+chmod +x "$t/gsgit/git"
+gsb gfl spikes/x.txt
+gsrun PATH="$t/gsgit:$PATH" GS_GIT_FAIL=merge-base
+expect_ok "gate: GS19: a failing git merge-base runs the suite" gs_ran "no merge-base of refs/heads/nucleus/v3-scaffold and HEAD"
+gsrun PATH="$t/gsgit:$PATH" GS_GIT_FAIL=diff
+expect_ok "gate: GS20: a failing git diff runs the suite" gs_ran "git diff"
+gsrun PATH="$t/gsgit:$PATH" GS_GIT_WARN=diff
+expect_ok "gate: GS21: a git that writes to stderr, though it succeeds, runs the suite" gs_ran "warning: gsgit: diff"
+gsrun PATH="$t/gsgit:$PATH"
+expect_ok "gate: GS21: premise: the shim alone (no failure, no warning) still skips" gs_skipped
+# GS22: not a git checkout at all (an archive extract).
+mkdir -p "$t/gsx" && git -C "$gs" archive "$gs_base" | tar -x -m -C "$t/gsx"
+GSDIR=$t/gsx gsrun GIT_CEILING_DIRECTORIES="$t"
+expect_ok "gate: GS22: outside any git checkout the suite runs" gs_ran "git state hides changes"
+git -C "$gs" checkout -q -f nucleus/v3-scaffold
+# GS23: the list covers every file this suite copies from the real tree:
+# those are its inputs, so a change to any of them must run it.
+gs_inputs() {
+  local list p n=0 ok=0
+  list=$(sed -n 's/^tooling=(\(.*\))$/\1/p' "$src/scripts/gate.sh")
+  echo "tooling: $list"
+  while IFS= read -r p; do
+    n=$((n + 1))
+    case " $list " in *" ${p%%/*} "* | *" $p "*) echo "covered: $p" ;; *) echo "not covered: $p"; ok=1 ;; esac
+  done < <(grep -o '"\?\$src"\?/[A-Za-z0-9_./*-]*' "${BASH_SOURCE[0]}" | sed 's/"//g; s/^\$src\///' | LC_ALL=C sort -u)
+  [ "$ok" -eq 0 ] && [ "$n" -ge 5 ]
+}
+expect_ok "gate: GS23: the skip list covers every file the suite copies from the tree (at least 5 found)" gs_inputs
+
 # --- queue-check ------------------------------------------------------------
 git -C "$r" checkout -q nucleus/v3-scaffold
 q() { (cd "$v3" && bash scripts/queue-check.sh); }
@@ -780,6 +922,13 @@ git -C "$r" checkout -q -B scratch/pass3 nucleus/v3-scaffold
 qa=$t/qa; mkdir -p "$qa"; printf '# QUEUE\n' >"$qa/QUEUE.local.md"
 promote() { (cd "$v3" && NV3_CARDS="$qa" FAKE_FAIL=${1:-none} bash scripts/promote-pass.sh scratch/pass3); }
 expect_no "promote: a red gate is not promoted" promote clippy
+# ENF-FASTGATE-1: the promote runs every step, whatever the pass touches. The
+# premise shows a plain gate run on scratch/pass3 (card A: spikes/ only) skips
+# the enforcement step, so the row after it is not vacuous.
+pg_skips() { local o; o=$(cd "$v3" && bash scripts/gate.sh 2>&1); echo "$o"; grep -qxF "STEP enforcement-tests SKIPPED (no scripts/ or tools/ change)" <<<"$o"; }
+expect_ok "premise: promote: a plain gate run on scratch/pass3 skips enforcement-tests" pg_skips
+pr_full() { local o rc=0; o=$(promote clippy 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qx "STEP enforcement-tests EXIT=0" <<<"$o" && ! grep -qF "enforcement-tests SKIPPED" <<<"$o" && grep -qx "gate: enforcement-tests runs: NV3_GATE_FULL is set" <<<"$o"; }
+expect_ok "promote: the gate runs every step, enforcement-tests included (NV3_GATE_FULL=1)" pr_full
 echo dirty >>"$v3/spikes/base.txt"
 expect_no "promote: a dirty worktree is not promoted" promote
 git -C "$r" checkout -q -- nucleus/v3/spikes/base.txt
@@ -3111,6 +3260,28 @@ expect_ok "runner e2e: G: a killed attempt's tokens are counted and its silence 
 # G2: a fresh run moves the old ledger aside and starts a new one.
 e2e XG-2 quota --attempts 1
 expect_ok "runner e2e: G: a fresh run moves the old ledger aside" res XG-2 "len(A) == 1 and len(A[0]) == 2 and len(L) == 2 and A[0][0]['run'] != L[0]['run']"
+# GD, GF (ENF-FASTGATE-1): the runner never runs the card's last line, the full
+# gate; the result says "gate": "deferred". e2e/gatefail's gate.sh always fails,
+# so a run that ran it could not pass (the premise runs it). GF: every other
+# Acceptance line still decides pass.
+git -C "$r" checkout -q -b e2e/gatefail e2e/base
+printf '#!/usr/bin/env bash\necho "STEP test EXIT=1"\necho "GATE EXIT=1"\nexit 1\n' >"$v3/scripts/gate.sh"
+git -C "$r" add nucleus/v3/scripts/gate.sh && git -C "$r" commit -qm "e2e: a gate that always fails"
+git -C "$r" checkout -q e2e/base
+gd_premise() { local o rc=0; o=$(git -C "$r" show e2e/gatefail:nucleus/v3/scripts/gate.sh | bash) || rc=$?; echo "exit $rc: $o"; [ "$rc" = 1 ] && [ "$(tail -n 1 <<<"$o")" = "GATE EXIT=1" ]; }
+expect_ok "runner e2e: GD: premise: e2e/gatefail's gate.sh exits 1 with GATE EXIT=1" gd_premise
+# gdrun ID FIRST: card ID on e2e/gatefail, Acceptance FIRST and then the gate, one attempt of clean work.
+gdrun() {
+  printf '# CARD %s: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/gatefail        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `%s`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' "$1" "$2" >"$e/cards/$1.local.md"
+  rm -f "$e/$1.n"
+  (cd "$r" && FAKE_OC=work FAKE_OC_N=$e/$1.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/$1" "$e/cards/$1.local.md" --base e2e/gatefail --attempts 1) || true
+}
+gdrun XGD true
+expect_ok "runner e2e: GD: the gate line is deferred, not run: the run passes over a failing gate.sh" \
+  res XGD "rc == 0 and r['pass'] and r['gate'] == 'deferred' and r['scope'] == 'ok' and '[XGD] DEFERRED: cd nucleus/v3 && bash scripts/gate.sh' in out and 'PASS: true' in out and 'FAIL: cd nucleus/v3' not in out and 'PASS: cd nucleus/v3' not in out and $closed"
+gdrun XGF false
+expect_ok "runner e2e: GF: a failing non-gate line still fails the run, gate deferred" \
+  res XGF "rc == 1 and not r['pass'] and r['gate'] == 'deferred' and '[XGF] FAIL: false' in out and r['attempts'] == 1 and $closed"
 # H: no output at all is a provider stall, never "of silence".
 e2e XH mute --attempts 1
 expect_ok "runner e2e: H: no output at all is reported as such" \
@@ -4261,7 +4432,9 @@ expect_ok "runner e2e: ACC: premise: the first line recorded its same-group chil
 expect_ok "runner e2e: ACC: a line's same-group child is dead before the next line starts (ACC-NO-END)" res XAE "rc == 0 and r['pass'] and $closed"
 # The one-killpg row above counts opencode's group. Each line adds its own, once;
 # since rework R8 the rustfmt pre-flight's container adds one more before them.
-kp_each() { local n; cat "$e/XKP.kp"; n=$(grep -c '' "$e/XKP.kp"); [ "$n" = 4 ] && [ "$(cut -d ' ' -f 1 "$e/XKP.kp" | sort -u | grep -c '')" = 4 ] && ! grep -qv ' 9$' "$e/XKP.kp"; }
+# Since ENF-FASTGATE-1 the last line, the gate, is deferred and starts no
+# container, so XKP's two lines (`true` and the gate) add one: 3, not 4.
+kp_each() { local n; cat "$e/XKP.kp"; n=$(grep -c '' "$e/XKP.kp"); [ "$n" = 3 ] && [ "$(cut -d ' ' -f 1 "$e/XKP.kp" | sort -u | grep -c '')" = 3 ] && ! grep -qv ' 9$' "$e/XKP.kp"; }
 expect_ok "runner e2e: ACC: the pre-flight, opencode and each line get one SIGKILL killpg, no group twice" kp_each
 # L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
 # always says "committed outside its worktree"). No fake-opencode action makes
@@ -4735,6 +4908,8 @@ rm -f "$e/XMSG.n"
 expect_ok "runner e2e: M: a run whose first Acceptance command always fails does not pass" res XMSG "rc == 1 and not r['pass'] and r['attempts'] == 2"
 expect_ok "runner e2e: M: attempt 2's message lists the failing STEP line from outside the tail" \
   res XMSG "'Failing steps (from the full output):\nSTEP fmt EXIT=1\n' in open('$e/XMSG.n.msg2').read()"
+expect_ok "runner e2e: M: attempt 2's message says the last line, the full gate, is not for the worker to re-run (ENF-FASTGATE-1)" \
+  res XMSG "'Re-run the acceptance commands (not the last one, the full gate: the gate session runs it), commit' in open('$e/XMSG.n.msg2').read()"
 
 
 # --- fresh-gate.sh (X-6-F1-F2-F2-F1-F1) -------------------------------------
@@ -4821,6 +4996,21 @@ fgcard FG2 1
 fgrun card/v3-FG2
 expect_ok "fresh-gate: FG2: a failing gate: exit 1, last line GATE EXIT=1" fg_gate 1 FG2
 expect_ok "fresh-gate: FG2: the checkout is removed" fg_clean
+
+# FGS (ENF-FASTGATE-1): the enforcement decision inside fresh-gate's real
+# container, on a commit carrying the scaffold's real gate.sh (and this suite's
+# stub enforcement script): a spikes/-only commit skips the step, a scripts/
+# one runs it.
+fgs_premise() { git -C "$r" show nucleus/v3-scaffold:nucleus/v3/scripts/gate.sh | cmp - "$src/scripts/gate.sh"; }
+expect_ok "fresh-gate: FGS: premise: the scaffold here carries the real gate.sh" fgs_premise
+fgs() { git -C "$r" checkout -q -b "card/v3-$1" nucleus/v3-scaffold && mkdir -p "$(dirname "$v3/$2")" && echo "$1" >>"$v3/$2" && git -C "$r" add "nucleus/v3/$2" && git -C "$r" commit -qm "nucleus v3: $1 work" && git -C "$r" checkout -q nucleus/v3-scaffold; }
+fgs_out() { fg_show; [ "$(cat "$t/fg.rc")" = 0 ] && [ "$(tail -n 1 "$t/fg.out")" = "GATE EXIT=0" ] && grep -qxF "$1" "$t/fg.out" && ! grep -qxF "$2" "$t/fg.out"; }
+fgs FGS1 spikes/fgs.txt
+fgrun card/v3-FGS1
+expect_ok "fresh-gate: FGS1: a spikes/-only commit skips enforcement-tests in the container, GATE EXIT=0" fgs_out "STEP enforcement-tests SKIPPED (no scripts/ or tools/ change)" "STEP enforcement-tests EXIT=0"
+fgs FGS2 scripts/fgs.sh
+fgrun card/v3-FGS2
+expect_ok "fresh-gate: FGS2: a scripts/ commit runs enforcement-tests in the container, GATE EXIT=0" fgs_out "STEP enforcement-tests EXIT=0" "STEP enforcement-tests SKIPPED (no scripts/ or tools/ change)"
 
 # fresh-gate's container (X-6-F1-F1-F2-F1-F1). The stub gate leaves a forge in its own
 # session and passes. FG_HOLD holds it, for a signal during the gate. Everything goes

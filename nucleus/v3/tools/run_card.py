@@ -118,6 +118,9 @@ must ask: there is no exemption here.
 v3 rules on top of v2: the last Acceptance command must be the full gate (`scripts/gate.sh`),
 whose pass requires a literal `GATE EXIT=0` line, not just exit code 0 (§7.6.4); workers may
 not touch docs/, cards/, tools/, scripts/, verdicts/, CORE_PATHS, or anything in nucleus/v2.
+This runner does not run that last line (ENF-FASTGATE-1): the result records `"gate": "deferred"`,
+and `pass` means scope, ledger and every other Acceptance line. The gate session's fresh-gate.sh
+run is the card's full gate, and promote-pass.sh runs another before the scaffold moves.
 """
 import argparse
 import fnmatch
@@ -570,7 +573,11 @@ def bash_permission(cmd, rules=None):
 
 
 def gate_passed(rc, out):
-    """A gate run passes only with exit 0 AND a last line of exactly `GATE EXIT=0` (§7.6.4)."""
+    """A gate run passes only with exit 0 AND a last line of exactly `GATE EXIT=0` (§7.6.4).
+
+    The rule every reader of a gate run applies (fresh-gate.sh's caller,
+    promote-pass.sh). main() no longer runs the gate (ENF-FASTGATE-1), so the
+    suite's rows are what call this; they pin the rule."""
     lines = out.rstrip("\n").splitlines()
     return rc == 0 and bool(lines) and lines[-1].strip() == GATE_PASS
 
@@ -1960,7 +1967,9 @@ def main():
         return bad
 
     session = None
-    result = {"pass": False, "attempts": 0, "in": 0, "out": 0, "reasoning": 0, "scope": "n/a", "seconds": 0, "killed": []}
+    # "gate": the card's last Acceptance line (GATE_CMD) is never run here; see
+    # the Acceptance loop. Every result says so, so no reader takes "pass" for a gate.
+    result = {"pass": False, "attempts": 0, "in": 0, "out": 0, "reasoning": 0, "scope": "n/a", "seconds": 0, "killed": [], "gate": "deferred"}
     t0 = time.time()
     failure = ""
     child = None
@@ -1977,7 +1986,7 @@ def main():
             cmd = ["opencode", "run", "--standalone", "-m", f"{args.model}#{effort}", "--format", "json", "--auto", "--thinking"]
             if session:
                 cmd += ["-s", session]
-            msg = prompt if (attempt == 1 or not session) else f"Acceptance or scope failed. Fix it within the same card. Failure output:\n\n{failure}\n\nRe-run the acceptance commands, commit, then end with the RESULT block."
+            msg = prompt if (attempt == 1 or not session) else f"Acceptance or scope failed. Fix it within the same card. Failure output:\n\n{failure}\n\nRe-run the acceptance commands (not the last one, the full gate: the gate session runs it), commit, then end with the RESULT block."
             cmd.append(msg)
             print(f"[{card_id}] attempt {attempt}: opencode {args.model} effort {effort}", flush=True)
             finished = False
@@ -2068,14 +2077,23 @@ def main():
             result["scope"] = "ok"
             failures = []
             for c in accept:
+                # ENF-FASTGATE-1 (the owner's 2026-11-27 yes): the full gate is
+                # not run after an attempt. The gate session's fresh-gate.sh run,
+                # in an isolated checkout of the commit, is the card's full gate,
+                # and promote-pass.sh runs another before any merge reaches the
+                # scaffold, so no card merges with less testing; a fmt or clippy
+                # slip the gate finds is a REWORK. validate_card still requires
+                # the line, last, so every card keeps naming its gate. Only that
+                # exact line is deferred, and every other line still decides pass.
+                if c.strip() == GATE_CMD:
+                    print(f"[{card_id}] DEFERRED: {c} (the gate session runs it in fresh-gate.sh)", flush=True)
+                    continue
                 # One container per command, ended before the next one starts, so
                 # nothing a line starts is alive for the next line or the end record.
                 # In `child`, so a signal during the wait still reaches the finally.
                 # keep_runtime carries the card's podman opt-in (Work 5).
                 child = spawn_contained(["/bin/sh", "-c", c], wt, git_env(env), keep_runtime=bus, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 rc, out = finish_contained(child, ACCEPT_S)
-                if c.strip() == GATE_CMD and not gate_passed(rc, out):
-                    rc, out = 1, out + "\nthe gate's last line was not GATE EXIT=0"
                 if rc == 0 and "cargo test" in c and sum(int(n) for n in re.findall(r"test result: ok\. (\d+) passed", out)) == 0:
                     rc, out = 1, out + "\nno tests ran: a cargo test acceptance command must run at least one test"
                 print(f"[{card_id}] {'PASS' if rc == 0 else 'FAIL'}: {c}", flush=True)
