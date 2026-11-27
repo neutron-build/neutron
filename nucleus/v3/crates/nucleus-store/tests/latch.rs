@@ -353,18 +353,11 @@ fn spot_cases() -> Result<(), String> {
     }
     // (l) The constructor's domain.
     {
-        require(
-            LatchCore::new(128, 1).is_err(),
-            "(l): a bound of 128 is `Invalid`",
-        )?;
-        require(
-            LatchCore::new(0, 0).is_err(),
-            "(l): a capacity of 0 is `Invalid`",
-        )?;
-        require(
-            LatchCore::new(0, 65_536).is_err(),
-            "(l): a capacity of 65,536 is `Invalid`",
-        )?;
+        for (bound, capacity) in [(128u32, 1u32), (0, 0), (0, 65_536)] {
+            // `invalid` fails the case unless the answer is `Invalid`.
+            invalid(LatchCore::new(bound, capacity))
+                .map_err(|e| format!("(l): new({bound}, {capacity}): {e}"))?;
+        }
         let c = said(LatchCore::new(127, 65_535))?;
         require(
             c.bound() == 127 && c.capacity() == 65_535 && c.waiting() == 0,
@@ -925,14 +918,11 @@ fn api() -> Result<(), String> {
         said(latch.bound())? == 1 && said(latch.capacity())? == 4,
         "bound() and capacity()",
     )?;
-    require(
-        Latch::<StdPrimitives>::new(128, 1).is_err(),
-        "a bound of 128 is `Invalid`",
-    )?;
-    require(
-        Latch::<StdPrimitives>::new(0, 0).is_err(),
-        "a capacity of 0 is `Invalid`",
-    )?;
+    for (bound, capacity) in [(128u32, 1u32), (0, 0)] {
+        // `invalid` fails the case unless the answer is `Invalid`.
+        invalid(Latch::<StdPrimitives>::new(bound, capacity))
+            .map_err(|e| format!("Latch::new({bound}, {capacity}): {e}"))?;
+    }
     Ok(())
 }
 

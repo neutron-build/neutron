@@ -236,12 +236,12 @@ impl LatchCore {
     /// no request waits. It is the largest count in the queue, since every
     /// increment applies to every queued entry and a later entry starts at 0.
     fn head_count(&self) -> u32 {
-        self.queue.first().map_or(0, |e| u32::from(e & COUNT_MASK))
+        self.live().first().map_or(0, |e| u32::from(e & COUNT_MASK))
     }
 
     /// The head's mode, `None` when no request waits.
     fn head_mode(&self) -> Option<Mode> {
-        self.queue.first().map(|e| {
+        self.live().first().map(|e| {
             if e & EXCLUSIVE_BIT != 0 {
                 Mode::Exclusive
             } else {

@@ -919,19 +919,28 @@ fn seed_override(exploration: &Exploration) -> Option<Failure> {
 ///
 /// Each execution runs `body` and reports an `Err` through `assert!`. A
 /// deadlock, a step-limit excess and any other panic end the run as they end
-/// the model checker's. A pass returns how many executions ran: exactly the
-/// stated number for a sampled exploration, and fewer than the cap for an
-/// exhaustive one, whose search reaching the cap is [`Class::NotExhausted`],
-/// never a pass.
+/// the model checker's, and so does a panic of its own before any execution
+/// starts, which is never a pass. A pass returns how many executions ran:
+/// exactly the stated number for a sampled exploration, and fewer than the cap
+/// for an exhaustive one, whose search reaching the cap is
+/// [`Class::NotExhausted`], never a pass.
 pub fn check<F>(bounds: Bounds, body: F) -> Result<Report, Failure>
 where
     F: Fn() -> Result<(), String> + Send + Sync + 'static,
 {
     let exploration = Exploration::new(bounds);
     let body = Arc::new(body);
-    if let End::Panicked(Some(index), class, message) = drive(&exploration, Arc::clone(&body), true)
-    {
-        return Err(panicked_failure(&exploration, index, class, message));
+    match drive(&exploration, Arc::clone(&body), true) {
+        End::Exhausted => {}
+        End::Panicked(Some(index), class, message) => {
+            return Err(panicked_failure(&exploration, index, class, message));
+        }
+        End::Panicked(None, _, message) => {
+            // The model checker failed before any execution started. No
+            // execution ran, so that is never a pass.
+            let text = format!("the model checker failed before any execution: {message}");
+            return Err(harness_failure(bounds, text));
+        }
     }
     if let Some(failure) = seed_override(&exploration) {
         return Err(failure);

@@ -173,15 +173,12 @@ impl<P: Primitives, T: Send + Default> Default for Mutex<P, T> {
     }
 }
 
-impl<P: Primitives, T: Send + fmt::Debug> fmt::Debug for Mutex<P, T> {
+impl<P: Primitives, T: Send> fmt::Debug for Mutex<P, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.lock() {
-            Ok(guard) => f.debug_struct("Mutex").field("value", &*guard).finish(),
-            Err(_) => f
-                .debug_struct("Mutex")
-                .field("value", &"<poisoned>")
-                .finish(),
-        }
+        // The value is not shown. This layer has no try-lock, and a `Debug`
+        // that waited for the mutex would never return when a thread prints a
+        // mutex it holds itself (the standard library's own never waits).
+        f.debug_struct("Mutex").finish_non_exhaustive()
     }
 }
 

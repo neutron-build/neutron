@@ -378,8 +378,19 @@ pub fn run<H: Harness, L: LatchUnderTest<H>>(
 /// capacity 1 that main holds exclusively while two threads ask it shared.
 /// While main holds, one of the two is queued and the other overflows in
 /// every schedule; the overflow is reported, never absorbed.
+///
+/// The error count is kept under the mutex that main waits with, not in an
+/// atomic of its own beside it. That is a judgment of this card's
+/// implementation: with the count in an atomic and the mutex only for the
+/// wait, the exhaustive search is 467,558 executions, past the cap, where
+/// this form's is 7,780 (both measured on this scenario on
+/// `Latch<Shuttle>` for K in {0, 1}), and the test passes only with the
+/// search complete.
 pub fn overflow<H: Harness>(k: u32) -> Result<(), String> {
     let latch = Arc::new(Latch::<H>::new(k, 1).map_err(|e| e.to_string())?);
+    // The error count, under the mutex with the condition variable main
+    // waits on. A notify made under that mutex cannot be missed between
+    // main's check and its wait.
     let reported = Arc::new((Mutex::<H, u64>::new(0), Condvar::<H>::new()));
 
     // Main takes the latch exclusive.
@@ -405,23 +416,26 @@ pub fn overflow<H: Harness>(k: u32) -> Result<(), String> {
                 }
                 Err(error) => {
                     // W3: an overflow is `Invalid`, names the capacity, and
-                    // changed nothing.
+                    // changed nothing. The count is raised whatever the
+                    // error is, so main goes on and a wrong error reaches it
+                    // at the join, not as a wait that never ends.
+                    let mut count = reported.0.lock().map_err(|e| e.to_string())?;
+                    *count += 1;
+                    reported.1.notify_all();
+                    drop(count);
                     let text = error.to_string();
                     if !matches!(error, StoreError::Invalid(_)) || !text.contains("capacity") {
                         return Err(format!(
                             "a full queue returned {text}, not `Invalid` naming the capacity"
                         ));
                     }
-                    let mut count = reported.0.lock().map_err(|e| e.to_string())?;
-                    *count += 1;
-                    reported.1.notify_all();
                     Ok(true)
                 }
             }
         }));
     }
 
-    // Main waits on the condition variable until one overflow is reported,
+    // Main waits on the condition variable until the count is at least 1,
     // with no spin.
     {
         let mut count = reported.0.lock().map_err(|e| e.to_string())?;

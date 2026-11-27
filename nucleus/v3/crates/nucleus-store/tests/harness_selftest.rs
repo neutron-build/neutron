@@ -276,8 +276,9 @@ fn lost_wakeup<H: Harness>() -> Result<(), String> {
     H::join(setter)
 }
 
-/// The fixed form of PB-LOST-WAKEUP: the same layout, the flag kept under the
-/// mutex, and a wait in a re-checking loop.
+/// The fixed form of PB-LOST-WAKEUP: the same layout (the main thread waits
+/// and the setter is the one spawned thread), the flag kept under the mutex,
+/// and a wait in a re-checking loop.
 fn fixed_handshake<H: Harness>() -> Result<(), String> {
     let state = Arc::new(Mutex::<H, u64>::new(0));
     let wake = Arc::new(Condvar::<H>::new());
@@ -288,13 +289,14 @@ fn fixed_handshake<H: Harness>() -> Result<(), String> {
         setter_wake.notify_all();
         Ok(())
     });
-    let joined = H::join(setter)?;
-    joined?;
+    // The waiter: the flag is read under the mutex the wait releases, and
+    // read again after every wake.
     let mut flag = state.lock().map_err(|e| e.to_string())?;
     while *flag == 0 {
         flag = wake.wait(flag).map_err(|e| e.to_string())?;
     }
-    Ok(())
+    drop(flag);
+    H::join(setter)?
 }
 
 /// PB-COUNTER-RACE: each thread increments the counter `increments` times by
@@ -919,7 +921,8 @@ fn harness_share_planted_bugs() {
 }
 
 /// Test 16: the share's boundary, on `Census` values built directly, and
-/// `kill_evidence`'s answer when nothing fails.
+/// `kill_evidence`'s refusals: when nothing fails, and when the first
+/// failure does not replay.
 #[test]
 fn harness_share_boundary() {
     let census = |executions: usize, failing: usize| Census {
@@ -958,4 +961,18 @@ fn harness_share_boundary() {
     let failure = kill_evidence(RANDOM, move || exact_counter::<Shuttle>(3, 2))
         .expect_err("kill_evidence on a clean body must fail");
     assert!(failure.message.contains("no execution failed"), "{failure}");
+
+    // The replay is what makes the evidence, so a first failure that does not
+    // replay to the same failure is refused. This body fails with a text of
+    // its own on every call, counted outside the model: the census notes its
+    // first failure, and the replay of that schedule cannot repeat it.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let theirs = Arc::clone(&calls);
+    let failure = kill_evidence(RANDOM, move || {
+        let n = theirs.fetch_add(1, Ordering::SeqCst);
+        Err(format!("planted violation {n}"))
+    })
+    .expect_err("kill_evidence must refuse a failure that does not replay");
+    assert_eq!(failure.class, Class::Panic, "{failure}");
+    assert!(failure.message.starts_with("replay differs"), "{failure}");
 }
