@@ -11,6 +11,10 @@
 //! - `sync_rwcell_std`, `sync_rwcell_model`, `sync_mutex_poison_std` and
 //!   `sync_mutex_poison_model`: the sync layer's cell and both backends'
 //!   poisoning.
+//! - `sync_condvar_poison_std`, `sync_condvar_poison_model`,
+//!   `sync_rwcell_poison_std` and `sync_rwcell_poison_model`: F5's other
+//!   halves, a mutex poisoned while a thread waits on it and a poisoned
+//!   cell, on both backends.
 //! - `sync_atomic_std` and `sync_atomic_model`: the sync layer's atomic,
 //!   including the value a failed `compare_exchange` answers, on both
 //!   backends.
@@ -31,7 +35,9 @@ use harness::{
 };
 use nucleus_store::StoreError;
 use nucleus_store::latch::{Batch, Holders, Kind, Latch, LatchCore, LatchInfo, Mode, TryLatch};
-use nucleus_store::sync::{AtomicU64, Mutex, Primitives, RwCell, StdPrimitives, yield_now};
+use nucleus_store::sync::{
+    AtomicU64, Condvar, Mutex, Primitives, RwCell, StdPrimitives, yield_now,
+};
 
 /// A check that answers with its text instead of panicking.
 fn require(condition: bool, what: impl Into<String>) -> Result<(), String> {
@@ -1144,6 +1150,146 @@ fn sync_atomic_std() {
 #[test]
 fn sync_atomic_model() {
     let report = check(EXHAUSTIVE, atomic_ops::<Shuttle>).unwrap();
+    assert!(
+        report.executions < EXHAUSTIVE_CAP,
+        "the search reached the cap"
+    );
+}
+
+/// What a poison scenario's thread answers: `Ok` once its panic was caught,
+/// the text of anything that went wrong before it.
+fn caught_panic(caught: std::thread::Result<Result<(), String>>) -> Result<(), String> {
+    match caught {
+        // The closure ends by unwinding, so it never returns `Ok`.
+        Ok(Ok(())) => Err("the closure returned where it unwinds".to_string()),
+        Ok(Err(text)) => Err(text),
+        Err(_) => Ok(()),
+    }
+}
+
+/// The state `condvar_poison` shares: main is ready to wait, and the other
+/// thread has notified it.
+type PoisonSignals<H> = (Mutex<H, (bool, bool)>, Condvar<H>, Condvar<H>);
+
+/// `sync_condvar_poison_std` and `sync_condvar_poison_model` (F5: a backend's
+/// `condvar_wait` maps a poisoned lock to `Poisoned` and never takes the
+/// guard out of the poisoning; S-STORE §9.2's "in every backend"). Main
+/// waits on a condition variable; the other thread takes the mutex once main
+/// waits, notifies, and unwinds while holding it, which poisons it. Main's
+/// wait must then answer `StoreError::Poisoned`, never the guard, and so must
+/// a later `lock()`. The panic is caught inside the thread, so it does not
+/// fail a model execution.
+fn condvar_poison<H: Harness>() -> Result<(), String> {
+    let shared: Arc<PoisonSignals<H>> =
+        Arc::new((Mutex::new((false, false)), Condvar::new(), Condvar::new()));
+    let theirs = Arc::clone(&shared);
+    let handle = H::spawn(move || {
+        let (mutex, ready, wake) = &*theirs;
+        caught_panic(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), String> {
+                let mut guard = mutex.lock().map_err(|e| e.to_string())?;
+                while !guard.0 {
+                    guard = ready.wait(guard).map_err(|e| e.to_string())?;
+                }
+                guard.1 = true;
+                wake.notify_all();
+                // The guard drops as this unwinds, which poisons the mutex
+                // with main waiting on it.
+                std::panic::resume_unwind(Box::new("a panic under the mutex, a waiter woken"));
+            },
+        )))
+    });
+    let (mutex, ready, wake) = &*shared;
+    let mut guard = mutex.lock().map_err(|e| e.to_string())?;
+    guard.0 = true;
+    ready.notify_all();
+    loop {
+        match wake.wait(guard) {
+            Err(StoreError::Poisoned(_)) => break,
+            Err(error) => return Err(format!("a wait on a poisoned mutex answered {error:?}")),
+            Ok(back) if back.1 => {
+                return Err(
+                    "a wait answered the guard of a mutex poisoned while it waited".to_string(),
+                );
+            }
+            // A spurious wakeup (the platform's backend may have them): the
+            // other thread has not notified yet, so wait again.
+            Ok(back) => guard = back,
+        }
+    }
+    H::join(handle)??;
+    match mutex.lock() {
+        Err(StoreError::Poisoned(_)) => Ok(()),
+        Ok(_) => Err("lock() after the poisoned wait answered the guard".to_string()),
+        Err(error) => Err(format!("lock() after the poisoned wait answered {error:?}")),
+    }
+}
+
+#[test]
+fn sync_condvar_poison_std() {
+    condvar_poison::<StdPrimitives>().unwrap();
+}
+
+#[test]
+fn sync_condvar_poison_model() {
+    let report = check(EXHAUSTIVE, condvar_poison::<Shuttle>).unwrap();
+    println!(
+        "sync_condvar_poison_model executions: {} (cap {EXHAUSTIVE_CAP})",
+        report.executions
+    );
+    assert!(
+        report.executions < EXHAUSTIVE_CAP,
+        "the search reached the cap"
+    );
+}
+
+/// `sync_rwcell_poison_std` and `sync_rwcell_poison_model` (F5 for the cell):
+/// a thread unwinds while it holds the cell's exclusive borrow, which
+/// poisons it; then both tries answer `StoreError::Poisoned`, never a borrow
+/// and never `Ok(None)`.
+fn rwcell_poison<H: Harness>() -> Result<(), String> {
+    let cell: Arc<RwCell<H, u32>> = Arc::new(RwCell::new(0));
+    let theirs = Arc::clone(&cell);
+    let handle = H::spawn(move || {
+        caught_panic(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<(), String> {
+                let _write = theirs
+                    .try_write()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("try_write was busy on an unshared cell")?;
+                std::panic::resume_unwind(Box::new("a panic under the cell's exclusive borrow"));
+            },
+        )))
+    });
+    H::join(handle)??;
+    match cell.try_read() {
+        Err(StoreError::Poisoned(_)) => {}
+        Ok(read) => {
+            return Err(format!(
+                "try_read on a poisoned cell answered Ok({:?})",
+                read.map(|r| *r)
+            ));
+        }
+        Err(error) => return Err(format!("try_read on a poisoned cell answered {error:?}")),
+    }
+    match cell.try_write() {
+        Err(StoreError::Poisoned(_)) => Ok(()),
+        Ok(write) => Err(format!(
+            "try_write on a poisoned cell answered Ok({:?})",
+            write.map(|w| *w)
+        )),
+        Err(error) => Err(format!("try_write on a poisoned cell answered {error:?}")),
+    }
+}
+
+#[test]
+fn sync_rwcell_poison_std() {
+    rwcell_poison::<StdPrimitives>().unwrap();
+}
+
+#[test]
+fn sync_rwcell_poison_model() {
+    let report = check(EXHAUSTIVE, rwcell_poison::<Shuttle>).unwrap();
     assert!(
         report.executions < EXHAUSTIVE_CAP,
         "the search reached the cap"
