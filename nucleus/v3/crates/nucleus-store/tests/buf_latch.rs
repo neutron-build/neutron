@@ -1589,9 +1589,8 @@ fn harness_load_waiter_woken() {
         .map_err(|f| format!("harness_load_waiter_woken, the parked order under RANDOM: {f}"))
         .unwrap();
     println!(
-        "harness_load_waiter_woken: EXHAUSTIVE (the look order) {} executions (cap \\
-         {EXHAUSTIVE_CAP}); the parked order under PCT {} and under RANDOM {} executions",
-        look.executions, pct.executions, random.executions
+        "harness_load_waiter_woken: EXHAUSTIVE (the look order) {} executions (cap {}); the parked order under PCT {} and under RANDOM {} executions",
+        look.executions, EXHAUSTIVE_CAP, pct.executions, random.executions
     );
     assert!(
         look.executions < EXHAUSTIVE_CAP,
