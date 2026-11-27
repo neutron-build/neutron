@@ -978,8 +978,9 @@ fn lp_alloc(
 /// S-STORE §4.2 and §5.6 "Restart" as Work 5 restates them. Mutants
 /// ALLOC-RETRY-LOWEST (a), WB-LPID-EMPTIED-TAKES (b), (c), (d); the two
 /// defects the implementer's review found, an LPID handed out twice in one
-/// call (e) and `next_lpid` left below an LPID taken from it (f); and the
-/// bound `1 ≤ n ≤ 64` (g).
+/// call (e) and `next_lpid` left below an LPID taken from it (f); the
+/// bound `1 ≤ n ≤ 64` (g); and the LPID bitmap's growth by adoption, which
+/// keeps its bits (h).
 #[test]
 fn lpid_held_scripts() {
     let taken = |lpids: &[u64], pinned: &[u64]| LpAnswer::Taken {
@@ -1078,6 +1079,26 @@ fn lpid_held_scripts() {
         assert_eq!(pool.lpid_stats().unwrap(), stats(8, 0), "(f)");
         assert!(!pool.lpid_is_free(1).unwrap(), "(f)");
         assert_eq!(lp_alloc(&pool, 1, &[]).unwrap(), restart(4, &[]), "(f)");
+    }
+    // (h) The LPID bitmap grows for a released LPID past its length and
+    // keeps every bit it had: LPID 2 released (the bitmap now covers 1..6),
+    // MapLeaf 3 made and held, two LPIDs taken from `next_lpid` (6 and 7),
+    // then 7 released, past the bitmap's length: 2 and 7 are free.
+    {
+        let (_file, pool) = lp_fixture().unwrap();
+        pool.release_lpid(2).unwrap();
+        s3_make_mapleaf(&pool, 3).unwrap();
+        let _h3 = pin(&pool, mapleaf(3), &Hold::nothing()).unwrap();
+        assert_eq!(
+            lp_alloc(&pool, 2, &[3]).unwrap(),
+            taken(&[6, 7], &[]),
+            "(h)"
+        );
+        pool.release_lpid(7).unwrap();
+        assert_eq!(pool.lpid_stats().unwrap(), stats(8, 2), "(h)");
+        assert!(pool.lpid_is_free(2).unwrap(), "(h)");
+        assert!(pool.lpid_is_free(7).unwrap(), "(h)");
+        assert!(!pool.lpid_is_free(6).unwrap(), "(h)");
     }
     // (g) One call takes 1 to 64 LPIDs (Work 5): 0 and 65 are `Invalid`; 64
     // is answered (here a restart at MapLeaf 3, which is not made), and
@@ -1709,6 +1730,55 @@ fn touch_check_table() {
         EvictOutcome::Obtained(_)
     ));
     assert_eq!(pin_read(&pool, lpid(z)).unwrap(), 0x26);
+}
+
+/// `map_mutation_after_flip` (card A-3c, Work 3.5, 3.7 and 6.4, against
+/// S-STORE 7.23 §5.6 "When it copies": "It never copies a MapInner"; the
+/// implementer's review, ESCALATE 3). `n` 1, `F` 18, fanout 4, `slot_count`
+/// 600. After an S1 flip a MapInner's ref and children are set with no
+/// touch check, though every MapInner made before the flip is dirty at
+/// content epoch 1. (a) MapLeaf 0, mutated in the new epoch, is evicted by
+/// §4.1's two steps through its parent MapInner (1, 0): `Obtained`, the
+/// parent's ref names the new home at epoch 2, and page `x` reloads with
+/// its last marker through it. (b) The map grows under the root (2, 0),
+/// made before the flip: MapLeaf 9's MapInner (1, 2) is made. A touch check
+/// on a MapInner refuses both, (a) after `mark_written`, which left the
+/// MapLeaf clean with its parent's ref on the old home.
+#[test]
+fn map_mutation_after_flip() {
+    assert_eq!(min_f(1), 18);
+    let (_file, pool) = wb_pool::<StdPrimitives>(18, 4, 600, 1, H_MIN_TEST).unwrap();
+    let (x, p) = s3_new_page(&pool, 0x31).unwrap();
+    assert_eq!(x, 1);
+    drop(p);
+    // MapLeaf 5 needs level 2: the root (2, 0) is made in epoch 1.
+    s3_make_mapleaf(&pool, 5).unwrap();
+    assert_eq!(pool.map_shape().unwrap().root_level, 2);
+    evict_out(&pool, lpid(x)).unwrap();
+    evict_out(&pool, mapleaf(0)).unwrap();
+    assert_eq!(s1_flip(&pool).unwrap(), 2);
+    {
+        let p = pin(&pool, lpid(x), &Hold::nothing()).unwrap();
+        s3_touch(&pool, &p, 0x32).unwrap();
+    }
+    // x's entry is set in MapLeaf 0, clean at content epoch 1 (S1's
+    // clause): MapLeaf 0 is then dirty at content epoch 2.
+    assert!(matches!(
+        evict(&pool, lpid(x)).unwrap(),
+        EvictOutcome::Obtained(_)
+    ));
+    // (a)
+    assert!(
+        matches!(evict(&pool, mapleaf(0)).unwrap(), EvictOutcome::Obtained(_)),
+        "a MapLeaf eviction after the flip"
+    );
+    assert_eq!(pool.frame_of(mapleaf(0)).unwrap(), None);
+    let leaf_ref = pool.latch_leaf_parent(0).unwrap().leaf_ref();
+    assert_eq!(leaf_ref.epoch, 2, "the parent's ref names the new home");
+    assert_eq!(pin_read(&pool, lpid(x)).unwrap(), 0x32);
+    // (b)
+    s3_make_mapleaf(&pool, 9).unwrap();
+    assert_eq!(pool.leaf_parent_id(9).unwrap(), Some(2));
 }
 
 /// `evict_prev_epoch` (card A-3c, Work 7, E2): a dirty page from before the
