@@ -569,13 +569,17 @@ fn t_pin_load_race_j() {
 /// blocks new shared holders and every try; released, it goes through and
 /// the waiter is granted at the new epoch. (b) `wait_for_flip` returns at
 /// once with no flip, and waits behind a flip that holds the gate (frame 0,
-/// "held"). Mutant WB-GATE-WRITER-STARVE fails (a).
+/// "held"). Mutant WB-GATE-WRITER-STARVE fails (a), and so does a
+/// registration made after the hook (G2: "The registration precedes the
+/// hook"), since the try runs while X is paused there.
 #[test]
 fn gate_rules() {
     let (_file, pool) = race_pool().unwrap();
     let pz = Pauser::new();
     pool.set_hook(Some(pz.hook()));
-    pz.report(GateExclusiveWaiting, NO_KEY);
+    // X is paused at its hook, so the try below runs while X can have done
+    // nothing past it: only a registration made before the hook refuses it.
+    pz.pause_at(GateExclusiveWaiting, NO_KEY);
     pz.report(GateSharedBlocking, NO_KEY);
     // (a) The controller holds the gate.
     let hold = pool.gate_shared().unwrap();
@@ -591,6 +595,7 @@ fn gate_rules() {
         // Once a test has seen the hook, every `gate_try_shared` fails
         // until the flip ends.
         let try_after_x = pool.gate_try_shared().unwrap().is_some();
+        pz.release(GateExclusiveWaiting, NO_KEY);
         let w = spawn(s, &pz, "S", || -> Result<u32, StoreError> {
             let g = pool.gate_shared()?;
             Ok(g.epoch())
@@ -602,7 +607,7 @@ fn gate_rules() {
     r_x.unwrap().unwrap();
     assert_eq!(
         seen_x,
-        Event::Seen(GateExclusiveWaiting, NO_KEY, FrameId(u32::MAX))
+        Event::Arrived(GateExclusiveWaiting, NO_KEY, FrameId(u32::MAX))
     );
     assert!(!try_after_x, "no try passes while a flip waits");
     assert_eq!(
