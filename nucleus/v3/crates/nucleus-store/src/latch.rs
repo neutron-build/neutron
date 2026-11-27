@@ -484,6 +484,18 @@ impl LatchCore {
 /// One queue entry as [`LatchCore`]'s `Debug` prints it.
 struct Entry(u8);
 
+/// The live part of the queue as [`LatchCore`]'s `Debug` prints it: a list
+/// written entry by entry, so formatting allocates nothing (W7).
+struct Live<'a>(&'a [u8]);
+
+impl fmt::Debug for Live<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|e| Entry(*e)))
+            .finish()
+    }
+}
+
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0 & EXCLUSIVE_BIT != 0 {
@@ -502,10 +514,7 @@ impl fmt::Debug for LatchCore {
             .field("bound", &self.bound)
             .field("capacity", &self.capacity())
             .field("holders", &self.holders)
-            .field(
-                "queue",
-                &self.live().iter().map(|e| Entry(*e)).collect::<Vec<_>>(),
-            )
+            .field("queue", &Live(self.live()))
             .field("len", &self.len)
             .field("head_seq", &self.head_seq)
             .field("handed_first", &self.handed_first)

@@ -652,8 +652,9 @@ impl<H: File, P: Primitives> Pool<H, P> {
             })
     }
 
-    /// A snapshot of frame `f`'s latch, taken under that latch's internal
-    /// mutex and no other (card A-3b, Work 7): who holds it, how many
+    /// A snapshot of frame `f`'s latch (S-STORE §5.3 "Fair latches", §15
+    /// `t_root_latch_fair`), taken under that latch's internal mutex and no
+    /// other (card A-3b, Work 4 and 7): who holds it, how many
     /// requests wait, and its bound, its capacity and its arrivals. A
     /// diagnostic: a test reads it to place an interleaving, as
     /// `t_root_latch_fair`'s forced order does (§15), and no store path does.
@@ -1457,7 +1458,11 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// of [`Pool::bytes_for`]'s arithmetic, which it must equal (R-1-memory
     /// §4.1, §8).
     ///
-    /// The table's three lengths were taken as the allocations were made, so
+    /// The latches' size is taken at [`StdPrimitives`], the production
+    /// backend, whatever backend `P` this pool runs on (card A-3b, Work 6),
+    /// as [`Pool::bytes_for`]'s and `o_frame`'s are, so the two computations
+    /// agree on every backend. The table's three lengths were taken as the
+    /// allocations were made (boxed slices, which never change length), so
     /// this takes the table mutex for nothing (card A-3b, Work 5): a panic
     /// may have poisoned it.
     pub fn footprint(&self) -> PoolFootprint {
@@ -1473,7 +1478,7 @@ impl<H: File, P: Primitives> Pool<H, P> {
         let times = |n: u64, size: usize| n.saturating_mul(wide(size));
         PoolFootprint {
             page_bytes,
-            frame_bytes: times(latches, size_of::<FrameLatch<P>>())
+            frame_bytes: times(latches, size_of::<FrameLatch>())
                 .saturating_add(times(lens.metas, size_of::<FrameMeta>()))
                 .saturating_add(queues),
             table_bytes: times(lens.buckets, size_of::<Option<FrameId>>())

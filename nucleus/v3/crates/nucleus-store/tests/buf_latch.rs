@@ -29,6 +29,9 @@
 //!   `FRAME_LATCH_BOUND` and a queue of the pool's threads, `o_frame` grows
 //!   by one byte per thread, and a guard's stamps rise across arrival, grant
 //!   and release. Mutants FRAME-BOUND-ZERO, FRAME-CAPACITY-ONE.
+//! - `footprint_at_production_sizes`: a pool on the model checker's backend
+//!   measures its footprint at the production backend's sizes, as
+//!   `Pool::bytes_for` computes it (Work 6). Mutant FOOTPRINT-AT-BACKEND.
 //! - `harness_cell_handoff`: a reader's and a writer's holds on one frame
 //!   pass through the content cell, by a drop and by an explicit release.
 //!   Mutant CELL-RELEASE-ORDER.
@@ -41,7 +44,8 @@
 //!   WAIT-NO-RECHECK, UNHELD-NO-BUMP-UNPIN.
 //! - `sync_mutex_try_lock_std` and `sync_mutex_try_lock_model`: the one item
 //!   this card adds to the sync layer, the try-lock `buf::Pool::table_free`
-//!   needs (card A-3b's ESCALATE): free, held and poisoned on both backends.
+//!   needs (card A-3b, Work 5's table seam; S-STORE §9.2's poison, F5):
+//!   free, held and poisoned on both backends.
 //!
 //! No test here reads a clock, sleeps or waits with a timeout: every bound
 //! is a count, and the only spin is through `yield_now`.
@@ -1066,9 +1070,23 @@ fn pinned() -> Result<(), String> {
     if core.waiting() != 1 || core.may_grant(seq) {
         return Err("the barge did not leave the queued writer waiting".to_string());
     }
+    // The core's `Debug` shows the live queue, `queue[0..len]`, and not the
+    // stale bytes past it (verdict A-4c0 5ef87b98, follow-up A-4c0-F4 (c)):
+    // here the queued writer, overtaken once by the barge.
+    let shown = format!("{core:?}");
+    if !shown.contains("queue: [X:1]") {
+        return Err(format!("the core with one queued writer prints {shown}"));
+    }
     core.release(Mode::Exclusive).map_err(said)?;
     if !core.may_grant(seq) {
         return Err("the queued writer is not grantable once the barger left".to_string());
+    }
+    core.grant_queued(seq).map_err(said)?;
+    let shown = format!("{core:?}");
+    if !shown.contains("queue: []") {
+        return Err(format!(
+            "the core whose writer was granted prints {shown}, not an empty queue"
+        ));
     }
     // With `K − 1` (0): the same arrival is not admitted.
     let mut fifo = LatchCore::new(FRAME_LATCH_BOUND - 1, 4).map_err(said)?;
@@ -1159,6 +1177,42 @@ fn pinned() -> Result<(), String> {
 #[test]
 fn frame_latch_pinned() {
     pinned().unwrap();
+}
+
+/// `footprint_at_production_sizes` (exploration `EXHAUSTIVE`, one thread;
+/// card A-3b, Work 6: the footprint's `size_of` terms "are taken at
+/// `StdPrimitives`, the production backend, whatever `P` the pool has"): a
+/// pool on the model checker's backend measures what `Pool::bytes_for`,
+/// which knows no backend, computes. A `footprint` that took the latches'
+/// size at the pool's own backend measures more on the model checker's,
+/// whose primitives are larger (mutant FOOTPRINT-AT-BACKEND).
+fn footprint_on_backend<H: Harness>() -> Result<(), String> {
+    let cfg = PoolConfig {
+        frames: 2,
+        page_size: PS,
+        callers: 2,
+    };
+    let pool = fixture::<H>(cfg.frames, cfg.callers)?;
+    let computed = Pool::<NoIoFile>::bytes_for(cfg).map_err(said)?;
+    let measured = pool.footprint();
+    if measured != computed {
+        return Err(format!(
+            "a pool on the harness's backend measures {measured:?}, where bytes_for computes \
+             {computed:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn footprint_at_production_sizes() {
+    let report = check(EXHAUSTIVE, footprint_on_backend::<Shuttle>)
+        .map_err(|f| format!("{f}"))
+        .unwrap();
+    assert!(
+        report.executions < EXHAUSTIVE_CAP,
+        "the search reached the cap"
+    );
 }
 
 // ------------------------------------------------------------ the cell's hand-off
