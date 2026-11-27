@@ -5,6 +5,8 @@
 //!   capacity, its overflow and the seq's wrap, called on [`LatchCore`].
 //! - `latch_core_exhaustive`: an exhaustive enumeration of the policy's
 //!   interleavings, with no model checker, checked by the monitor.
+//! - `latch_core_equality`: the core's `Eq` and `Hash`, on which that
+//!   enumeration memoises, keep the logical state and nothing else.
 //! - `latch_model_exhaustive`, `latch_model_overflow`, `latch_model_pct` and
 //!   `latch_model_random`: the blocking latch on the model checker's backend.
 //! - `latch_threads` and `latch_api`: the production backend.
@@ -1294,4 +1296,141 @@ fn sync_rwcell_poison_model() {
         report.executions < EXHAUSTIVE_CAP,
         "the search reached the cap"
     );
+}
+
+/// The core's hash under the standard library's fixed-key hasher.
+fn hash_of(core: &LatchCore) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    core.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Two cores are equal and hash alike.
+fn same(a: &LatchCore, b: &LatchCore, what: &str) -> Result<(), String> {
+    require(a == b, format!("{what}: equal, where {a:?} and {b:?}"))?;
+    require(
+        hash_of(a) == hash_of(b),
+        format!("{what}: equal cores hash alike"),
+    )
+}
+
+/// Two cores differ.
+fn differ(a: &LatchCore, b: &LatchCore, what: &str) -> Result<(), String> {
+    require(a != b, format!("{what}: not equal, where {a:?} and {b:?}"))
+}
+
+/// `latch_core_equality` (card A-4c0 Work 3, "Equality and hashing"): `Eq`
+/// and `Hash` compare the bound, the capacity, the holders, `queue[0..len]`,
+/// `handed_len`, `handed_left` and `handed_first − head_seq`; neither
+/// `head_seq` itself nor the bytes past `len` enter. `latch_core_exhaustive`
+/// memoises on them, so an equality that ignored a live field would shrink
+/// its search silently, and one that kept `head_seq` would grow it.
+fn core_equality() -> Result<(), String> {
+    use Mode::{Exclusive as X, Shared as S};
+
+    // `head_seq` does not enter: two cores whose first seqs differ, and the
+    // same arrivals on each.
+    let mut a = said(LatchCore::new_at(1, 4, 0))?;
+    let mut b = said(LatchCore::new_at(1, 4, 1_000))?;
+    same(&a, &b, "new cores whose first seqs differ")?;
+    for core in [&mut a, &mut b] {
+        require(arrive(core, X)?.is_none(), "1:X is granted")?;
+        require(arrive(core, S)?.is_some(), "2:S is queued")?;
+        require(arrive(core, X)?.is_some(), "3:X is queued")?;
+    }
+    require(a.head_seq() != b.head_seq(), "the two heads' seqs differ")?;
+    same(&a, &b, "the same arrivals from different first seqs")?;
+
+    // The bytes past `len` do not enter. Both cores grant 1:S, queue 2:X,
+    // release S and grant 2:X from the queue, so both hold Exclusive with an
+    // empty queue; in `d` a barging 3:X raised 2:X's count before its grant,
+    // so the stale byte at index 0 differs.
+    let mut c = said(LatchCore::new(1, 4))?;
+    require(arrive(&mut c, S)?.is_none(), "c: 1:S is granted")?;
+    let sc = arrive(&mut c, X)?.ok_or("c: 2:X is queued")?;
+    said(c.release(S))?;
+    said(c.grant_queued(sc))?;
+    let mut d = said(LatchCore::new(1, 4))?;
+    require(arrive(&mut d, S)?.is_none(), "d: 1:S is granted")?;
+    let sd = arrive(&mut d, X)?.ok_or("d: 2:X is queued")?;
+    said(d.release(S))?;
+    require(arrive(&mut d, X)?.is_none(), "d: 3:X barges")?;
+    said(d.release(X))?;
+    said(d.grant_queued(sd))?;
+    require(
+        c.holders() == Holders::Exclusive && c.waiting() == 0 && d.waiting() == 0,
+        "c and d hold Exclusive with no waiter",
+    )?;
+    same(&c, &d, "cores that differ only past `len`")?;
+
+    // Each logical field enters.
+    differ(
+        &said(LatchCore::new(0, 4))?,
+        &said(LatchCore::new(1, 4))?,
+        "the bound",
+    )?;
+    differ(
+        &said(LatchCore::new(1, 4))?,
+        &said(LatchCore::new(1, 5))?,
+        "the capacity",
+    )?;
+    let free = said(LatchCore::new(1, 4))?;
+    let mut shared = free.clone();
+    shared.grant_arrival(S);
+    differ(&free, &shared, "the holders")?;
+
+    // A queued entry's mode.
+    let mut e1 = said(LatchCore::new(0, 4))?;
+    let mut e2 = e1.clone();
+    for (core, mode) in [(&mut e1, S), (&mut e2, X)] {
+        require(arrive(core, X)?.is_none(), "1:X is granted")?;
+        require(arrive(core, mode)?.is_some(), "2 is queued")?;
+    }
+    differ(&e1, &e2, "a queued entry's mode")?;
+
+    // A queued entry's count: both hold Shared(2) with one X queued, which a
+    // later shared grant overtook in `f1` only.
+    let mut f1 = said(LatchCore::new(1, 4))?;
+    f1.grant_arrival(S);
+    said(f1.enqueue(X))?;
+    f1.grant_arrival(S);
+    let mut f2 = said(LatchCore::new(1, 4))?;
+    f2.grant_arrival(S);
+    f2.grant_arrival(S);
+    said(f2.enqueue(X))?;
+    require(
+        f1.holders() == Holders::Shared(2) && f2.holders() == Holders::Shared(2),
+        "f1 and f2 hold Shared(2)",
+    )?;
+    differ(&f1, &f2, "a queued entry's count")?;
+
+    // The queue's length.
+    let mut g1 = said(LatchCore::new(0, 4))?;
+    g1.grant_arrival(X);
+    said(g1.enqueue(S))?;
+    let mut g2 = g1.clone();
+    said(g2.enqueue(S))?;
+    differ(&g1, &g2, "the queue's length")?;
+
+    // The uncollected members of the last batch: a batch of two readers,
+    // before and after its second member collects.
+    let mut h1 = said(LatchCore::new(0, 4))?;
+    h1.grant_arrival(X);
+    let s1 = said(h1.enqueue(S))?;
+    let s2 = said(h1.enqueue(S))?;
+    said(h1.release(X))?;
+    require(
+        said(h1.grant_queued(s1))? == Batch { first: s1, len: 2 },
+        "the batch of two",
+    )?;
+    let mut h2 = h1.clone();
+    said(h2.grant_queued(s2))?;
+    differ(&h1, &h2, "the last batch's uncollected members")?;
+    Ok(())
+}
+
+#[test]
+fn latch_core_equality() {
+    core_equality().unwrap();
 }
