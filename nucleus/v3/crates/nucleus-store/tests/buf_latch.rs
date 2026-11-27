@@ -5,9 +5,11 @@
 //! Every harness test is a scenario generic over `H: Harness`, run through
 //! `check` under a stated exploration, whose bounds are the harness's
 //! presets: `RANDOM` (seed `0xA4C0_0001`, 1,000 executions) for the two
-//! streams, `EXHAUSTIVE` (a pass only if the search ends under the cap of
-//! 100,000 executions) for the rest, each with the presets' step limit of
-//! 10,000, which is every test's step budget (S-STORE §15). The pool is
+//! streams, `PCT` and `RANDOM` (1,000 executions each) for
+//! `harness_unheld_two_waiters_starved`, `EXHAUSTIVE` (a pass only if the
+//! search ends under the cap of 100,000 executions) for the rest, each with
+//! the presets' step limit of 10,000, which is every test's step budget
+//! (S-STORE §15). The pool is
 //! built with `Pool::new_with_below_minimum_for_tests` on the model
 //! checker's backend, so the harness runs the pool's own code: the page
 //! table's mutex, both condition variables, the yields of the frame
@@ -24,11 +26,14 @@
 //!   the queued request waits, in every schedule: a mutant that lets new
 //!   requests over a waiting writer fails in every execution. No time enters
 //!   any bound. Mutants LATCH-READER-PREF, LATCH-WRITER-PREF,
-//!   TRYLATCH-BYPASS, FRAME-CAPACITY-ONE.
+//!   TRYLATCH-BYPASS, FRAME-CAPACITY-ONE. The reader stream also checks
+//!   that two readers' holds overlap in stamps in some execution: mutant
+//!   SHARED-AS-EXCLUSIVE.
 //! - `frame_latch_pinned` (no harness): every frame latch carries
 //!   `FRAME_LATCH_BOUND` and a queue of the pool's threads, `o_frame` grows
-//!   by one byte per thread, and a guard's stamps rise across arrival, grant
-//!   and release. Mutants FRAME-BOUND-ZERO, FRAME-CAPACITY-ONE.
+//!   by one byte per thread, a guard's stamps rise across arrival, grant
+//!   and release, and two shared holds of one frame coexist. Mutants
+//!   FRAME-BOUND-ZERO, FRAME-CAPACITY-ONE, SHARED-AS-EXCLUSIVE.
 //! - `footprint_at_production_sizes`: a pool on the model checker's backend
 //!   measures its footprint at the production backend's sizes, as
 //!   `Pool::bytes_for` computes it (Work 6). Mutant FOOTPRINT-AT-BACKEND.
@@ -39,9 +44,10 @@
 //!   the harness reports a `Deadlock`, not a hang: `harness_unheld_pin_drop`
 //!   (U1), `harness_unheld_reservation_drop` (U2),
 //!   `harness_unheld_failed_load` (U3), `harness_load_waiter_woken` (P2 (b)
-//!   and P10). Mutants UNPIN-NO-NOTIFY, WAIT-NO-REGISTER,
+//!   and P10), `harness_unheld_two_waiters_starved` (two acquisitions wait
+//!   for one unpin; sampled). Mutants UNPIN-NO-NOTIFY, WAIT-NO-REGISTER,
 //!   RESERVATION-DROP-NO-NOTIFY, CLEANUP-NO-NOTIFY, LOAD-NO-NOTIFY,
-//!   WAIT-NO-RECHECK, UNHELD-NO-BUMP-UNPIN.
+//!   WAIT-NO-RECHECK, UNHELD-NO-BUMP-UNPIN, NOTIFY-ONE.
 //! - `sync_mutex_try_lock_std` and `sync_mutex_try_lock_model`: the one item
 //!   this card adds to the sync layer, the try-lock `buf::Pool::table_free`
 //!   needs (card A-3b, Work 5's table seam; S-STORE §9.2's poison, F5):
@@ -698,7 +704,7 @@ fn pool_at_minimum(callers: u32) -> Result<Pool<NoIoFile>, String> {
 /// releasing between; main waits until every reader's first request has
 /// arrived while W still waits, and releases. Both waits read `latch_info`
 /// between two yields, under the step budget.
-fn reader_stream<H: Harness>() -> Result<(), String> {
+fn reader_stream<H: Harness>(overlapped: &AtomicUsize) -> Result<(), String> {
     let pool = Arc::new(fixture::<H>(2, 2 + STREAM)?);
     let (root, f) = root_page(&pool)?;
     let held_guard = root.latch_shared().map_err(said)?;
@@ -777,22 +783,80 @@ fn reader_stream<H: Harness>() -> Result<(), String> {
     for reader in readers {
         all.push(H::join(reader)??);
     }
+    // Two readers' holds overlap in stamps (verdict A-3b, follow-up A-3b-F2):
+    // a batch grant gives them overlapping `[grant, release]` intervals. The
+    // executions in which it happened are counted by the caller.
+    if readers_overlap(&all) {
+        overlapped.fetch_add(1, Ordering::SeqCst);
+    }
     judged(all, "the reader stream")
 }
 
-/// `t_root_latch_fair_reader_stream`: the reader stream under `RANDOM`.
-fn reader_stream_checked() -> Result<Report, String> {
-    check(RANDOM, reader_stream::<Shuttle>).map_err(|f| format!("{f}"))
+/// Whether two readers' holds overlap in stamps in one execution (verdict
+/// A-3b, follow-up A-3b-F2). `all` is as [`reader_stream`] collects it:
+/// main's requests, the queued writer's, then each reader's own; only the
+/// readers' are compared.
+fn readers_overlap(all: &[Vec<Request>]) -> bool {
+    let Some(readers) = all.get(2..) else {
+        return false;
+    };
+    for (i, mine) in readers.iter().enumerate() {
+        for theirs in readers.get(i + 1..).unwrap_or(&[]) {
+            for first in mine {
+                for second in theirs {
+                    if overlap(first, second) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether two granted holds' `[grant, release]` intervals intersect: a
+/// batch grant gives the members of one batch stamps between which none of
+/// them releases.
+fn overlap(first: &Request, second: &Request) -> bool {
+    match (first.outcome, second.outcome) {
+        (
+            Outcome::Granted {
+                grant: first_grant,
+                release: Some(first_release),
+            },
+            Outcome::Granted {
+                grant: second_grant,
+                release: Some(second_release),
+            },
+        ) => first_grant < second_release && second_grant < first_release,
+        _ => false,
+    }
+}
+
+/// `t_root_latch_fair_reader_stream`: the reader stream under `RANDOM`, and
+/// in how many of its executions two readers' holds overlapped in stamps
+/// (verdict A-3b, follow-up A-3b-F2).
+fn reader_stream_checked() -> Result<(Report, usize), String> {
+    let overlapped = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&overlapped);
+    let report =
+        check(RANDOM, move || reader_stream::<Shuttle>(&seen)).map_err(|f| format!("{f}"))?;
+    Ok((report, overlapped.load(Ordering::SeqCst)))
 }
 
 #[test]
 fn t_root_latch_fair_reader_stream() {
-    let report = reader_stream_checked().unwrap();
+    let (report, overlapped) = reader_stream_checked().unwrap();
     println!(
-        "t_root_latch_fair_reader_stream: RANDOM, {} executions",
-        report.executions
+        "t_root_latch_fair_reader_stream: RANDOM, {} executions; two readers' holds overlapped in \
+         {} of them",
+        report.executions, overlapped
     );
     assert_eq!(report.executions, random_executions());
+    assert!(
+        overlapped >= 1,
+        "in no execution did two readers' holds overlap in stamps"
+    );
 }
 
 // ------------------------------------------------- t_root_latch_fair, writer variant
@@ -1151,6 +1215,16 @@ fn pinned() -> Result<(), String> {
     let (pin, f) = root_page(&pool)?;
     let reader = pin.latch_shared().map_err(said)?;
     let (arrived, granted) = reader.stamps();
+    // Two shared holds of one frame coexist (verdict A-3b, follow-up
+    // A-3b-F2): while `reader` is held, a shared try is granted. Its guard
+    // is released first, so `released` is still the last stamp before the
+    // writer's arrival below.
+    let second = pin.try_latch_shared().map_err(said)?.ok_or_else(|| {
+        "a shared try was refused while a shared hold is held: two shared holds of one frame \
+         do not coexist"
+            .to_string()
+    })?;
+    second.release().map_err(said)?;
     let released = reader.release().map_err(said)?;
     if !(arrived < granted && granted < released) {
         return Err(format!(
@@ -1649,6 +1723,90 @@ fn harness_load_waiter_woken() {
     assert!(
         look.executions < EXHAUSTIVE_CAP,
         "the look order's search reached the cap"
+    );
+    assert_eq!(pct.executions, 1_000, "PCT's executions");
+    assert_eq!(random.executions, 1_000, "RANDOM's executions");
+}
+
+// ------------------------------------------------ two waiters for one unpin
+
+/// One waiter's `reserve()` (verdict A-3b, follow-up A-3b-F1): it accepts
+/// `Err(PoolStarved)` or a reservation, which it drops, and fails on any
+/// other error.
+fn starved_or_reserved<H: Harness>(pool: &Pool<NoIoFile, H>) -> Result<(), String> {
+    match pool.reserve() {
+        Ok(res) => {
+            drop(res);
+            Ok(())
+        }
+        Err(StoreError::PoolStarved) => Ok(()),
+        Err(other) => Err(format!(
+            "reserve() answered {other:?}, where PoolStarved or a reservation is expected"
+        )),
+    }
+}
+
+/// `harness_unheld_two_waiters_starved`'s scenario (verdict A-3b, follow-up
+/// A-3b-F1; explorations `PCT` and `RANDOM`): a pool of 1 frame for 3 callers
+/// over [`NoIoFile`]. Main creates `Lpid(1)` through the created page's guard,
+/// calls `mark_dirty(1)`, releases the latch and keeps the pin. Two spawned
+/// threads each call `reserve()` ([`starved_or_reserved`]). Main waits
+/// through `yield_now`, under the step budget, until
+/// `stats().unpin_waiters >= 2`, drops its pin, joins both, and requires
+/// `unpin_waiters == 0`.
+///
+/// Both acquisitions wait for the unpin (A7), since the only frame is held.
+/// The page is dirty, and in a pool built without write-back the clock takes
+/// no dirty victim, so each woken waiter ends starved. `became_unheld` wakes
+/// every waiter; with a `notify_one` in its place (mutant NOTIFY-ONE) the
+/// verdict's gate measured a `Deadlock` in 932 of 1,000 executions under
+/// `PCT` and in 380 under `RANDOM`, and the correct build failing none. The
+/// kill rests on sampling, so the RESULT carries its `kill_evidence` lines
+/// (S-STORE §15, card S-KAPPA).
+fn two_waiters_starved<H: Harness>() -> Result<(), String> {
+    let pool = Arc::new(fixture::<H>(1, 3)?);
+    let res = pool.reserve().map_err(said)?;
+    let made = pool.create(res, X, PageKind::Leaf, 1).map_err(said)?;
+    let CreateOutcome::Created(mut page) = made else {
+        return Err("Lpid(1) already has a frame in a fresh pool".to_string());
+    };
+    page.mark_dirty(1).map_err(said)?;
+    let held = page.release();
+
+    let theirs = Arc::clone(&pool);
+    let first = H::spawn(move || starved_or_reserved(&theirs));
+    let theirs = Arc::clone(&pool);
+    let second = H::spawn(move || starved_or_reserved(&theirs));
+
+    spin_until::<H>("two acquisitions did not both wait for an unpin", || {
+        Ok(pool.stats().map_err(said)?.unpin_waiters >= 2)
+    })?;
+    drop(held);
+    H::join(first)??;
+    H::join(second)??;
+
+    let s = pool.stats().map_err(said)?;
+    if s.unpin_waiters != 0 {
+        return Err(format!(
+            "at the end the pool is {s:?}, where no waiter for an unpin is expected"
+        ));
+    }
+    Ok(())
+}
+
+/// `harness_unheld_two_waiters_starved`: the scenario under `PCT` and under
+/// `RANDOM`.
+#[test]
+fn harness_unheld_two_waiters_starved() {
+    let pct = check(PCT, two_waiters_starved::<Shuttle>)
+        .map_err(|f| format!("harness_unheld_two_waiters_starved, under PCT: {f}"))
+        .unwrap();
+    let random = check(RANDOM, two_waiters_starved::<Shuttle>)
+        .map_err(|f| format!("harness_unheld_two_waiters_starved, under RANDOM: {f}"))
+        .unwrap();
+    println!(
+        "harness_unheld_two_waiters_starved: under PCT {} and under RANDOM {} executions",
+        pct.executions, random.executions
     );
     assert_eq!(pct.executions, 1_000, "PCT's executions");
     assert_eq!(random.executions, 1_000, "RANDOM's executions");
