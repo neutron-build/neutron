@@ -162,11 +162,6 @@ impl Table {
         self.buckets.len()
     }
 
-    /// The length of the free stack's allocation (`F`), for the footprint.
-    pub(crate) fn free_capacity(&self) -> usize {
-        self.free.len()
-    }
-
     /// How many frames are on the free list.
     pub(crate) fn free_len(&self) -> u32 {
         self.free_len

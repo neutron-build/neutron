@@ -30,8 +30,10 @@
 //!   H-NO-MINUS-TWO, EPOCH-SLOPE-16.
 //! - **`o_frame` bounds a frame's cost besides its page** (R-1-memory §4.1,
 //!   §12): for every `F`, `F × o_frame` is at least the frame headers plus the
-//!   page table, and `o_frame` depends on neither `F` nor the page size.
-//!   Test `o_frame_bound`; mutant O-FRAME-NO-TABLE.
+//!   page table, and `o_frame` depends on neither `F` nor the page size. It
+//!   grows with the thread count, by one byte per thread: each frame latch's
+//!   waiter queue (card A-3b, Work 6). Test `o_frame_bound`; mutant
+//!   O-FRAME-NO-TABLE.
 //! - **No panic on any input**: every sum is checked, and an overflow is
 //!   [`StoreError::Invalid`]. Test `pool_sizing_refusals`.
 
@@ -96,7 +98,9 @@ pub struct PoolSizing {
     /// releases (R-1-memory §4.4).
     pub r_map: u64,
     /// `o_frame`: the bytes each frame costs besides its page (R-1-memory
-    /// §4.1, §12).
+    /// §4.1, §12): its header, its share of the page table, its image-record
+    /// list record, and one byte of frame-latch waiter queue per thread
+    /// (card A-3b, Work 6), so it grows with `threads`.
     pub o_frame: u32,
 }
 
@@ -152,16 +156,21 @@ fn base(
         .ok_or_else(past)?;
     // S7: a frame's header (its latch with its content, and its metadata), its
     // page-table share (a bucket count below `2F`, since the buckets are
-    // `F.next_power_of_two()`, and its free-stack slot) and its image-record
-    // list record.
+    // `F.next_power_of_two()`, and its free-stack slot), its image-record
+    // list record, and its frame latch's waiter queue (card A-3b, Work 6):
+    // one entry, one byte, for each thread that can wait on the latch.
+    // The sizes are the production backend's, whatever backend a pool is
+    // built on: `FrameLatch`'s default, `StdPrimitives`.
     let bucket = term(size_of::<Option<FrameId>>())?;
     let id = term(size_of::<FrameId>())?;
+    let queue = u32::try_from(threads).map_err(|_| past_u64())?;
     let o_frame = term(size_of::<FrameLatch>())?
         .checked_add(term(size_of::<FrameMeta>())?)
         .and_then(|o| o.checked_add(bucket))
         .and_then(|o| o.checked_add(bucket))
         .and_then(|o| o.checked_add(id))
         .and_then(|o| o.checked_add(IMAGE_RECORD_BYTES))
+        .and_then(|o| o.checked_add(queue))
         .ok_or_else(past)?;
     Ok(Base {
         threads,

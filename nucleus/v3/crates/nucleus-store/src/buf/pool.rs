@@ -16,6 +16,16 @@
 //! (Work 4), two of them in `frame.rs` and two here, each counted by
 //! [`Pool::became_unheld`]; and P3's call of the frame acquisition (Work 5),
 //! whose own steps A1–A7 are in `acquire.rs`.
+//!
+//! Card A-3b (Work 4–7) moves the pool onto the store's sync layer: the pool
+//! is `Pool<H, P>` over the backend `P`, every mutex and condition variable
+//! is `sync::`'s, and each frame's latch is card A-4c0's task-fair
+//! `latch::Latch` with bypass bound `FRAME_LATCH_BOUND` and a waiter queue of
+//! the pool's `threads` entries, beside a content cell (S-STORE §5.3). So the
+//! interleaving harness runs the pool's own code (§15), and its tests judge
+//! the waits' liveness mutants, which on OS threads only hang. No step moved.
+//! A table mutex a panic poisoned can no longer be taken "anyway": a `Drop`
+//! that meets one returns and leaves what it would have changed (§9.2).
 
 use core::fmt;
 use core::ops::Range;
@@ -28,10 +38,9 @@ use super::frame::{
     LatchExclusive, Pin, Removal, VictimGuard,
 };
 use super::key::PageKey;
-#[cfg(feature = "test-hooks")]
-use super::sync::TryLockError;
-use super::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use super::sync::{Arc, Condvar, Mutex, MutexGuard, Primitives, StdPrimitives};
 use super::table::{FrameMeta, Table, bucket_index};
+use crate::latch::LatchInfo;
 use crate::meta::{self, Ref};
 use crate::page::{self, Kind};
 use crate::store::StoreError;
@@ -60,14 +69,15 @@ pub struct PoolConfig {
     /// `n_c`: the threads (or under N10 the tasks that can hold a pin while
     /// they wait) that call into the pool at once (R-1-memory §1, §11). The
     /// minimum counts every pin each can hold (S-STORE §5.4), so a pool that
-    /// would be below it is refused; 0 is refused. `Pool::bytes_for` and
-    /// `Pool::footprint` do not read it.
+    /// would be below it is refused; 0 is refused. Card A-3b: it also sizes
+    /// each frame latch's waiter queue (one byte per thread), which
+    /// `Pool::bytes_for` computes from it and `Pool::footprint` measures.
     pub callers: u32,
 }
 
 /// The source of a page's current reference (S-STORE §4.1, §5.4): the
 /// current page map, card A-3c's; card A-3a's tests pass a test double.
-pub trait CurrentRef<H: File> {
+pub trait CurrentRef<H: File, P: Primitives = StdPrimitives> {
     /// The key's current reference `(slot, epoch, crc)`: an LPID's current
     /// map entry, or the MapLeaf's ref in its parent; slot 0 when the LPID
     /// is unmapped or the MapLeaf was never made (§4.1).
@@ -82,14 +92,15 @@ pub trait CurrentRef<H: File> {
     ///
     /// # Errors
     /// Whatever the map's reads give; the load returns it unchanged.
-    fn current_ref(&self, pool: &Pool<H>, key: PageKey) -> Result<Ref, StoreError>;
+    fn current_ref(&self, pool: &Pool<H, P>, key: PageKey) -> Result<Ref, StoreError>;
 }
 
-/// What [`Pool::pin`] found (S-STORE §5.4 "What a pin finds").
+/// What [`Pool::pin`] found (S-STORE §5.4 "What a pin finds"). `P` is the
+/// pool's sync-layer backend (card A-3b, Work 5).
 #[must_use]
-pub enum PinOutcome<'p, H: File> {
+pub enum PinOutcome<'p, H: File, P: Primitives = StdPrimitives> {
     /// The page, pinned in its frame (§5.3).
-    Pinned(Pin<'p, H>),
+    Pinned(Pin<'p, H, P>),
     /// No frame held the key and its reference has slot 0: an LPID that is
     /// not mapped, or a MapLeaf never made. The pin holds no frame, and
     /// nothing is left in the page table. Not an error: the caller decides,
@@ -100,18 +111,18 @@ pub enum PinOutcome<'p, H: File> {
 
 /// What [`Pool::create`] did (S-STORE §5.4 "The load", last paragraph).
 #[must_use]
-pub enum CreateOutcome<'p, H: File> {
+pub enum CreateOutcome<'p, H: File, P: Primitives = StdPrimitives> {
     /// The page was made: in the reservation's frame, or in the frame that
     /// held the key freed (§4.2), and its exclusive latch is held.
-    Created(CreatedPage<'p, H>),
+    Created(CreatedPage<'p, H, P>),
     /// A frame holds the key live: a pin on it, and the unused reservation.
     /// For a MapLeaf another restart made it first (§5.6 "Restart"); for an
     /// LPID it is damage, the caller's XX001 (§5.4).
-    Exists(Pin<'p, H>, FrameReservation<'p, H>),
+    Exists(Pin<'p, H, P>, FrameReservation<'p, H, P>),
     /// The key is being loaded: the caller waits with [`Pool::wait_settled`]
     /// and calls `create` again with the reservation (§5.4: "the creation
     /// waits for that load to end and looks again").
-    Loading(FrameReservation<'p, H>),
+    Loading(FrameReservation<'p, H, P>),
 }
 
 /// The pool's frames by state, and its counters (S-STORE §5.1, §5.4; card
@@ -169,7 +180,9 @@ pub struct PoolFootprint {
     /// The frames' headers: `F × (size_of::<FrameLatch>() +
     /// size_of::<FrameMeta>())`, each latch holding its frame's content
     /// cell (dirty flag, freed flag, content epoch and the buffer's handle;
-    /// R-1-memory §4.1).
+    /// R-1-memory §4.1), and the waiter queues of the frame latches, one
+    /// byte for each of the pool's `threads` per frame (card A-3b, Work 6:
+    /// `o_frame = c + n`).
     pub frame_bytes: u64,
     /// The page table: `F.next_power_of_two()` bucket heads and the free
     /// stack's `F` frame ids (S-STORE §5.7).
@@ -260,8 +273,11 @@ pub type Hook = Arc<dyn Fn(HookPoint, PageKey, FrameId) + Send + Sync>;
 
 /// The buffer pool (S-STORE §5.1): `F` frames, the page table and the free
 /// list, all allocated by [`Pool::new`] and never grown (BUF-FIXED), over the
-/// page file `H` (every page read goes through `nucleus-env`, §2).
-pub struct Pool<H: File> {
+/// page file `H` (every page read goes through `nucleus-env`, §2), on the
+/// sync layer's backend `P`: the platform's primitives by default, and a
+/// model checker's in a harness test, which then builds the pool with
+/// [`Pool::new_with`] (card A-3b, Work 5; S-STORE §15).
+pub struct Pool<H: File, P: Primitives = StdPrimitives> {
     /// The page file.
     file: Arc<H>,
     /// The page size.
@@ -272,20 +288,35 @@ pub struct Pool<H: File> {
     reserved: Range<u64>,
     /// `buckets − 1`, outside the mutex: the bucket count never changes.
     bucket_mask: u32,
-    /// One latch per frame, each guarding its frame's content.
-    latches: Box<[FrameLatch]>,
+    /// One task-fair latch per frame, each guarding its frame's content
+    /// cell (card A-3b, Work 4).
+    latches: Box<[FrameLatch<P>]>,
     /// The page table, the frames' bookkeeping and the free list.
-    table: Mutex<Table>,
+    table: Mutex<P, Table>,
+    /// The lengths of the table's three allocations as they were made, for
+    /// the footprint: read without the table mutex, which a panic may have
+    /// poisoned (card A-3b, Work 5).
+    table_lens: TableLens,
     /// Signalled whenever a load ends (P10, cleanup).
-    settled: Condvar,
+    settled: Condvar<P>,
     /// Signalled whenever a held frame becomes unheld (U1–U4, card A-3b-0,
     /// Work 4) while an acquisition waits for it.
-    unheld: Condvar,
+    unheld: Condvar<P>,
     /// The numbers the pool was opened with (R-1-memory §8 "The report").
     sizing: PoolSizing,
     /// The test hook (card A-3a, `test-hooks`).
     #[cfg(feature = "test-hooks")]
-    hook: Mutex<Option<Hook>>,
+    hook: Mutex<P, Option<Hook>>,
+}
+
+/// The lengths of the page table's three allocations, taken as
+/// [`Pool::build`] made them: the frames' metadata, the buckets and the free
+/// stack. [`Pool::footprint`] measures from them.
+#[derive(Debug, Clone, Copy)]
+struct TableLens {
+    metas: u64,
+    buckets: u64,
+    free: u64,
 }
 
 /// A validated [`PoolConfig`].
@@ -378,16 +409,7 @@ impl<H: File> Pool<H> {
     /// is below the minimum for `cfg.callers`;
     /// [`StoreError::OutOfMemory`] (53200) if an allocation fails.
     pub fn new(file: Arc<H>, cfg: PoolConfig) -> Result<Pool<H>, StoreError> {
-        let s = sizes(cfg)?;
-        let reserved = meta::reserved_slots(s.page_size)?;
-        let sizing = PoolSizing::compute(
-            cfg.frames,
-            cfg.callers,
-            OWN_PINNING_THREADS,
-            STEP2_RESERVE_FRAMES,
-            H_MIN,
-        )?;
-        Self::build(file, s, reserved, sizing)
+        Self::new_with(file, cfg)
     }
 
     /// [`Pool::new`] for a pool below its minimum (card A-3b-0, Work 2;
@@ -410,6 +432,57 @@ impl<H: File> Pool<H> {
         file: Arc<H>,
         cfg: PoolConfig,
     ) -> Result<Pool<H>, StoreError> {
+        Self::new_with_below_minimum_for_tests(file, cfg)
+    }
+}
+
+impl<H: File, P: Primitives> Pool<H, P> {
+    /// The pool's numbers (R-1-memory §8 "The report": `F`, `R_EPOCH`,
+    /// `R_MAP`, `H`, `n_s`, `s` and `o_frame`; card A-3b-0, Work 2). Fixed at
+    /// open.
+    pub fn sizing(&self) -> PoolSizing {
+        self.sizing
+    }
+
+    /// [`Pool::new`] on the backend `P` (card A-3b, Work 5): the same checks,
+    /// allocations and order, with the pool's mutexes, condition variables
+    /// and frame latches over `P`. Production calls [`Pool::new`], which is
+    /// this at the platform's primitives; the interleaving harness calls
+    /// this with a model checker's, so it runs the pool's own code
+    /// (S-STORE §15).
+    ///
+    /// # Errors
+    ///
+    /// What [`Pool::new`] returns, and [`StoreError::OutOfMemory`] if a frame
+    /// latch's waiter queue cannot be allocated.
+    pub fn new_with(file: Arc<H>, cfg: PoolConfig) -> Result<Pool<H, P>, StoreError> {
+        let s = sizes(cfg)?;
+        let reserved = meta::reserved_slots(s.page_size)?;
+        let sizing = PoolSizing::compute(
+            cfg.frames,
+            cfg.callers,
+            OWN_PINNING_THREADS,
+            STEP2_RESERVE_FRAMES,
+            H_MIN,
+        )?;
+        Self::build(file, s, reserved, sizing)
+    }
+
+    /// [`Pool::new_below_minimum_for_tests`] on the backend `P` (card A-3b,
+    /// Work 5; `test-hooks` only): for the harness's tests, which run the pin
+    /// protocol, the latch and the clock on pools of a few frames. The same
+    /// reach rule as [`Pool::new_below_minimum_for_tests`].
+    ///
+    /// # Errors
+    ///
+    /// What [`Pool::new_below_minimum_for_tests`] returns, and
+    /// [`StoreError::OutOfMemory`] if a frame latch's waiter queue cannot be
+    /// allocated.
+    #[cfg(feature = "test-hooks")]
+    pub fn new_with_below_minimum_for_tests(
+        file: Arc<H>,
+        cfg: PoolConfig,
+    ) -> Result<Pool<H, P>, StoreError> {
         let s = sizes(cfg)?;
         let reserved = meta::reserved_slots(s.page_size)?;
         let sizing = PoolSizing::below_minimum(
@@ -422,13 +495,6 @@ impl<H: File> Pool<H> {
         Self::build(file, s, reserved, sizing)
     }
 
-    /// The pool's numbers (R-1-memory §8 "The report": `F`, `R_EPOCH`,
-    /// `R_MAP`, `H`, `n_s`, `s` and `o_frame`; card A-3b-0, Work 2). Fixed at
-    /// open.
-    pub fn sizing(&self) -> PoolSizing {
-        self.sizing
-    }
-
     /// Card A-3a's allocations (BUF-FIXED), for a validated configuration
     /// and its sizing. Neither `Pool::new` nor
     /// [`Pool::new_below_minimum_for_tests`] allocates before it is called.
@@ -437,7 +503,7 @@ impl<H: File> Pool<H> {
         s: Sizes,
         reserved: Range<u64>,
         sizing: PoolSizing,
-    ) -> Result<Pool<H>, StoreError> {
+    ) -> Result<Pool<H, P>, StoreError> {
         let too_wide = || StoreError::Invalid("pool size past usize".into());
         let frames = usize::try_from(s.frames).map_err(|_| too_wide())?;
         let buckets_len = usize::try_from(s.buckets).map_err(|_| too_wide())?;
@@ -447,7 +513,7 @@ impl<H: File> Pool<H> {
         meta_v
             .try_reserve_exact(frames)
             .map_err(|e| oom("frame metadata", e))?;
-        let mut latches: Vec<FrameLatch> = Vec::new();
+        let mut latches: Vec<FrameLatch<P>> = Vec::new();
         latches
             .try_reserve_exact(frames)
             .map_err(|e| oom("frame latches", e))?;
@@ -464,16 +530,27 @@ impl<H: File> Pool<H> {
                 .try_reserve_exact(page_len)
                 .map_err(|e| oom("page buffer", e))?;
             bytes.resize(page_len, 0);
-            latches.push(FrameLatch::new(FrameContent {
-                bytes: bytes.into_boxed_slice(),
-                dirty: false,
-                freed: false,
-                content_epoch: 0,
-            }));
+            // The latch's queue holds every thread the pool counts (card
+            // A-3b, Work 4): its allocation is the pool's, and a failed one
+            // is reported like the others.
+            latches.push(FrameLatch::new(
+                sizing.threads,
+                FrameContent {
+                    bytes: bytes.into_boxed_slice(),
+                    dirty: false,
+                    freed: false,
+                    content_epoch: 0,
+                },
+            )?);
         }
         meta_v.resize(frames, FrameMeta::FREE);
         buckets.resize(buckets_len, None);
         free.extend((0..s.frames).rev().map(FrameId));
+        let table_lens = TableLens {
+            metas: wide(meta_v.len()),
+            buckets: wide(buckets.len()),
+            free: wide(free.len()),
+        };
         let table = Table::new(
             buckets.into_boxed_slice(),
             meta_v.into_boxed_slice(),
@@ -487,6 +564,7 @@ impl<H: File> Pool<H> {
             bucket_mask: s.buckets - 1,
             latches: latches.into_boxed_slice(),
             table: Mutex::new(table),
+            table_lens,
             settled: Condvar::new(),
             unheld: Condvar::new(),
             sizing,
@@ -515,31 +593,32 @@ impl<H: File> Pool<H> {
     ///
     /// # Errors
     /// [`StoreError::Poisoned`] if a panic poisoned the mutex.
-    pub(crate) fn lock_table(&self) -> Result<MutexGuard<'_, Table>, StoreError> {
+    pub(crate) fn lock_table(&self) -> Result<MutexGuard<'_, P, Table>, StoreError> {
         self.table.lock().map_err(|_| poisoned_table())
-    }
-
-    /// Lock the table even if poisoned (for `Drop`, which cannot fail).
-    pub(crate) fn lock_table_anyway(&self) -> MutexGuard<'_, Table> {
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Wait for a load to end: release the table mutex, sleep on the
     /// condition variable, and lock it again.
-    fn wait<'t>(&self, t: MutexGuard<'t, Table>) -> Result<MutexGuard<'t, Table>, StoreError> {
+    fn wait<'t>(
+        &self,
+        t: MutexGuard<'t, P, Table>,
+    ) -> Result<MutexGuard<'t, P, Table>, StoreError> {
         self.settled.wait(t).map_err(|_| poisoned_table())
     }
 
     /// Wait for a held frame to become unheld (card A-3b-0, Work 5, A7):
-    /// release the table mutex, wait on `unheld`, and lock it again. A
-    /// poisoned mutex gives the guard back in `Err`, so the caller, a
-    /// registered waiter, can take itself off the count before it returns
-    /// the error.
+    /// release the table mutex, wait on `unheld`, and lock it again.
+    ///
+    /// Card A-3b, Work 5: the sync layer hands back no guard from a mutex a
+    /// panic poisoned while the caller waited (its F5), so the caller, a
+    /// registered waiter, returns the error with its count still raised.
+    /// That count is stale in a pool nobody can use: the panic poisoned the
+    /// store (S-STORE §9.2), and A-3c's mark fails every later call.
     pub(crate) fn wait_for_unheld<'t>(
         &self,
-        t: MutexGuard<'t, Table>,
-    ) -> Result<MutexGuard<'t, Table>, MutexGuard<'t, Table>> {
-        self.unheld.wait(t).map_err(PoisonError::into_inner)
+        t: MutexGuard<'t, P, Table>,
+    ) -> Result<MutexGuard<'t, P, Table>, StoreError> {
+        self.unheld.wait(t)
     }
 
     /// U1–U4's second half (card A-3b-0, Work 4): a held frame has just
@@ -560,7 +639,7 @@ impl<H: File> Pool<H> {
     ///
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range.
-    pub(crate) fn latch(&self, f: FrameId) -> Result<&FrameLatch, StoreError> {
+    pub(crate) fn latch(&self, f: FrameId) -> Result<&FrameLatch<P>, StoreError> {
         usize::try_from(f.0)
             .ok()
             .and_then(|i| self.latches.get(i))
@@ -571,6 +650,22 @@ impl<H: File> Pool<H> {
                     self.latches.len()
                 ))
             })
+    }
+
+    /// A snapshot of frame `f`'s latch, taken under that latch's internal
+    /// mutex and no other (card A-3b, Work 7): who holds it, how many
+    /// requests wait, and its bound, its capacity and its arrivals. A
+    /// diagnostic: a test reads it to place an interleaving, as
+    /// `t_root_latch_fair`'s forced order does (§15), and no store path does.
+    /// It waits for nobody's hold on the frame, only for the latch's own
+    /// brief mutex.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Invalid`] if `f` is out of range;
+    /// [`StoreError::Poisoned`] if the latch's internal mutex is poisoned.
+    pub fn latch_info(&self, f: FrameId) -> Result<LatchInfo, StoreError> {
+        self.latch(f)?.info()
     }
 
     /// The byte offset of `slot` if it can be a page's home (S-STORE §4.4:
@@ -590,14 +685,14 @@ impl<H: File> Pool<H> {
     /// under the hook's own mutex, which is released before the call, so a
     /// hook never runs under a pool mutex. Compiles to nothing without the
     /// `test-hooks` feature.
+    ///
+    /// Card A-3b, Work 5: the hook's mutex is the sync layer's, so a harness
+    /// run schedules it too. Nothing under that mutex can panic, so it is
+    /// never poisoned; were it, nothing fires.
     pub(crate) fn fire(&self, point: HookPoint, key: PageKey, frame: FrameId) {
         #[cfg(feature = "test-hooks")]
         {
-            let hook = self
-                .hook
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
+            let hook = self.hook.lock().ok().and_then(|slot| slot.clone());
             if let Some(hook) = hook {
                 hook(point, key, frame);
             }
@@ -641,8 +736,8 @@ impl<H: File> Pool<H> {
     pub fn pin(
         &self,
         key: PageKey,
-        map: &impl CurrentRef<H>,
-    ) -> Result<PinOutcome<'_, H>, StoreError> {
+        map: &impl CurrentRef<H, P>,
+    ) -> Result<PinOutcome<'_, H, P>, StoreError> {
         // P1.
         let id = key.header_id()?;
         loop {
@@ -743,8 +838,8 @@ impl<H: File> Pool<H> {
         f: FrameId,
         key: PageKey,
         id: u64,
-        map: &impl CurrentRef<H>,
-    ) -> Result<PinOutcome<'_, H>, StoreError> {
+        map: &impl CurrentRef<H, P>,
+    ) -> Result<PinOutcome<'_, H, P>, StoreError> {
         // P5: the reference, holding only the count on f.
         let r = match map.current_ref(self, key) {
             Ok(r) => r,
@@ -867,7 +962,7 @@ impl<H: File> Pool<H> {
     ///
     /// # Errors
     /// [`StoreError::Invalid`] for `Lpid(0)` or a count at `u64::MAX`.
-    pub fn pin_resident(&self, key: PageKey) -> Result<Option<Pin<'_, H>>, StoreError> {
+    pub fn pin_resident(&self, key: PageKey) -> Result<Option<Pin<'_, H, P>>, StoreError> {
         key.header_id()?;
         let mut t = self.lock_table()?;
         let Some(f) = t.lookup(key)? else {
@@ -893,7 +988,7 @@ impl<H: File> Pool<H> {
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range or its count is at
     /// `u64::MAX`.
-    pub fn pin_frame(&self, f: FrameId) -> Result<Option<Pin<'_, H>>, StoreError> {
+    pub fn pin_frame(&self, f: FrameId) -> Result<Option<Pin<'_, H, P>>, StoreError> {
         let mut t = self.lock_table()?;
         let m = *t.meta(f)?;
         if m.state != FrameState::Resident {
@@ -926,7 +1021,7 @@ impl<H: File> Pool<H> {
     /// [`StoreError::PoolStarved`] when no frame is free and every unpinned
     /// frame is dirty: at this card no dirty victim is written (A-3c writes
     /// them, §5.2); [`StoreError::Poisoned`] if the table mutex was poisoned.
-    pub fn reserve(&self) -> Result<FrameReservation<'_, H>, StoreError> {
+    pub fn reserve(&self) -> Result<FrameReservation<'_, H, P>, StoreError> {
         match self.acquire(true, None)? {
             Some(res) => Ok(res),
             None => Err(StoreError::Invalid(
@@ -944,7 +1039,7 @@ impl<H: File> Pool<H> {
     ///
     /// # Errors
     /// [`StoreError::Poisoned`] if the table mutex or a latch was poisoned.
-    pub fn try_reserve(&self) -> Result<Option<FrameReservation<'_, H>>, StoreError> {
+    pub fn try_reserve(&self) -> Result<Option<FrameReservation<'_, H, P>>, StoreError> {
         self.acquire(false, None)
     }
 
@@ -978,11 +1073,11 @@ impl<H: File> Pool<H> {
     /// is first given back and the frame is freed again, card A-3a-F2).
     pub fn create<'p>(
         &'p self,
-        res: FrameReservation<'p, H>,
+        res: FrameReservation<'p, H, P>,
         key: PageKey,
         kind: Kind,
         epoch: u32,
-    ) -> Result<CreateOutcome<'p, H>, StoreError> {
+    ) -> Result<CreateOutcome<'p, H, P>, StoreError> {
         // C1.
         if !res.is_of(self) {
             return Err(StoreError::Invalid(
@@ -1114,7 +1209,7 @@ impl<H: File> Pool<H> {
     /// # Errors
     /// [`StoreError::Invalid`] if `f` is out of range;
     /// [`StoreError::Poisoned`] if its latch or the mutex was poisoned.
-    pub fn try_victim(&self, f: FrameId) -> Result<Option<VictimGuard<'_, H>>, StoreError> {
+    pub fn try_victim(&self, f: FrameId) -> Result<Option<VictimGuard<'_, H, P>>, StoreError> {
         // V1.
         let Some(c) = self.latch(f)?.try_exclusive()? else {
             return Ok(None);
@@ -1140,7 +1235,7 @@ impl<H: File> Pool<H> {
         &self,
         f: FrameId,
         key: PageKey,
-    ) -> Result<Pin<'_, H>, StoreError> {
+    ) -> Result<Pin<'_, H, P>, StoreError> {
         let mut t = self.lock_table()?;
         t.raise(f)?;
         drop(t);
@@ -1153,10 +1248,10 @@ impl<H: File> Pool<H> {
     /// exclusive latch `content`.
     pub(crate) fn remove_victim<'p>(
         &'p self,
-        content: LatchExclusive<'p>,
+        content: LatchExclusive<'p, P>,
         key: PageKey,
         f: FrameId,
-    ) -> Result<Removal<'p, H>, StoreError> {
+    ) -> Result<Removal<'p, H, P>, StoreError> {
         // R1.
         self.fire(HookPoint::RemoveLatched, key, f);
         // R2: only an unpinned, clean frame leaves the table.
@@ -1319,6 +1414,11 @@ impl<H: File> Pool<H> {
     /// # Errors
     /// [`StoreError::Invalid`] for a configuration [`Pool::new`] refuses, or
     /// a size past `u64`.
+    ///
+    /// Card A-3b (Work 6): each frame latch's waiter queue is counted too,
+    /// one byte per thread that can wait on a frame, `cfg.callers` and the
+    /// store's own pinning threads; the sum of the queues [`Pool::footprint`]
+    /// measures is the other, independent computation of it.
     pub fn bytes_for(cfg: PoolConfig) -> Result<PoolFootprint, StoreError> {
         let s = sizes(cfg)?;
         let past = || StoreError::Invalid("pool footprint past u64".into());
@@ -1330,7 +1430,14 @@ impl<H: File> Pool<H> {
         let page_bytes = frames
             .checked_mul(u64::from(s.page_size))
             .ok_or_else(past)?;
-        let frame_bytes = frames.checked_mul(per_frame).ok_or_else(past)?;
+        let queues = u64::from(cfg.callers)
+            .checked_add(u64::from(OWN_PINNING_THREADS))
+            .and_then(|threads| frames.checked_mul(threads))
+            .ok_or_else(past)?;
+        let frame_bytes = frames
+            .checked_mul(per_frame)
+            .and_then(|b| b.checked_add(queues))
+            .ok_or_else(past)?;
         let table_bytes = u64::from(s.buckets)
             .checked_mul(head)
             .and_then(|b| frames.checked_mul(id).and_then(|f| b.checked_add(f)))
@@ -1345,28 +1452,32 @@ impl<H: File> Pool<H> {
     /// The memory this pool holds, measured from its allocations' lengths:
     /// the page buffers' lengths (read under each frame's latch shared, in
     /// turn, so call it holding no latch), the latches and metadata, the
-    /// buckets and the free stack. Independent of [`Pool::bytes_for`]'s
-    /// arithmetic, which it must equal (R-1-memory §4.1, §8).
+    /// buckets and the free stack, and, card A-3b (Work 6), each frame
+    /// latch's waiter queue at the length it was allocated with. Independent
+    /// of [`Pool::bytes_for`]'s arithmetic, which it must equal (R-1-memory
+    /// §4.1, §8).
+    ///
+    /// The table's three lengths were taken as the allocations were made, so
+    /// this takes the table mutex for nothing (card A-3b, Work 5): a panic
+    /// may have poisoned it.
     pub fn footprint(&self) -> PoolFootprint {
-        let page_bytes = self
+        let page_bytes = self.latches.iter().fold(0u64, |sum, l| {
+            sum.saturating_add(wide(l.page_len(self.page_len)))
+        });
+        let latches = wide(self.latches.len());
+        let queues = self
             .latches
             .iter()
-            .fold(0u64, |sum, l| sum.saturating_add(wide(l.page_len())));
-        let latches = wide(self.latches.len());
-        let t = self.lock_table_anyway();
-        let (metas, buckets, free) = (
-            wide(t.frames()),
-            wide(t.bucket_count()),
-            wide(t.free_capacity()),
-        );
-        drop(t);
+            .fold(0u64, |sum, l| sum.saturating_add(u64::from(l.capacity())));
+        let lens = self.table_lens;
         let times = |n: u64, size: usize| n.saturating_mul(wide(size));
         PoolFootprint {
             page_bytes,
-            frame_bytes: times(latches, size_of::<FrameLatch>())
-                .saturating_add(times(metas, size_of::<FrameMeta>())),
-            table_bytes: times(buckets, size_of::<Option<FrameId>>())
-                .saturating_add(times(free, size_of::<FrameId>())),
+            frame_bytes: times(latches, size_of::<FrameLatch<P>>())
+                .saturating_add(times(lens.metas, size_of::<FrameMeta>()))
+                .saturating_add(queues),
+            table_bytes: times(lens.buckets, size_of::<Option<FrameId>>())
+                .saturating_add(times(lens.free, size_of::<FrameId>())),
         }
     }
 
@@ -1374,7 +1485,11 @@ impl<H: File> Pool<H> {
     /// hook-placed interleavings).
     #[cfg(feature = "test-hooks")]
     pub fn set_hook(&self, hook: Option<Hook>) {
-        *self.hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
+        // The hook's mutex cannot be poisoned, since nothing under it can
+        // panic; were it, nothing is installed (card A-3b, Work 5).
+        if let Ok(mut slot) = self.hook.lock() {
+            *slot = hook;
+        }
     }
 
     /// Set a `Resident` frame's pin count to `n`: fault injection for a count
@@ -1399,9 +1514,11 @@ impl<H: File> Pool<H> {
     /// `independent_loads`; `test-hooks` only; S-STORE §4.2's leaf-lock rank).
     #[cfg(feature = "test-hooks")]
     pub fn table_free(&self) -> bool {
+        // The sync layer's try (card A-3b, Work 5), read as `std::sync`'s was
+        // at card A-3a: a held mutex answers false, a poisoned one true.
         match self.table.try_lock() {
-            Ok(_) | Err(TryLockError::Poisoned(_)) => true,
-            Err(TryLockError::WouldBlock) => false,
+            Ok(Some(_)) | Err(StoreError::Poisoned(_)) => true,
+            Ok(None) | Err(_) => false,
         }
     }
 }
@@ -1414,7 +1531,7 @@ fn loading_frame(t: &Table, key: PageKey) -> Result<Option<FrameId>, StoreError>
     }
 }
 
-impl<H: File> fmt::Debug for PinOutcome<'_, H> {
+impl<H: File, P: Primitives> fmt::Debug for PinOutcome<'_, H, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PinOutcome::Pinned(p) => f.debug_tuple("Pinned").field(p).finish(),
@@ -1423,7 +1540,7 @@ impl<H: File> fmt::Debug for PinOutcome<'_, H> {
     }
 }
 
-impl<H: File> fmt::Debug for CreateOutcome<'_, H> {
+impl<H: File, P: Primitives> fmt::Debug for CreateOutcome<'_, H, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CreateOutcome::Created(c) => f.debug_tuple("Created").field(c).finish(),
@@ -1433,7 +1550,7 @@ impl<H: File> fmt::Debug for CreateOutcome<'_, H> {
     }
 }
 
-impl<H: File> fmt::Debug for Pool<H> {
+impl<H: File, P: Primitives> fmt::Debug for Pool<H, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pool")
             .field("frames", &self.latches.len())
