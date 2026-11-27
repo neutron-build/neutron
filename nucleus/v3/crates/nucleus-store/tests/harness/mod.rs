@@ -126,6 +126,16 @@ impl Primitives for Shuttle {
         m.lock().map_err(|_| Poisoned)
     }
 
+    fn mutex_try_lock<T: Send>(
+        m: &Self::RawMutex<T>,
+    ) -> Result<Option<Self::RawGuard<'_, T>>, Poisoned> {
+        match m.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(ModelTryLockError::WouldBlock) => Ok(None),
+            Err(ModelTryLockError::Poisoned(_)) => Err(Poisoned),
+        }
+    }
+
     fn condvar_new() -> Self::RawCondvar {
         ModelCondvar::new()
     }
