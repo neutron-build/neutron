@@ -1,29 +1,29 @@
 Card: NB-3
 Class: bench
 Card-gate: S
-Verdict: MERGE-WITH-FOLLOWUPS
+Verdict: MERGE
 Gate-tier: S
 Gate-model: zai-coding-plan/glm-5.3 (max)
-Gate-session: opencode session ses_ddf8cae74ffetQmjREVFEbeVqK (T3 Code review sub-agent, S gate of record for NB-3, requested by T3 thread 45584af2-e651-490e-862c-3402320cffa3)
+Gate-session: opencode review sub-agent, T3 thread 45584af2-e651-490e-862c-3402320cffa3 (fresh gate; the earlier verdict a2c8bf63 is void per Opus ruling ruling-NB-containment.md)
 Date: 2026-11-28
 Gate-exit: GATE EXIT=0
-Commit: 2e709024d54ed18fde68a381c5745e086abda2ed
-Mutants: MYSQL-PROBE-PORTLESS -> caught: runner::tests::mysql_ping_probe_targets_the_configured_port FAILED ("left: mysqladmin -h 127.0.0.1 ping, right: mysqladmin -h 127.0.0.1 -P 3307 ping") | MYSQL-DURABILITY-SOFT -> caught: rows::tests::mysql84_base_args_carry_the_per_commit_flush FAILED (base args ["…","--innodb_flush_log_at_trx_commit=2","--skip-log-bin"]) | DRAGONFLY-PORT-SWAPPED -> caught: kv-memtier-dragonfly smoke exit 1 "DRAGONFLY SMOKE FAIL: memtier measured 0 ops/sec — did it reach the server?" | SYSBENCH-DRIVER-CONFUSED -> caught: oltp-sysbench-mysql84 smoke exit 1, "FATAL: Connection to database failed: connection to server at 'localhost' (127.0.0.1)/(::1), port 5432 failed: Connection refused" in NB_LOG | QUERIES-COUNT-LIED -> caught: embedded-duckdb-tpch1 smoke exit 1 "DUCKDB TPCH SMOKE FAIL: results JSON does not record queries: 22" (JSON carries samples:[21]) | DUCKDB-EXT-RUNTIME-FETCH -> UNCAUGHT by any test, as the card itself states (inspection-verified: build-time INSTALL + offline LOAD; the gate also ran it live: a runtime INSTALL under the run pass's --network none fetches nothing — the baked extension satisfies it offline and the smoke still passes, confirming the no-fetch property structurally) | TPCH-ANSWERS-UNHASHED -> UNCAUGHT within one run, as the card itself states (inspection-verified: digest.sh hashes the concatenated outputs of all 22 queries plus the per-table dbgen row counts)
-Followups: NB-3-F1
+Commit: e40cb6b8973d0ba2fd25bc95cf2f72b474243812
+Mutants: MYSQL-PROBE-PORTLESS -> caught: runner::tests::mysql_ping_probe_targets_the_configured_port FAILED ("left: \"mysqladmin -h 127.0.0.1 ping\" right: \"mysqladmin -h 127.0.0.1 -P 3307 ping\"") | MYSQL-DURABILITY-SOFT -> caught: rows::tests::mysql84_base_args_carry_the_per_commit_flush FAILED (base args carry --innodb_flush_log_at_trx_commit=2) | DRAGONFLY-PORT-SWAPPED -> caught: kv-memtier-dragonfly Host smoke on a mutated extract, exit 1, "DRAGONFLY SMOKE FAIL: memtier measured 0 ops/sec — did it reach the server?" | SYSBENCH-DRIVER-CONFUSED -> caught: oltp-sysbench-mysql84 Host smoke on a mutated extract, exit 1, sysbench "FATAL: Connection to database failed: connection to server at \"localhost\" (::1), port 5432 failed: Connection refused" | QUERIES-COUNT-LIED -> caught: embedded-duckdb-tpch1 Host smoke on a mutated extract, exit 1, "DUCKDB TPCH SMOKE FAIL: results JSON does not record queries: 22" | DUCKDB-EXT-RUNTIME-FETCH -> UNCAUGHT by any test, as the card states (inspection-verified: build-time INSTALL — the baked /root/.duckdb/extensions/v2.0.1/linux_amd64/tpch.duckdb_extension is in the image; the driver's dbgen and run passes run under --network none, so no fetch is possible where it is measured) | TPCH-ANSWERS-UNHASHED -> UNCAUGHT within one run, as the card states (inspection-verified: digest.sh re-executes all 22 queries and hashes the concatenated outputs plus the per-table dbgen row counts)
+Followups: none
 
-## Gate run
+## Gate run (fresh, on the reworked tip e40cb6b8)
 
-GATE-PROMPT step 1, on the scaffold's own `fresh-gate.sh` extracted
-through a shallow `--no-local` clone of `nucleus/v3-scaffold`
-(scaffold id `d155924534028dfc147aaad3d0991575fae4a2c3`), run
-foreground under `systemd-run --user --scope --quiet -p
+GATE-PROMPT step 1, the scaffold's own `fresh-gate.sh` extracted
+through a shallow `--no-local` clone of `nucleus/v3-scaffold` (scaffold
+id `84a5cc707efcd42d6ecda2c46e2d77b063d8e2a3`, pass 195's promotion),
+run foreground under `systemd-run --user --scope --quiet -p
 CPUWeight=10000 --` with `CARGO_TARGET_DIR=~/.cache/nv3-target/gate-NB-3`
 (the scope worked; no plain fallback needed):
 
 ```
-fresh-gate: commit 2e709024d54ed18fde68a381c5745e086abda2ed
-fresh-gate: base d155924534028dfc147aaad3d0991575fae4a2c3
-fresh-gate: checks passed (4989 files hashed in 1.56 s)
+fresh-gate: commit e40cb6b8973d0ba2fd25bc95cf2f72b474243812
+fresh-gate: base 84a5cc707efcd42d6ecda2c46e2d77b063d8e2a3
+fresh-gate: checks passed (4990 files hashed in 1.94 s)
 fresh-gate: 2 file(s) matched through their eol conversion
 STEP test EXIT=0
 STEP clippy EXIT=0
@@ -36,160 +36,164 @@ STEP api-surface EXIT=0
 GATE EXIT=0
 ```
 
-The literal last line was `GATE EXIT=0`; wrapper exit 0; stderr empty.
-No known load or zombie row (FAST-TRACK §3 / QUEUE ENF-TIMING-1)
-failed, and no external SIGTERM arrived, so no enforcement re-run was
-needed. This was the card's one full gate run (the runner's own
-`gate.sh` PASS after attempt 3 is the runner's record; the implementer
-ran none, per FAST-TRACK §3). The scaffold extract was removed
-afterwards.
+The literal last line was `GATE EXIT=0`; stderr empty. This is the
+card's one full gate run (FAST-TRACK §2: the implementer ran none; the
+runner's `gate.sh` line was deferred to it). No known load or zombie
+row (FAST-TRACK §3 / QUEUE ENF-TIMING-1) failed and no external
+SIGTERM arrived, so no enforcement re-run was needed. The brief
+expected `STEP enforcement-tests SKIPPED` (no scripts/ or tools/
+change); the pass-195 scaffold runs the enforcement suite regardless,
+and it passed — recorded as found, and harmless. The scaffold extract
+was removed afterwards.
 
-## Licence gate (PLAN §5.2 rule 9 — the card's Work 1, checked first)
+## Host smoke (GATE-PROMPT "Host smoke"; the ruling's re-gate)
 
-Verified genuine, not asserted. The worker's logs show the reads
-happened before any row was built or measured, and this gate
-re-checked every claim:
+Run by this gate plainly, each line in its own shell pass, on a fresh
+`git clone --no-local` of the pinned commit `e40cb6b8…` (branch
+`card/v3-NB-3`, `nucleus/v2` beside `nucleus/v3`), never the worker's
+worktree:
 
-- **MySQL 8.4.13** — licence text read from inside the pinned image
-  (`cat /usr/share/doc/mysql-community-server-minimal/LICENSE` via
-  `nb-podman run --rm docker.io/library/mysql:8.4 …`) and grepped for
-  benchmark/publication clauses: every "publish" occurrence is GPLv2's
-  own distribution terms or a bundled third-party grant (Apache/MIT
-  style); **no benchmark-restriction clause**. GPLv2 restricts
-  distributing the software, not publishing results about it. Recorded
-  in `LICENSES.md` with the path and date 2026-11-27.
-- **Dragonfly v1.27.1** — the image itself carries no Dragonfly
-  licence file (verified from inside the image: only Ubuntu's
-  `/usr/share/common-licenses/`; the binary embeds no licence text —
-  grepped). The governing text is upstream's LICENSE.md: BSL 1.1 with
-  Dragonfly's Additional Use Grant. The gate independently fetched the
-  **v1.27.1-tagged** LICENSE.md and confirms the worker's reading: the
-  grant wording is identical to what was recorded (only the Change
-  Date differs from main's — 2029 vs 2030 — irrelevant to publication).
-  BSL 1.1 grants non-production use (a benchmark run is one) and the
-  grant is a field-of-use restriction; **neither text restricts
-  publishing benchmark results**. Recorded with the date.
-- **DuckDB 2.0.1** — MIT, verified from the upstream repository
-  licence; no restriction. The v2.0.1 release page publishes the CLI
-  artifact's sha256 (`b676268b…b5eca`), and the worker re-measured the
-  downloaded artifact byte-identical — the card's disclosed
-  fetch-time-pin open point is closed with *better* provenance than
-  the card asked for.
+| Line | Exit | Last line |
+|---|---|---|
+| `cd nucleus/v3/bench/nbench && bash workloads/oltp-sysbench-mysql84/smoke.sh` | 0 | `MYSQL84 SMOKE OK (wall 30s)` |
+| `cd nucleus/v3/bench/nbench && bash workloads/kv-memtier-dragonfly/smoke.sh` | 0 | `DRAGONFLY SMOKE OK (wall 23s)` |
+| `cd nucleus/v3/bench/nbench && bash workloads/embedded-duckdb-tpch1/smoke.sh` | 0 | `DUCKDB TPCH SMOKE OK (wall 9s)` |
 
-No clause restricts publication on any of the three engines; nothing
-to exclude, no permission needed, no ESCALATE. The licence-gate
-evidence trail in `LICENSES.md` (rows, paths, dates) is complete.
+Verified beyond the exit codes: `"voided":false` and `nbench_build`
+provenance in all three results JSONs; dragonfly `ops_sec` samples
+begin `202140.68` (memtier reached the server; the structural >0
+check); duckdb `"queries":{"samples":[22` (exactly the 22 that ran);
+all pinned images (mysql:8.4, dragonfly:v1.27.1, memtier, debian:12)
+matched their `image.txt` digests; the clone stayed git-clean (only
+gitignored `results/smoke/`, `work/`, `expected/*-smoke.txt` writes);
+no nbench container was left behind (the runner's own cleanup removed
+each; the host's only remaining container is an unrelated
+8-month-old `alpine`). Smoke, not a measurement (§7.7.3 item 5).
+
+## Relay containment check (ruling Work 8; GATE-PROMPT Host smoke rule)
+
+- The rework commit `e40cb6b8` is exactly Work 8: 68 deletions, 0
+  insertions, the three relay blocks (mysql84 smoke.sh:48-68,
+  dragonfly:47-67, duckdb:50-72) gone from every `workloads/*/smoke.sh`.
+- Grep of every touched path (`workloads/`, `systems/`, `src/`, `bin/`):
+  no `NB3_RELAYED`, no `XDG_RUNTIME_DIR`, no `systemd/private`, no dbus
+  or bus socket, no containment probe. The only `systemd-run` callers
+  in the harness are `src/podman.rs` and `bin/nb-podman` — nbench's
+  podman wrapper, untouched by this diff.
+- Grep of the added lines of the whole code diff: the only
+  "relay"/"systemd-run" hits are three prose comments (the B-0-era
+  stdin lesson in `embedded-duckdb-tpch1/driver.sh:26` and the digest's
+  header, plus `rows.rs`'s environment note) — no calls.
+- What is left of each smoke is the env derivation, the `"$BIN" run`
+  pass and the structural checks only, as the ruling requires.
+
+## Licence gate (PLAN §5.2 rule 9 — still holds)
+
+`LICENSES.md` carries all three rows with paths and dates (2026-11-27):
+MySQL 8.4.13 (GPLv2 + Universal FOSS Exception, read from the pinned
+image at `/usr/share/doc/mysql-community-server-minimal/LICENSE`),
+Dragonfly v1.27.1 (BSL 1.1 + Additional Use Grant; the image itself
+carries no licence file, so the governing text is upstream's LICENSE.md)
+and DuckDB 2.0.1 (MIT, upstream repository licence). This gate re-grepped
+the MySQL licence text from inside the pinned image: every "publish"
+occurrence is GPLv2's own distribution terms or a bundled third-party
+grant — no benchmark-restriction clause. Nothing to exclude, no
+permission needed, no ESCALATE.
 
 ## Scope
 
-`git diff nucleus/v3-scaffold...HEAD --stat`: 51 files, 2930
-insertions. Every changed file is in the card's Touch only list;
-nothing in `docs/`, `scripts/`, `tools/`, `cards/`, `verdicts/` or
-`CORE_PATHS`. `systems/sysbenchcli/` is **untouched**: the card's
-driver check ran live against the MySQL container (Debian's sysbench
-1.0.20 carries the MySQL driver — `oltp_read_write prepare` and `run`
-both worked through `--db-driver=mysql`), so the source-build
-fallback was correctly not taken.
+`git diff nucleus/v3-scaffold...HEAD --stat`: 52 files. All 51 code
+files are in the card's Touch only list; nothing in `docs/`, `scripts/`,
+`tools/`, `cards/`, `verdicts/` or `CORE_PATHS`; `systems/sysbenchcli/`
+untouched (the driver check passed, so the source-build fallback was
+correctly not taken). The 52nd file is `nucleus/v3/verdicts/NB-3.md`
+itself — the void gate's own verdict commit (a2c8bf63), which this
+verdict replaces on the card branch, as GATE-PROMPT step 7 provides.
 
 ## Correctness review
 
-- `rows.rs`: three `SystemDef`s (mysql84/dragonfly/duckdb), three
-  rows, `Ready::MysqlPing`, `sweep_kv_fixed`, the `port()` entries;
-  `plan()`, `Step` and every existing row's definition unchanged. The
-  mysql84 row mirrors pg17 cell for cell; the dragonfly row's
-  description carries the durability-unmatched note the report prints
-  verbatim (checked in a real smoke REPORT.md); the duckdb row mirrors
-  the sqlite embedded shape.
-- `runner.rs`: the `MysqlPing` arm of `wait_ready` with a 300 s window
-  (MySQL's first-time datadir init) and the pure-probe unit test; plus
-  the `Parser::DuckdbTpch` dispatch arm the Limits didn't name but the
-  exhaustive match forces (Work 5 adds the variant) — disclosed in the
-  RESULT; minimal and correct.
-- `parse.rs`/`params.rs`: `parse_duckdb_tpch` pinned to a **real
-  captured driver fixture** (758 lines, header names the exact build;
-  the fixture's tail matches the RESULT's verbatim time/RSS lines);
-  missing summary lines are errors, never zeros; `tpch_sf` defaults to
-  1 with a set arm and defaults test, no dead knobs
-  (`mysql_*`/`dragonfly_*` correctly not added).
+- `rows.rs` (+276/-0): three `SystemDef`s (mysql84 Server 3307 with
+  per-commit flush base args, dragonfly Server 6382, duckdb Transient),
+  three rows, `Ready::MysqlPing`, `sweep_kv_fixed` (pipeline-only, the
+  durability-unmatched note in the row description the report prints),
+  the `port()` entries; `plan()`, `Step` and every existing row's
+  definition unchanged.
+- `runner.rs`: the `MysqlPing` arm of `wait_ready` (TCP probe
+  `mysqladmin -h 127.0.0.1 -P <port> ping`, 300 s window for MySQL's
+  first-time datadir init — never the unix socket the entrypoint's
+  temporary server answers) plus its pure-probe unit test; and the
+  `Parser::DuckdbTpch` dispatch arm the exhaustive match forces (Work 5
+  adds the variant; disclosed in the RESULT; one line).
+- `parse.rs`: `parse_duckdb_tpch` pinned to the real captured fixture
+  (`src/fixtures/duckdb-tpch-run.txt`, 758 lines, header names the
+  exact build; this gate's own Host smoke reproduced the same
+  `TPCH_*` summary shape with `TPCH_QUERIES 22`); last occurrence of a
+  tag wins; missing summary lines are errors, never zeros; the
+  `queries` metric rides the pre-existing aggregate path (runner.rs
+  aggregates unregistered metrics with samples, by B-0 design).
+- `params.rs`: `tpch_sf` (default 1) with a `set` arm and defaults
+  test; no dead `mysql_*`/`dragonfly_*` knobs.
 - Shell: all 12 scripts `bash -n` + `shellcheck -S warning` clean
-  (re-run by this gate on a fresh extract); drivers `set -euo
-  pipefail`; stderr never swallowed (the mysql digest's `-D` fix,
-  commit 0d87bcd0).
+  (re-run by this gate on the fresh clone, exit 0); `set -euo
+  pipefail` throughout; stderr never swallowed; no stdin piped into
+  containers (the B-0 relay-stdin lesson); the duckdb driver refuses
+  to start unless exactly `tpc01.sql..tpc22.sql` are present by name.
 - Code rules: no `unsafe`; all 14 `expect(` additions are inside
-  `#[cfg(test)]`; pub items documented; the crate stays std-only;
+  `#[cfg(test)]`; pub items documented; the crate stays std-only,
   `Cargo.toml` untouched.
-- Judgment calls all reviewed and accepted: `--skip-log-bin` replaces
-  the card's `--log_bin=0` (silently ignored by MySQL 8.4 — verified
-  live, `@@log_bin` stayed 1; the card's intent is implemented and
-  provenance-recorded); the Dragonfly digest/probe use the image's own
-  redis-cli 6.0.16 (the card's "ships no CLI" premise was false,
-  recorded in the README); smokes derive their own env (the attempt-3
-  rework; the acceptance lines pass bare).
+- Pins: mysql84/dragonfly digest-pinned in `image.txt` with recording
+  date and method; the duckdb builder is `FROM` a digest-pinned
+  Debian 12, downloads the CLI artifact at build time and verifies the
+  upstream-published sha256, and bakes the tpch extension with a
+  build-time `INSTALL` (this gate listed the baked
+  `tpch.duckdb_extension` in the image).
+- Judgment calls reviewed and accepted (all disclosed in the RESULT):
+  `--skip-log-bin` replaces the card's `--log_bin=0` (MySQL 8.4
+  silently ignores the latter, verified live, provenance-recorded);
+  the Dragonfly digest/probe use the image's own redis-cli 6.0.16
+  (the card's "ships no CLI" premise was false, recorded in the
+  README); smokes derive their own env (the acceptance lines pass
+  none).
 
-## Pinning and no test-time fetch
+## Acceptance re-run (fresh clone)
 
-mysql84 and dragonfly are digest-pinned in `image.txt` with the
-recording date and method; the duckdb builder is `FROM` a
-digest-pinned Debian 12, downloads the CLI artifact at **build** time
-and verifies the upstream-published sha256, and bakes the tpch
-extension with a build-time `INSTALL`. The run and dbgen passes use
-`--network none`, so no fetch is even possible at test time — the
-DUCKDB-EXT-RUNTIME-FETCH live run above confirms it. `versions.txt`
-exists for all three rows; digests exist for all three.
+- `cd nucleus/v3 && cargo test -q -p nbench`: 141 passed, 0 failed,
+  0 ignored (matches the RESULT; 131 before the card).
+- `bash -n` + `shellcheck -S warning` over the 12 scripts: exit 0.
+- `bash scripts/gate.sh`: the fresh-gate run above (the deferred line).
 
-## Smoke only, no measurements
+## Notes
 
-All three smokes run `--tag smoke` and write only under gitignored
-`results/smoke/` (worktree clean; only `expected/*-smoke.txt` files,
-which the scaffold's `.gitignore` design covers). Every number in the
-RESULT is labelled smoke; this gate re-ran all three smokes pristine
-itself: `MYSQL84 SMOKE OK (wall 30s)`, `DRAGONFLY SMOKE OK (wall
-26s)`, `DUCKDB TPCH SMOKE OK (wall 7s)`, all `"voided":false`,
-duckdb `queries: 22`. `cargo test -q -p nbench`: 141 passed, 0 failed
-(matches the RESULT; 131 before the card). Nothing is claimed as a
-measurement; the full matrices are correctly deferred to the
-release-hardening window (§7.7.4).
-
-## Follow-up
-
-**NB-3-F1 — the smoke containment relay needs an owner ruling.** The
-card's Acceptance lines start real NBench rows, which a contained
-runner line cannot do through `unit_start`'s `systemd-run --user
---unit` shape (run_card.py documents this: "A card that needs one must
-ask: there is no exemption here"); the card, drafted 2026-11-27, did
-not ask. The worker's resolution: each smoke.sh probes `unit_start`'s
-exact shape, and when it fails (a contained shell) re-execs itself
-through `systemd-run --user --wait --pipe` — the owner-approved podman
-door, this card being `Container: podman` — loudly (a two-line stderr
-banner), with unchanged row code and assertions, and as a no-op on an
-uncontained host (the gate's and runner's bare runs prove both
-branches). The worker disclosed it in the RESULT and escalated for a
-ruling; removing it is one block per script. The ruling — bless the
-self-relay as the documented pattern for smokes that must start real
-rows, or replace it with a runner-side mechanism — is a process/spec
-gap for a later card, not a defect in this one: no wrong result, no
-missing test, no uncaught mutant, no scope breach. It touches only
-smoke scripts, so future real measurements (uncontained `nbench run`)
-are unaffected.
-
-## Nits
-
+- The void verdict's NB-3-F1 (the smoke containment relay needed an
+  owner ruling) is **resolved**: the Opus ruling chose design (c), the
+  GATE-PROMPT gained the Host smoke section, the card moved its real
+  smokes there and deleted the relays, and this gate ran them. No
+  follow-up card is warranted from this work.
+- SEC-RELAY-1 (the runner's `Container: podman` opt-in unmasking
+  `/run/user`) is real but is **not this card's**: NB-3 no longer
+  carries a Container line and its code holds no relay; the item is
+  already QUEUE row SEC-RELAY-1, waiting on the owner's answer.
+- NIT: the brief's "expect `STEP enforcement-tests SKIPPED" is stale —
+  the pass-195 scaffold runs the enforcement suite regardless of
+  scripts/tools changes (it passed; nothing to fix).
 - NIT: `LICENSES.md`'s Dragonfly row cites the project's LICENSE.md
-  without naming the ref; the v1.27.1 tag's own LICENSE.md is the
-  stronger source and reads identically (this gate checked). The next
-  card touching that file can pin the citation to the tag.
+  without naming the ref; the v1.27.1 tag's own LICENSE.md reads
+  identically (the void gate checked) and is the stronger citation.
 - NIT: the card's Open point "DuckDB publishes no upstream hash for
   the CLI zip" is stale — v2.0.1's release page lists asset sha256s
-  and the pin uses one. The code and LICENSES.md already record this
-  correctly; only the card text is behind (local-only, no edit
-  needed).
-- NIT: `systems/mysql84/README.md`'s tuning table cites "38 GiB host"
-  for the 6GB buffer pool while `rows.rs` says "~25% of host RAM";
-  6/38 ≈ 16%, not 25%. The PG row's own guidance text has the same
-  rounding looseness, so the mirror is faithful, but the percentage
-  claim should not be repeated as exact.
-- NIT: `sweep_kv_fixed`'s doc says "no AOF-equivalent fsync flag
-  (v1.27.1, verified against its own `--help`)" — accurate, but the
-  133-flag count and the no-fsync grep evidence live only in
-  `systems/dragonfly/README.md` prose; a future sweep change can't
-  unit-test a flag absence. Acceptable for an M-tier harness card.
+  and the pin uses one; the code and LICENSES.md already record this.
+  Local-only card text, no edit needed.
+- NIT: `systems/mysql84/README.md` says "~25% of machine RAM (38 GiB
+  host)" for the 6GB buffer pool (≈16%) — loose rounding that mirrors
+  the PG row's own guidance text; the percentage should not be read
+  as exact.
+- NIT: the duckdb driver's versions sub-run (init's first container,
+  `--version` + extension listing) starts with default networking;
+  no fetch occurs there (the extension is baked and the LOAD is from
+  disk), and the measured dbgen/run/digest passes are `--network
+  none`. A future card could make that sub-run offline too, for
+  uniformity.
+
+Everything the rework was asked to do is done and verified; the card
+is harness-side, smoke-tagged only, and publishes no measurement.
+MERGE.
