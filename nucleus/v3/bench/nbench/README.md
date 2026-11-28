@@ -14,10 +14,13 @@ bench/nbench/
                        required under NoNewPrivs — card B-0 env note)
   lib/nb-lib.sh        shared helpers for driver scripts
   systems/<name>/      pinned image digests, container args, named
-                       variants (durability pairs), vendor tuning sources
+                       variants (durability pairs), vendor tuning
+                       sources; client-tool images (sysbenchcli,
+                       ycsbcli) build the load generators here
   workloads/<row>/     driver.sh (one execution), digest.sh (result-set
                        hash), prepare.sh (client images / datasets),
-                       smoke.sh (tagged-smoke structural check),
+                       smoke.sh (tagged-smoke structural check,
+                       e.g. oltp-ycsb-pg17),
                        expected/ (recorded digest expectations)
   results/<date>/      <row>.json + REPORT.md (committed evidence)
   work/, data/         raw logs and datasets (gitignored)
@@ -39,6 +42,7 @@ From `nucleus/v3` (uses the workspace target dir):
 ```sh
 cargo run -q -p nbench -- list
 cargo run -q -p nbench -- run oltp-pgbench-pg17     # one row
+cargo run -q -p nbench -- run oltp-ycsb-pg17        # YCSB A–F over pgwire (JDBC)
 cargo run -q -p nbench -- run all                   # every row
 cargo run -q -p nbench -- report                    # regenerate REPORT.md
 cargo run -q -p nbench -- cleanup                   # stop all nbench servers

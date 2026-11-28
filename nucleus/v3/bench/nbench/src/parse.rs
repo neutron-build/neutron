@@ -212,6 +212,55 @@ pub fn parse_sysbench(log: &str) -> Result<ParsedRun> {
     })
 }
 
+/// Parse a YCSB 0.17.0 final measurement report (card NB-2, row
+/// `oltp-ycsb-pg17`).
+///
+/// A load/run ends with `[SECTION], Metric, Value` lines; the `-s`
+/// status lines (every 10 s), the launcher's java-command echo and the
+/// `2>&1 | tee` contract land in the same log but carry no brackets:
+///
+/// ```text
+/// [OVERALL], RunTime(ms), 130054
+/// [OVERALL], Throughput(ops/sec), 7688.8125763666825
+/// [READ], Operations, 653952
+/// [READ], AverageLatency(us), 1298.4990136212595
+/// [READ], MinLatency(us), 560
+/// [READ], MaxLatency(us), 63263
+/// [READ], 95thPercentileLatency(us), 2247
+/// [READ], 99thPercentileLatency(us), 5335
+/// [READ], Return=OK, 653952
+/// [UPDATE], Operations, 131138
+/// [UPDATE], AverageLatency(us), 2360.36
+/// [UPDATE], 99thPercentileLatency(us), 8438
+/// [UPDATE], Return=OK, 131138
+/// [CLEANUP], Operations, 1
+/// ```
+///
+/// `[OVERALL]` is the one section every series carries, so a missing
+/// `Throughput(ops/sec)` line is an error, never a zero (card NB-2
+/// mutant PARSER-OPS-DROPPED). Read latencies are optional *by mix*:
+/// workload E (scan-heavy) carries `[SCAN]` and workload F
+/// (read-modify-write) carries `[READ-MODIFY-WRITE]` instead of
+/// `[READ]`, so those series have no `avg_read_us`/`p99_read_us` —
+/// absent fields are omitted, never invented. The last occurrence of
+/// each line wins, so a re-run appended to one log never reports the
+/// earlier attempt's numbers.
+pub fn parse_ycsb(log: &str) -> Result<ParsedRun> {
+    let lines: Vec<&str> = log.lines().collect();
+    let ops_sec = last_number_after(&lines, "[OVERALL], Throughput(ops/sec)", "ops_sec")?;
+    let mut out = vec![("ops_sec".to_string(), ops_sec)];
+    if let Ok(avg) = last_number_after(&lines, "[READ], AverageLatency(us)", "avg_read_us") {
+        out.push(("avg_read_us".to_string(), avg));
+    }
+    if let Ok(p99) = last_number_after(&lines, "[READ], 99thPercentileLatency(us)", "p99_read_us") {
+        out.push(("p99_read_us".to_string(), p99));
+    }
+    Ok(ParsedRun {
+        metrics: out,
+        digest: None,
+    })
+}
+
 /// Parse a memtier_benchmark "ALL STATS" table (2.5.2 format): a header
 /// row (`Type Ops/sec Hits/sec ... KB/sec`) followed by per-command rows
 /// and a `Totals` row whose columns are, in order: ops/sec, hits/sec,
@@ -575,6 +624,102 @@ mod tests {
         assert_eq!(get("qps"), 2840.0);
         assert_eq!(get("latency_avg_ms"), 112.05);
         assert_eq!(get("p99_ms"), 450.12);
+    }
+
+    #[test]
+    fn ycsb_report_sections_and_order() {
+        // Card NB-2: [OVERALL] Throughput is the one mandatory metric;
+        // [READ] latencies come from the [READ] section only, and the
+        // LAST occurrence of each line wins (a re-run appended to one
+        // log must not report the earlier attempt's numbers).
+        let log = "[OVERALL], RunTime(ms), 1000\n\
+                   [OVERALL], Throughput(ops/sec), 100.5\n\
+                   [READ], AverageLatency(us), 111.0\n\
+                   [READ], 99thPercentileLatency(us), 222.0\n\
+                   [OVERALL], Throughput(ops/sec), 7688.81\n\
+                   [READ], AverageLatency(us), 1298.5\n\
+                   [READ], 99thPercentileLatency(us), 5335.0\n";
+        let parsed = parse_ycsb(log).expect("parse");
+        let get = |p: &ParsedRun, k: &str| {
+            p.metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get(&parsed, "ops_sec"), 7688.81);
+        assert_eq!(get(&parsed, "avg_read_us"), 1298.5);
+        assert_eq!(get(&parsed, "p99_read_us"), 5335.0);
+    }
+
+    #[test]
+    fn ycsb_read_mixes_without_a_read_section_omit_read_metrics() {
+        // Workload E is scan-heavy and F is read-modify-write: their
+        // reports carry [SCAN]/[READ-MODIFY-WRITE] and no [READ], so the
+        // row's read-latency metrics are absent — omitted, never
+        // invented (the [UPDATE] section must not feed them either).
+        let scan_mix = "[OVERALL], RunTime(ms), 1000\n\
+                        [OVERALL], Throughput(ops/sec), 42.0\n\
+                        [SCAN], Operations, 950\n\
+                        [SCAN], AverageLatency(us), 900.0\n\
+                        [SCAN], 99thPercentileLatency(us), 4000.0\n\
+                        [INSERT], Operations, 50\n";
+        let parsed = parse_ycsb(scan_mix).expect("parse");
+        assert_eq!(
+            parsed.metrics.len(),
+            1,
+            "ops_sec only: {:?}",
+            parsed.metrics
+        );
+        assert_eq!(parsed.metrics[0], ("ops_sec".to_string(), 42.0));
+        let rmw_mix = "[OVERALL], RunTime(ms), 2000\n\
+                       [OVERALL], Throughput(ops/sec), 17.0\n\
+                       [READ-MODIFY-WRITE], Operations, 500\n\
+                       [READ-MODIFY-WRITE], AverageLatency(us), 2000.0\n\
+                       [READ-MODIFY-WRITE], 99thPercentileLatency(us), 8000.0\n";
+        let parsed = parse_ycsb(rmw_mix).expect("parse");
+        assert_eq!(
+            parsed.metrics.len(),
+            1,
+            "ops_sec only: {:?}",
+            parsed.metrics
+        );
+        assert_eq!(parsed.metrics[0], ("ops_sec".to_string(), 17.0));
+    }
+
+    #[test]
+    fn ycsb_missing_throughput_is_an_error() {
+        // A silent format change in the tool must fail the run, never
+        // publish a zero (card NB-2 mutant PARSER-OPS-DROPPED: the
+        // parser that never reads [OVERALL] fails here).
+        let log = "[OVERALL], RunTime(ms), 1000\n\
+                   [READ], AverageLatency(us), 10.0\n";
+        let err = parse_ycsb(log).expect_err("must error without Throughput");
+        let text = format!("{err}");
+        assert!(text.contains("ops_sec"), "names the missing metric: {text}");
+        assert!(parse_ycsb("10 sec: 100 operations\n").is_err());
+    }
+
+    #[test]
+    fn ycsb_percentiles_are_not_averages() {
+        // Distinct pinned values: a parser that reports
+        // AverageLatency(us) as p99_read_us (card NB-2 mutant
+        // PARSER-P99-AS-AVG) fails both assertions below.
+        let log = "[OVERALL], Throughput(ops/sec), 500.0\n\
+                   [READ], AverageLatency(us), 100.0\n\
+                   [READ], 99thPercentileLatency(us), 9900.0\n";
+        let parsed = parse_ycsb(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get("avg_read_us"), 100.0);
+        assert_eq!(get("p99_read_us"), 9900.0);
+        assert_ne!(get("avg_read_us"), get("p99_read_us"));
     }
 
     #[test]

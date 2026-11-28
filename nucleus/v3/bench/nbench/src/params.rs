@@ -34,6 +34,18 @@ pub struct Params {
     pub tables: u64,
     /// sysbench rows per table.
     pub table_size: u64,
+    /// YCSB workload letters (core workloads A–F; card NB-2).
+    pub ycsb_workloads: Vec<String>,
+    /// YCSB client thread counts.
+    pub ycsb_threads: Vec<u64>,
+    /// YCSB operations per measured pass. YCSB's own practice is an
+    /// operation-count-driven pass (the stock workload files set
+    /// `operationcount`); the default sizes the full A–F × 1/16/64
+    /// matrix, which runs in the quiet window (§7.7.4), not on a card.
+    pub ycsb_operations: u64,
+    /// YCSB dataset size in records — mirrors `table_size` (the two
+    /// knobs play the same role: rows the workload draws keys from).
+    pub recordcount: u64,
     /// AOF fsync policies to sweep for KV rows.
     pub fsync_modes: Vec<String>,
     /// memtier pipeline depths.
@@ -85,6 +97,17 @@ impl Default for Params {
             threads: vec![1, 16, 64],
             tables: 10,
             table_size: 100_000,
+            ycsb_workloads: vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into(),
+            ],
+            ycsb_threads: vec![1, 16, 64],
+            ycsb_operations: 1_000_000,
+            recordcount: 100_000,
             fsync_modes: vec!["always".into(), "everysec".into()],
             pipelines: vec![1, 16],
             mt_threads: 16,
@@ -134,6 +157,12 @@ impl Params {
             "threads" => self.threads = parse_list_u64(v)?,
             "tables" => self.tables = parse_u64(v)?,
             "table_size" => self.table_size = parse_u64(v)?,
+            "ycsb_workloads" => {
+                self.ycsb_workloads = v.split(',').map(|s| s.trim().to_string()).collect()
+            }
+            "ycsb_threads" => self.ycsb_threads = parse_list_u64(v)?,
+            "ycsb_operations" => self.ycsb_operations = parse_u64(v)?,
+            "recordcount" => self.recordcount = parse_u64(v)?,
             "fsync_modes" => {
                 self.fsync_modes = v.split(',').map(|s| s.trim().to_string()).collect()
             }
@@ -172,6 +201,10 @@ impl Params {
             ("threads".into(), join_u(&self.threads)),
             ("tables".into(), self.tables.to_string()),
             ("table_size".into(), self.table_size.to_string()),
+            ("ycsb_workloads".into(), join(&self.ycsb_workloads)),
+            ("ycsb_threads".into(), join_u(&self.ycsb_threads)),
+            ("ycsb_operations".into(), self.ycsb_operations.to_string()),
+            ("recordcount".into(), self.recordcount.to_string()),
             ("fsync_modes".into(), join(&self.fsync_modes)),
             ("pipelines".into(), join_u(&self.pipelines)),
             ("mt_threads".into(), self.mt_threads.to_string()),
@@ -248,6 +281,56 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("2")
         );
+    }
+
+    #[test]
+    fn ycsb_params_round_trip() {
+        // Card NB-2 Work item 4: the four YCSB knobs default to the
+        // card's named values, apply through `set`, and serialize back
+        // through to_pairs (the results JSON must fully describe the
+        // run, §5.2 rule 6).
+        let p = Params::default();
+        assert_eq!(
+            p.ycsb_workloads,
+            vec!["a", "b", "c", "d", "e", "f"],
+            "core workloads A–F by default"
+        );
+        assert_eq!(p.ycsb_threads, vec![1, 16, 64]);
+        assert_eq!(p.ycsb_operations, 1_000_000);
+        assert_eq!(p.recordcount, 100_000, "recordcount mirrors table_size");
+        let p = Params::with_overrides(&[
+            ("ycsb_workloads", "a"),
+            ("ycsb_threads", "1"),
+            ("ycsb_operations", "1000"),
+            ("recordcount", "1000"),
+        ])
+        .expect("overrides");
+        assert_eq!(p.ycsb_workloads, vec!["a"]);
+        assert_eq!(p.ycsb_threads, vec![1]);
+        assert_eq!(p.ycsb_operations, 1000);
+        assert_eq!(p.recordcount, 1000);
+        let pairs = p.to_pairs();
+        for (k, want) in [
+            ("ycsb_workloads", "a"),
+            ("ycsb_threads", "1"),
+            ("ycsb_operations", "1000"),
+            ("recordcount", "1000"),
+        ] {
+            assert_eq!(
+                pairs
+                    .iter()
+                    .find(|(pk, _)| pk == k)
+                    .map(|(_, v)| v.as_str()),
+                Some(want),
+                "{k} did not round-trip"
+            );
+        }
+        // bad values error like every other param (a silent default
+        // would mis-size a measured run)
+        let mut q = Params::default();
+        assert!(q.set("ycsb_threads", "1,,2").is_err());
+        assert!(q.set("ycsb_operations", "many").is_err());
+        assert!(q.set("recordcount", "lots").is_err());
     }
 
     #[test]
