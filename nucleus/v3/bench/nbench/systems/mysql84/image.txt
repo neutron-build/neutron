@@ -1,0 +1,8 @@
+# Pinned competitor image (card NB-3 Work 2, B-0's style). Format:
+# repo:tag@sha256:<digest>. Recorded 2026-11-27 at first pull via
+# `podman inspect --format '{{index .RepoDigests 0}}'`.
+# The licence gate ran BEFORE any row was built or measured: the licence
+# text the image itself carries was read and checked for
+# benchmark-publication restrictions (see ../../LICENSES.md, row MySQL
+# 8.4) — none found.
+docker.io/library/mysql:8.4@sha256:8c233bad33d520a7aae1c1e619c3a9775f4a1ba2d463d692fada04ec7f40be00

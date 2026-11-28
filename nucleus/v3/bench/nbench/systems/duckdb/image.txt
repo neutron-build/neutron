@@ -1,0 +1,6 @@
+# Pinned base image for the transient DuckDB builder container (the
+# sqlite row's shape: base pinned by digest, the builder Dockerfile is
+# FROM this pin). The DuckDB CLI binary itself is the v2.0.1 release
+# artifact, downloaded and hash-verified at build time (see
+# Dockerfile); the sha256 is upstream-published on the release page.
+docker.io/library/debian:12@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858

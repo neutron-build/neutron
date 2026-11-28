@@ -222,6 +222,17 @@ fn resp_ping_probe(cli: &str, port: u16) -> String {
     format!("{cli} -p {port} ping | grep -q PONG")
 }
 
+/// Shell snippet that pings a MySQL server over TCP and succeeds when
+/// the server answers (mysqladmin ping exits 0 for a live server even
+/// when authentication is refused; a down server exits non-zero).
+/// Kept pure for a unit test (card NB-3, RespPing's lesson): the probe
+/// must carry the server's port over TCP — never the container's unix
+/// socket, which the entrypoint's temporary init server also listens on
+/// while the real server is not up yet.
+fn mysql_ping_probe(port: u16) -> String {
+    format!("mysqladmin -h 127.0.0.1 -P {port} ping")
+}
+
 fn wait_ready(system: &SystemDef, _root: &Path) -> Result<()> {
     match system.ready {
         Ready::None => Ok(()),
@@ -256,6 +267,23 @@ fn wait_ready(system: &SystemDef, _root: &Path) -> Result<()> {
                 name: format!("ping for {}", system.name),
                 status: 1,
                 stderr_tail: "not ready after 120s".into(),
+            })
+        }
+        Ready::MysqlPing { port } => {
+            // MySQL's first-ever start initializes the datadir (the
+            // entrypoint runs a temporary server with --skip-networking
+            // first), so the probe polls over TCP with the row's port
+            // and allows the same window pg_isready does (300 s).
+            let probe = mysql_ping_probe(port);
+            let ok = podman::wait_until_exec_ok(
+                &system.container(),
+                &["sh", "-c", &probe],
+                Duration::from_secs(300),
+            );
+            ok.then_some(()).ok_or_else(|| Error::Command {
+                name: format!("mysqladmin ping for {}", system.name),
+                status: 1,
+                stderr_tail: "not ready after 300s".into(),
             })
         }
         Ready::Http { port } => {
@@ -451,6 +479,7 @@ fn parse_result(row: &RowDef, log: &Path, metrics_file: &Path) -> Result<ParsedR
         rows::Parser::VectorSearch => Err(Error::Usage(
             "vector rows must write NB_METRICS json".into(),
         )),
+        rows::Parser::DuckdbTpch => parse::parse_duckdb_tpch(&text),
     }
 }
 
@@ -1159,6 +1188,23 @@ mod tests {
             resp_ping_probe("valkey-cli", 6379),
             "valkey-cli -p 6379 ping | grep -q PONG"
         );
+    }
+
+    #[test]
+    fn mysql_ping_probe_targets_the_configured_port() {
+        // MYSQL-PROBE-PORTLESS: the probe must carry the server's port
+        // over TCP (card NB-3 Work 2, RespPing's lesson). MySQL 8.4
+        // coexists on the host network (postgres 5432, mysql84 3307), and
+        // the container's unix socket answers the entrypoint's temporary
+        // init server before the real one is up — so the probe must be
+        // `-h 127.0.0.1 -P <port>`, never a bare `mysqladmin ping`.
+        assert_eq!(
+            mysql_ping_probe(3307),
+            "mysqladmin -h 127.0.0.1 -P 3307 ping"
+        );
+        let probe = mysql_ping_probe(3307);
+        assert!(probe.contains("-P 3307"), "probe carries the port: {probe}");
+        assert!(probe.contains("-h 127.0.0.1"), "probe uses TCP: {probe}");
     }
 
     #[test]

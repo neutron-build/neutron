@@ -1,0 +1,13 @@
+# Pinned competitor image (card NB-3 Work 3, B-0's style). Format:
+# repo:tag@sha256:<digest>. Recorded 2026-11-27 at first pull via
+# `podman inspect --format '{{index .RepoDigests 0}}'`.
+# `:latest` is not a published tag for this repository (verified via
+# `podman search --list-tags`); v1.27.1 is the pinned release.
+# The licence gate ran BEFORE any row was built or measured: the image
+# itself carries no Dragonfly licence file (label NOASSERTION; only
+# Ubuntu package licences inside), so the licence that governs the
+# pinned release — BSL 1.1 for pre-v2.1 releases, with Dragonfly's
+# Additional Use Grant — was read and checked for
+# benchmark-publication restrictions (see ../../LICENSES.md, row
+# Dragonfly): none found.
+docker.io/dragonflydb/dragonfly:v1.27.1@sha256:385cb73078f4dabe43d536766842eab444f3d791b0fcf86951decdcbcda37917
