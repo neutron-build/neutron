@@ -43,19 +43,12 @@ the first smoke run:
 ## Notes
 
 - **The smoke derives its own environment** (the acceptance line runs
-  it bare — the NB-3 smokes' rule). When the user-scope sd-bus
-  private transport is unreachable (this card's sandbox nests PID
-  namespaces, so the host user manager's SO_PEERCRED pid reads 0 and
-  `systemctl --user` / plain `systemd-run --user` get ENODATA — the
-  runner's container start/stop calls), `smoke.sh` relays the
-  transport through a local socket (SCM_RIGHTS included;
-  `systemd-run --pipe` passes stdio over them) and points
-  `$XDG_RUNTIME_DIR` at a shim holding that socket and a `bus`
-  symlink to the real session bus. Units still start under the
-  host's user manager — only the client's socket path changes. On a
-  host where the transport works, none of this activates. See
-  `smoke.sh`'s header; the relay log lands in
-  `work/ycsb-smoke-env/relay.log` (gitignored).
+  it bare — the NB-3 smokes' rule): `smoke.sh` derives ROOT and the
+  nbench binary path itself. The real-row run is the gate's Host smoke
+  line (card NB-2, Opus ruling ruling-NB-containment.md, 2026-11-28):
+  the worker's sandbox cannot start real rows, and the smoke holds no
+  relay and no derived transport — the row run and the checks only,
+  under the host's real user manager.
 - **Metrics path** (scope note, also in rows.rs): the row parses
   driver-side through the NB_METRICS protocol (the `VectorSearch`
   arm) — the runner's log-parser dispatch table is outside this
