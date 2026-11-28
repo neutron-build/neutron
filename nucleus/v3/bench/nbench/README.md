@@ -17,11 +17,20 @@ bench/nbench/
                        variants (durability pairs), vendor tuning sources
   workloads/<row>/     driver.sh (one execution), digest.sh (result-set
                        hash), prepare.sh (client images / datasets),
+                       smoke.sh (tagged-smoke structural check),
                        expected/ (recorded digest expectations)
   results/<date>/      <row>.json + REPORT.md (committed evidence)
   work/, data/         raw logs and datasets (gitignored)
   nbench-smoke.sh      acceptance: one tiny row end to end
 ```
+
+Rows: `oltp-pgbench-pg17`, `oltp-sysbench-pg17`,
+`kv-memtier-valkey8`, `kv-memtier-redis7`, `vector-sift1m-qdrant`,
+`vector-sift1m-pgvector`, `embedded-sqlite-speedtest1` (card B-0);
+`oltp-sysbench-mysql84`, `kv-memtier-dragonfly`,
+`embedded-duckdb-tpch1` (card NB-3). Systems: `postgres17`,
+`pgvector17`, `valkey8`, `redis7`, `qdrant`, `sqlite` (B-0);
+`mysql84`, `dragonfly`, `duckdb` (NB-3).
 
 ## Usage
 
@@ -101,4 +110,6 @@ away:
 ## Competitors and licences
 
 See `LICENSES.md` — every competitor's licence was checked for
-benchmark-publication restrictions (DeWitt clauses); none was found.
+benchmark-publication restrictions (DeWitt clauses); none was found
+(the MySQL, Dragonfly and DuckDB rows' checks, read from the pinned
+image or release before any row was built, are dated 2026-11-27).

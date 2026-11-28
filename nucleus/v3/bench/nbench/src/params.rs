@@ -65,6 +65,10 @@ pub struct Params {
     /// (SQLITE_LIMIT_LENGTH, error 18). The bound is pinned by a unit
     /// test in this file.
     pub st_size: u64,
+    /// TPC-H scale factor for the DuckDB embedded row (card NB-3 Work
+    /// 5): `CALL dbgen(sf=...)`. Default 1 per PLAN-v3 §5.1's embedded
+    /// row ("embedded TPC-H SF1").
+    pub tpch_sf: u64,
 }
 
 impl Default for Params {
@@ -92,6 +96,7 @@ impl Default for Params {
             ef: vec![16, 32, 64, 128, 256],
             queries: 10_000,
             st_size: 10_000,
+            tpch_sf: 1,
         }
     }
 }
@@ -140,6 +145,7 @@ impl Params {
             "ef" => self.ef = parse_list_u64(v)?,
             "queries" => self.queries = parse_u64(v)?,
             "st_size" => self.st_size = parse_u64(v)?,
+            "tpch_sf" => self.tpch_sf = parse_u64(v)?,
             _ => return Err(Error::Usage(format!("unknown parameter {k}"))),
         }
         Ok(())
@@ -177,6 +183,7 @@ impl Params {
             ("ef".into(), join_u(&self.ef)),
             ("queries".into(), self.queries.to_string()),
             ("st_size".into(), self.st_size.to_string()),
+            ("tpch_sf".into(), self.tpch_sf.to_string()),
         ]
     }
 }
@@ -206,6 +213,9 @@ mod tests {
             "st_size {} can overflow SQLITE_MAX_LENGTH in test 140",
             p.st_size
         );
+        // card NB-3 Work 5: the DuckDB embedded row's scale factor
+        // defaults to PLAN-v3 §5.1's "embedded TPC-H SF1"
+        assert_eq!(p.tpch_sf, 1);
     }
 
     #[test]
@@ -215,12 +225,14 @@ mod tests {
             ("clients", "1"),
             ("modes", "on"),
             ("ef", "64,128"),
+            ("tpch_sf", "2"),
         ])
         .expect("overrides");
         assert_eq!(p.runs, 2);
         assert_eq!(p.clients, vec![1]);
         assert_eq!(p.modes, vec!["on"]);
         assert_eq!(p.ef, vec![64, 128]);
+        assert_eq!(p.tpch_sf, 2);
         let pairs = p.to_pairs();
         assert_eq!(
             pairs
@@ -228,6 +240,13 @@ mod tests {
                 .find(|(k, _)| k == "scale")
                 .map(|(_, v)| v.as_str()),
             Some("100")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "tpch_sf")
+                .map(|(_, v)| v.as_str()),
+            Some("2")
         );
     }
 

@@ -435,6 +435,60 @@ fn parse_busybox_time_seconds(line: &str) -> Option<f64> {
     Some(minutes * 60.0 + seconds)
 }
 
+/// Parse the DuckDB TPC-H driver log (card NB-3 Work 5).
+///
+/// The driver (workloads/embedded-duckdb-tpch1/driver.sh) executes all
+/// 22 queries in one DuckDB CLI process under `/usr/bin/time -v` and
+/// prints, at the end of the log, one machine-readable summary line per
+/// metric:
+/// ```text
+/// TPCH_TOTAL_WALL_S 12.345
+/// TPCH_TOTAL_USER_S 11.010
+/// TPCH_TOTAL_SYS_S 0.880
+/// TPCH_MAX_RSS_KB 123456
+/// TPCH_QUERIES 22
+/// ```
+/// Totals come from `/usr/bin/time -v` (elapsed / user / system /
+/// maximum RSS), so they include the CLI process's own startup — the
+/// honest cost of the embedded run. `TPCH_QUERIES` is the count of
+/// query files that actually ran; the driver refuses to start unless
+/// exactly 22 are present, so a value other than 22 is a driver defect
+/// and fails the row here.
+///
+/// Per-query wall times are printed as `TPCH_QUERY qNN <s>` evidence
+/// lines (from DuckDB's own `.timer on` output) and are not metrics.
+pub fn parse_duckdb_tpch(log: &str) -> Result<ParsedRun> {
+    let tagged = |tag: &str| -> Result<f64> {
+        for line in log.lines().rev() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix(tag)
+                && let Some(num) = rest.split_whitespace().next()
+            {
+                return parse_f64(num, "duckdb tpch");
+            }
+        }
+        Err(Error::Parse {
+            what: "duckdb tpch",
+            line: format!("no {tag} summary line"),
+        })
+    };
+    let wall = tagged("TPCH_TOTAL_WALL_S")?;
+    let user = tagged("TPCH_TOTAL_USER_S")?;
+    let sys = tagged("TPCH_TOTAL_SYS_S")?;
+    let rss = tagged("TPCH_MAX_RSS_KB")?;
+    let queries = tagged("TPCH_QUERIES")?;
+    Ok(ParsedRun {
+        metrics: vec![
+            ("wall_s".to_string(), wall),
+            ("user_s".to_string(), user),
+            ("sys_s".to_string(), sys),
+            ("rss_kb".to_string(), rss),
+            ("queries".to_string(), queries),
+        ],
+        digest: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +708,84 @@ mod tests {
         assert_eq!(num_prefix("83333.33 ops/sec"), Some("83333.33"));
         assert_eq!(num_prefix("ms"), None);
         assert_eq!(num_prefix("-1.5e3x"), Some("-1.5e3"));
+    }
+
+    #[test]
+    fn duckdb_tpch_real_fixture() {
+        // Real captured driver log (card NB-3's smoke run; the file's
+        // first line names the exact DuckDB build). The parser must find
+        // all five summary lines and report the row's contract: 22
+        // queries actually ran.
+        let log = include_str!("fixtures/duckdb-tpch-run.txt");
+        let parsed = parse_duckdb_tpch(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get("queries"), 22.0);
+        assert!(get("wall_s") > 0.0);
+        assert!(get("user_s") > 0.0);
+        assert!(get("sys_s") >= 0.0);
+        assert!(get("rss_kb") > 0.0);
+    }
+
+    #[test]
+    fn duckdb_tpch_synthetic_shapes() {
+        let log = "TPCH_QUERY q01 0.123\n\
+                   TPCH_QUERY q02 0.456\n\
+                   TPCH_TOTAL_WALL_S 12.345\n\
+                   TPCH_TOTAL_USER_S 11.010\n\
+                   TPCH_TOTAL_SYS_S 0.880\n\
+                   TPCH_MAX_RSS_KB 123456\n\
+                   TPCH_QUERIES 22\n";
+        let parsed = parse_duckdb_tpch(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get("wall_s"), 12.345);
+        assert_eq!(get("user_s"), 11.010);
+        assert_eq!(get("sys_s"), 0.880);
+        assert_eq!(get("rss_kb"), 123456.0);
+        assert_eq!(get("queries"), 22.0);
+        // the last occurrence of a tag wins (a re-printed summary must
+        // not resurrect an earlier, stale value)
+        let dup = "TPCH_TOTAL_WALL_S 1.000\nTPCH_TOTAL_WALL_S 2.000\n\
+                   TPCH_TOTAL_USER_S 1.0\nTPCH_TOTAL_SYS_S 0.1\n\
+                   TPCH_MAX_RSS_KB 1\nTPCH_QUERIES 22\n";
+        let parsed = parse_duckdb_tpch(dup).expect("parse");
+        assert_eq!(
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == "wall_s")
+                .map(|(_, v)| *v),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn duckdb_tpch_missing_lines_error() {
+        // A metric that cannot be found is an error, never a zero: a
+        // driver that forgot its time wrapper or RSS line fails the run
+        // instead of publishing a wrong number (§5.2 rule 8).
+        assert!(parse_duckdb_tpch("run started\n").is_err());
+        // one missing summary line (no RSS) is an error
+        let no_rss = "TPCH_TOTAL_WALL_S 1.0\nTPCH_TOTAL_USER_S 1.0\n\
+                      TPCH_TOTAL_SYS_S 0.1\nTPCH_QUERIES 22\n";
+        assert!(parse_duckdb_tpch(no_rss).is_err());
+        // a summary line with no number is an error
+        let bad = "TPCH_TOTAL_WALL_S \nTPCH_TOTAL_USER_S 1.0\n\
+                   TPCH_TOTAL_SYS_S 0.1\nTPCH_MAX_RSS_KB 1\nTPCH_QUERIES 22\n";
+        assert!(parse_duckdb_tpch(bad).is_err());
     }
 }
 

@@ -27,6 +27,9 @@ pub enum Parser {
     Speedtest1,
     /// Vector search helper output (already JSON metrics).
     VectorSearch,
+    /// DuckDB TPC-H driver (TPCH_* summary lines from the driver log;
+    /// card NB-3 Work 5).
+    DuckdbTpch,
 }
 
 /// Metric direction, for honest ratio reporting.
@@ -72,6 +75,13 @@ pub enum Ready {
     /// network with distinct ports (6379/6380); a probe that ignores the
     /// configured port pings the wrong (or no) server.
     RespPing { cli: &'static str, port: u16 },
+    /// `mysqladmin -h 127.0.0.1 -P <port> ping` via podman exec. The port
+    /// must be carried over TCP (never the container's unix socket): the
+    /// mysql entrypoint's first-time init runs a temporary server with
+    /// `--skip-networking`, so a socket probe would report ready while
+    /// the real server is not listening yet — the same lesson as
+    /// [`Ready::RespPing`]'s (card NB-3 Work 2).
+    MysqlPing { port: u16 },
     /// HTTP GET /healthz expecting 200 (Qdrant).
     Http { port: u16 },
     /// Transient system: nothing to wait for.
@@ -197,6 +207,20 @@ fn sweep_kv(p: &Params) -> Vec<Series> {
     ])
 }
 
+/// The Dragonfly sweep (card NB-3 Work 3): pipeline only, one fixed
+/// durability configuration. The pinned Dragonfly release (v1.27.1)
+/// exposes no AOF-equivalent fsync flag (verified against its own
+/// `--help`, recorded in `systems/dragonfly/README.md`), so there is no
+/// durability dimension to sweep and the row's numbers are
+/// durability-unmatched against the Redis/Valkey AOF pairs — stated, per
+/// PLAN-v3 §5.2 rule 3, never silently relaxed.
+fn sweep_kv_fixed(p: &Params) -> Vec<Series> {
+    cross(&[(
+        "pipeline",
+        p.pipelines.iter().map(|v| v.to_string()).collect(),
+    )])
+}
+
 fn variant_kv(s: &Series) -> Option<&'static str> {
     let mode = s
         .iter()
@@ -294,6 +318,30 @@ pub const ROWS: &[RowDef] = &[
         "embedded-sqlite-speedtest1", "sqlite", Speedtest1,
         "SQLite speedtest1 from the amalgamation (in container)",
         ["wall_s" => LowerIsBetter, "user_s" => LowerIsBetter, "sys_s" => LowerIsBetter],
+        sweep_single, no_variant, init: true, final: true, reinit: false
+    ),
+    row!(
+        "oltp-sysbench-mysql84", "mysql84", Sysbench,
+        "sysbench oltp_read_write + oltp_point_select on MySQL 8.4 (InnoDB), threads 1/16/64",
+        ["tps" => HigherIsBetter, "qps" => HigherIsBetter,
+         "latency_avg_ms" => LowerIsBetter, "p99_ms" => LowerIsBetter],
+        sweep_sysbench, no_variant, init: true, final: false, reinit: true
+    ),
+    row!(
+        "kv-memtier-dragonfly", "dragonfly", Memtier,
+        "memtier GET/SET 1:10 against Dragonfly, pipeline 1/16 — durability-unmatched: \
+         the pinned v1.27.1 release has no AOF-equivalent fsync flag (snapshots only; \
+         systems/dragonfly/README.md), so this number must not be read against the \
+         AOF-matched Redis/Valkey pairs (PLAN-v3 §5.2 rule 3)",
+        ["ops_sec" => HigherIsBetter, "p50_ms" => LowerIsBetter,
+         "p99_ms" => LowerIsBetter, "kb_per_sec" => HigherIsBetter],
+        sweep_kv_fixed, no_variant, init: true, final: true, reinit: true
+    ),
+    row!(
+        "embedded-duckdb-tpch1", "duckdb", DuckdbTpch,
+        "DuckDB 2.0.1 CLI, embedded TPC-H SF1: dbgen data persisted to a file, 22 queries",
+        ["wall_s" => LowerIsBetter, "user_s" => LowerIsBetter,
+         "sys_s" => LowerIsBetter, "rss_kb" => LowerIsBetter],
         sweep_single, no_variant, init: true, final: true, reinit: false
     ),
 ];
@@ -480,6 +528,83 @@ pub const SYSTEMS: &[SystemDef] = &[
         ready: Ready::None,
         run_extra: &[],
     },
+    SystemDef {
+        name: "mysql84",
+        kind: SystemKind::Server,
+        volume: "nbench-mysql84-data",
+        mount: "/var/lib/mysql",
+        mem_limit: "24g",
+        cpus: "16",
+        // Tuning per MySQL production guidance, durability-matched to the
+        // PG row (PLAN-v3 §5.2 rule 3):
+        // - innodb_buffer_pool_size ~25% of machine RAM (38 GiB host),
+        //   the same guidance the postgres17 row follows;
+        // - innodb_flush_log_at_trx_commit=1 is the per-commit flush —
+        //   the pair of PG's synchronous_commit=on (rule 3 made checkable
+        //   by the provenance test below);
+        // - skip-log-bin disables the binary log: replication is not this
+        //   row's subject. The card named `--log_bin=0`, which MySQL 8.4
+        //   silently ignores (verified 2026-11-27: started with
+        //   `--log_bin=0`, @@log_bin stayed 1); `--skip-log-bin` is the
+        //   documented spelling and actually sets @@log_bin=0.
+        base_args: &[
+            "--port=3307",
+            "--innodb_buffer_pool_size=6GB",
+            "--innodb_flush_log_at_trx_commit=1",
+            "--skip-log-bin",
+        ],
+        // No variants: the row is durability-matched through the base
+        // args (per-commit flush), mirroring oltp-sysbench-pg17's shape
+        // (no off-variant; the pairing is exercised by the pgbench row).
+        variants: &[],
+        ready: Ready::MysqlPing { port: 3307 },
+        run_extra: &[
+            "-e",
+            "MYSQL_ROOT_PASSWORD=nbench",
+            "-e",
+            "MYSQL_DATABASE=nbench",
+        ],
+    },
+    SystemDef {
+        name: "dragonfly",
+        kind: SystemKind::Server,
+        volume: "nbench-dragonfly-data",
+        mount: "/data",
+        mem_limit: "12g",
+        cpus: "16",
+        // Base args per the image's documented run shape (the entrypoint
+        // itself prepends `dragonfly --logtostderr`; stating it here
+        // keeps the provenance explicit) and the same CPU budget the
+        // other KV systems get (16 proactor threads on 16 --cpus).
+        // No AOF-style durability variants exist in the pinned release
+        // (v1.27.1, verified against the image's own --help: snapshots
+        // only — `snapshot_cron`/`dbfilename`/`dir`, no fsync control),
+        // so `variants` is empty and the row is durability-unmatched
+        // against the AOF pairs (PLAN-v3 §5.2 rule 3, stated in the row
+        // description the report prints).
+        base_args: &["--logtostderr", "--port=6382", "--proactor_threads=16"],
+        variants: &[],
+        // RESP-compatible server; the image ships redis-cli 6.0.16
+        // (Ubuntu redis-tools), so the in-container probe and digest use
+        // it exactly like the redis7 row (card NB-3 Work 3).
+        ready: Ready::RespPing {
+            cli: "redis-cli",
+            port: 6382,
+        },
+        run_extra: &[],
+    },
+    SystemDef {
+        name: "duckdb",
+        kind: SystemKind::Transient,
+        volume: "nbench-duckdb-artifacts",
+        mount: "/opt/nb",
+        mem_limit: "24g",
+        cpus: "16",
+        base_args: &[],
+        variants: &[],
+        ready: Ready::None,
+        run_extra: &[],
+    },
 ];
 
 impl SystemDef {
@@ -496,6 +621,8 @@ impl SystemDef {
             "valkey8" => 6379,
             "redis7" => 6380,
             "qdrant" => 6333,
+            "mysql84" => 3307,
+            "dragonfly" => 6382,
             _ => 0,
         }
     }
@@ -812,5 +939,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mysql_probes_carry_their_configured_port() {
+        // The MysqlPing lesson (card NB-3, RespPing's): the probe must
+        // carry the server's port. MYSQL-PROBE-PORTLESS (a probe that
+        // omits the port) pings the wrong or no server; the SystemDef's
+        // probe port must equal the configured server port.
+        for s in SYSTEMS {
+            if let Ready::MysqlPing { port } = s.ready {
+                assert_eq!(
+                    port,
+                    s.port(),
+                    "{}: mysql probe port {} != server port {}",
+                    s.name,
+                    port,
+                    s.port()
+                );
+            }
+        }
+        let mysql = SystemDef::find("mysql84").expect("mysql84 system");
+        assert_eq!(mysql.port(), 3307);
+        assert!(matches!(mysql.ready, Ready::MysqlPing { port: 3307 }));
+    }
+
+    #[test]
+    fn mysql84_base_args_carry_the_per_commit_flush() {
+        // MYSQL-DURABILITY-SOFT (base args using
+        // --innodb_flush_log_at_trx_commit=2) must fail here: rule 3's
+        // durability match to the PG row (synchronous_commit=on, a
+        // per-commit flush) is made checkable by pinning the flush
+        // setting — and the two settings that shape the row's provenance
+        // with it.
+        let mysql = SystemDef::find("mysql84").expect("mysql84 system");
+        assert!(
+            mysql
+                .base_args
+                .contains(&"--innodb_flush_log_at_trx_commit=1"),
+            "mysql84 must run the per-commit flush (§5.2 rule 3): {:?}",
+            mysql.base_args
+        );
+        assert!(
+            !mysql.base_args.iter().any(|a| a.contains("trx_commit=2")),
+            "mysql84 must not soften the flush: {:?}",
+            mysql.base_args
+        );
+        // no binlog (replication is not this row's subject)
+        assert!(
+            mysql.base_args.contains(&"--skip-log-bin"),
+            "mysql84 must disable the binary log: {:?}",
+            mysql.base_args
+        );
+        // the buffer pool follows the same ~25%-of-RAM guidance as the
+        // PG row's shared_buffers
+        assert!(
+            mysql.base_args.contains(&"--innodb_buffer_pool_size=6GB"),
+            "mysql84 buffer pool must follow the PG row's guidance: {:?}",
+            mysql.base_args
+        );
+        // the server port is set by the container args, not the image
+        // default (3306), so the row coexists on the host network
+        assert!(
+            mysql.base_args.contains(&"--port=3307"),
+            "mysql84 must listen on its configured port: {:?}",
+            mysql.base_args
+        );
+        // the durability match is in the base args, so no off variant
+        // exists to pair (mirrors oltp-sysbench-pg17's shape)
+        assert!(mysql.variants.is_empty());
+    }
+
+    #[test]
+    fn dragonfly_row_is_durability_unmatched_and_says_so() {
+        // PLAN-v3 §5.2 rule 3 is never silently relaxed: the pinned
+        // Dragonfly release (v1.27.1) has no AOF-equivalent fsync flag
+        // (verified against the image's own --help; snapshots only), so
+        // the row runs with a fixed durability configuration and its
+        // published line must carry the unmatched note verbatim.
+        let df = SystemDef::find("dragonfly").expect("dragonfly system");
+        assert!(
+            df.variants.is_empty(),
+            "dragonfly must not invent durability variants: {:?}",
+            df.variants
+        );
+        let row = RowDef::find("kv-memtier-dragonfly").expect("row");
+        assert!(
+            row.description.contains("durability-unmatched"),
+            "the row's report line must state the unmatched durability: {}",
+            row.description
+        );
+        // the sweep is pipeline-only: no durability dimension exists
+        let p = Params::default();
+        for s in (row.sweep)(&p) {
+            assert!(
+                !s.iter().any(|(k, _)| k == "appendfsync"),
+                "dragonfly sweep must not carry a durability dimension: {s:?}"
+            );
+            assert!(s.iter().any(|(k, _)| k == "pipeline"));
+        }
+        // one fixed configuration per pipeline depth
+        assert_eq!((row.sweep)(&p).len(), p.pipelines.len());
+    }
+
+    #[test]
+    fn sweep_kv_fixed_ignores_the_fsync_dimension() {
+        // sweep_kv_fixed (the new fn card NB-3 names): the sweep keeps
+        // the pipeline dimension of sweep_kv and drops the fsync
+        // dimension entirely — a fixed durability configuration.
+        let p = Params::with_overrides(&[("pipelines", "4,8")]).expect("overrides");
+        let series = sweep_kv_fixed(&p);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0], vec![("pipeline".to_string(), "4".to_string())]);
+        assert_eq!(series[1], vec![("pipeline".to_string(), "8".to_string())]);
+    }
+
+    #[test]
+    fn embedded_duckdb_row_mirrors_the_sqlite_shape() {
+        // The embedded row (PLAN-v3 §5.1): a transient system, one config
+        // point, a dataset created at init and digested at init and
+        // final, no per-series reinit (the database file persists on the
+        // volume across the row's runs).
+        let row = RowDef::find("embedded-duckdb-tpch1").expect("row");
+        let sys = SystemDef::find(row.system).expect("system");
+        assert_eq!(sys.kind, SystemKind::Transient);
+        assert!(matches!(row.parser, Parser::DuckdbTpch));
+        assert!(row.strict_init_digest && row.strict_final_digest);
+        assert!(!row.reinit_per_series);
+        let p = Params::default();
+        assert_eq!((row.sweep)(&p).len(), 1);
+        // the four §5.1 embedded metrics, efficiency included (rss_kb)
+        let names: Vec<&str> = row.metrics.iter().map(|(m, _)| *m).collect();
+        assert_eq!(names, vec!["wall_s", "user_s", "sys_s", "rss_kb"]);
+    }
+
+    #[test]
+    fn mysql84_row_mirrors_the_pg17_sysbench_row() {
+        // The row mirrors oltp-sysbench-pg17 cell for cell (card NB-3
+        // Work 2): the same sweep, no variants, the same digest
+        // discipline and the same metrics.
+        let pg = RowDef::find("oltp-sysbench-pg17").expect("pg row");
+        let my = RowDef::find("oltp-sysbench-mysql84").expect("mysql row");
+        assert_eq!(my.system, "mysql84");
+        assert!(matches!(my.parser, Parser::Sysbench));
+        assert_eq!(my.metrics, pg.metrics);
+        assert_eq!(my.strict_init_digest, pg.strict_init_digest);
+        assert_eq!(my.strict_final_digest, pg.strict_final_digest);
+        assert_eq!(my.reinit_per_series, pg.reinit_per_series);
+        let p = Params::default();
+        assert_eq!((my.sweep)(&p), (pg.sweep)(&p));
     }
 }
