@@ -1018,8 +1018,9 @@ mod probe {
 /// `oltp-ycsb-pg17` publishes driver-side: `workloads/oltp-ycsb-pg17/
 /// driver.sh` writes the NB_METRICS JSON the runner reads, and the same
 /// script is what refuses a pass with failed operations and what
-/// restores the dataset an earlier pass grew. The only honest test of
-/// those code paths runs the real script. Each test executes it with a
+/// restores the dataset an earlier pass grew; `digest.sh` hashes the
+/// server's own row count. The only honest test of those code paths
+/// runs the real scripts. Each test executes one with a
 /// cleared environment whose PATH starts with a stub `nb-podman` — no
 /// call can reach the real wrapper, `systemd-run` or a container —
 /// which records its arguments and replays a recorded YCSB log in place
@@ -1169,6 +1170,18 @@ esac
         Ok(dir)
     }
 
+    /// Write the [`STUB`] into `dir` and return its directory, to go
+    /// first on PATH.
+    fn stub_bin(dir: &Path) -> std::result::Result<PathBuf, String> {
+        let io = |e: std::io::Error| e.to_string();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).map_err(io)?;
+        let stub = bin.join("nb-podman");
+        std::fs::write(&stub, STUB).map_err(io)?;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
+        Ok(bin)
+    }
+
     /// Execute the real `driver.sh` once under `sc`, the way the
     /// runner does (its `exec_driver` environment), with `nb-podman`
     /// replaced by [`STUB`].
@@ -1180,11 +1193,7 @@ esac
     ) -> std::result::Result<Outcome, String> {
         let io = |e: std::io::Error| e.to_string();
         let dir = tmpdir(name)?;
-        let bin = dir.join("bin");
-        std::fs::create_dir_all(&bin).map_err(io)?;
-        let stub = bin.join("nb-podman");
-        std::fs::write(&stub, STUB).map_err(io)?;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
+        let bin = stub_bin(&dir)?;
         let stub_load = dir.join("stub-load.log");
         let stub_run = dir.join("stub-run.log");
         std::fs::write(&stub_load, &sc.load).map_err(io)?;
@@ -1262,6 +1271,73 @@ esac
             .iter()
             .find(|c| c.contains(" run jdbc -s "))
             .cloned()
+    }
+
+    /// Execute the real `digest.sh` once, with the stub answering the
+    /// row count; returns the digest it printed.
+    fn run_digest(rows: &str) -> std::result::Result<String, String> {
+        let io = |e: std::io::Error| e.to_string();
+        let dir = tmpdir("digest")?;
+        let bin = stub_bin(&dir)?;
+        let calls = dir.join("calls.txt");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = Command::new("bash")
+            .arg(
+                root.join("workloads")
+                    .join("oltp-ycsb-pg17")
+                    .join("digest.sh"),
+            )
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("NB_HARNESS", root)
+            .env("NB_CONTAINER", "nbench-postgres17-stub")
+            .env("NB_DB", "nbench")
+            .env("NB_PHASE", "init")
+            .env("NB_OUT", &dir)
+            .env("NB_LOG", dir.join("digest.log"))
+            .env("NB_STUB_CALLS", &calls)
+            .env("NB_STUB_ROWS", rows)
+            .output()
+            .map_err(io)?;
+        if !out.status.success() {
+            return Err(format!(
+                "digest.sh exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn digest_hashes_the_servers_own_row_count() {
+        // digest.sh is one pipeline: the server's `SELECT count(*)`
+        // line goes through sha256sum unchanged, so the digest of a
+        // table is the hash of its count line (`printf '1000\n' |
+        // sha256sum`). The record-then-match protocol cannot see a
+        // digest of a fixed string within one run (card NB-2 mutant
+        // DIGEST-CONSTANT); executing the script can. 83c02ac2… is
+        // also the smoke's recorded init expectation.
+        for (rows, expected) in [
+            (
+                "1000",
+                "83c02ac2d48c863dab2ccf6870455aadfc2cec073b8db269b517c879d76aa6d9",
+            ),
+            (
+                "1500",
+                "d6e02e548a55f01b58ebb4addbe8e78c0a67198d09c6a41af9c6e6f640d7f4dd",
+            ),
+        ] {
+            let got = run_digest(rows).expect("run digest.sh");
+            assert_eq!(got.trim(), expected, "digest of a {rows}-row table");
+        }
     }
 
     #[test]

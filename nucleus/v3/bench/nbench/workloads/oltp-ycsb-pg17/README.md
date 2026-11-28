@@ -83,7 +83,9 @@ read-latency metrics for mixes without reads. Because those `sed`
 lines are the row's numbers, `parse.rs` executes the real `driver.sh`
 over the recorded fixtures with a stub `nb-podman` and requires its
 output to equal the reference parser's (verdict NB-2, rework 1); the
-same tests run the failed-operation guard and the restore rule.
+same tests run the failed-operation guard and the restore rule, and
+`digest.sh` too — its digest is the hash of the server's own count
+line, not of anything fixed.
 
 ## Notes
 
