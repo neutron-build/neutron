@@ -12,9 +12,21 @@
 //!   `acquire_kept_continues`; mutants KEPT-ENDS-SWEEP.
 //! - **Clean victims only, dropped with no write** (§5.2 "Clean victims are
 //!   dropped"; §4.2: a freed page's frame leaves "as a clean victim, with no
-//!   write"): a dirty victim is passed over at this card, and A-3c writes it.
-//!   Tests `clock_evicts_freed_unwritten`, `pool_starved_all_dirty`; mutants
-//!   DIRTY-NOT-SKIPPED, EVICT-FREED-WRITES.
+//!   write"): in a pool built with `Pool::new` a dirty victim is passed over
+//!   as at card A-3b; in a write-back pool (card A-3c, Work 8.2) it is
+//!   written by `evict_victim` (E1–E9), and the acquisition has its frame
+//!   when that answers `Obtained`.
+//!   Tests `clock_evicts_freed_unwritten`, `pool_starved_all_dirty`,
+//!   `row_i_pool_bound_e4`; mutants DIRTY-NOT-SKIPPED, EVICT-FREED-WRITES,
+//!   EVICT-SKIP-DIRTY, POOL-GROW.
+//! - **A pending flip is a restart, never a wait** (card A-3c, Work 8.3;
+//!   S-STORE §5.2: "If no victim is clean, the thread releases its latches
+//!   and restarts (§5.3)"): when the sweep passed a dirty victim over as
+//!   `FlipPending` and found no clean one, the acquisition answers
+//!   [`Acquired::FlipPending`] whatever the caller holds, unless a frame
+//!   came free meanwhile; it never waits for an unpin under a pending flip.
+//!   Tests `t_pin_load_race_k`, `t_pin_load_race_k_reload`; mutants
+//!   WB-GATE-BLOCKING, WB-NO-GATE, WB-GATE-WRITER-STARVE.
 //! - **The second chance** (§5.2 "Clock"): the sweep takes `2F` hand positions,
 //!   so every frame is visited twice, and a frame whose bit is set loses it
 //!   at the first visit and is taken at the second. Tests `clock_order`;
@@ -49,18 +61,56 @@
 //! "anyway": on a table mutex a panic poisoned, a waiter returns the error
 //! with its count still raised, since the sync layer gives no way into a
 //! poisoned mutex and the store is poisoned (§9.2).
+//!
+//! Card A-3c (Work 8.2 and 8.3): the acquisition takes the caller's `Hold`,
+//! so that a dirty victim it meets is evicted under a gated caller's hold or
+//! a gate try that never blocks; `FlipPending`, `PrevEpoch` and `Kept` move
+//! the clock on, as a latched or pinned frame does. A write that cleans a
+//! victim and leaves it in the table counts as an unheld event, which
+//! `evict_victim` does, so A6′'s argument holds (verdict A-3b-0 (0f83f9c1),
+//! follow-up A-3b-0-F1).
 
 use nucleus_env::File;
 
+use super::evict::EvictOutcome;
 use super::frame::{FrameId, FrameReservation, FrameState, Removal};
 use super::key::PageKey;
 use super::pool::{HookPoint, Pool};
 use super::sync::{Primitives, yield_now};
+use super::wb::Hold;
 use crate::store::StoreError;
 
 /// The frame a hook of the acquisition fires with when it has none (card
 /// A-3b-0, Work 6): no frame has it, since `frames ≤ 2^31`.
 const NO_FRAME: FrameId = FrameId(u32::MAX);
+
+/// A6's and A6′'s yield before the acquisition looks again (card A-3b-0,
+/// Work 5), except for an acquisition made while its thread holds a page
+/// being loaded, which looks again at once (card A-3c, Work 8; S-STORE §5.3
+/// "No latch escapes a call": "a storage call never yields (an `await`, or
+/// an N10 cooperative step boundary) while it holds a latch, nor while it
+/// holds a page being loaded"). Card A-3c's nested MapLeaf pin (P5's
+/// `current_ref`, Work 3.3) is the first acquisition that runs inside a
+/// load. It still waits for no other thread's call to end: the latch it
+/// found busy is another thread's momentary `try_victim` or pin. Mutant
+/// LOAD-ACROSS-YIELD is judged by `t_latch_scope` (A-4c).
+fn yield_unless_in_load<H: File, P: Primitives>(hold: &Hold<'_, '_, H, P>) {
+    if !hold.in_load {
+        yield_now::<P>();
+    }
+}
+
+/// What the acquisition answered (card A-3c, Work 8.3).
+pub(crate) enum Acquired<'p, H: File, P: Primitives> {
+    /// A frame, reserved for the caller.
+    Frame(FrameReservation<'p, H, P>),
+    /// The try form found no frame it could take without blocking
+    /// (§5.3: the caller releases its latches and restarts).
+    None,
+    /// A dirty victim was passed over as `FlipPending` and no clean victim
+    /// was found (§5.2: the caller restarts; Work 8.4 says who waits).
+    FlipPending,
+}
 
 /// What one step of the sweep (A2) found under the table mutex.
 enum Step {
@@ -73,15 +123,28 @@ enum Step {
 
 /// How a sweep (A2) ended.
 enum Sweep<'p, H: File, P: Primitives> {
-    /// It took no victim; `true` if a frame was momentarily latched or pinned.
-    Over(bool),
-    /// A clean victim left the page table and is the caller's reservation.
+    /// It took no victim: `busy` if a frame was momentarily latched, pinned
+    /// or kept; `flip_pending` if a dirty victim was passed over as such.
+    Over { busy: bool, flip_pending: bool },
+    /// A victim left the page table and is the caller's reservation.
     Found(FrameReservation<'p, H, P>),
+}
+
+/// What taking one candidate (A2's or the own pass's) did.
+enum Taken<'p, H: File, P: Primitives> {
+    /// A victim left the page table and is the caller's reservation.
+    Got(FrameReservation<'p, H, P>),
+    /// Its latch was not free, or a pin arrived.
+    Busy,
+    /// It is not a victim now, or a dirty one that could not be written.
+    Passed,
+    /// A dirty one passed over for a pending flip (card A-3c).
+    FlipPending,
 }
 
 /// How the own pass (A6′) ended.
 enum Pass<'p, H: File, P: Primitives> {
-    /// A clean victim left the page table and is the caller's reservation.
+    /// A victim left the page table and is the caller's reservation.
     Found(FrameReservation<'p, H, P>),
     /// Look again from A1: a frame was momentarily latched or pinned, or one
     /// may now be had.
@@ -89,6 +152,9 @@ enum Pass<'p, H: File, P: Primitives> {
     /// Every frame that was `Resident` with no count was latched by this
     /// acquisition and found dirty, and nothing has changed since A1.
     Starved,
+    /// The pass passed a dirty victim over as `FlipPending` (card A-3c,
+    /// Work 8.3).
+    FlipPending,
 }
 
 impl<H: File, P: Primitives> Pool<H, P> {
@@ -97,19 +163,26 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// the decision (A4–A7). `for_key` is the key a pin's miss (P3) loads, and
     /// names the acquisition in its hooks; `None` for a plain reservation.
     ///
-    /// [`Pool::reserve`] is `acquire(true, None)` and may wait for an unpin;
-    /// [`Pool::try_reserve`] is `acquire(false, None)` and never does.
+    /// [`Pool::reserve_with`] is `acquire(true, None, hold)` and may wait for
+    /// an unpin; [`Pool::try_reserve_with`] is `acquire(false, None, hold)`
+    /// and never does. `hold` is what the caller holds (card A-3c): a dirty
+    /// victim is evicted under a gated caller's hold or a try that never
+    /// blocks.
     ///
     /// # Errors
     /// [`StoreError::PoolStarved`] when `wait` is set, no frame is free and
-    /// every unpinned frame is dirty (at this card; A-3c writes them);
+    /// every unpinned frame is dirty and cannot be written (a pool built
+    /// with `Pool::new`, or a dirty set from before a flip, A-3c-C's);
+    /// [`StoreError::Invalid`], [`StoreError::Env`] or
+    /// [`StoreError::OutOfMemory`] as a dirty eviction gives them;
     /// [`StoreError::Invalid`] or [`StoreError::Poisoned`] as `try_victim`,
     /// `remove_from_table` and the table mutex give them.
     pub(crate) fn acquire(
         &self,
         wait: bool,
         for_key: Option<PageKey>,
-    ) -> Result<Option<FrameReservation<'_, H, P>>, StoreError> {
+        hold: &Hold<'_, '_, H, P>,
+    ) -> Result<Acquired<'_, H, P>, StoreError> {
         let key = for_key.unwrap_or(PageKey::Lpid(0));
         loop {
             // A1: the free list.
@@ -117,16 +190,18 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 let mut t = self.lock_table()?;
                 if let Some(f) = t.reserve_free()? {
                     drop(t);
-                    return Ok(Some(FrameReservation::reserved(self, f)));
+                    return Ok(Acquired::Frame(FrameReservation::reserved(self, f)));
                 }
                 (t.hand, t.unheld_events)
             };
 
             // A2: the sweep. `busy` says whether a frame was momentarily
-            // latched or pinned while this acquisition looked at it.
-            let busy = match self.sweep(h0, key)? {
-                Sweep::Found(res) => return Ok(Some(res)),
-                Sweep::Over(busy) => busy,
+            // latched, pinned or kept while this acquisition looked at it;
+            // `flip_pending`, whether a dirty victim was passed over for a
+            // pending flip (card A-3c).
+            let (busy, flip_pending) = match self.sweep(h0, key, hold)? {
+                Sweep::Found(res) => return Ok(Acquired::Frame(res)),
+                Sweep::Over { busy, flip_pending } => (busy, flip_pending),
             };
 
             // A3.
@@ -134,7 +209,22 @@ impl<H: File, P: Primitives> Pool<H, P> {
 
             // A4.
             if !wait {
-                return Ok(None);
+                return Ok(Acquired::None);
+            }
+
+            // Card A-3c, Work 8.3: a flip is pending and the sweep found no
+            // clean victim. The thread releases what it holds and restarts
+            // (S-STORE §5.2), whatever the hold says, unless a frame is free
+            // or became unheld since A1, which A5 would look again at.
+            if flip_pending {
+                let look_again = {
+                    let t = self.lock_table()?;
+                    t.free_len() != 0 || t.unheld_events != g0
+                };
+                if !look_again {
+                    return Ok(Acquired::FlipPending);
+                }
+                continue;
             }
 
             // A5, A6 and A7's registration, under one hold of the table mutex:
@@ -155,14 +245,19 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 if busy {
                     // Another thread's brief latch on a victim, or a pin whose
                     // drop moved the generation (§5.3's fairness bound): never
-                    // block on it, and look again.
-                    yield_now::<P>();
+                    // block on it, and look again. Without yielding when the
+                    // thread holds a page being loaded (the nested MapLeaf
+                    // pin of a load; card A-3c, Work 8): S-STORE §5.3, "a
+                    // storage call never yields ... while it holds a page
+                    // being loaded".
+                    yield_unless_in_load(hold);
                     continue;
                 }
-                match self.own_pass(g0, key)? {
-                    Pass::Found(res) => return Ok(Some(res)),
+                match self.own_pass(g0, key, hold)? {
+                    Pass::Found(res) => return Ok(Acquired::Frame(res)),
                     Pass::Retry => continue,
                     Pass::Starved => return Err(StoreError::PoolStarved),
+                    Pass::FlipPending => return Ok(Acquired::FlipPending),
                 }
             }
             // A7: every frame is held. Wait for an unpin.
@@ -184,7 +279,10 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// passed, a referenced one loses its bit, and any other is latched with
     /// `try_victim` (never blocking), which decides:
     /// - its latch was not free, or it was pinned meanwhile: `busy`;
-    /// - dirty: passed over, since this card writes no victim (A-3c does);
+    /// - dirty: passed over in a pool built with `Pool::new`, which writes
+    ///   no victim; in a write-back pool written by `evict_victim` (card
+    ///   A-3c, Work 8.2), which answers as a clean victim's removal does, or
+    ///   `FlipPending`, which the sweep notes;
     /// - clean: out of the page table by `remove_from_table`. A `Kept` answer
     ///   (a pin arrived) is `busy` and the sweep goes on; a `Removed` one is
     ///   returned to the caller.
@@ -216,17 +314,26 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// key, since A1, because every way back to unheld passes through U1–U4.
     /// The pass latched it and found it dirty. Only a holder of its exclusive
     /// latch can clean it: a pin holder, whose unpin would have moved the
-    /// generation, or a victim's holder. At this card no store path cleans a
-    /// victim and leaves it in the table (only tests call
-    /// `VictimGuard::mark_written`). So every unpinned frame is dirty. Dirty
-    /// frames leave the page table only by A-3c's dirty eviction, so
-    /// `PoolStarved` is the right answer here, and A-3c replaces it. With
+    /// generation, or a victim's holder. At card A-3b-0 no store path cleans
+    /// a victim and leaves it in the table (only tests call
+    /// `VictimGuard::mark_written`). Card A-3c adds one, E5's and E6's
+    /// `Kept`, and closes the gap it would open: that path counts an unheld
+    /// event, and a `Kept` is `busy` besides. So every unpinned frame is
+    /// dirty and unwritable, in a pool built with `Pool::new` or from before
+    /// a flip (A-3c-C's), when `PoolStarved` is the answer; a dirty frame
+    /// that can be written is written. With
     /// `busy` true at A6 or A6′, a frame was momentarily latched or pinned by
     /// another thread: an evictor's brief victim latch, or a pin whose drop
     /// moves the generation. A7 waits exactly when every frame is held (§5.4:
     /// "every frame is pinned").
-    fn sweep(&self, h0: u64, key: PageKey) -> Result<Sweep<'_, H, P>, StoreError> {
+    fn sweep(
+        &self,
+        h0: u64,
+        key: PageKey,
+        hold: &Hold<'_, '_, H, P>,
+    ) -> Result<Sweep<'_, H, P>, StoreError> {
         let mut busy = false;
+        let mut flip_pending = false;
         loop {
             self.fire(HookPoint::SweepStep, key, NO_FRAME);
             let step = {
@@ -250,21 +357,13 @@ impl<H: File, P: Primitives> Pool<H, P> {
                 }
             };
             match step {
-                None => return Ok(Sweep::Over(busy)),
+                None => return Ok(Sweep::Over { busy, flip_pending }),
                 Some(Step::Passed) => {}
-                Some(Step::Candidate(f)) => match self.try_victim(f)? {
-                    None => busy = true,
-                    Some(v) if v.is_dirty() => drop(v),
-                    Some(v) => {
-                        let k = v.key();
-                        match v.remove_from_table()? {
-                            Removal::Removed(res) => {
-                                self.evicted(k, f)?;
-                                return Ok(Sweep::Found(res));
-                            }
-                            Removal::Kept => busy = true,
-                        }
-                    }
+                Some(Step::Candidate(f)) => match self.take_candidate(f, hold)? {
+                    Taken::Got(res) => return Ok(Sweep::Found(res)),
+                    Taken::Busy => busy = true,
+                    Taken::Passed => {}
+                    Taken::FlipPending => flip_pending = true,
                 },
             }
         }
@@ -274,10 +373,8 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// acquisition's own visit of every frame, in frame order, without moving
     /// the hand and without reading or changing a reference bit. A frame that
     /// is `Resident` with no count is offered to `try_victim` (never blocking)
-    /// and the answer is read exactly as A2 reads it: its latch was not free,
-    /// or a pin arrived, so `busy`; dirty, so passed over (A-3c writes it);
-    /// clean, so out of the page table, counted and announced as A2's victim
-    /// is, and returned. The pass fires no `SweepEnded`.
+    /// and the answer is read exactly as A2 reads it ([`Pool::take_candidate`]).
+    /// The pass fires no `SweepEnded`.
     ///
     /// After the last frame, `busy` means another thread held a latch or a pin
     /// on a frame this acquisition looked at (§5.3 "The fairness bound"), so
@@ -287,9 +384,17 @@ impl<H: File, P: Primitives> Pool<H, P> {
     /// unpinned frame left each makes it look again. Only when none does is
     /// every unpinned frame dirty by this acquisition's own observation, and
     /// `PoolStarved` is the answer (the argument is in [`Pool::sweep`]'s doc,
-    /// "Why the decision is exact at this card").
-    fn own_pass(&self, g0: u64, key: PageKey) -> Result<Pass<'_, H, P>, StoreError> {
+    /// "Why the decision is exact at this card"). Card A-3c, Work 8.3: a
+    /// dirty victim passed over for a pending flip makes the answer
+    /// `FlipPending` instead, unless there is reason to look again.
+    fn own_pass(
+        &self,
+        g0: u64,
+        key: PageKey,
+        hold: &Hold<'_, '_, H, P>,
+    ) -> Result<Pass<'_, H, P>, StoreError> {
         let mut busy = false;
+        let mut flip_pending = false;
         for i in 0..self.frames() {
             let f = FrameId(i);
             let unpinned = {
@@ -300,23 +405,16 @@ impl<H: File, P: Primitives> Pool<H, P> {
             if !unpinned {
                 continue;
             }
-            match self.try_victim(f)? {
-                None => busy = true,
-                Some(v) if v.is_dirty() => drop(v),
-                Some(v) => {
-                    let k = v.key();
-                    match v.remove_from_table()? {
-                        Removal::Removed(res) => {
-                            self.evicted(k, f)?;
-                            return Ok(Pass::Found(res));
-                        }
-                        Removal::Kept => busy = true,
-                    }
-                }
+            match self.take_candidate(f, hold)? {
+                Taken::Got(res) => return Ok(Pass::Found(res)),
+                Taken::Busy => busy = true,
+                Taken::Passed => {}
+                Taken::FlipPending => flip_pending = true,
             }
         }
         if busy {
-            yield_now::<P>();
+            // As at A6: no yield while the thread holds a page being loaded.
+            yield_unless_in_load(hold);
             return Ok(Pass::Retry);
         }
         self.fire(HookPoint::PassEnded, key, NO_FRAME);
@@ -326,8 +424,51 @@ impl<H: File, P: Primitives> Pool<H, P> {
         };
         Ok(if look_again {
             Pass::Retry
+        } else if flip_pending {
+            Pass::FlipPending
         } else {
             Pass::Starved
+        })
+    }
+
+    /// Take one candidate the clock named, or A6′ found unpinned (card
+    /// A-3b-0's reading of `try_victim`, with card A-3c's Work 8.2): its
+    /// latch was not free, or a pin arrived, so `Busy`; clean, so out of the
+    /// page table, counted and announced; dirty, so written by
+    /// `evict_victim` in a write-back pool (`Kept` is `Busy`; `FlipPending`
+    /// and the rest move the clock on) and passed over in any other.
+    fn take_candidate(
+        &self,
+        f: FrameId,
+        hold: &Hold<'_, '_, H, P>,
+    ) -> Result<Taken<'_, H, P>, StoreError> {
+        let Some(v) = self.try_victim(f)? else {
+            return Ok(Taken::Busy);
+        };
+        let k = v.key();
+        if !v.is_dirty() {
+            return Ok(match v.remove_from_table()? {
+                Removal::Removed(res) => {
+                    self.evicted(k, f)?;
+                    Taken::Got(res)
+                }
+                Removal::Kept => Taken::Busy,
+            });
+        }
+        if self.wb().is_none() {
+            // A pool built with `Pool::new` writes nothing: A-3b's
+            // behaviour, unchanged (card A-3c, Work 9).
+            drop(v);
+            return Ok(Taken::Passed);
+        }
+        Ok(match self.evict_victim(v, hold)? {
+            EvictOutcome::Obtained(res) => {
+                self.evicted(k, f)?;
+                Taken::Got(res)
+            }
+            EvictOutcome::Kept => Taken::Busy,
+            EvictOutcome::FlipPending => Taken::FlipPending,
+            EvictOutcome::PrevEpoch | EvictOutcome::NotVictim => Taken::Passed,
         })
     }
 

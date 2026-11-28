@@ -75,6 +75,11 @@ pub enum StoreError {
         /// `threads × 3 × (H_min + 2) + R_EPOCH + R_MAP` (R-1-memory §4.2).
         minimum: u64,
     },
+    /// The operation must release what it holds and restart (S-STORE §5.2,
+    /// §5.3): no frame could be obtained without blocking where the caller
+    /// may not block. Never returned to a client (card A-3c).
+    #[error("restart: {0:?}")]
+    Restart(crate::buf::Restart),
 }
 
 /// The seed's page storage surface (card A-0). E4 implemented it over a

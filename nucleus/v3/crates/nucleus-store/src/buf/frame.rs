@@ -21,6 +21,17 @@
 //!   cleared only by `mark_written`, whose four checks are §3.3's against
 //!   the home its caller wrote, or by `mark_freed`; a freed page is never
 //!   marked dirty again (§4.2: "Nothing mutates a freed page").
+//! - **§4.1's pin follows the page's dirtiness** (card A-3c, Work 6.2 and
+//!   6.3; S-STORE §4.1 "Residency"; R-1-memory §4.4: "§4.1's pins end when a
+//!   MapLeaf's last dirty page leaves the pool"): in a write-back pool an
+//!   LPID page's `mark_dirty` on a clean page takes the pin from a resident
+//!   MapLeaf before the flag is set, and `mark_written` and `mark_freed` end
+//!   it; a pool built with `Pool::new` takes none. Tests `mappin_residency`,
+//!   `dirty_needs_resident_mapleaf`, `pin_hook_kinds`, `t_pool_floor_scattered`;
+//!   mutants MAPPIN-KEPT, WB-MAPPIN-NOT-TAKEN, WB-DIRTY-COLD-IGNORED.
+//! - **Every frame-latch request announces itself** (card A-3c, Work 10):
+//!   the four `Pin` methods and `try_victim` fire `LatchTaking` first, in a
+//!   write-back pool, holding what the caller holds.
 //! - **The frame latch is task-fair, and on the store's sync layer**
 //!   (§5.3 "Fair latches"; card A-3b, Work 4): a [`FrameLatch`] is card
 //!   A-4c0's [`Latch`] with bypass bound [`FRAME_LATCH_BOUND`] and a fixed
@@ -345,13 +356,35 @@ pub struct Pin<'p, H: File, P: Primitives = StdPrimitives> {
     pool: &'p Pool<H, P>,
     frame: FrameId,
     key: PageKey,
+    /// Whether the pin is an operation's own, which fires `Pinned` where it
+    /// is taken and `Unpinned` where it drops (§5.3), or one the eviction
+    /// takes for the frame it obtains (card A-3c, Work 6.5), which fires
+    /// neither: not an operation's pin in §5.4's count.
+    hooks: bool,
 }
 
 impl<'p, H: File, P: Primitives> Pin<'p, H, P> {
     /// A pin for a count the caller raised on `frame`, a `Resident` frame of
-    /// `key`, under the table mutex.
+    /// `key`, under the table mutex: an operation's own pin.
     pub(crate) fn counted(pool: &'p Pool<H, P>, frame: FrameId, key: PageKey) -> Pin<'p, H, P> {
-        Pin { pool, frame, key }
+        Pin {
+            pool,
+            frame,
+            key,
+            hooks: true,
+        }
+    }
+
+    /// A pin that fires nothing where it is taken or where it drops (card
+    /// A-3c, Work 6.5): the eviction's, on a frame the victim's §4.1 pin
+    /// already holds or on the frame the acquisition is obtaining.
+    pub(crate) fn quiet(pool: &'p Pool<H, P>, frame: FrameId, key: PageKey) -> Pin<'p, H, P> {
+        Pin {
+            pool,
+            frame,
+            key,
+            hooks: false,
+        }
     }
 
     /// The pinned page's key (§5.1).
@@ -372,6 +405,8 @@ impl<'p, H: File, P: Primitives> Pin<'p, H, P> {
     /// [`StoreError::Invalid`] if the frame's content cell is busy under the
     /// latch's grant, an engine invariant violation (F7).
     pub fn latch_shared(&self) -> Result<SharedGuard<'_, P>, StoreError> {
+        self.pool
+            .fire_wb(super::pool::HookPoint::LatchTaking, self.key, self.frame);
         let content = self.pool.latch(self.frame)?.shared()?;
         Ok(SharedGuard {
             content,
@@ -388,6 +423,8 @@ impl<'p, H: File, P: Primitives> Pin<'p, H, P> {
     /// [`StoreError::Invalid`] if the frame's content cell is busy under the
     /// latch's grant (F7).
     pub fn latch_exclusive(&self) -> Result<ExclusiveGuard<'_, H, P>, StoreError> {
+        self.pool
+            .fire_wb(super::pool::HookPoint::LatchTaking, self.key, self.frame);
         let content = self.pool.latch(self.frame)?.exclusive()?;
         Ok(ExclusiveGuard {
             content,
@@ -406,6 +443,8 @@ impl<'p, H: File, P: Primitives> Pin<'p, H, P> {
     /// [`StoreError::Invalid`] if the frame's content cell is busy under the
     /// latch's grant (F7).
     pub fn try_latch_shared(&self) -> Result<Option<SharedGuard<'_, P>>, StoreError> {
+        self.pool
+            .fire_wb(super::pool::HookPoint::LatchTaking, self.key, self.frame);
         Ok(self
             .pool
             .latch(self.frame)?
@@ -426,6 +465,8 @@ impl<'p, H: File, P: Primitives> Pin<'p, H, P> {
     /// [`StoreError::Invalid`] if the frame's content cell is busy under the
     /// latch's grant (F7).
     pub fn try_latch_exclusive(&self) -> Result<Option<ExclusiveGuard<'_, H, P>>, StoreError> {
+        self.pool
+            .fire_wb(super::pool::HookPoint::LatchTaking, self.key, self.frame);
         Ok(self
             .pool
             .latch(self.frame)?
@@ -470,7 +511,9 @@ impl<H: File, P: Primitives> Drop for Pin<'_, H, P> {
                 self.pool.became_unheld(&mut t);
             }
         }
-        self.pool.fire(HookPoint::Unpinned, self.key, self.frame);
+        if self.hooks {
+            self.pool.fire(HookPoint::Unpinned, self.key, self.frame);
+        }
     }
 }
 
@@ -634,7 +677,8 @@ impl<'a, H: File, P: Primitives> ExclusiveGuard<'a, H, P> {
     /// freed page"; only a creation of its key remakes it); the page is then
     /// unchanged.
     pub fn mark_dirty(&mut self, epoch: u32) -> Result<(), StoreError> {
-        set_dirty(&mut self.content, self.key, epoch)
+        self.pool
+            .mark_dirty_frame(&mut self.content, self.key, self.frame, epoch)
     }
 
     /// Record that the caller wrote these bytes, sealed, to `home.slot`
@@ -651,7 +695,8 @@ impl<'a, H: File, P: Primitives> ExclusiveGuard<'a, H, P> {
     /// `page::verify` against `home` and the key's header id (§3.3), and the
     /// key admits the header's kind.
     pub fn mark_written(&mut self, home: Ref) -> Result<(), StoreError> {
-        self.pool.mark_written(&mut self.content, self.key, home)
+        self.pool
+            .mark_written(&mut self.content, self.key, self.frame, home)
     }
 
     /// Mark the page freed (§4.2): clean, never written again, and never
@@ -689,7 +734,9 @@ impl<H: File, P: Primitives> fmt::Debug for ExclusiveGuard<'_, H, P> {
     }
 }
 
-/// `mark_dirty`'s rule, shared by the exclusive guards.
+/// `mark_dirty`'s flag, after [`super::Pool::mark_dirty_frame`] took the
+/// page's §4.1 pin where its clean-to-dirty transition needs one (card A-3c,
+/// Work 6.2).
 pub(crate) fn set_dirty(
     content: &mut FrameContent,
     key: PageKey,
@@ -930,7 +977,8 @@ impl<'p, H: File, P: Primitives> VictimGuard<'p, H, P> {
     /// [`StoreError::Invalid`], the page still dirty, unless every check of
     /// [`ExclusiveGuard::mark_written`] passes.
     pub fn mark_written(&mut self, home: Ref) -> Result<(), StoreError> {
-        self.pool.mark_written(&mut self.content, self.key, home)
+        self.pool
+            .mark_written(&mut self.content, self.key, self.frame, home)
     }
 
     /// Pin the frame while its latch is held (§4.1's two-step map-page write:

@@ -28,6 +28,11 @@
 //!   (S-STORE §5.1, §5.4): a fixed pool, a page table that never grows,
 //!   and loads through a page's current reference, checked by
 //!   `page::verify` (§3.3). No tree uses it yet.
+//! - `buf`'s write-back (card A-3c): the epoch gate (S-STORE §5.6), the
+//!   current page map with its growth (§4.1), §4.1's MapLeaf pins, slot and
+//!   LPID allocation with the two-generation pending frees (§4.2–§4.5,
+//!   §13 step 6), and dirty eviction to fresh slots (§5.2), in pools built
+//!   with `Pool::with_writeback`.
 //! - `buf`'s frame acquisition and pool sizing (card A-3b-0): clock
 //!   eviction of clean victims with `try_latch`, the wait for an unpin,
 //!   and the minimum pool size at open with R-1-memory's values
@@ -48,14 +53,16 @@
 //! - the seed tree's pages are neither sealed nor checked: it writes every
 //!   page with `id` 0, `epoch` 0 and `crc` 0 through `pool`, which never
 //!   calls `page::seal` or `page::verify` (§3.1, §3.3): A-4a moves the tree
-//!   onto `buf`, whose every load is checked (card A-3a); A-3c (dirty
-//!   eviction) and A-7b (the checkpoint's image writes) seal;
+//!   onto `buf`, whose every load is checked (card A-3a) and whose dirty
+//!   eviction seals what it writes (card A-3c); A-7b (the checkpoint's image
+//!   writes) seals its own;
 //! - ids: the seed tree's [`store::PageStore`] hands out dense page ids
 //!   that are addressed directly (§4.1–§4.5): A-4a moves the tree onto
 //!   `buf`, which names a page by LPID or map position and loads it through
-//!   its current reference (card A-3a); the current page map (§4.1), LPID
-//!   allocation (§4.2), the free set (§4.3) and slot reuse (§4.4, §4.5):
-//!   A-3c; LPID freeing: A-4b; `pool`'s recycle list of unpublished
+//!   its current reference (card A-3a); write-back pools hold the current
+//!   page map (§4.1), LPID allocation (§4.2), the free set in memory (§4.3)
+//!   and slot reuse (§4.4, §4.5) (card A-3c), persisted by A-7b; LPID
+//!   freeing: A-4b; `pool`'s recycle list of unpublished
 //!   reserved ids (card X-0-F2), which S-STORE does not have, goes with
 //!   `pool`: A-4a;
 //! - the file header is encoded and selected (`meta`, `open`) but never
@@ -64,11 +71,16 @@
 //! - pool: the seed tree runs on `pool`, whose victims are picked by pin
 //!   count and whose dirty victims are written back in place under the same
 //!   id (§5.2, I-NO-INPLACE): A-4a moves the tree onto `buf` and retires
-//!   `pool`. `buf` (card A-3a): dirty victims are not evicted, so a pool
-//!   whose unpinned frames are all dirty answers `PoolStarved` (§5.2): A-3c;
-//!   no current page map behind its `CurrentRef`, no dirty eviction to a
-//!   fresh slot and no poison check at a pin or in its load wait (§4.1, §5.2,
-//!   §9.2): A-3c; no epoch gate (§5.6): A-3c; no `write_guard` (§5.6): A-7a;
+//!   `pool`. `buf` (card A-3c): in a pool built with `Pool::new`, and in a
+//!   write-back pool for a dirty set from before the last flip, dirty
+//!   victims are not evicted, so a pool whose unpinned frames are all dirty
+//!   answers `PoolStarved` (§5.2): A-3c-C;
+//!   no current page map behind its `CurrentRef` in a pool built with
+//!   `Pool::new` (card A-3c builds one for `Pool::with_writeback`); no poison
+//!   check at a pin or in its load wait (§9.2): A-3c-B; no epoch-copy
+//!   reserve, image-record list or step 2, and no eviction of a dirty victim
+//!   from before the last flip (§5.2, §5.6, §13): A-3c-C; no `write_guard`
+//!   (§5.6): A-7a;
 //! - latch scope: `BufferPool`'s guards keep a latch past the call, and
 //!   `fetch_*` reads the store while ancestors are latched (§5.3 "No latch
 //!   escapes a call"; §5.6's restart rule): A-4a retires `pool`; `buf`
@@ -76,7 +88,7 @@
 //!   caller under latches uses it only where §5.3 allows a read), which
 //!   A-4c's tracker checks;
 //! - fail-stop: no poison mark, and `StoreError` has no SQLSTATE mapping
-//!   (XX001, 58030, 53100, 53200; §9.2): A-3c, A-4c;
+//!   (XX000, XX001, 58030, 53100, 53200; §9.2): A-3c-B, A-4c;
 //! - tree: the root id in a `RwLock<PageId>` with the T-ROOT restart, not a
 //!   stable root (§6.3): A-4a; the split separator is the right page's first
 //!   key, not the shortest separator, and no prune-before-split decision
