@@ -17,12 +17,28 @@
 # the smoke tag is exempt from the release-build rule, card B-0-F7-F1
 # J5).
 set -euo pipefail
-. "${NB_HARNESS:?NB_HARNESS not set}/lib/nb-lib.sh"
 
-BIN=${NB_BIN:?NB_BIN not set}
-ROOT=${NB_HARNESS:?}
-# The release binary may live in a shared CARGO_TARGET_DIR outside the
-# harness tree, so the harness root must be explicit.
+# The acceptance line is `cd nucleus/v3/bench/nbench && bash
+# workloads/oltp-sysbench-mysql84/smoke.sh` — no environment is passed,
+# so everything is derived: the harness root from this script's own
+# location, and the nbench binary from the workspace target dir (built
+# on demand; the smoke tag allows a debug build, card B-0-F7-F1 J5).
+# Explicit NB_HARNESS/NB_BIN always win.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+ROOT=${NB_HARNESS:-$(cd "$SCRIPT_DIR/../.." && pwd)}
+WORKSPACE=$(cd "$ROOT/../.." && pwd)
+. "${ROOT}/lib/nb-lib.sh"
+
+if [ -z "${NB_BIN:-}" ]; then
+  NB_BIN="${CARGO_TARGET_DIR:-$WORKSPACE/target}/debug/nbench"
+  if [ ! -x "$NB_BIN" ]; then
+    (cd "$WORKSPACE" && cargo build -q -p nbench)
+  fi
+fi
+BIN=${NB_BIN:?no nbench build at ${CARGO_TARGET_DIR:-$WORKSPACE/target}/debug/nbench and cargo build failed}
+export NB_HARNESS="$ROOT"
+# The build may live in a shared CARGO_TARGET_DIR outside the harness
+# tree, so the harness root must be explicit.
 export NBENCH_ROOT="$ROOT"
 export PATH="${ROOT}/bin:$PATH"
 DATE=$(date -u +%F)
