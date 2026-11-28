@@ -313,12 +313,16 @@ fn race_k<H: Harness>(reload: bool) -> Result<Seen, String> {
             }
         } else {
             // T1's first Restarting, as Seen; T2's Arrived(WaitWoken) may
-            // come before or after it.
+            // come before or after it. Either thread may fire first:
+            // `end_load` wakes the waiters and returns, T1 then fires
+            // Restarting, while T2 must take the table mutex again and
+            // leave its wait before it fires WaitWoken (verdict A-3c R2).
+            let mut woken = false;
             let mut others = 0;
             loop {
                 match pz.next_event()? {
                     ev if seen(&ev, Restarting, l) => break,
-                    ev if arrived(&ev, WaitWoken, l) => {}
+                    ev if !woken && arrived(&ev, WaitWoken, l) => woken = true,
                     ev => {
                         others += 1;
                         if others > 16 {
@@ -330,8 +334,15 @@ fn race_k<H: Harness>(reload: bool) -> Result<Seen, String> {
             }
             if problem.is_none() {
                 // T1's next: GateSharedBlocking, a second Restarting, or a
-                // LoadPublished of L.
-                out.first_after = Some(pz.next_event()?);
+                // LoadPublished of L. T2's Arrived(WaitWoken), if it did
+                // not come before T1's Restarting, is skipped here: it is
+                // T2's, not T1's (WaitWoken is a one-shot pause, so it
+                // comes once).
+                let mut ev = pz.next_event()?;
+                if !woken && arrived(&ev, WaitWoken, l) {
+                    ev = pz.next_event()?;
+                }
+                out.first_after = Some(ev);
             }
         }
     }
