@@ -28,7 +28,14 @@ step() {
 # enforcement suite tests the runner, merge and audit tooling, never engine
 # code, and it is the slowest and flakiest step, so it runs only when the
 # change under test touches what it tests: scripts/ and tools/, plus the three
-# other files it copies from this tree (CORE_PATHS and the two READMEs).
+# other files it copies from this tree (CORE_PATHS and the two READMEs), and
+# every attribute file that can apply to one of them: the root, nucleus/,
+# nucleus/v3/, docs/ and verdicts/ .gitattributes (those under scripts/ and
+# tools/ are inside the list already). An attribute rewrites a tooling file's
+# bytes in every fresh checkout without changing its blob (fresh-gate accepts
+# an eol=crlf conversion), and a pass worktree keeps the old bytes of an
+# unchanged blob, so only the card gate's fresh checkout runs the suite on
+# them (verdict ENF-FASTGATE-1 R1).
 # Every engine step below runs on every card. promote-pass.sh always runs it
 # (NV3_GATE_FULL=1), once per pass, so a tooling regression still stops the
 # scaffold from moving.
@@ -46,7 +53,7 @@ step() {
 #
 # Read before any step runs, so nothing a step writes changes it. In a
 # subshell, so git-env.sh's variables do not reach the steps.
-tooling=(scripts tools CORE_PATHS docs/README.md verdicts/README.md)
+tooling=(scripts tools CORE_PATHS docs/README.md verdicts/README.md ../../.gitattributes ../.gitattributes .gitattributes docs/.gitattributes verdicts/.gitattributes)
 enforcement_decision() (
   full() { echo "$*"; exit 0; }
   [ -z "${NV3_GATE_FULL:-}" ] || full "NV3_GATE_FULL is set"

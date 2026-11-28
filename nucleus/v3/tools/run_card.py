@@ -575,9 +575,11 @@ def bash_permission(cmd, rules=None):
 def gate_passed(rc, out):
     """A gate run passes only with exit 0 AND a last line of exactly `GATE EXIT=0` (§7.6.4).
 
-    The rule every reader of a gate run applies (fresh-gate.sh's caller,
-    promote-pass.sh). main() no longer runs the gate (ENF-FASTGATE-1), so the
-    suite's rows are what call this; they pin the rule."""
+    The rule a reader of a gate run applies to fresh-gate.sh's output.
+    promote-pass.sh reads only the last line (its gate call ends `|| true`),
+    which is the same test while gate.sh exits with its own GATE EXIT value.
+    main() no longer runs the gate (ENF-FASTGATE-1), so the suite's rows are
+    what call this; they pin the rule."""
     lines = out.rstrip("\n").splitlines()
     return rc == 0 and bool(lines) and lines[-1].strip() == GATE_PASS
 

@@ -685,6 +685,35 @@ gs_inputs() {
   [ "$ok" -eq 0 ] && [ "$n" -ge 5 ]
 }
 expect_ok "gate: GS23: the skip list covers every file the suite copies from the tree (at least 5 found)" gs_inputs
+# GS24-GS25 (verdict ENF-FASTGATE-1 R1): an attribute-only change runs the
+# suite. An ancestor .gitattributes can rewrite a tooling file's checked-out
+# bytes (eol=crlf) without changing its blob, and only the card gate's fresh
+# checkout would run the suite on those bytes.
+gsb attr .gitattributes; gsrun
+expect_ok "gate: GS24: an attribute-only change at nucleus/v3/.gitattributes runs the suite" gs_ran "the change touches the tooling: nucleus/v3/.gitattributes"
+for f in ../../.gitattributes:.gitattributes ../.gitattributes:nucleus/.gitattributes docs/.gitattributes:nucleus/v3/docs/.gitattributes verdicts/.gitattributes:nucleus/v3/verdicts/.gitattributes; do
+  gsb attr "${f%%:*}"; gsrun
+  expect_ok "gate: GS25: an attribute-only change at ${f#*:} runs the suite" gs_ran "the change touches the tooling: ${f#*:}"
+done
+# GS26: an index flag that hides a tooling edit from git diff runs the suite
+# (git_state_refuse --index names it; without --index nothing would).
+gsb au spikes/x.txt; echo '# hidden' >>"$gs/nucleus/v3/tools/run_card.py"; git -C "$gs" update-index --assume-unchanged nucleus/v3/tools/run_card.py
+expect_ok "gate: GS26: premise: the assume-unchanged edit is invisible to git diff HEAD" bash -c '[ -z "$(git -C "$1" diff --name-only HEAD)" ]' _ "$gs"
+gsrun
+expect_ok "gate: GS26: an assume-unchanged edited tools/ file runs the suite" gs_ran "nucleus/v3/tools/run_card.py is marked assume-unchanged in the index"
+git -C "$gs" update-index --no-assume-unchanged nucleus/v3/tools/run_card.py
+# GS27: the skip test is the exact word: a reason that contains "skip" runs.
+gsb skp tools/skip.py; gsrun
+expect_ok "gate: GS27: a reason containing the word skip (tools/skip.py) still runs the suite" gs_ran "the change touches the tooling: nucleus/v3/tools/skip.py"
+# GS28: a gitlink under tools/ runs the suite even with diff.ignoreSubmodules=all
+# configured, which hides it from a diff without --ignore-submodules=none.
+gsb sub spikes/x.txt; git -C "$gs" update-index --add --cacheinfo "160000,$gs_base,nucleus/v3/tools/sub" && git -C "$gs" commit -qm "gs sub: a gitlink under tools/"
+git -C "$gs" config diff.ignoreSubmodules all
+expect_ok "gate: GS28: premise: diff.ignoreSubmodules=all hides the gitlink from a plain diff" bash -c '[ -z "$(git -C "$1" diff --name-only "$2" HEAD)" ]' _ "$gs" "$gs_base"
+gsrun
+expect_ok "gate: GS28: a gitlink under tools/ runs the suite though diff.ignoreSubmodules=all is configured" gs_ran "the change touches the tooling: nucleus/v3/tools/sub"
+git -C "$gs" config --unset diff.ignoreSubmodules
+git -C "$gs" checkout -q -f nucleus/v3-scaffold
 
 # --- queue-check ------------------------------------------------------------
 git -C "$r" checkout -q nucleus/v3-scaffold
@@ -5011,6 +5040,19 @@ expect_ok "fresh-gate: FGS1: a spikes/-only commit skips enforcement-tests in th
 fgs FGS2 scripts/fgs.sh
 fgrun card/v3-FGS2
 expect_ok "fresh-gate: FGS2: a scripts/ commit runs enforcement-tests in the container, GATE EXIT=0" fgs_out "STEP enforcement-tests EXIT=0" "STEP enforcement-tests SKIPPED (no scripts/ or tools/ change)"
+# FGS3 (verdict ENF-FASTGATE-1 R1): a commit that adds only
+# nucleus/v3/.gitattributes, turning the stub suite's checkout into CRLF (same
+# blob; fresh-gate accepts the eol conversion), runs the suite in the
+# container, and the CRLF stub fails it: the old gate.sh's result.
+git -C "$r" checkout -q -b card/v3-FGS3 nucleus/v3-scaffold && printf 'scripts/test-enforcement.sh text eol=crlf\n' >"$v3/.gitattributes" &&
+  git -C "$r" add nucleus/v3/.gitattributes && git -C "$r" commit -qm "nucleus v3: FGS3 work" && git -C "$r" checkout -q nucleus/v3-scaffold
+fgrun card/v3-FGS3
+fgs3_out() {
+  fg_show; [ "$(cat "$t/fg.rc")" = 1 ] && [ "$(tail -n 1 "$t/fg.out")" = "GATE EXIT=1" ] && ! grep -qF 'enforcement-tests SKIPPED' "$t/fg.out" &&
+    grep -q '^STEP enforcement-tests EXIT=[1-9][0-9]*$' "$t/fg.out" && grep -qxF 'fresh-gate: 1 file(s) matched through their eol conversion' "$t/fg.out" &&
+    grep '^gate: enforcement-tests runs: ' "$t/fg.out" | grep -qF 'the change touches the tooling: nucleus/v3/.gitattributes'
+}
+expect_ok "fresh-gate: FGS3: an attribute-only commit (CRLF suite) runs enforcement-tests in the container and fails it, GATE EXIT=1" fgs3_out
 
 # fresh-gate's container (X-6-F1-F1-F2-F1-F1). The stub gate leaves a forge in its own
 # session and passes. FG_HOLD holds it, for a signal during the gate. Everything goes
