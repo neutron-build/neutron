@@ -73,7 +73,7 @@ run_queries() {
       {
         echo ".timer on"
         for f in /workload/queries/tpc*.sql; do
-          echo "SELECT '"'"'tpch-$(basename "$f" .sql)'"'"';"
+          echo "SELECT '"'"'NB3MARK-$(basename "$f" .sql)'"'"';"
           echo ".read $f"
         done
       } > /tmp/tpch-run.sql
@@ -139,13 +139,13 @@ case ${NB_MODE:?} in
     # Post-process the log into the TPCH_* summary lines. They are
     # appended to NB_LOG — the harness parser reads them from there —
     # and echoed so the operator sees them.
-    ran=$(grep -o "tpch-q[0-9][0-9]" "${NB_LOG}" | sort -u | wc -l)
+    ran=$({ grep -o "NB3MARK-tpc[0-9][0-9]" "${NB_LOG}" || true; } | sort -u | wc -l)
     {
       # per-query wall: the sum of each query's Run Time lines
       awk '
-        /tpch-q[0-9][0-9]/ {
-          match($0, /tpch-q[0-9][0-9]/);
-          q = substr($0, RSTART + 6, 2);
+        /NB3MARK-tpc[0-9][0-9]/ {
+          match($0, /NB3MARK-tpc[0-9][0-9]/);
+          q = substr($0, RSTART + 11, 2);
           sum[q] = 0;
         }
         /Run Time \(s\): real/ && q != "" {

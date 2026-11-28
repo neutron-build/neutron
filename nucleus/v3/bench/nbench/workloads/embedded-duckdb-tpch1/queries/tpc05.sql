@@ -19,5 +19,7 @@ where
     and s_nationkey = n_nationkey
     and n_regionkey = r_regionkey
     and r_name = 'ASIA'
+group by
+    n_name
 order by
     revenue desc;

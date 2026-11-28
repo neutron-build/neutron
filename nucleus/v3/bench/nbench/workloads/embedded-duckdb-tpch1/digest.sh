@@ -9,8 +9,9 @@
 # No stdin is piped into the container (the driver's relay lesson): the
 # digest script is built inside the container and read from a
 # container-local file. The digest prints ONLY the sha256 on stdout
-# (the runner captures stdout as the measured value); everything else
-# goes to the log.
+# (the runner captures stdout as the measured value); the queries'
+# answers are hashed inside the container and everything else (DuckDB's
+# stderr) flows back as the command's own stderr.
 set -euo pipefail
 . "${NB_HARNESS}/lib/nb-lib.sh"
 
@@ -22,7 +23,6 @@ QDIR="${NB_HARNESS}/workloads/embedded-duckdb-tpch1/queries"
 nb-podman run --rm \
   -v "$VOL:/opt/nb:Z" -v "$DATA_VOL:/data:Z" \
   -v "$QDIR:/workload/queries:ro" \
-  -e TPCH_LOG="${NB_LOG:?}" \
   "$IMG" bash -c '
     set -euo pipefail
     {
@@ -38,6 +38,6 @@ nb-podman run --rm \
       echo "SELECT '"'"'orders'"'"' AS t, count(*) AS n FROM orders;"
       echo "SELECT '"'"'lineitem'"'"' AS t, count(*) AS n FROM lineitem;"
     } > /tmp/tpch-digest.sql
-    /opt/nb/duckdb /data/tpch.db < /tmp/tpch-digest.sql > /tmp/tpch-digest.out 2> "$TPCH_LOG"
+    /opt/nb/duckdb /data/tpch.db < /tmp/tpch-digest.sql > /tmp/tpch-digest.out
     sha256sum /tmp/tpch-digest.out | cut -d" " -f1
   '
