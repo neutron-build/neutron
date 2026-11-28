@@ -1569,6 +1569,76 @@ fn mapleaf_two_step() {
     two_step_body(true).unwrap();
 }
 
+/// `mapleaf_pinned_under_latch` (card A-3c, Work 7's E6; S-STORE §4.1's
+/// two-step write: "keeping the frame pinned and in the page table; it then
+/// releases the page's latch"; verdict A-3c, A-3c-F6's SW-E13). MapLeaf 0
+/// with page `x` written, dirty and unpinned, evicted with a recording hook
+/// at the first `TableLocking` after its `EvictWrite`: E6's pin of the
+/// frame, the table hold after the write (a MapLeaf ends no §4.1 pin at its
+/// `mark_written`). There the victim's latch is still held, so
+/// `try_victim(f_M)` is `None`. With the latch released before the pin, the
+/// clean, unpinned, unlatched frame is a victim there: another evictor could
+/// take it while its parent's ref still names the old home, and E6 would
+/// pin a frame that is no longer the MapLeaf's.
+#[test]
+fn mapleaf_pinned_under_latch() {
+    assert_eq!(min_f(1), 18);
+    let (_file, pool) = wb_pool::<StdPrimitives>(18, 4, 600, 1, H_MIN_TEST).unwrap();
+    let pool: &'static Pool<WbFile, StdPrimitives> = Box::leak(Box::new(pool));
+    let (x, p) = s3_new_page(pool, 0xC5).unwrap();
+    assert_eq!(x, 1);
+    drop(p);
+    evict_out(pool, lpid(x)).unwrap();
+    let f_m = frame_of(pool, mapleaf(0)).unwrap();
+    // `None`: not yet armed; `Some(false)`: armed by MapLeaf 0's
+    // `EvictWrite`; `Some(true)`: the first `TableLocking` since was taken.
+    let armed = Arc::new(Mutex::new(None::<bool>));
+    let records = Arc::new(Mutex::new(Vec::<Option<nucleus_store::buf::FrameId>>::new()));
+    {
+        let armed = Arc::clone(&armed);
+        let records = Arc::clone(&records);
+        pool.set_hook(Some(Arc::new(move |point, key, _| {
+            if point == HookPoint::EvictWrite && key == mapleaf(0) {
+                *lock(&armed) = Some(false);
+                return;
+            }
+            if point != HookPoint::TableLocking {
+                return;
+            }
+            {
+                let mut a = lock(&armed);
+                if *a != Some(false) {
+                    return;
+                }
+                // Disarmed before `try_victim`, whose own table hold fires
+                // this point again.
+                *a = Some(true);
+            }
+            // A granted guard is dropped at once.
+            let got = match pool.try_victim(f_m) {
+                Ok(Some(v)) => {
+                    let f = v.frame();
+                    drop(v);
+                    Some(f)
+                }
+                _ => None,
+            };
+            lock(&records).push(got);
+        })));
+    }
+    let out = evict(pool, mapleaf(0)).unwrap();
+    pool.set_hook(None);
+    assert_eq!(*lock(&armed), Some(true), "the hook was reached");
+    assert_eq!(
+        lock(&records).clone(),
+        vec![None],
+        "try_victim at E6's pin: the latch is still held"
+    );
+    assert!(matches!(out, EvictOutcome::Obtained(_)), "{out:?}");
+    assert_eq!(pool.frame_of(mapleaf(0)).unwrap(), None);
+    assert_eq!(pin_read(pool, lpid(1)).unwrap(), 0xC5);
+}
+
 /// `mappin_residency` (card A-3c, Work 14.1; S-STORE §4.1 "Residency"): a
 /// MapLeaf stays pinned while any page it maps is dirty. Mutant
 /// WB-MAPPIN-NOT-TAKEN.
