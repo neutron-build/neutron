@@ -55,7 +55,7 @@ start=$(date +%s)
 mkdir -p "$ROOT/work/$DATE"
 "$BIN" run kv-memtier-dragonfly --tag smoke \
   --set runs=1 --set cold_runs=1 --set warmup_runs=0 \
-  --set pipeline=1 --set duration_s=10 \
+  --set pipelines=1 --set duration_s=10 \
   2>&1 | tee "$ROOT/work/$DATE/dragonfly-smoke.log"
 
 # --- structural checks (no measurement assertions) ---

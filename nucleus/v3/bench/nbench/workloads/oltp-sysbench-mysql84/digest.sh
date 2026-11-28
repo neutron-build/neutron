@@ -18,6 +18,8 @@ for i in $(seq 2 "$tables"); do
 done
 # -N: no column headers; -B: batch (tab-separated) — the same
 # tuples-only, unaligned shape the pg row's `psql -q -t -A` produces.
+# mysql's password warning lands on stderr, which the runner uses only
+# on failure — never swallowed, so a real error stays visible.
 nb-podman exec "$C" mysql -uroot -pnbench -h127.0.0.1 -P"${NB_PORT:?}" \
-  -N -B -e "$q" 2>/dev/null \
+  -D "${NB_DB:?}" -N -B -e "$q" \
   | sha256sum | cut -d' ' -f1
