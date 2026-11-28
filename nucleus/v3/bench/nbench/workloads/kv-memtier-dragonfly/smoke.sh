@@ -61,6 +61,16 @@ mkdir -p "$ROOT/work/$DATE"
 # --- structural checks (no measurement assertions) ---
 grep -q '"voided":false' "$RESULTS" || { echo "DRAGONFLY SMOKE FAIL: run was voided" >&2; exit 1; }
 grep -q 'nbench_build' "$RESULTS" || { echo "DRAGONFLY SMOKE FAIL: no nbench_build provenance" >&2; exit 1; }
+# The memtier pass must have reached the server. Measured 2026-11-28:
+# memtier 2.5.2 prints zero Totals and exits 0 when it cannot connect,
+# so a port-swapped driver (card NB-3 mutant DRAGONFLY-PORT-SWAPPED)
+# does not fail by itself — this check makes it fail loudly. ops/sec >
+# 0 is structural (the workload ran at all), never a performance claim.
+ops=$(grep -o '"ops_sec":{"samples":\[[0-9.]*' "$RESULTS" | head -1 | grep -o '[0-9.]*$')
+if [ -z "$ops" ] || ! awk -v o="$ops" 'BEGIN { exit (o > 0) ? 0 : 1 }'; then
+  echo "DRAGONFLY SMOKE FAIL: memtier measured ${ops:-no} ops/sec — did it reach the server?" >&2
+  exit 1
+fi
 [ -f "$WORK/versions.txt" ] || { echo "DRAGONFLY SMOKE FAIL: no versions.txt" >&2; exit 1; }
 grep -q 'dragonfly_version:df-v1.27.1' "$WORK/versions.txt" || { echo "DRAGONFLY SMOKE FAIL: versions.txt lacks the dragonfly version" >&2; exit 1; }
 grep -q 'memtier_benchmark' "$WORK/versions.txt" || { echo "DRAGONFLY SMOKE FAIL: versions.txt lacks the memtier version" >&2; exit 1; }
