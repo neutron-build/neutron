@@ -44,28 +44,6 @@ DATE=$(date -u +%F)
 RESULTS="$ROOT/results/smoke/$DATE/kv-memtier-dragonfly.smoke.json"
 WORK="$ROOT/work/$DATE/kv-memtier-dragonfly-smoke"
 
-# --- card NB-3 containment relay (disclosed, never silent) ------------
-# run_card.py documents that a contained Acceptance line cannot start a
-# real NBench row ("What a contained command cannot do"):
-# `systemd-run --user --unit ...` — podman::unit_start's exact shape —
-# fails from inside a PID namespace, while `systemd-run --user --wait
-# --pipe` works: the owner-approved podman door, and this card is
-# `Container: podman`. When the probe fails, this script re-execs
-# itself through the door, so the SAME smoke (row run, drivers,
-# digests, checks) executes uncontained and unchanged. On an
-# uncontained host (the gate, a plain shell) the probe succeeds and
-# nothing here runs. Verdict X-6-F1-F1-F2-F1 F4; the card's RESULT
-# discloses this block and escalates it.
-SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-if [ -z "${NB3_RELAYED:-}" ] \
-  && ! systemd-run --user --unit "nb3-probe-$$" --collect --quiet true >/dev/null 2>&1; then
-  echo "dragonfly smoke: contained shell cannot start server rows (X-6-F1-F1-F2-F1 F4);" >&2
-  echo "relaying the unchanged smoke through the owner-approved podman door" >&2
-  exec systemd-run --user --wait --pipe --quiet \
-    env NB3_RELAYED=1 NB_HARNESS="$ROOT" NB_BIN="$BIN" \
-    NBENCH_ROOT="$ROOT" PATH="$PATH" bash "$SCRIPT"
-fi
-
 start=$(date +%s)
 
 mkdir -p "$ROOT/work/$DATE"
