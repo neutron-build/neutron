@@ -709,7 +709,7 @@ expect_ok "gate: GS27: a reason containing the word skip (tools/skip.py) still r
 # configured, which hides it from a diff without --ignore-submodules=none.
 gsb sub spikes/x.txt; git -C "$gs" update-index --add --cacheinfo "160000,$gs_base,nucleus/v3/tools/sub" && git -C "$gs" commit -qm "gs sub: a gitlink under tools/"
 git -C "$gs" config diff.ignoreSubmodules all
-expect_ok "gate: GS28: premise: diff.ignoreSubmodules=all hides the gitlink from a plain diff" bash -c '[ -z "$(git -C "$1" diff --name-only "$2" HEAD)" ]' _ "$gs" "$gs_base"
+expect_ok "gate: GS28: premise: diff.ignoreSubmodules=all hides the gitlink from a plain diff" bash -c '[ -z "$(git -C "$1" diff --name-only "$2" HEAD -- nucleus/v3/tools)" ] && [ -n "$(git -C "$1" diff --name-only --ignore-submodules=none "$2" HEAD -- nucleus/v3/tools)" ]' _ "$gs" "$gs_base"
 gsrun
 expect_ok "gate: GS28: a gitlink under tools/ runs the suite though diff.ignoreSubmodules=all is configured" gs_ran "the change touches the tooling: nucleus/v3/tools/sub"
 git -C "$gs" config --unset diff.ignoreSubmodules
