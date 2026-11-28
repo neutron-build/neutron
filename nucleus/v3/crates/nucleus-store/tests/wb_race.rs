@@ -139,10 +139,25 @@ fn marker_of(p: &Pin<'_, WbFile, StdPrimitives>) -> Result<u8, StoreError> {
     Ok(g.get(MARK).copied().unwrap_or(0))
 }
 
+/// T2's report in `t_pin_load_race_a`: its pin is dropped and it waits for
+/// the controller's message. It goes on the `Pauser`'s channel, the one the
+/// controller reads, through `Pauser::done`, its one sender a thread can
+/// call; the name tells it from T2's own `Done("T2")`.
+const T2_UNPINNED: &str = "T2 unpinned";
+
 /// (a) T1 paused at *resolved* holds its count on the Loading frame; T2
-/// waits for that load, is served T1's frame, dirties it and evicts it
-/// to a fresh slot, `s1` unchanged. T2 must wait first, and a later pin
-/// reads `m2`. LOAD-REF-BEFORE-PUBLISH fails it.
+/// waits for that load, is served T1's frame, dirties it, drops its pin,
+/// reports and waits; only once T1 has joined, its pin dropped, does T2
+/// evict the frame to a fresh slot, `s1` unchanged. T2 must wait first,
+/// and a later pin reads `m2`. LOAD-REF-BEFORE-PUBLISH fails it: T2's
+/// report comes before any `LoadWaiting`.
+///
+/// Why T2's eviction waits for a message (verdict A-3c R1; card
+/// Amendment 2): T1's `pin_read` releases its shared latch before it drops
+/// its pin, and T2 takes the latch as soon as it goes. An eviction before
+/// T1's `drop(p)` meets T1's pin and is rightly refused (I-B12: a pinned
+/// frame is never a victim). The order comes from an event a thread sends,
+/// never from a timed wait or a retry.
 #[test]
 fn t_pin_load_race_a() {
     let (file, pool) = race_pool().unwrap();
@@ -153,11 +168,18 @@ fn t_pin_load_race_a() {
     pool.set_hook(Some(pz.hook()));
     pz.pause_at(LoadResolved, key);
     pz.report(LoadWaiting, key);
-    let t2_work = || -> Result<(), StoreError> {
-        let p = pin(&pool, key, &Hold::nothing())?;
-        s3_touch(&pool, &p, m2)?;
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (pool_ref, reporter) = (&pool, pz.clone());
+    let t2_work = move || -> Result<(), StoreError> {
+        let p = pin(pool_ref, key, &Hold::nothing())?;
+        s3_touch(pool_ref, &p, m2)?;
         drop(p);
-        evict_out(&pool, key)?;
+        // T2 holds nothing: no pin, no latch, no gate, no mutex.
+        reporter.done(T2_UNPINNED);
+        go_rx
+            .recv()
+            .map_err(|_| StoreError::Invalid("the controller left".to_string()))?;
+        evict_out(pool_ref, key)?;
         Ok(())
     };
     let (first, second, r1, r2) = thread::scope(|s| {
@@ -167,11 +189,17 @@ fn t_pin_load_race_a() {
         let (mut second, mut t2) = (None, None);
         if arrived(&first, LoadResolved, key) {
             t2 = Some(spawn(s, &pz, "T2", t2_work));
-            // T2 waiting (its count on T1's frame), or T2's end.
+            // The first of T2 waiting (its count on T1's frame) and T2's
+            // report (it holds nothing); or T2's end, if it failed first.
             second = Some(pz.next_event());
         }
         pz.release_all();
-        (first, second, t1.join(), t2.map(|h| h.join()))
+        // T1 joined: its pin is dropped, so T2's eviction may begin.
+        let r1 = t1.join();
+        // T2 may have ended without waiting, or never started: then no one
+        // receives this, which is no failure.
+        let _ = go_tx.send(());
+        (first, second, r1, t2.map(|h| h.join()))
     });
     assert!(arrived(&first, LoadResolved, key), "{first:?}");
     assert!(
