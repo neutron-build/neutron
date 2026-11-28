@@ -197,6 +197,20 @@ fn sweep_sysbench(p: &Params) -> Vec<Series> {
     ])
 }
 
+fn sweep_ycsb(p: &Params) -> Vec<Series> {
+    // Card NB-2: the YCSB row crosses the same two dimensions as the
+    // sysbench row — workload letters (a–f, the stock core workloads)
+    // x thread counts — in the fixed cross order, so the series list
+    // is reproducible (18 points at the defaults).
+    cross(&[
+        ("workload", p.ycsb_workloads.clone()),
+        (
+            "threads",
+            p.ycsb_threads.iter().map(|t| t.to_string()).collect(),
+        ),
+    ])
+}
+
 fn sweep_kv(p: &Params) -> Vec<Series> {
     cross(&[
         ("appendfsync", p.fsync_modes.clone()),
@@ -286,6 +300,25 @@ pub const ROWS: &[RowDef] = &[
         ["tps" => HigherIsBetter, "qps" => HigherIsBetter,
          "latency_avg_ms" => LowerIsBetter, "p99_ms" => LowerIsBetter],
         sweep_sysbench, no_variant, init: true, final: false, reinit: true
+    ),
+    // NB-2 scope note: this row parses driver-side through the
+    // NB_METRICS protocol (the `VectorSearch` arm — the harness's one
+    // mechanism for driver-written metrics), because the runner's
+    // log-parser dispatch table is outside this card's Touch only
+    // list (the match there is exhaustive; the scope ruling reverted
+    // the one-line arm the first attempt added). The driver extracts
+    // the fixed-format `[OVERALL]`/`[READ]` lines that `parse_ycsb` —
+    // the fixture-pinned reference parser in parse.rs — reads, fails
+    // loudly when the mandatory throughput line is missing, and is
+    // itself under test: parse.rs's `driver` module executes the real
+    // script over the recorded fixtures and holds its output to the
+    // reference parser (verdict NB-2, rework 1).
+    row!(
+        "oltp-ycsb-pg17", "postgres17", VectorSearch,
+        "YCSB core A–F over pgwire (JDBC) on PG17, threads 1/16/64 — the C-9 comparison row, Nucleus speaks pgwire (§3.7)",
+        ["ops_sec" => HigherIsBetter, "p99_read_us" => LowerIsBetter,
+         "avg_read_us" => LowerIsBetter],
+        sweep_ycsb, no_variant, init: true, final: false, reinit: true
     ),
     row!(
         "kv-memtier-valkey8", "valkey8", Memtier,
@@ -827,6 +860,82 @@ mod tests {
         assert!(starts.contains(&Some(SYNC_OFF.to_string())));
         // 2 modes x 3 client counts = 6 config points
         assert_eq!((row.sweep)(&p).len(), 6);
+    }
+
+    #[test]
+    fn sysbench_and_ycsb_rows_fix_synchronous_commit_by_container_default() {
+        // The sysbench row's README states the rule; the YCSB row
+        // (card NB-2) inherits it: `variant_of` is `no_variant`, so the
+        // server always starts with the image default
+        // (synchronous_commit=on) — the durability pairing is owned by
+        // the pgbench row, and provenance records the fixed setting.
+        let p = Params::default();
+        for id in ["oltp-sysbench-pg17", "oltp-ycsb-pg17"] {
+            let row = RowDef::find(id).expect("row");
+            for s in (row.sweep)(&p) {
+                assert!((row.variant_of)(&s).is_none(), "{id}: unexpected variant");
+            }
+            let starts: Vec<_> = plan(row, &p)
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Start { variant } => Some(variant.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                starts.iter().all(|v| v.is_none()),
+                "{id}: a variant leaked into a start step"
+            );
+        }
+    }
+
+    #[test]
+    fn ycsb_plan_crosses_workloads_with_threads_and_reinits_each_series() {
+        // Card NB-2 mutants SWEEP-NOT-CROSS and REINIT-DROPPED: the
+        // sweep is the full cross product (6 workload letters x 3 thread
+        // counts = 18 series) in the fixed cross order — zipping instead
+        // of crossing, or dropping the thread dimension, fails the exact
+        // order list below — and every series gets its own reinit, so
+        // series 2+ never inherit the previous series' mutated table
+        // (YCSB load generates fresh random field values; the digest
+        // pins the row-count shape, the reinit restores it).
+        let p = Params::default();
+        let row = RowDef::find("oltp-ycsb-pg17").expect("row");
+        let series = (row.sweep)(&p);
+        assert_eq!(series.len(), 18);
+        let expected: Vec<Series> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .flat_map(|w| {
+                [1u64, 16, 64].iter().map(move |t| {
+                    vec![
+                        kv_pair("workload", w.to_string()),
+                        kv_pair("threads", t.to_string()),
+                    ]
+                })
+            })
+            .collect();
+        assert_eq!(series, expected, "series order must be the fixed cross");
+        let steps = plan(row, &p);
+        let reinits = steps
+            .iter()
+            .filter(|s| matches!(s, Step::Exec { mode: "reinit", .. }))
+            .count();
+        assert_eq!(reinits, 18, "one reinit per series");
+        // Overrides narrow the cross the same way as every other row.
+        let tiny = Params::with_overrides(&[
+            ("ycsb_workloads", "a"),
+            ("ycsb_threads", "1"),
+            ("runs", "1"),
+        ])
+        .expect("overrides");
+        assert_eq!((row.sweep)(&tiny).len(), 1);
+        assert_eq!(
+            plan(row, &tiny)
+                .iter()
+                .filter(|s| matches!(s, Step::Exec { mode: "reinit", .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

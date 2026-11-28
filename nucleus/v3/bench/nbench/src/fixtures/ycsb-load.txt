@@ -1,0 +1,33 @@
+/opt/java/openjdk/bin/java  -classpath /opt/ycsb/conf:/opt/ycsb/lib/HdrHistogram-2.1.4.jar:/opt/ycsb/lib/core-0.17.0.jar:/opt/ycsb/lib/htrace-core4-4.1.0-incubating.jar:/opt/ycsb/lib/jackson-core-asl-1.9.4.jar:/opt/ycsb/lib/jackson-mapper-asl-1.9.4.jar:/opt/ycsb/jdbc-binding/conf:/opt/ycsb/jdbc-binding/lib/commons-collections-3.2.1.jar:/opt/ycsb/jdbc-binding/lib/commons-lang-2.4.jar:/opt/ycsb/jdbc-binding/lib/commons-pool-1.5.4.jar:/opt/ycsb/jdbc-binding/lib/geronimo-jms_1.1_spec-1.1.1.jar:/opt/ycsb/jdbc-binding/lib/geronimo-jta_1.1_spec-1.1.1.jar:/opt/ycsb/jdbc-binding/lib/jdbc-binding-0.17.0.jar:/opt/ycsb/jdbc-binding/lib/openjpa-jdbc-2.1.1.jar:/opt/ycsb/jdbc-binding/lib/openjpa-kernel-2.1.1.jar:/opt/ycsb/jdbc-binding/lib/openjpa-lib-2.1.1.jar:/opt/ycsb/jdbc-binding/lib/postgresql-42.7.6.jar:/opt/ycsb/jdbc-binding/lib/serp-1.13.1.jar site.ycsb.Client -load -db site.ycsb.db.JdbcDBClient -p db.driver=org.postgresql.Driver -p db.url=jdbc:postgresql://127.0.0.1:5432/nbench -p db.user=postgres -p db.passwd=postgres -P /opt/ycsb/workloads/workloada -p recordcount=1000 -p threadcount=1
+Command line: -load -db site.ycsb.db.JdbcDBClient -p db.driver=org.postgresql.Driver -p db.url=jdbc:postgresql://127.0.0.1:5432/nbench -p db.user=postgres -p db.passwd=postgres -P /opt/ycsb/workloads/workloada -p recordcount=1000 -p threadcount=1
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+Adding shard node URL: jdbc:postgresql://127.0.0.1:5432/nbench
+Using shards: 1, batchSize:-1, fetchSize: -1
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+[OVERALL], RunTime(ms), 425
+[OVERALL], Throughput(ops/sec), 2352.9411764705883
+[TOTAL_GCS_G1_Young_Generation], Count, 1
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 4
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.9411764705882352
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 1
+[TOTAL_GC_TIME], Time(ms), 4
+[TOTAL_GC_TIME_%], Time(%), 0.9411764705882352
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 249.0
+[CLEANUP], MinLatency(us), 249
+[CLEANUP], MaxLatency(us), 249
+[CLEANUP], 95thPercentileLatency(us), 249
+[CLEANUP], 99thPercentileLatency(us), 249
+[INSERT], Operations, 1000
+[INSERT], AverageLatency(us), 322.18
+[INSERT], MinLatency(us), 165
+[INSERT], MaxLatency(us), 7935
+[INSERT], 95thPercentileLatency(us), 547
+[INSERT], 99thPercentileLatency(us), 910
+[INSERT], Return=OK, 1000

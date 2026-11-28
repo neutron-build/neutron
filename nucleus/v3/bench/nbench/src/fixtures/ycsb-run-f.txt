@@ -1,0 +1,48 @@
+Command line: -t -db StandinTable -s -P /home/tyler/.cache/nv3-cards/NB-2/nucleus/v3/bench/nbench/work/ycsb-0.17.0/workloads/workloadf -p recordcount=1000 -p operationcount=1000 -p threadcount=1
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-11-28 01:47:08:013 0 sec: 0 operations; est completion in 0 second [READ: Count=1, Max=352, Min=352, Avg=352, 90=352, 99=352, 99.9=352, 99.99=352] [READ-MODIFY-WRITE: Count=3, Max=8831, Min=25, Avg=2959.67, 90=8831, 99=8831, 99.9=8831, 99.99=8831] [UPDATE: Count=49, Max=1, Min=0, Avg=0.02, 90=0, 99=1, 99.9=1, 99.99=1] 
+2026-11-28 01:47:08:028 0 sec: 1000 operations; 30303.03 current ops/sec; [READ: Count=999, Max=4, Min=0, Avg=0.01, 90=0, 99=0, 99.9=3, 99.99=4] [READ-MODIFY-WRITE: Count=482, Max=157, Min=1, Avg=6.3, 90=16, 99=57, 99.9=157, 99.99=157] [CLEANUP: Count=1, Max=121, Min=121, Avg=121, 90=121, 99=121, 99.9=121, 99.99=121] [UPDATE: Count=436, Max=3, Min=0, Avg=0.01, 90=0, 99=0, 99.9=3, 99.99=3] 
+[OVERALL], RunTime(ms), 34
+[OVERALL], Throughput(ops/sec), 29411.764705882353
+[TOTAL_GCS_G1_Young_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.0
+[TOTAL_GCS_G1_Concurrent_GC], Count, 0
+[TOTAL_GC_TIME_G1_Concurrent_GC], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Concurrent_GC], Time(%), 0.0
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 0
+[TOTAL_GC_TIME], Time(ms), 0
+[TOTAL_GC_TIME_%], Time(%), 0.0
+[READ], Operations, 1000
+[READ], AverageLatency(us), 0.36
+[READ], MinLatency(us), 0
+[READ], MaxLatency(us), 352
+[READ], 95thPercentileLatency(us), 0
+[READ], 99thPercentileLatency(us), 0
+[READ], Return=OK, 1000
+[READ-MODIFY-WRITE], Operations, 485
+[READ-MODIFY-WRITE], AverageLatency(us), 24.57319587628866
+[READ-MODIFY-WRITE], MinLatency(us), 1
+[READ-MODIFY-WRITE], MaxLatency(us), 8831
+[READ-MODIFY-WRITE], 95thPercentileLatency(us), 25
+[READ-MODIFY-WRITE], 99thPercentileLatency(us), 67
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 121.0
+[CLEANUP], MinLatency(us), 121
+[CLEANUP], MaxLatency(us), 121
+[CLEANUP], 95thPercentileLatency(us), 121
+[CLEANUP], 99thPercentileLatency(us), 121
+[UPDATE], Operations, 485
+[UPDATE], AverageLatency(us), 0.012371134020618556
+[UPDATE], MinLatency(us), 0
+[UPDATE], MaxLatency(us), 3
+[UPDATE], 95thPercentileLatency(us), 0
+[UPDATE], 99thPercentileLatency(us), 0
+[UPDATE], Return=OK, 485

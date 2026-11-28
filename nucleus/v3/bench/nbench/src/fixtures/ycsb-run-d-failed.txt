@@ -1,0 +1,49 @@
+Command line: -t -db StandinTable -s -P /home/tyler/.cache/nv3-cards/NB-2/nucleus/v3/bench/nbench/work/ycsb-0.17.0/workloads/workloadd -p recordcount=1000 -p operationcount=1000 -p threadcount=1
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-11-28 01:47:07:221 0 sec: 34 operations; ∞ current ops/sec; est completion in 0 second [READ: Count=61, Max=343, Min=0, Avg=6.05, 90=0, 99=26, 99.9=343, 99.99=343] [INSERT: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] [INSERT-FAILED: Count=12, Max=18, Min=0, Avg=2.67, 90=7, 99=18, 99.9=18, 99.99=18] 
+2026-11-28 01:47:07:231 0 sec: 1000 operations; 32200 current ops/sec; [READ: Count=891, Max=3, Min=0, Avg=0.01, 90=0, 99=0, 99.9=2, 99.99=3] [CLEANUP: Count=1, Max=104, Min=104, Avg=104, 90=104, 99=104, 99.9=104, 99.99=104] [INSERT: Count=4, Max=74, Min=19, Avg=33.5, 90=74, 99=74, 99.9=74, 99.99=74] [INSERT-FAILED: Count=32, Max=2, Min=0, Avg=0.22, 90=1, 99=2, 99.9=2, 99.99=2] 
+[OVERALL], RunTime(ms), 30
+[OVERALL], Throughput(ops/sec), 33333.333333333336
+[TOTAL_GCS_G1_Young_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.0
+[TOTAL_GCS_G1_Concurrent_GC], Count, 0
+[TOTAL_GC_TIME_G1_Concurrent_GC], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Concurrent_GC], Time(%), 0.0
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 0
+[TOTAL_GC_TIME], Time(ms), 0
+[TOTAL_GC_TIME_%], Time(%), 0.0
+[READ], Operations, 952
+[READ], AverageLatency(us), 0.3939075630252101
+[READ], MinLatency(us), 0
+[READ], MaxLatency(us), 343
+[READ], 95thPercentileLatency(us), 0
+[READ], 99thPercentileLatency(us), 0
+[READ], Return=OK, 952
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 104.0
+[CLEANUP], MinLatency(us), 104
+[CLEANUP], MaxLatency(us), 104
+[CLEANUP], 95thPercentileLatency(us), 104
+[CLEANUP], 99thPercentileLatency(us), 104
+[INSERT], Operations, 4
+[INSERT], AverageLatency(us), 33.5
+[INSERT], MinLatency(us), 19
+[INSERT], MaxLatency(us), 74
+[INSERT], 95thPercentileLatency(us), 74
+[INSERT], 99thPercentileLatency(us), 74
+[INSERT], Return=OK, 4
+[INSERT], Return=ERROR, 44
+[INSERT-FAILED], Operations, 44
+[INSERT-FAILED], AverageLatency(us), 0.8863636363636364
+[INSERT-FAILED], MinLatency(us), 0
+[INSERT-FAILED], MaxLatency(us), 18
+[INSERT-FAILED], 95thPercentileLatency(us), 2
+[INSERT-FAILED], 99thPercentileLatency(us), 18

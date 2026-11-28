@@ -1,0 +1,42 @@
+Command line: -t -db StandinTable -s -P /home/tyler/.cache/nv3-cards/NB-2/nucleus/v3/bench/nbench/work/ycsb-0.17.0/workloads/workloade -p recordcount=1000 -p operationcount=1000 -p threadcount=1
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-11-28 01:47:07:751 0 sec: 1000 operations; ∞ current ops/sec; [CLEANUP: Count=1, Max=88, Min=88, Avg=88, 90=88, 99=88, 99.9=88, 99.99=88] [INSERT: Count=59, Max=47, Min=8, Avg=11.22, 90=13, 99=17, 99.9=47, 99.99=47] [SCAN: Count=941, Max=172, Min=0, Avg=0.2, 90=0, 99=0, 99.9=13, 99.99=172] 
+2026-11-28 01:47:07:752 0 sec: 1000 operations; 0 current ops/sec; [CLEANUP: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] [INSERT: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] [SCAN: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] 
+[OVERALL], RunTime(ms), 18
+[OVERALL], Throughput(ops/sec), 55555.555555555555
+[TOTAL_GCS_G1_Young_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.0
+[TOTAL_GCS_G1_Concurrent_GC], Count, 0
+[TOTAL_GC_TIME_G1_Concurrent_GC], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Concurrent_GC], Time(%), 0.0
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 0
+[TOTAL_GC_TIME], Time(ms), 0
+[TOTAL_GC_TIME_%], Time(%), 0.0
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 88.0
+[CLEANUP], MinLatency(us), 88
+[CLEANUP], MaxLatency(us), 88
+[CLEANUP], 95thPercentileLatency(us), 88
+[CLEANUP], 99thPercentileLatency(us), 88
+[INSERT], Operations, 59
+[INSERT], AverageLatency(us), 11.220338983050848
+[INSERT], MinLatency(us), 8
+[INSERT], MaxLatency(us), 47
+[INSERT], 95thPercentileLatency(us), 14
+[INSERT], 99thPercentileLatency(us), 17
+[INSERT], Return=OK, 59
+[SCAN], Operations, 941
+[SCAN], AverageLatency(us), 0.19766206163655686
+[SCAN], MinLatency(us), 0
+[SCAN], MaxLatency(us), 172
+[SCAN], 95thPercentileLatency(us), 0
+[SCAN], 99thPercentileLatency(us), 0
+[SCAN], Return=OK, 941

@@ -1,0 +1,42 @@
+Command line: -t -db StandinTable -s -P /home/tyler/.cache/nv3-cards/NB-2/nucleus/v3/bench/nbench/work/ycsb-0.17.0/workloads/workloadd -p recordcount=1000 -p operationcount=1000 -p threadcount=1
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-11-28 01:47:07:105 0 sec: 1000 operations; ∞ current ops/sec; [READ: Count=956, Max=8, Min=0, Avg=0.01, 90=0, 99=0, 99.9=2, 99.99=8] [CLEANUP: Count=1, Max=141, Min=141, Avg=141, 90=141, 99=141, 99.9=141, 99.99=141] [INSERT: Count=44, Max=218, Min=10, Avg=23.89, 90=26, 99=218, 99.9=218, 99.99=218] 
+2026-11-28 01:47:07:108 0 sec: 1000 operations; 0 current ops/sec; [READ: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] [CLEANUP: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] [INSERT: Count=0, Max=0, Min=9223372036854775807, Avg=NaN, 90=0, 99=0, 99.9=0, 99.99=0] 
+[OVERALL], RunTime(ms), 20
+[OVERALL], Throughput(ops/sec), 50000.0
+[TOTAL_GCS_G1_Young_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.0
+[TOTAL_GCS_G1_Concurrent_GC], Count, 0
+[TOTAL_GC_TIME_G1_Concurrent_GC], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Concurrent_GC], Time(%), 0.0
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 0
+[TOTAL_GC_TIME], Time(ms), 0
+[TOTAL_GC_TIME_%], Time(%), 0.0
+[READ], Operations, 956
+[READ], AverageLatency(us), 0.011506276150627616
+[READ], MinLatency(us), 0
+[READ], MaxLatency(us), 8
+[READ], 95thPercentileLatency(us), 0
+[READ], 99thPercentileLatency(us), 0
+[READ], Return=OK, 956
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 141.0
+[CLEANUP], MinLatency(us), 141
+[CLEANUP], MaxLatency(us), 141
+[CLEANUP], 95thPercentileLatency(us), 141
+[CLEANUP], 99thPercentileLatency(us), 141
+[INSERT], Operations, 44
+[INSERT], AverageLatency(us), 23.886363636363637
+[INSERT], MinLatency(us), 10
+[INSERT], MaxLatency(us), 218
+[INSERT], 95thPercentileLatency(us), 29
+[INSERT], 99thPercentileLatency(us), 218
+[INSERT], Return=OK, 44

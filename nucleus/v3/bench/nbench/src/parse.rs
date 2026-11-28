@@ -7,6 +7,13 @@
 //!
 //! The fixtures in `src/fixtures/` are real captured outputs (see each
 //! fixture's first line for the tool version).
+//!
+//! One row publishes driver-side (card NB-2: `oltp-ycsb-pg17` writes the
+//! NB_METRICS JSON itself — the row's scope note in rows.rs explains why),
+//! so its published numbers are tested by executing its driver: the
+//! [`driver`] module at the bottom of this file runs the real script over
+//! the recorded fixtures and holds its output to [`parse_ycsb`], the
+//! fixture-pinned reference parser (verdict NB-2, rework 1).
 
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -205,6 +212,73 @@ pub fn parse_sysbench(log: &str) -> Result<ParsedRun> {
     }
     if let Ok(p99) = last_number_after(&lines, "99th percentile:", "p99_ms") {
         out.push(("p99_ms".to_string(), p99));
+    }
+    Ok(ParsedRun {
+        metrics: out,
+        digest: None,
+    })
+}
+
+/// Parse a YCSB 0.17.0 final measurement report (card NB-2, row
+/// `oltp-ycsb-pg17`).
+///
+/// **Reference parser for the driver's own extraction.** The row
+/// publishes driver-side through the NB_METRICS protocol (the row's
+/// scope note in rows.rs: the runner's log-parser dispatch is outside
+/// card NB-2's Touch only list), so this function never runs in a
+/// measured pass. `workloads/oltp-ycsb-pg17/driver.sh` extracts the
+/// same fixed-format lines from the tee'd log and writes the metrics
+/// JSON that becomes the row's numbers. This function stays the
+/// fixture-pinned definition of the format, and the [`driver`] tests
+/// below hold the driver to it: they execute the real script over the
+/// recorded fixtures and require its NB_METRICS output to equal this
+/// function's result (verdict NB-2, rework 1), so the card's
+/// PARSER-OPS-DROPPED and PARSER-P99-AS-AVG mutants fail `cargo test`
+/// on the published path, not only here.
+///
+/// A run ends with `[SECTION], Metric, Value` lines; the `-s` status
+/// lines (every 10 s), the launcher's java-command echo and the
+/// `2>&1 | tee` contract land in the same log but carry no report lines:
+///
+/// ```text
+/// [OVERALL], RunTime(ms), 130054
+/// [OVERALL], Throughput(ops/sec), 7688.8125763666825
+/// [READ], Operations, 653952
+/// [READ], AverageLatency(us), 1298.4990136212595
+/// [READ], MinLatency(us), 560
+/// [READ], MaxLatency(us), 63263
+/// [READ], 95thPercentileLatency(us), 2247
+/// [READ], 99thPercentileLatency(us), 5335
+/// [READ], Return=OK, 653952
+/// [UPDATE], Operations, 131138
+/// [UPDATE], AverageLatency(us), 2360.36
+/// [UPDATE], 99thPercentileLatency(us), 8438
+/// [UPDATE], Return=OK, 131138
+/// [CLEANUP], Operations, 1
+/// ```
+///
+/// `[OVERALL]` is the one section every series carries, so a missing
+/// `Throughput(ops/sec)` line is an error, never a zero (card NB-2
+/// mutant PARSER-OPS-DROPPED). Read latencies are optional *by mix*:
+/// every stock workload but E carries a `[READ]` section — workload F
+/// reads (its plain reads plus the read half of each
+/// read-modify-write) and inserts nothing — while E (scan-heavy)
+/// carries `[SCAN]` and `[INSERT]`, so only E's series have no
+/// `avg_read_us`/`p99_read_us`. Absent fields are omitted, never
+/// invented; `[SCAN]`, `[READ-MODIFY-WRITE]` and `[UPDATE]` latencies
+/// never feed the read metrics. The last occurrence of each line wins,
+/// so a re-run appended to one log never reports the earlier
+/// attempt's numbers.
+#[cfg(test)]
+pub fn parse_ycsb(log: &str) -> Result<ParsedRun> {
+    let lines: Vec<&str> = log.lines().collect();
+    let ops_sec = last_number_after(&lines, "[OVERALL], Throughput(ops/sec)", "ops_sec")?;
+    let mut out = vec![("ops_sec".to_string(), ops_sec)];
+    if let Ok(avg) = last_number_after(&lines, "[READ], AverageLatency(us)", "avg_read_us") {
+        out.push(("avg_read_us".to_string(), avg));
+    }
+    if let Ok(p99) = last_number_after(&lines, "[READ], 99thPercentileLatency(us)", "p99_read_us") {
+        out.push(("p99_read_us".to_string(), p99));
     }
     Ok(ParsedRun {
         metrics: out,
@@ -578,6 +652,144 @@ mod tests {
     }
 
     #[test]
+    fn ycsb_real_run_fixture() {
+        // Real captured output (YCSB 0.17.0 over pgwire/JDBC against
+        // PG 17, card NB-2 smoke-size run; the file's first lines are
+        // the launcher's java-command echo and "YCSB Client 0.17.0").
+        // The values are the fixture's own, pinned exactly — the
+        // real output carries all three row metrics, so none is
+        // dropped (card NB-2 Work item 4: the fixture is recorded,
+        // not invented).
+        let log = include_str!("fixtures/ycsb-run.txt");
+        let parsed = parse_ycsb(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert!(
+            (get("ops_sec") - 2801.1204481792715).abs() < 1e-9,
+            "{}",
+            get("ops_sec")
+        );
+        assert!((get("avg_read_us") - 127.0767754318618).abs() < 1e-9);
+        assert_eq!(get("p99_read_us"), 440.0);
+        // p99 and avg are distinct real fields, not one value reused
+        assert_ne!(get("p99_read_us"), get("avg_read_us"));
+        // exactly the row's three metrics: [UPDATE]/[CLEANUP]/GC
+        // sections must not leak into the row's metric set
+        let names: Vec<&str> = parsed.metrics.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(names, vec!["ops_sec", "avg_read_us", "p99_read_us"]);
+        // the -s status line and the launcher echo carry no brackets
+        // and must not confuse the parser (the fixture has both)
+    }
+
+    #[test]
+    fn ycsb_report_sections_and_order() {
+        // Card NB-2: [OVERALL] Throughput is the one mandatory metric;
+        // [READ] latencies come from the [READ] section only, and the
+        // LAST occurrence of each line wins (a re-run appended to one
+        // log must not report the earlier attempt's numbers).
+        let log = "[OVERALL], RunTime(ms), 1000\n\
+                   [OVERALL], Throughput(ops/sec), 100.5\n\
+                   [READ], AverageLatency(us), 111.0\n\
+                   [READ], 99thPercentileLatency(us), 222.0\n\
+                   [OVERALL], Throughput(ops/sec), 7688.81\n\
+                   [READ], AverageLatency(us), 1298.5\n\
+                   [READ], 99thPercentileLatency(us), 5335.0\n";
+        let parsed = parse_ycsb(log).expect("parse");
+        let get = |p: &ParsedRun, k: &str| {
+            p.metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get(&parsed, "ops_sec"), 7688.81);
+        assert_eq!(get(&parsed, "avg_read_us"), 1298.5);
+        assert_eq!(get(&parsed, "p99_read_us"), 5335.0);
+    }
+
+    #[test]
+    fn ycsb_only_the_scan_heavy_mix_lacks_read_metrics() {
+        // The stock mixes, on real 0.17.0 reports (recorded with the
+        // real client; the `driver` module below says how):
+        // - E is scan-heavy: `[SCAN]` + `[INSERT]` and no `[READ]`, so
+        //   the row's read-latency metrics are absent — omitted, never
+        //   invented — and the [SCAN] latencies must not feed them;
+        // - F reads, read-modifies-writes and inserts nothing: its
+        //   report carries `[READ]` (plus `[READ-MODIFY-WRITE]` and
+        //   `[UPDATE]`), so its series do carry the read metrics, from
+        //   the [READ] section only (verdict NB-2 NIT: F has a [READ]
+        //   section and no [INSERT]).
+        let get = |p: &ParsedRun, k: &str| {
+            p.metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        let scan_mix = parse_ycsb(include_str!("fixtures/ycsb-run-e.txt")).expect("parse E");
+        assert_eq!(
+            scan_mix.metrics.len(),
+            1,
+            "ops_sec only: {:?}",
+            scan_mix.metrics
+        );
+        assert_eq!(
+            scan_mix.metrics[0],
+            ("ops_sec".to_string(), 55555.555555555555)
+        );
+
+        let rmw_mix = parse_ycsb(include_str!("fixtures/ycsb-run-f.txt")).expect("parse F");
+        let names: Vec<&str> = rmw_mix.metrics.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(names, vec!["ops_sec", "avg_read_us", "p99_read_us"]);
+        // the [READ] lines' own values — not the [READ-MODIFY-WRITE]
+        // ones (24.573…, 67) or the [UPDATE] ones
+        assert_eq!(get(&rmw_mix, "ops_sec"), 29411.764705882353);
+        assert_eq!(get(&rmw_mix, "avg_read_us"), 0.36);
+        assert_eq!(get(&rmw_mix, "p99_read_us"), 0.0);
+    }
+
+    #[test]
+    fn ycsb_missing_throughput_is_an_error() {
+        // A silent format change in the tool must fail the run, never
+        // publish a zero (card NB-2 mutant PARSER-OPS-DROPPED: the
+        // parser that never reads [OVERALL] fails here).
+        let log = "[OVERALL], RunTime(ms), 1000\n\
+                   [READ], AverageLatency(us), 10.0\n";
+        let err = parse_ycsb(log).expect_err("must error without Throughput");
+        let text = format!("{err}");
+        assert!(text.contains("ops_sec"), "names the missing metric: {text}");
+        assert!(parse_ycsb("10 sec: 100 operations\n").is_err());
+    }
+
+    #[test]
+    fn ycsb_percentiles_are_not_averages() {
+        // Distinct pinned values: a parser that reports
+        // AverageLatency(us) as p99_read_us (card NB-2 mutant
+        // PARSER-P99-AS-AVG) fails both assertions below.
+        let log = "[OVERALL], Throughput(ops/sec), 500.0\n\
+                   [READ], AverageLatency(us), 100.0\n\
+                   [READ], 99thPercentileLatency(us), 9900.0\n";
+        let parsed = parse_ycsb(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get("avg_read_us"), 100.0);
+        assert_eq!(get("p99_read_us"), 9900.0);
+        assert_ne!(get("avg_read_us"), get("p99_read_us"));
+    }
+
+    #[test]
     fn memtier_totals_table_real_format() {
         // Real captured output (memtier 2.5.2, card B-0 run), trimmed of
         // the per-second progress line.
@@ -797,5 +1009,791 @@ mod probe {
         let log = include_str!("fixtures/memtier-run2.txt");
         let parsed = parse_memtier(log);
         assert!(parsed.is_ok(), "probe failed: {:?}", parsed.err());
+    }
+}
+
+/// Tests that execute the row's own scripts (card NB-2 rework 1: verdict
+/// NB-2 R1 and R2).
+///
+/// `oltp-ycsb-pg17` publishes driver-side: `workloads/oltp-ycsb-pg17/
+/// driver.sh` writes the NB_METRICS JSON the runner reads, and the same
+/// script is what refuses a pass with failed operations and what
+/// restores the dataset an earlier pass grew; `digest.sh` hashes the
+/// server's own row count. The only honest test of those code paths
+/// runs the real scripts. Each test executes one with a cleared
+/// environment whose PATH starts with a stub `nb-podman` and does not
+/// include the real wrapper, so no call can start anything: the stub
+/// records its arguments and replays a recorded YCSB log in place of the
+/// client. The scripts are bash, so this is unix-only.
+///
+/// The fixtures are all real output of YCSB Client 0.17.0; the `-db`
+/// class on each file's `Command line:` line says how it was produced:
+/// - `ycsb-run.txt` and `ycsb-load.txt`: the pinned image against
+///   PostgreSQL 17 through JDBC (`site.ycsb.db.JdbcDBClient`) — the run
+///   phase and the load phase of the 2026-11-27 real smoke-size run;
+/// - `ycsb-run-d.txt`, `ycsb-run-d-failed.txt`, `ycsb-run-e.txt`,
+///   `ycsb-run-f.txt`: the same client from the pinned tarball, run
+///   offline with `fixtures/ycsb-standin/StandinTable.java` (`-db
+///   StandinTable`), a file-backed table whose insert returns ERROR on
+///   a duplicate key, as the JDBC binding does on PostgreSQL's unique
+///   violation. The report shapes, the `Return=` and the `-FAILED`
+///   lines are the client's own; the latencies are the stand-in's and
+///   mean nothing. `ycsb-run-d-failed.txt` is a second workload-D pass
+///   on the table the first pass had grown — the failure the verdict
+///   found on the real row.
+#[cfg(all(test, unix))]
+mod driver {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Recorded logs the stub replays, by YCSB phase.
+    const RUN_A: &str = include_str!("fixtures/ycsb-run.txt");
+    const LOAD: &str = include_str!("fixtures/ycsb-load.txt");
+    const RUN_D: &str = include_str!("fixtures/ycsb-run-d.txt");
+    const RUN_D_FAILED: &str = include_str!("fixtures/ycsb-run-d-failed.txt");
+    const RUN_E: &str = include_str!("fixtures/ycsb-run-e.txt");
+    const RUN_F: &str = include_str!("fixtures/ycsb-run-f.txt");
+
+    /// The stand-in for `bin/nb-podman`. Every call is appended to
+    /// `$NB_STUB_CALLS` (one line, arguments joined by spaces) and each
+    /// kind of call the driver makes is answered from the test's
+    /// variables instead of starting a container. With `NB_STUB_TABLE`
+    /// set the row count lives in that file instead: a sequence of
+    /// passes can then be replayed against a table that grows.
+    const STUB: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${NB_STUB_CALLS:?}"
+table=${NB_STUB_TABLE:-}
+rowcount() {
+  if [ -n "$table" ] && [ -s "$table" ]; then cat "$table"; else printf '0\n'; fi
+}
+add() { [ -n "$table" ] || return 0; printf '%s\n' "$(( $(rowcount) + $1 ))" > "$table"; }
+truncate() { [ -n "$table" ] || return 0; printf '0\n' > "$table"; }
+case ${1:-} in
+  exec)
+    case $* in
+      *"postgres --version"*) printf 'postgres (PostgreSQL) %s\n' "${NB_STUB_PG_VERSION:?}" ;;
+      *"SELECT version()"*) printf 'PostgreSQL %s on x86_64-pc-linux-gnu\n' "${NB_STUB_PG_VERSION}" ;;
+      *"TRUNCATE usertable"*) truncate ;;
+      *"SELECT count(*) FROM usertable"*)
+        if [ -n "$table" ]; then rowcount; else printf '%s\n' "${NB_STUB_ROWS:?}"; fi ;;
+    esac
+    ;;
+  run)
+    case $* in
+      *"java -version"*)
+        printf 'openjdk version "%s"\nYCSB release: ycsb-0.17.0\n' "${NB_STUB_JAVA_VERSION:?}" ;;
+      *" load jdbc "*)
+        cat "${NB_STUB_LOAD:?}"
+        for a in "$@"; do case $a in recordcount=*) n=${a#recordcount=} ;; esac; done
+        add "${n:-0}" ;;
+      *" run jdbc "*)
+        cat "${NB_STUB_RUN:?}"
+        n=$(grep -E '^\[INSERT\], Return=OK, ' "${NB_STUB_RUN}" | tail -1 | sed 's/.*,//' | tr -d ' ')
+        add "${n:-0}" ;;
+    esac
+    ;;
+esac
+"#;
+
+    /// What one driver execution is given.
+    struct Scenario {
+        /// `NB_MODE`: init, reinit, cold, warmup or run.
+        mode: &'static str,
+        /// `NB_SERIES` (`k=v,k=v`; empty for init).
+        series: &'static str,
+        /// The server's answer to `SELECT count(*) FROM usertable`.
+        rows: &'static str,
+        /// The log replayed for a YCSB `load` call.
+        load: String,
+        /// The log replayed for a YCSB `run` call.
+        run: String,
+    }
+
+    impl Scenario {
+        /// A measured pass of `series` over a table of `rows` rows.
+        fn measured(
+            mode: &'static str,
+            series: &'static str,
+            rows: &'static str,
+            run: &str,
+        ) -> Self {
+            Scenario {
+                mode,
+                series,
+                rows,
+                load: LOAD.to_string(),
+                run: run.to_string(),
+            }
+        }
+
+        /// init or reinit: the load phase, no measured pass.
+        fn load_phase(mode: &'static str, series: &'static str, load: &str) -> Self {
+            Scenario {
+                mode,
+                series,
+                rows: "",
+                load: load.to_string(),
+                run: String::new(),
+            }
+        }
+    }
+
+    /// What one driver execution produced.
+    struct Outcome {
+        success: bool,
+        stderr: String,
+        /// The stub's calls, in order.
+        calls: Vec<String>,
+        /// `NB_LOG`, the tee'd pass log.
+        log: String,
+        /// `NB_METRICS`, when the driver wrote it.
+        metrics: Option<String>,
+        /// `${NB_LOG}.reload`, when the driver reloaded the dataset.
+        reload_log: Option<String>,
+        /// `versions.txt`, when the driver wrote it.
+        versions: Option<String>,
+    }
+
+    impl Outcome {
+        /// Index of the first recorded call whose arguments contain
+        /// `needle`.
+        fn call_index(&self, needle: &str) -> Option<usize> {
+            self.calls.iter().position(|c| c.contains(needle))
+        }
+
+        fn has_call(&self, needle: &str) -> bool {
+            self.call_index(needle).is_some()
+        }
+    }
+
+    fn read_if_exists(path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    // The helpers below return their failures instead of unwrapping:
+    // the crate's lint policy (`expect_used = "deny"`, relaxed only
+    // inside `#[test]` bodies) applies to them too.
+
+    /// A private, initially empty directory for one execution.
+    fn tmpdir(name: &str) -> std::result::Result<PathBuf, String> {
+        let dir = std::env::temp_dir()
+            .join("nbench-tests")
+            .join(format!("{}-ycsb-driver-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+
+    /// Write the [`STUB`] into `dir` and return its directory, to go
+    /// first on PATH.
+    fn stub_bin(dir: &Path) -> std::result::Result<PathBuf, String> {
+        let io = |e: std::io::Error| e.to_string();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).map_err(io)?;
+        let stub = bin.join("nb-podman");
+        std::fs::write(&stub, STUB).map_err(io)?;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
+        Ok(bin)
+    }
+
+    /// Execute the real `driver.sh` once under `sc`, the way the
+    /// runner does (its `exec_driver` environment), with `nb-podman`
+    /// replaced by [`STUB`].
+    fn run_driver(
+        name: &str,
+        sc: &Scenario,
+        recordcount: &str,
+        operations: &str,
+    ) -> std::result::Result<Outcome, String> {
+        run_driver_on(name, sc, recordcount, operations, None)
+    }
+
+    /// [`run_driver`] with one addition: when `table` is given, the stub
+    /// keeps the row count in that file, shared by every call of one
+    /// sequence, instead of answering a fixed count.
+    fn run_driver_on(
+        name: &str,
+        sc: &Scenario,
+        recordcount: &str,
+        operations: &str,
+        table: Option<&Path>,
+    ) -> std::result::Result<Outcome, String> {
+        let io = |e: std::io::Error| e.to_string();
+        let dir = tmpdir(name)?;
+        let bin = stub_bin(&dir)?;
+        let stub_load = dir.join("stub-load.log");
+        let stub_run = dir.join("stub-run.log");
+        std::fs::write(&stub_load, &sc.load).map_err(io)?;
+        std::fs::write(&stub_run, &sc.run).map_err(io)?;
+        let log = dir.join("pass.log");
+        let metrics = dir.join("pass.metrics.json");
+        let calls = dir.join("calls.txt");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let driver = root
+            .join("workloads")
+            .join("oltp-ycsb-pg17")
+            .join("driver.sh");
+
+        let out = Command::new("bash")
+            .arg(&driver)
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("NB_HARNESS", root)
+            .env("NB_CONTAINER", "nbench-postgres17-stub")
+            .env("NB_PORT", "5432")
+            .env("NB_DB", "nbench")
+            .env("NB_MODE", sc.mode)
+            .env("NB_SERIES", sc.series)
+            .env("NB_RUN_INDEX", "0")
+            .env("NB_LOG", &log)
+            .env("NB_METRICS", &metrics)
+            .env("NB_OUT", &dir)
+            .env("NB_P_RECORDCOUNT", recordcount)
+            .env("NB_P_YCSB_OPERATIONS", operations)
+            .env("NB_STUB_CALLS", &calls)
+            .env("NB_STUB_ROWS", sc.rows)
+            .env("NB_STUB_LOAD", &stub_load)
+            .env("NB_STUB_RUN", &stub_run)
+            .env("NB_STUB_PG_VERSION", "17.11-stub")
+            .env("NB_STUB_JAVA_VERSION", "17.0.21-stub")
+            .envs(table.map(|t| ("NB_STUB_TABLE", t)))
+            .output()
+            .map_err(io)?;
+
+        Ok(Outcome {
+            success: out.status.success(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            calls: read_if_exists(&calls)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            log: read_if_exists(&log).unwrap_or_default(),
+            metrics: read_if_exists(&metrics),
+            reload_log: read_if_exists(&PathBuf::from(format!("{}.reload", log.display()))),
+            versions: read_if_exists(&dir.join("versions.txt")),
+        })
+    }
+
+    /// The numeric pairs of an NB_METRICS file, in file order — the
+    /// same reading the runner's `parse_result` gives them.
+    fn metrics_of(text: &str) -> std::result::Result<Vec<(String, f64)>, String> {
+        let v = crate::json::parse(text).map_err(|e| e.to_string())?;
+        Ok(v.pairs()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|(k, val)| val.as_f64().map(|n| (k.clone(), n)))
+            .collect())
+    }
+
+    /// The recorded YCSB run call's arguments.
+    fn run_call(out: &Outcome) -> Option<String> {
+        out.calls
+            .iter()
+            .find(|c| c.contains(" run jdbc -s "))
+            .cloned()
+    }
+
+    /// Execute the real `digest.sh` once, with the stub answering the
+    /// row count; returns the digest it printed.
+    fn run_digest(rows: &str) -> std::result::Result<String, String> {
+        let io = |e: std::io::Error| e.to_string();
+        let dir = tmpdir("digest")?;
+        let bin = stub_bin(&dir)?;
+        let calls = dir.join("calls.txt");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = Command::new("bash")
+            .arg(
+                root.join("workloads")
+                    .join("oltp-ycsb-pg17")
+                    .join("digest.sh"),
+            )
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("NB_HARNESS", root)
+            .env("NB_CONTAINER", "nbench-postgres17-stub")
+            .env("NB_DB", "nbench")
+            .env("NB_PHASE", "init")
+            .env("NB_OUT", &dir)
+            .env("NB_LOG", dir.join("digest.log"))
+            .env("NB_STUB_CALLS", &calls)
+            .env("NB_STUB_ROWS", rows)
+            .output()
+            .map_err(io)?;
+        if !out.status.success() {
+            return Err(format!(
+                "digest.sh exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn digest_hashes_the_servers_own_row_count() {
+        // digest.sh is one pipeline: the server's `SELECT count(*)`
+        // line goes through sha256sum unchanged, so the digest of a
+        // table is the hash of its count line (`printf '1000\n' |
+        // sha256sum`). The record-then-match protocol cannot see a
+        // digest of a fixed string within one run (card NB-2 mutant
+        // DIGEST-CONSTANT); executing the script can. 83c02ac2… is
+        // also the smoke's recorded init expectation.
+        for (rows, expected) in [
+            (
+                "1000",
+                "83c02ac2d48c863dab2ccf6870455aadfc2cec073b8db269b517c879d76aa6d9",
+            ),
+            (
+                "1500",
+                "d6e02e548a55f01b58ebb4addbe8e78c0a67198d09c6a41af9c6e6f640d7f4dd",
+            ),
+        ] {
+            let got = run_digest(rows).expect("run digest.sh");
+            assert_eq!(got.trim(), expected, "digest of a {rows}-row table");
+        }
+    }
+
+    #[test]
+    fn driver_publishes_the_reference_parsers_numbers() {
+        // Verdict NB-2 R1: the row's published numbers come from the
+        // driver's own sed extraction, so that extraction — not only
+        // the reference parser — is under test. Applied to the driver,
+        // the card's PARSER-OPS-DROPPED (no ops line: the driver dies
+        // on an unbound variable) and PARSER-P99-AS-AVG (p99 read from
+        // AverageLatency) both fail here, in every measured mode.
+        let expected = parse_ycsb(RUN_A).expect("reference parse").metrics;
+        for mode in ["cold", "warmup", "run"] {
+            let sc = Scenario::measured(mode, "workload=a,threads=1", "1000", RUN_A);
+            let out = run_driver("publish", &sc, "1000", "1000").expect("run the driver");
+            assert!(out.success, "{mode}: driver failed: {}", out.stderr);
+            let text = out.metrics.as_deref().expect("NB_METRICS written");
+            assert_eq!(
+                metrics_of(text).expect("metrics json"),
+                expected,
+                "{mode}: the published metrics must equal the reference parser's"
+            );
+            // the log's own tokens, verbatim
+            for token in [
+                "\"ops_sec\":2801.1204481792715",
+                "\"avg_read_us\":127.0767754318618",
+                "\"p99_read_us\":440",
+            ] {
+                assert!(text.contains(token), "{mode}: {text} lacks {token}");
+            }
+            // the 2>&1 | tee contract: NB_LOG is the pass's own output
+            assert_eq!(out.log, RUN_A, "{mode}: NB_LOG must hold the tee'd run");
+            // a pristine table (rows == recordcount): no reload, then
+            // the pass with the series point and the sizes
+            assert!(
+                !out.has_call(" load jdbc "),
+                "{mode}: no reload on a pristine table"
+            );
+            assert!(
+                !out.has_call("TRUNCATE"),
+                "{mode}: no truncate on a pristine table"
+            );
+            assert!(
+                out.reload_log.is_none(),
+                "{mode}: no reload log on a pristine table"
+            );
+            let run = run_call(&out).expect("the pass ran");
+            for arg in [
+                "-P /opt/ycsb/workloads/workloada",
+                "-p recordcount=1000",
+                "-p operationcount=1000",
+                "-p threadcount=1",
+                "db.url=jdbc:postgresql://127.0.0.1:5432/nbench",
+                "db.driver=org.postgresql.Driver",
+            ] {
+                assert!(
+                    run.contains(arg),
+                    "{mode}: YCSB run call lacks {arg}: {run}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn driver_publishes_only_the_metrics_a_mix_carries() {
+        // E (scan-heavy) carries no [READ]: the driver publishes ops_sec
+        // alone, exactly as the reference parser reads the same report.
+        // The series point reaches YCSB: workload file, thread count
+        // and both sizes.
+        let sc = Scenario::measured("run", "workload=e,threads=64", "1500", RUN_E);
+        let out = run_driver("mix-e", &sc, "1500", "5000").expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        let text = out.metrics.as_deref().expect("NB_METRICS written");
+        assert_eq!(
+            metrics_of(text).expect("metrics json"),
+            parse_ycsb(RUN_E).expect("parse E").metrics
+        );
+        assert_eq!(
+            text, "{\"ops_sec\":55555.555555555555}\n",
+            "no read metric invented"
+        );
+        let run = run_call(&out).expect("the pass ran");
+        for arg in [
+            "-P /opt/ycsb/workloads/workloade",
+            "-p recordcount=1500",
+            "-p operationcount=5000",
+            "-p threadcount=64",
+        ] {
+            assert!(run.contains(arg), "YCSB run call lacks {arg}: {run}");
+        }
+        assert!(
+            !out.has_call(" load jdbc "),
+            "1500 rows is a pristine table at recordcount 1500"
+        );
+
+        // F reads and inserts nothing: all three metrics, the [READ]
+        // section's own (not the [READ-MODIFY-WRITE] latencies).
+        let sc = Scenario::measured("run", "workload=f,threads=1", "1000", RUN_F);
+        let out = run_driver("mix-f", &sc, "1000", "1000").expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        let text = out.metrics.as_deref().expect("NB_METRICS written");
+        let got = metrics_of(text).expect("metrics json");
+        assert_eq!(got, parse_ycsb(RUN_F).expect("parse F").metrics);
+        let names: Vec<&str> = got.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(names, vec!["ops_sec", "avg_read_us", "p99_read_us"]);
+        assert_eq!(
+            text,
+            "{\"ops_sec\":29411.764705882353,\"avg_read_us\":0.36,\"p99_read_us\":0}\n"
+        );
+    }
+
+    #[test]
+    fn driver_fails_a_pass_whose_operations_failed() {
+        // Verdict NB-2 R2: YCSB exits 0 with failed operations (this
+        // fixture: a second workload-D pass re-inserting the keys the
+        // first pass created), and its throughput line still looks
+        // healthy. Such a pass must never be published: the driver
+        // fails it, names the report's own lines as the reason and
+        // writes no NB_METRICS file. Mutant RETURN-ERROR-IGNORED (the
+        // guard not called, or its condition inverted) fails here.
+        let sc = Scenario::measured("run", "workload=d,threads=1", "1000", RUN_D_FAILED);
+        let out = run_driver("failed", &sc, "1000", "1000").expect("run the driver");
+        assert!(
+            !out.success,
+            "a pass with failed operations must fail the driver"
+        );
+        assert!(
+            out.metrics.is_none(),
+            "no metrics may be published: {:?}",
+            out.metrics
+        );
+        assert!(
+            out.stderr.contains("[INSERT], Return=ERROR, 44"),
+            "names the failed return code: {}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("[INSERT-FAILED], Operations, 44"),
+            "names the FAILED section: {}",
+            out.stderr
+        );
+        // the pass log is kept, so the reason stays reachable
+        assert_eq!(out.log, RUN_D_FAILED);
+
+        // A report with no successful operation at all is not a
+        // measurement either (the recorded report minus its Return=OK
+        // lines; it still carries a throughput line to publish).
+        let no_ok = RUN_A
+            .lines()
+            .filter(|l| !l.contains(", Return=OK, "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(no_ok.contains("Throughput(ops/sec)"));
+        let sc = Scenario::measured("run", "workload=a,threads=1", "1000", &no_ok);
+        let out = run_driver("no-ok", &sc, "1000", "1000").expect("run the driver");
+        assert!(
+            !out.success,
+            "a report without one successful operation must fail"
+        );
+        assert!(
+            out.metrics.is_none(),
+            "nothing published: {:?}",
+            out.metrics
+        );
+        assert!(
+            out.stderr.contains("no successful operation"),
+            "names the reason: {}",
+            out.stderr
+        );
+
+        // A report whose only Return=OK lines count zero operations is
+        // the same case (the recorded report with its OK counts
+        // zeroed).
+        let zero_ok = RUN_A
+            .replace("Return=OK, 521", "Return=OK, 0")
+            .replace("Return=OK, 479", "Return=OK, 0");
+        let sc = Scenario::measured("run", "workload=a,threads=1", "1000", &zero_ok);
+        let out = run_driver("zero-ok", &sc, "1000", "1000").expect("run the driver");
+        assert!(
+            !out.success,
+            "a report of zero successful operations must fail"
+        );
+        assert!(
+            out.metrics.is_none(),
+            "nothing published: {:?}",
+            out.metrics
+        );
+        assert!(
+            out.stderr.contains("no successful operation"),
+            "names the reason: {}",
+            out.stderr
+        );
+
+        // A missing or empty report is not a successful one either.
+        let sc = Scenario::measured("run", "workload=a,threads=1", "1000", "");
+        let out = run_driver("empty", &sc, "1000", "1000").expect("run the driver");
+        assert!(!out.success, "an empty report must fail the pass");
+        assert!(
+            out.metrics.is_none(),
+            "nothing published: {:?}",
+            out.metrics
+        );
+        assert!(
+            out.stderr.contains("missing or empty"),
+            "names the reason: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn driver_reloads_before_a_pass_an_earlier_pass_grew() {
+        // Verdict NB-2 R2, the cause: every `ycsb run` restarts its
+        // insert key sequence at recordcount, so a pass that follows
+        // one that inserted (stock D and E, 5 %) must start from the
+        // digested dataset again. The row count is the one thing a pass
+        // changes and exactly what the init digest pins: more rows than
+        // recordcount -> truncate + reload, then the pass. (1044 is the
+        // fixture's own first pass: 1 000 loaded + 44 inserted.)
+        let sc = Scenario::measured("warmup", "workload=d,threads=1", "1044", RUN_D);
+        let out = run_driver("reload", &sc, "1000", "1000").expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        let count = out
+            .call_index("SELECT count(*) FROM usertable")
+            .expect("row count asked");
+        let truncate = out
+            .call_index("TRUNCATE usertable")
+            .expect("table truncated");
+        let load = out.call_index(" load jdbc ").expect("dataset reloaded");
+        let run = out.call_index(" run jdbc -s ").expect("the pass ran");
+        assert!(
+            count < truncate && truncate < load && load < run,
+            "restore order is count, truncate, reload, run: {:?}",
+            out.calls
+        );
+        let load_call = &out.calls[load];
+        for arg in [
+            "-P /opt/ycsb/workloads/workloadd",
+            "-p recordcount=1000",
+            "-p threadcount=1",
+        ] {
+            assert!(
+                load_call.contains(arg),
+                "reload call lacks {arg}: {load_call}"
+            );
+        }
+        // the reload's log is its own; the pass log is the pass's
+        assert_eq!(out.reload_log.as_deref(), Some(LOAD));
+        assert_eq!(out.log, RUN_D);
+        let text = out.metrics.as_deref().expect("NB_METRICS written");
+        assert_eq!(
+            metrics_of(text).expect("metrics json"),
+            parse_ycsb(RUN_D).expect("parse D").metrics
+        );
+        assert!(
+            out.stderr.contains("1044 rows, more than recordcount=1000"),
+            "the reload is on record: {}",
+            out.stderr
+        );
+
+        // A reload whose own load reports failures is refused before
+        // the pass runs.
+        let mut sc = Scenario::measured("run", "workload=d,threads=1", "1044", RUN_D);
+        sc.load = RUN_D_FAILED.to_string();
+        let out = run_driver("reload-failed", &sc, "1000", "1000").expect("run the driver");
+        assert!(!out.success, "a failed reload must fail the pass");
+        assert!(
+            !out.has_call(" run jdbc -s "),
+            "the pass must not run on a failed reload"
+        );
+        assert!(
+            out.metrics.is_none(),
+            "nothing published: {:?}",
+            out.metrics
+        );
+        assert!(
+            out.stderr.contains("failed operations") && out.stderr.contains("Return=ERROR, 44"),
+            "names the reload's failed operations: {}",
+            out.stderr
+        );
+
+        // Fewer rows than recordcount is a lost dataset — never
+        // reloaded away silently.
+        let sc = Scenario::measured("run", "workload=d,threads=1", "999", RUN_D);
+        let out = run_driver("shrink", &sc, "1000", "1000").expect("run the driver");
+        assert!(!out.success, "a shrunken dataset must fail the pass");
+        assert!(
+            !out.has_call("TRUNCATE") && !out.has_call(" load jdbc "),
+            "no reload: {:?}",
+            out.calls
+        );
+        assert!(!out.has_call(" run jdbc -s "), "the pass must not run");
+        assert!(
+            out.metrics.is_none(),
+            "nothing published: {:?}",
+            out.metrics
+        );
+        assert!(
+            out.stderr.contains("999 rows, fewer than recordcount=1000"),
+            "names the reason: {}",
+            out.stderr
+        );
+
+        // Anything but a row count from the server is refused before
+        // the pass runs, never read as a table state.
+        let sc = Scenario::measured("run", "workload=d,threads=1", "1 044", RUN_D);
+        let out = run_driver("count-garbage", &sc, "1000", "1000").expect("run the driver");
+        assert!(!out.success, "a non-numeric row count must fail the pass");
+        assert!(
+            !out.has_call(" load jdbc ") && !out.has_call(" run jdbc -s "),
+            "{:?}",
+            out.calls
+        );
+        assert!(
+            out.stderr.contains("not a row count"),
+            "names the reason: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn driver_carries_an_inserting_series_pass_by_pass() {
+        // The plan's sequence for one workload-D series (reinit, cold,
+        // warmup, run, run) replayed against a table whose row count the
+        // stub keeps: the load fills `recordcount` rows and each pass adds
+        // the inserts its report returned OK (44 in the fixture). The
+        // cold pass follows the reinit and runs on the pristine table
+        // without reloading; each later pass finds the rows the pass
+        // before inserted, reloads, and publishes the reference parser's
+        // numbers. It is the smoke's workload-D run, offline.
+        let table = tmpdir("series").expect("mkdir").join("table");
+        let count = || {
+            std::fs::read_to_string(&table)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let reinit = Scenario::load_phase("reinit", "workload=d,threads=1", LOAD);
+        let out = run_driver_on("series-init", &reinit, "1000", "1000", Some(&table))
+            .expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        assert_eq!(count(), "1000", "the load fills recordcount rows");
+        for (i, mode) in ["cold", "warmup", "run", "run"].into_iter().enumerate() {
+            let sc = Scenario::measured(mode, "workload=d,threads=1", "", RUN_D);
+            let out = run_driver_on(&format!("series-{i}"), &sc, "1000", "1000", Some(&table))
+                .expect("run the driver");
+            assert!(out.success, "{mode}: driver failed: {}", out.stderr);
+            let text = out.metrics.as_deref().expect("NB_METRICS written");
+            assert_eq!(
+                metrics_of(text).expect("metrics json"),
+                parse_ycsb(RUN_D).expect("parse D").metrics,
+                "{mode}: the published metrics must equal the reference parser's"
+            );
+            if i == 0 {
+                assert!(
+                    !out.has_call(" load jdbc ") && out.reload_log.is_none(),
+                    "the cold pass follows the reinit and must not reload: {:?}",
+                    out.calls
+                );
+            } else {
+                assert!(
+                    out.reload_log.is_some(),
+                    "{mode}: must reload the rows the pass before inserted"
+                );
+            }
+            assert_eq!(count(), "1044", "{mode}: the pass inserted 44 rows");
+        }
+    }
+
+    #[test]
+    fn driver_init_records_versions_then_loads() {
+        // Provenance (§5.2 rule 6): a row whose init mode writes no
+        // versions.txt fails loudly in the runner (card NB-2 mutant
+        // VERSIONS-SKIPPED, which the Host smoke catches at row level;
+        // this is the same catcher on the driver alone). The file must
+        // carry the server binary's, the server's SQL, the client JVM's
+        // and the YCSB release's version.
+        let sc = Scenario::load_phase("init", "", LOAD);
+        let out = run_driver("init", &sc, "1000", "1000").expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        let versions = out.versions.as_deref().expect("versions.txt written");
+        for line in [
+            "postgres (PostgreSQL) 17.11-stub",
+            "PostgreSQL 17.11-stub on x86_64-pc-linux-gnu",
+            "openjdk version \"17.0.21-stub\"",
+            "YCSB release: ycsb-0.17.0",
+        ] {
+            assert!(
+                versions.contains(line),
+                "versions.txt lacks {line}: {versions}"
+            );
+        }
+        // the DDL precedes the load; init has no series, so the load
+        // falls back to workloada and writes no metrics
+        let ddl = out
+            .call_index("CREATE TABLE IF NOT EXISTS usertable")
+            .expect("ddl");
+        let load = out.call_index(" load jdbc ").expect("load");
+        assert!(ddl < load, "ddl before load: {:?}", out.calls);
+        let load_call = &out.calls[load];
+        for arg in [
+            "-P /opt/ycsb/workloads/workloada",
+            "-p recordcount=1000",
+            "-p threadcount=1",
+        ] {
+            assert!(
+                load_call.contains(arg),
+                "load call lacks {arg}: {load_call}"
+            );
+        }
+        assert!(out.metrics.is_none(), "init writes no metrics");
+
+        // reinit is the same, with the series' own workload file
+        let sc = Scenario::load_phase("reinit", "workload=d,threads=16", LOAD);
+        let out = run_driver("reinit", &sc, "1000", "1000").expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        assert!(out.versions.is_some(), "reinit rewrites versions.txt");
+        let load = out.call_index(" load jdbc ").expect("load");
+        assert!(
+            out.calls[load].contains("-P /opt/ycsb/workloads/workloadd"),
+            "the series' workload file: {}",
+            out.calls[load]
+        );
+
+        // a load that reports failed operations is refused too — the
+        // strict digest would also void the row; this names the reason
+        let sc = Scenario::load_phase("init", "", RUN_D_FAILED);
+        let out = run_driver("init-failed", &sc, "1000", "1000").expect("run the driver");
+        assert!(!out.success, "a load with failed operations must fail");
+        assert!(out.stderr.contains("Return=ERROR, 44"), "{}", out.stderr);
     }
 }
