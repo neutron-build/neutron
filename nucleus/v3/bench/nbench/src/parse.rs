@@ -627,6 +627,42 @@ mod tests {
     }
 
     #[test]
+    fn ycsb_real_run_fixture() {
+        // Real captured output (YCSB 0.17.0 over pgwire/JDBC against
+        // PG 17, card NB-2 smoke-size run; the file's first lines are
+        // the launcher's java-command echo and "YCSB Client 0.17.0").
+        // The values are the fixture's own, pinned exactly — the
+        // real output carries all three row metrics, so none is
+        // dropped (card NB-2 Work item 4: the fixture is recorded,
+        // not invented).
+        let log = include_str!("fixtures/ycsb-run.txt");
+        let parsed = parse_ycsb(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert!(
+            (get("ops_sec") - 2801.1204481792715).abs() < 1e-9,
+            "{}",
+            get("ops_sec")
+        );
+        assert!((get("avg_read_us") - 127.0767754318618).abs() < 1e-9);
+        assert_eq!(get("p99_read_us"), 440.0);
+        // p99 and avg are distinct real fields, not one value reused
+        assert_ne!(get("p99_read_us"), get("avg_read_us"));
+        // exactly the row's three metrics: [UPDATE]/[CLEANUP]/GC
+        // sections must not leak into the row's metric set
+        let names: Vec<&str> = parsed.metrics.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(names, vec!["ops_sec", "avg_read_us", "p99_read_us"]);
+        // the -s status line and the launcher echo carry no brackets
+        // and must not confuse the parser (the fixture has both)
+    }
+
+    #[test]
     fn ycsb_report_sections_and_order() {
         // Card NB-2: [OVERALL] Throughput is the one mandatory metric;
         // [READ] latencies come from the [READ] section only, and the

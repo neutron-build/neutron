@@ -28,11 +28,17 @@ db.passwd=postgres
 
 plus the core properties `recordcount` (dataset size, `-p` overriding
 the stock file's 1000), `operationcount` (ops per pass, same override
-rule) and `threadcount` (the series' thread count). The binding does
-NOT auto-create the table — `driver.sh` init/reinit creates
-`usertable` with the README's exact schema (`YCSB_KEY VARCHAR(255)
-PRIMARY KEY, FIELD0..FIELD9 TEXT`) and truncates before each load so
-every series starts from the same pristine state.
+rule) and `threadcount` (the series' thread count). Verified live on
+the first smoke run:
+
+- the **load phase also requires a workload file** (`-P
+  workloads/workloada`): YCSB 0.17.0 refuses to start without the
+  `workload` property ("Missing property: workload") — the fix is in
+  `driver.sh`'s init/reinit arm and recorded in the card's RESULT;
+- the binding does NOT auto-create the table — `driver.sh` init/reinit
+  creates `usertable` with the README's exact schema (`YCSB_KEY
+  VARCHAR(255) PRIMARY KEY, FIELD0..FIELD9 TEXT`) and truncates before
+  each load so every series starts from the same pristine state.
 
 ## Notes
 

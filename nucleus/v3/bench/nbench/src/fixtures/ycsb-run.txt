@@ -1,0 +1,42 @@
+/opt/java/openjdk/bin/java  -classpath /opt/ycsb/conf:/opt/ycsb/lib/HdrHistogram-2.1.4.jar:/opt/ycsb/lib/core-0.17.0.jar:/opt/ycsb/lib/htrace-core4-4.1.0-incubating.jar:/opt/ycsb/lib/jackson-core-asl-1.9.4.jar:/opt/ycsb/lib/jackson-mapper-asl-1.9.4.jar:/opt/ycsb/jdbc-binding/conf:/opt/ycsb/jdbc-binding/lib/commons-collections-3.2.1.jar:/opt/ycsb/jdbc-binding/lib/commons-lang-2.4.jar:/opt/ycsb/jdbc-binding/lib/commons-pool-1.5.4.jar:/opt/ycsb/jdbc-binding/lib/geronimo-jms_1.1_spec-1.1.1.jar:/opt/ycsb/jdbc-binding/lib/geronimo-jta_1.1_spec-1.1.1.jar:/opt/ycsb/jdbc-binding/lib/jdbc-binding-0.17.0.jar:/opt/ycsb/jdbc-binding/lib/openjpa-jdbc-2.1.1.jar:/opt/ycsb/jdbc-binding/lib/openjpa-kernel-2.1.1.jar:/opt/ycsb/jdbc-binding/lib/openjpa-lib-2.1.1.jar:/opt/ycsb/jdbc-binding/lib/postgresql-42.7.6.jar:/opt/ycsb/jdbc-binding/lib/serp-1.13.1.jar site.ycsb.Client -t -db site.ycsb.db.JdbcDBClient -s -p db.driver=org.postgresql.Driver -p db.url=jdbc:postgresql://127.0.0.1:5432/nbench -p db.user=postgres -p db.passwd=postgres -P /opt/ycsb/workloads/workloada -p recordcount=1000 -p operationcount=1000 -p threadcount=1
+Command line: -t -db site.ycsb.db.JdbcDBClient -s -p db.driver=org.postgresql.Driver -p db.url=jdbc:postgresql://127.0.0.1:5432/nbench -p db.user=postgres -p db.passwd=postgres -P /opt/ycsb/workloads/workloada -p recordcount=1000 -p operationcount=1000 -p threadcount=1
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+Adding shard node URL: jdbc:postgresql://127.0.0.1:5432/nbench
+2026-11-28 01:52:26:003 0 sec: 0 operations; est completion in 0 second 
+Using shards: 1, batchSize:-1, fetchSize: -1
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-11-28 01:52:26:344 0 sec: 1000 operations; 2801.12 current ops/sec; [READ: Count=521, Max=7903, Min=39, Avg=127.08, 90=216, 99=440, 99.9=791, 99.99=7903] [CLEANUP: Count=1, Max=477, Min=477, Avg=477, 90=477, 99=477, 99.9=477, 99.99=477] [UPDATE: Count=479, Max=8935, Min=193, Avg=413.43, 90=632, 99=1645, 99.9=8935, 99.99=8935] 
+[OVERALL], RunTime(ms), 357
+[OVERALL], Throughput(ops/sec), 2801.1204481792715
+[TOTAL_GCS_G1_Young_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.0
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 0
+[TOTAL_GC_TIME], Time(ms), 0
+[TOTAL_GC_TIME_%], Time(%), 0.0
+[READ], Operations, 521
+[READ], AverageLatency(us), 127.0767754318618
+[READ], MinLatency(us), 39
+[READ], MaxLatency(us), 7903
+[READ], 95thPercentileLatency(us), 279
+[READ], 99thPercentileLatency(us), 440
+[READ], Return=OK, 521
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 477.0
+[CLEANUP], MinLatency(us), 477
+[CLEANUP], MaxLatency(us), 477
+[CLEANUP], 95thPercentileLatency(us), 477
+[CLEANUP], 99thPercentileLatency(us), 477
+[UPDATE], Operations, 479
+[UPDATE], AverageLatency(us), 413.4321503131524
+[UPDATE], MinLatency(us), 193
+[UPDATE], MaxLatency(us), 8935
+[UPDATE], 95thPercentileLatency(us), 805
+[UPDATE], 99thPercentileLatency(us), 1645
+[UPDATE], Return=OK, 479

@@ -51,8 +51,18 @@ case ${NB_MODE:?} in
     nb-podman exec "$C" psql -U postgres -d "$NB_DB" -q -c \
       "CREATE TABLE IF NOT EXISTS usertable (YCSB_KEY VARCHAR(255) PRIMARY KEY, FIELD0 TEXT, FIELD1 TEXT, FIELD2 TEXT, FIELD3 TEXT, FIELD4 TEXT, FIELD5 TEXT, FIELD6 TEXT, FIELD7 TEXT, FIELD8 TEXT, FIELD9 TEXT)"
     nb-podman exec "$C" psql -U postgres -d "$NB_DB" -q -c "TRUNCATE usertable"
+    # The load phase needs a workload file too: YCSB 0.17.0 refuses to
+    # start without the `workload` property ("Missing property:
+    # workload" — verified on the live smoke run, card NB-2 Open point;
+    # the fix is recorded in the RESULT). init runs with an empty
+    # series, so fall back to workloada; the dataset *shape* is
+    # identical for every letter (the stock files differ only in the
+    # operation mix, never the schema or insert distribution), and
+    # recordcount is overridden by this run's params either way.
+    wl=$(series_get workload 2>/dev/null || printf 'a')
     nb-podman run --rm --network host "$IMG" \
       "$YCSB" load jdbc "${COMMON[@]}" \
+      -P "/opt/ycsb/workloads/workload${wl}" \
       -p "recordcount=${NB_P_RECORDCOUNT:?}" \
       -p "threadcount=1" \
       2>&1 | tee "${NB_LOG:?}"
