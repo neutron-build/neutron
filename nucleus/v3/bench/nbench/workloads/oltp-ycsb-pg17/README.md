@@ -42,6 +42,15 @@ the first smoke run:
 
 ## Notes
 
+- **Metrics path** (scope note, also in rows.rs): the row parses
+  driver-side through the NB_METRICS protocol (the `VectorSearch`
+  arm) — the runner's log-parser dispatch table is outside this
+  card's Touch only list, so a `Ycsb` parser variant cannot be
+  registered without touching runner.rs. `driver.sh` extracts the
+  same fixed-format `[OVERALL]`/`[READ]` lines that `parse_ycsb`
+  (parse.rs, fixture-pinned, test-only reference) reads, fails
+  loudly when the mandatory throughput line is missing, and omits
+  the read-latency metrics for mixes without reads.
 - The launcher is `bin/ycsb.sh` (POSIX sh, same tarball); the `bin/ycsb`
   launcher is Python 2 and no current base image carries it — see
   `../../systems/ycsbcli/README.md`.

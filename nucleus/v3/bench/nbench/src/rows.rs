@@ -21,8 +21,6 @@ pub enum Parser {
     Pgbench,
     /// sysbench (per-sec rates from the final stats block).
     Sysbench,
-    /// YCSB 0.17.0 (final `[SECTION], Metric, Value` report; card NB-2).
-    Ycsb,
     /// memtier_benchmark (Totals block).
     Memtier,
     /// SQLite speedtest1 (TOTAL wall time, --verify hash line).
@@ -303,8 +301,19 @@ pub const ROWS: &[RowDef] = &[
          "latency_avg_ms" => LowerIsBetter, "p99_ms" => LowerIsBetter],
         sweep_sysbench, no_variant, init: true, final: false, reinit: true
     ),
+    // NB-2 scope note: this row parses driver-side through the
+    // NB_METRICS protocol (the `VectorSearch` arm — the harness's one
+    // mechanism for driver-written metrics), because the runner's
+    // log-parser dispatch table is outside this card's Touch only
+    // list: a `Ycsb` parser variant cannot exist without a runner.rs
+    // edit (the match there is exhaustive), and the scope ruling
+    // reverted the one-line arm the first attempt added. The driver
+    // extracts the same fixed-format `[OVERALL]`/`[READ]` lines that
+    // `parse_ycsb` — the fixture-pinned reference parser in
+    // parse.rs — reads, and fails loudly when the mandatory
+    // throughput line is missing.
     row!(
-        "oltp-ycsb-pg17", "postgres17", Ycsb,
+        "oltp-ycsb-pg17", "postgres17", VectorSearch,
         "YCSB core A–F over pgwire (JDBC) on PG17, threads 1/16/64 — the C-9 comparison row, Nucleus speaks pgwire (§3.7)",
         ["ops_sec" => HigherIsBetter, "p99_read_us" => LowerIsBetter,
          "avg_read_us" => LowerIsBetter],

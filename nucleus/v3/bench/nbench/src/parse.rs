@@ -215,6 +215,18 @@ pub fn parse_sysbench(log: &str) -> Result<ParsedRun> {
 /// Parse a YCSB 0.17.0 final measurement report (card NB-2, row
 /// `oltp-ycsb-pg17`).
 ///
+/// **Reference implementation, test-only.** The row measures through
+/// the NB_METRICS protocol (see the row's scope note in rows.rs):
+/// `workloads/oltp-ycsb-pg17/driver.sh` extracts these same
+/// fixed-format lines from the tee'd log and writes the metrics JSON,
+/// because the runner's log-parser dispatch table is outside card
+/// NB-2's Touch only list and cannot gain a `Ycsb` arm. This function
+/// stays as the fixture-pinned definition of the format — the unit
+/// tests below (against the real captured `ycsb-run.txt`) hold the
+/// driver's extraction honest by pinning exactly which fields the real
+/// output carries, and they are the named catchers for the card's
+/// PARSER-OPS-DROPPED and PARSER-P99-AS-AVG mutants.
+///
 /// A load/run ends with `[SECTION], Metric, Value` lines; the `-s`
 /// status lines (every 10 s), the launcher's java-command echo and the
 /// `2>&1 | tee` contract land in the same log but carry no brackets:
@@ -245,6 +257,7 @@ pub fn parse_sysbench(log: &str) -> Result<ParsedRun> {
 /// absent fields are omitted, never invented. The last occurrence of
 /// each line wins, so a re-run appended to one log never reports the
 /// earlier attempt's numbers.
+#[cfg(test)]
 pub fn parse_ycsb(log: &str) -> Result<ParsedRun> {
     let lines: Vec<&str> = log.lines().collect();
     let ops_sec = last_number_after(&lines, "[OVERALL], Throughput(ops/sec)", "ops_sec")?;

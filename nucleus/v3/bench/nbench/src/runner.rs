@@ -474,11 +474,6 @@ fn parse_result(row: &RowDef, log: &Path, metrics_file: &Path) -> Result<ParsedR
             Ok(parsed)
         }
         rows::Parser::Sysbench => parse::parse_sysbench(&text),
-        // Card NB-2: the one-line dispatch its Parser variant requires.
-        // The card's Touch only list omits this file, but the match is
-        // exhaustive — without this arm the crate does not compile
-        // (error[E0004]); reported in the card's RESULT as a scope gap.
-        rows::Parser::Ycsb => parse::parse_ycsb(&text),
         rows::Parser::Memtier => parse::parse_memtier(&text),
         rows::Parser::Speedtest1 => parse::parse_speedtest1(&text),
         rows::Parser::VectorSearch => Err(Error::Usage(
