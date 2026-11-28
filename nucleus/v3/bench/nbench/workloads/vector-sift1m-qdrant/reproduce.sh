@@ -33,6 +33,18 @@
 #     gitignored (*.log), so the window's evidence must be committed
 #     in its own tracked file.
 #
+# B-0-F7-F1b-F2-F2 (2026-11-27; verdict B-0-F7-F1b-F2 finding 2): the
+# window selftest's satisfied line is self-identifying — only in
+# NB_REPRO_SELFTEST=window mode it appends " [NB_REPRO_SELFTEST=window:
+# stubbed loadavg, not a measurement]", so a stubbed window can never
+# be committed as real quiet evidence (a stubbed loadavg is not a
+# quiet host; the =1 BYPASSED line is loud by design, but the window
+# line was byte-identical to a real one). `check` flags any COMMITTED
+# run-*.quiet.txt holding BYPASSED or that marker: untracked files are
+# the operator's working state, not evidence, and a repro with no
+# quiet file (the committed 2026-10-31 one) stays consistent. The
+# real-mode satisfied line is byte-for-byte unchanged.
+#
 # Run outcomes (gate round 1, findings R2/R3): `nbench run` prints a
 # `results:` line whenever it RECORDED a results JSON — on success and
 # on VOID (a digest mismatch writes the JSON, then exits 1). Such a
@@ -124,8 +136,21 @@ quiet_wait() {
   # unreachable without NB_REPRO_SELFTEST, and in every other mode the
   # window is byte-for-byte the production rule.
   local loadavg=/proc/loadavg
+  # The window line's self-identifying suffix (card
+  # B-0-F7-F1b-F2-F2, verdict B-0-F7-F1b-F2 finding 2). Why: the
+  # satisfied line becomes committed evidence in
+  # repro/run-<x>.quiet.txt, and a loadavg read from a selftest file
+  # is not a quiet host — a window-mode line must be distinguishable
+  # from a real one in exactly the place it becomes evidence, or a
+  # selftest line could be published as a real quiet window (unlike
+  # =1's BYPASSED line, which is loud by design). The suffix is
+  # composed ONLY inside the window branch below and appended to the
+  # satisfied line; real mode composes the same literal with an empty
+  # suffix, so the real line stays byte-for-byte unchanged.
+  local marker=""
   if [ "${NB_REPRO_SELFTEST:-}" = "window" ]; then
     loadavg=${NB_REPRO_SELFTEST_LOADAVG:?NB_REPRO_SELFTEST_LOADAVG not set}
+    marker=" [NB_REPRO_SELFTEST=window: stubbed loadavg, not a measurement]"
   fi
   local deadline=$(( $(date +%s) + 1800 )) n=0 first="" a
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -137,7 +162,7 @@ quiet_wait() {
       if [ "$n" -eq 0 ]; then first=$a; fi
       n=$((n + 1))
       if [ "$n" -ge 13 ]; then
-        QUIET_LINE="$(date -u +%FT%TZ) quiet-host window satisfied (load1 $first -> $a, 13 consecutive samples; no cargo/rustc; no nbench unit)"
+        QUIET_LINE="$(date -u +%FT%TZ) quiet-host window satisfied (load1 $first -> $a, 13 consecutive samples; no cargo/rustc; no nbench unit)$marker"
         printf '%s\n' "$QUIET_LINE" >&2
         return 0
       fi
@@ -542,6 +567,27 @@ do_check() {
       echo "check: verdict is $word but $row_file exists" >&2; ok=1
     fi
   fi
+
+  # Committed quiet evidence must be real (card B-0-F7-F1b-F2-F2,
+  # verdict B-0-F7-F1b-F2 finding 2): run-*.quiet.txt is the
+  # publishable quiet-window record, and a window that was bypassed
+  # (=1, BYPASSED) or window-stubbed (the marker) is not a quiet host
+  # — a committed file holding either is flagged. Why only committed
+  # files: untracked ones are the operator's working state, not
+  # evidence; and a missing quiet file is not a flag either (the
+  # committed 2026-10-31 repro predates them — no quiet file is ever
+  # required). Non-git roots hold no committed files, so the arm is
+  # inert there — the same fallback shape as refuse_if_row_committed.
+  local q rel
+  for q in "$dir"/run-*.quiet.txt; do
+    rel="${dir#"$ROOT/"}/$(basename "$q")"
+    [ -f "$q" ] || continue
+    if git -C "$ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
+       && grep -q -e BYPASSED -e 'NB_REPRO_SELFTEST=window' "$q"; then
+      echo "check: $rel is committed and holds non-real quiet-window evidence (BYPASSED or the window-selftest marker) — only real satisfied lines may be published (card B-0-F7-F1b-F2-F2)" >&2
+      ok=1
+    fi
+  done
   [ "$ok" -eq 0 ] && echo "check: consistent ($word)" >&2
   return "$ok"
 }
@@ -558,8 +604,16 @@ do_check() {
 # (R5's probe). Outcome-neutral: no timing, no podman, no real row,
 # nothing outside the temp root is read or written. The scratch dir is
 # left in place for inspection (its path is printed); the only rm in
-# this script's test path is S6b's, of a single file inside its own
-# throwaway root.
+# this script's test path is S6b's (one row file) and S10d's (two
+# quiet files), each inside its own throwaway root.
+#
+# B-0-F7-F1b-F2-F2 (2026-11-27): S9 runs quiet_wait's real loop with
+# NB_REPRO_SELFTEST unset — only the four peripheral tools (sleep,
+# pgrep, systemctl, cut) are stubbed — so the recorded satisfied line
+# is the real one, end-anchored with no marker; S10 drives `check`'s
+# committed-quiet-evidence arm: bypassed and window-marked lines are
+# refused when committed, while real, missing and untracked quiet
+# files are never flagged.
 #
 # Assert helpers: st_rc <name> <want-rc> <root> <stub-mode> <args...>
 # runs this script and asserts its exit code; st_ok <name> <cmd...>
@@ -710,14 +764,48 @@ STUB
       NB_STUB_DEBUG=0 PATH="$stub_bin:$PATH" \
       bash "$script" "$@" > "$t/last.out" 2>&1
   }
-  # Like st_run, but for S7b only: quiet_wait's REAL loop in window
-  # mode (card B-0-F7-F1b-F2 Work 3) — load1 comes from $win_loadavg,
-  # and the Work 3 PATH stubs (sleep instant, pgrep matchless,
-  # systemctl silent) sit first on PATH, so 13 samples pass in
-  # milliseconds and the satisfied line is the real one.
+  # Like st_run, but for the window-mode scenarios (S7b and S10b):
+  # quiet_wait's REAL loop in window mode (card B-0-F7-F1b-F2 Work 3)
+  # — load1 comes from $win_loadavg, and the Work 3 PATH stubs (sleep
+  # instant, pgrep matchless, systemctl silent) sit first on PATH, so
+  # 13 samples pass in milliseconds and the satisfied line is the real
+  # one.
   st_run_win() {
     local r=$1 m=$2; shift 2
     st_run_win_stubs "$r" "$m" "$win_bin" "$win_loadavg" "$@"
+  }
+  # make_win_stubs <bin-dir>: the Work 3 peripheral stubs, hoisted out
+  # of S7b (card B-0-F7-F1b-F2-F2 Work 4): sleep exits at once (13
+  # samples pass in milliseconds), pgrep never matches (no
+  # cargo/rustc), systemctl is silent and succeeds (no live nbench
+  # unit). S7b's window mode and S9's real-loop run share them; S9
+  # adds a cut stub of its own to its bin dir.
+  make_win_stubs() { # make_win_stubs <bin-dir>
+    local bin=$1
+    mkdir -p "$bin"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/sleep"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$bin/pgrep"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/systemctl"
+    chmod +x "$bin/sleep" "$bin/pgrep" "$bin/systemctl"
+  }
+  # Like st_run, but for S9 and S10c only: quiet_wait's REAL loop with
+  # the PRODUCTION branches (card B-0-F7-F1b-F2-F2 Work 4).
+  # NB_REPRO_SELFTEST and its LOADAVG companion are removed from the
+  # child's environment with env -u — load-bearing: a selftest
+  # variable exported by the operator's shell must not silently
+  # bypass or window-stub a run whose whole point is that no selftest
+  # branch fires. Determinism comes from the stubs alone: $real_bin
+  # (created in S9, below, with make_win_stubs plus a cut stub that
+  # stands in for `cut -d' ' -f1 <loadavg>` reading a fixed load1)
+  # sits first on PATH. Only the four peripherals are stubbed; every
+  # branch quiet_wait takes — loadavg path, marker gate, satisfied
+  # line — is the production one.
+  st_run_real() { # st_run_real <root> <mode> <args...>
+    local r=$1 m=$2; shift 2
+    env -u NB_REPRO_SELFTEST -u NB_REPRO_SELFTEST_LOADAVG \
+      NB_HARNESS="$r" NB_BIN="$t/nbench-stub" \
+      NB_STUB_MODE="$m" NB_STUB_DEBUG=0 PATH="$real_bin:$PATH" \
+      bash "$script" "$@" > "$t/last.out" 2>&1
   }
   st_rc() { # st_rc <name> <want-rc> <st_run args...>
     local name=$1 want=$2 got
@@ -1007,16 +1095,18 @@ S6GDATE
 
   echo "S7: the line the quiet window ended on is recorded in repro/run-<x>.quiet.txt (B-0-F7-F1b finding 2)"
   # S7a: bypass mode — each run's quiet file holds exactly the one
-  # UTC-stamped BYPASSED line.
+  # UTC-stamped BYPASSED line. End-anchored (card
+  # B-0-F7-F1b-F2-F2 Work 3): any marker that leaks onto the BYPASSED
+  # line fails these.
   r=$t/s7a; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
   st_rc "a succeeds (bypassed window)" 0 st_run "$r" success a
   st_rc "b succeeds (bypassed window)" 0 st_run "$r" success b
   st_ok "run-a.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-a.quiet.txt")" -eq 1
-  st_ok "run-a's quiet line is the UTC-stamped BYPASSED line" \
-    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window BYPASSED' "$r/results/$D/repro/run-a.quiet.txt"
+  st_ok "run-a's quiet line is the UTC-stamped BYPASSED line (end-anchored: no marker may leak onto it)" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window BYPASSED \(NB_REPRO_SELFTEST=1: stub-driven selftest, not a measurement\)$' "$r/results/$D/repro/run-a.quiet.txt"
   st_ok "run-b.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-b.quiet.txt")" -eq 1
-  st_ok "run-b's quiet line is the UTC-stamped BYPASSED line" \
-    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window BYPASSED' "$r/results/$D/repro/run-b.quiet.txt"
+  st_ok "run-b's quiet line is the UTC-stamped BYPASSED line (end-anchored: no marker may leak onto it)" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window BYPASSED \(NB_REPRO_SELFTEST=1: stub-driven selftest, not a measurement\)$' "$r/results/$D/repro/run-b.quiet.txt"
   # S7b: window mode (Work 3) — the real loop, stubbed peripherals, so
   # the satisfied line itself is what gets recorded. No busy-load
   # case: with sleep stubbed it would spin to the 30-min deadline, and
@@ -1025,15 +1115,21 @@ S6GDATE
   win_loadavg="$t/s7b.loadavg"
   printf '0.50 0.40 0.30 1/100 1\n' > "$win_loadavg"
   win_bin="$t/s7b-bin"
-  mkdir -p "$win_bin"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$win_bin/sleep"
-  printf '#!/usr/bin/env bash\nexit 1\n' > "$win_bin/pgrep"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$win_bin/systemctl"
-  chmod +x "$win_bin/sleep" "$win_bin/pgrep" "$win_bin/systemctl"
+  make_win_stubs "$win_bin"
   st_rc "a succeeds through the real (stubbed) window" 0 st_run_win "$r" success a
   st_ok "run-a.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-a.quiet.txt")" -eq 1
   st_ok "the recorded line is the satisfied line (first -> last load1, 13 samples)" \
     grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window satisfied \(load1 0\.50 -> 0\.50, 13 consecutive samples' "$r/results/$D/repro/run-a.quiet.txt"
+  # B-0-F7-F1b-F2-F2 Work 2: the whole line, end-anchored — the real
+  # literal plus the self-identifying marker, and nothing after it
+  # (the prefix assertion above is the one S7b already had, kept
+  # unchanged).
+  st_ok "the recorded line is the full window line (real literal plus the marker), end-anchored" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window satisfied \(load1 0\.50 -> 0\.50, 13 consecutive samples; no cargo/rustc; no nbench unit\) \[NB_REPRO_SELFTEST=window: stubbed loadavg, not a measurement\]$' "$r/results/$D/repro/run-a.quiet.txt"
+  # The verdict's own ask (finding 2): an assertion that the marker is
+  # present — a window line must never pass for a real one.
+  st_ok "the window marker is present on the recorded line" \
+    grep -qF '[NB_REPRO_SELFTEST=window: stubbed loadavg, not a measurement]' "$r/results/$D/repro/run-a.quiet.txt"
 
   echo "S8: a killed run b, then its one allowed retry (verdict B-0-F7-F1-F2-F1 finding 2: the retry is a new run — the marker refreshes, the quiet record appends)"
   # No git needed (S1 style): the root is never a repo, so the
@@ -1071,6 +1167,103 @@ S6GDATE
   # attempt's line (mutant QUIET-OVERWRITE).
   st_ok "run-b.quiet.txt holds two lines (the killed attempt's and the retry's)" \
     test "$(wc -l < "$r/results/$D/repro/run-b.quiet.txt")" -eq 2
+
+  echo "S9: the real loop, production branches — the real satisfied line, no marker (card B-0-F7-F1b-F2-F2)"
+  # Why this scenario: the marker must be IMPOSSIBLE in real mode —
+  # quiet_wait composes it only inside the NB_REPRO_SELFTEST=window
+  # branch, and the byte-for-byte real line is exactly what a real
+  # quiet window would commit. This is the only run that observes that
+  # without sitting out a real 120 s window on a possibly-busy host
+  # (the parent card's no-busy-load rule stands): every branch
+  # quiet_wait takes is a production one (NB_REPRO_SELFTEST is unset
+  # in the child), and only the four peripheral tools are stubbed. The
+  # cut stub stands in for `cut -d' ' -f1 <loadavg>` reading a fixed
+  # loadavg line (0.50 0.40 0.30 1/100 1, whose first field is 0.50)
+  # because the real /proc/loadavg is host state, not test state; the
+  # :132 read is the only cut call in this script, so stubbing it
+  # cannot perturb anything else. Fresh non-git root (S1 style): the
+  # committed-row guard's git arm is inert and the -e arm sees nothing.
+  r=$t/s9; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  real_bin="$t/s9-bin"
+  make_win_stubs "$real_bin"
+  cat > "$real_bin/cut" <<'S9CUT'
+#!/usr/bin/env bash
+# S9 cut stub (card B-0-F7-F1b-F2-F2 Work 4): emulate
+# `cut -d' ' -f1 <loadavg>` over a fixed loadavg line
+# (0.50 0.40 0.30 1/100 1) — field 1 is 0.50. The file argument is
+# ignored on purpose: /proc/loadavg is host state, not test state.
+printf '0.50\n'
+S9CUT
+  chmod +x "$real_bin/cut"
+  st_rc "a succeeds through the real loop (production branches, stubbed peripherals)" 0 st_run_real "$r" success a
+  st_ok "run-a.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-a.quiet.txt")" -eq 1
+  st_ok "the real satisfied line, end-anchored, carries NO marker (byte-for-byte the production line)" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window satisfied \(load1 0\.50 -> 0\.50, 13 consecutive samples; no cargo/rustc; no nbench unit\)$' "$r/results/$D/repro/run-a.quiet.txt"
+
+  echo "S10: check flags committed non-real quiet evidence (card B-0-F7-F1b-F2-F2)"
+  # Each scenario gets its own root; the git cases are made repos
+  # here, and every git init/add/commit runs ONLY inside these
+  # throwaway roots (the same rule S6 states), with S6's selftest
+  # identity. s10_commit publishes exactly what an operator would:
+  # the whole date dir.
+  s10_commit() { # s10_commit <root>
+    local r=$1
+    git -C "$r" add "results/$D"
+    git -C "$r" -c user.name=selftest -c user.email=selftest@invalid \
+      -c commit.gpgsign=false commit -q -m "selftest repro evidence"
+  }
+  # S10a: bypass lines committed — check must refuse them.
+  r=$t/s10a; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds (bypassed window)" 0 st_run "$r" success a
+  st_rc "b succeeds (bypassed window)" 0 st_run "$r" success b
+  st_rc "verdict succeeds" 0 st_run "$r" success verdict
+  s10_commit "$r"
+  st_rc "check refuses committed BYPASSED quiet evidence" 1 st_run "$r" success check
+  st_ok "the refusal names run-a.quiet.txt" grep -q 'run-a.quiet.txt' "$t/last.out"
+  st_ok "the refusal says committed" grep -q 'is committed' "$t/last.out"
+  # S10b: window-marker lines committed (make_win_stubs + st_run_win,
+  # so both quiet lines hold the satisfied line plus the marker and no
+  # BYPASSED) — check must refuse them on the marker alone.
+  r=$t/s10b; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds through the real (stubbed) window" 0 st_run_win "$r" success a
+  st_rc "b succeeds through the real (stubbed) window" 0 st_run_win "$r" success b
+  st_rc "verdict succeeds" 0 st_run_win "$r" success verdict
+  s10_commit "$r"
+  st_rc "check refuses committed window-marker quiet evidence" 1 st_run_win "$r" success check
+  st_ok "the refusal names run-a.quiet.txt" grep -q 'run-a.quiet.txt' "$t/last.out"
+  st_ok "the refusal names the marker evidence" grep -q 'window-selftest marker' "$t/last.out"
+  # S10c (control): the real-mode line from S9's runner, committed —
+  # a real satisfied line is never flagged.
+  r=$t/s10c; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds through the real loop" 0 st_run_real "$r" success a
+  st_rc "b succeeds through the real loop" 0 st_run_real "$r" success b
+  st_rc "verdict succeeds" 0 st_run_real "$r" success verdict
+  s10_commit "$r"
+  st_rc "check stays consistent: a real satisfied line is never flagged" 0 st_run_real "$r" success check
+  # S10d (the 2026-10-31 shape): the repro predates quiet files — none
+  # is required. The rm is one of the test path's two (see the
+  # selftest header) and removes two quiet files inside this
+  # scenario's own throwaway root.
+  r=$t/s10d; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds (bypassed window)" 0 st_run "$r" success a
+  st_rc "b succeeds (bypassed window)" 0 st_run "$r" success b
+  st_rc "verdict succeeds" 0 st_run "$r" success verdict
+  rm -f "$r/results/$D/repro/run-a.quiet.txt" "$r/results/$D/repro/run-b.quiet.txt"
+  s10_commit "$r"
+  st_rc "check stays consistent: no quiet file is required" 0 st_run "$r" success check
+  # S10e (uncommitted): the same evidence, nothing committed — the
+  # operator's working state is not flagged. (S1 already covers the
+  # non-git root arm.)
+  r=$t/s10e; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds (bypassed window)" 0 st_run "$r" success a
+  st_rc "b succeeds (bypassed window)" 0 st_run "$r" success b
+  st_rc "verdict succeeds" 0 st_run "$r" success verdict
+  st_rc "check stays consistent: untracked quiet evidence is not flagged" 0 st_run "$r" success check
 
   if [ "$fails" -eq 0 ]; then
     echo "REPRO SELFTEST OK ($t)"

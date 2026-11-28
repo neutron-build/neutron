@@ -174,6 +174,23 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   gitignored by the repo's `*.log` rule; a `.txt` under `results/` is
   not). The append is `>>`: a killed-attempt retry adds a second line
   instead of hiding the first.
+- **Window-selftest marker (card B-0-F7-F1b-F2-F2).** The
+  `NB_REPRO_SELFTEST=window` satisfied line appends
+  ` [NB_REPRO_SELFTEST=window: stubbed loadavg, not a measurement]`
+  — only in that mode, so a stubbed window's line can never be
+  published as real quiet evidence (verdict B-0-F7-F1b-F2 finding 2:
+  it was byte-identical to a real one, unlike `=1`'s loud BYPASSED
+  line).
+- **Committed quiet evidence must be real (card B-0-F7-F1b-F2-F2).**
+  `check` flags any **committed** `run-*.quiet.txt` that holds
+  `BYPASSED` or the window marker — only real satisfied lines may be
+  published as quiet evidence. Untracked files are the operator's
+  working state, not evidence, and are never flagged; a repro with no
+  quiet file (the committed 2026-10-31 one) stays consistent.
+- **The real satisfied line is unchanged, byte-for-byte** (card
+  B-0-F7-F1b-F2-F2): the marker is a suffix composed only inside the
+  window-selftest branch, so a real quiet window records exactly the
+  line it recorded before this card.
 - `verdict` — writes `repro/verdict.txt`: `nbench qdrant-repro-verdict
   --a F --b F` when both JSONs exist, or `REPRO VERDICT=INVALID (run X
   refused/voided: …)` for a failed or voided run. On REPRODUCED only,
