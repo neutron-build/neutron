@@ -305,13 +305,14 @@ pub const ROWS: &[RowDef] = &[
     // NB_METRICS protocol (the `VectorSearch` arm — the harness's one
     // mechanism for driver-written metrics), because the runner's
     // log-parser dispatch table is outside this card's Touch only
-    // list: a `Ycsb` parser variant cannot exist without a runner.rs
-    // edit (the match there is exhaustive), and the scope ruling
-    // reverted the one-line arm the first attempt added. The driver
-    // extracts the same fixed-format `[OVERALL]`/`[READ]` lines that
-    // `parse_ycsb` — the fixture-pinned reference parser in
-    // parse.rs — reads, and fails loudly when the mandatory
-    // throughput line is missing.
+    // list (the match there is exhaustive; the scope ruling reverted
+    // the one-line arm the first attempt added). The driver extracts
+    // the fixed-format `[OVERALL]`/`[READ]` lines that `parse_ycsb` —
+    // the fixture-pinned reference parser in parse.rs — reads, fails
+    // loudly when the mandatory throughput line is missing, and is
+    // itself under test: parse.rs's `driver` module executes the real
+    // script over the recorded fixtures and holds its output to the
+    // reference parser (verdict NB-2, rework 1).
     row!(
         "oltp-ycsb-pg17", "postgres17", VectorSearch,
         "YCSB core A–F over pgwire (JDBC) on PG17, threads 1/16/64 — the C-9 comparison row, Nucleus speaks pgwire (§3.7)",

@@ -30,10 +30,10 @@ bench/nbench/
 Rows: `oltp-pgbench-pg17`, `oltp-sysbench-pg17`,
 `kv-memtier-valkey8`, `kv-memtier-redis7`, `vector-sift1m-qdrant`,
 `vector-sift1m-pgvector`, `embedded-sqlite-speedtest1` (card B-0);
-`oltp-sysbench-mysql84`, `kv-memtier-dragonfly`,
-`embedded-duckdb-tpch1` (card NB-3). Systems: `postgres17`,
-`pgvector17`, `valkey8`, `redis7`, `qdrant`, `sqlite` (B-0);
-`mysql84`, `dragonfly`, `duckdb` (NB-3).
+`oltp-ycsb-pg17` (card NB-2); `oltp-sysbench-mysql84`,
+`kv-memtier-dragonfly`, `embedded-duckdb-tpch1` (card NB-3).
+Systems: `postgres17`, `pgvector17`, `valkey8`, `redis7`, `qdrant`,
+`sqlite` (B-0); `mysql84`, `dragonfly`, `duckdb` (NB-3).
 
 ## Usage
 
