@@ -15,7 +15,7 @@
 //! joins. No test waits on time.
 //!
 //! Mutants: LOAD-REF-BEFORE-PUBLISH (a), EVICT-UNLINK-BEFORE-ENTRY (h),
-//! WB-NO-GATE (`evict_holds_gate`), WB-GATE-WRITER-STARVE (`gate_rules`),
+//! WB-NO-GATE and OWN-1 (`evict_holds_gate`), WB-GATE-WRITER-STARVE (`gate_rules`),
 //! LEVEL-GROW-UNCONDITIONAL (`growth_race_level`),
 //! MAPINNER-CREATE-UNCONDITIONAL (`growth_race_inner`).
 
@@ -685,61 +685,73 @@ fn gate_rules() {
     r_w.unwrap().unwrap();
 }
 
-/// `evict_holds_gate` (card A-3c, Work 14.3; E1): an eviction for a caller
-/// that holds no gate takes the gate by a try, and holds it across the
-/// write, so a flip registers behind it. Mutant WB-NO-GATE fails it.
+/// `evict_holds_gate` (card A-3c, Work 14.3; E1, E5): an eviction for a
+/// caller that holds no gate takes the gate by a try, and holds it across
+/// the write and the entry set, so a flip registers behind it. Checked
+/// twice, on a fresh fixture each: the evictor paused at `EvictWrite`, and
+/// paused at `EvictEntrySet` (verdict A-3c, A-3c-F6's OWN-1: once step 2
+/// exists, a flip between the write and the entry set would hand E5 a stale
+/// epoch). Mutants WB-NO-GATE and OWN-1 (GATE-RELEASED-BEFORE-ENTRY) fail
+/// it: the flip ends rather than registers.
 #[test]
 fn evict_holds_gate() {
-    let (file, pool) = race_pool().unwrap();
-    let (l, _s1) = page_at_home(&pool, 0x11).unwrap();
-    let key = lpid(l);
-    {
-        let p = pin(&pool, key, &Hold::nothing()).unwrap();
-        s3_touch(&pool, &p, 0x12).unwrap();
-    }
-    let pz = Pauser::new();
-    pool.set_hook(Some(pz.hook()));
-    pz.pause_at(EvictWrite, key);
-    pz.report(GateExclusiveWaiting, NO_KEY);
-    let (first, which, r_e) = thread::scope(|s| {
-        let e = spawn(s, &pz, "E", || evict(&pool, key));
-        // E holds L's latch and its gate try-hold; no map latch.
-        let first = pz.next_event();
-        let mut which = None;
-        let mut x = None;
-        if arrived(&first, EvictWrite, key) {
-            x = Some(spawn(s, &pz, "X", || s1_flip(&pool)));
-            let mut others = 0;
-            loop {
-                let ev = pz.next_event();
-                if seen(&ev, GateExclusiveWaiting, NO_KEY) {
-                    which = Some("hook");
-                    break;
+    // One check: the evictor paused at `point`, where it holds L's
+    // exclusive latch and its gate try-hold, no map latch (E4's
+    // `EvictWrite`, E5's `EvictEntrySet`).
+    let check_at = |point: HookPoint| {
+        let (file, pool) = race_pool().unwrap();
+        let (l, _s1) = page_at_home(&pool, 0x11).unwrap();
+        let key = lpid(l);
+        {
+            let p = pin(&pool, key, &Hold::nothing()).unwrap();
+            s3_touch(&pool, &p, 0x12).unwrap();
+        }
+        let pz = Pauser::new();
+        pool.set_hook(Some(pz.hook()));
+        pz.pause_at(point, key);
+        pz.report(GateExclusiveWaiting, NO_KEY);
+        let (first, which, r_e) = thread::scope(|s| {
+            let e = spawn(s, &pz, "E", || evict(&pool, key));
+            // E holds L's latch and its gate try-hold; no map latch.
+            let first = pz.next_event();
+            let mut which = None;
+            let mut x = None;
+            if arrived(&first, point, key) {
+                x = Some(spawn(s, &pz, "X", || s1_flip(&pool)));
+                let mut others = 0;
+                loop {
+                    let ev = pz.next_event();
+                    if seen(&ev, GateExclusiveWaiting, NO_KEY) {
+                        which = Some("hook");
+                        break;
+                    }
+                    if done(&ev, "X") {
+                        which = Some("done");
+                        break;
+                    }
+                    others += 1;
+                    assert!(others < 16, "an unexpected event: {ev:?}");
                 }
-                if done(&ev, "X") {
-                    which = Some("done");
-                    break;
-                }
-                others += 1;
-                assert!(others < 16, "an unexpected event: {ev:?}");
             }
-        }
-        pz.release_all();
-        if let Some(x) = x {
-            let _ = x.join();
-        }
-        (first, which, e.join())
-    });
-    assert!(arrived(&first, EvictWrite, key), "{first:?}");
-    assert_eq!(
-        which,
-        Some("hook"),
-        "the flip registered before it could end"
-    );
-    assert!(matches!(r_e.unwrap().unwrap(), EvictOutcome::Obtained(_)));
-    assert_eq!(pool.epoch().unwrap(), 2);
-    // L's home from the fixture, and this eviction's write: no other.
-    assert_eq!(file.writes().len(), 2);
+            pz.release_all();
+            if let Some(x) = x {
+                let _ = x.join();
+            }
+            (first, which, e.join())
+        });
+        assert!(arrived(&first, point, key), "{point:?}: {first:?}");
+        assert_eq!(
+            which,
+            Some("hook"),
+            "{point:?}: the flip registered before it could end"
+        );
+        assert!(matches!(r_e.unwrap().unwrap(), EvictOutcome::Obtained(_)));
+        assert_eq!(pool.epoch().unwrap(), 2);
+        // L's home from the fixture, and this eviction's write: no other.
+        assert_eq!(file.writes().len(), 2);
+    };
+    check_at(EvictWrite);
+    check_at(EvictEntrySet);
 }
 
 /// `flip_pending_rechecks_free` (card A-3c, Work 8.3, with A5's re-check;
