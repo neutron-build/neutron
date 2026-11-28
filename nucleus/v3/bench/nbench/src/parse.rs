@@ -1059,23 +1059,39 @@ mod driver {
     /// The stand-in for `bin/nb-podman`. Every call is appended to
     /// `$NB_STUB_CALLS` (one line, arguments joined by spaces) and each
     /// kind of call the driver makes is answered from the test's
-    /// variables instead of starting a container.
+    /// variables instead of starting a container. With `NB_STUB_TABLE`
+    /// set the row count lives in that file instead: a sequence of
+    /// passes can then be replayed against a table that grows.
     const STUB: &str = r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "${NB_STUB_CALLS:?}"
+table=${NB_STUB_TABLE:-}
+rowcount() {
+  if [ -n "$table" ] && [ -s "$table" ]; then cat "$table"; else printf '0\n'; fi
+}
+add() { [ -n "$table" ] || return 0; printf '%s\n' "$(( $(rowcount) + $1 ))" > "$table"; }
+truncate() { [ -n "$table" ] || return 0; printf '0\n' > "$table"; }
 case ${1:-} in
   exec)
     case $* in
       *"postgres --version"*) printf 'postgres (PostgreSQL) %s\n' "${NB_STUB_PG_VERSION:?}" ;;
       *"SELECT version()"*) printf 'PostgreSQL %s on x86_64-pc-linux-gnu\n' "${NB_STUB_PG_VERSION}" ;;
-      *"SELECT count(*) FROM usertable"*) printf '%s\n' "${NB_STUB_ROWS:?}" ;;
+      *"TRUNCATE usertable"*) truncate ;;
+      *"SELECT count(*) FROM usertable"*)
+        if [ -n "$table" ]; then rowcount; else printf '%s\n' "${NB_STUB_ROWS:?}"; fi ;;
     esac
     ;;
   run)
     case $* in
       *"java -version"*)
         printf 'openjdk version "%s"\nYCSB release: ycsb-0.17.0\n' "${NB_STUB_JAVA_VERSION:?}" ;;
-      *" load jdbc "*) cat "${NB_STUB_LOAD:?}" ;;
-      *" run jdbc "*) cat "${NB_STUB_RUN:?}" ;;
+      *" load jdbc "*)
+        cat "${NB_STUB_LOAD:?}"
+        for a in "$@"; do case $a in recordcount=*) n=${a#recordcount=} ;; esac; done
+        add "${n:-0}" ;;
+      *" run jdbc "*)
+        cat "${NB_STUB_RUN:?}"
+        n=$(grep -E '^\[INSERT\], Return=OK, ' "${NB_STUB_RUN}" | tail -1 | sed 's/.*,//' | tr -d ' ')
+        add "${n:-0}" ;;
     esac
     ;;
 esac
@@ -1191,6 +1207,19 @@ esac
         recordcount: &str,
         operations: &str,
     ) -> std::result::Result<Outcome, String> {
+        run_driver_on(name, sc, recordcount, operations, None)
+    }
+
+    /// [`run_driver`] with one addition: when `table` is given, the stub
+    /// keeps the row count in that file, shared by every call of one
+    /// sequence, instead of answering a fixed count.
+    fn run_driver_on(
+        name: &str,
+        sc: &Scenario,
+        recordcount: &str,
+        operations: &str,
+        table: Option<&Path>,
+    ) -> std::result::Result<Outcome, String> {
         let io = |e: std::io::Error| e.to_string();
         let dir = tmpdir(name)?;
         let bin = stub_bin(&dir)?;
@@ -1236,6 +1265,7 @@ esac
             .env("NB_STUB_RUN", &stub_run)
             .env("NB_STUB_PG_VERSION", "17.11-stub")
             .env("NB_STUB_JAVA_VERSION", "17.0.21-stub")
+            .envs(table.map(|t| ("NB_STUB_TABLE", t)))
             .output()
             .map_err(io)?;
 
@@ -1654,6 +1684,54 @@ esac
             "names the reason: {}",
             out.stderr
         );
+    }
+
+    #[test]
+    fn driver_carries_an_inserting_series_pass_by_pass() {
+        // The plan's sequence for one workload-D series (reinit, cold,
+        // warmup, run, run) replayed against a table whose row count the
+        // stub keeps: the load fills `recordcount` rows and each pass adds
+        // the inserts its report returned OK (44 in the fixture). The
+        // cold pass follows the reinit and runs on the pristine table
+        // without reloading; each later pass finds the rows the pass
+        // before inserted, reloads, and publishes the reference parser's
+        // numbers. It is the smoke's workload-D run, offline.
+        let table = tmpdir("series").expect("mkdir").join("table");
+        let count = || {
+            std::fs::read_to_string(&table)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let reinit = Scenario::load_phase("reinit", "workload=d,threads=1", LOAD);
+        let out = run_driver_on("series-init", &reinit, "1000", "1000", Some(&table))
+            .expect("run the driver");
+        assert!(out.success, "driver failed: {}", out.stderr);
+        assert_eq!(count(), "1000", "the load fills recordcount rows");
+        for (i, mode) in ["cold", "warmup", "run", "run"].into_iter().enumerate() {
+            let sc = Scenario::measured(mode, "workload=d,threads=1", "", RUN_D);
+            let out = run_driver_on(&format!("series-{i}"), &sc, "1000", "1000", Some(&table))
+                .expect("run the driver");
+            assert!(out.success, "{mode}: driver failed: {}", out.stderr);
+            let text = out.metrics.as_deref().expect("NB_METRICS written");
+            assert_eq!(
+                metrics_of(text).expect("metrics json"),
+                parse_ycsb(RUN_D).expect("parse D").metrics,
+                "{mode}: the published metrics must equal the reference parser's"
+            );
+            if i == 0 {
+                assert!(
+                    !out.has_call(" load jdbc ") && out.reload_log.is_none(),
+                    "the cold pass follows the reinit and must not reload: {:?}",
+                    out.calls
+                );
+            } else {
+                assert!(
+                    out.reload_log.is_some(),
+                    "{mode}: must reload the rows the pass before inserted"
+                );
+            }
+            assert_eq!(count(), "1044", "{mode}: the pass inserted 44 rows");
+        }
     }
 
     #[test]

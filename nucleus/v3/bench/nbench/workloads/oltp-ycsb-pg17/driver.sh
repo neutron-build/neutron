@@ -153,7 +153,7 @@ case ${NB_MODE:?} in
         exit 1
       fi
       reload_log="${NB_LOG:?}.reload"
-      echo "usertable holds ${rows} rows, more than recordcount=${recordcount}: an earlier pass of this series inserted — reloading before this pass (${reload_log})" >&2
+      echo "usertable holds ${rows} rows, more than recordcount=${recordcount}: an earlier pass inserted — reloading before this pass (${reload_log})" >&2
       load_dataset "$workload" "$reload_log" \
         || { echo "reload failed; see ${reload_log}" >&2; exit 1; }
       assert_all_ok "$reload_log"
