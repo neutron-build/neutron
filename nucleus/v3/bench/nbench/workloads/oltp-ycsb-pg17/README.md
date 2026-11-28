@@ -5,10 +5,11 @@ binding over pgwire — the row C-9's OLTP row later reuses against
 Nucleus (both speak pgwire, PLAN-v3 §3.7). Landed by card NB-2; the
 Nucleus column is `n/a` until C-9.
 
-- Driver: `driver.sh` (init / cold / warmup / run)
+- Driver: `driver.sh` (init / reinit / cold / warmup / run)
 - Digest: `digest.sh` (init strict, final recorded — pins the dataset
   *shape*, the usertable row count; see its header)
-- Smoke: `smoke.sh` (workload A, one thread, 1 000 records,
+- Smoke: `smoke.sh` — the card's Host smoke line, run by the gate on a
+  fresh clone (workload A, then workload D; one thread, 1 000 records,
   1 000 operations, `--tag smoke` — §7.7.4 smoke-size form; never a
   measurement)
 - Expected digests: `expected/init-smoke.txt` (recorded by the first
@@ -40,24 +41,66 @@ the first smoke run:
   VARCHAR(255) PRIMARY KEY, FIELD0..FIELD9 TEXT`) and truncates before
   each load so every series starts from the same pristine state.
 
+## What the driver guarantees
+
+**No pass with a failed operation is published.** YCSB exits 0 whatever
+its operations returned, so the driver reads the report itself: any
+`[<OP>], Return=<STATUS>` line other than `OK`, any `[<OP>-FAILED]`
+section, or a report with no successful operation at all fails the
+pass, with the report's own lines on stderr and no `NB_METRICS` file
+written. `nbench run` then fails the row with that reason and writes no
+results file (the card asks for `"voided": true`; a results document
+with that field is the runner's to write — `src/runner.rs`, outside
+this card's Touch only list — so the driver's loud failure, the
+harness's existing path for a missing throughput line, is what this
+card can produce; see its RESULT).
+
+**Every pass starts from the digested dataset.** YCSB 0.17.0 restarts
+its run-phase insert key sequence at `recordcount` in every process
+(read from `core-0.17.0.jar`: the first insert keynums are
+`recordcount`, `recordcount+1`, … whatever `insertstart`/`insertcount`
+say — those two move the load and the request key ranges, not this
+counter). Stock D and E insert (5 %), so without more the second pass
+of a series would re-insert the first pass's keys and fail on
+`usertable_pkey` — which is what the NB-2 verdict found (R2). A
+measured pass therefore counts `usertable` first: exactly `recordcount`
+rows is pristine and the pass runs; more rows means an earlier pass of
+the series inserted, and the driver truncates and reloads the full
+`recordcount` (the reinit's own steps, logged to `<pass log>.reload`)
+before running; fewer rows is a lost dataset and fails the pass. The
+non-inserting workloads (A, B, C, F) never trip the rule, so it costs
+nothing there; for D and E each pass after the cold one costs one
+reload.
+
+**The published numbers are the driver's own, and they are under
+test.** The row parses driver-side through the NB_METRICS protocol (the
+`VectorSearch` arm): the runner's log-parser dispatch table is outside
+this card's Touch only list, so there is no parser variant for this
+row. `driver.sh` extracts the `[OVERALL]`/`[READ]` lines the
+fixture-pinned reference parser `parse_ycsb` (parse.rs) reads, fails
+loudly when the mandatory throughput line is missing, and omits the
+read-latency metrics for mixes without reads. Because those `sed`
+lines are the row's numbers, `parse.rs` executes the real `driver.sh`
+over the recorded fixtures with a stub `nb-podman` and requires its
+output to equal the reference parser's (verdict NB-2, rework 1); the
+same tests run the failed-operation guard and the restore rule.
+
 ## Notes
 
-- **The smoke derives its own environment** (the acceptance line runs
+- **The smoke derives its own environment** (the Host smoke line runs
   it bare — the NB-3 smokes' rule): `smoke.sh` derives ROOT and the
-  nbench binary path itself. The real-row run is the gate's Host smoke
-  line (card NB-2, Opus ruling ruling-NB-containment.md, 2026-11-28):
-  the worker's sandbox cannot start real rows, and the smoke holds no
-  relay and no derived transport — the row run and the checks only,
-  under the host's real user manager.
-- **Metrics path** (scope note, also in rows.rs): the row parses
-  driver-side through the NB_METRICS protocol (the `VectorSearch`
-  arm) — the runner's log-parser dispatch table is outside this
-  card's Touch only list, so a `Ycsb` parser variant cannot be
-  registered without touching runner.rs. `driver.sh` extracts the
-  same fixed-format `[OVERALL]`/`[READ]` lines that `parse_ycsb`
-  (parse.rs, fixture-pinned, test-only reference) reads, fails
-  loudly when the mandatory throughput line is missing, and omits
-  the read-latency metrics for mixes without reads.
+  nbench binary path itself. The real-row run is the gate's (card NB-2,
+  Opus ruling ruling-NB-containment.md, 2026-11-27): the worker's
+  sandbox cannot start real rows, and the smoke holds no relay and no
+  derived transport — the row runs and the checks only, under the
+  host's real user manager.
+- **The smoke's second run is workload D** (verdict NB-2, R2 fix item
+  3): A has no inserts, so A alone can never see a failed insert. D,
+  with a warmup and two warm passes, exercises the guard and the
+  restore at row level — the smoke checks each D pass log for
+  successful inserts only, the cold pass for running on the pristine
+  table, and each later pass for having reloaded the full recordcount
+  first.
 - The launcher is `bin/ycsb.sh` (POSIX sh, same tarball); the `bin/ycsb`
   launcher is Python 2 and no current base image carries it — see
   `../../systems/ycsbcli/README.md`.
@@ -69,7 +112,12 @@ the first smoke run:
 - `versions.txt` (mandatory) records `postgres --version`, the server's
   `SELECT version()`, the client's `java -version` and the YCSB release
   string.
-- Per-workload sections: A/B/C carry `[READ]` (avg/p99 read latencies
-  reported), D carries `[READ]`+`[INSERT]`, E is `[SCAN]`+`[INSERT]`,
-  F is `[READ-MODIFY-WRITE]`+`[INSERT]` — the read-latency metrics are
-  simply absent for E and F, never invented.
+- Per-workload sections (real 0.17.0 reports): A and B carry
+  `[READ]`+`[UPDATE]`, C `[READ]`, D `[READ]`+`[INSERT]`, E
+  `[SCAN]`+`[INSERT]`, F `[READ]`+`[READ-MODIFY-WRITE]`+`[UPDATE]` — F
+  reads (its plain reads plus the read half of each read-modify-write)
+  and inserts nothing. Only E's series lack `avg_read_us`/`p99_read_us`;
+  absent fields are omitted, never invented.
+- The fixtures under `src/fixtures/ycsb-*.txt` that the driver tests
+  replay are described in `src/parse.rs` (`mod driver`);
+  `src/fixtures/ycsb-standin/` is how the offline ones were recorded.
