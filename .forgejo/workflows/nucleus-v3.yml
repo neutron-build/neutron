@@ -45,6 +45,11 @@ jobs:
           cargo deny --version >/dev/null 2>&1 || cargo install cargo-deny --locked
 
       - name: Gate
+        # Every step, the enforcement self-tests included (ENF-FASTGATE-1):
+        # on the scaffold the change under test is empty, so the gate's own
+        # rule would skip them, and CI is the independent re-check.
+        env:
+          NV3_GATE_FULL: "1"
         run: bash scripts/gate.sh
 
       - name: Merge audit (scaffold)
