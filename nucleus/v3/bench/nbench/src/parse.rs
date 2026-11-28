@@ -1012,7 +1012,7 @@ mod probe {
     }
 }
 
-/// Tests that execute the row's own driver (card NB-2 rework 1: verdict
+/// Tests that execute the row's own scripts (card NB-2 rework 1: verdict
 /// NB-2 R1 and R2).
 ///
 /// `oltp-ycsb-pg17` publishes driver-side: `workloads/oltp-ycsb-pg17/
@@ -1020,17 +1020,17 @@ mod probe {
 /// script is what refuses a pass with failed operations and what
 /// restores the dataset an earlier pass grew; `digest.sh` hashes the
 /// server's own row count. The only honest test of those code paths
-/// runs the real scripts. Each test executes one with a
-/// cleared environment whose PATH starts with a stub `nb-podman` — no
-/// call can reach the real wrapper, `systemd-run` or a container —
-/// which records its arguments and replays a recorded YCSB log in place
-/// of the client. The driver is bash, so this is unix-only.
+/// runs the real scripts. Each test executes one with a cleared
+/// environment whose PATH starts with a stub `nb-podman` and does not
+/// include the real wrapper, so no call can start anything: the stub
+/// records its arguments and replays a recorded YCSB log in place of the
+/// client. The scripts are bash, so this is unix-only.
 ///
 /// The fixtures are all real output of YCSB Client 0.17.0; the `-db`
 /// class on each file's `Command line:` line says how it was produced:
 /// - `ycsb-run.txt` and `ycsb-load.txt`: the pinned image against
-///   PostgreSQL 17 through JDBC (`site.ycsb.db.JdbcDBClient`) — the
-///   run and the load phase of the 2026-11-27 smoke-size passes;
+///   PostgreSQL 17 through JDBC (`site.ycsb.db.JdbcDBClient`) — the run
+///   phase and the load phase of the 2026-11-27 real smoke-size run;
 /// - `ycsb-run-d.txt`, `ycsb-run-d-failed.txt`, `ycsb-run-e.txt`,
 ///   `ycsb-run-f.txt`: the same client from the pinned tarball, run
 ///   offline with `fixtures/ycsb-standin/StandinTable.java` (`-db
